@@ -18,6 +18,8 @@ pub mod metadata;
 pub mod preconditions;
 #[cfg(test)]
 mod preconditions_suite;
+#[cfg(test)]
+mod request_context_tests;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod size_estimator;
@@ -1403,112 +1405,145 @@ impl StorageBackend {
     }
 }
 
+/// Run one backend operation unless the request context is done first.
+///
+/// Every `StorageBackend` call goes through here, the single dispatch point
+/// where Go's etcd3 store observes `ctx.Done()` (staging/.../storage/etcd3/
+/// store.go: each `client.KV` call takes the request `ctx`, and
+/// `clientv3` returns `ctx.Err()` once it is done). The context is the
+/// task-local [`rusternetes_common::cancellation`] one the api-server's
+/// timeout filter installs (request_deadline.go:91-96); outside a request
+/// (controllers, tests) there is none and this is just `op`.
+///
+/// Cancelling a multi-step handler between two storage calls leaves it
+/// half-done, exactly as Go does when `ctx` is cancelled between two etcd
+/// calls; a write already submitted to the backend may still be applied.
+async fn cancellable<T>(op: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    match rusternetes_common::cancellation::run_until_done(op).await {
+        Ok(r) => r,
+        Err(done) => Err(done.into()),
+    }
+}
+
 #[async_trait]
 impl Storage for StorageBackend {
     async fn create<T>(&self, key: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::create(s, key, value).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::create(s, key, value).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::create(s, key, value).await,
-            StorageBackend::Memory(s) => Storage::create(s.as_ref(), key, value).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::create(s, key, value).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::create(s, key, value).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::create(s, key, value).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::create(s, key, value).await,
+                StorageBackend::Memory(s) => Storage::create(s.as_ref(), key, value).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::create(s, key, value).await,
+            }
+        })
+        .await
     }
 
     async fn get<T>(&self, key: &str) -> Result<T>
     where
         T: DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::get(s, key).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::get(s, key).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::get(s, key).await,
-            StorageBackend::Memory(s) => Storage::get(s.as_ref(), key).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::get(s, key).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::get(s, key).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::get(s, key).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::get(s, key).await,
+                StorageBackend::Memory(s) => Storage::get(s.as_ref(), key).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::get(s, key).await,
+            }
+        })
+        .await
     }
 
     async fn update<T>(&self, key: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        // No-op update short-circuit (upstream parity). Kubernetes' etcd3 store
-        // skips the write when the new object is byte-identical to what is
-        // stored, modulo resourceVersion — no write, no resourceVersion bump,
-        // and crucially no watch event:
-        //   staging/.../apiserver/pkg/storage/etcd3/store.go:
-        //     if !origState.stale && bytes.Equal(data, origState.data) { return }
-        // Without this, an idempotent controller update — e.g. cert-manager's
-        // cainjector re-setting the SAME caBundle on a webhook config every
-        // reconcile — publishes a MODIFIED event each time, which re-triggers
-        // the controller into a ~20/sec hot-loop (#1566). The Api backend
-        // proxies to a real api-server that already applies this semantic, so
-        // skip the extra network round-trip there.
-        let is_api_backend = {
-            #[cfg(feature = "api-client")]
-            {
-                matches!(self, StorageBackend::Api(_))
-            }
-            #[cfg(not(feature = "api-client"))]
-            {
-                false
-            }
-        };
-        if !is_api_backend {
-            if let Ok(incoming) = serde_json::to_value(value) {
-                if let Ok(current) = Storage::get::<serde_json::Value>(self, key).await {
-                    // Only short-circuit when the caller's resourceVersion is
-                    // absent or matches the stored one. A stale RV with
-                    // otherwise-identical content must still surface a Conflict
-                    // (upstream checks the precondition before the no-op
-                    // short-circuit), so let those fall through to the backend.
-                    let cur_rv = current.pointer("/metadata/resourceVersion");
-                    let incoming_rv = incoming.pointer("/metadata/resourceVersion");
-                    let rv_compatible = incoming_rv.is_none() || incoming_rv == cur_rv;
-                    if rv_compatible && objects_equal_ignoring_resource_version(&current, &incoming)
-                    {
-                        return serde_json::from_value(current).map_err(Error::Serialization);
+        cancellable(async {
+            // No-op update short-circuit (upstream parity). Kubernetes' etcd3 store
+            // skips the write when the new object is byte-identical to what is
+            // stored, modulo resourceVersion — no write, no resourceVersion bump,
+            // and crucially no watch event:
+            //   staging/.../apiserver/pkg/storage/etcd3/store.go:
+            //     if !origState.stale && bytes.Equal(data, origState.data) { return }
+            // Without this, an idempotent controller update — e.g. cert-manager's
+            // cainjector re-setting the SAME caBundle on a webhook config every
+            // reconcile — publishes a MODIFIED event each time, which re-triggers
+            // the controller into a ~20/sec hot-loop (#1566). The Api backend
+            // proxies to a real api-server that already applies this semantic, so
+            // skip the extra network round-trip there.
+            let is_api_backend = {
+                #[cfg(feature = "api-client")]
+                {
+                    matches!(self, StorageBackend::Api(_))
+                }
+                #[cfg(not(feature = "api-client"))]
+                {
+                    false
+                }
+            };
+            if !is_api_backend {
+                if let Ok(incoming) = serde_json::to_value(value) {
+                    if let Ok(current) = Storage::get::<serde_json::Value>(self, key).await {
+                        // Only short-circuit when the caller's resourceVersion is
+                        // absent or matches the stored one. A stale RV with
+                        // otherwise-identical content must still surface a Conflict
+                        // (upstream checks the precondition before the no-op
+                        // short-circuit), so let those fall through to the backend.
+                        let cur_rv = current.pointer("/metadata/resourceVersion");
+                        let incoming_rv = incoming.pointer("/metadata/resourceVersion");
+                        let rv_compatible = incoming_rv.is_none() || incoming_rv == cur_rv;
+                        if rv_compatible
+                            && objects_equal_ignoring_resource_version(&current, &incoming)
+                        {
+                            return serde_json::from_value(current).map_err(Error::Serialization);
+                        }
                     }
                 }
             }
-        }
-        match self {
-            StorageBackend::Etcd(s) => Storage::update(s, key, value).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::update(s, key, value).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::update(s, key, value).await,
-            StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update(s, key, value).await,
-        }
+            match self {
+                StorageBackend::Etcd(s) => Storage::update(s, key, value).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::update(s, key, value).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::update(s, key, value).await,
+                StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::update(s, key, value).await,
+            }
+        })
+        .await
     }
 
     async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::create_with_ttl(s, key, value, ttl).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::create_with_ttl(s, key, value, ttl).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::create_with_ttl(s, key, value, ttl).await,
-            StorageBackend::Memory(s) => {
-                Storage::create_with_ttl(s.as_ref(), key, value, ttl).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::create_with_ttl(s, key, value, ttl).await,
+                StorageBackend::Memory(s) => {
+                    Storage::create_with_ttl(s.as_ref(), key, value, ttl).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::create_with_ttl(s, key, value, ttl).await,
             }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::create_with_ttl(s, key, value, ttl).await,
-        }
+        })
+        .await
     }
 
     /// Unlike [`Storage::update`] this has no no-op short-circuit: the write
@@ -1517,42 +1552,50 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::update_with_ttl(s, key, value, ttl).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::update_with_ttl(s, key, value, ttl).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::update_with_ttl(s, key, value, ttl).await,
-            StorageBackend::Memory(s) => {
-                Storage::update_with_ttl(s.as_ref(), key, value, ttl).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::update_with_ttl(s, key, value, ttl).await,
+                StorageBackend::Memory(s) => {
+                    Storage::update_with_ttl(s.as_ref(), key, value, ttl).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::update_with_ttl(s, key, value, ttl).await,
             }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update_with_ttl(s, key, value, ttl).await,
-        }
+        })
+        .await
     }
 
     async fn update_subresource<T>(&self, key: &str, subresource: &str, value: &T) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => {
-                Storage::update_subresource(s, key, subresource, value).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => {
+                    Storage::update_subresource(s, key, subresource, value).await
+                }
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => {
+                    Storage::update_subresource(s, key, subresource, value).await
+                }
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => {
+                    Storage::update_subresource(s, key, subresource, value).await
+                }
+                StorageBackend::Memory(s) => {
+                    Storage::update_subresource(s.as_ref(), key, subresource, value).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::update_subresource(s, key, subresource, value).await
+                }
             }
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => {
-                Storage::update_subresource(s, key, subresource, value).await
-            }
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => {
-                Storage::update_subresource(s, key, subresource, value).await
-            }
-            StorageBackend::Memory(s) => {
-                Storage::update_subresource(s.as_ref(), key, subresource, value).await
-            }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update_subresource(s, key, subresource, value).await,
-        }
+        })
+        .await
     }
 
     /// Status writes must reach the inner backend's `update_status` — for the
@@ -1563,42 +1606,46 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update_status(s, key, value).await,
-            // Non-API backends: replicate the trait default (graft only the
-            // incoming status onto the freshly-read object, CAS-retry on
-            // conflict) — they don't separate status, so update() persists it.
-            _ => {
-                let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
-                let new_status = incoming.get("status").cloned();
-                const MAX_ATTEMPTS: usize = 8;
-                for attempt in 0..MAX_ATTEMPTS {
-                    let mut current: serde_json::Value = Storage::get(self, key).await?;
-                    if let Some(obj) = current.as_object_mut() {
-                        match &new_status {
-                            Some(status) => {
-                                obj.insert("status".to_string(), status.clone());
-                            }
-                            None => {
-                                obj.remove("status");
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::update_status(s, key, value).await,
+                // Non-API backends: replicate the trait default (graft only the
+                // incoming status onto the freshly-read object, CAS-retry on
+                // conflict) — they don't separate status, so update() persists it.
+                _ => {
+                    let incoming = serde_json::to_value(value).map_err(Error::Serialization)?;
+                    let new_status = incoming.get("status").cloned();
+                    const MAX_ATTEMPTS: usize = 8;
+                    for attempt in 0..MAX_ATTEMPTS {
+                        let mut current: serde_json::Value = Storage::get(self, key).await?;
+                        if let Some(obj) = current.as_object_mut() {
+                            match &new_status {
+                                Some(status) => {
+                                    obj.insert("status".to_string(), status.clone());
+                                }
+                                None => {
+                                    obj.remove("status");
+                                }
                             }
                         }
-                    }
-                    match Storage::update::<serde_json::Value>(self, key, &current).await {
-                        Ok(updated) => {
-                            return serde_json::from_value(updated).map_err(Error::Serialization)
+                        match Storage::update::<serde_json::Value>(self, key, &current).await {
+                            Ok(updated) => {
+                                return serde_json::from_value(updated)
+                                    .map_err(Error::Serialization)
+                            }
+                            Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
+                            Err(e) => return Err(e),
                         }
-                        Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,
-                        Err(e) => return Err(e),
                     }
+                    Err(Error::Conflict(format!(
+                        "update_status: exhausted {} CAS retries for {}",
+                        MAX_ATTEMPTS, key
+                    )))
                 }
-                Err(Error::Conflict(format!(
-                    "update_status: exhausted {} CAS retries for {}",
-                    MAX_ATTEMPTS, key
-                )))
             }
-        }
+        })
+        .await
     }
 
     /// `Api` PUTs `/status` (the api-server does the compare); every other
@@ -1608,11 +1655,14 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update_status_cas(s, key, value).await,
-            _ => update_status_cas_via_update(self, key, value).await,
-        }
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::update_status_cas(s, key, value).await,
+                _ => update_status_cas_via_update(self, key, value).await,
+            }
+        })
+        .await
     }
 
     /// `Api` sends a real status PATCH; direct variants write `full`.
@@ -1625,13 +1675,16 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => {
-                Storage::patch_status_strategic_merge(s, key, patch, _full).await
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::patch_status_strategic_merge(s, key, patch, _full).await
+                }
+                _ => patch_status_via_update(self, key, patch, _full).await,
             }
-            _ => patch_status_via_update(self, key, patch, _full).await,
-        }
+        })
+        .await
     }
 
     /// `Api` sends a real PATCH; every other variant runs the default CAS
@@ -1640,11 +1693,14 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::patch_strategic_merge(s, key, patch).await,
-            _ => patch_via_update(self, key, patch).await,
-        }
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::patch_strategic_merge(s, key, patch).await,
+                _ => patch_via_update(self, key, patch).await,
+            }
+        })
+        .await
     }
 
     /// `Api` sends the preconditions in the PATCH body; every other variant
@@ -1658,14 +1714,19 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => {
-                Storage::patch_strategic_merge_with_preconditions(s, key, patch, preconditions)
-                    .await
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::patch_strategic_merge_with_preconditions(s, key, patch, preconditions)
+                        .await
+                }
+                _ => {
+                    patch_via_update_with_preconditions(self, key, patch, Some(preconditions)).await
+                }
             }
-            _ => patch_via_update_with_preconditions(self, key, patch, Some(preconditions)).await,
-        }
+        })
+        .await
     }
 
     /// `Api` sends a real apply PATCH; every other variant runs the default
@@ -1681,39 +1742,51 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => {
-                Storage::apply(s, key, apply_config, field_manager, force, subresource).await
+        cancellable(async {
+            match self {
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::apply(s, key, apply_config, field_manager, force, subresource).await
+                }
+                _ => {
+                    apply_via_update(self, key, apply_config, field_manager, force, subresource)
+                        .await
+                }
             }
-            _ => apply_via_update(self, key, apply_config, field_manager, force, subresource).await,
-        }
+        })
+        .await
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::update_raw(s, key, value).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::update_raw(s, key, value).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
-            StorageBackend::Memory(s) => Storage::update_raw(s.as_ref(), key, value).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::update_raw(s, key, value).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::update_raw(s, key, value).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::update_raw(s, key, value).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
+                StorageBackend::Memory(s) => Storage::update_raw(s.as_ref(), key, value).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::update_raw(s, key, value).await,
+            }
+        })
+        .await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::delete(s, key).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::delete(s, key).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::delete(s, key).await,
-            StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::delete(s, key).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::delete(s, key).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::delete(s, key).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::delete(s, key).await,
+                StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::delete(s, key).await,
+            }
+        })
+        .await
     }
 
     async fn delete_with_preconditions(
@@ -1721,68 +1794,80 @@ impl Storage for StorageBackend {
         key: &str,
         preconditions: &Preconditions,
     ) -> Result<()> {
-        match self {
-            StorageBackend::Etcd(s) => {
-                Storage::delete_with_preconditions(s, key, preconditions).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => {
+                    Storage::delete_with_preconditions(s, key, preconditions).await
+                }
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => {
+                    Storage::delete_with_preconditions(s, key, preconditions).await
+                }
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => {
+                    Storage::delete_with_preconditions(s, key, preconditions).await
+                }
+                StorageBackend::Memory(s) => {
+                    Storage::delete_with_preconditions(s.as_ref(), key, preconditions).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::delete_with_preconditions(s, key, preconditions).await
+                }
             }
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => {
-                Storage::delete_with_preconditions(s, key, preconditions).await
-            }
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => {
-                Storage::delete_with_preconditions(s, key, preconditions).await
-            }
-            StorageBackend::Memory(s) => {
-                Storage::delete_with_preconditions(s.as_ref(), key, preconditions).await
-            }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => {
-                Storage::delete_with_preconditions(s, key, preconditions).await
-            }
-        }
+        })
+        .await
     }
 
     async fn delete_gracefully(&self, key: &str) -> Result<()> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::delete_gracefully(s, key).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::delete_gracefully(s, key).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::delete_gracefully(s, key).await,
-            StorageBackend::Memory(s) => Storage::delete_gracefully(s.as_ref(), key).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::delete_gracefully(s, key).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::delete_gracefully(s, key).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::delete_gracefully(s, key).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::delete_gracefully(s, key).await,
+                StorageBackend::Memory(s) => Storage::delete_gracefully(s.as_ref(), key).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::delete_gracefully(s, key).await,
+            }
+        })
+        .await
     }
 
     async fn delete_collection(&self, prefix: &str) -> Result<bool> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::delete_collection(s, prefix).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::delete_collection(s, prefix).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::delete_collection(s, prefix).await,
-            StorageBackend::Memory(s) => Storage::delete_collection(s.as_ref(), prefix).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::delete_collection(s, prefix).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::delete_collection(s, prefix).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::delete_collection(s, prefix).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::delete_collection(s, prefix).await,
+                StorageBackend::Memory(s) => Storage::delete_collection(s.as_ref(), prefix).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::delete_collection(s, prefix).await,
+            }
+        })
+        .await
     }
 
     async fn list<T>(&self, prefix: &str) -> Result<Vec<T>>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::list(s, prefix).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::list(s, prefix).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::list(s, prefix).await,
-            StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::list(s, prefix).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::list(s, prefix).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::list(s, prefix).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::list(s, prefix).await,
+                StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::list(s, prefix).await,
+            }
+        })
+        .await
     }
 
     // Dispatch explicitly rather than inheriting the trait default: the default
@@ -1793,18 +1878,21 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => Storage::list_at_revision(s, prefix, revision).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::list_at_revision(s, prefix, revision).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::list_at_revision(s, prefix, revision).await,
-            StorageBackend::Memory(s) => {
-                Storage::list_at_revision(s.as_ref(), prefix, revision).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::list_at_revision(s, prefix, revision).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::list_at_revision(s, prefix, revision).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::list_at_revision(s, prefix, revision).await,
+                StorageBackend::Memory(s) => {
+                    Storage::list_at_revision(s.as_ref(), prefix, revision).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::list_at_revision(s, prefix, revision).await,
             }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::list_at_revision(s, prefix, revision).await,
-        }
+        })
+        .await
     }
 
     async fn list_paginated<T>(
@@ -1816,80 +1904,99 @@ impl Storage for StorageBackend {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        match self {
-            StorageBackend::Etcd(s) => {
-                Storage::list_paginated(s, prefix, limit, continue_token).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => {
+                    Storage::list_paginated(s, prefix, limit, continue_token).await
+                }
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => {
+                    Storage::list_paginated(s, prefix, limit, continue_token).await
+                }
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => {
+                    Storage::list_paginated(s, prefix, limit, continue_token).await
+                }
+                StorageBackend::Memory(s) => {
+                    Storage::list_paginated(s.as_ref(), prefix, limit, continue_token).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::list_paginated(s, prefix, limit, continue_token).await
+                }
             }
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => {
-                Storage::list_paginated(s, prefix, limit, continue_token).await
-            }
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => {
-                Storage::list_paginated(s, prefix, limit, continue_token).await
-            }
-            StorageBackend::Memory(s) => {
-                Storage::list_paginated(s.as_ref(), prefix, limit, continue_token).await
-            }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => {
-                Storage::list_paginated(s, prefix, limit, continue_token).await
-            }
-        }
+        })
+        .await
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::watch(s, prefix).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::watch(s, prefix).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
-            StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::watch(s, prefix).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::watch(s, prefix).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::watch(s, prefix).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
+                StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::watch(s, prefix).await,
+            }
+        })
+        .await
     }
 
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::watch_from_revision(s, prefix, revision).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::watch_from_revision(s, prefix, revision).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::watch_from_revision(s, prefix, revision).await,
-            StorageBackend::Memory(s) => {
-                Storage::watch_from_revision(s.as_ref(), prefix, revision).await
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::watch_from_revision(s, prefix, revision).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => {
+                    Storage::watch_from_revision(s, prefix, revision).await
+                }
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::watch_from_revision(s, prefix, revision).await,
+                StorageBackend::Memory(s) => {
+                    Storage::watch_from_revision(s.as_ref(), prefix, revision).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::watch_from_revision(s, prefix, revision).await,
             }
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::watch_from_revision(s, prefix, revision).await,
-        }
+        })
+        .await
     }
 
     async fn current_revision(&self) -> Result<i64> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::current_revision(s).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::current_revision(s).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::current_revision(s).await,
-            StorageBackend::Memory(s) => Storage::current_revision(s.as_ref()).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::current_revision(s).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::current_revision(s).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::current_revision(s).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::current_revision(s).await,
+                StorageBackend::Memory(s) => Storage::current_revision(s.as_ref()).await,
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::current_revision(s).await,
+            }
+        })
+        .await
     }
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
-        match self {
-            StorageBackend::Etcd(s) => Storage::is_revision_compacted(s, revision).await,
-            #[cfg(feature = "sqlite")]
-            StorageBackend::Sqlite(s) => Storage::is_revision_compacted(s, revision).await,
-            #[cfg(feature = "redis")]
-            StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
-            StorageBackend::Memory(s) => Storage::is_revision_compacted(s.as_ref(), revision).await,
-            #[cfg(feature = "api-client")]
-            StorageBackend::Api(s) => Storage::is_revision_compacted(s, revision).await,
-        }
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => Storage::is_revision_compacted(s, revision).await,
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => Storage::is_revision_compacted(s, revision).await,
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
+                StorageBackend::Memory(s) => {
+                    Storage::is_revision_compacted(s.as_ref(), revision).await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => Storage::is_revision_compacted(s, revision).await,
+            }
+        })
+        .await
     }
 }
 
