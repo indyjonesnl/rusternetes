@@ -50,6 +50,8 @@ mod registry;
 // The task-local is read by the lib's webhook authorizer, so the bin must
 // install it through the lib's module, not a second copy (#3159).
 use rusternetes_api_server::request_scope;
+// `s.Flagz` is read by the lib router, so set it through the lib module.
+use rusternetes_api_server::zpages;
 // The bin's own `bootstrap` copy names the lib's trust type (#3414).
 use rusternetes_api_server::request_header_authentication;
 #[allow(dead_code)]
@@ -324,7 +326,11 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     // `fs.Changed` for the legacy authorization flags needs the raw matches.
-    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    // `s.Flagz = flagz.NamedFlagSetsReader{FlagSets: namedFlagSets}`
+    // (cmd/kube-apiserver/app/server.go:131-134).
+    zpages::set_flagz_reader(rusternetes_common::flagz::flags_from_clap(&cmd, &matches));
     let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
         .map_err(|e| e.exit())
         .unwrap();
