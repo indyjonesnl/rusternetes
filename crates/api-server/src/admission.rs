@@ -6,6 +6,7 @@ pub mod config;
 pub mod event_rate_limit;
 pub mod image_policy;
 pub mod namespace_plugins;
+pub mod owner_references_permission_enforcement;
 pub mod plugin_metrics;
 pub mod plugins;
 pub mod pod_plugins;
