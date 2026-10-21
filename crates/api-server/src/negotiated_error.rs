@@ -348,3 +348,39 @@ pub fn respond_with_error(
     );
     r
 }
+
+/// The response-layer counterpart of upstream calling `ErrorNegotiated` at
+/// every error site (`scope.err` -> `responsewriters.ErrorNegotiated`,
+/// `endpoints/handlers/rest.go`; `responsewriters.ErrorNegotiated` itself
+/// :381-397). `Error::into_response` has no request, so it tags its JSON body
+/// with [`ErrorStatus`]; this middleware re-encodes such a body per the
+/// request's `Accept` (json / pretty / yaml / protobuf). Other headers and
+/// extensions (audit object, `Allow`, ...) are kept; `Retry-After` is
+/// re-derived from `details.retryAfterSeconds` as upstream does.
+pub async fn negotiate_error_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = req.headers().clone();
+    let query = req.uri().query().map(str::to_owned);
+    let mut resp = next.run(req).await;
+    let Some(rusternetes_common::error::ErrorStatus(status)) =
+        resp.extensions_mut()
+            .remove::<rusternetes_common::error::ErrorStatus>()
+    else {
+        return resp;
+    };
+    let (old, _) = resp.into_parts();
+    let mut new = error_negotiated(&status, &headers, query.as_deref());
+    for (name, value) in old.headers.iter() {
+        if name == header::CONTENT_TYPE
+            || name == header::CONTENT_LENGTH
+            || name == header::RETRY_AFTER
+        {
+            continue;
+        }
+        new.headers_mut().insert(name.clone(), value.clone());
+    }
+    new.extensions_mut().extend(old.extensions);
+    new
+}
