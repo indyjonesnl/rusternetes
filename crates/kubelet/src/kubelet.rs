@@ -405,6 +405,9 @@ pub struct Kubelet {
     /// Defaults to `/var/lib/kubelet` when not provided.
     eviction_root_dir: PathBuf,
     eviction_manager: Mutex<EvictionManager>,
+    /// The shared `realImageGCManager` (`kubelet.imageManager`), set once the
+    /// kubelet starts; the eviction manager's `imageGC`.
+    image_gc_manager: std::sync::OnceLock<Arc<crate::image_gc::ImageGcManager>>,
     /// Per-pod worker state. K8s uses a goroutine per pod; we track state
     /// per-UID and dispatch in the sync loop.
     /// K8s ref: pkg/kubelet/pod_workers.go
@@ -838,6 +841,7 @@ impl Kubelet {
             sync_interval: Duration::from_secs(sync_interval_secs),
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
+            image_gc_manager: std::sync::OnceLock::new(),
             pod_states: Mutex::new(HashMap::new()),
             terminal_finalize_failures: Mutex::new(HashMap::new()),
             pod_sync_locks: crate::sync_locks::SyncLocks::new(),
@@ -1178,6 +1182,7 @@ impl Kubelet {
             ) {
                 Ok(manager) => {
                     let manager = Arc::new(manager);
+                    let _ = self.image_gc_manager.set(manager.clone());
                     tokio::spawn(manager.clone().run_detect_loop());
                     tokio::spawn(manager.run_gc_loop());
                 }
@@ -1822,7 +1827,7 @@ impl Kubelet {
         let original_node = node.clone();
 
         // Get current node resource statistics via upstream-parity statvfs.
-        let node_stats = get_node_stats(&self.eviction_root_dir);
+        let node_stats = self.observe_node_stats().await;
 
         // Check if eviction is needed — scoped block ensures the MutexGuard
         // is dropped before any subsequent .await points. When the eviction
@@ -6193,9 +6198,69 @@ impl Kubelet {
             .await
     }
 
+    /// `makeSignalObservations` for the node: nodefs/memory/pids from the
+    /// local filesystem plus the `imagefs.*` observation from the image GC
+    /// manager's stats provider (CRI `ImageFsInfo`). The imagefs is only
+    /// reported separately when it is on another device than the root dir
+    /// (`HasDedicatedImageFs`); otherwise `imagefs.*` reads the nodefs numbers.
+    async fn observe_node_stats(&self) -> crate::eviction::NodeStats {
+        let mut stats = get_node_stats(&self.eviction_root_dir);
+        let Some(mgr) = self.image_gc_manager.get() else {
+            return stats;
+        };
+        match mgr.image_fs_stats().await {
+            Ok(fs) => {
+                use std::os::unix::fs::MetadataExt;
+                let root_dev = std::fs::metadata(&self.eviction_root_dir)
+                    .ok()
+                    .map(|m| m.dev());
+                let dedicated = matches!((fs.device, root_dev), (Some(a), Some(b)) if a != b);
+                if let (true, Some(avail), Some(total)) =
+                    (dedicated, fs.available_bytes, fs.capacity_bytes)
+                {
+                    stats.imagefs = Some(crate::eviction::FsUsage {
+                        available_bytes: avail,
+                        total_bytes: total,
+                        inodes_free: fs.inodes_free.unwrap_or(0),
+                        inodes_total: fs.inodes.unwrap_or(0),
+                    });
+                }
+            }
+            Err(err) => debug!(%err, "Eviction manager: failed to get image filesystem stats"),
+        }
+        stats
+    }
+
     /// Handle pod eviction when node resources are exhausted
     async fn handle_eviction(&self, signals: &[EvictionSignal]) -> Result<()> {
         info!("Handling eviction for signals: {:?}", signals);
+
+        // `byEvictionPriority` + `getReclaimableThreshold`: memory first, then
+        // the first remaining signal; try node-level reclaim for it before
+        // evicting end-user pods (`eviction_manager.go:376-392`).
+        if let Some(signal) = signals
+            .iter()
+            .find(|s| **s == EvictionSignal::MemoryAvailable)
+            .or_else(|| signals.first())
+        {
+            let stats = self.observe_node_stats().await;
+            let funcs =
+                crate::eviction::build_signal_to_node_reclaim_funcs(stats.imagefs.is_some(), false)
+                    .remove(signal)
+                    .unwrap_or_default();
+            let reclaimer = KubeletNodeReclaimer { kubelet: self };
+            if crate::eviction::reclaim_node_level_resources(&funcs, &reclaimer, |s| {
+                self.eviction_manager.lock().unwrap().no_thresholds_met(s)
+            })
+            .await
+            {
+                info!(
+                    ?signal,
+                    "Eviction manager: able to reduce resource pressure without evicting pods."
+                );
+                return Ok(());
+            }
+        }
 
         // Get all pods assigned to this node
         let all_pods_prefix = build_prefix("pods", None);
@@ -6479,6 +6544,34 @@ mod default_labels_tests {
         )]));
         assert!(update_default_labels(&initial, &mut existing));
         assert!(!existing.unwrap().contains_key("kubernetes.io/os"));
+    }
+}
+
+/// The eviction manager's `imageGC` / `containerGC` (`eviction_manager.go`
+/// `managerImpl.imageGC`, `.containerGC`) bound to this kubelet.
+struct KubeletNodeReclaimer<'a> {
+    kubelet: &'a Kubelet,
+}
+
+#[async_trait::async_trait]
+impl crate::eviction::NodeReclaimer for KubeletNodeReclaimer<'_> {
+    async fn delete_all_unused_containers(&self) -> Result<()> {
+        // Deviation: upstream `DeleteAllUnusedContainers` GCs with
+        // MinAge=0, MaxPerPodContainer=-1, evictNonDeletedPods=true; this runs
+        // the regular container GC (tracked as a follow-up).
+        self.kubelet.container_gc().await;
+        Ok(())
+    }
+
+    async fn delete_unused_images(&self) -> Result<()> {
+        match self.kubelet.image_gc_manager.get() {
+            Some(mgr) => mgr.delete_unused_images().await,
+            None => Ok(()),
+        }
+    }
+
+    async fn observe(&self) -> crate::eviction::NodeStats {
+        self.kubelet.observe_node_stats().await
     }
 }
 

@@ -186,6 +186,7 @@ fn test_memory_pressure_detection_hard_threshold() {
         nodefs_inodes_total: 10_000_000,
         pid_available: 30000,
         pid_total: 32768,
+        imagefs: None,
     };
 
     let signals = check_after_observation_window(&mut manager, &low_memory_stats);
@@ -209,6 +210,7 @@ fn test_disk_pressure_detection_hard_threshold() {
         nodefs_inodes_total: 10_000_000,
         pid_available: 30000,
         pid_total: 32768,
+        imagefs: None,
     };
 
     let signals = check_after_observation_window(&mut manager, &low_disk_stats);
@@ -232,6 +234,7 @@ fn test_inode_pressure_detection() {
         nodefs_inodes_total: 10_000_000, // 10M total (3%)
         pid_available: 30000,
         pid_total: 32768,
+        imagefs: None,
     };
 
     let signals = check_after_observation_window(&mut manager, &low_inode_stats);
@@ -255,6 +258,7 @@ fn test_no_pressure_with_sufficient_resources() {
         nodefs_inodes_total: 10_000_000,                // 10M total (80%)
         pid_available: 30000,
         pid_total: 32768,
+        imagefs: None,
     };
 
     let signals = manager.check_eviction_needed(&healthy_stats);
@@ -547,6 +551,7 @@ fn test_eviction_threshold_percentage() {
         nodefs_inodes_total: 10_000_000,
         pid_available: 30000,
         pid_total: 32768,
+        imagefs: None,
     };
 
     let signals = check_after_observation_window(&mut manager, &stats);
