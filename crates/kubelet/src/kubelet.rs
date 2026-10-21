@@ -5632,26 +5632,26 @@ impl Kubelet {
                 })
                 .collect()
         });
+        // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
         let prior = new_pod.status.as_ref();
-        new_pod.status = Some(PodStatus {
-            phase: Some(phase),
+        let (host_ip, host_ips) = self.host_ip_fields();
+        let input = crate::pod_status::ApiPodStatusInput {
+            phase,
             message: Some(err_msg.to_string()),
             reason: Some("FailedToStart".to_string()),
-            host_ip: prior
-                .and_then(|s| s.host_ip.clone())
-                .or_else(|| self.host_ip_fields().0),
+            host_ip: prior.and_then(|s| s.host_ip.clone()).or(host_ip),
+            host_ips: prior.and_then(|s| s.host_i_ps.clone()).or(host_ips),
             pod_ip: prior.and_then(|s| s.pod_ip.clone()),
-            conditions: Some(conditions),
+            pod_ips: prior.and_then(|s| s.pod_i_ps.clone()),
+            conditions,
             container_statuses,
             init_container_statuses,
-            observed_generation: new_pod.metadata.generation,
+            ephemeral_container_statuses: prior
+                .and_then(|s| s.ephemeral_container_statuses.clone()),
             qos_class: Some(qos),
-            start_time: prior.and_then(|s| s.start_time),
-            host_i_ps: prior
-                .and_then(|s| s.host_i_ps.clone())
-                .or_else(|| self.host_ip_fields().1),
-            ..Default::default()
-        });
+            start_time: preserved_start_time(prior.and_then(|s| s.start_time), chrono::Utc::now()),
+        };
+        new_pod.status = Some(crate::pod_status::generate_api_pod_status(new_pod, input));
         self.apply_host_ips_to_pod(new_pod).await;
     }
 
@@ -5663,26 +5663,26 @@ impl Kubelet {
             status.message = Some("Liveness probe failed".to_string());
             status.reason = Some("Restarting".to_string());
         } else {
-            new_pod.status = Some(PodStatus {
-                phase: Some(Phase::Running),
-                message: Some("Liveness probe failed".to_string()),
-                reason: Some("Restarting".to_string()),
-                host_ip: self.host_ip_fields().0,
-                pod_ip: None,
-                conditions: None,
-                container_statuses: None,
-                init_container_statuses: None,
-                ephemeral_container_statuses: None,
-                resize: None,
-                resource_claim_statuses: None,
-                observed_generation: new_pod.metadata.generation,
-                host_i_ps: self.host_ip_fields().1,
-                pod_i_ps: None,
-                nominated_node_name: None,
-                qos_class: None,
-                start_time: None,
-                ..Default::default()
-            });
+            // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
+            let (host_ip, host_ips) = self.host_ip_fields();
+            new_pod.status = Some(crate::pod_status::generate_api_pod_status(
+                new_pod,
+                crate::pod_status::ApiPodStatusInput {
+                    phase: Phase::Running,
+                    message: Some("Liveness probe failed".to_string()),
+                    reason: Some("Restarting".to_string()),
+                    host_ip,
+                    host_ips,
+                    pod_ip: None,
+                    pod_ips: None,
+                    conditions: Vec::new(),
+                    container_statuses: None,
+                    init_container_statuses: None,
+                    ephemeral_container_statuses: None,
+                    qos_class: None,
+                    start_time: chrono::Utc::now(),
+                },
+            ));
         }
         self.apply_host_ips_to_pod(new_pod).await;
     }
@@ -5732,32 +5732,33 @@ impl Kubelet {
         };
         let prior_status = pod.status.as_ref();
 
-        PodStatus {
-            phase: Some(phase),
-            message: Some(message),
-            reason: Some(reason.to_string()),
-            host_ip: prior_status
-                .and_then(|status| status.host_ip.clone())
-                .or(host_ip),
-            pod_ip: prior_status.and_then(|status| status.pod_ip.clone()),
-            conditions: Some(Self::init_failed_pod_conditions(&incomplete_inits)),
-            container_statuses: Self::pod_initializing_container_statuses(pod),
-            init_container_statuses: init_statuses,
-            ephemeral_container_statuses: prior_status
-                .and_then(|status| status.ephemeral_container_statuses.clone()),
-            resize: prior_status.and_then(|status| status.resize.clone()),
-            resource_claim_statuses: prior_status
-                .and_then(|status| status.resource_claim_statuses.clone()),
-            observed_generation: pod.metadata.generation,
-            host_i_ps: prior_status
-                .and_then(|status| status.host_i_ps.clone())
-                .or(host_i_ps),
-            pod_i_ps: prior_status.and_then(|status| status.pod_i_ps.clone()),
-            nominated_node_name: prior_status.and_then(|status| status.nominated_node_name.clone()),
-            qos_class: qos.or_else(|| prior_status.and_then(|status| status.qos_class.clone())),
-            start_time: prior_status.and_then(|status| status.start_time),
-            ..Default::default()
-        }
+        // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
+        crate::pod_status::generate_api_pod_status(
+            pod,
+            crate::pod_status::ApiPodStatusInput {
+                phase,
+                message: Some(message),
+                reason: Some(reason.to_string()),
+                host_ip: prior_status
+                    .and_then(|status| status.host_ip.clone())
+                    .or(host_ip),
+                host_ips: prior_status
+                    .and_then(|status| status.host_i_ps.clone())
+                    .or(host_i_ps),
+                pod_ip: prior_status.and_then(|status| status.pod_ip.clone()),
+                pod_ips: prior_status.and_then(|status| status.pod_i_ps.clone()),
+                conditions: Self::init_failed_pod_conditions(&incomplete_inits),
+                container_statuses: Self::pod_initializing_container_statuses(pod),
+                init_container_statuses: init_statuses,
+                ephemeral_container_statuses: prior_status
+                    .and_then(|status| status.ephemeral_container_statuses.clone()),
+                qos_class: qos.or_else(|| prior_status.and_then(|status| status.qos_class.clone())),
+                start_time: preserved_start_time(
+                    prior_status.and_then(|status| status.start_time),
+                    chrono::Utc::now(),
+                ),
+            },
+        )
     }
 
     /// Build the standard pod conditions with ContainersReady and Ready set
