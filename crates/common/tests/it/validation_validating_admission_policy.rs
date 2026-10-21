@@ -9,7 +9,8 @@ use rusternetes_common::resources::validating_admission_policy::{
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
 use rusternetes_common::validation::validating_admission_policy::{
-    validate_validating_admission_policy, validate_validating_admission_policy_binding,
+    set_defaults_validating_admission_policy, validate_validating_admission_policy,
+    validate_validating_admission_policy_binding,
 };
 use serde_json::{json, Value};
 
@@ -147,4 +148,39 @@ fn unknown_values_round_trip() {
     let back = serde_json::to_value(&p).unwrap();
     assert_eq!(back["spec"]["failurePolicy"], "other");
     assert_eq!(back["spec"]["validations"][0]["reason"], "weird");
+}
+
+/// `failurePolicy` and `matchConstraints.matchPolicy` are `*FailurePolicyType`
+/// / `*MatchPolicyType` upstream (admissionregistration/v1/types.go:248,683).
+/// Defaulting only fills nil (v1/defaults.go
+/// `SetDefaults_ValidatingAdmissionPolicySpec`, `SetDefaults_MatchResources`),
+/// so a non-nil `""` reaches validation, which answers NotSupported
+/// (validation.go:784-785, :893-894) (#2562).
+#[test]
+fn empty_pointer_enum_values_are_not_supported() {
+    let cases = [
+        (
+            "failurePolicy",
+            r#"spec.failurePolicy: Unsupported value: "": supported values: "Fail", "Ignore""#,
+        ),
+        (
+            "matchPolicy",
+            r#"spec.matchConstraints.matchPolicy: Unsupported value: "": supported values: "Equivalent", "Exact""#,
+        ),
+    ];
+    for (field, want) in cases {
+        let mut v = policy();
+        if field == "failurePolicy" {
+            v["spec"]["failurePolicy"] = json!("");
+        } else {
+            v["spec"]["matchConstraints"]["matchPolicy"] = json!("");
+        }
+        let mut p: ValidatingAdmissionPolicy = serde_json::from_value(v).unwrap();
+        set_defaults_validating_admission_policy(&mut p);
+        let errs: Vec<String> = validate_validating_admission_policy(&p)
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errs.iter().any(|e| e.contains(want)), "{field}: {errs:?}");
+    }
 }

@@ -53,11 +53,12 @@ pub struct ValidatingAdmissionPolicySpec {
     pub validations: Option<Vec<Validation>>,
 
     /// FailurePolicy defines how to handle failures for the admission policy
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    ///
+    /// No `empty_string_as_none`: upstream's field is a `*FailurePolicyType`
+    /// (admissionregistration/v1/types.go:248), defaulting only fills nil
+    /// (`SetDefaults_ValidatingAdmissionPolicySpec`), so a non-nil `""` reaches
+    /// validation and is NotSupported (validation.go:784-785) (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<FailurePolicy>,
 
     /// AuditAnnotations contains CEL expressions which are used to produce audit annotations
@@ -110,11 +111,11 @@ pub struct MatchResources {
     pub exclude_resource_rules: Option<Vec<NamedRuleWithOperations>>,
 
     /// MatchPolicy defines how the "rules" list is used to match incoming requests
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    ///
+    /// No `empty_string_as_none`: upstream's field is a `*MatchPolicyType`
+    /// (v1/types.go:683); `SetDefaults_MatchResources` only fills nil, and
+    /// validation answers NotSupported for `""` (validation.go:893-894) (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_policy: Option<MatchPolicyType>,
 }
 
@@ -440,6 +441,10 @@ pub struct ParamRef {
     pub selector: Option<LabelSelector>,
 
     /// ParameterNotFoundAction controls the behavior when the param resource is not found
+    ///
+    /// Keeps `empty_string_as_none` on purpose: upstream has no defaulting and
+    /// validation answers `Required` for both nil and `""`
+    /// (validation.go:1227-1228), which is what `None` yields here.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
