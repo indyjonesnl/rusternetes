@@ -14,7 +14,7 @@ use rusternetes_common::auth::{TokenManager, UserInfo};
 use rusternetes_common::authz::AlwaysAllowAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::resources::ConfigMap;
-use rusternetes_storage::{MemoryStorage, StorageBackend};
+use rusternetes_storage::{MemoryStorage, Storage, StorageBackend};
 use serde_json::json;
 
 fn state() -> ApiServerState {
@@ -349,4 +349,79 @@ async fn rejecting_plugin_is_observed_as_rejected() {
     assert!(plugin_series("Priority", "admit", "CREATE", "true") > bad0);
     // LimitRanger precedes Priority in the chain, so it ran and succeeded.
     assert!(plugin_series("LimitRanger", "admit", "CREATE", "false") > ok0);
+}
+
+/// The chain runs ~30 plugin bodies in one async fn. Decorated plugins must
+/// not be held inline in its state machine: an unoptimised build then
+/// overflowed the stack of every test that creates a resource (#3644). Drive
+/// a Pod create through admit and validate on a thread whose stack is far
+/// smaller than the default 2 MiB test thread, so a regression aborts here.
+#[test]
+fn pod_chain_fits_a_small_stack() {
+    std::thread::Builder::new()
+        .name("small-stack-admission".into())
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let state = state();
+                    let ns: rusternetes_common::resources::Namespace =
+                        serde_json::from_value(json!({
+                            "apiVersion": "v1", "kind": "Namespace",
+                            "metadata": {"name": "default"},
+                        }))
+                        .unwrap();
+                    state
+                        .storage
+                        .create(
+                            &rusternetes_storage::build_key("namespaces", None, "default"),
+                            &ns,
+                        )
+                        .await
+                        .unwrap();
+                    let kind = GroupVersionKind {
+                        group: String::new(),
+                        version: "v1".into(),
+                        kind: "Pod".into(),
+                    };
+                    let resource = GroupVersionResource {
+                        group: String::new(),
+                        version: "v1".into(),
+                        resource: "pods".into(),
+                    };
+                    let user = UserInfo {
+                        username: "u".into(),
+                        uid: String::new(),
+                        groups: vec![],
+                        extra: HashMap::new(),
+                    };
+                    let admission = Admission {
+                        state: &state,
+                        kind: &kind,
+                        resource: &resource,
+                        subresource: None,
+                        namespace: Some("default"),
+                        user: &user,
+                        dry_run: false,
+                        forbid_create: false,
+                    };
+                    let pod: rusternetes_common::resources::Pod = serde_json::from_value(json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": {"name": "p", "namespace": "default"},
+                        "spec": {"containers": [{"name": "c", "image": "busybox"}]},
+                    }))
+                    .unwrap();
+                    let pod = admission.admit(Operation::Create, pod, None).await.unwrap();
+                    let ctx = RequestContext::new(Some("default")).with_user(&user);
+                    admission
+                        .validate(&ctx, Operation::Create, Some(&pod), None)
+                        .await
+                        .unwrap();
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }

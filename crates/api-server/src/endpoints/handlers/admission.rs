@@ -161,8 +161,16 @@ impl Admission<'_> {
         {
             return Ok(());
         }
+        // Boxed: this chain runs 30 plugin bodies in one async fn, and held
+        // inline their futures sum into one state machine (each plugin's
+        // storage/recast frames), overflowing the stack of an unoptimised
+        // build. Upstream's decorator is a plain call frame per plugin
+        // (metrics.go:89-113), never part of the chain's own frame.
         rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
-            name, op, step_type, work,
+            name,
+            op,
+            step_type,
+            Box::pin(work),
         )
         .await
     }
