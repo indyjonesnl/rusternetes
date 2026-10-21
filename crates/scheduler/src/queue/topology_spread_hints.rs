@@ -50,7 +50,7 @@ struct SpreadConstraint {
 /// `mergeLabelSetWithSelector` (`common.go:132-146`): the selector built from
 /// the `matchLabelKeys` label set, plus every requirement of `s`. A `Nothing`
 /// selector (nil `LabelSelector`) has no requirements and is returned as-is.
-fn merge_label_set_with_selector(
+pub fn merge_label_set_with_selector(
     match_labels: HashMap<String, String>,
     original: Option<&LabelSelector>,
     s: Selector,

@@ -13,8 +13,9 @@
 //!   requested_to_capacity_ratio,balanced_allocation,fit}.go`;
 //! - `tainttoleration/taint_toleration.go` `Score` / `NormalizeScore`;
 //! - `imagelocality/image_locality.go`;
-//! - `interpodaffinity/scoring.go` and `podtopologyspread/scoring.go`
-//!   `NormalizeScore`.
+//! - `interpodaffinity/scoring.go` `NormalizeScore` (the rest of both
+//!   InterPodAffinity and PodTopologySpread scoring lives in
+//!   `inter_pod_affinity_score.rs` / `pod_topology_spread_score.rs`).
 
 use std::collections::HashMap;
 
@@ -70,24 +71,6 @@ pub fn normalize_inter_pod_affinity(scores: &mut [i64]) {
             0.0
         };
         *s = f as i64;
-    }
-}
-
-/// `podtopologyspread.NormalizeScore` (scoring.go:229-268), with no ignored
-/// nodes: higher raw (more skew) -> lower score.
-pub fn normalize_pod_topology_spread(scores: &mut [i64]) {
-    let mut min = i64::MAX;
-    let mut max = 0i64;
-    for &s in scores.iter() {
-        min = min.min(s);
-        max = max.max(s);
-    }
-    for s in scores.iter_mut() {
-        if max == 0 {
-            *s = MAX_NODE_SCORE;
-            continue;
-        }
-        *s = MAX_NODE_SCORE * (max + min - *s) / max;
     }
 }
 
@@ -816,20 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn inter_pod_affinity_and_spread_normalize() {
+    fn inter_pod_affinity_normalize() {
         let mut v = vec![-5, 0, 5];
         normalize_inter_pod_affinity(&mut v);
         assert_eq!(v, vec![0, 50, 100]);
         let mut v = vec![3, 3];
         normalize_inter_pod_affinity(&mut v);
         assert_eq!(v, vec![0, 0]);
-        // spread: raw skew {0, 4}: max 4 min 0 -> 100*(4-s)/4
-        let mut v = vec![0, 4];
-        normalize_pod_topology_spread(&mut v);
-        assert_eq!(v, vec![100, 0]);
-        let mut v = vec![0, 0];
-        normalize_pod_topology_spread(&mut v);
-        assert_eq!(v, vec![100, 100]);
     }
 
     // taint_toleration_test.go TestTaintTolerationScore.

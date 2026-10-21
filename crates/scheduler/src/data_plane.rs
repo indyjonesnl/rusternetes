@@ -223,6 +223,58 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
+    /// `lister.<Kind>s(ns).List(labels.Everything())` for a namespaced kind
+    /// (`plural` is the storage resource type, `api_prefix` the api-server
+    /// group-version path, e.g. `/api/v1`).
+    pub async fn list_namespaced<T>(
+        &self,
+        plural: &str,
+        api_prefix: &str,
+        ns: &str,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        match self {
+            DataPlane::Storage(s) => {
+                s.list(&rusternetes_storage::build_prefix(plural, Some(ns)))
+                    .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .get_list(&format!("{api_prefix}/namespaces/{ns}/{plural}"))
+                .await
+                .map_err(get_err_to_common),
+        }
+    }
+
+    /// `lister.<Kind>s(ns).Get(name)` for a namespaced kind; `Ok(None)` is the
+    /// lister's NotFound.
+    pub async fn get_namespaced<T>(
+        &self,
+        plural: &str,
+        api_prefix: &str,
+        ns: &str,
+        name: &str,
+    ) -> Result<Option<T>>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        let r = match self {
+            DataPlane::Storage(s) => s.get(&build_key(plural, Some(ns), name)).await,
+            DataPlane::Api(a) => a
+                .client
+                .get(&format!("{api_prefix}/namespaces/{ns}/{plural}/{name}"))
+                .await
+                .map_err(get_err_to_common),
+        };
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List every PriorityClass. Storage: `list(/registry/priorityclasses)`.
     /// API: GET the collection (priority classes change rarely, so no informer).
     pub async fn list_priority_classes(&self) -> Result<Vec<PriorityClass>> {

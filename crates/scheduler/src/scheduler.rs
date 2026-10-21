@@ -1753,7 +1753,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         return None;
                     }
                     // Topology spread constraints (hard requirements and penalty scoring)
-                    let (topology_ok, topology_penalty) =
+                    let (topology_ok, _) =
                         check_topology_spread_constraints(node, pod, all_pods, nodes);
                     if spread_filter_on && !topology_ok {
                         diag.add_plugin_status(names::POD_TOPOLOGY_SPREAD);
@@ -1773,7 +1773,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     Some(NodeEval {
                         node,
                         node_affinity_score,
-                        topology_penalty,
                     })
                 }
                 .await;
@@ -1933,9 +1932,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 .collect();
                             (names::IMAGE_LOCALITY, Some(v))
                         }
-                        // Deviation (tracked in #3815): PodTopologySpread's raw
-                        // per-node number below is still the compiled-in
-                        // `check_topology_spread_constraints` heuristic.
                         names::INTER_POD_AFFINITY => {
                             // interpodaffinity/scoring.go PreScore + Score +
                             // NormalizeScore. A PreScore `Skip` leaves the
@@ -1984,12 +1980,58 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             }
                         }
                         names::POD_TOPOLOGY_SPREAD => {
-                            let mut v: Vec<i64> = feasible
-                                .iter()
-                                .map(|e| i64::from(e.topology_penalty))
-                                .collect();
-                            crate::score::normalize_pod_topology_spread(&mut v);
-                            (names::POD_TOPOLOGY_SPREAD, Some(v))
+                            // podtopologyspread/scoring.go PreScore + Score +
+                            // NormalizeScore; `Skip` leaves the plugin out.
+                            use crate::pod_topology_spread_score as pts;
+                            let args = &profile.pod_topology_spread;
+                            let default_sel = if pts::needs_default_selector(pod, args) {
+                                match pts::read_default_selector_inputs(&self.data, pod).await {
+                                    Ok(inputs) => Some(pts::default_selector(pod, &inputs)),
+                                    Err(e) => {
+                                        warn!("PodTopologySpread: failed to read listers: {}", e);
+                                        return None;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let by_node = pts::pods_by_node(all_pods);
+                            let filtered: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
+                            match pts::pre_score(
+                                pod,
+                                &filtered,
+                                nodes,
+                                &by_node,
+                                args,
+                                default_sel.as_ref(),
+                            ) {
+                                Ok(Some(state)) => {
+                                    let no_pods: Vec<&Pod> = Vec::new();
+                                    let mut v: Vec<i64> = feasible
+                                        .iter()
+                                        .map(|e| {
+                                            let pods = by_node
+                                                .get(e.node.metadata.name.as_str())
+                                                .unwrap_or(&no_pods);
+                                            pts::score(&state, pod, e.node, pods)
+                                        })
+                                        .collect();
+                                    let names: Vec<&str> = feasible
+                                        .iter()
+                                        .map(|e| e.node.metadata.name.as_str())
+                                        .collect();
+                                    pts::normalize_score(&state, &names, &mut v);
+                                    (names::POD_TOPOLOGY_SPREAD, Some(v))
+                                }
+                                Ok(None) => (names::POD_TOPOLOGY_SPREAD, None),
+                                Err(e) => {
+                                    warn!(
+                                        "running PreScore plugin {:?} failed with: {}",
+                                        plugin, e
+                                    );
+                                    return None;
+                                }
+                            }
                         }
                         names::VOLUME_BINDING => (
                             names::VOLUME_BINDING,
@@ -2879,7 +2921,6 @@ fn random_offset(num_nodes: usize) -> usize {
 struct NodeEval<'a> {
     node: &'a Node,
     node_affinity_score: i32,
-    topology_penalty: i32,
 }
 
 fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {

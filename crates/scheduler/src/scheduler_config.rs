@@ -918,6 +918,11 @@ fn resolve_profiles(
                             .ignore_preferred_terms_of_existing_pods,
                     };
                 }
+                "PodTopologySpread" => {
+                    let mut a: PodTopologySpreadArgs = decode_args(pc, &args_path)?;
+                    a.set_defaults();
+                    p.pod_topology_spread = crate::pod_topology_spread_score::Args::from_config(&a);
+                }
                 "DefaultPreemption" => {
                     let mut a: DefaultPreemptionArgs = decode_args(pc, &args_path)?;
                     a.set_defaults();
