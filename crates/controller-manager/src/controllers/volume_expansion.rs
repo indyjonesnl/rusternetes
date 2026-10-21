@@ -297,6 +297,12 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
             "resourceVersion": pvc.metadata.resource_version,
         }});
         let mut full = pvc.clone();
+        // The REST scope's kind picks the patch schema (strategicPatchObject);
+        // a PVC read back from storage may carry no TypeMeta.
+        full.type_meta = rusternetes_common::types::TypeMeta {
+            kind: "PersistentVolumeClaim".to_string(),
+            api_version: "v1".to_string(),
+        };
         full.metadata
             .annotations
             .get_or_insert_with(Default::default)

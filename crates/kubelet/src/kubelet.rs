@@ -2000,6 +2000,13 @@ impl Kubelet {
             // current object (see Storage::patch_status_strategic_merge).
             let patch = crate::node_status::prepare_patch_for_node_status(&original_node, &node)
                 .map_err(|e| anyhow::anyhow!("failed to patch status for node: {e}"))?;
+            // strategicPatchObject builds the patch schema from the REST
+            // scope's kind; a typed object read back from storage may carry
+            // no TypeMeta, so name it here (no schema-less merge-key guess).
+            node.type_meta = rusternetes_common::types::TypeMeta {
+                kind: "Node".to_string(),
+                api_version: "v1".to_string(),
+            };
             let _: Node = self
                 .storage
                 .patch_status_strategic_merge(&key, &patch, &node)

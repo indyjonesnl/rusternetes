@@ -510,6 +510,12 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             "volumesAttached": if want.is_empty() { serde_json::Value::Null } else { list }
         }});
         let mut full = node;
+        // The REST scope's kind picks the patch schema (strategicPatchObject);
+        // a Node read back from storage may carry no TypeMeta.
+        full.type_meta = TypeMeta {
+            kind: "Node".to_string(),
+            api_version: "v1".to_string(),
+        };
         full.status
             .get_or_insert_with(Default::default)
             .volumes_attached = if want.is_empty() { None } else { Some(want) };
