@@ -45,8 +45,6 @@ impl Authorizer for AllowWithError {
 
 #[tokio::test]
 async fn allow_with_error_survives_union_and_instrumentation_and_tracks_latency() {
-    // Share the lock with assertions over the process-global filter counters.
-    let _guard = super::authorization_filter_test::LOCK.lock().await;
     use rusternetes_common::authz::UnionAuthorizer;
     let instrumented = rusternetes_api_server::authorization_metrics::instrumented_authorizer(
         "RBAC",

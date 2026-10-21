@@ -15,8 +15,10 @@ use rusternetes_common::Result;
 use rusternetes_storage::{MemoryStorage, StorageBackend};
 use std::sync::Arc;
 
-/// The metrics are process-global: serialize the tests that read them.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// The metrics are process-global: the ONE lock every test in this binary that
+/// records or reads `authorization_*` takes (also used by `filter_test`). Two
+/// locks would not exclude one another (#3649).
+pub(crate) static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fake(Result<Opinion>);
 
@@ -106,6 +108,9 @@ fn duration_count(r: &str) -> u64 {
 // outcome, `allowed` winning over an error.
 #[test]
 fn record_authorization_metrics_labels_every_result() {
+    // Sync test: it writes the global counters, so it must exclude the
+    // before/after-delta readers too.
+    let _g = LOCK.blocking_lock();
     use rusternetes_common::authz_filter_metrics::record_authorization_metrics;
     use std::time::Duration;
     let cases: Vec<(&str, Result<Opinion>)> = vec![
