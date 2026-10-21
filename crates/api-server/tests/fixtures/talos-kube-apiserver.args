@@ -1,0 +1,41 @@
+# argv of Talos's kube-apiserver static pod. Source: Talos
+# internal/app/machined/pkg/controllers/k8s/control_plane_static_pod.go
+# manageAPIServer (:282-330) with a 10.96.0.0/12 service CIDR and local port
+# 6443. Excluded here: --audit-log-max{age,backup,size} (audit log rotation,
+# PR #4000) and the unimplemented --encryption-provider-config, which is
+# asserted separately as a startup error.
+/usr/local/bin/kube-apiserver
+--admission-control-config-file=/etc/kubernetes/config/admission-control-config.yaml
+--allow-privileged=true
+--api-audiences=https://cp.example.com:6443
+--bind-address=0.0.0.0
+--client-ca-file=/system/secrets/kubernetes/kube-apiserver/ca.crt
+--enable-admission-plugins=NodeRestriction
+--requestheader-client-ca-file=/system/secrets/kubernetes/kube-apiserver/aggregator-ca.crt
+--requestheader-allowed-names=front-proxy-client
+--requestheader-extra-headers-prefix=X-Remote-Extra-
+--requestheader-group-headers=X-Remote-Group
+--requestheader-username-headers=X-Remote-User
+--proxy-client-cert-file=/system/secrets/kubernetes/kube-apiserver/front-proxy-client.crt
+--proxy-client-key-file=/system/secrets/kubernetes/kube-apiserver/front-proxy-client.key
+--enable-bootstrap-token-auth=true
+--tls-min-version=VersionTLS13
+--audit-policy-file=/etc/kubernetes/config/auditpolicy.yaml
+--audit-log-path=/var/log/audit/kube/kube-apiserver.log
+--profiling=false
+--etcd-cafile=/system/secrets/kubernetes/kube-apiserver/etcd-client-ca.crt
+--etcd-certfile=/system/secrets/kubernetes/kube-apiserver/etcd-client.crt
+--etcd-keyfile=/system/secrets/kubernetes/kube-apiserver/etcd-client.key
+--etcd-servers=https://127.0.0.1:2379
+--kubelet-client-certificate=/system/secrets/kubernetes/kube-apiserver/apiserver-kubelet-client.crt
+--kubelet-client-key=/system/secrets/kubernetes/kube-apiserver/apiserver-kubelet-client.key
+--secure-port=6443
+--service-account-issuer=https://cp.example.com:6443
+--service-account-key-file=/system/secrets/kubernetes/kube-apiserver/service-account.pub
+--service-account-signing-key-file=/system/secrets/kubernetes/kube-apiserver/service-account.key
+--service-cluster-ip-range=10.96.0.0/12
+--tls-cert-file=/system/secrets/kubernetes/kube-apiserver/apiserver.crt
+--tls-private-key-file=/system/secrets/kubernetes/kube-apiserver/apiserver.key
+--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+--authorization-mode=Node,RBAC
+--anonymous-auth=false
