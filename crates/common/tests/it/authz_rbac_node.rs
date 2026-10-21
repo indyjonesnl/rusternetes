@@ -12,9 +12,10 @@
 
 use async_trait::async_trait;
 use rusternetes_common::auth::UserInfo;
+use rusternetes_common::authz::node_graph::{GraphPopulator, NodeGraph};
 use rusternetes_common::authz::{
     AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage, Decision,
-    RBACAuthorizer, RequestAttributes,
+    NodeAuthorizer, Opinion, RBACAuthorizer, RequestAttributes,
 };
 use rusternetes_common::error::Result;
 use rusternetes_common::resources::rbac::{
@@ -177,10 +178,6 @@ fn user_with_groups(username: &str, groups: &[&str]) -> UserInfo {
 
 fn service_account_user(namespace: &str, name: &str) -> UserInfo {
     user(&format!("system:serviceaccount:{}:{}", namespace, name))
-}
-
-fn node_user(node_name: &str) -> UserInfo {
-    user(&format!("system:node:{}", node_name))
 }
 
 fn policy_rule(
@@ -953,278 +950,145 @@ async fn rbac_no_bindings_denies_everything() {
 }
 
 // ---------------------------------------------------------------------------
-// NodeAuthorizer — own node access
+// NodeAuthorizer — public-API checks. The table ported from upstream's
+// node_authorizer_test.go (every resource family, selector and feature
+// variants) lives next to the implementation in
+// `crates/common/src/authz/node_authorizer_tests.rs`; these exercise the
+// graph through `NodeGraph` / `GraphPopulator` the way the api-server does.
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn node_authorizer_allows_own_node_get() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
+fn node_identity(node_name: &str) -> UserInfo {
+    user_with_groups(&format!("system:node:{node_name}"), &["system:nodes"])
+}
 
-    let attrs = RequestAttributes::new(node_user("worker-1"), "get", "nodes")
-        .with_api_group("")
-        .with_name("worker-1");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
+fn graph_with_pod(node: &str) -> Arc<NodeGraph> {
+    let graph = Arc::new(NodeGraph::new());
+    let pod: rusternetes_common::resources::Pod = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
+        "spec": {
+            "nodeName": node,
+            "containers": [],
+            "volumes": [{"name": "v", "secret": {"secretName": "bound"}}],
+        },
+    }))
+    .unwrap();
+    GraphPopulator::new(graph.clone()).add_pod(&pod);
+    graph
 }
 
 #[tokio::test]
-async fn node_authorizer_allows_reading_other_node() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // Rusternetes NodeAuthorizer is more permissive than the upstream Go implementation:
-    // `is_node_allowed_resource` lists `("", "nodes")` as an unconditionally readable
-    // resource, so any node user can read other nodes.  The upstream Go NodeAuthorizer
-    // uses a graph-based scheme and restricts each kubelet to its OWN node object —
-    // this is a known Rusternetes deviation (tracked for future tightening).
-    let attrs = RequestAttributes::new(node_user("worker-1"), "get", "nodes")
-        .with_api_group("")
-        .with_name("worker-2");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_own_node_create() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-2"), "create", "nodes")
-        .with_api_group("")
-        .with_name("worker-2");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_own_node_status_update() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let mut attrs = RequestAttributes::new(node_user("worker-1"), "update", "nodes")
-        .with_api_group("")
-        .with_name("worker-1")
-        .with_subresource("status");
-    attrs.namespace = None;
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-// Note: the status-update check in authz.rs does not filter by verb, so any verb
-// (including "delete") is allowed when resource="nodes", subresource="status", and
-// the name matches the node.  This test documents the current permissive behaviour.
-#[tokio::test]
-async fn node_authorizer_status_path_has_no_verb_restriction() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // "delete nodes/status" is currently allowed — documents a known deviation from
-    // upstream K8s which only allows update/patch on a node's own status subresource.
-    let mut attrs = RequestAttributes::new(node_user("worker-1"), "delete", "nodes")
-        .with_api_group("")
-        .with_name("worker-1")
-        .with_subresource("status");
-    attrs.namespace = None;
+async fn node_authorizer_secret_follows_the_pod_graph() {
+    let az = NodeAuthorizer::new(graph_with_pod("worker-1"));
+    let get = |node: &str, secret: &str| {
+        RequestAttributes::new(node_identity(node), "get", "secrets")
+            .with_api_group("")
+            .with_namespace("ns")
+            .with_name(secret)
+    };
     assert_eq!(
-        az.authorize(&attrs).await.unwrap(),
-        Decision::Allow,
-        "current impl allows delete nodes/status (no verb check in status path); \
-         tighten authz.rs to restrict to update/patch only"
+        az.authorize(&get("worker-1", "bound")).await.unwrap(),
+        Decision::Allow
+    );
+    // Another node, and a secret no pod on the node references.
+    for attrs in [get("worker-2", "bound"), get("worker-1", "other")] {
+        assert!(
+            matches!(az.authorize(&attrs).await.unwrap(), Decision::Deny(_)),
+            "{attrs:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn node_authorizer_reasons_are_upstreams() {
+    let az = NodeAuthorizer::new(graph_with_pod("worker-1"));
+    let attrs = RequestAttributes::new(node_identity("worker-1"), "get", "secrets")
+        .with_api_group("")
+        .with_namespace("ns")
+        .with_name("other");
+    assert_eq!(
+        az.authorize_opinion(&attrs).await.unwrap(),
+        Opinion::NoOpinion {
+            reason: "no relationship found between node 'worker-1' and this object".into(),
+            error: None
+        }
+    );
+    // A graph lookup is only attempted for a named object.
+    let list = RequestAttributes::new(node_identity("worker-1"), "list", "secrets")
+        .with_api_group("")
+        .with_namespace("ns");
+    assert_eq!(
+        az.authorize_opinion(&list).await.unwrap(),
+        Opinion::NoOpinion {
+            reason: "No Object name found".into(),
+            error: None
+        }
     );
 }
 
 #[tokio::test]
-async fn node_authorizer_denies_non_node_user() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // Plain user (not system:node:*) must be rejected.
-    let attrs = RequestAttributes::new(user("alice"), "get", "nodes")
-        .with_api_group("")
-        .with_name("worker-1");
-    assert!(matches!(
-        az.authorize(&attrs).await.unwrap(),
-        Decision::Deny(_)
-    ));
+async fn node_authorizer_reads_own_node_and_nothing_else_of_nodes() {
+    let az = NodeAuthorizer::new(Arc::new(NodeGraph::new()));
+    let get = |name: &str| {
+        RequestAttributes::new(node_identity("worker-1"), "get", "nodes")
+            .with_api_group("")
+            .with_name(name)
+    };
+    assert_eq!(
+        az.authorize(&get("worker-1")).await.unwrap(),
+        Decision::Allow
+    );
+    assert_eq!(
+        az.authorize_opinion(&get("worker-2")).await.unwrap(),
+        Opinion::NoOpinion {
+            reason: "node 'worker-1' cannot read 'worker-2', only its own Node object".into(),
+            error: None
+        }
+    );
 }
 
 #[tokio::test]
-async fn node_authorizer_allows_node_to_read_services() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
+async fn node_authorizer_requires_the_system_nodes_group() {
+    // pkg/auth/nodeidentifier/default.go:42-68: prefix AND group.
+    let az = NodeAuthorizer::new(Arc::new(NodeGraph::new()));
+    for u in [
+        user("alice"),
+        user("system:node:worker-1"),
+        user_with_groups("not-a-node", &["system:nodes"]),
+    ] {
+        let attrs = RequestAttributes::new(u, "get", "nodes")
+            .with_api_group("")
+            .with_name("worker-1");
+        assert!(matches!(
+            az.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            az.authorize_opinion(&attrs).await.unwrap(),
+            Opinion::NoOpinion {
+                reason: String::new(),
+                error: None
+            }
+        );
+    }
+}
 
+#[tokio::test]
+async fn node_authorizer_static_rules_cover_unsubdivided_resources() {
+    let az = NodeAuthorizer::new(Arc::new(NodeGraph::new()));
     for verb in ["get", "list", "watch"] {
         let attrs =
-            RequestAttributes::new(node_user("worker-1"), verb, "services").with_api_group("");
+            RequestAttributes::new(node_identity("worker-1"), verb, "services").with_api_group("");
         assert_eq!(
             az.authorize(&attrs).await.unwrap(),
             Decision::Allow,
-            "node should be able to {verb} services"
+            "{verb}"
         );
     }
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_read_endpoints() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
     let attrs =
-        RequestAttributes::new(node_user("worker-1"), "list", "endpoints").with_api_group("");
+        RequestAttributes::new(node_identity("worker-1"), "create", "events").with_api_group("");
     assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_read_persistentvolumes() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-1"), "get", "persistentvolumes")
-        .with_api_group("");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_read_pods_in_namespace() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    for verb in ["get", "list", "watch"] {
-        let attrs = RequestAttributes::new(node_user("worker-1"), verb, "pods")
-            .with_api_group("")
-            .with_namespace("default");
-        assert_eq!(
-            az.authorize(&attrs).await.unwrap(),
-            Decision::Allow,
-            "node should {verb} pods in a namespace"
-        );
-    }
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_read_secrets_in_namespace() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-1"), "get", "secrets")
-        .with_api_group("")
-        .with_namespace("default");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_read_configmaps_in_namespace() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-1"), "get", "configmaps")
-        .with_api_group("")
-        .with_namespace("default");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_to_create_events() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
     let attrs =
-        RequestAttributes::new(node_user("worker-1"), "create", "events").with_api_group("");
-    assert_eq!(az.authorize(&attrs).await.unwrap(), Decision::Allow);
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_node_pod_create_and_delete() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // "Needed for the node to create/delete mirror pods. Use the
-    // NodeRestriction admission plugin to limit a node to creating/deleting
-    // mirror pods bound to itself."
-    // (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go:215-217)
-    //
-    // This test used to assert the opposite. The deny was deliberate while
-    // rusternetes had no NodeRestriction admission (#1721) -- granting the verb
-    // alone would have let any node delete any pod. The plugin now exists
-    // (api-server `handlers::node_restriction`), so the grant is restored to
-    // upstream's shape and the narrowing happens there, which is what lets a
-    // kubelet clean up the mirror pod of a static pod (#1906).
-    for verb in ["create", "delete"] {
-        let attrs = RequestAttributes::new(node_user("worker-1"), verb, "pods")
-            .with_api_group("")
-            .with_namespace("default");
-        assert_eq!(
-            az.authorize(&attrs).await.unwrap(),
-            Decision::Allow,
-            "node should be authorized to {verb} pods; NodeRestriction narrows it"
-        );
-    }
-}
-
-/// Still denied: `pods/eviction` has no NodeRestriction equivalent yet, so the
-/// grant at policy.go:223 stays omitted rather than letting a node evict any
-/// pod in the cluster.
-#[tokio::test]
-async fn node_authorizer_denies_node_pod_eviction() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-1"), "create", "pods")
-        .with_api_group("")
-        .with_namespace("default")
-        .with_subresource("eviction");
-    assert!(matches!(
-        az.authorize(&attrs).await.unwrap(),
-        Decision::Deny(_)
-    ));
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_coordination_lease() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    for verb in ["get", "create", "update", "patch"] {
-        let attrs = RequestAttributes::new(node_user("worker-1"), verb, "leases")
-            .with_api_group("coordination.k8s.io")
-            .with_namespace("kube-node-lease");
-        assert_eq!(
-            az.authorize(&attrs).await.unwrap(),
-            Decision::Allow,
-            "node should be able to {verb} leases in coordination.k8s.io"
-        );
-    }
-}
-
-#[tokio::test]
-async fn node_authorizer_allows_csinodes() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // CSINode belongs to the storage.k8s.io API group in real Kubernetes.
-    // authz.rs currently allows create/update/patch on "csinodes" without checking
-    // the api_group, so we test both the real group and the permissive fallback.
-    for api_group in ["storage.k8s.io", ""] {
-        for verb in ["create", "update", "patch"] {
-            let attrs = RequestAttributes::new(node_user("worker-1"), verb, "csinodes")
-                .with_api_group(api_group)
-                .with_name("worker-1");
-            assert_eq!(
-                az.authorize(&attrs).await.unwrap(),
-                Decision::Allow,
-                "node should be able to {verb} its own CSINode (api_group={api_group})"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn node_authorizer_denies_deleting_other_nodes_objects() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    let attrs = RequestAttributes::new(node_user("worker-1"), "delete", "nodes")
-        .with_api_group("")
-        .with_name("worker-2");
-    assert!(matches!(
-        az.authorize(&attrs).await.unwrap(),
-        Decision::Deny(_)
-    ));
-}
-
-// ---------------------------------------------------------------------------
-// NodeAuthorizer — system:nodes group is irrelevant (username is the signal)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn node_authorizer_group_membership_irrelevant_username_matters() {
-    let az = rusternetes_common::authz::NodeAuthorizer;
-
-    // User with system:nodes group but wrong username prefix → denied.
-    let u = user_with_groups("not-a-node", &["system:nodes"]);
-    let attrs = RequestAttributes::new(u, "get", "nodes")
-        .with_api_group("")
-        .with_name("worker-1");
-    // The NodeAuthorizer only checks username prefix, not group membership.
+        RequestAttributes::new(node_identity("worker-1"), "delete", "services").with_api_group("");
     assert!(matches!(
         az.authorize(&attrs).await.unwrap(),
         Decision::Deny(_)

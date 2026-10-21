@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 
+mod node_authorizer;
+pub mod node_graph;
 mod reasons;
+pub use node_authorizer::{NodeAuthorizer, NodeAuthorizerFeatures};
 use reasons::{aggregate_errors, applicable_subject, describe_subject, quoted};
 
 /// Subject ↔ user matcher mirroring upstream
@@ -787,256 +790,6 @@ fn node_rules_allow(attrs: &RequestAttributes) -> bool {
     })
 }
 
-pub struct NodeAuthorizer;
-
-impl NodeAuthorizer {
-    /// Extract the node name from a node username (system:node:<nodename>)
-    fn extract_node_name(username: &str) -> Option<String> {
-        username.strip_prefix("system:node:").map(|s| s.to_string())
-    }
-
-    /// Check if the request is for the node's own Node object
-    fn is_own_node(&self, attrs: &RequestAttributes, node_name: &str) -> bool {
-        attrs.resource == "nodes"
-            && attrs.api_group.is_empty()
-            && attrs.name.as_ref().map(|n| n == node_name).unwrap_or(false)
-    }
-
-    /// Check if the resource type is one that nodes are allowed to read
-    fn is_node_allowed_resource(&self, attrs: &RequestAttributes) -> bool {
-        // Nodes can read these resources (but creation/updates are restricted)
-        let allowed_resources = [
-            ("", "services"),
-            ("", "endpoints"),
-            ("discovery.k8s.io", "endpointslices"),
-            ("", "nodes"),
-            ("", "persistentvolumes"),
-            ("", "persistentvolumeclaims"),
-            ("storage.k8s.io", "volumeattachments"),
-            ("storage.k8s.io", "csidrivers"),
-            ("storage.k8s.io", "csinodes"),
-        ];
-
-        allowed_resources
-            .iter()
-            .any(|(group, resource)| attrs.api_group == *group && attrs.resource == *resource)
-    }
-
-    /// Check if the request is for node-related API groups
-    fn is_node_api_group(&self, attrs: &RequestAttributes) -> bool {
-        matches!(
-            attrs.api_group.as_str(),
-            "authentication.k8s.io"
-                | "authorization.k8s.io"
-                | "certificates.k8s.io"
-                | "coordination.k8s.io"
-        )
-    }
-}
-
-#[async_trait]
-impl Authorizer for NodeAuthorizer {
-    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // Check if this is a node (kubelet) making the request
-        let node_name = match Self::extract_node_name(&attrs.user.username) {
-            Some(name) => name,
-            None => return Ok(Decision::Deny("Not a node user".to_string())),
-        };
-
-        // Allow nodes to access their own Node object
-        if self.is_own_node(attrs, &node_name) {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to create/update their own Node and CSINode objects
-        if (attrs.resource == "nodes" || attrs.resource == "csinodes")
-            && matches!(attrs.verb.as_str(), "create" | "update" | "patch")
-            && attrs.name.as_ref().map(|n| n == &node_name).unwrap_or(true)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to update their own Node status
-        if attrs.resource == "nodes"
-            && attrs
-                .subresource
-                .as_ref()
-                .map(|s| s == "status")
-                .unwrap_or(false)
-            && attrs
-                .name
-                .as_ref()
-                .map(|n| n == &node_name)
-                .unwrap_or(false)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to read certain cluster-wide resources
-        if matches!(attrs.verb.as_str(), "get" | "list" | "watch")
-            && self.is_node_allowed_resource(attrs)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to access node-related API groups
-        // (authentication, authorization, certificates, coordination)
-        if self.is_node_api_group(attrs) {
-            // Nodes can create TokenReviews, SubjectAccessReviews, CSRs, and Leases
-            if matches!(
-                attrs.verb.as_str(),
-                "create" | "get" | "list" | "watch" | "update" | "patch"
-            ) {
-                return Ok(Decision::Allow);
-            }
-        }
-
-        // Allow nodes to read/write pods bound to them
-        // Note: In a full implementation, this would check if the pod is actually
-        // bound to this specific node by querying storage. For now, we allow
-        // read access to pods and let RBAC provide additional restrictions.
-        if attrs.resource == "pods" && attrs.namespace.is_some() {
-            if matches!(
-                attrs.verb.as_str(),
-                "get" | "list" | "watch" | "update" | "patch"
-            ) {
-                return Ok(Decision::Allow);
-            }
-            // Allow updating pod status
-            if attrs.verb == "update"
-                && attrs
-                    .subresource
-                    .as_ref()
-                    .map(|s| s == "status")
-                    .unwrap_or(false)
-            {
-                return Ok(Decision::Allow);
-            }
-        }
-
-        // Allow nodes to read secrets and configmaps in namespaces
-        // Note: In a full implementation, this should verify the secret/configmap
-        // is referenced by a pod bound to this node
-        if matches!(attrs.resource.as_str(), "secrets" | "configmaps")
-            && attrs.namespace.is_some()
-            && matches!(attrs.verb.as_str(), "get" | "list" | "watch")
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to create events
-        if attrs.resource == "events" && attrs.verb == "create" {
-            return Ok(Decision::Allow);
-        }
-
-        // Fall through to the statically defined node rules, exactly as upstream's
-        // Node authorizer does for resources it does not subdivide. This is what
-        // authorizes the kubelet's own cluster-scoped pod list/watch.
-        if node_rules_allow(attrs) {
-            return Ok(Decision::Allow);
-        }
-
-        // Deny everything else.
-        //
-        // The namespace is rendered as a plain string, empty for a
-        // cluster-scoped request, the way upstream's node authorizer prints it
-        // (`node '%s' cannot get %s %s/%s`,
-        // plugin/pkg/auth/authorizer/node/node_authorizer.go:506-551). Using
-        // `{:?}` on the `Option` leaked Rust's `Debug` form into an API error
-        // message a real kubelet then logged verbatim:
-        //
-        //   Node ... is not authorized to delete pods in namespace Some("kube-system")
-        //   Failed to watch: failed to list *v1.Pod: Node <name> is not
-        //   authorized to list pods in namespace None
-        Ok(Decision::Deny(format!(
-            "Node {} is not authorized to {} {} in namespace {}",
-            node_name,
-            attrs.verb,
-            attrs.resource,
-            attrs.namespace.as_deref().unwrap_or("")
-        )))
-    }
-
-    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
-        // NodeIdentity requires prefix AND system:nodes (nodeidentifier/default.go:42-68).
-        // node_authorizer.go:109-118,164-168: non-node/default miss and all
-        // existing successful branches have empty reasons; unknown node name
-        // has the exact quoted identity reason. Graph/selector cases: #3672.
-        let is_node = attrs
-            .user
-            .groups
-            .iter()
-            .any(|group| group == "system:nodes");
-        let Some(name) = Self::extract_node_name(&attrs.user.username).filter(|_| is_node) else {
-            return Ok(Opinion::NoOpinion {
-                reason: String::new(),
-                error: None,
-            });
-        };
-        if name.is_empty() {
-            return Ok(Opinion::NoOpinion {
-                reason: format!("unknown node for user {}", quoted(&attrs.user.username)),
-                error: None,
-            });
-        }
-        Ok(match self.authorize(attrs).await? {
-            Decision::Allow => Opinion::Allow(String::new()),
-            Decision::Deny(_) => Opinion::NoOpinion {
-                reason: String::new(),
-                error: None,
-            },
-        })
-    }
-
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        _namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
-        // Extract node name
-        let _node_name = match Self::extract_node_name(&user.username) {
-            Some(name) => name,
-            None => return Ok((vec![], vec![])),
-        };
-
-        // Return a representative set of rules for nodes
-        let resource_rules = vec![
-            crate::resources::ResourceRule {
-                verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
-                api_groups: Some(vec!["".to_string()]),
-                resources: Some(vec![
-                    "services".to_string(),
-                    "endpoints".to_string(),
-                    "nodes".to_string(),
-                    "pods".to_string(),
-                    "secrets".to_string(),
-                    "configmaps".to_string(),
-                    "persistentvolumeclaims".to_string(),
-                    "persistentvolumes".to_string(),
-                ]),
-                resource_names: None,
-            },
-            crate::resources::ResourceRule {
-                verbs: vec!["create".to_string()],
-                api_groups: Some(vec!["".to_string()]),
-                resources: Some(vec!["events".to_string()]),
-                resource_names: None,
-            },
-            crate::resources::ResourceRule {
-                verbs: vec!["update".to_string(), "patch".to_string()],
-                api_groups: Some(vec!["".to_string()]),
-                resources: Some(vec!["nodes".to_string(), "pods".to_string()]),
-                resource_names: None,
-            },
-        ];
-
-        Ok((resource_rules, vec![]))
-    }
-}
-
 /// Upstream `authorization/union/union.go:45-68`: return the first terminal
 /// Allow/Deny tuple; otherwise aggregate abstention reasons and errors.
 /// Legacy binary authorizers map Deny to NoOpinion through the trait adapter.
@@ -1445,6 +1198,19 @@ mod tests {
     /// authorizer falls through to when pods are not subdivided by selector
     /// (node_authorizer.go: "Access to other resources is not subdivided, so just
     /// evaluate against the statically defined node rules").
+    /// A node authorizer over an empty graph with the selector-gated pod/node
+    /// decisions off, so pods fall through to the static rules (the mode the
+    /// api-server runs the authorizer in until the kubelet sends selectors).
+    fn node_authorizer() -> NodeAuthorizer {
+        NodeAuthorizer::new(Arc::new(node_graph::NodeGraph::new())).with_features(
+            NodeAuthorizerFeatures {
+                authorize_node_with_selectors: false,
+                kubelet_service_account_token_for_credential_providers: true,
+                pod_certificate_request: false,
+            },
+        )
+    }
+
     fn node_user() -> UserInfo {
         UserInfo {
             username: "system:node:worker-1".to_string(),
@@ -1459,7 +1225,7 @@ mod tests {
         let attrs = RequestAttributes::new(node_user(), "list", "pods").with_api_group("");
         assert!(
             matches!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                node_authorizer().authorize(&attrs).await.unwrap(),
                 Decision::Allow
             ),
             "the kubelet's own cluster-scoped pod list must be allowed"
@@ -1470,7 +1236,7 @@ mod tests {
     async fn node_may_watch_pods_cluster_wide() {
         let attrs = RequestAttributes::new(node_user(), "watch", "pods").with_api_group("");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            node_authorizer().authorize(&attrs).await.unwrap(),
             Decision::Allow
         ));
     }
@@ -1482,7 +1248,7 @@ mod tests {
         let attrs = RequestAttributes::new(node_user(), "list", "runtimeclasses")
             .with_api_group("node.k8s.io");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            node_authorizer().authorize(&attrs).await.unwrap(),
             Decision::Allow
         ));
     }
@@ -1499,7 +1265,7 @@ mod tests {
                 .with_namespace("kube-system")
                 .with_api_group("");
             assert_eq!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                node_authorizer().authorize(&attrs).await.unwrap(),
                 Decision::Allow,
                 "node should be authorized to {verb} pods; NodeRestriction narrows it"
             );
@@ -1516,7 +1282,7 @@ mod tests {
             .with_api_group("")
             .with_subresource("eviction");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            node_authorizer().authorize(&attrs).await.unwrap(),
             Decision::Deny(_)
         ));
     }
@@ -1530,7 +1296,7 @@ mod tests {
             .with_api_group("");
         assert!(
             matches!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                node_authorizer().authorize(&attrs).await.unwrap(),
                 Decision::Deny(_)
             ),
             "nodes have read-only access to services"
@@ -1548,7 +1314,7 @@ mod tests {
         };
         let attrs = RequestAttributes::new(user, "list", "pods").with_api_group("");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            node_authorizer().authorize(&attrs).await.unwrap(),
             Decision::Deny(_)
         ));
     }
@@ -1819,7 +1585,7 @@ mod tests {
         // Node authorizer grants a kubelet its own Node, even chained with a
         // denying authorizer (models Node + empty-RBAC).
         let node_union = UnionAuthorizer::new(vec![
-            Arc::new(NodeAuthorizer),
+            Arc::new(node_authorizer()),
             Arc::new(AlwaysDenyAuthorizer),
         ]);
         // NodeIdentity requires the system:nodes group (default.go:42-68).
