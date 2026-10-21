@@ -179,6 +179,14 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: true,
     },
+    // extendedresourcetoleration/admission.go:44 (Admit only,
+    // NewHandler(Create, Update))
+    Spec {
+        name: "ExtendedResourceToleration",
+        ops: C | U,
+        admit: true,
+        validate: false,
+    },
     // imagepolicy/admission.go:91 (ValidationInterface only), :284
     // (NewHandler(Create, Update))
     Spec {
