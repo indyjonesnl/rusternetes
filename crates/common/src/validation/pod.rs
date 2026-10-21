@@ -3164,6 +3164,12 @@ fn validate_volume_source(vol: &Volume, fld_path: &Path, opts: &PodValidationOpt
         "downwardAPI",
         validate_downward_api_volume_source
     );
+    // `source.FC` (validation.go:685-691), between DownwardAPI and FlexVolume.
+    source!(
+        vol.legacy_sources.fc.as_ref(),
+        "fc",
+        crate::validation::persistentvolume::validate_fc_volume_source
+    );
     source!(
         vol.legacy_sources.flex_volume.as_ref(),
         "flexVolume",

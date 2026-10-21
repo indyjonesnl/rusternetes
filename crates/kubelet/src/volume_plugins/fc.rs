@@ -740,12 +740,9 @@ impl CustomBlockVolumeUnmapper for FcDiskUnmapper {
 /// author; used as a PersistentVolume they get the ReadOnly flag indirectly
 /// through the persistent-claim volume used to mount the PV.
 pub(crate) fn get_volume_source(spec: &Spec<'_>) -> Result<(FCVolumeSource, bool)> {
-    if let Some(v) = spec.volume.legacy_sources.fc.as_ref() {
-        // `Volume.fc` is carried opaquely by the API types.
-        let fc: FCVolumeSource = serde_json::from_value(v.clone())
-            .map_err(|e| anyhow!("Spec does not reference a FibreChannel volume type: {e}"))?;
+    if let Some(fc) = spec.volume.legacy_sources.fc.as_ref() {
         let read_only = fc.read_only.unwrap_or(false);
-        return Ok((fc, read_only));
+        return Ok((fc.clone(), read_only));
     } else if let Some(fc) = spec.persistent_volume.and_then(|pv| pv.spec.fc.as_ref()) {
         return Ok((fc.clone(), spec.read_only));
     }

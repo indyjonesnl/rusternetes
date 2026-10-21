@@ -172,7 +172,7 @@ fn validate_gce_persistent_disk_volume_source(
 }
 
 /// `validateFCVolumeSource` (validation.go:928-948).
-fn validate_fc_volume_source(fc: &FCVolumeSource, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_fc_volume_source(fc: &FCVolumeSource, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let wwns = fc.target_wwns.as_deref().unwrap_or(&[]);
     let wwids = fc.wwids.as_deref().unwrap_or(&[]);
