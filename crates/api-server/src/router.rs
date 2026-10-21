@@ -3131,6 +3131,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     .layer(axum::middleware::from_fn(
         crate::request_scope::request_info_middleware,
     ))
+    // The first value of `watch` / `fieldSelector` / `labelSelector` is the
+    // one both RequestInfo and the handlers see (requestinfo.go:225-275).
+    .layer(axum::middleware::from_fn(
+        crate::request_scope::first_value_query_middleware,
+    ))
     // Carries the revision a LIST was read at to the RV it stamps (#3078).
     .layer(axum::middleware::from_fn(
         crate::handlers::list_options::list_snapshot_middleware,
