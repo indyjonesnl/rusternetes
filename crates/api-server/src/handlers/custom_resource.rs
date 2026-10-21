@@ -820,6 +820,7 @@ fn validate_custom_resource_with_ratcheting(
     let old_extra_specs: HashMap<&str, &serde_json::Value> =
         old_cr.extra.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
+    let mut unratcheted_cel: Vec<String> = Vec::new();
     for (key, prop_schema) in properties {
         let (new_val, old_val) = match key.as_str() {
             "spec" => (cr.spec.as_ref(), old_cr.spec.as_ref()),
@@ -859,18 +860,31 @@ fn validate_custom_resource_with_ratcheting(
                 false
             };
             if !ratcheted {
-                let path_str = render_full_path(&f.path);
+                let path_str = render_path_with_map_keys(&f.path, &f.map_key_positions);
                 let msg = if path_str.is_empty() {
                     f.message.clone()
                 } else {
                     format!("{}: {}", path_str, f.message)
                 };
-                return Err(rusternetes_common::Error::InvalidResource(msg));
+                unratcheted_cel.push(msg);
             }
         }
     }
 
-    Ok(())
+    // Upstream's validator accumulates every rule error into one aggregate
+    // (field.ErrorList), so a request that fails several rules reports all of
+    // them, e.g. the six paths asserted by
+    // test/e2e/apimachinery/crd_validation_ratcheting.go:807-816.
+    match unratcheted_cel.len() {
+        0 => Ok(()),
+        1 => Err(rusternetes_common::Error::InvalidResource(
+            unratcheted_cel.remove(0),
+        )),
+        _ => Err(rusternetes_common::Error::InvalidResource(format!(
+            "[{}]",
+            unratcheted_cel.join(", ")
+        ))),
+    }
 }
 
 /// Render the K8s-style path for a sub-tree issue. Object segments under a
@@ -891,6 +905,32 @@ fn render_full_path(path: &[rusternetes_common::schema_validation::PathSeg]) -> 
             rusternetes_common::schema_validation::PathSeg::Index(i) => {
                 out.push_str(&format!("[{}]", i));
             }
+        }
+    }
+    out
+}
+
+/// Like [`render_full_path`] but renders `additionalProperties` keys as
+/// `map[key]` (k8s.io/apimachinery field.Path.Key), as the ratcheting e2e
+/// asserts `map[foo].field` (crd_validation_ratcheting.go:807-816).
+fn render_path_with_map_keys(
+    path: &[rusternetes_common::schema_validation::PathSeg],
+    map_key_positions: &[usize],
+) -> String {
+    use rusternetes_common::schema_validation::PathSeg;
+    let mut out = String::new();
+    for (i, seg) in path.iter().enumerate() {
+        match seg {
+            PathSeg::Key(k) if map_key_positions.contains(&i) => {
+                out.push_str(&format!("[{}]", k));
+            }
+            PathSeg::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+            PathSeg::Index(n) => out.push_str(&format!("[{}]", n)),
         }
     }
     out
