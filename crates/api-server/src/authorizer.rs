@@ -13,9 +13,10 @@ use crate::authorization_config::{
 };
 use crate::authorization_reload::ChainBuilder;
 use rusternetes_common::authz::{
-    superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage,
-    NodeAuthorizer, RBACAuthorizer,
+    node_graph::NodeGraph, superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer,
+    AuthzStorage, NodeAuthorizer, NodeAuthorizerFeatures, RBACAuthorizer,
 };
+use rusternetes_storage::Storage;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -145,7 +146,7 @@ pub fn validate_authorization_modes(modes: &[String], policy_file: &str) -> Vec<
 /// the configured `modes` in order (reload.go:101-176), after Complete and
 /// Validate. ABAC reads `policy_file` once here (reload.go:118-123 reuses the
 /// list loaded at startup; no hot reload). Webhook: see [`build_authorizer_with_webhook`].
-pub fn build_authorizer<S: AuthzStorage + 'static>(
+pub fn build_authorizer<S: AuthzStorage + Storage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
@@ -156,7 +157,7 @@ pub fn build_authorizer<S: AuthzStorage + 'static>(
 
 /// [`build_authorizer`] with the `--authorization-webhook-*` options, for the
 /// `Webhook` mode (reload.go:124-167).
-pub fn build_authorizer_with_webhook<S: AuthzStorage + 'static>(
+pub fn build_authorizer_with_webhook<S: AuthzStorage + Storage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
@@ -200,7 +201,7 @@ pub fn load_authorization_config(
 /// [`ReloadableAuthorizer`](crate::authorization_reload::ReloadableAuthorizer)
 /// that watches it (`Config.New`, config.go:157-159; must be called inside a
 /// tokio runtime).
-pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
+pub fn build_authorizer_with_config<S: AuthzStorage + Storage + 'static>(
     storage: Arc<S>,
     skip_auth: bool,
     modes: &[String],
@@ -254,7 +255,7 @@ pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
     };
     for a in &configuration.authorizers {
         match a.type_.as_str() {
-            MODE_NODE => factory.node = Some(Arc::new(NodeAuthorizer)),
+            MODE_NODE => factory.node = Some(new_node_authorizer(storage.clone())),
             // config.go:126-130 `abac.NewFromFile(config.PolicyFile)`.
             MODE_ABAC => {
                 factory.abac = Some(Arc::new(PolicyList::new_from_file(Path::new(policy_file))?))
@@ -278,6 +279,29 @@ pub fn build_authorizer_with_config<S: AuthzStorage + 'static>(
     );
     reloadable.spawn_reload();
     Ok(reloadable)
+}
+
+/// The Node authorizer with its graph and the populator that keeps it current
+/// (`pkg/kubeapiserver/authorizer/config.go`: `node.NewGraph()`,
+/// `node.AddGraphEventHandlers`, `node.NewAuthorizer(graph, nodeidentifier,
+/// bootstrappolicy.NodeRules())`).
+///
+/// DEVIATION: `AuthorizeNodeWithSelectors` is pinned off here although it is GA
+/// and locked on upstream. With it on, upstream authorizes a node's pod and
+/// node reads by `spec.nodeName` / `metadata.name` field selectors, and this
+/// repo's kubelet reads pods and nodes through `ApiStorage` without them; the
+/// stricter decisions would lock every kubelet out of its own pods. Off is the
+/// mode upstream runs with the gate disabled (node_authorizer.go:131-153):
+/// pods and nodes fall to the static node rules. Flip it once the kubelet
+/// sends the selectors.
+fn new_node_authorizer<S: Storage + 'static>(storage: Arc<S>) -> Arc<dyn Authorizer> {
+    let graph = Arc::new(NodeGraph::new());
+    crate::node_graph_populator::spawn(storage, graph.clone());
+    let features = NodeAuthorizerFeatures {
+        authorize_node_with_selectors: false,
+        ..NodeAuthorizerFeatures::current()
+    };
+    Arc::new(NodeAuthorizer::new(graph).with_features(features))
 }
 
 /// `defaultWebhookName` (authorization.go).
