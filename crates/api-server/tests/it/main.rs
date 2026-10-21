@@ -21,8 +21,6 @@ mod apps_update_spec_validation_test;
 mod auth_integration_test;
 mod authorization_allow_reason_test;
 mod authorization_config_test;
-mod authorization_filter_metrics_test;
-mod authorization_filter_test;
 mod authorization_match_conditions_test;
 mod authorization_reload_test;
 mod authorization_webhook_metrics_test;

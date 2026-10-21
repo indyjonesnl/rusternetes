@@ -45,9 +45,6 @@ async fn forbidden_for(
     uri: &str,
     headers: &[(&str, &str)],
 ) -> (axum::http::response::Parts, Vec<u8>) {
-    // The attempt counters are process-global (see authorization_filter_test).
-    let _g = super::authorization_filter_test::LOCK.lock().await;
-    let _m = super::authorization_filter_metrics_test::LOCK.lock().await;
     let authorizer: Arc<dyn Authorizer> = Arc::new(Deny);
     let app = Router::new()
         .fallback(any(|| async { "ok" }))
