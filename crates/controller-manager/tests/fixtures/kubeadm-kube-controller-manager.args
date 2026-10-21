@@ -1,0 +1,22 @@
+# argv of kubeadm's kube-controller-manager static pod (v1.35), one token per
+# line, `#` lines ignored. Source:
+# cmd/kubeadm/app/phases/controlplane/manifests.go getControllerManagerCommand
+# (:321-365) with PodSubnet/ServiceSubnet/ClusterName set.
+kube-controller-manager
+--allocate-node-cidrs=true
+--authentication-kubeconfig=/etc/kubernetes/controller-manager.conf
+--authorization-kubeconfig=/etc/kubernetes/controller-manager.conf
+--bind-address=127.0.0.1
+--client-ca-file=/etc/kubernetes/pki/ca.crt
+--cluster-cidr=10.244.0.0/16
+--cluster-name=kubernetes
+--cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt
+--cluster-signing-key-file=/etc/kubernetes/pki/ca.key
+--controllers=*,bootstrapsigner,tokencleaner
+--kubeconfig=/etc/kubernetes/controller-manager.conf
+--leader-elect=true
+--requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt
+--root-ca-file=/etc/kubernetes/pki/ca.crt
+--service-account-private-key-file=/etc/kubernetes/pki/sa.key
+--service-cluster-ip-range=10.96.0.0/12
+--use-service-account-credentials=true
