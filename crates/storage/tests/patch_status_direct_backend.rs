@@ -74,3 +74,37 @@ async fn direct_backend_status_patch_applies_metadata_but_not_spec() {
     assert_eq!(out["spec"]["unschedulable"], json!(false));
     assert_eq!(out["status"]["conditions"][0]["status"], "False");
 }
+
+/// #3862: the applier reads `status.conditions`' `patchMergeKey:"type"` from
+/// the kind of the object being patched (`NewPatchMetaFromStruct(versionedObj)`,
+/// apiserver endpoints/handlers/patch.go `strategicPatchObject`), here the
+/// caller's typed `Node`, even when the stored JSON carries no
+/// `apiVersion`/`kind` to infer it from.
+#[tokio::test]
+async fn direct_backend_status_patch_uses_callers_kind_not_stored_json() {
+    use rusternetes_common::resources::Node;
+    let s = MemoryStorage::new();
+    let key = "/registry/minions/n3";
+    // No apiVersion/kind in the stored object.
+    let seed = json!({"metadata":{"name":"n3"},
+        "status":{"conditions":[
+            {"type":"Ready","status":"True"},
+            {"type":"MemoryPressure","status":"False"}]}});
+    s.create(key, &seed).await.unwrap();
+
+    let full: Node = serde_json::from_value(json!({"apiVersion":"v1","kind":"Node",
+        "metadata":{"name":"n3"}}))
+    .unwrap();
+    let delta = json!({"status":{"conditions":[{"type":"Ready","status":"False"}]}});
+    let out: Node = s
+        .patch_status_strategic_merge(key, &delta, &full)
+        .await
+        .unwrap();
+    let out = serde_json::to_value(out).unwrap();
+
+    let conds = out["status"]["conditions"].as_array().unwrap();
+    assert_eq!(conds.len(), 2, "merged by type, not replaced: {conds:?}");
+    assert!(conds
+        .iter()
+        .any(|c| c["type"] == "MemoryPressure" && c["status"] == "False"));
+}
