@@ -31,6 +31,16 @@ pub fn config_registry() -> Arc<ConfigRegistry> {
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(ConfigRegistry::default())))
 }
 
+static FLAGZ: OnceLock<rusternetes_common::flagz::NamedFlagSetsReader> = OnceLock::new();
+
+/// `o.flagz = flagz.NamedFlagSetsReader{...}` (cmd/kube-proxy/app/options.go:244-251):
+/// set once from the parsed command line, and only when `ComponentFlagz` is
+/// enabled. Unset leaves `/flagz` uninstalled (`flagzReader != nil`,
+/// server.go:483).
+pub fn set_flagz_reader(reader: rusternetes_common::flagz::NamedFlagSetsReader) {
+    let _ = FLAGZ.set(reader);
+}
+
 /// `ports.ProxyStatusPort` (pkg/cluster/ports/ports.go).
 pub const PROXY_STATUS_PORT: u16 = 10249;
 /// `defaultMetricsAddress` (defaults.go).
@@ -134,6 +144,16 @@ pub fn metrics_router(proxy_mode: &str) -> Router {
 
 /// Install the metrics mux with a config registry (configz.go:65-66).
 pub fn metrics_router_with_config(proxy_mode: &str, configs: Arc<ConfigRegistry>) -> Router {
+    metrics_router_with_flagz(proxy_mode, configs, FLAGZ.get().cloned())
+}
+
+/// As [`metrics_router_with_config`] with an explicit `flagzReader`
+/// (server.go:459 parameter).
+pub fn metrics_router_with_flagz(
+    proxy_mode: &str,
+    configs: Arc<ConfigRegistry>,
+    flagz_reader: Option<rusternetes_common::flagz::NamedFlagSetsReader>,
+) -> Router {
     exposition::initialize();
     let proxy_mode = proxy_mode.to_owned();
     let router = Router::new()
@@ -191,14 +211,22 @@ pub fn metrics_router_with_config(proxy_mode: &str, configs: Arc<ConfigRegistry>
             }),
         )
         .with_state(configs);
+    // `if flagzReader != nil { flagz.Install(...) }` (server.go:483-485); the
+    // ComponentFlagz gate lives where the reader is built (options.go:244).
+    // Installed before statusz, so /flagz is in ListedPaths.
+    let flagz_installed = flagz_reader.is_some();
+    let router = match flagz_reader {
+        Some(reader) => rusternetes_common::flagz::install(router, KUBE_PROXY, Box::new(reader)),
+        None => router,
+    };
     // ListedPaths excludes neither healthz/ping nor metrics/slis and is sorted
     // (mux/pathrecorder.go:98-105). Read before statusz.Install (server.go:490).
     rusternetes_common::statusz::install_if_enabled(router, KUBE_PROXY, || {
         rusternetes_common::statusz::Registry::new(Some(
             rusternetes_common::compatibility::default_build_effective_version(),
         ))
-        .with_listed_paths(
-            vec![
+        .with_listed_paths({
+            let mut paths: Vec<String> = [
                 "/configz",
                 "/healthz",
                 "/healthz/ping",
@@ -208,8 +236,13 @@ pub fn metrics_router_with_config(proxy_mode: &str, configs: Arc<ConfigRegistry>
             ]
             .into_iter()
             .map(str::to_owned)
-            .collect(),
-        )
+            .collect();
+            if flagz_installed {
+                paths.push(rusternetes_common::flagz::DEFAULT_FLAGZ_PATH.to_owned());
+            }
+            paths.sort();
+            paths
+        })
     })
 }
 
@@ -331,6 +364,48 @@ mod tests {
             vec!["/configz", "/healthz", "/metrics", "/proxyMode"],
             "{body}"
         );
+    }
+
+    fn flagz_reader() -> rusternetes_common::flagz::NamedFlagSetsReader {
+        rusternetes_common::flagz::NamedFlagSetsReader {
+            flags: vec![rusternetes_common::flagz::Flag {
+                name: "v".into(),
+                value: "2".into(),
+                classified: false,
+            }],
+        }
+    }
+
+    // server.go:483-485: nil reader => no /flagz.
+    #[tokio::test]
+    async fn flagz_absent_without_reader() {
+        let app = metrics_router_with_flagz("iptables", config_registry(), None);
+        let (status, _) = get(app, "/flagz", "text/plain").await;
+        assert_eq!(status, 404);
+    }
+
+    // server.go:483-485 + statusz installed after flagz (server.go:487-492):
+    // /flagz serves and is listed in statusz Paths.
+    #[tokio::test]
+    #[serial]
+    async fn flagz_installed_with_reader_and_listed() {
+        let _g = with_feature(Feature::ComponentStatusz, true);
+        let app = metrics_router_with_flagz("iptables", config_registry(), Some(flagz_reader()));
+        let (status, body) = get(app.clone(), "/flagz", "text/plain").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("kube-proxy flagz"), "{body}");
+        // Upstream randomises the key/value delimiter (flagz.go), so match the line.
+        assert!(
+            body.lines().any(|l| l.starts_with('v') && l.ends_with('2')),
+            "{body}"
+        );
+        let (_, statusz) = get(app, "/statusz", "text/plain").await;
+        let line = statusz
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("Paths"))
+            .unwrap();
+        assert!(line.split_whitespace().any(|p| p == "/flagz"), "{statusz}");
     }
 
     // server.go:487: gate off => no /statusz.
