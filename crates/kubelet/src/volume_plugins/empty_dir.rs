@@ -520,11 +520,21 @@ impl EmptyDirUnmounter {
     }
 }
 
-/// `teardownDefault` (`empty_dir.go:527-542`). The fsquota branch
-/// (`LocalStorageCapacityIsolationFSQuotaMonitoring`) is not ported: the
-/// feature is off by default and `SetUp` never assigns a quota
-/// (`assignQuota`).
+/// `teardownDefault` (`empty_dir.go:527-542`).
 fn teardown_default(dir: &str) -> Result<()> {
+    // The unmounter's `emptyDir` carries only the pod UID (`NewUnmounter`),
+    // so `HostUsers` is nil and `userNamespacesEnabled` is false.
+    #[cfg(target_os = "linux")]
+    if rusternetes_common::feature_gates::gate_enabled(
+        "LocalStorageCapacityIsolationFSQuotaMonitoring",
+    )
+    .unwrap_or(false)
+    {
+        // Remove any quota.
+        if let Err(e) = crate::fsquota::clear_quota(dir, false) {
+            warn!("Warning: Failed to clear quota on {dir}: {e}");
+        }
+    }
     // Renaming the directory is not required anymore because the operation
     // executor now handles duplicate operations on the same volume.
     remove_all(dir)
@@ -539,6 +549,47 @@ fn remove_all(dir: &str) -> Result<()> {
     }
 }
 
+/// `userNamespacesEnabled` of `assignQuota`/`teardownDefault`
+/// (`empty_dir.go:297-300`): `HostUsers` is true by default, so a pod is by
+/// default not confined by a user namespace.
+fn user_namespaces_enabled(pod: &Pod) -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::UserNamespacesSupport,
+    ) && pod.spec.as_ref().and_then(|s| s.host_users) == Some(false)
+}
+
+/// `assignQuota` (`empty_dir.go:292-316`): checks if the underlying medium
+/// supports quotas and if so, sets one. A `None` size is a no-op.
+#[cfg(target_os = "linux")]
+fn assign_quota_with(
+    quota: &crate::fsquota::FsQuota,
+    mounter: &dyn crate::fsquota::MountInterface,
+    dir: &str,
+    pod_uid: &str,
+    mounter_size: Option<i64>,
+    user_namespaces_enabled: bool,
+) -> Result<()> {
+    if mounter_size.is_none() {
+        return Ok(());
+    }
+    match quota.supports_quotas(mounter, dir, user_namespaces_enabled) {
+        Err(e) => {
+            tracing::debug!("Unable to check for quota support on {dir}: {e}");
+        }
+        Ok(true) => {
+            tracing::debug!("emptydir trying to assign quota {mounter_size:?} on {dir}");
+            if let Err(e) =
+                quota.assign_quota(mounter, dir, pod_uid, mounter_size, user_namespaces_enabled)
+            {
+                tracing::debug!("Set quota on {dir} failed {e}");
+                return Err(e);
+            }
+        }
+        Ok(false) => {}
+    }
+    Ok(())
+}
+
 struct EmptyDirMounter {
     /// `ed.pod`: `getPageSizeMountOption` reads its resource requests.
     pod: Pod,
@@ -549,6 +600,28 @@ struct EmptyDirMounter {
     meta_dir: String,
     volume_name: String,
     empty_dir: EmptyDirVolumeSource,
+}
+
+impl EmptyDirMounter {
+    /// `emptyDir.assignQuota` (`empty_dir.go:292-316`).
+    fn assign_quota(&self, dir: &str, mounter_size: Option<i64>) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            assign_quota_with(
+                crate::fsquota::global(),
+                &crate::fsquota::RealMounter,
+                dir,
+                &self.pod.metadata.uid,
+                mounter_size,
+                user_namespaces_enabled(&self.pod),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (dir, mounter_size, user_namespaces_enabled(&self.pod));
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
@@ -581,9 +654,11 @@ impl Mounter for EmptyDirMounter {
             match kind {
                 Ok(Medium::Memory) if !not_mnt => return Ok(()),
                 Ok(Medium::Default) => {
-                    // Further check dir exists. (`assignQuota` is not ported.)
+                    // Further check dir exists
                     if std::fs::metadata(volume_dir).is_ok() {
-                        return Ok(());
+                        // Dir exists, so check and assign quota if the
+                        // underlying medium supports quotas.
+                        return self.assign_quota(volume_dir, args.desired_size);
                     }
                     // This situation should not happen unless user manually
                     // delete volume dir. In this case, delete ready file.
@@ -636,12 +711,37 @@ impl Mounter for EmptyDirMounter {
             "Created emptyDir volume {} at {}",
             self.volume_name, volume_dir
         );
-        Ok(())
+        // `err = ed.assignQuota(dir, mounterArgs.DesiredSize)` after SetReady
+        // (empty_dir.go:283-286): the error is returned.
+        self.assign_quota(volume_dir, args.desired_size)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// `assignQuota` (`empty_dir.go:292-316`): no size is a no-op, and with
+    /// `LocalStorageCapacityIsolationFSQuotaMonitoring` off (or no user
+    /// namespace) `SupportsQuotas` is false, so nothing is assigned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assign_quota_is_noop_without_size_or_support() {
+        use crate::fsquota::{FsQuota, RealMounter};
+        let mk = |on: bool| {
+            FsQuota::new(
+                vec![],
+                "/nonexistent/p".into(),
+                "/nonexistent/q".into(),
+                Box::new(move || on),
+            )
+        };
+        let q = mk(true);
+        assert!(assign_quota_with(&q, &RealMounter, "/tmp", "uid", None, true).is_ok());
+        // Gate on, pod not in a user namespace: SupportsQuotas is false.
+        assert!(assign_quota_with(&q, &RealMounter, "/tmp", "uid", Some(1024), false).is_ok());
+        let off = mk(false);
+        assert!(assign_quota_with(&off, &RealMounter, "/tmp", "uid", Some(1024), true).is_ok());
+    }
+
     use super::*;
     use rusternetes_common::resources::Volume;
     use serde_json::json;

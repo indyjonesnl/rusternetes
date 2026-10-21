@@ -1,13 +1,14 @@
 //! Port of `pkg/volume/metrics_du.go` (`metricsDu`) and `DiskUsage`
 //! (`pkg/volume/util/fs/fs.go:65-142`, linux).
 //!
-//! `DiskUsage` observes `servermetrics.CollectVolumeStatCalDuration` under
-//! `fsquota` when the quota system knows the path and `du` otherwise
-//! (`fs.go:80-85`). The fsquota provider (`pkg/volume/util/fsquota`) is gated
-//! by `LocalStorageCapacityIsolationFSQuotaMonitoring` and not ported, so
-//! `GetConsumption`/`GetInodes` always return nil here, which is exactly
-//! upstream's "path does not support quotas" case: the `du` source and the
-//! walk are used.
+//! `DiskUsage` asks the quota system first (`fsquota.GetConsumption` /
+//! `GetInodes`, `fs.go:77,85`; see [`crate::fsquota`], gated by
+//! `LocalStorageCapacityIsolationFSQuotaMonitoring`). It observes
+//! `servermetrics.CollectVolumeStatCalDuration` under `fsquota` when the
+//! quota system knows the path and `du` otherwise (`fs.go:80-85`); a
+//! `None`/error answer (path does not support quotas, or the `xfs_quota` tool
+//! is missing) means "use other mechanisms", i.e. the walk, which then only
+//! counts the half the quota system did not answer (`fs.go:127-135`).
 
 use crate::server_metrics::collect_volume_stat_cal_duration;
 use crate::volume_plugins::metrics_statfs::{fs_info, fs_info_failed_error, no_path_defined_error};
@@ -26,6 +27,14 @@ pub struct UsageInfo {
     pub inodes: i64,
 }
 
+/// Which halves of the usage the walk counts: `consumption == nil` /
+/// `inodes == nil` (`fs.go:127-135`).
+#[derive(Clone, Copy)]
+struct Counting {
+    bytes: bool,
+    inodes: bool,
+}
+
 /// `filepath.SkipDir` as returned by the `Walk` callback.
 enum Step {
     Continue,
@@ -39,9 +48,37 @@ pub fn disk_usage(path: &str) -> Result<UsageInfo> {
         return Err(anyhow!("invalid directory"));
     }
 
-    // fs.go:73-85: fsquota.GetConsumption/GetInodes are nil (see module doc).
+    // fs.go:73-85: first check whether the quota system knows about this
+    // directory. A nil quantity or error means that the path does not
+    // support quotas or the xfs_quota tool is missing and we should use
+    // other mechanisms.
     let start_time = Instant::now();
+    #[cfg(target_os = "linux")]
+    let (consumption, inodes) = (
+        crate::fsquota::get_consumption(path).ok().flatten(),
+        crate::fsquota::get_inodes(path).ok().flatten(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let (consumption, inodes): (Option<i64>, Option<i64>) = (None, None);
+    let source = if consumption.is_some() {
+        "fsquota"
+    } else {
+        "du"
+    };
+    if let Some(c) = consumption {
+        usage.bytes = c;
+    }
+    if let Some(i) = inodes {
+        usage.inodes = i;
+    }
+    let counting = Counting {
+        bytes: consumption.is_none(),
+        inodes: inodes.is_none(),
+    };
     let result = (|| {
+        if inodes.is_some() && consumption.is_some() {
+            return Ok(());
+        }
         let top_level_dev = std::fs::metadata(path)?.dev();
         let mut deduped_inodes: HashSet<u64> = HashSet::new();
         let md = std::fs::symlink_metadata(path)?;
@@ -51,11 +88,12 @@ pub fn disk_usage(path: &str) -> Result<UsageInfo> {
             top_level_dev,
             &mut deduped_inodes,
             &mut usage,
+            counting,
         )?;
         Ok(())
     })();
-    // fs.go:84: `defer servermetrics.CollectVolumeStatCalDuration("du", ..)`.
-    collect_volume_stat_cal_duration("du", start_time);
+    // fs.go:80-84: `defer servermetrics.CollectVolumeStatCalDuration(..)`.
+    collect_volume_stat_cal_duration(source, start_time);
     result.map(|()| usage)
 }
 
@@ -66,6 +104,7 @@ fn visit(
     top_level_dev: u64,
     deduped: &mut HashSet<u64>,
     usage: &mut UsageInfo,
+    counting: Counting,
 ) -> Step {
     // fs.go:122: don't descend into directories on other devices.
     if md.dev() != top_level_dev {
@@ -76,8 +115,12 @@ fn visit(
         return Step::Continue;
     }
     let _ = path;
-    usage.bytes += md.blocks() as i64 * 512;
-    usage.inodes += 1;
+    if counting.bytes {
+        usage.bytes += md.blocks() as i64 * 512;
+    }
+    if counting.inodes {
+        usage.inodes += 1;
+    }
     Step::Continue
 }
 
@@ -89,8 +132,9 @@ fn walk(
     top_level_dev: u64,
     deduped: &mut HashSet<u64>,
     usage: &mut UsageInfo,
+    counting: Counting,
 ) -> Result<Step> {
-    let step = visit(path, md, top_level_dev, deduped, usage);
+    let step = visit(path, md, top_level_dev, deduped, usage, counting);
     if !md.is_dir() {
         return Ok(step);
     }
@@ -121,7 +165,7 @@ fn walk(
                 ))
             }
         };
-        match walk(&child, &cmd, top_level_dev, deduped, usage)? {
+        match walk(&child, &cmd, top_level_dev, deduped, usage, counting)? {
             Step::SkipDir if !cmd.is_dir() => return Ok(Step::Continue),
             _ => {}
         }
