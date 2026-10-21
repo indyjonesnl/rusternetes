@@ -1901,5 +1901,6 @@ mod selectable_fields_tests;
 #[path = "crd_defaults_tests.rs"]
 mod defaults_tests;
 
+#[cfg(test)]
 #[path = "crd_openapi_schema_tests.rs"]
 mod openapi_schema_tests;
