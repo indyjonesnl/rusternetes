@@ -350,6 +350,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             priority_sort_less(),
             PriorityQueueOptions {
                 queueing_hint_map,
+                // `WithPreEnqueuePluginMap` (scheduler.go:388-414): gated pods
+                // stay out of activeQ.
+                pre_enqueue_plugin_map:
+                    crate::queue::scheduling_gates::build_pre_enqueue_plugin_map(
+                        self.profiles.profiles(),
+                    ),
                 // Upstream default (5m): pods rejected by the volume plugins
                 // are requeued by the PV/PVC/StorageClass/CSI* events fed by
                 // `add_resource_event_handlers`, not by a short flush.
