@@ -25,13 +25,13 @@ use std::collections::{HashMap, HashSet};
 use crate::resources::pod::{
     AppArmorProfile, ConfigMapVolumeSource, Container, ContainerPort, ContainerResizePolicy,
     ContainerRestartRule, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvFromSource, EnvVar,
-    EphemeralVolumeSource, ExecAction, GRPCAction, HTTPGetAction, HostPathVolumeSource, KeyToPath,
-    Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm, Pod, PodAffinityTerm,
-    PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim, PodSchedulingGate, PodSecurityContext,
-    PodSpec, PreferredSchedulingTerm, Probe, ProjectedVolumeSource, ResourceFieldSelector,
-    SeccompProfile, SecretVolumeSource, SecurityContext, SleepAction, TCPSocketAction, Toleration,
-    TopologySpreadConstraint, Volume, VolumeDevice, VolumeMount, WeightedPodAffinityTerm,
-    WorkloadReference,
+    EphemeralVolumeSource, ExecAction, FileKeySelector, GRPCAction, HTTPGetAction,
+    HostPathVolumeSource, KeyToPath, Lifecycle, LifecycleHandler, NodeAffinity, NodeSelectorTerm,
+    Pod, PodAffinityTerm, PodDNSConfig, PodOS, PodReadinessGate, PodResourceClaim,
+    PodSchedulingGate, PodSecurityContext, PodSpec, PreferredSchedulingTerm, Probe,
+    ProjectedVolumeSource, ResourceFieldSelector, SeccompProfile, SecretVolumeSource,
+    SecurityContext, SleepAction, TCPSocketAction, Toleration, TopologySpreadConstraint, Volume,
+    VolumeDevice, VolumeMount, WeightedPodAffinityTerm, WorkloadReference,
 };
 use crate::resources::policy::IntOrString;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
@@ -342,6 +342,7 @@ fn validate_pod_spec_for(
             os,
             spec.restart_policy.as_deref(),
             host_users,
+            opts,
             &containers_path.index(i),
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -364,6 +365,7 @@ fn validate_pod_spec_for(
                 os,
                 spec.restart_policy.as_deref(),
                 host_users,
+                opts,
                 &init_path.index(i),
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
@@ -1251,6 +1253,7 @@ pub(crate) fn validate_container(
     os: Option<&PodOS>,
     pod_restart_policy: Option<&str>,
     host_users: bool,
+    opts: &PodValidationOptions,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -1347,13 +1350,17 @@ pub(crate) fn validate_container(
 
     // env.
     if let Some(ref env) = c.env {
-        errs.extend(validate_env(env, &fld_path.child("env")));
+        errs.extend(validate_env(env, &fld_path.child("env"), opts));
     }
 
     // envFrom (upstream `validateContainerCommon`,
     // `pkg/apis/core/validation/validation.go:3909`).
     if let Some(ref env_from) = c.env_from {
-        errs.extend(validate_env_from(env_from, &fld_path.child("envFrom")));
+        errs.extend(validate_env_from(
+            env_from,
+            &fld_path.child("envFrom"),
+            opts,
+        ));
     }
 
     // volumeDevices (upstream `validateContainerCommon`, `:3911`).
@@ -1448,13 +1455,17 @@ const APP_ARMOR_PROFILE_TYPES: &[&str] = &["Localhost", "RuntimeDefault", "Uncon
 /// `is_relaxed_env_var_name`; the gate is locked on in 1.35), exactly one of
 /// `configMapRef` / `secretRef`, and a non-empty DNS-subdomain name on
 /// whichever one is set.
-fn validate_env_from(sources: &[EnvFromSource], fld_path: &Path) -> ErrorList {
+fn validate_env_from(
+    sources: &[EnvFromSource],
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for (i, ev) in sources.iter().enumerate() {
         let idx = fld_path.index(i);
 
         if let Some(prefix) = ev.prefix.as_deref().filter(|p| !p.is_empty()) {
-            for msg in crate::validation::metav1::is_relaxed_env_var_name(prefix) {
+            for msg in env_var_name_errors(prefix, opts) {
                 errs.push(Error::invalid(
                     &idx.child("prefix"),
                     prefix.to_string(),
@@ -2178,18 +2189,22 @@ fn validate_mount_recursive_read_only(mount: &VolumeMount, fld_path: &Path) -> E
 /// Port of upstream `validateEnv`: each env var needs a valid name, and its
 /// `valueFrom` (when present) must reference exactly one source and not coexist
 /// with a non-empty `value`.
-fn validate_env(env: &[EnvVar], fld_path: &Path) -> ErrorList {
+fn validate_env(env: &[EnvVar], fld_path: &Path, opts: &PodValidationOptions) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for (i, ev) in env.iter().enumerate() {
         let idx = fld_path.index(i);
         if ev.name.is_empty() {
             errs.push(Error::required(&idx.child("name"), ""));
         } else {
-            for msg in crate::validation::metav1::is_relaxed_env_var_name(&ev.name) {
+            for msg in env_var_name_errors(&ev.name, opts) {
                 errs.push(Error::invalid(&idx.child("name"), ev.name.clone(), msg));
             }
         }
-        errs.extend(validate_env_var_value_from(ev, &idx.child("valueFrom")));
+        errs.extend(validate_env_var_value_from(
+            ev,
+            &idx.child("valueFrom"),
+            opts,
+        ));
     }
     errs
 }
@@ -2197,7 +2212,11 @@ fn validate_env(env: &[EnvVar], fld_path: &Path) -> ErrorList {
 /// Port of upstream `validateEnvVarValueFrom`: exactly one source, mutually
 /// exclusive with a non-empty `value`, and the structural requireds of the
 /// chosen source.
-fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
+fn validate_env_var_value_from(
+    ev: &EnvVar,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let Some(vf) = ev.value_from.as_ref() else {
         return errs;
@@ -2247,18 +2266,23 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
             &fld_path.child("secretKeyRef"),
         ));
     }
-    // fileKeyRef (alpha, EnvFiles) still counts as a source so a fileKeyRef-only
-    // env var isn't wrongly flagged as specifying none.
-    if vf.file_key_ref.is_some() {
+    // `validateFileKeySelector` (validation.go:3056).
+    if let Some(fkr) = &vf.file_key_ref {
         num_sources += 1;
+        errs.extend(validate_file_key_selector(
+            fkr,
+            &fld_path.child("fileKeyRef"),
+        ));
     }
 
     if num_sources == 0 {
-        errs.push(Error::invalid(
-            fld_path,
-            String::new(),
-            "must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef` or `secretKeyRef`",
-        ));
+        // validation.go:2843-2847.
+        let detail = if opts.allow_env_files_validation {
+            "must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef`, `secretKeyRef` or `fileKeyRef`"
+        } else {
+            "must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef` or `secretKeyRef`"
+        };
+        errs.push(Error::invalid(fld_path, String::new(), detail));
     } else if ev.value.as_deref().is_some_and(|v| !v.is_empty()) {
         errs.push(Error::invalid(
             fld_path,
@@ -2270,6 +2294,54 @@ fn validate_env_var_value_from(ev: &EnvVar, fld_path: &Path) -> ErrorList {
             fld_path,
             String::new(),
             "may not have more than one field specified at a time",
+        ));
+    }
+    errs
+}
+
+/// The `AllowRelaxedEnvironmentVariableValidation` switch shared by
+/// `ValidateEnv` (validation.go:2769) and `ValidateEnvFrom` (:2924):
+/// `IsRelaxedEnvVarName` when set, `IsEnvVarName` otherwise.
+fn env_var_name_errors(name: &str, opts: &PodValidationOptions) -> Vec<String> {
+    if opts.allow_relaxed_environment_variable_validation {
+        crate::validation::metav1::is_relaxed_env_var_name(name)
+    } else {
+        crate::validation::metav1::is_env_var_name(name)
+    }
+}
+
+/// `validateFileKeySelector` (validation.go:3056-3083).
+fn validate_file_key_selector(s: &FileKeySelector, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    // The key must be non-empty and a valid (relaxed) environment variable name.
+    match s.key.as_deref().filter(|k| !k.is_empty()) {
+        None => errs.push(Error::required(&fld_path.child("key"), "")),
+        Some(key) => {
+            for msg in crate::validation::metav1::is_relaxed_env_var_name(key) {
+                errs.push(Error::invalid(&fld_path.child("key"), key.to_string(), msg));
+            }
+        }
+    }
+    // The volumeName must be non-empty and a DNS-1123 label.
+    if s.volume_name.is_empty() {
+        errs.push(Error::required(&fld_path.child("volumeName"), ""));
+    } else {
+        for msg in is_dns1123_label(&s.volume_name) {
+            errs.push(
+                Error::invalid(&fld_path.child("volumeName"), s.volume_name.clone(), msg)
+                    .with_origin("format=k8s-short-name"),
+            );
+        }
+    }
+    // The path must be non-empty and free of backsteps (`validatePathNoBacksteps`,
+    // validation.go:1420).
+    if s.path.is_empty() {
+        errs.push(Error::required(&fld_path.child("path"), ""));
+    } else if s.path.split('/').any(|part| part == "..") {
+        errs.push(Error::invalid(
+            &fld_path.child("path"),
+            s.path.clone(),
+            "must not contain '..'",
         ));
     }
     errs
@@ -6011,7 +6083,7 @@ mod tests {
             {"name": "", "value": "y"}
         ]))
         .unwrap();
-        let errs = validate_env(&env, &Path::new("env"));
+        let errs = validate_env(&env, &Path::new("env"), &test_opts());
         assert!(
             errs.iter().any(|e| e.field.ends_with("[1].name")),
             "{errs:?}"
@@ -6032,6 +6104,150 @@ mod tests {
     /// ASCII other than `=`. The conformance specs "should be consumable as
     /// environment variable names with various prefixes" (ConfigMap and
     /// Secret) send exactly these prefixes.
+    /// The v1.35 defaults (both env gates on).
+    fn test_opts() -> PodValidationOptions {
+        get_validation_options_from_pod_spec_and_meta(None, None)
+    }
+
+    fn env_pod(env: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [{"name": "c", "image": "i", "env": env}]}
+        }))
+        .unwrap()
+    }
+
+    fn env_only(errs: ErrorList) -> Vec<String> {
+        errs.into_iter()
+            .map(|e| e.to_string())
+            .filter(|e| e.starts_with("spec.containers[0].env"))
+            .collect()
+    }
+
+    const STRICT_ENV_NAME_ERR: &str = "a valid environment variable name must consist of alphabetic characters, digits, '_', '-', or '.', and must not start with a digit (e.g. 'my.env-name',  or 'MY_ENV.NAME',  or 'MyEnvName1', regex used for validation is '[-._a-zA-Z][-._a-zA-Z0-9]*')";
+
+    /// `ValidateEnv`, `AllowRelaxedEnvironmentVariableValidation` unset
+    /// (validation.go:2769-2778): the strict `IsEnvVarName` applies.
+    #[test]
+    #[serial_test::serial]
+    fn strict_env_name_when_the_relaxed_gate_is_off() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
+            false,
+        );
+        let errs = env_only(validate_pod_create(
+            &env_pod(serde_json::json!([{"name": "1bad", "value": "x"}])),
+            false,
+        ));
+        assert_eq!(
+            errs,
+            vec![format!(
+                "spec.containers[0].env[0].name: Invalid value: \"1bad\": {STRICT_ENV_NAME_ERR}"
+            )]
+        );
+    }
+
+    /// `useRelaxedEnvironmentVariableValidation` / `relaxedEnvVarUsed`
+    /// (util.go:497, :635): a relaxed name already on the old pod stays valid.
+    #[test]
+    #[serial_test::serial]
+    fn update_keeps_a_relaxed_env_name_the_old_pod_already_used() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
+            false,
+        );
+        let old = env_pod(serde_json::json!([{"name": "1bad", "value": "x"}]));
+        let new = env_pod(serde_json::json!([{"name": "1bad", "value": "y"}]));
+        let kept = env_only(validate_pod_update(&new, &old, false, false));
+        assert!(kept.is_empty(), "{kept:?}");
+        // A relaxed name the old pod did not use is not grandfathered, but the
+        // option is pod-wide once any name is.
+        let other = env_pod(serde_json::json!([{"name": "2bad", "value": "y"}]));
+        let errs = env_only(validate_pod_update(&other, &old, false, false));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains(STRICT_ENV_NAME_ERR), "{errs:?}");
+    }
+
+    /// `validateEnvVarValueFrom` `numSources == 0` (validation.go:2843-2847).
+    #[test]
+    #[serial_test::serial]
+    fn no_source_error_names_file_key_ref_only_when_env_files_validation_allowed() {
+        let pod = env_pod(serde_json::json!([{"name": "a", "valueFrom": {}}]));
+        let on = env_only(validate_pod_create(&pod, false));
+        assert_eq!(
+            on,
+            vec!["spec.containers[0].env[0].valueFrom: Invalid value: \"\": must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef`, `secretKeyRef` or `fileKeyRef`".to_string()]
+        );
+        let _g = crate::feature_gates::with_feature(crate::feature_gates::Feature::EnvFiles, false);
+        let off = env_only(validate_pod_create(&pod, false));
+        assert_eq!(
+            off,
+            vec!["spec.containers[0].env[0].valueFrom: Invalid value: \"\": must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef` or `secretKeyRef`".to_string()]
+        );
+        // An old pod that already uses fileKeyRef re-enables it
+        // (`useAllowEnvFilesValidation`, util.go:561).
+        let old = env_pod(serde_json::json!([{"name": "f", "valueFrom": {"fileKeyRef":
+            {"volumeName": "v", "path": "p", "key": "K"}}}]));
+        let upd = env_only(validate_pod_update(&pod, &old, false, false));
+        assert!(upd.iter().any(|e| e.contains("or `fileKeyRef`")), "{upd:?}");
+    }
+
+    /// `TestValidateEnvVarValueFromFileKeyRef` (validation_test.go:7011) via
+    /// `validateFileKeySelector` (validation.go:3056).
+    #[test]
+    fn file_key_ref_is_validated() {
+        let errs = |fkr: serde_json::Value| {
+            env_only(validate_pod_create(
+                &env_pod(serde_json::json!([{"name": "foo", "valueFrom": {"fileKeyRef": fkr}}])),
+                false,
+            ))
+        };
+        let p = "spec.containers[0].env[0].valueFrom.fileKeyRef";
+        assert!(errs(serde_json::json!({"volumeName": "volume-name", "path": "path/to/file.env", "key": "MY_VAR"})).is_empty());
+        assert_eq!(
+            errs(
+                serde_json::json!({"volumeName": "volume-name", "path": "path/to/file.env", "key": ""})
+            ),
+            vec![format!("{p}.key: Required value")]
+        );
+        assert_eq!(
+            errs(
+                serde_json::json!({"volumeName": "", "path": "path/to/file.env", "key": "MY_VAR"})
+            ),
+            vec![format!("{p}.volumeName: Required value")]
+        );
+        assert_eq!(
+            errs(serde_json::json!({"volumeName": "volume-name", "path": "", "key": "MY_VAR"})),
+            vec![format!("{p}.path: Required value")]
+        );
+        assert_eq!(
+            errs(
+                serde_json::json!({"volumeName": "volume-name", "path": "../etc/passwd", "key": "MY_VAR"})
+            ),
+            vec![format!(
+                "{p}.path: Invalid value: \"../etc/passwd\": must not contain '..'"
+            )]
+        );
+        let multi = errs(
+            serde_json::json!({"volumeName": "!badname", "path": "../badpath", "key": "bad=key"}),
+        );
+        assert_eq!(multi.len(), 3, "{multi:?}");
+        assert!(
+            multi[0].starts_with(&format!("{p}.key: Invalid value: \"bad=key\": ")),
+            "{multi:?}"
+        );
+        assert!(
+            multi[1].starts_with(&format!("{p}.volumeName: Invalid value: \"!badname\": ")),
+            "{multi:?}"
+        );
+        assert!(
+            multi[2].starts_with(&format!(
+                "{p}.path: Invalid value: \"../badpath\": must not contain '..'"
+            )),
+            "{multi:?}"
+        );
+    }
+
     #[test]
     fn env_names_and_prefixes_are_relaxed() {
         let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
@@ -6040,7 +6256,7 @@ mod tests {
             {"name": "#@!", "value": "x"}
         ]))
         .unwrap();
-        let errs = validate_env(&env, &Path::new("env"));
+        let errs = validate_env(&env, &Path::new("env"), &test_opts());
         assert!(errs.is_empty(), "{errs:?}");
 
         let env_from: Vec<EnvFromSource> = serde_json::from_value(serde_json::json!([
@@ -6051,7 +6267,7 @@ mod tests {
             {"prefix": "#@!", "configMapRef": {"name": "cm"}}
         ]))
         .unwrap();
-        let errs = validate_env_from(&env_from, &Path::new("envFrom"));
+        let errs = validate_env_from(&env_from, &Path::new("envFrom"), &test_opts());
         assert!(errs.is_empty(), "{errs:?}");
     }
 
@@ -6061,7 +6277,7 @@ mod tests {
             {"prefix": "a=", "configMapRef": {"name": "cm"}}
         ]))
         .unwrap();
-        let errs = validate_env_from(&env_from, &Path::new("envFrom"));
+        let errs = validate_env_from(&env_from, &Path::new("envFrom"), &test_opts());
         assert_eq!(
             errs.iter().map(|e| e.to_string()).collect::<Vec<_>>(),
             vec!["envFrom[0].prefix: Invalid value: \"a=\": a valid environment variable name must consist only of printable ASCII characters other than '='".to_string()],
@@ -6073,7 +6289,7 @@ mod tests {
         let env: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
             {"name": "A", "value": "v", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": "k"}}}
         ])).unwrap();
-        let errs = validate_env(&env, &Path::new("env"));
+        let errs = validate_env(&env, &Path::new("env"), &test_opts());
         assert!(
             errs.iter().any(|e| e
                 .to_string()
@@ -6089,14 +6305,14 @@ mod tests {
             {"name": "A", "valueFrom": {}}
         ]))
         .unwrap();
-        assert!(validate_env(&none, &Path::new("env"))
+        assert!(validate_env(&none, &Path::new("env"), &test_opts())
             .iter()
             .any(|e| e.to_string().contains("must specify one of")));
         // two sources
         let two: Vec<EnvVar> = serde_json::from_value(serde_json::json!([
             {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": "k"}, "secretKeyRef": {"name": "s", "key": "k"}}}
         ])).unwrap();
-        assert!(validate_env(&two, &Path::new("env"))
+        assert!(validate_env(&two, &Path::new("env"), &test_opts())
             .iter()
             .any(|e| e.to_string().contains("more than one field")));
     }
@@ -6107,7 +6323,7 @@ mod tests {
             {"name": "A", "valueFrom": {"configMapKeyRef": {"name": "cm", "key": ""}}}
         ]))
         .unwrap();
-        let errs = validate_env(&env, &Path::new("env"));
+        let errs = validate_env(&env, &Path::new("env"), &test_opts());
         assert!(
             errs.iter()
                 .any(|e| e.field.ends_with("configMapKeyRef.key")),
@@ -6205,6 +6421,7 @@ mod tests {
             None,
             None,
             true,
+            &test_opts(),
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -6349,7 +6566,7 @@ mod tests {
 
     fn env_errs(json: serde_json::Value) -> Vec<String> {
         let env: Vec<EnvVar> = serde_json::from_value(json).unwrap();
-        validate_env(&env, &Path::new("env"))
+        validate_env(&env, &Path::new("env"), &test_opts())
             .into_iter()
             .map(|e| e.to_string())
             .collect()
@@ -6826,6 +7043,7 @@ mod tests {
             None,
             None,
             true,
+            &test_opts(),
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()
@@ -6889,6 +7107,7 @@ mod tests {
             None,
             Some("Never"),
             true,
+            &test_opts(),
             &Path::new("spec").child("containers").index(0),
         )
         .into_iter()

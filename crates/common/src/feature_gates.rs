@@ -322,6 +322,17 @@ pub enum Feature {
     /// `:565`). Read by `ActivePodsWithRanks.Less`
     /// (`pkg/controller/controller_utils.go:875,895`).
     LogarithmicScaleDown,
+
+    /// Upstream gate `RelaxedEnvironmentVariableValidation` (1.30 Alpha, 1.32
+    /// Beta on, 1.34 GA locked to default;
+    /// `pkg/features/kube_features.go:1702-1706`). Read by
+    /// `useRelaxedEnvironmentVariableValidation` (`pkg/api/pod/util.go:497`).
+    RelaxedEnvironmentVariableValidation,
+
+    /// Upstream gate `EnvFiles` (1.34 Alpha, 1.35 Beta on;
+    /// `pkg/features/kube_features.go:1299-1302`). Read by
+    /// `useAllowEnvFilesValidation` (`pkg/api/pod/util.go:561`).
+    EnvFiles,
 }
 
 impl Feature {
@@ -403,6 +414,8 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => 72,
             Feature::ImageVolume => 73,
             Feature::LogarithmicScaleDown => 74,
+            Feature::RelaxedEnvironmentVariableValidation => 75,
+            Feature::EnvFiles => 76,
         }
     }
 
@@ -429,7 +442,8 @@ impl Feature {
             | Feature::ServiceAccountTokenNodeBinding
             | Feature::ServiceAccountTokenNodeBindingValidation
             | Feature::StructuredAuthenticationConfiguration
-            | Feature::LogarithmicScaleDown => PreRelease::Ga,
+            | Feature::LogarithmicScaleDown
+            | Feature::RelaxedEnvironmentVariableValidation => PreRelease::Ga,
             Feature::InPlacePodVerticalScalingAllocatedStatus => PreRelease::Deprecated,
             Feature::PodTopologyLabelsAdmission
             | Feature::SELinuxMountReadWriteOncePod
@@ -464,7 +478,8 @@ impl Feature {
             | Feature::DeclarativeValidationTakeover
             | Feature::StructuredAuthenticationConfigurationEgressSelector
             | Feature::StructuredAuthenticationConfigurationJWKSMetrics
-            | Feature::ImageVolume => PreRelease::Beta,
+            | Feature::ImageVolume
+            | Feature::EnvFiles => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
             | Feature::DRAPartitionableDevices
@@ -518,6 +533,7 @@ impl Feature {
                 | Feature::ServiceAccountTokenNodeBindingValidation
                 | Feature::StructuredAuthenticationConfiguration
                 | Feature::LogarithmicScaleDown
+                | Feature::RelaxedEnvironmentVariableValidation
         )
     }
 
@@ -672,6 +688,8 @@ impl Feature {
             Feature::ImageVolume => true,
             // pkg/features/kube_features.go:1494-1498 (1.31 GA + LockToDefault)
             Feature::LogarithmicScaleDown => true,
+            Feature::RelaxedEnvironmentVariableValidation => true,
+            Feature::EnvFiles => true,
         }
     }
 }
@@ -763,6 +781,8 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StructuredAuthenticationConfigurationJWKSMetrics,
     Feature::ImageVolume,
     Feature::LogarithmicScaleDown,
+    Feature::RelaxedEnvironmentVariableValidation,
+    Feature::EnvFiles,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -852,6 +872,8 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationJWKSMetrics.default_enabled()),
     AtomicBool::new(Feature::ImageVolume.default_enabled()),
     AtomicBool::new(Feature::LogarithmicScaleDown.default_enabled()),
+    AtomicBool::new(Feature::RelaxedEnvironmentVariableValidation.default_enabled()),
+    AtomicBool::new(Feature::EnvFiles.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
