@@ -36,8 +36,9 @@ fn http_method_to_verb(method: &Method) -> &'static str {
         Method::PUT => "update",
         Method::PATCH => "patch",
         Method::DELETE => "delete",
-        // GET, HEAD, OPTIONS, and any other method default to "get".
-        _ => "get",
+        Method::GET | Method::HEAD => "get",
+        // requestinfo.go:177-190: any other method has no verb.
+        _ => "",
     }
 }
 
@@ -142,12 +143,14 @@ pub async fn proxy_node(
 
     // Check authorization - requires permission to proxy to nodes.
     // Verb derives from the HTTP method (matches K8s RBAC semantics).
-    // The RBAC name field carries the *node name*, not the raw id, so
-    // policies that bind on `nodes/proxy` with a `resourceName` match.
+    // Authorized as `RequestInfo` sees the path, as the `WithAuthorization`
+    // filter does: resource `nodes`, subresource `proxy`, and the *raw* id
+    // (`name:port`) as the name, as upstream (requestinfo.go:211-221).
     let verb = http_method_to_verb(&method);
-    let attrs = RequestAttributes::new(auth_ctx.user, verb, "nodes/proxy")
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "nodes")
         .with_api_group("")
-        .with_name(actual_node_name);
+        .with_subresource("proxy")
+        .with_name(&node_name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -232,10 +235,11 @@ pub async fn proxy_service(
 
     // Check authorization. Verb derives from the HTTP method to match K8s RBAC.
     let verb = http_method_to_verb(&method);
-    let attrs = RequestAttributes::new(auth_ctx.user, verb, "services/proxy")
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "services")
         .with_api_group("")
+        .with_subresource("proxy")
         .with_namespace(&namespace)
-        .with_name(actual_service_name);
+        .with_name(&service_name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -513,10 +517,11 @@ pub async fn proxy_pod(
 
     // Check authorization. Verb derives from the HTTP method to match K8s RBAC.
     let verb = http_method_to_verb(&method);
-    let attrs = RequestAttributes::new(auth_ctx.user, verb, "pods/proxy")
+    let attrs = RequestAttributes::new(auth_ctx.user, verb, "pods")
         .with_api_group("")
+        .with_subresource("proxy")
         .with_namespace(&namespace)
-        .with_name(actual_pod_name);
+        .with_name(&pod_name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -892,10 +897,11 @@ mod tests {
 
     #[test]
     fn test_http_method_to_verb_get_and_head() {
-        // GET/HEAD/OPTIONS all map to "get" — matches K8s RequestInfoFactory.
+        // GET/HEAD map to "get"; any other method has no verb
+        // (requestinfo.go:177-190).
         assert_eq!(http_method_to_verb(&Method::GET), "get");
         assert_eq!(http_method_to_verb(&Method::HEAD), "get");
-        assert_eq!(http_method_to_verb(&Method::OPTIONS), "get");
+        assert_eq!(http_method_to_verb(&Method::OPTIONS), "");
     }
 
     #[test]

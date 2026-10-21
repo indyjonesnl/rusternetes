@@ -189,8 +189,9 @@ pub async fn create_token_request(
     );
 
     // Check authorization - requires permission to create token requests for the service account
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "create", "serviceaccounts/token")
+    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "create", "serviceaccounts")
         .with_api_group("")
+        .with_subresource("token")
         .with_namespace(&namespace)
         .with_name(&service_account_name);
 

@@ -119,7 +119,9 @@ impl ApiServerState {
             // The `WithAuthorization` filter records the metrics, once per
             // request (authorization_filter.rs); the per-handler checks that
             // remain must not count again.
-            authorizer: authorizer.clone(),
+            authorizer: Arc::new(crate::request_scope::RequestInfoAuthorizer::new(
+                authorizer.clone(),
+            )),
             unfiltered_authorizer: authorizer,
             metrics,
             skip_auth,

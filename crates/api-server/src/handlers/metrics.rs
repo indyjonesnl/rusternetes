@@ -61,7 +61,6 @@ pub async fn get_node_metrics(
 
     let attrs = RequestAttributes::new(auth_ctx.user, "get", "nodes")
         .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics")
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
@@ -131,9 +130,12 @@ pub async fn list_node_metrics(
 ) -> Result<Json<List<NodeMetrics>>> {
     debug!("Listing node metrics");
 
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", "nodes")
-        .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics");
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        crate::request_scope::list_or_watch_verb(),
+        "nodes",
+    )
+    .with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -175,7 +177,6 @@ pub async fn get_pod_metrics(
     let attrs = RequestAttributes::new(auth_ctx.user, "get", "pods")
         .with_api_group("metrics.k8s.io")
         .with_namespace(&namespace)
-        .with_subresource("metrics")
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
@@ -204,10 +205,13 @@ pub async fn list_pod_metrics(
     debug!("Listing pod metrics in namespace: {}", namespace);
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", "pods")
-        .with_api_group("metrics.k8s.io")
-        .with_namespace(&namespace)
-        .with_subresource("metrics");
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        crate::request_scope::list_or_watch_verb(),
+        "pods",
+    )
+    .with_api_group("metrics.k8s.io")
+    .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -245,9 +249,12 @@ pub async fn list_all_pod_metrics(
     debug!("Listing pod metrics across all namespaces");
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", "pods")
-        .with_api_group("metrics.k8s.io")
-        .with_subresource("metrics");
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        crate::request_scope::list_or_watch_verb(),
+        "pods",
+    )
+    .with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
