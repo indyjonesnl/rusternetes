@@ -113,6 +113,38 @@ fn collect_rules_recursive(
     }
 }
 
+/// Whether `schema` or anything the evaluator walks beneath it (`properties`,
+/// `additionalProperties`, `items`) carries a rule: upstream's
+/// `cel.NewValidator(...) != nil`, which is nil for a schema without rules.
+pub fn schema_has_rules(schema: &JSONSchemaProps) -> bool {
+    use rusternetes_common::resources::crd::{JSONSchemaPropsOrArray, JSONSchemaPropsOrBool};
+    if schema
+        .x_kubernetes_validations
+        .as_ref()
+        .is_some_and(|r| !r.is_empty())
+    {
+        return true;
+    }
+    if schema
+        .properties
+        .as_ref()
+        .is_some_and(|p| p.values().any(schema_has_rules))
+    {
+        return true;
+    }
+    if let Some(JSONSchemaPropsOrBool::Schema(s)) = schema.additional_properties.as_deref() {
+        if schema_has_rules(s) {
+            return true;
+        }
+    }
+    if let Some(JSONSchemaPropsOrArray::Schema(s)) = schema.items.as_deref() {
+        if schema_has_rules(s) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The first unknown property reference in one `x-kubernetes-validations`
 /// rule of `schema`. A rule reference like `self.foo` is "known" if `foo` is
 /// declared in the same schema's `properties` map.

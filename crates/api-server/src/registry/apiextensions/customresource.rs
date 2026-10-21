@@ -22,9 +22,13 @@
 //! Not ported here, and still served by the bespoke handlers:
 //! - list and watch, tracked in #2135;
 //! - table conversion;
-//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
-//!   and the `schemaobjectmeta.Validate` embedded-resource check, which
-//!   Rusternetes' schema validator does not implement.
+//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`),
+//!   which Rusternetes' schema validator does not implement.
+//!
+//! `schemaobjectmeta.Validate` (embedded resources) and the `hasBlockingErr`
+//! gate before the CEL rules run in `Strategy::validate`/`validate_update` and
+//! `StatusStrategy::validate_update`, in upstream's order: schema, embedded
+//! resources, (list types), then CEL.
 //!
 //! Decode-time coercion. Upstream's request decoder (`schemaCoercingDecoder`,
 //! customresource_handler.go:1321-1346) prunes and defaults the object as it
@@ -62,7 +66,8 @@ use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
 use crate::handlers::custom_resource::{
-    apply_schema_defaults, validate_custom_resource_with_old, validate_field_selector_paths,
+    apply_schema_defaults, has_cel_rules, validate_custom_resource_phase,
+    validate_field_selector_paths, CrPhase,
 };
 use crate::registry::generic::store::{BeginUpdate, Finish};
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
@@ -178,6 +183,51 @@ fn parse_rendered(msg: &str) -> FieldError {
         detail: body.to_string(),
         origin: String::new(),
     }
+}
+
+/// The error types `hasBlockingErr` (strategy.go:405-412) treats as blocking
+/// CEL validation: OpenAPI type, maxLength, maxItems, maxProperties, required,
+/// enum violations and wrong types.
+fn is_blocking_error(err: &FieldError) -> bool {
+    matches!(
+        err.error_type,
+        ErrorType::NotSupported
+            | ErrorType::Required
+            | ErrorType::TooLong
+            | ErrorType::TooMany
+            | ErrorType::TypeInvalid
+    )
+}
+
+/// [`is_blocking_error`] for a message the bespoke schema validator rendered:
+/// it does not type its errors, so the kinds `hasBlockingErr` names are
+/// recognised by their wording (`schema_validation.rs`).
+fn legacy_is_blocking(err: &Error) -> bool {
+    let msg = match err {
+        Error::InvalidResource(msg) | Error::BadRequest(msg) => msg.clone(),
+        other => other.to_string(),
+    };
+    msg.contains("Required value")
+        || msg.contains("Unsupported value")
+        || msg.contains("Too long")
+        || msg.contains("Too many")
+        || msg.contains("must be of type")
+        || msg.contains("must have at most")
+        || (msg.contains("must be at most") && msg.contains("characters"))
+}
+
+/// `hasBlockingErr` (strategy.go:405-412): the error appended in place of the
+/// CEL results when a blocking error is present.
+fn has_blocking_err(errs: &[FieldError], legacy_blocking: bool) -> Option<FieldError> {
+    if !legacy_blocking && !errs.iter().any(is_blocking_error) {
+        return None;
+    }
+    // `field.Invalid(nil, nil, ...)`: no path, a nil bad value (rendered `null`).
+    Some(FieldError::invalid(
+        &Path::default(),
+        rusternetes_common::validation::field::BadValue::Json(serde_json::Value::Null),
+        "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation",
+    ))
 }
 
 /// `ValidateScaleSpec` / `ValidateScaleStatus` (validator.go:134-180): the
@@ -416,16 +466,90 @@ impl Strategy {
         let _ = self.coerce_embedded_metadata(cr, true, false);
     }
 
-    /// The object's schema and CEL errors, as field errors.
-    fn schema_errors(&self, cr: &CustomResource, old: Option<&CustomResource>) -> ErrorList {
+    /// The object's OpenAPI schema (and scale) errors, as field errors: the
+    /// `validator.Validate` half of `customResourceStrategy.Validate`
+    /// (strategy.go:214). The bool is whether one of them is a blocking error
+    /// in the sense of `hasBlockingErr` (strategy.go:405-412); the bespoke
+    /// validator reports a rendered message that [`legacy_errors`] cannot
+    /// always type, so it is judged by [`legacy_is_blocking`].
+    fn schema_errors(
+        &self,
+        cr: &CustomResource,
+        old: Option<&CustomResource>,
+    ) -> (ErrorList, bool) {
         let mut errs = Vec::new();
-        if let Err(e) = validate_custom_resource_with_old(&self.crd, &self.version, cr, old) {
+        let mut blocking = false;
+        if let Err(e) =
+            validate_custom_resource_phase(&self.crd, &self.version, cr, old, CrPhase::Schema)
+        {
+            blocking = legacy_is_blocking(&e);
             errs.extend(legacy_errors(e));
         }
         if let Some(scale) = self.scale() {
             errs.extend(validate_scale(cr, scale));
         }
-        errs
+        (errs, blocking)
+    }
+
+    /// The object as `u.Object` minus the typed root `metadata`: what
+    /// `schemaobjectmeta.Validate` walks (the root is not an embedded
+    /// resource, so its `metadata` is not part of the walk).
+    fn unstructured_body(cr: &CustomResource) -> serde_json::Value {
+        let mut map: serde_json::Map<String, serde_json::Value> = cr
+            .extra
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if let Some(spec) = &cr.spec {
+            map.insert("spec".to_string(), spec.clone());
+        }
+        if let Some(status) = &cr.status {
+            map.insert("status".to_string(), status.clone());
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// `schemaobjectmeta.Validate(nil, u.Object, a.structuralSchema, false)`
+    /// (strategy.go:211, :297): every `x-kubernetes-embedded-resource` must
+    /// carry `apiVersion` and `kind`, and its `metadata` is validated. Create
+    /// and update are not told apart ("we don't make a difference between
+    /// update and create for those", :296).
+    fn embedded_resource_errors(&self, cr: &CustomResource) -> ErrorList {
+        let Some(structural) = self.structural_schema() else {
+            return Vec::new();
+        };
+        rusternetes_common::validation::structural::objectmeta::validate(
+            None,
+            &Self::unstructured_body(cr),
+            Some(&structural),
+            false,
+        )
+    }
+
+    /// The `x-kubernetes-validations` half of `Validate`/`ValidateUpdate`/
+    /// `statusStrategy.ValidateUpdate` (strategy.go:216-224, :304-312,
+    /// status_strategy.go:123-131): the CEL rules run only when `errs` — the
+    /// schema, embedded-resource and list-type errors so far — holds no
+    /// blocking error; otherwise the "some validation rules were not
+    /// checked" error is appended instead. Skipped when the schema has no
+    /// rules (`celValidator == nil`).
+    fn append_cel_errors(
+        &self,
+        errs: &mut ErrorList,
+        legacy_blocking: bool,
+        cr: &CustomResource,
+        old: Option<&CustomResource>,
+    ) {
+        if !has_cel_rules(&self.crd, &self.version) {
+            return;
+        }
+        if let Some(err) = has_blocking_err(errs, legacy_blocking) {
+            errs.push(err);
+        } else if let Err(e) =
+            validate_custom_resource_phase(&self.crd, &self.version, cr, old, CrPhase::Cel)
+        {
+            errs.extend(legacy_errors(e));
+        }
     }
 
     /// `ValidateTypeMeta` (validator.go:120-132).
@@ -470,7 +594,13 @@ impl RestCreateStrategy<CustomResource> for Strategy {
             name_is_dns_subdomain,
             &Path::new("metadata"),
         ));
-        errs.extend(self.schema_errors(obj, None));
+        let (schema, mut blocking) = self.schema_errors(obj, None);
+        errs.extend(schema);
+        // validate embedded resources
+        errs.extend(self.embedded_resource_errors(obj));
+        blocking |= errs.iter().any(is_blocking_error);
+        // validate x-kubernetes-validations rules
+        self.append_cel_errors(&mut errs, blocking, obj, None);
         errs
     }
 
@@ -523,11 +653,19 @@ impl RestUpdateStrategy<CustomResource> for Strategy {
         obj: &CustomResource,
         old: &CustomResource,
     ) -> ErrorList {
-        let errs = self.type_meta_errors(obj);
+        let mut errs = self.type_meta_errors(obj);
         if !errs.is_empty() {
             return errs;
         }
-        self.schema_errors(obj, Some(old))
+        let (schema, mut blocking) = self.schema_errors(obj, Some(old));
+        errs.extend(schema);
+        // Checks the embedded objects. We don't make a difference between
+        // update and create for those (strategy.go:296-297).
+        errs.extend(self.embedded_resource_errors(obj));
+        blocking |= errs.iter().any(is_blocking_error);
+        // validate x-kubernetes-validations rules
+        self.append_cel_errors(&mut errs, blocking, obj, Some(old));
+        errs
     }
 
     fn warnings_on_update(
@@ -598,7 +736,13 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
         obj: &CustomResource,
         old: &CustomResource,
     ) -> ErrorList {
-        self.0.schema_errors(obj, Some(old))
+        // No `schemaobjectmeta.Validate` here: status_strategy.go:88-135
+        // does not run it.
+        let (mut errs, mut blocking) = self.0.schema_errors(obj, Some(old));
+        blocking |= errs.iter().any(is_blocking_error);
+        self.0
+            .append_cel_errors(&mut errs, blocking, obj, Some(old));
+        errs
     }
 
     /// `WarningsOnUpdate` (status_strategy.go:140-143).
@@ -1444,5 +1588,197 @@ mod prune_nulls_tests {
             err.to_string(),
             "Other.stable.example.com \"w\" is invalid: kind: Invalid value: \"Other\": must be Widget"
         );
+    }
+}
+
+#[cfg(test)]
+mod embedded_and_blocking_tests {
+    use super::*;
+    use serde_json::json;
+
+    const BLOCKING: &str = "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation";
+
+    fn strategy(with_rule: bool) -> Strategy {
+        let mut spec = json!({"type": "object",
+        "required": ["need"],
+        "properties": {
+            "need": {"type": "string"},
+            "n": {"type": "integer"},
+            "embedded": {"type": "object",
+                "x-kubernetes-embedded-resource": true,
+                "x-kubernetes-preserve-unknown-fields": true}
+        }});
+        if with_rule {
+            spec["x-kubernetes-validations"] =
+                json!([{"rule": "!has(self.n) || self.n < 10", "message": "n too big"}]);
+        }
+        let crd: CustomResourceDefinition = serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.stable.example.com"},
+            "spec": {
+                "group": "stable.example.com", "scope": "Namespaced",
+                "names": {"plural": "widgets", "kind": "Widget", "listKind": "WidgetList"},
+                "versions": [{"name": "v1", "served": true, "storage": true,
+                    "subresources": {"status": {}},
+                    "schema": {"openAPIV3Schema": {"type": "object", "properties": {
+                        "spec": spec,
+                        "status": {"type": "object", "properties": {
+                            "s": {"type": "string"}}}
+                    }}}}]
+            }
+        }))
+        .unwrap();
+        Strategy::new(Arc::new(crd), "v1")
+    }
+
+    fn cr(spec: serde_json::Value) -> CustomResource {
+        serde_json::from_value(json!({
+            "apiVersion": "stable.example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w", "namespace": "ns"}, "spec": spec
+        }))
+        .unwrap()
+    }
+
+    fn ctx() -> RequestContext {
+        RequestContext::new(Some("ns"))
+    }
+
+    fn has(errs: &ErrorList, ty: ErrorType, field: &str) -> bool {
+        errs.iter().any(|e| e.error_type == ty && e.field == field)
+    }
+
+    fn blocking_count(errs: &ErrorList) -> usize {
+        errs.iter().filter(|e| e.detail == BLOCKING).count()
+    }
+
+    /// strategy.go:211 + objectmeta/validation_test.go `TestValidate`
+    /// ("embedded"): an embedded resource needs apiVersion and kind.
+    #[test]
+    fn create_requires_api_version_and_kind_on_embedded_resource() {
+        let s = strategy(false);
+        let errs = s.validate(&ctx(), &cr(json!({"need": "x", "embedded": {}})));
+        assert!(
+            has(&errs, ErrorType::Required, "spec.embedded.apiVersion"),
+            "{errs:?}"
+        );
+        assert!(
+            has(&errs, ErrorType::Required, "spec.embedded.kind"),
+            "{errs:?}"
+        );
+        assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    /// An embedded resource's `metadata` is validated with
+    /// `ValidateObjectMeta` and a path-segment name check
+    /// (validation_test.go `TestValidateEmbeddedResource` "invalid").
+    #[test]
+    fn create_validates_embedded_metadata() {
+        let s = strategy(false);
+        let errs = s.validate(
+            &ctx(),
+            &cr(json!({"need": "x", "embedded": {
+                "apiVersion": "foo/v1", "kind": "Foo",
+                "metadata": {"name": "..", "namespace": "$$$"}}})),
+        );
+        assert!(
+            has(&errs, ErrorType::Invalid, "spec.embedded.metadata.name"),
+            "{errs:?}"
+        );
+        assert!(
+            has(
+                &errs,
+                ErrorType::Invalid,
+                "spec.embedded.metadata.namespace"
+            ),
+            "{errs:?}"
+        );
+        let ok = s.validate(
+            &ctx(),
+            &cr(json!({"need": "x", "embedded": {
+                "apiVersion": "foo/v1", "kind": "Foo", "metadata": {"name": "foo"}}})),
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    /// strategy.go:296-297: update checks the embedded objects too, with no
+    /// ratcheting against the old object.
+    #[test]
+    fn update_validates_embedded_resource_without_ratcheting() {
+        let s = strategy(false);
+        let old = cr(json!({"need": "x", "embedded": {}}));
+        let errs = s.validate_update(&ctx(), &old, &old);
+        assert!(
+            has(&errs, ErrorType::Required, "spec.embedded.apiVersion"),
+            "{errs:?}"
+        );
+    }
+
+    /// status_strategy.go:88-135 does not run `schemaobjectmeta.Validate`.
+    #[test]
+    fn status_update_does_not_validate_embedded_resource() {
+        let st = StatusStrategy(Arc::new(strategy(false)));
+        let old = cr(json!({"need": "x", "embedded": {}}));
+        let errs = st.validate_update(&ctx(), &old, &old);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// strategy.go:216-224: a blocking error (here `required`) suppresses the
+    /// CEL rules and adds the "not checked" error instead.
+    #[test]
+    fn create_blocking_error_skips_cel() {
+        let s = strategy(true);
+        let errs = s.validate(&ctx(), &cr(json!({"n": 50})));
+        assert!(has(&errs, ErrorType::Required, "spec.need"), "{errs:?}");
+        assert_eq!(blocking_count(&errs), 1, "{errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.to_string().contains("n too big")),
+            "{errs:?}"
+        );
+        let blocking = errs.iter().find(|e| e.detail == BLOCKING).unwrap();
+        assert_eq!(blocking.error_type, ErrorType::Invalid);
+        assert_eq!(blocking.field, "");
+    }
+
+    /// A wrong type is a blocking error too (`ErrorTypeTypeInvalid`).
+    #[test]
+    fn create_wrong_type_is_blocking() {
+        let s = strategy(true);
+        let errs = s.validate(&ctx(), &cr(json!({"need": "x", "n": "ten"})));
+        assert_eq!(blocking_count(&errs), 1, "{errs:?}");
+    }
+
+    /// Without a blocking error the CEL rules run.
+    #[test]
+    fn create_without_blocking_error_runs_cel() {
+        let s = strategy(true);
+        let errs = s.validate(&ctx(), &cr(json!({"need": "x", "n": 50})));
+        assert_eq!(blocking_count(&errs), 0, "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.to_string().contains("n too big")),
+            "{errs:?}"
+        );
+    }
+
+    /// `celValidator == nil` when the schema has no rules: no gate message.
+    #[test]
+    fn no_cel_rules_means_no_blocking_message() {
+        let s = strategy(false);
+        let errs = s.validate(&ctx(), &cr(json!({"n": 50})));
+        assert!(has(&errs, ErrorType::Required, "spec.need"), "{errs:?}");
+        assert_eq!(blocking_count(&errs), 0, "{errs:?}");
+    }
+
+    /// strategy.go:304-312 and status_strategy.go:123-131 gate update the same
+    /// way.
+    #[test]
+    fn update_and_status_update_gate_cel() {
+        let s = Arc::new(strategy(true));
+        let old = cr(json!({"need": "x"}));
+        let new = cr(json!({"n": 50}));
+        let errs = s.validate_update(&ctx(), &new, &old);
+        assert_eq!(blocking_count(&errs), 1, "{errs:?}");
+        let errs = StatusStrategy(s.clone()).validate_update(&ctx(), &new, &old);
+        assert_eq!(blocking_count(&errs), 1, "{errs:?}");
     }
 }
