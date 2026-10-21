@@ -519,10 +519,21 @@ pub async fn mount_volume_with_attributes(
     }
     let device_path = device_path.as_str();
 
+    // `volumeToMount.SELinuxLabel` / `DesiredSizeLimit`: computed once and used
+    // by both `MountDevice` (`DeviceMounterArgs.SELinuxLabel`, `:547`) and
+    // `SetUp` (`MounterArgs.SELinuxLabel`, `:588`).
+    let mounter_args = mounter_args_for(
+        mgr,
+        spec,
+        pod,
+        &crate::volume_plugins::util::selinux::Translator,
+    )?;
+
     if let Some(device_mounter) = device_mounter {
         let device_mount_path = device_mounter.get_device_mount_path(spec)?;
         let args = DeviceMounterArgs {
             fs_group: fs_group_from(pod),
+            selinux_label: mounter_args.selinux_label.clone(),
             node_name: pod
                 .spec
                 .as_ref()
@@ -538,15 +549,10 @@ pub async fn mount_volume_with_attributes(
         );
     }
 
-    let mut args = mounter_args_for(
-        mgr,
-        spec,
-        pod,
-        &crate::volume_plugins::util::selinux::Translator,
-    )?;
     // `Recorder: og.recorder` (`operation_generator.go:587`).
-    args.recorder = recorder;
-    mounter.set_up_with(&args).await?;
+    let mut mounter_args = mounter_args;
+    mounter_args.recorder = recorder;
+    mounter.set_up_with(&mounter_args).await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
 }
 
