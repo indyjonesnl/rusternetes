@@ -131,6 +131,12 @@ pub struct VolumeManager {
     /// (`unmount_device`, `list_staged_devices`) that are not part of
     /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
+    /// `operationExecutor.pendingOperations`
+    /// (`NewNestedPendingOperations(true /* exponentialBackOffOnError */)`,
+    /// `operation_executor.go:159`): what `IsOperationPending` and
+    /// `UnmountDevice`'s backoff consult. Shared by every clone of the manager.
+    pending_operations:
+        crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations,
     /// `csiMigratedPluginManager` of `desiredStateOfWorldPopulator`
     /// (`desired_state_of_world_populator.go:131`).
     pub(crate) csi_migrated_plugin_manager: rusternetes_common::csi_migration::PluginManager,
@@ -312,6 +318,10 @@ impl VolumeManager {
             token_manager,
             node_allocatable,
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
+            pending_operations:
+                crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations::new(
+                    true,
+                ),
             csi_migrated_plugin_manager: Default::default(),
             intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
             // `NewActualStateOfWorld(nodeName, volumePluginMgr)`. The manager
@@ -800,10 +810,11 @@ impl VolumeManager {
     /// reconstructed into it ([`Self::reconstruct_staged_devices`]), then each
     /// of `GetUnmountedVolumes()` that nothing holds or desires is unmounted
     /// when `DeviceMayBeMounted()` and otherwise marked detached (the
-    /// non-attachable-plugin branch, `:301-303`). Not ported:
-    /// `IsOperationPending` (the sweep is the only operation issuer and runs
-    /// sequentially) and `DetachVolume` (a CSI plugin that is attachable is
-    /// detached by the attach/detach controller, `controllerAttachDetachEnabled`).
+    /// non-attachable-plugin branch, `:301-303`), both behind the
+    /// `IsOperationPending` gate (`:276-277`) so a volume with an operation in
+    /// flight is left alone. Not ported: `DetachVolume` (a CSI plugin that is
+    /// attachable is detached by the attach/detach controller,
+    /// `controllerAttachDetachEnabled`).
     pub(crate) async fn unmount_csi_devices_not_in(
         &self,
         desired: &std::collections::HashSet<(String, String)>,
@@ -816,6 +827,15 @@ impl VolumeManager {
                 .as_ref()
                 .is_some_and(|k| held.contains(k) || desired.contains(k))
             {
+                continue;
+            }
+            // "Check IsOperationPending to avoid marking a volume as detached
+            // if it's in the process of mounting" (`:275-277`).
+            if self.pending_operations.is_operation_pending(
+                &unmounted.volume_name.0,
+                crate::volume_plugins::util::nested_pending_operations::EMPTY,
+                crate::volume_plugins::util::nested_pending_operations::EMPTY,
+            ) {
                 continue;
             }
             // "Re-read the actual state of the world, maybe the volume got
@@ -927,9 +947,30 @@ impl VolumeManager {
                 return;
             }
         };
-        let ctx = op.run().await;
-        if let Some(e) = ctx.detailed_err {
-            warn!("UnmountDevice of {what} failed: {e:#}");
+        // `oe.pendingOperations.Run(deviceToDetach.VolumeName, EmptyUniquePodName,
+        // "" /* nodeName */, generatedOperations)` (`operation_executor.go:922-927`):
+        // refused while one is pending or its failure's backoff has not elapsed.
+        use crate::volume_plugins::util::nested_pending_operations::EMPTY;
+        let name = op.operation_name;
+        let run = self.pending_operations.run_inline(
+            &device_to_detach.volume_name.0,
+            EMPTY,
+            EMPTY,
+            name,
+            async {
+                match op.run().await.detailed_err {
+                    Some(e) => Err(format!("{e:#}")),
+                    None => Ok(()),
+                }
+            },
+        );
+        match run.await {
+            // `isExpectedError` (`reconciler_common.go`): AlreadyExists and
+            // ExponentialBackoff are not logged.
+            Err(refused) => debug!("UnmountDevice of {what} not started: {refused}"),
+            // The map has already logged the failure (`operationComplete`).
+            Ok(Err(e)) => debug!("UnmountDevice of {what} failed: {e}"),
+            Ok(Ok(())) => {}
         }
     }
 

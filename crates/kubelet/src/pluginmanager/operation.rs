@@ -7,10 +7,11 @@
 //! add to the actual state, `RegisterPlugin`, then `NotifyRegistrationStatus`.
 
 use super::cache::{ActualStateOfWorld, PluginHandler, PluginInfo};
+use crate::volume_plugins::util::exponential_backoff::ExponentialBackoff;
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
@@ -29,11 +30,6 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The `GetInfo` context is `context.WithTimeout(ctx, time.Second)` (`:84`).
 const GET_INFO_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// `initialDurationBeforeRetry` / `maxDurationBeforeRetry`
-/// (`goroutinemap/exponentialbackoff/exponential_backoff.go:31,37`).
-const INITIAL_DURATION_BEFORE_RETRY: Duration = Duration::from_millis(500);
-const MAX_DURATION_BEFORE_RETRY: Duration = Duration::from_secs(2 * 60 + 2);
-
 /// Why `GoRoutineMap::run` refused to start an operation: upstream's
 /// `alreadyExistsError` and `exponentialBackoffError`, both of which the
 /// reconciler treats as expected and does not log.
@@ -46,8 +42,7 @@ pub enum RunError {
 #[derive(Clone, Default)]
 struct Operation {
     pending: bool,
-    duration_before_retry: Duration,
-    last_error_time: Option<Instant>,
+    exp_backoff: ExponentialBackoff,
 }
 
 /// Port of `goRoutineMap` with `exponentialBackOffOnError = true`
@@ -75,11 +70,7 @@ impl GoRoutineMap {
             if existing.pending {
                 return Err(RunError::AlreadyExists);
             }
-            // SafeToRetry: refused while `since(lastErrorTime) <= durationBeforeRetry`.
-            if existing
-                .last_error_time
-                .is_some_and(|t| t.elapsed() <= existing.duration_before_retry)
-            {
+            if existing.exp_backoff.safe_to_retry(name).is_err() {
                 return Err(RunError::ExponentialBackoff);
             }
         }
@@ -117,12 +108,7 @@ impl GoRoutineMap {
             Err(err) => {
                 tracing::error!(operation = name, "operation failed: {err}");
                 let op = ops.entry(name.to_string()).or_default();
-                op.duration_before_retry = if op.duration_before_retry.is_zero() {
-                    INITIAL_DURATION_BEFORE_RETRY
-                } else {
-                    (op.duration_before_retry * 2).min(MAX_DURATION_BEFORE_RETRY)
-                };
-                op.last_error_time = Some(Instant::now());
+                op.exp_backoff.update(&err);
                 op.pending = false;
             }
         }
