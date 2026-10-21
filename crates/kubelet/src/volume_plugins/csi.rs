@@ -327,6 +327,7 @@ impl VolumePlugin for CsiPlugin {
             driver_name,
             volume_id,
             read_only,
+            migrated: spec.migrated,
             mode,
             source,
             pod_name: pod.metadata.name.clone(),
@@ -560,6 +561,9 @@ struct CsiMounter {
     driver_name: String,
     volume_id: String,
     read_only: bool,
+    /// `csiMountMgr.spec.Migrated` (`csi_mounter.go:112`): the spec was
+    /// translated to CSI, so metrics label this mounter's RPCs `migrated=true`.
+    migrated: bool,
     mode: LifecycleMode,
     source: Source,
     pod_name: String,
@@ -899,11 +903,15 @@ impl DeviceMounter for CsiAttacher {
 
         // Treat the absence of the CSI driver as a transient error
         // (https://github.com/kubernetes/kubernetes/issues/120268).
-        let client = CsiDriverClient::new(&pv_src.driver).map_err(|e| {
-            transient(format!(
-                "kubernetes.io/csi: attacher.MountDevice failed to create newCsiDriverClient: {e}"
-            ))
-        })?;
+        // `createCSIOperationContext(spec, c.watchTimeout)`
+        // (`csi_attacher.go:291`).
+        let client = CsiDriverClient::new(&pv_src.driver)
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: attacher.MountDevice failed to create newCsiDriverClient: {e}"
+                ))
+            })?
+            .with_operation_spec(Some(spec));
         let stage_unstage_set = client.node_supports_stage_unstage().await?;
 
         // Get secrets and publish context required for mountDevice.
@@ -1068,8 +1076,9 @@ impl Mounter for CsiMounter {
         let fs_group = args.fs_group;
         let fs_group_change_policy = args.fs_group_change_policy.clone();
 
+        // `createCSIOperationContext(c.spec, csiTimeout)` (`csi_mounter.go:112`).
         let client = match CsiDriverClient::new(&self.driver_name) {
-            Ok(c) => c,
+            Ok(c) => c.with_migrated(self.migrated),
             // Treat the absence of the CSI driver as a transient error
             // (https://github.com/kubernetes/kubernetes/issues/120268).
             Err(e) => {

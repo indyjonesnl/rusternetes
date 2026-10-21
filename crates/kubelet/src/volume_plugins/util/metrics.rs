@@ -8,9 +8,11 @@
 use crate::server_metrics::collect_volume_stat_cal_duration;
 use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use anyhow::{anyhow, Result};
+use prometheus::{HistogramOpts, HistogramVec};
 use rusternetes_common::quantity::{Format, Quantity};
 use std::io::{Seek, SeekFrom};
-use std::time::Instant;
+use std::sync::{LazyLock, Once};
+use std::time::{Duration, Instant};
 
 /// `NewNoPathDefinedError` (`metrics_errors.go:60-65`).
 pub const NO_PATH_DEFINED: &str = "no path defined for disk usage metrics.";
@@ -98,6 +100,84 @@ impl MetricsProvider for MetricsNil {
     }
 }
 
+/// `csiOperationsLatencyMetric` (`pkg/volume/util/metrics.go:66-75`):
+/// subsystem `csi`, name `operations_seconds`, `StabilityLevel: ALPHA` (so the
+/// served help carries the `[ALPHA] ` prefix, `component-base/metrics/opts.go`).
+static CSI_OPERATIONS_LATENCY_METRIC: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "csi_operations_seconds",
+            "[ALPHA] Container Storage Interface operation duration with gRPC error code status total",
+        )
+        .buckets(vec![
+            0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 25.0, 50.0, 120.0, 300.0, 600.0,
+        ]),
+        &["driver_name", "method_name", "grpc_status_code", "migrated"],
+    )
+    .expect("valid csi operations histogram definition")
+});
+
+static REGISTER_METRICS: Once = Once::new();
+
+/// `registerMetrics` (`metrics.go:81-87`), `registerMetrics.Do`; registered on
+/// first use rather than from `init()` (see `crate::server_metrics`).
+fn register_metrics() {
+    REGISTER_METRICS.call_once(|| {
+        prometheus::default_registry()
+            .register(Box::new(CSI_OPERATIONS_LATENCY_METRIC.clone()))
+            .expect("csi operations histogram registered once");
+    });
+}
+
+/// `getErrorCode` (`metrics.go:148-161`): `codes.OK.String()` for no error, the
+/// gRPC code name for a gRPC status. `unknown-non-grpc` (an error that did not
+/// come from a gRPC call) cannot occur here: every error this client's
+/// interceptor sees is a `tonic::Status`.
+pub fn get_error_code(err: Option<&tonic::Status>) -> &'static str {
+    use tonic::Code;
+    // `codes.Code.String()` (`google.golang.org/grpc/codes/code_string.go`).
+    match err.map(|s| s.code()) {
+        None | Some(Code::Ok) => "OK",
+        Some(Code::Cancelled) => "Canceled",
+        Some(Code::Unknown) => "Unknown",
+        Some(Code::InvalidArgument) => "InvalidArgument",
+        Some(Code::DeadlineExceeded) => "DeadlineExceeded",
+        Some(Code::NotFound) => "NotFound",
+        Some(Code::AlreadyExists) => "AlreadyExists",
+        Some(Code::PermissionDenied) => "PermissionDenied",
+        Some(Code::ResourceExhausted) => "ResourceExhausted",
+        Some(Code::FailedPrecondition) => "FailedPrecondition",
+        Some(Code::Aborted) => "Aborted",
+        Some(Code::OutOfRange) => "OutOfRange",
+        Some(Code::Unimplemented) => "Unimplemented",
+        Some(Code::Internal) => "Internal",
+        Some(Code::Unavailable) => "Unavailable",
+        Some(Code::DataLoss) => "DataLoss",
+        Some(Code::Unauthenticated) => "Unauthenticated",
+    }
+}
+
+/// `RecordCSIOperationLatencyMetrics` (`metrics.go:138-146`): records the CSI
+/// operation latency and gRPC status into `csi_operations_seconds`.
+/// `migrated` is the `"true"`/`"false"` string upstream passes.
+pub fn record_csi_operation_latency_metrics(
+    driver_name: &str,
+    operation_name: &str,
+    operation_err: Option<&tonic::Status>,
+    operation_duration: Duration,
+    migrated: &str,
+) {
+    register_metrics();
+    CSI_OPERATIONS_LATENCY_METRIC
+        .with_label_values(&[
+            driver_name,
+            operation_name,
+            get_error_code(operation_err),
+            migrated,
+        ])
+        .observe(operation_duration.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +225,35 @@ mod tests {
             MetricsNil.get_metrics().unwrap_err().to_string(),
             NOT_SUPPORTED
         );
+    }
+
+    /// `getErrorCode` (`metrics.go:148-161`).
+    #[test]
+    fn error_code_names_follow_grpc_codes_string() {
+        assert_eq!(get_error_code(None), "OK");
+        assert_eq!(
+            get_error_code(Some(&tonic::Status::unavailable("x"))),
+            "Unavailable"
+        );
+        assert_eq!(
+            get_error_code(Some(&tonic::Status::cancelled("x"))),
+            "Canceled"
+        );
+    }
+
+    /// `RecordCSIOperationLatencyMetrics` is served by the kubelet's
+    /// `/metrics` with upstream's name, help and labels.
+    #[test]
+    fn csi_operation_latency_is_served_with_migrated_label() {
+        record_csi_operation_latency_metrics(
+            "util.metrics.test.driver",
+            "/csi.v1.Node/NodeStageVolume",
+            None,
+            Duration::from_millis(5),
+            "true",
+        );
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains("# HELP csi_operations_seconds [ALPHA] Container Storage Interface operation duration with gRPC error code status total"));
+        assert!(body.contains("csi_operations_seconds_count{driver_name=\"util.metrics.test.driver\",grpc_status_code=\"OK\",method_name=\"/csi.v1.Node/NodeStageVolume\",migrated=\"true\"} 1"), "{body}");
     }
 }
