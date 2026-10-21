@@ -3236,6 +3236,10 @@ fn is_already_exists_status(body: &[u8]) -> bool {
 ///
 /// A namespaced *content* path is `.../namespaces/{ns}/{resource}[/...]`, so a
 /// gated request is one with at least one segment after the namespace name.
+pub fn create_target_namespace(path: &str) -> Option<&str> {
+    gated_namespace(path)
+}
+
 fn gated_namespace(path: &str) -> Option<&str> {
     let mut segments = path.split('/').filter(|s| !s.is_empty());
     // Only the two API roots carry namespaced content.

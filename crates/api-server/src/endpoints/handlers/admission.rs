@@ -148,6 +148,20 @@ impl Admission<'_> {
     /// handles only CREATE of a PersistentVolumeClaim. LimitRanger's `Admit`
     /// mutates only pods.
     async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T, old: Option<&T>) -> Result<T> {
+        // NamespaceAutoProvision.Admit (autoprovision/admission.go:55-95) is
+        // second in `AllOrderedPlugins`, ahead of every other in-tree plugin;
+        // `NewProvision` handles Create only.
+        if *op == Operation::Create && plugin_enabled("NamespaceAutoProvision") {
+            crate::admission::namespace_plugins::auto_provision_admit(
+                &self.state.storage,
+                self.kind,
+                &GroupResource::new(&self.resource.group, &self.resource.resource),
+                self.namespace,
+                &builtin_plugins::attr_name(obj.metadata()),
+                self.dry_run,
+            )
+            .await?;
+        }
         if self.is_core("pods") {
             let pod: Pod = recast(&obj)?;
             let mut pod = self.admit_pod(op, pod).await?;
@@ -240,6 +254,18 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        // NamespaceExists.Validate (exists/admission.go:55-86), registered for
+        // Create, Update and Delete; it follows NamespaceLifecycle in
+        // `AllOrderedPlugins` (plugins.go:69-72), ahead of the other
+        // validating plugins.
+        if plugin_enabled("NamespaceExists") {
+            crate::admission::namespace_plugins::exists_validate(
+                &self.state.storage,
+                self.kind,
+                self.namespace,
+            )
+            .await?;
+        }
         if let (Operation::Update, Some(obj), Some(old)) = (op, obj, old) {
             // `approval` is CertificateApproval's, `status` CertificateSigning's.
             let plugin = match self.subresource {
