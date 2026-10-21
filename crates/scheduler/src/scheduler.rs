@@ -19,8 +19,8 @@ use crate::framework_runtime::{names, ExtensionPoint};
 use crate::profile::DEFAULT_SCHEDULER_NAME;
 use crate::queue::{
     hints, node_scheduling_properties_change, pod_scheduling_properties_change, priority_sort_less,
-    ActionType, ClusterEvent, EventObject, EventResource, PriorityQueue, PriorityQueueOptions,
-    QueuedPodInfo, EVENT_ASSIGNED_POD_ADD, EVENT_ASSIGNED_POD_DELETE,
+    ActionType, ClusterEvent, EventObject, EventResource, NominatingInfo, PriorityQueue,
+    PriorityQueueOptions, QueuedPodInfo, EVENT_ASSIGNED_POD_ADD, EVENT_ASSIGNED_POD_DELETE,
 };
 use crate::volume_binding::{self, PreFilterOutcome};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,15 +110,6 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// upstream's `recorder.Eventf` after bind. `None` in API mode, where events
     /// POST through the data plane's client recorder instead.
     recorder: Option<EventRecorder<S>>,
-    /// In-memory nominator: pod key (`ns/name`) → node reserved by preemption.
-    /// Set synchronously the instant the scheduler decides to preempt, BEFORE
-    /// the async `nominatedNodeName` `/status` write propagates back through the
-    /// pods informer. Overlaid onto the pod list each scheduling cycle so the
-    /// nominated-pod space reservation (advanced.rs) sees the reservation
-    /// immediately — without it, a lower-priority pod fills the space the
-    /// preemptor just freed before the informer catches up, and preemption
-    /// live-locks. Mirrors upstream's in-memory `SchedulingQueue` nominator.
-    nominations: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Long-lived VolumeBinding assume caches (`volumeBinder.pvCache` /
     /// `pvcCache`), refreshed from the volume listers every cycle.
     volume_binder: Arc<std::sync::Mutex<crate::volume_assume::VolumeBinder>>,
@@ -147,7 +138,6 @@ impl Scheduler<StorageBackend> {
             recorder: None,
             interval: Duration::from_secs(interval_secs),
             profiles,
-            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
             next_start_node_index: AtomicUsize::new(0),
@@ -180,7 +170,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             data: DataPlane::Storage(storage),
             interval: Duration::from_secs(interval_secs),
             profiles,
-            nominations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             volume_binder: Arc::default(),
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
             next_start_node_index: AtomicUsize::new(0),
@@ -193,14 +182,18 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         self.profiles.framework_for_pod(pod)
     }
 
-    /// Record a preemption nomination synchronously (in-memory) and persist it
-    /// to `status.nominatedNodeName` via the `/status` subresource.
-    async fn nominate(&self, pod_key: &str, node_name: &str) {
-        let (ns, name) = parse_pod_storage_key(pod_key);
-        self.nominations
-            .lock()
-            .unwrap()
-            .insert(format!("{ns}/{name}"), node_name.to_string());
+    /// Record a preemption nomination and persist it to
+    /// `status.nominatedNodeName` via the `/status` subresource.
+    ///
+    /// The queue's nominator (`AddNominatedPod`, scheduling_queue.go:628-632,
+    /// nominator.go:70-107) is updated BEFORE the API write, "to avoid races
+    /// with the following scheduling cycles" (nominator.go:62-65). Deviation:
+    /// upstream calls it from `handleSchedulingFailure` with the PostFilter
+    /// result (schedule_one.go:1095-1101); here eviction and the status write
+    /// happen inside `try_schedule_pod`, so the nomination is recorded at the
+    /// same point.
+    async fn nominate(&self, queue: &PriorityQueue, pod: &Pod, pod_key: &str, node_name: &str) {
+        queue.add_nominated_pod(pod, Some(&NominatingInfo::override_node(node_name)));
         let node = node_name.to_string();
         self.update_pod_status_with_retry(pod_key, move |p| {
             if let Some(ref mut status) = p.status {
@@ -210,37 +203,33 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         .await;
     }
 
-    /// Overlay the in-memory nominations onto a freshly-read pod list so the
-    /// space reservation sees them before the informer propagates the `/status`
-    /// write. Prunes stale entries: a nomination is dropped once the pod is
-    /// bound (`spec.nodeName` set) or no longer present.
-    fn apply_nominations(&self, all_pods: &mut [Pod]) {
-        let mut noms = self.nominations.lock().unwrap();
+    /// Overlay the queue nominator's nominations onto a freshly-read pod list
+    /// so the nominated-pod space reservation sees them before the informer
+    /// propagates the `/status` write (upstream reads
+    /// `NominatedPodsForNode`, runtime/framework.go:1200; our reservation
+    /// reads `status.nominatedNodeName` from the pod list instead). Bound pods
+    /// are skipped; the nominator drops them on delete / after scheduling.
+    fn apply_nominations(&self, queue: &PriorityQueue, all_pods: &mut [Pod]) {
+        let noms = queue.nominated_nodes();
         if noms.is_empty() {
             return;
         }
-        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pod in all_pods.iter_mut() {
-            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-            let key = format!("{}/{}", ns, pod.metadata.name);
             let bound = pod
                 .spec
                 .as_ref()
                 .and_then(|s| s.node_name.as_ref())
                 .is_some();
-            if let Some(node) = noms.get(&key) {
-                if bound {
-                    continue; // pruned below — reservation no longer needed
-                }
-                live.insert(key.clone());
+            if bound {
+                continue;
+            }
+            if let Some(node) = noms.get(&pod.metadata.uid) {
                 let status = pod.status.get_or_insert_with(Default::default);
                 if status.nominated_node_name.is_none() {
                     status.nominated_node_name = Some(node.clone());
                 }
             }
         }
-        // Keep only nominations whose pod is still present and unbound.
-        noms.retain(|k, _| live.contains(k));
     }
 
     /// `responsibleForPod` (eventhandlers.go:474-476):
@@ -777,8 +766,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         while let Some(mut p_info) = queue.pop().await {
             let ns = p_info.pod.metadata.namespace.clone().unwrap_or_default();
             let key = format!("pods/{}/{}", ns, p_info.pod.metadata.name);
-            match self.try_schedule_pod(&key).await {
-                Ok(ScheduleOutcome::Done) => queue.done(&p_info.pod.metadata.uid),
+            match self.try_schedule_pod(&queue, &key).await {
+                Ok(ScheduleOutcome::Done) => {
+                    // `assume` (schedule_one.go:966-970) and the delete /
+                    // assigned paths: a bound, gone or foreign pod is no
+                    // longer nominated.
+                    queue.delete_nominated_pod_if_exists(&p_info.pod);
+                    queue.done(&p_info.pod.metadata.uid)
+                }
                 Ok(ScheduleOutcome::Unschedulable(plugins)) => {
                     // FitError: inject UnschedulablePlugins into the PodInfo.
                     p_info.unschedulable_plugins = plugins;
@@ -845,7 +840,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Try to schedule a single pod by its queue key (pods/{ns}/{name}).
     /// K8s schedules one pod per cycle in scheduleOne().
-    async fn try_schedule_pod(&self, key: &str) -> rusternetes_common::Result<ScheduleOutcome> {
+    async fn try_schedule_pod(
+        &self,
+        queue: &PriorityQueue,
+        key: &str,
+    ) -> rusternetes_common::Result<ScheduleOutcome> {
         let parts: Vec<&str> = key.splitn(3, '/').collect();
         let (ns, name) = match parts.len() {
             3 => (parts[1], parts[2]),
@@ -919,7 +918,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // Overlay in-memory preemption nominations so the space reservation in
         // select_node sees a just-nominated preemptor before its /status write
         // propagates back through the informer (prevents the live-lock).
-        self.apply_nominations(&mut all_pods);
+        self.apply_nominations(queue, &mut all_pods);
 
         // Same in-memory priority resolution for the candidate being scheduled.
         let mut pod = pod;
@@ -973,7 +972,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
                 }
             }
-            self.nominate(&pod_key, &node_name).await;
+            self.nominate(queue, &pod, &pod_key, &node_name).await;
             // The preemptor stays unschedulable this cycle (PostFilter only
             // nominates); the victims' Pod/Delete events requeue it.
             return Ok(ScheduleOutcome::Unschedulable(
@@ -2868,6 +2867,10 @@ fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
 // Unit tests for the DisruptionTarget condition are verified inline:
 #[cfg(test)]
 mod tests {
+    fn test_queue() -> Arc<PriorityQueue> {
+        PriorityQueue::new(priority_sort_less(), PriorityQueueOptions::default())
+    }
+
     use super::*;
     use rusternetes_common::resources::{Container, PodSpec, PodStatus};
     use rusternetes_common::types::ObjectMeta;
@@ -3359,7 +3362,7 @@ mod tests {
         });
 
         scheduler
-            .try_schedule_pod("pods/default/wffc-pod")
+            .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
             .await
             .unwrap();
         controller.await.unwrap();
@@ -3396,7 +3399,9 @@ mod tests {
         scheduler.volume_bind_poll = Duration::from_millis(20);
         wffc_fixture(&storage).await;
 
-        let r = scheduler.try_schedule_pod("pods/default/wffc-pod").await;
+        let r = scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
+            .await;
         assert!(r.is_err(), "PreBind timeout must surface as an error");
         let p: Pod = storage
             .get("/registry/pods/default/wffc-pod")
@@ -4085,7 +4090,7 @@ mod tests {
         let scheduler =
             Scheduler::new_with_name(Arc::clone(&storage), 60, DEFAULT_SCHEDULER_NAME.to_string());
         match scheduler
-            .try_schedule_pod("pods/default/big")
+            .try_schedule_pod(&test_queue(), "pods/default/big")
             .await
             .unwrap()
         {

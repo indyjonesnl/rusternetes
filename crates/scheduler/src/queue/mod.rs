@@ -16,10 +16,12 @@ pub mod csi_hints;
 pub mod events;
 pub mod heap;
 pub mod hints;
+pub mod nominator;
 pub mod preemption_hints;
 pub mod scheduling_queue;
 pub mod topology_spread_hints;
 pub mod volume_hints;
 
 pub use events::*;
+pub use nominator::*;
 pub use scheduling_queue::*;

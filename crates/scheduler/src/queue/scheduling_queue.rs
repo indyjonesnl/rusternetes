@@ -38,12 +38,13 @@
 //! - One `Mutex` guards activeQ, backoffQ, unschedulablePods and the in-flight
 //!   bookkeeping instead of upstream's four nested locks; `pop` never waits
 //!   while holding it, which is the only property upstream's split buys.
-//! - The queue does not embed the `PodNominator`; `Scheduler.nominations`
-//!   already plays that role.
+//! - The `nominator` (see [`super::nominator`]) is a field of the guarded
+//!   state rather than an embedded struct with its own `nLock`.
 //! - Metrics are not recorded.
 
 use super::events::*;
 use super::heap::Heap;
+use super::nominator::{NominatingInfo, Nominator, PodLister, PodRef};
 use rusternetes_common::resources::Pod;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -252,6 +253,9 @@ pub struct PriorityQueueOptions {
     pub pod_max_in_unschedulable_pods_duration: Duration,
     pub pre_enqueue_plugin_map: PreEnqueuePluginMap,
     pub queueing_hint_map: QueueingHintMapPerProfile,
+    /// `WithPodLister` (`:248-252`): lets the nominator drop deleted or
+    /// already-bound pods. `None` skips that check (nil lister upstream).
+    pub pod_lister: Option<PodLister>,
 }
 
 impl Default for PriorityQueueOptions {
@@ -264,6 +268,7 @@ impl Default for PriorityQueueOptions {
             pod_max_in_unschedulable_pods_duration: DEFAULT_POD_MAX_IN_UNSCHEDULABLE_PODS_DURATION,
             pre_enqueue_plugin_map: HashMap::new(),
             queueing_hint_map: HashMap::new(),
+            pod_lister: None,
         }
     }
 }
@@ -312,6 +317,29 @@ struct Inner {
     /// `schedCycle` (`active_queue.go:210-212`).
     sched_cycle: i64,
     closed: bool,
+    /// The embedded `*nominator` (`scheduling_queue.go:164`).
+    nominator: Nominator,
+}
+
+impl Inner {
+    /// `nominatedPodToInfo` (`:1371-1389`).
+    fn nominated_pod_to_info(&self, np: &PodRef) -> Pod {
+        let key = format!("{}/{}", np.namespace, np.name);
+        if let Some(p) = self.active_q.get_by_key(&key) {
+            return p.pod.clone();
+        }
+        if let Some(p) = self.unschedulable_pods.pod_info_map.get(&key) {
+            return p.pod.clone();
+        }
+        if let Some(p) = self.backoff_q.get_by_key(&key) {
+            return p.pod.clone();
+        }
+        let mut pod = Pod::new(np.name.clone(), Default::default());
+        pod.spec = None;
+        pod.metadata.namespace = Some(np.namespace.clone());
+        pod.metadata.uid = np.uid.clone();
+        pod
+    }
 }
 
 /// `PriorityQueue` (`scheduling_queue.go:163-209`).
@@ -394,6 +422,7 @@ impl PriorityQueue {
                 next_seq: 0,
                 sched_cycle: 0,
                 closed: false,
+                nominator: Nominator::new(options.pod_lister),
             }),
             cond: Notify::new(),
             clock: options.clock,
@@ -655,6 +684,12 @@ impl PriorityQueue {
         inner.unschedulable_pods.delete(&p_info.pod, gated_before);
         inner.backoff_q.delete(&p_info);
         debug!(pod = %pod_key(&p_info.pod), event, queue = ACTIVE_Q, "Pod moved to an internal scheduling queue");
+        if event == EVENT_UNSCHEDULED_POD_ADD.label()
+            || event == EVENT_UNSCHEDULED_POD_UPDATE.label()
+        {
+            // `:675`
+            inner.nominator.add_nominated_pod(&p_info.pod, None);
+        }
         inner.active_q.add_or_update(p_info);
         true
     }
@@ -1010,17 +1045,19 @@ impl PriorityQueue {
             trace!(pod = %pod_key(new_pod), "The pod doesn't need to be queued for now because it's being scheduled and will be queued back if necessary");
             return;
         }
-        if old_pod.is_some() {
+        if let Some(old_pod) = old_pod {
             let key = pod_key(new_pod);
             // If the pod is already in the active queue, just update it there.
             if let Some(p) = inner.active_q.get_mut_by_key(&key) {
                 p.update(new_pod.clone());
                 let p = p.clone();
                 inner.active_q.add_or_update(p);
+                inner.nominator.update_nominated_pod(old_pod, new_pod);
                 return;
             }
             // If the pod is in the backoff queue, update it there.
             if inner.backoff_q.update(new_pod) {
+                inner.nominator.update_nominated_pod(old_pod, new_pod);
                 return;
             }
         }
@@ -1028,6 +1065,9 @@ impl PriorityQueue {
         // If the pod is in the unschedulable queue, updating it may make it schedulable.
         if let Some(mut p_info) = inner.unschedulable_pods.delete(new_pod, false) {
             p_info.update(new_pod.clone());
+            inner
+                .nominator
+                .update_nominated_pod(old_pod.unwrap_or(new_pod), new_pod);
             inner
                 .unschedulable_pods
                 .add_or_update(p_info.clone(), &EVENT_UNSCHEDULED_POD_UPDATE.label());
@@ -1072,10 +1112,50 @@ impl PriorityQueue {
         }
     }
 
+    /// `AddNominatedPod` (`:628-632`): adds the pod to the nominator (or
+    /// updates it), under the queue lock.
+    pub fn add_nominated_pod(&self, pod: &Pod, nominating_info: Option<&NominatingInfo>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .nominator
+            .add_nominated_pod(pod, nominating_info);
+    }
+
+    /// `DeleteNominatedPodIfExists` (nominator.go:138-142).
+    pub fn delete_nominated_pod_if_exists(&self, pod: &Pod) {
+        self.inner.lock().unwrap().nominator.delete(pod);
+    }
+
+    /// Snapshot of `nominatedPodToNode` (pod UID -> nominated node name).
+    pub fn nominated_nodes(&self) -> HashMap<String, String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .nominator
+            .nominated_pod_to_node
+            .clone()
+    }
+
+    /// `NominatedPodsForNode` (`:1403-1417`): copies of the pods nominated to
+    /// run on `node_name`, as held by the queue (`nominatedPodToInfo`,
+    /// `:1371-1389`: activeQ, then unschedulablePods, then backoffQ, else a
+    /// stub with only name/namespace/UID).
+    pub fn nominated_pods_for_node(&self, node_name: &str) -> Vec<Pod> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .nominator
+            .nominated_pods_for_node(node_name)
+            .iter()
+            .map(|np| inner.nominated_pod_to_info(np))
+            .collect()
+    }
+
     /// `Delete` (`:1115-1129`): deletes the pod from whichever sub-queue
     /// holds it.
     pub fn delete(&self, pod: &Pod) {
         let mut inner = self.inner.lock().unwrap();
+        inner.nominator.delete(pod);
         let lookup = QueuedPodInfo::for_lookup(pod.clone(), &[]);
         if inner.active_q.delete(&lookup).is_ok() {
             return;
@@ -2736,5 +2816,193 @@ mod tests {
             calculate_backoff_duration(init, max, 100),
             Duration::from_secs(10)
         );
+    }
+
+    // -- nominator tests (scheduling_queue_test.go:2565-2780) ---------------
+
+    fn nominated_pod(name: &str, ns: &str, uid: &str, prio: i32, node: &str) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": name, "namespace": ns, "uid": uid},
+            "spec": {"priority": prio},
+            "status": {"nominatedNodeName": node}
+        }))
+        .unwrap()
+    }
+
+    fn lister_of(pods: Vec<Pod>) -> PodLister {
+        Arc::new(move |ns, name| {
+            pods.iter()
+                .find(|p| {
+                    p.metadata.namespace.as_deref().unwrap_or("") == ns && p.metadata.name == name
+                })
+                .cloned()
+        })
+    }
+
+    type NominatorState = (HashMap<String, Vec<PodRef>>, HashMap<String, String>);
+
+    fn nominator_state(q: &PriorityQueue) -> NominatorState {
+        let inner = q.inner.lock().unwrap();
+        (
+            inner.nominator.nominated_pods.clone(),
+            inner.nominator.nominated_pod_to_node.clone(),
+        )
+    }
+
+    fn expected_state(pairs: &[(&str, &Pod)]) -> NominatorState {
+        let mut pods: HashMap<String, Vec<PodRef>> = HashMap::new();
+        let mut to_node = HashMap::new();
+        for (node, pod) in pairs {
+            pods.entry(node.to_string())
+                .or_default()
+                .push(PodRef::from_pod(pod));
+            to_node.insert(pod.metadata.uid.clone(), node.to_string());
+        }
+        (pods, to_node)
+    }
+
+    fn names(pods: &[Pod]) -> Vec<String> {
+        pods.iter().map(|p| p.metadata.name.clone()).collect()
+    }
+
+    /// `TestPriorityQueue_NominatedPodsForNode` (`:2565-2589`).
+    #[tokio::test]
+    async fn nominated_pods_for_node() {
+        let med = nominated_pod("mpp", "ns2", "mppns2", 50000, "node1");
+        let unsched = nominated_pod("up", "ns1", "upns1", 0, "node1");
+        let high = mk_pod_prio("hpp", "ns1", "hppns1", 100000);
+        let q = new_test_queue(HashMap::new(), Arc::new(RealClock));
+        q.add(med);
+        q.add(unsched);
+        q.add(high);
+        assert_eq!(q.pop().await.unwrap().pod.metadata.name, "hpp");
+        let mut got = q.nominated_pods_for_node("node1");
+        assert_eq!(names(&got), vec!["mpp", "up"]);
+        // The returned pods are copies.
+        got[0].metadata.name = "not mpp".to_string();
+        assert_eq!(
+            names(&q.nominated_pods_for_node("node1")),
+            vec!["mpp", "up"]
+        );
+        assert!(q.nominated_pods_for_node("node2").is_empty());
+    }
+
+    /// `TestPriorityQueue_NominatedPodDeleted` (`:2591-2650`).
+    #[tokio::test]
+    async fn nominated_pod_deleted() {
+        let med = nominated_pod("mpp", "ns2", "mppns2", 50000, "node1");
+        let high_nominated = nominated_pod("hpp", "ns1", "hppns1", 100000, "node1");
+        let high = mk_pod_prio("hpp", "ns1", "hppns1", 100000);
+        for (name, pod, deleted, want_len) in [
+            ("alive pod gets added into PodNominator", med, false, 1),
+            (
+                "deleted pod shouldn't be added into PodNominator",
+                high_nominated,
+                true,
+                0,
+            ),
+            (
+                "pod without .status.nominatedPodName shouldn't be added into PodNominator",
+                high,
+                false,
+                0,
+            ),
+        ] {
+            let lister = lister_of(if deleted { vec![] } else { vec![pod.clone()] });
+            let q = PriorityQueue::new(
+                priority_sort_less(),
+                PriorityQueueOptions {
+                    pod_lister: Some(lister),
+                    ..Default::default()
+                },
+            );
+            q.add_nominated_pod(&pod, None);
+            let node = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.nominated_node_name.clone())
+                .unwrap_or_default();
+            assert_eq!(q.nominated_pods_for_node(&node).len(), want_len, "{name}");
+        }
+    }
+
+    /// `TestPriorityQueue_UpdateNominatedPodForNode` (`:2695-2780`).
+    #[tokio::test]
+    async fn update_nominated_pod_for_node() {
+        let med = nominated_pod("mpp", "ns2", "mppns2", 50000, "node1");
+        let unsched = nominated_pod("up", "ns1", "upns1", 0, "node1");
+        let high = mk_pod_prio("hpp", "ns1", "hppns1", 100000);
+        let mut scheduled = mk_pod_prio("sp", "ns1", "spns1", 0);
+        scheduled.spec.as_mut().unwrap().node_name = Some("node1".to_string());
+        let non_existent = nominated_pod("nonexistent", "ns1", "nens1", 0, "node1");
+        let q = PriorityQueue::new(
+            priority_sort_less(),
+            PriorityQueueOptions {
+                pod_lister: Some(lister_of(vec![
+                    med.clone(),
+                    unsched.clone(),
+                    high.clone(),
+                    scheduled.clone(),
+                ])),
+                ..Default::default()
+            },
+        );
+        q.add(med.clone());
+        // Update `unsched` on a different node than specified in the pod.
+        q.add_nominated_pod(&unsched, Some(&NominatingInfo::override_node("node5")));
+        // Nominate a pod on a node that is not specified in the pod object.
+        q.add_nominated_pod(&high, Some(&NominatingInfo::override_node("node2")));
+        let expected = expected_state(&[("node1", &med), ("node2", &high), ("node5", &unsched)]);
+        assert_eq!(nominator_state(&q), expected, "after adding pods");
+        assert_eq!(q.pop().await.unwrap().pod.metadata.name, "mpp");
+        // List of nominated pods shouldn't change after popping them from the queue.
+        assert_eq!(nominator_state(&q), expected, "after popping pods");
+        // Update one of the nominated pods that doesn't have nominatedNodeName
+        // in the pod object.
+        q.add_nominated_pod(&high, Some(&NominatingInfo::override_node("node4")));
+        let expected = expected_state(&[("node1", &med), ("node4", &high), ("node5", &unsched)]);
+        assert_eq!(nominator_state(&q), expected, "after updating pods");
+        // Nominate a pod that was deleted from the informer cache: nothing changes.
+        q.add_nominated_pod(&non_existent, Some(&NominatingInfo::override_node("node1")));
+        assert_eq!(
+            nominator_state(&q),
+            expected,
+            "after nominating a deleted pod"
+        );
+        // Nominate a pod that was already scheduled in the informer cache:
+        // nothing changes.
+        let mut scheduled_unbound = scheduled.clone();
+        scheduled_unbound.spec.as_mut().unwrap().node_name = None;
+        q.add_nominated_pod(
+            &scheduled_unbound,
+            Some(&NominatingInfo::override_node("node1")),
+        );
+        assert_eq!(
+            nominator_state(&q),
+            expected,
+            "after nominating a scheduled pod"
+        );
+        // Delete a nominated pod that doesn't have nominatedNodeName in the pod object.
+        q.delete_nominated_pod_if_exists(&high);
+        let expected = expected_state(&[("node1", &med), ("node5", &unsched)]);
+        assert_eq!(nominator_state(&q), expected, "after deleting pods");
+    }
+
+    /// `Delete` clears the nominator (scheduling_queue.go:1118) and an `Update`
+    /// of a queued pod without `nominatedNodeName` keeps reserving the node
+    /// recorded in memory (`UpdateNominatedPod`, nominator.go:110-136).
+    #[tokio::test]
+    async fn queue_delete_and_update_maintain_nominator() {
+        let q = new_test_queue(HashMap::new(), Arc::new(RealClock));
+        let pod = mk_pod_prio("p", "ns1", "p-uid", 0);
+        q.add(pod.clone());
+        q.add_nominated_pod(&pod, Some(&NominatingInfo::override_node("node1")));
+        let mut updated = pod.clone();
+        updated.metadata.resource_version = Some("2".to_string());
+        q.update(Some(&pod), &updated);
+        assert_eq!(q.nominated_pods_for_node("node1").len(), 1);
+        q.delete(&updated);
+        assert!(q.nominated_pods_for_node("node1").is_empty());
+        assert!(q.nominated_nodes().is_empty());
     }
 }
