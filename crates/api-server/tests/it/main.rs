@@ -283,6 +283,7 @@ mod put_metadata_inheritance_guard_test;
 mod pv_defaults_test;
 mod pv_volume_source_validation_test;
 mod pvc_default_volume_mode_test;
+mod authz_query_first_value_test;
 mod rbac_authorization_test;
 mod rbac_handler_test;
 mod rbac_store_test;
