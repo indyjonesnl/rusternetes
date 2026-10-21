@@ -10,6 +10,7 @@ pub mod authorization_reload;
 pub mod authorization_webhook;
 pub mod authorization_webhook_metrics;
 pub mod authorizer;
+pub mod node_graph_populator;
 pub mod request_scope;
 pub mod request_timeout;
 pub use rusternetes_admission_webhook as admission_webhook;
