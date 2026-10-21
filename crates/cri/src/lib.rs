@@ -62,6 +62,10 @@ pub enum CriError {
     /// The socket path was not a valid endpoint.
     #[error("invalid CRI endpoint: {0}")]
     Endpoint(#[source] tonic::transport::Error),
+
+    /// A request rejected client-side before it reached the runtime.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Result alias for CRI operations.
@@ -654,6 +658,42 @@ impl CriClient {
                 source: Box::new(source),
             })?;
         Ok(resp.into_inner())
+    }
+
+    /// `CheckpointContainer` (remote_runtime.go:812-856): checkpoint a container
+    /// to `location` on the node. A negative `timeout` is rejected; a timeout
+    /// above the request timeout (in whole seconds) is used for the deadline,
+    /// otherwise the request timeout is used and sent as the timeout.
+    pub async fn checkpoint_container(
+        &mut self,
+        container_id: &str,
+        location: &str,
+        timeout: i64,
+    ) -> Result<()> {
+        if timeout < 0 {
+            return Err(CriError::Invalid(
+                "CheckpointContainer requires the timeout value to be > 0".to_string(),
+            ));
+        }
+        let default_timeout = self.timeout.as_secs() as i64;
+        let (timeout, deadline) = if timeout > default_timeout {
+            (timeout, Duration::from_secs(timeout as u64))
+        } else {
+            (default_timeout, self.timeout)
+        };
+        let request = v1::CheckpointContainerRequest {
+            container_id: container_id.to_string(),
+            location: location.to_string(),
+            timeout,
+        };
+        self.runtime
+            .checkpoint_container(with_deadline(request, Some(deadline)))
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "CheckpointContainer",
+                source: Box::new(source),
+            })?;
+        Ok(())
     }
 
     /// Prepare a streaming `exec` session, returning the URL the kubelet's

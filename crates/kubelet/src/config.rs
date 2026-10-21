@@ -213,6 +213,29 @@ pub struct KubeletConfiguration {
     /// The first IP in this range is used for the kubernetes service
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_service_cidr: Option<String>,
+
+    /// `enableDebuggingHandlers` (types.go; nil defaults to true,
+    /// v1beta1/defaults.go:122-124). Gates `/run`, `/exec`, `/attach`,
+    /// `/portForward`, `/containerLogs`, `/runningpods`, `/debug/pprof`, `/logs/`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_debugging_handlers: Option<bool>,
+
+    /// `enableSystemLogHandler` (nil defaults to true, defaults.go:280-282).
+    /// Serves `/logs/`; only honoured when `enableDebuggingHandlers` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_system_log_handler: Option<bool>,
+}
+
+impl KubeletConfiguration {
+    /// `*obj.EnableDebuggingHandlers` after `SetDefaults_KubeletConfiguration`.
+    pub fn debugging_handlers_enabled(&self) -> bool {
+        self.enable_debugging_handlers.unwrap_or(true)
+    }
+
+    /// `*obj.EnableSystemLogHandler` after `SetDefaults_KubeletConfiguration`.
+    pub fn system_log_handler_enabled(&self) -> bool {
+        self.enable_system_log_handler.unwrap_or(true)
+    }
 }
 
 /// A zero `metav1.Duration` means "unset" and takes the upstream default.
@@ -363,6 +386,8 @@ impl Default for KubeletConfiguration {
             metrics_bind_port: None,
             log_level: None,
             cluster_service_cidr: None,
+            enable_debugging_handlers: None,
+            enable_system_log_handler: None,
         }
     }
 }

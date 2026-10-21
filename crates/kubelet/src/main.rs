@@ -467,6 +467,12 @@ async fn main() -> Result<()> {
     let eviction_manager = build_eviction_manager(&args, config_file.as_ref())?;
 
     // Build runtime configuration with proper precedence
+    // enableDebuggingHandlers / enableSystemLogHandler (nil => true, v1beta1
+    // defaults.go:122-124,280-282); read before the config file is consumed.
+    let enable_debugging_handlers = config_file
+        .as_ref()
+        .is_none_or(|c| c.debugging_handlers_enabled());
+
     let runtime_config = RuntimeConfig::build(
         args.root_dir,
         args.volume_dir,
@@ -729,6 +735,8 @@ async fn main() -> Result<()> {
         });
     }
 
+    // `getCheckpointsDir` (kubelet_getters.go:89): `<rootDir>/checkpoints`.
+    let checkpoints_dir = runtime_config.root_dir.join("checkpoints");
     let server_state = server::ServerState {
         node_name: runtime_config.node_name.clone(),
         storage: storage.clone(),
@@ -768,7 +776,18 @@ async fn main() -> Result<()> {
         let _keep_auth_stop = _auth_stop_tx;
         let app = Router::new()
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
-            .route(
+            .merge(server_metrics_endpoints::router())
+            .merge(server::auth_not_required_router(server_state.clone()));
+        // server.go:315-325 `InstallAuthRequiredHandlers` /
+        // `InstallDebuggingDisabledHandlers`: the debugging handlers (and
+        // /configz, /runningpods/) exist only when `EnableDebuggingHandlers`.
+        let checkpoint_enabled = server::checkpoint_enabled();
+        let app = if enable_debugging_handlers {
+            let run_state = streaming_server::RunState {
+                server: server_state.clone(),
+                checkpoints_dir: checkpoints_dir.clone(),
+            };
+            app.route(
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             )
@@ -802,15 +821,34 @@ async fn main() -> Result<()> {
                 "/containerLogs/:namespace/:pod/:container",
                 get(streaming_server::handle_container_logs),
             )
-            .merge(server_metrics_endpoints::router())
-            .merge(server::read_only_router(server_state));
+            .merge(server::running_pods_router(server_state))
+            .merge(streaming_server::run_router(run_state, checkpoint_enabled))
+        } else {
+            server::install_debugging_disabled_handlers(app)
+        };
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
-        let registered: Vec<String> = ["/metrics", "/configz"]
+        let registered: Vec<String> = ["/metrics"]
             .into_iter()
-            .chain(server::STREAMING_PATHS)
-            .chain(server::READ_ONLY_PATHS)
             .chain(server_metrics_endpoints::PATHS)
             .map(String::from)
+            .chain(
+                enable_debugging_handlers
+                    .then_some("/configz")
+                    .map(String::from),
+            )
+            .chain(
+                enable_debugging_handlers
+                    .then_some(server::STREAMING_PATHS)
+                    .into_iter()
+                    .flatten()
+                    .map(String::from),
+            )
+            .chain(server::READ_ONLY_PATHS.map(String::from))
+            .chain(server::debugging_registered_paths(
+                enable_debugging_handlers,
+                true,
+                checkpoint_enabled,
+            ))
             .collect();
         let app = server::install_statusz(app, registered);
         // server.go:312-314 `InstallAuthFilter`: wraps every route registered
@@ -819,7 +857,9 @@ async fn main() -> Result<()> {
         // server.go:1176 `ServeHTTP`: request metrics outside the auth filter.
         let app = server::install_metrics_filter(
             app,
-            server::MetricsBuckets::new_server(server::server_bucket_options()),
+            server::MetricsBuckets::new_server(server::server_bucket_options(
+                enable_debugging_handlers,
+            )),
             true,
         );
 
