@@ -946,6 +946,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // (handleBindingCycleError re-queues the pod upstream).
                 return Err(e);
             }
+        } else if let Some(msg) = diagnosis.scheduling_error.clone() {
+            // `schedulePod` returned a non-FitError error: `ScheduleOne`
+            // (schedule_one.go:161-164) logs "Error selecting node for pod"
+            // and skips PostFilter/preemption; `handleSchedulingFailure`
+            // records the error with reason SchedulerError (:1045-1068) and
+            // requeues with backoff (no UnschedulablePlugins).
+            error!("Error selecting node for pod {}/{}: {}", ns, name, msg);
+            self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
+                .await;
+            return Err(rusternetes_common::Error::Internal(msg));
         } else if let Some((node_name, victims)) = self
             .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
             .await
@@ -1512,6 +1522,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 Ok(snap) => Some(snap),
                 Err(e) => {
                     warn!("NodeVolumeLimits: failed to list volume objects: {}", e);
+                    // A plugin error aborts the cycle (schedule_one.go:496-497).
+                    diag.scheduling_error = Some(format!(
+                        "running {:?} filter plugin: {}",
+                        names::NODE_VOLUME_LIMITS,
+                        e
+                    ));
                     return None;
                 }
             }
@@ -1585,6 +1601,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .filter(|n| !n.is_empty())
             .and_then(|n| nodes.iter().position(|x| x.metadata.name == n));
         let mut nominated_failed = false;
+        let mut filter_error: Option<String> = None;
         // (node indexes to visit, stop after this many feasible, is the full search)
         let mut passes: Vec<(Vec<usize>, usize, bool)> = Vec::new();
         if let Some(idx) = nominated_idx {
@@ -1692,6 +1709,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                     "NodeVolumeLimits filter error on node {} for pod {}: {}",
                                     node.metadata.name, pod.metadata.name, m
                                 );
+                                // `findNodesThatPassFilters` (schedule_one.go:664-668):
+                                // an Error status aborts the whole search; the
+                                // message is wrapped by `RunFilterPlugins`
+                                // (framework.go:1058).
+                                filter_error = Some(format!(
+                                    "running {:?} filter plugin: {}",
+                                    names::NODE_VOLUME_LIMITS,
+                                    m
+                                ));
                                 return None;
                             }
                         }
@@ -1780,6 +1806,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     })
                 }
                 .await;
+                if let Some(e) = filter_error.take() {
+                    // `errCh.ReceiveError()` (schedule_one.go:703-706): the
+                    // error replaces the whole result; no feasible nodes.
+                    diag.scheduling_error = Some(e);
+                    return None;
+                }
                 if let Some(eval) = eval {
                     feasible.push(eval);
                     if feasible.len() >= to_find {
@@ -4095,6 +4127,64 @@ mod tests {
             ),
             other => panic!("expected an unschedulable outcome, got {other:?}"),
         }
+    }
+
+    /// `findNodesThatPassFilters` (schedule_one.go:664-668) + `ScheduleOne`
+    /// (:161-164): a Filter `Error` status (csi_test.go "ephemral volume not
+    /// owned") aborts the cycle as a scheduling error - not a FitError - so
+    /// the pod is neither reported unschedulable nor preempted for.
+    #[tokio::test]
+    async fn node_volume_limits_filter_error_aborts_cycle() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/n1", &cpu_node("n1", "4"))
+            .await
+            .unwrap();
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "abc", "namespace": "default", "uid": "12345"},
+            "spec": {"containers": [{"name": "main", "image": "busybox"}],
+                "volumes": [{"name": "xyz", "ephemeral": {}}]},
+            "status": {"phase": "Pending"}
+        }))
+        .unwrap();
+        let claim: rusternetes_common::resources::PersistentVolumeClaim =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "abc-xyz", "namespace": "default"},
+                "spec": {}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/pods/default/abc", &pod)
+            .await
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/default/abc-xyz", &claim)
+            .await
+            .unwrap();
+        // Take VolumeBinding's PreFilter/Filter out so that NodeVolumeLimits
+        // is the plugin that sees the un-owned claim (csi_test.go drives the
+        // plugin alone).
+        let mut profile = crate::profile::Profile::named(DEFAULT_SCHEDULER_NAME);
+        let mut plugins = profile.plugins.take().unwrap();
+        plugins.pre_filter.disabled =
+            vec![crate::framework_runtime::Plugin::new(names::VOLUME_BINDING)];
+        plugins.filter.disabled =
+            vec![crate::framework_runtime::Plugin::new(names::VOLUME_BINDING)];
+        profile.plugins = Some(plugins);
+        let profiles = crate::profile::Map::new_map(vec![profile]).unwrap();
+        let scheduler = Scheduler::new_with_profiles(Arc::clone(&storage), 60, profiles);
+        let err = scheduler
+            .try_schedule_pod("pods/default/abc")
+            .await
+            .expect_err("a filter Error must abort the cycle");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("running \"NodeVolumeLimits\" filter plugin")
+                && msg.contains("pod is not owner"),
+            "{msg}"
+        );
     }
 
     /// End-to-end through `run()`: a pod rejected by NodeResourcesFit waits in
