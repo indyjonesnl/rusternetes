@@ -851,7 +851,8 @@ pub const STORAGE_OBJECT_COUNT_TRACKER_HOOK: &str = "storage-object-count-tracke
 ///   `go c.StorageObjectCountTracker.RunUntil(stop)`.
 ///
 /// Upstream also registers `max-in-flight-filter` (:949-958) when APF is off;
-/// this server has no max-in-flight filter (#3664).
+/// the max-in-flight hook lives in `post_start_hooks::register_generic_server_hooks` (#3664);
+/// the max-in-flight filter itself is still absent.
 pub fn register_post_start_hooks<S: Storage + 'static>(
     registry: &crate::post_start_hooks::PostStartHooks,
     engine: Arc<FlowControlEngine<S>>,
