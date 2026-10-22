@@ -110,8 +110,8 @@ const TERMINAL_FINALIZE_ERROR_THRESHOLD: u32 = 3;
 /// `runtimeRequestTimeout` and image pulls run unbounded-with-progress. 4 min
 /// comfortably covers a cold pull while still bounding a genuinely wedged call.
 const POD_START_TIMEOUT: Duration = Duration::from_secs(240);
-const ACTIVE_DEADLINE_REASON: &str = "DeadlineExceeded";
-const ACTIVE_DEADLINE_MESSAGE: &str =
+pub(crate) const ACTIVE_DEADLINE_REASON: &str = "DeadlineExceeded";
+pub(crate) const ACTIVE_DEADLINE_MESSAGE: &str =
     "Pod was active on the node longer than the specified deadline";
 
 /// Backoff delay before re-attempting termination of a terminal pod whose
@@ -142,7 +142,7 @@ fn preserved_start_time(
     prior.unwrap_or(now)
 }
 
-fn active_deadline_elapsed(
+pub(crate) fn active_deadline_elapsed(
     status: Option<&PodStatus>,
     deadline_seconds: i64,
     now: chrono::DateTime<chrono::Utc>,
@@ -3198,31 +3198,50 @@ impl Kubelet {
         if let Some(ref spec) = pod.spec {
             if let Some(deadline) = spec.active_deadline_seconds {
                 if let Some(ref status) = pod.status {
-                    if let Some(elapsed) =
-                        active_deadline_elapsed(Some(status), deadline, chrono::Utc::now())
+                    // activeDeadlineHandler.ShouldEvict via generateAPIPodStatus
+                    // (kubelet_pods.go:1928-1936; active_deadline.go:70).
+                    if let Some(evict) =
+                        crate::pod_status::active_deadline_should_evict(pod, chrono::Utc::now())
                     {
                         info!(
-                            "Pod {}/{} exceeded activeDeadlineSeconds ({}s >= {}s)",
-                            namespace, pod_name, elapsed, deadline
+                            "Pod {}/{} exceeded activeDeadlineSeconds ({}s)",
+                            namespace, pod_name, deadline
                         );
                         let key = build_key("pods", Some(namespace), pod_name);
                         let mut failed_pod = pod.clone();
-                        if let Some(ref mut s) = failed_pod.status {
-                            s.phase = Some(Phase::Failed);
-                            s.reason = Some(ACTIVE_DEADLINE_REASON.to_string());
-                            s.message = Some(ACTIVE_DEADLINE_MESSAGE.to_string());
-                            s.conditions = Some(Self::failed_pod_conditions());
-                            if let Some(ref mut cs) = s.container_statuses {
+                        let not_ready = |statuses: &Option<Vec<ContainerStatus>>| {
+                            statuses.clone().map(|mut cs| {
                                 for c in cs.iter_mut() {
                                     c.ready = false;
                                 }
-                            }
-                            if let Some(ref mut ics) = s.init_container_statuses {
-                                for ic in ics.iter_mut() {
-                                    ic.ready = false;
-                                }
-                            }
-                        }
+                                cs
+                            })
+                        };
+                        failed_pod.status = Some(crate::pod_status::generate_api_pod_status(
+                            pod,
+                            crate::pod_status::ApiPodStatusInput {
+                                phase: Phase::Failed,
+                                message: None,
+                                reason: None,
+                                host_ip: status.host_ip.clone(),
+                                host_ips: status.host_i_ps.clone(),
+                                pod_ip: status.pod_ip.clone(),
+                                pod_ips: status.pod_i_ps.clone(),
+                                conditions: Self::failed_pod_conditions(),
+                                container_statuses: not_ready(&status.container_statuses),
+                                init_container_statuses: not_ready(&status.init_container_statuses),
+                                ephemeral_container_statuses: status
+                                    .ephemeral_container_statuses
+                                    .clone(),
+                                qos_class: status.qos_class.clone(),
+                                start_time: preserved_start_time(
+                                    status.start_time,
+                                    chrono::Utc::now(),
+                                ),
+                                should_evict: Some(evict),
+                            },
+                        ));
+                        self.apply_host_ips_to_pod(&mut failed_pod).await;
                         let _ = self.storage.update_status(&key, &failed_pod).await;
                         // Stop the pod
                         if self.runtime.is_pod_running(pod).await.unwrap_or(false) {
@@ -3827,6 +3846,7 @@ impl Kubelet {
                                     ephemeral_container_statuses,
                                     qos_class: Some(qos),
                                     start_time,
+                                    should_evict: None,
                                 },
                             ));
                             self.apply_host_ips_to_pod(&mut new_pod).await;
@@ -4239,6 +4259,7 @@ impl Kubelet {
                             ephemeral_container_statuses,
                             qos_class: Some(qos),
                             start_time,
+                            should_evict: None,
                         },
                     ));
                     self.apply_host_ips_to_pod(&mut new_pod).await;
@@ -5574,6 +5595,7 @@ impl Kubelet {
                 ephemeral_container_statuses: None,
                 qos_class: Some(qos),
                 start_time,
+                should_evict: None,
             },
         )
     }
@@ -5662,6 +5684,7 @@ impl Kubelet {
                 .and_then(|s| s.ephemeral_container_statuses.clone()),
             qos_class: Some(qos),
             start_time: preserved_start_time(prior.and_then(|s| s.start_time), chrono::Utc::now()),
+            should_evict: None,
         };
         new_pod.status = Some(crate::pod_status::generate_api_pod_status(new_pod, input));
         self.apply_host_ips_to_pod(new_pod).await;
@@ -5693,6 +5716,7 @@ impl Kubelet {
                     ephemeral_container_statuses: None,
                     qos_class: None,
                     start_time: chrono::Utc::now(),
+                    should_evict: None,
                 },
             ));
         }
@@ -5769,6 +5793,7 @@ impl Kubelet {
                     prior_status.and_then(|status| status.start_time),
                     chrono::Utc::now(),
                 ),
+                should_evict: None,
             },
         )
     }
