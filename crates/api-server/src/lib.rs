@@ -477,6 +477,8 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    // This entry point never enables APF (no `--enable-priority-and-fairness`).
+    post_start_hooks::register_generic_server_hooks(post_start_hooks::global(), false);
     let crd_controllers = Default::default();
     startup::register_post_start_hooks(
         storage.clone(),

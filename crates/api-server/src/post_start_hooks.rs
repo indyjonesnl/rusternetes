@@ -162,6 +162,53 @@ pub fn spawn_starting_hook(
     spawn_starting_hook_with(global(), name, start)
 }
 
+/// `genericApiServerHookName` (staging/src/k8s.io/apiserver/pkg/server/config.go:900).
+pub const GENERIC_APISERVER_START_INFORMERS_HOOK: &str = "generic-apiserver-start-informers";
+/// `NewInformerSyncHealthz(...).Name()` (server/healthz/healthz.go `informerSync`),
+/// added with `AddReadyzChecks` (config.go:912-917).
+pub const INFORMER_SYNC_CHECK: &str = "informer-sync";
+/// server/options/admission.go:169 `AddPostStartHook`.
+pub const ADMISSION_INITIALIZER_HOOK: &str = "start-apiserver-admission-initializer";
+/// `maxInFlightFilterHookName` (server/config.go:949-958).
+pub const MAX_IN_FLIGHT_FILTER_HOOK: &str = "max-in-flight-filter";
+
+/// The hooks `GenericAPIServer.New` / `AdmissionOptions.ApplyTo` register that
+/// are not owned by any one subsystem (#3664). Each only starts background
+/// work and returns nil, so each finishes at once and is never fatal.
+///
+/// Lives here (not in `startup`) because `main.rs` and `lib.rs` each compile
+/// their own `post_start_hooks`/`global()`, and the registry that `/readyz`
+/// reads is the one in the same crate as the router.
+///
+/// - `generic-apiserver-start-informers` (config.go:899-917):
+///   `c.SharedInformerFactory.Start(stop)` plus the `informer-sync` readyz
+///   check (`InformerSyncHealthz`: every started informer `HasSynced`). This
+///   server has no shared informer factory -- handlers read storage directly --
+///   so there is nothing to start and nothing that can be unsynced; the hook
+///   and the check are registered so `/readyz?verbose` and
+///   `/healthz/poststarthook/<name>` expose the upstream surface. Deliberate
+///   deviation: the check is vacuously ok.
+/// - `start-apiserver-admission-initializer` (options/admission.go:151-170):
+///   `discoveryRESTMapper.Reset()` every 30s for the admission plugins'
+///   REST mapper. Admission here resolves resources without a cached
+///   discovery mapper, so there is no cache to reset (deliberate deviation).
+/// - `max-in-flight-filter` (config.go:949-958): registered only when APF is
+///   off (`c.FlowControl == nil`); starts the executing-request watermark
+///   flush (`StartMaxInFlightWatermarkMaintenance`, filters/maxinflight.go:91-105).
+///   This server has no max-in-flight filter feeding the watermark (follow-up),
+///   so the loop reports zeros; with APF on, `priority-and-fairness-filter`
+///   owns the same flush.
+pub fn register_generic_server_hooks(registry: &PostStartHooks, apf_enabled: bool) {
+    spawn_starting_hook_with(registry, GENERIC_APISERVER_START_INFORMERS_HOOK, || {});
+    registry.register_boot_check(INFORMER_SYNC_CHECK, || Ok(()));
+    spawn_starting_hook_with(registry, ADMISSION_INITIALIZER_HOOK, || {});
+    if !apf_enabled {
+        spawn_starting_hook_with(registry, MAX_IN_FLIGHT_FILTER_HOOK, || {
+            crate::apiserver_request_metrics::start_watermark_maintenance();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +249,49 @@ mod tests {
         .unwrap();
         assert_eq!(rx.recv().unwrap(), "x/y: boom");
         assert_eq!(reg.check("x/y"), Some(Err("not finished")));
+    }
+
+    async fn finished(reg: &PostStartHooks, name: &str) -> bool {
+        for _ in 0..300 {
+            if reg.check(name) == Some(Ok(())) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// server/config_test.go expects `generic-apiserver-start-informers`,
+    /// `start-apiserver-admission-initializer` and (APF off)
+    /// `max-in-flight-filter` as `poststarthook/<name>` checks, plus the
+    /// `informer-sync` readyz check.
+    #[tokio::test]
+    async fn apf_off_registers_all_three_hooks_and_informer_sync() {
+        let reg = PostStartHooks::new();
+        register_generic_server_hooks(&reg, false);
+        for name in [
+            "generic-apiserver-start-informers",
+            "start-apiserver-admission-initializer",
+            "max-in-flight-filter",
+        ] {
+            assert!(finished(&reg, name).await, "{name} not registered/finished");
+        }
+        let names: Vec<_> = reg.checks().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&"poststarthook/max-in-flight-filter".to_string()));
+        assert_eq!(
+            reg.boot_checks(),
+            vec![("informer-sync".to_string(), Ok(()))]
+        );
+    }
+
+    /// config.go:937-958: with APF on the watermark hook is
+    /// `priority-and-fairness-filter`, never `max-in-flight-filter`.
+    #[tokio::test]
+    async fn apf_on_omits_max_in_flight_filter() {
+        let reg = PostStartHooks::new();
+        register_generic_server_hooks(&reg, true);
+        assert!(finished(&reg, "generic-apiserver-start-informers").await);
+        assert!(finished(&reg, "start-apiserver-admission-initializer").await);
+        assert_eq!(reg.check("max-in-flight-filter"), None);
     }
 }
