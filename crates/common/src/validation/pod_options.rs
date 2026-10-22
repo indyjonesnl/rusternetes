@@ -60,6 +60,9 @@ pub struct PodValidationOptions {
     pub old_pod_violates_legacy_match_label_keys_validation: bool,
     /// `AllowRelaxedDNSSearchValidation`.
     pub allow_relaxed_dns_search_validation: bool,
+    /// `AllowOnlyRecursiveSELinuxChangePolicy`: `seLinuxChangePolicy` may only
+    /// be `Recursive` (gate `SELinuxMount` off and the old spec has no policy).
+    pub allow_only_recursive_se_linux_change_policy: bool,
     /// `AllowTaintTolerationComparisonOperators`.
     pub allow_taint_toleration_comparison_operators: bool,
     /// `AllowPodLifecycleSleepActionZeroValue`: a `sleep` lifecycle action may
@@ -108,6 +111,9 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         use_relaxed_environment_variable_validation(spec, old_spec);
     // util.go:440 `useAllowEnvFilesValidation(oldPodSpec)`.
     opts.allow_env_files_validation = use_allow_env_files_validation(old_spec);
+    // util.go:443 `useOnlyRecursiveSELinuxChangePolicy(oldPodSpec)`.
+    opts.allow_only_recursive_se_linux_change_policy =
+        use_only_recursive_se_linux_change_policy(old_spec);
     // util.go:444 `allowTaintTolerationComparisonOperators(oldPodSpec)`.
     opts.allow_taint_toleration_comparison_operators =
         allow_taint_toleration_comparison_operators(old_spec);
@@ -444,6 +450,22 @@ fn pod_lifecycle_sleep_action_zero_value_in_use(spec: &PodSpec) -> bool {
             .iter()
             .flatten()
             .any(|c| zero(&c.lifecycle))
+}
+
+/// `seLinuxChangePolicyInUse` (util.go:1628-1633).
+fn se_linux_change_policy_in_use(spec: Option<&PodSpec>) -> bool {
+    spec.and_then(|s| s.security_context.as_ref())
+        .is_some_and(|sc| sc.se_linux_change_policy.is_some())
+}
+
+/// `useOnlyRecursiveSELinuxChangePolicy` (util.go:1635-1650): with the
+/// `SELinuxMount` gate on every policy is allowed; otherwise only `Recursive`,
+/// unless the old spec already carries any policy.
+fn use_only_recursive_se_linux_change_policy(old_spec: Option<&PodSpec>) -> bool {
+    if enabled(Feature::SELinuxMount) {
+        return false;
+    }
+    !se_linux_change_policy_in_use(old_spec)
 }
 
 /// `hasNonLocalProjectedTokenPath` (util.go:393-408).
@@ -827,5 +849,62 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
+}
+
+    fn selinux_spec(policy: &str) -> PodSpec {
+        spec(json!({"securityContext": {"seLinuxChangePolicy": policy}}))
+    }
+
+    /// `useOnlyRecursiveSELinuxChangePolicy` (util.go:1635): `SELinuxMount` on
+    /// allows everything; off, only Recursive unless the old spec has a policy.
+    #[test]
+    #[serial_test::serial]
+    fn allow_only_recursive_se_linux_change_policy_option() {
+        use crate::feature_gates::{with_feature, Feature};
+        let g = with_feature(Feature::SELinuxMount, true);
+        assert!(!opts(None).allow_only_recursive_se_linux_change_policy);
+        assert!(!opts(Some(&spec(json!({})))).allow_only_recursive_se_linux_change_policy);
+        drop(g);
+        let _g = with_feature(Feature::SELinuxMount, false);
+        assert!(opts(None).allow_only_recursive_se_linux_change_policy);
+        assert!(opts(Some(&spec(json!({})))).allow_only_recursive_se_linux_change_policy);
+        assert!(
+            opts(Some(&spec(json!({"securityContext": {}}))))
+                .allow_only_recursive_se_linux_change_policy
+        );
+        for p in ["Recursive", "MountOption"] {
+            assert!(
+                !opts(Some(&selinux_spec(p))).allow_only_recursive_se_linux_change_policy,
+                "{p}"
+            );
+        }
+    }
+
+    /// `TestValidateSELinuxChangePolicy` cases (validation_test.go:27884).
+    #[test]
+    fn se_linux_change_policy_rule() {
+        use crate::validation::pod::validate_pod_spec_with_options;
+        let errs = |policy: &str, only_recursive: bool| -> Vec<String> {
+            let o = PodValidationOptions {
+                allow_only_recursive_se_linux_change_policy: only_recursive,
+                ..Default::default()
+            };
+            validate_pod_spec_with_options(&selinux_spec(policy), &Path::new("spec"), &o)
+                .iter()
+                .map(|e| e.to_string())
+                .filter(|e| e.contains("seLinuxChangePolicy"))
+                .collect()
+        };
+        assert!(errs("Recursive", true).is_empty());
+        assert!(errs("Recursive", false).is_empty());
+        assert!(errs("MountOption", false).is_empty());
+        assert_eq!(
+            errs("MountOption", true),
+            ["spec.securityContext.seLinuxChangePolicy: Unsupported value: \"MountOption\": supported values: \"Recursive\""]
+        );
+        assert_eq!(
+            errs("InvalidValue", false),
+            ["spec.securityContext.seLinuxChangePolicy: Unsupported value: \"InvalidValue\": supported values: \"MountOption\", \"Recursive\""]
+        );
     }
 }
