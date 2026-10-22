@@ -3,7 +3,8 @@
 //! paths (stale-incarnation exists-checks, same-name sync races) run in a unit
 //! test with no containerd (#1115).
 //!
-//! Implemented: the list RPCs plus the sandbox/container lifecycle RPCs
+//! Implemented: the `ImageService` (`ListImages`, `ImageStatus`, `PullImage`,
+//! `RemoveImage`, `ImageFsInfo`), the list RPCs plus the sandbox/container lifecycle RPCs
 //! (`RunPodSandbox`, `StopPodSandbox`, `RemovePodSandbox`, `CreateContainer`,
 //! `StartContainer`, `StopContainer`, `RemoveContainer`). Every other RPC
 //! answers `UNIMPLEMENTED`, like a runtime that lacks the feature.
@@ -29,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 use crate::v1;
+use crate::v1::image_service_server::{ImageService, ImageServiceServer};
 use crate::v1::runtime_service_server::{RuntimeService, RuntimeServiceServer};
 
 /// Shared, mutable runtime state a test can seed and inspect.
@@ -39,6 +41,8 @@ struct FakeState {
     next_id: u64,
     /// RPC names in call order (upstream `FakeRuntimeService.Called`).
     called: Vec<String>,
+    /// Image store (upstream `FakeImageService.Images`), keyed by image name.
+    images: HashMap<String, v1::Image>,
 }
 
 impl FakeState {
@@ -126,9 +130,11 @@ impl FakeCri {
         let listener = tokio::net::UnixListener::bind(socket).expect("bind fake CRI socket");
         let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
         let svc = RuntimeServiceServer::new(self.clone());
+        let img = ImageServiceServer::new(self.clone());
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(svc)
+                .add_service(img)
                 .serve_with_incoming(incoming)
                 .await;
         })
@@ -370,5 +376,82 @@ fake_runtime_service! {
         list_pod_sandbox_metrics: ListPodSandboxMetricsRequest => ListPodSandboxMetricsResponse,
         runtime_config: RuntimeConfigRequest => RuntimeConfigResponse,
         update_pod_sandbox_resources: UpdatePodSandboxResourcesRequest => UpdatePodSandboxResourcesResponse,
+    }
+}
+
+/// Image service, ported from upstream `FakeImageService`
+/// (`staging/src/k8s.io/cri-api/pkg/apis/testing/fake_image_service.go`:
+/// `ListImages`, `ImageStatus`, `PullImage`, `RemoveImage`, `ImageFsInfo`).
+/// The image ID is the image name, as in `PullImage`/`makeFakeImage`; an
+/// absent image yields an `ImageStatusResponse` with no image.
+#[tonic::async_trait]
+impl ImageService for FakeCri {
+    async fn list_images(
+        &self,
+        request: Request<v1::ListImagesRequest>,
+    ) -> Result<Response<v1::ListImagesResponse>, Status> {
+        let filter = request.into_inner().filter.and_then(|f| f.image);
+        let mut st = self.state.lock().unwrap();
+        st.record("ListImages");
+        let images = st
+            .images
+            .values()
+            .filter(|i| {
+                filter
+                    .as_ref()
+                    .is_none_or(|f| i.repo_tags.contains(&f.image))
+            })
+            .cloned()
+            .collect();
+        Ok(Response::new(v1::ListImagesResponse { images }))
+    }
+
+    async fn image_status(
+        &self,
+        request: Request<v1::ImageStatusRequest>,
+    ) -> Result<Response<v1::ImageStatusResponse>, Status> {
+        let spec = request.into_inner().image.unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        st.record("ImageStatus");
+        Ok(Response::new(v1::ImageStatusResponse {
+            image: st.images.get(&spec.image).cloned(),
+            ..Default::default()
+        }))
+    }
+
+    async fn pull_image(
+        &self,
+        request: Request<v1::PullImageRequest>,
+    ) -> Result<Response<v1::PullImageResponse>, Status> {
+        let spec = request.into_inner().image.unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        st.record("PullImage");
+        let id = spec.image.clone();
+        st.images.entry(id.clone()).or_insert_with(|| v1::Image {
+            id: id.clone(),
+            repo_tags: vec![spec.image.clone()],
+            spec: Some(spec),
+            ..Default::default()
+        });
+        Ok(Response::new(v1::PullImageResponse { image_ref: id }))
+    }
+
+    async fn remove_image(
+        &self,
+        request: Request<v1::RemoveImageRequest>,
+    ) -> Result<Response<v1::RemoveImageResponse>, Status> {
+        let spec = request.into_inner().image.unwrap_or_default();
+        let mut st = self.state.lock().unwrap();
+        st.record("RemoveImage");
+        st.images.remove(&spec.image);
+        Ok(Response::new(v1::RemoveImageResponse {}))
+    }
+
+    async fn image_fs_info(
+        &self,
+        _request: Request<v1::ImageFsInfoRequest>,
+    ) -> Result<Response<v1::ImageFsInfoResponse>, Status> {
+        self.state.lock().unwrap().record("ImageFsInfo");
+        Ok(Response::new(v1::ImageFsInfoResponse::default()))
     }
 }

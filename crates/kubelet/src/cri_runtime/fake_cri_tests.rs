@@ -241,3 +241,88 @@ async fn garbage_collect_containers_removes_only_undesired_sandboxes() {
     assert!(rt.container_exists("uid-keep", "app").await);
     assert!(!rt.container_exists("uid-gone", "app").await);
 }
+
+// ---- start_container against the fake (#3884) ------------------------------
+//
+// `CriContainerRuntime::start_container` is the create+start path
+// `kuberuntime_manager.go: start()` drives. Upstream's own coverage of it
+// (`kuberuntime_container_test.go`, `kuberuntime_manager_test.go`) runs on
+// `FakeRuntimeService` + `FakeImageService`; the fake image service lets this
+// path (EnsureImageExists -> CreateContainer -> StartContainer) run here too.
+
+fn app_container() -> rusternetes_common::resources::pod::Container {
+    serde_json::from_value(serde_json::json!({"name": "app", "image": "busybox"})).unwrap()
+}
+
+async fn run_sandbox_only(cri: &mut CriClient, p: &rusternetes_common::resources::Pod) {
+    cri.run_pod_sandbox(sandbox_config(p, "/tmp/fake-logs"), "")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn start_container_creates_and_starts_once_and_pulls_image() {
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    let p = pod("ns", "web-0", "uid-1");
+    run_sandbox_only(&mut cri, &p).await;
+
+    rt.start_container(&p, &app_container(), &Default::default(), None, None, None)
+        .await
+        .unwrap();
+
+    assert!(rt.container_exists("uid-1", "app").await);
+    assert!(rt.is_container_running("uid-1", "app").await.unwrap());
+    let called = fake.called();
+    for rpc in [
+        "ImageStatus",
+        "PullImage",
+        "CreateContainer",
+        "StartContainer",
+    ] {
+        assert!(
+            called.iter().any(|c| c == rpc),
+            "{rpc} missing in {called:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn start_container_twice_same_name_hits_name_reservation() {
+    // The double-start `computePodActions` avoids via `container_exists`
+    // (#1112): the second create collides on the runtime's name index.
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    let p = pod("ns", "web-0", "uid-1");
+    run_sandbox_only(&mut cri, &p).await;
+    let c = app_container();
+    rt.start_container(&p, &c, &Default::default(), None, None, None)
+        .await
+        .unwrap();
+    let err = rt
+        .start_container(&p, &c, &Default::default(), None, None, None)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("AlreadyExists"), "{err:?}");
+    assert_eq!(fake.containers().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_same_name_start_container_exactly_one_wins() {
+    // Without the per-pod sync lock (`Kubelet::sync_pod`'s `pod_sync_locks`
+    // skip path), two concurrent syncs race here and one loses with a
+    // name-reserved error (the 409 storm of #1014). `SyncLocks` itself is
+    // unit-tested in `sync_locks.rs`; this pins the runtime side of the race.
+    let fake = FakeCri::new();
+    let (mut cri, rt, _tmp) = setup_client(&fake).await;
+    let p = pod("ns", "web-0", "uid-1");
+    run_sandbox_only(&mut cri, &p).await;
+    let c = app_container();
+    let vp = Default::default();
+    let (a, b) = tokio::join!(
+        rt.start_container(&p, &c, &vp, None, None, None),
+        rt.start_container(&p, &c, &vp, None, None, None),
+    );
+    assert_eq!(a.is_ok() as u8 + b.is_ok() as u8, 1, "{a:?} / {b:?}");
+    assert_eq!(fake.containers().len(), 1);
+}
