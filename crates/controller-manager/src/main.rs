@@ -152,6 +152,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     attach_detach_disable_force_detach_on_timeout: bool,
 
+    /// `--attach-detach-reconcile-sync-period`
+    /// (`ReconcilerSyncLoopPeriod`, default 60s; must be at least 1s).
+    #[arg(long, default_value_t = 60)]
+    attach_detach_reconcile_sync_period_seconds: u64,
+
+    /// `--disable-attach-detach-reconcile-sync`.
+    #[arg(long, default_value_t = false)]
+    disable_attach_detach_reconcile_sync: bool,
+
     /// `--default-fstype` of external-provisioner, for every `--csi-provisioner`.
     #[arg(long, default_value = "")]
     csi_default_fstype: String,
@@ -1324,7 +1333,11 @@ async fn main() -> Result<()> {
                 ))
                 .with_disable_force_detach_on_timeout(
                     args.attach_detach_disable_force_detach_on_timeout,
-                ),
+                )
+                .with_reconciler_sync_period(std::time::Duration::from_secs(
+                    args.attach_detach_reconcile_sync_period_seconds,
+                ))
+                .with_disable_reconciliation_sync(args.disable_attach_detach_reconcile_sync),
         );
         spawn_controller!("AttachDetach controller", leader_elector, {
             let controller = attach_detach.clone();
