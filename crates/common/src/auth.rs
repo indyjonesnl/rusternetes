@@ -21,7 +21,23 @@ pub struct KubernetesClaims {
     /// Bound Secret (`pkg/serviceaccount/claims.go` `privateClaims.Kubernetes.Secret`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<KubeRef>,
+    /// `privateClaims.Kubernetes.WarnAfter` (`pkg/serviceaccount/claims.go:62`,
+    /// a `jwt.NumericDate`: Unix seconds). Set on pod-bound tokens whose
+    /// expiration was extended (`--service-account-extend-token-expiration`):
+    /// the token keeps working after it, but is reported stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnafter: Option<i64>,
 }
+
+/// `serviceaccount.WarnOnlyBoundTokenExpirationSeconds`
+/// (`pkg/serviceaccount/claims.go:39`): the injected bound token expiration
+/// that triggers monitoring of its time-bound feature.
+pub const WARN_ONLY_BOUND_TOKEN_EXPIRATION_SECONDS: i64 = 60 * 60 + 7;
+
+/// `serviceaccount.ExpirationExtensionSeconds` (`claims.go:42`): extended
+/// expiration of the tokens involved in the safe rollout of the time-bound
+/// feature (one year).
+pub const EXPIRATION_EXTENSION_SECONDS: i64 = 24 * 365 * 60 * 60;
 
 /// Name+UID reference used in kubernetes.io JWT claims
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -176,6 +192,7 @@ impl ServiceAccountClaims {
                 pod: None,
                 node: None,
                 secret: None,
+                warnafter: None,
             }),
             pod_name: None,
             pod_uid: None,
@@ -218,6 +235,11 @@ pub struct ServiceAccountOptions {
     /// (authentication.go:226). Independent of the other flags, so it does not
     /// count towards [`Self::is_empty`].
     pub lookup: bool,
+    /// `--service-account-extend-token-expiration` (authentication.go:464;
+    /// default true, authentication.go:227): extend admission-injected bound
+    /// tokens up to a year. Independent of the other flags, so it does not
+    /// count towards [`Self::is_empty`].
+    pub extend_expiration: bool,
 }
 
 impl Default for ServiceAccountOptions {
@@ -230,6 +252,7 @@ impl Default for ServiceAccountOptions {
             max_expiration: None,
             jwks_uri: None,
             lookup: true,
+            extend_expiration: true,
         }
     }
 }
@@ -373,6 +396,11 @@ pub struct TokenManager {
     /// `--service-account-lookup` (`ServiceAccountLookup`, config.go:69);
     /// defaults to true.
     lookup: bool,
+    /// `--service-account-extend-token-expiration` (`TokenREST.extendExpiration`).
+    extend_expiration: bool,
+    /// `TokenREST.maxExtendedExpirationSeconds`
+    /// (`ServiceAccounts.MaxExtendedExpiration`, authentication.go:228).
+    max_extended_expiration_seconds: i64,
 }
 
 impl TokenManager {
@@ -390,6 +418,8 @@ impl TokenManager {
             max_token_expiration_seconds: 0,
             jwks_uri: None,
             lookup: true,
+            extend_expiration: true,
+            max_extended_expiration_seconds: EXPIRATION_EXTENSION_SECONDS,
         }
     }
 
@@ -413,6 +443,8 @@ impl TokenManager {
             max_token_expiration_seconds: 0,
             jwks_uri: None,
             lookup: true,
+            extend_expiration: true,
+            max_extended_expiration_seconds: EXPIRATION_EXTENSION_SECONDS,
         })
     }
 
@@ -429,6 +461,27 @@ impl TokenManager {
         }
         self.jwks_uri = opts.jwks_uri.clone().filter(|u| !u.is_empty());
         self.lookup = opts.lookup;
+        self.extend_expiration = opts.extend_expiration;
+        // completeServiceAccountOptions (options.go:349-356): warn on
+        // conflicting configuration.
+        if opts.extend_expiration {
+            if let Some(max) = opts.max_expiration.filter(|d| !d.is_zero()) {
+                if max.as_secs() < WARN_ONLY_BOUND_TOKEN_EXPIRATION_SECONDS as u64 {
+                    tracing::warn!(
+                        "service-account-extend-token-expiration is true, in order to correctly trigger safe transition logic, service-account-max-token-expiration must be set longer than {} seconds (currently {:?})",
+                        WARN_ONLY_BOUND_TOKEN_EXPIRATION_SECONDS,
+                        max
+                    );
+                }
+                if max.as_secs() < EXPIRATION_EXTENSION_SECONDS as u64 {
+                    tracing::warn!(
+                        "service-account-extend-token-expiration is true, enabling tokens valid up to {} seconds, which is longer than service-account-max-token-expiration set to {:?}",
+                        EXPIRATION_EXTENSION_SECONDS,
+                        max
+                    );
+                }
+            }
+        }
         self.max_token_expiration_seconds = opts
             .max_expiration
             .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
@@ -528,6 +581,43 @@ impl TokenManager {
             max
         } else {
             requested
+        }
+    }
+
+    /// `TokenREST.extendExpiration`.
+    pub fn extend_expiration(&self) -> bool {
+        self.extend_expiration
+    }
+
+    /// `TokenREST.maxExtendedExpirationSeconds`.
+    pub fn max_extended_expiration_seconds(&self) -> i64 {
+        self.max_extended_expiration_seconds
+    }
+
+    /// The expiration tweak of `TokenREST.Create` (token.go:228-237): safe
+    /// transition of projected service account tokens. Warn (instead of fail)
+    /// after the requested expiration, fail after the extended one. Only a
+    /// pod-bound token requesting exactly
+    /// [`WARN_ONLY_BOUND_TOKEN_EXPIRATION_SECONDS`] for audiences that are a
+    /// subset of the API audiences (`isKubeAudiences`) is extended.
+    ///
+    /// Returns `(expiration_seconds, warn_after_seconds)`; the latter is 0
+    /// when no extension applies (upstream's `warnAfter == 0`).
+    pub fn tweak_expiration(
+        &self,
+        requested: i64,
+        pod_bound: bool,
+        audiences: &[String],
+    ) -> (i64, i64) {
+        let kube_auds = audiences.iter().all(|a| self.api_audiences.contains(a));
+        if self.extend_expiration
+            && pod_bound
+            && requested == WARN_ONLY_BOUND_TOKEN_EXPIRATION_SECONDS
+            && kube_auds
+        {
+            (self.max_extended_expiration_seconds, requested)
+        } else {
+            (requested, 0)
         }
     }
 

@@ -293,6 +293,7 @@ mod attest {
                 pod: None,
                 node: None,
                 secret: None,
+                warnafter: None,
             }),
             pod_name: None,
             pod_uid: None,

@@ -572,6 +572,7 @@ impl ProjectedMounter {
                         uid: node_uid.clone().unwrap_or_default(),
                     }),
                 secret: None,
+                warnafter: None,
             }),
             pod_name: Some(self.pod_name.clone()),
             pod_uid: Some(self.pod.metadata.uid.clone()),

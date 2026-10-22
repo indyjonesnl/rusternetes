@@ -303,6 +303,21 @@ pub struct ServiceAccountArgs {
         require_equals = true
     )]
     pub service_account_lookup: bool,
+    /// Turns on projected service account expiration extension during token
+    /// generation, which helps safe transition from legacy token to bound
+    /// service account token feature. If enabled, admission injected tokens
+    /// are extended up to 1 year to prevent unexpected failure during
+    /// transition, ignoring service-account-max-token-expiration
+    /// (authentication.go:464-468; default true, authentication.go:227).
+    #[arg(
+        long = "service-account-extend-token-expiration",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub service_account_extend_token_expiration: bool,
 }
 
 fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, String> {
@@ -325,6 +340,7 @@ impl Default for ServiceAccountArgs {
             service_account_jwks_uri: None,
             // WithServiceAccounts: Lookup = true (authentication.go:226)
             service_account_lookup: true,
+            service_account_extend_token_expiration: true,
         }
     }
 }
@@ -339,6 +355,7 @@ impl ServiceAccountArgs {
             max_expiration: self.service_account_max_token_expiration,
             jwks_uri: self.service_account_jwks_uri.clone(),
             lookup: self.service_account_lookup,
+            extend_expiration: self.service_account_extend_token_expiration,
         }
     }
 }
@@ -644,6 +661,16 @@ mod service_account_args_tests {
             o.max_expiration,
             Some(std::time::Duration::from_secs(86400))
         );
+    }
+
+    /// `--service-account-extend-token-expiration` defaults to true
+    /// (authentication.go:227) and takes `=false` (a pflag bool).
+    #[test]
+    fn extend_token_expiration_flag_defaults_true() {
+        let o = |a: &[&str]| Wrap::try_parse_from(a).unwrap().sa.to_options();
+        assert!(o(&["x"]).extend_expiration);
+        assert!(ServiceAccountArgs::default().to_options().extend_expiration);
+        assert!(!o(&["x", "--service-account-extend-token-expiration=false"]).extend_expiration);
     }
 
     /// `--service-account-lookup` defaults to true (authentication.go:226) and

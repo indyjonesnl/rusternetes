@@ -297,6 +297,7 @@ pub async fn create_token_request(
             pod: None,
             node: None,
             secret: None,
+            warnafter: None,
         }),
         pod_name: None,
         pod_uid: None,
@@ -410,6 +411,32 @@ pub async fn create_token_request(
             )));
         }
     }
+
+    // Tweak expiration for safe transition of projected service account token
+    // (token.go:228-237): warn (instead of fail) after the requested
+    // expiration, fail after the extended one; only for pod-bound tokens.
+    let (exp_seconds, warn_after) = state.token_manager.tweak_expiration(
+        expiration_seconds,
+        claims.pod_name.is_some(),
+        &claims.aud,
+    );
+    // `token.Claims` (claims.go:125-127): warnafter = now + requested expiry.
+    let expiration_timestamp = if warn_after != 0 {
+        let ext = now
+            .checked_add_signed(chrono::Duration::seconds(exp_seconds))
+            .ok_or_else(|| {
+                rusternetes_common::Error::Internal(
+                    "Failed to calculate expiration time".to_string(),
+                )
+            })?;
+        claims.exp = ext.timestamp();
+        if let Some(k) = claims.kubernetes.as_mut() {
+            k.warnafter = Some(now.timestamp() + warn_after);
+        }
+        ext
+    } else {
+        expiration_timestamp
+    };
 
     let token = state.token_manager.generate_token(claims)?;
 
