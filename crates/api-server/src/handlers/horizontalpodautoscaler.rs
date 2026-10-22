@@ -81,6 +81,7 @@ const V1_PATCH_CONVERSION: crate::endpoints::handlers::RequestVersionConversion 
     crate::endpoints::handlers::RequestVersionConversion {
         to_request_version: hpa_v2_to_v1,
         from_request_version: |_stored, patched| hpa_v1_to_v2(&patched),
+        strict_decode: None,
     };
 
 /// A request body in the shape the scope decodes. An `autoscaling/v1` body is
