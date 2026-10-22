@@ -1628,6 +1628,13 @@ impl VolumeManager {
                         &spec,
                         pod,
                         "",
+                        // `og.recorder`: the kubelet's event recorder over
+                        // the same API the volumes are read through.
+                        self.storage.as_ref().map(|s| {
+                            crate::volume_plugins::plugin::MounterRecorder(
+                                rusternetes_storage::EventRecorder::new(s.clone()),
+                            )
+                        }),
                     )
                     .await?;
                 // Keep an existing `SELinuxLabeled` across a re-mount of the

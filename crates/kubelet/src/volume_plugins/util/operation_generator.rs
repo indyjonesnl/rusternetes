@@ -465,9 +465,11 @@ pub async fn mount_volume(
     pod: &Pod,
     device_path: &str,
 ) -> anyhow::Result<String> {
-    Ok(mount_volume_with_attributes(mgr, spec, pod, device_path)
-        .await?
-        .0)
+    Ok(
+        mount_volume_with_attributes(mgr, spec, pod, device_path, None)
+            .await?
+            .0,
+    )
 }
 
 /// [`mount_volume`], also returning `mounter.GetAttributes()` read after
@@ -477,6 +479,7 @@ pub async fn mount_volume_with_attributes(
     spec: &Spec<'_>,
     pod: &Pod,
     device_path: &str,
+    recorder: Option<crate::volume_plugins::plugin::MounterRecorder>,
 ) -> anyhow::Result<(String, crate::volume_plugins::plugin::Attributes)> {
     let plugin = mgr.find_plugin_by_spec(spec)?;
     let mounter = plugin.new_mounter(spec, pod).await?;
@@ -535,14 +538,15 @@ pub async fn mount_volume_with_attributes(
         );
     }
 
-    mounter
-        .set_up_with(&mounter_args_for(
-            mgr,
-            spec,
-            pod,
-            &crate::volume_plugins::util::selinux::Translator,
-        )?)
-        .await?;
+    let mut args = mounter_args_for(
+        mgr,
+        spec,
+        pod,
+        &crate::volume_plugins::util::selinux::Translator,
+    )?;
+    // `Recorder: og.recorder` (`operation_generator.go:587`).
+    args.recorder = recorder;
+    mounter.set_up_with(&args).await?;
     Ok((mounter.get_path(), mounter.get_attributes()))
 }
 
@@ -1050,6 +1054,9 @@ pub(crate) fn mounter_args_for(
             q.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64
         }),
         selinux_label,
+        // `Recorder: og.recorder`: set by the caller that owns a recorder
+        // ([`mount_volume_with_attributes`]).
+        recorder: None,
     })
 }
 
