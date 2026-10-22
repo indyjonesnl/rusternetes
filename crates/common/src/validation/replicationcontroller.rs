@@ -14,7 +14,7 @@ use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_nonnegative_field, validate_object_meta,
     validate_object_meta_update,
 };
-use crate::validation::podtemplate::validate_pod_template_spec;
+use crate::validation::podtemplate::validate_pod_template_spec_with_old;
 
 /// Validate a `ReplicationControllerSpec`. Mirrors upstream
 /// `ValidateReplicationControllerSpec`: non-negative `replicas` /
@@ -22,6 +22,18 @@ use crate::validation::podtemplate::validate_pod_template_spec;
 /// it.
 pub fn validate_replication_controller_spec(
     spec: &ReplicationControllerSpec,
+    fld_path: &Path,
+) -> ErrorList {
+    validate_replication_controller_spec_with_old(spec, None, fld_path)
+}
+
+/// [`validate_replication_controller_spec`] with the pod validation options
+/// derived from the old RC's template
+/// (`GetValidationOptionsFromPodTemplate(newRc.Spec.Template,
+/// oldRc.Spec.Template)`, pkg/registry/core/replicationcontroller/strategy.go:160).
+pub fn validate_replication_controller_spec_with_old(
+    spec: &ReplicationControllerSpec,
+    old: Option<&ReplicationControllerSpec>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -80,8 +92,9 @@ pub fn validate_replication_controller_spec(
 
     // `ValidatePodTemplateSpecForRC` (validation.go:7026-7050) validates the
     // template as a pod template, and then holds it to the RC rules.
-    errs.extend(validate_pod_template_spec(
+    errs.extend(validate_pod_template_spec_with_old(
         &spec.template,
+        old.map(|o| &o.template),
         &fld_path.child("template"),
         false,
     ));
@@ -134,8 +147,9 @@ pub fn validate_replication_controller_update(
     old: &ReplicationController,
 ) -> ErrorList {
     let mut errs = validate_object_meta_update(&rc.metadata, &old.metadata, &Path::new("metadata"));
-    errs.extend(validate_replication_controller_spec(
+    errs.extend(validate_replication_controller_spec_with_old(
         &rc.spec,
+        Some(&old.spec),
         &Path::new("spec"),
     ));
     errs
@@ -207,4 +221,36 @@ fn validate_replication_controller_status(
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod old_template_options_tests {
+    use super::*;
+
+    fn rc(search: &str) -> ReplicationController {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "r", "namespace": "d", "resourceVersion": "1"},
+            "spec": {"replicas": 1, "selector": {"a": "b"},
+                "template": {"metadata": {"labels": {"a": "b"}}, "spec": {
+                    "containers": [{"name": "c", "image": "x"}],
+                    "dnsConfig": {"searches": [search]}}}}
+        }))
+        .unwrap()
+    }
+
+    /// strategy.go:127 vs :160 (`GetValidationOptionsFromPodTemplate`).
+    #[test]
+    #[serial_test::serial]
+    fn update_derives_pod_options_from_the_old_template() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::RelaxedDNSSearchValidation,
+            false,
+        );
+        let relaxed = "my_search.example.com";
+        assert!(!validate_replication_controller(&rc(relaxed)).is_empty());
+        assert!(validate_replication_controller_update(&rc(relaxed), &rc(relaxed)).is_empty());
+        assert!(
+            !validate_replication_controller_update(&rc(relaxed), &rc("a.example.com")).is_empty()
+        );
+    }
 }
