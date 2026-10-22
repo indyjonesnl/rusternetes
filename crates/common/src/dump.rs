@@ -147,6 +147,22 @@ where
     CURRENT_PAYLOAD.scope(RefCell::new(Some(body)), fut).await
 }
 
+/// The payload of the request being served, if a payload scope is active
+/// (the outer `Option`; the inner one is the stashed body). Task-locals do not
+/// cross `tokio::spawn`: capture this before spawning and re-scope it with
+/// [`scope_payload`] inside.
+pub fn current_payload() -> Option<Option<bytes::Bytes>> {
+    CURRENT_PAYLOAD.try_with(|cell| cell.borrow().clone()).ok()
+}
+
+/// Re-scope a payload captured with [`current_payload`].
+pub async fn scope_payload<F, T>(payload: Option<bytes::Bytes>, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CURRENT_PAYLOAD.scope(RefCell::new(payload), fut).await
+}
+
 #[cfg(feature = "axum-support")]
 use axum::{
     body::{Body, Bytes as AxumBytes},

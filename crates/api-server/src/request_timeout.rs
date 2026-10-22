@@ -8,11 +8,19 @@
 //! (`server/config.go:1065-1071`): inside request-info, outside everything
 //! else.
 //!
-//! DEVIATIONS: (1) Go runs the handler in a goroutine and lets it finish after
-//! the 504 is written; here the handler future is dropped at the deadline
-//! (a cancelled future cannot write to the dead response anyway), so
-//! `RecordRequestPostTimeout` / `PostTimeoutHandlerOK|Panic` have no
-//! analogue. (2) Go distinguishes "handler has written the header" via
+//! Like Go, the handler runs detached (`tokio::spawn`, timeout.go:101-116) and
+//! outlives the 504: its request context (`rusternetes_common::cancellation`,
+//! the task-local counterpart of `req.Context()`) is done once the deadline
+//! passes or the client goes away, which ends the `StorageBackend` and webhook
+//! calls it is blocked in, and `RecordRequestPostTimeout` records how it
+//! finished (timeout.go:125-142).
+//!
+//! DEVIATIONS: (1) The request context is a task-local, not a parameter, and
+//! only the storage dispatch point and the webhook dispatchers observe it; a
+//! handler blocked elsewhere (e.g. proxying upstream) runs to its own timeouts,
+//! as a Go handler that ignores `ctx` would. A client disconnect is detected
+//! by axum dropping the middleware future (`DetachedHandler`'s `Drop`), not by
+//! net/http's background read. (2) Go distinguishes "handler has written the header" via
 //! `baseTimeoutWriter.wroteHeader`; here the handler has "started the
 //! response" once it returns a `Response`, after which only the body can still
 //! run past the deadline. That is the abort case: the body stream is failed
@@ -22,6 +30,8 @@
 //! which selects the default exactly as a negative one does upstream
 //! (`userSpecifiedTimeout > 0`).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -31,10 +41,16 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use rusternetes_common::cancellation::{
+    request_cancellation_with_deadline, with_request_cancellation, RequestCanceller,
+};
 use rusternetes_common::types::{Status, StatusDetails};
+use tracing::Instrument;
 
 use crate::apiserver_request_metrics::{
-    record_request_abort, record_request_termination, request_meta, RequestMeta,
+    record_request_abort, record_request_post_timeout, record_request_termination, request_meta,
+    RequestMeta, POST_TIMEOUT_HANDLER_OK, POST_TIMEOUT_HANDLER_PANIC,
+    POST_TIMEOUT_SOURCE_TIMEOUT_HANDLER,
 };
 use crate::flow_control_filter::{is_long_running, DEFAULT_REQUEST_TIMEOUT};
 
@@ -164,14 +180,134 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
         received_at: started.into_std(),
         deadline: deadline.into_std(),
     });
-    match tokio::time::timeout_at(deadline, next.run(req)).await {
-        Err(_) => {
-            // `postTimeoutFn` (timeout.go:56-58).
-            record_request_termination(&meta, "apiserver", 504);
-            timeout_error()
+
+    // `r.Context()` of the handler: the deadline, cancelled when the client
+    // goes away (see [`DetachedHandler`]).
+    let (canceller, ctx) = request_cancellation_with_deadline(Some(deadline));
+    // `rCopy := r.Clone(r.Context()); go func() { t.handler.ServeHTTP(w, rCopy) }()`
+    // (timeout.go:98-116). Task-locals set by the filters OUTSIDE this one do
+    // not cross `tokio::spawn`, so re-scope them inside.
+    let request_info = crate::request_scope::current_request_info();
+    let payload = rusternetes_common::dump::current_payload();
+    let handler = Box::pin(next.run(req)) as Pin<Box<dyn Future<Output = Response> + Send>>;
+    let handler: Pin<Box<dyn Future<Output = Response> + Send>> = match request_info {
+        Some(info) => Box::pin(crate::request_scope::with_request_info(info, handler)),
+        None => handler,
+    };
+    let handler: Pin<Box<dyn Future<Output = Response> + Send>> = match payload {
+        Some(p) => Box::pin(rusternetes_common::dump::scope_payload(p, handler)),
+        None => handler,
+    };
+    let handler = crate::handlers::list_options::with_list_snapshot(handler);
+    let handler = with_request_cancellation(ctx, handler).instrument(tracing::Span::current());
+    let mut detached = DetachedHandler {
+        handle: Some(tokio::spawn(handler)),
+        canceller,
+        meta: meta.clone(),
+    };
+
+    // `select { case err := <-resultCh: ...; case <-timeoutCh: ... }`
+    // (timeout.go:117-148). `timeoutCh` is `r.Context().Done()`; the cancel
+    // half of it is [`DetachedHandler`]'s `Drop`, the deadline is this arm.
+    let result = {
+        let handle = detached.handle.as_mut().expect("handle is set");
+        tokio::select! {
+            biased;
+            res = handle => Some(res),
+            _ = tokio::time::sleep_until(deadline) => None,
         }
-        Ok(resp) => abort_body_at(resp, deadline, meta),
+    };
+    match result {
+        Some(res) => {
+            detached.handle = None;
+            match res {
+                Ok(resp) => abort_body_at(resp, deadline, meta),
+                // "panic if error occurs" (timeout.go:119-122): the
+                // handler's panic payload continues on this task, to
+                // `WithPanicRecovery`.
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => {
+                    tracing::error!("request handler task failed: {e}");
+                    let status = Status::failure("Internal error occurred", "InternalError", 500);
+                    status_response(StatusCode::INTERNAL_SERVER_ERROR, status)
+                }
+            }
+        }
+        None => {
+            // `defer postTimeoutFn()` (timeout.go:56-58, :146) after
+            // `tw.timeout(err)`, then the deferred post-timeout goroutine
+            // (:125-142).
+            let resp = timeout_error();
+            record_request_termination(&meta, "apiserver", 504);
+            detached.finish_in_background();
+            resp
+        }
     }
+}
+
+/// The handler goroutine of `timeoutHandler.ServeHTTP`: it outlives the 504
+/// (timeout.go:101-148), so it runs as its own task, and its context is
+/// cancelled when this guard is dropped.
+///
+/// Go's `Request.Context()` is cancelled by net/http when the client's
+/// connection goes away (`connReader.backgroundRead` -> `cancelCtx`), which
+/// also fires `timeoutCh` and so takes the timeout branch. axum instead drops
+/// the middleware future on a client disconnect; that drop IS the signal.
+/// `Drop` therefore cancels the context (storage calls and webhook calls the
+/// handler is blocked in end with `context.Canceled`) and counts the request as
+/// timed out, exactly as the `<-timeoutCh` arm does. The handler task is not
+/// aborted: like the Go goroutine it runs on to its next context check and
+/// finishes, and [`record_post_timeout`] observes how.
+struct DetachedHandler {
+    handle: Option<tokio::task::JoinHandle<Response>>,
+    canceller: RequestCanceller,
+    meta: RequestMeta,
+}
+
+impl DetachedHandler {
+    /// The `<-timeoutCh` arm's deferred goroutine: wait for the handler and
+    /// record `RecordRequestPostTimeout`.
+    fn finish_in_background(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            record_post_timeout(handle, &self.meta);
+        }
+    }
+}
+
+impl Drop for DetachedHandler {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            // The client went away before the handler finished.
+            self.canceller.cancel();
+            record_request_termination(&self.meta, "apiserver", 504);
+            self.finish_in_background();
+        }
+    }
+}
+
+/// timeout.go:129-141: after the request timed out, wait for the handler to
+/// finish, then `RecordRequestPostTimeout(PostTimeoutSourceTimeoutHandler,
+/// ok|panic)` and log "Post-timeout activity".
+fn record_post_timeout(handle: tokio::task::JoinHandle<Response>, meta: &RequestMeta) {
+    let method = meta.method.clone();
+    let path = meta.path.clone();
+    tokio::spawn(async move {
+        let timed_out_at = tokio::time::Instant::now();
+        let res = handle.await;
+        let status = match &res {
+            Ok(_) => POST_TIMEOUT_HANDLER_OK,
+            // "a non nil res indicates that there was a panic."
+            Err(_) => POST_TIMEOUT_HANDLER_PANIC,
+        };
+        record_request_post_timeout(POST_TIMEOUT_SOURCE_TIMEOUT_HANDLER, status);
+        tracing::error!(
+            time_elapsed = ?timed_out_at.elapsed(),
+            method = %method,
+            path = %path,
+            result = status,
+            "Post-timeout activity"
+        );
+    });
 }
 
 /// The handler already started its response, so a 504 can no longer be sent:
@@ -432,5 +568,246 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("invalid timeout specified in the request URL"));
+    }
+
+    // ---- detached handler / post-timeout (timeout.go:101-148) ----
+
+    /// `apiserver_request_post_timeout_total` carries no per-test label, so the
+    /// tests that read it take turns.
+    static POST_TIMEOUT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn post_timeout(status: &str) -> f64 {
+        sample(
+            "apiserver_request_post_timeout_total",
+            &[("source", "timeout-handler"), ("status", status)],
+        )
+    }
+
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn get(uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // TestTimeout "Times out" + the deferred goroutine (timeout_test.go:128-160,
+    // timeout.go:125-142): the handler outlives the 504; when it finishes,
+    // RecordRequestPostTimeout(timeout-handler, ok).
+    #[tokio::test]
+    async fn handler_outlives_504_and_records_post_timeout_ok() {
+        let _g = POST_TIMEOUT.lock().await;
+        let before = post_timeout("ok");
+        let release = Arc::new(tokio::sync::Notify::new());
+        let r = release.clone();
+        let app = axum::Router::new()
+            .fallback(move || {
+                let r = r.clone();
+                async move {
+                    r.notified().await;
+                    "late"
+                }
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware));
+        let resp = app
+            .oneshot(get("/api/v1/namespaces/default/postok?timeout=50ms"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 504);
+        release.notify_one();
+        eventually("post-timeout ok", || post_timeout("ok") >= before + 1.0).await;
+    }
+
+    // A handler that panics after the 504: PostTimeoutHandlerPanic.
+    #[tokio::test]
+    async fn panic_after_deadline_records_post_timeout_panic() {
+        let _g = POST_TIMEOUT.lock().await;
+        let before = post_timeout("panic");
+        let app = axum::Router::new()
+            .fallback(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if true {
+                    panic!("inner handler panics after the deadline");
+                }
+                "unreachable"
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware));
+        let resp = app
+            .oneshot(get("/api/v1/namespaces/default/postpanic?timeout=50ms"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 504);
+        eventually("post-timeout panic", || {
+            post_timeout("panic") >= before + 1.0
+        })
+        .await;
+    }
+
+    // TestTimeout "Panics" (timeout_test.go:170-190): a panic before the
+    // deadline is re-raised on the request task so WithPanicRecovery answers
+    // 500; it is not a post-timeout event.
+    #[tokio::test]
+    async fn panic_before_deadline_reaches_panic_recovery() {
+        let _g = POST_TIMEOUT.lock().await;
+        let panics = post_timeout("panic");
+        let app = axum::Router::new()
+            .fallback(|| async {
+                if true {
+                    panic!("inner handler panics");
+                }
+                "unreachable"
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware))
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+                |_p: Box<dyn std::any::Any + Send>| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "panic'd").into_response()
+                },
+            ));
+        let resp = app
+            .oneshot(get("/api/v1/namespaces/default/prepanic?timeout=5s"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(post_timeout("panic"), panics);
+    }
+
+    // The handler's request context (what etcd3 calls select on): once the
+    // deadline passes, a StorageBackend call inside it fails with a timeout
+    // instead of running to completion after the 504.
+    #[tokio::test]
+    async fn storage_call_after_deadline_fails_in_the_detached_handler() {
+        use rusternetes_storage::{Storage, StorageBackend};
+        let _g = POST_TIMEOUT.lock().await;
+        let backend = Arc::new(StorageBackend::new_memory());
+        let outcome = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let (b, o) = (backend.clone(), outcome.clone());
+        let app = axum::Router::new()
+            .fallback(move || {
+                let (b, o) = (b.clone(), o.clone());
+                async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let r = Storage::current_revision(b.as_ref()).await;
+                    *o.lock().unwrap() = Some(r.is_err());
+                    "late"
+                }
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware));
+        let resp = app
+            .oneshot(get("/api/v1/namespaces/default/ctxstore?timeout=50ms"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 504);
+        eventually("handler to finish", || outcome.lock().unwrap().is_some()).await;
+        assert_eq!(*outcome.lock().unwrap(), Some(true));
+        // And a call before the deadline is untouched.
+        let ok = Arc::new(std::sync::Mutex::new(None::<bool>));
+        let (b, o) = (backend.clone(), ok.clone());
+        let app = axum::Router::new()
+            .fallback(move || {
+                let (b, o) = (b.clone(), o.clone());
+                async move {
+                    let r = Storage::current_revision(b.as_ref()).await;
+                    *o.lock().unwrap() = Some(r.is_ok());
+                    "fast"
+                }
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware));
+        let resp = app
+            .oneshot(get("/api/v1/namespaces/default/ctxstore?timeout=5s"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(*ok.lock().unwrap(), Some(true));
+    }
+
+    // Client disconnect: axum drops the middleware future. Go cancels
+    // `req.Context()` (net/http connReader.backgroundRead), which also fires
+    // timeoutCh: the handler sees context.Canceled, the request counts as a
+    // 504 termination and the handler's end is recorded as post-timeout.
+    #[tokio::test]
+    async fn client_disconnect_cancels_the_handler_context() {
+        use rusternetes_common::cancellation::current_request_cancellation;
+        let _g = POST_TIMEOUT.lock().await;
+        let before = post_timeout("ok");
+        let l = [
+            ("resource", "disconnectthings"),
+            ("component", "apiserver"),
+            ("code", "504"),
+        ];
+        let term_before = sample("apiserver_request_terminations_total", &l);
+        let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = saw_cancel.clone();
+        let app = axum::Router::new()
+            .fallback(move || {
+                let s = s.clone();
+                async move {
+                    let ctx = current_request_cancellation().expect("request context");
+                    ctx.cancelled().await;
+                    s.store(true, std::sync::atomic::Ordering::SeqCst);
+                    "gone"
+                }
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware));
+        // The client gives up after 50ms: its future is dropped.
+        let r = tokio::time::timeout(
+            Duration::from_millis(50),
+            app.oneshot(get(
+                "/api/v1/namespaces/default/disconnectthings?timeout=30s",
+            )),
+        )
+        .await;
+        assert!(r.is_err(), "the request must still be in flight");
+        eventually("handler to observe the cancel", || {
+            saw_cancel.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        eventually("post-timeout ok", || post_timeout("ok") >= before + 1.0).await;
+        assert_eq!(
+            sample("apiserver_request_terminations_total", &l),
+            term_before + 1.0
+        );
+    }
+
+    // The handler runs on its own task: the task-locals installed by the
+    // filters OUTSIDE this one (request-info, the payload scope) and the
+    // request context itself must be re-scoped inside it.
+    #[tokio::test]
+    async fn outer_task_locals_reach_the_spawned_handler() {
+        use rusternetes_common::cancellation::current_request_cancellation;
+        let app = axum::Router::new()
+            .fallback(|| async {
+                let info = crate::request_scope::current_request_info().is_some();
+                let payload = rusternetes_common::dump::current_payload();
+                let ctx = current_request_cancellation();
+                format!(
+                    "{info} {} {}",
+                    payload.flatten().map(|b| b.len()).unwrap_or(0),
+                    ctx.and_then(|c| c.deadline()).is_some()
+                )
+            })
+            .layer(axum::middleware::from_fn(request_timeout_middleware))
+            .layer(axum::middleware::from_fn(
+                crate::request_scope::request_info_middleware,
+            ));
+        let resp = rusternetes_common::dump::with_payload(
+            axum::body::Bytes::from_static(b"abcd"),
+            app.oneshot(get("/api/v1/namespaces/default/locals?timeout=5s")),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"true 4 true");
     }
 }
