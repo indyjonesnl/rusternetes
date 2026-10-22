@@ -18,6 +18,11 @@ pub struct Diagnosis {
     /// the `QueuedPodInfo` in `handleSchedulingFailure` so the scheduling
     /// queue only re-evaluates the pod on events those plugins registered.
     pub unschedulable_plugins: std::collections::HashSet<String>,
+    /// A plugin returned `Error` (not a rejection): `findNodesThatPassFilters`
+    /// (schedule_one.go:664-668) cancels the search and `schedulePod` returns
+    /// this error instead of a `FitError`, so the cycle is a scheduling
+    /// *error* (no PostFilter, error backoff), not "unschedulable".
+    pub scheduling_error: Option<String>,
 }
 
 impl Diagnosis {
