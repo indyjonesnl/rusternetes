@@ -36,17 +36,14 @@
 
 use serde_json::{Map, Value};
 
-use super::objectmeta::{coerce_without_paths, get_object_meta};
+use super::objectmeta::{coerce_without_paths, validate as object_meta_validate};
 use super::prune::prune_with_options;
 use super::{new_structural, validate_structural, Structural};
 use crate::resources::crd::{
     CustomResourceDefinitionSpec, JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
 };
 use crate::schema_validation::{PathSeg, SchemaValidator};
-use crate::types::ObjectMeta;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
-use crate::validation::metav1::is_dns1035_label;
-use crate::validation::objectmeta::{name_is_path_segment, validate_object_meta};
 
 // ---------------------------------------------------------------------------
 // surroundingobject.go
@@ -150,186 +147,6 @@ impl Surrounding {
         }
         Ok(Some(cur.clone()))
     }
-}
-
-// ---------------------------------------------------------------------------
-// objectmeta/validation.go: Validate
-// ---------------------------------------------------------------------------
-
-/// `schemaobjectmeta.Validate` (objectmeta/validation.go:30-73): validates
-/// embedded ObjectMeta and TypeMeta, and those at the root if
-/// `is_resource_root`.
-fn object_meta_validate(
-    pth: Option<&Path>,
-    obj: &Value,
-    s: &Structural,
-    is_resource_root: bool,
-) -> ErrorList {
-    if is_resource_root && !s.extensions.x_embedded_resource {
-        let mut clone = s.clone();
-        clone.extensions.x_embedded_resource = true;
-        return object_meta_validate_rec(pth, obj, Some(&clone));
-    }
-    object_meta_validate_rec(pth, obj, Some(s))
-}
-
-fn opt_child(p: Option<&Path>, name: &str) -> Path {
-    match p {
-        Some(p) => p.child(name),
-        None => Path::new(name),
-    }
-}
-
-fn opt_key(p: Option<&Path>, k: &str) -> Path {
-    match p {
-        Some(p) => p.key(k),
-        None => Path::default().key(k),
-    }
-}
-
-fn opt_index(p: Option<&Path>, i: usize) -> Path {
-    match p {
-        Some(p) => p.index(i),
-        None => Path::default().index(i),
-    }
-}
-
-fn object_meta_validate_rec(pth: Option<&Path>, x: &Value, s: Option<&Structural>) -> ErrorList {
-    let Some(s) = s else {
-        return Vec::new();
-    };
-    let mut errs = Vec::new();
-    match x {
-        Value::Object(map) => {
-            if s.extensions.x_embedded_resource {
-                errs.extend(validate_embedded_resource(pth, map));
-            }
-            for (k, v) in map {
-                if let Some(prop) = s.properties.get(k) {
-                    errs.extend(object_meta_validate_rec(
-                        Some(&opt_child(pth, k)),
-                        v,
-                        Some(prop),
-                    ));
-                } else if let Some(ap) = s.additional_properties.as_deref() {
-                    errs.extend(object_meta_validate_rec(
-                        Some(&opt_key(pth, k)),
-                        v,
-                        ap.structural.as_ref(),
-                    ));
-                }
-            }
-        }
-        Value::Array(items) => {
-            for (i, v) in items.iter().enumerate() {
-                errs.extend(object_meta_validate_rec(
-                    Some(&opt_index(pth, i)),
-                    v,
-                    s.items.as_deref(),
-                ));
-            }
-        }
-        _ => {}
-    }
-    errs
-}
-
-/// `schema.ParseGroupVersion` (apimachinery/pkg/runtime/schema/group_version.go).
-fn parse_group_version(gv: &str) -> Result<(), String> {
-    if gv.is_empty() || gv == "/" {
-        return Ok(());
-    }
-    if gv.matches('/').count() > 1 {
-        return Err(format!("unexpected GroupVersion string: {gv}"));
-    }
-    Ok(())
-}
-
-/// `validateEmbeddedResource` (objectmeta/validation.go:75-123).
-fn validate_embedded_resource(pth: Option<&Path>, x: &Map<String, Value>) -> ErrorList {
-    let mut errs = Vec::new();
-    // require apiVersion and kind, but not metadata
-    if !x.contains_key("apiVersion") {
-        errs.push(Error::required(&opt_child(pth, "apiVersion"), ""));
-    }
-    if !x.contains_key("kind") {
-        errs.push(Error::required(&opt_child(pth, "kind"), ""));
-    }
-    for (k, v) in x {
-        match k.as_str() {
-            "apiVersion" => {
-                let p = opt_child(pth, "apiVersion");
-                match v {
-                    Value::String(a) if a.is_empty() => {
-                        errs.push(Error::invalid(&p, a.clone(), "must not be empty"))
-                    }
-                    Value::String(a) => {
-                        if let Err(e) = parse_group_version(a) {
-                            errs.push(Error::invalid(&p, a.clone(), e));
-                        }
-                    }
-                    other => errs.push(Error::invalid(
-                        &p,
-                        BadValue::Json(other.clone()),
-                        "must be a string",
-                    )),
-                }
-            }
-            "kind" => {
-                let p = opt_child(pth, "kind");
-                match v {
-                    Value::String(kind) if kind.is_empty() => {
-                        errs.push(Error::invalid(&p, kind.clone(), "must not be empty"))
-                    }
-                    Value::String(kind) => {
-                        let msgs = is_dns1035_label(&kind.to_lowercase());
-                        if !msgs.is_empty() {
-                            errs.push(Error::invalid(
-                                &p,
-                                kind.clone(),
-                                format!(
-                                    "may have mixed case, but should otherwise match: {}",
-                                    msgs.join(",")
-                                ),
-                            ));
-                        }
-                    }
-                    other => errs.push(Error::invalid(
-                        &p,
-                        BadValue::Json(other.clone()),
-                        "must be a string",
-                    )),
-                }
-            }
-            "metadata" => {
-                let p = opt_child(pth, "metadata");
-                // GetObjectMeta returns the decoded ObjectMeta in its
-                // ToUnstructured form, which the typed `ObjectMeta` reads.
-                let meta = get_object_meta(x, false).and_then(|r| {
-                    serde_json::from_value::<ObjectMeta>(Value::Object(r.meta.unwrap_or_default()))
-                        .map_err(|e| e.to_string())
-                });
-                match meta {
-                    Err(e) => errs.push(Error::invalid(&p, BadValue::Json(v.clone()), e)),
-                    Ok(mut meta) => {
-                        if meta.name.is_empty() {
-                            // we have to set something to avoid an error
-                            meta.name = "fakename".to_string();
-                        }
-                        let namespaced = meta.namespace.as_deref().is_some_and(|n| !n.is_empty());
-                        errs.extend(validate_object_meta(
-                            &meta,
-                            namespaced,
-                            name_is_path_segment,
-                            &p,
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    errs
 }
 
 /// `utilerrors.Aggregate.Error()` for a list of field errors.
@@ -495,7 +312,7 @@ fn validate(
                     format!("must result in valid metadata: {err}"),
                 ));
             } else {
-                let errs = object_meta_validate(None, &obj, root_schema, true);
+                let errs = object_meta_validate(None, &obj, Some(root_schema), true);
                 if !errs.is_empty() {
                     all_errs.push(Error::invalid(
                         &default_path,
@@ -543,7 +360,7 @@ fn validate(
                 let errs = object_meta_validate(
                     Some(&default_path),
                     &d,
-                    s,
+                    Some(s),
                     s.extensions.x_embedded_resource,
                 );
                 if !errs.is_empty() {

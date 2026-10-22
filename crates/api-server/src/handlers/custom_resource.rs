@@ -752,13 +752,53 @@ pub(crate) fn validate_custom_resource_with_old(
     cr: &CustomResource,
     old_cr: Option<&CustomResource>,
 ) -> Result<()> {
+    validate_custom_resource_phase(crd, version, cr, old_cr, CrPhase::Schema)?;
+    validate_custom_resource_phase(crd, version, cr, old_cr, CrPhase::Cel)
+}
+
+/// Which half of custom resource validation to run. Upstream's strategies run
+/// the OpenAPI validator first and the CEL validator last, only when
+/// `hasBlockingErr` finds no blocking error among everything before it
+/// (`registry/customresource/strategy.go:216-224`), so the two halves must be
+/// callable apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrPhase {
+    /// The OpenAPI v3 schema checks (`validator.Validate`).
+    Schema,
+    /// The `x-kubernetes-validations` rules (`celValidator.Validate`).
+    Cel,
+}
+
+/// [`validate_custom_resource_with_old`] restricted to one [`CrPhase`].
+pub(crate) fn validate_custom_resource_phase(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    cr: &CustomResource,
+    old_cr: Option<&CustomResource>,
+    phase: CrPhase,
+) -> Result<()> {
     match old_cr {
-        None => {
-            validate_custom_resource_schema(crd, version, cr)?;
-            crate::handlers::cel_validation::validate_cr_against_crd(crd, version, cr, None)
-        }
-        Some(old) => validate_custom_resource_with_ratcheting(crd, version, cr, old),
+        None => match phase {
+            CrPhase::Schema => validate_custom_resource_schema(crd, version, cr),
+            CrPhase::Cel => {
+                crate::handlers::cel_validation::validate_cr_against_crd(crd, version, cr, None)
+            }
+        },
+        Some(old) => validate_custom_resource_with_ratcheting(crd, version, cr, old, phase),
     }
+}
+
+/// Whether the version's schema carries any `x-kubernetes-validations` rule,
+/// i.e. upstream's `celValidator != nil` (`cel.NewValidator` returns nil when
+/// the schema has no rules).
+pub(crate) fn has_cel_rules(crd: &CustomResourceDefinition, version: &str) -> bool {
+    crd.spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)
+        .and_then(|v| v.schema.as_ref())
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+        .is_some_and(crate::handlers::cel_validation::schema_has_rules)
 }
 
 /// Ratcheting-aware validation used on UPDATE/PATCH. Walks each top-level
@@ -778,6 +818,7 @@ fn validate_custom_resource_with_ratcheting(
     version: &str,
     cr: &CustomResource,
     old_cr: &CustomResource,
+    phase: CrPhase,
 ) -> Result<()> {
     use crate::handlers::cel_validation::evaluate_cr_rules_with_paths;
     use crate::handlers::ratcheting::is_ratcheted;
@@ -836,7 +877,11 @@ fn validate_custom_resource_with_ratcheting(
         let old_val_ref = old_val.as_ref();
 
         // 1) Schema issues.
-        let issues: Vec<ValidationIssue> = SchemaValidator::collect_issues(prop_schema, new_val);
+        let issues: Vec<ValidationIssue> = if phase == CrPhase::Schema {
+            SchemaValidator::collect_issues(prop_schema, new_val)
+        } else {
+            Vec::new()
+        };
         for issue in issues {
             let ratcheted = match old_val_ref {
                 Some(old) => is_ratcheted(prop_schema, old, new_val, &issue.path),
@@ -850,6 +895,9 @@ fn validate_custom_resource_with_ratcheting(
         }
 
         // 2) CEL rule failures.
+        if phase != CrPhase::Cel {
+            continue;
+        }
         let failures = evaluate_cr_rules_with_paths(prop_schema, new_val, old_val_ref)?;
         for f in failures {
             let ratcheted = if f.is_transition {

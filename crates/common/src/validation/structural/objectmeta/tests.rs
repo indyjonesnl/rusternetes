@@ -561,3 +561,199 @@ fn coerce_invalid_fields_error() {
         "pruned.metadata: Invalid value: {\"labels\":3}: json: cannot unmarshal number into Go struct field ObjectMeta.labels of type map[string]string"
     );
 }
+
+// ---------------------------------------------------------------------------
+// validation_test.go.
+// ---------------------------------------------------------------------------
+
+use crate::validation::field::ErrorType;
+
+/// `validationMatch`: (field path, error type).
+type Match = (&'static str, ErrorType);
+
+fn req(p: &'static str) -> Match {
+    (p, ErrorType::Required)
+}
+
+fn inv(p: &'static str) -> Match {
+    (p, ErrorType::Invalid)
+}
+
+/// The Go tests' multiset comparison: every expectation is matched by exactly
+/// one distinct error and every error by one expectation.
+fn assert_errs(errs: &[Error], want: &[Match]) {
+    let mut seen = vec![false; errs.len()];
+    for (field, ty) in want {
+        let hit = errs
+            .iter()
+            .enumerate()
+            .find(|(i, e)| !seen[*i] && e.field == *field && e.error_type == *ty);
+        match hit {
+            Some((i, _)) => seen[i] = true,
+            None => panic!("expected {ty:?} at {field}, got {errs:?}"),
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        assert!(*s, "unexpected error: {:?}", errs[i]);
+    }
+}
+
+/// `TestValidateEmbeddedResource`.
+#[test]
+fn validate_embedded_resource_cases() {
+    let cases: Vec<(&str, Value, Vec<Match>)> = vec![
+        ("empty", json!({}), vec![req("apiVersion"), req("kind")]),
+        (
+            "version and kind",
+            json!({"apiVersion": "foo/v1", "kind": "Foo"}),
+            vec![],
+        ),
+        (
+            "invalid kind",
+            json!({"apiVersion": "foo/v1", "kind": "foo.bar-com"}),
+            vec![inv("kind")],
+        ),
+        (
+            "no name",
+            json!({"apiVersion": "foo/v1", "kind": "Foo",
+                   "metadata": {"namespace": "kube-system"}}),
+            vec![],
+        ),
+        (
+            "no namespace",
+            json!({"apiVersion": "foo/v1", "kind": "Foo", "metadata": {"name": "foo"}}),
+            vec![],
+        ),
+        (
+            "invalid",
+            json!({"apiVersion": "foo/v1", "kind": "Foo", "metadata": {
+                "name": "..", "namespace": "$$$",
+                "labels": {"#": "#"}, "annotations": {"#": "#"}}}),
+            vec![
+                inv("metadata.name"),
+                inv("metadata.namespace"),
+                inv("metadata.labels"),      // key
+                inv("metadata.labels"),      // value
+                inv("metadata.annotations"), // key
+            ],
+        ),
+    ];
+    for (name, object, want) in cases {
+        eprintln!("case {name}");
+        let errs = validate(None, &object, Some(&embedded()), false);
+        assert_errs(&errs, &want);
+    }
+}
+
+fn embedded_leaf() -> Structural {
+    Structural {
+        extensions: Extensions {
+            x_embedded_resource: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// `TestValidate`.
+#[test]
+fn validate_cases() {
+    let schema = Structural {
+        properties: BTreeMap::from([
+            ("embedded".to_string(), embedded_leaf()),
+            (
+                "nested".to_string(),
+                Structural {
+                    properties: BTreeMap::from([("embedded".to_string(), embedded_leaf())]),
+                    ..embedded_leaf()
+                },
+            ),
+            (
+                "items".to_string(),
+                Structural {
+                    items: Some(Box::new(embedded_leaf())),
+                    ..Default::default()
+                },
+            ),
+            (
+                "additionalProperties".to_string(),
+                Structural {
+                    additional_properties: Some(Box::new(
+                        crate::validation::structural::StructuralOrBool {
+                            structural: Some(embedded_leaf()),
+                            bool_: false,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    let cases: Vec<(&str, Value, bool, Vec<Match>)> = vec![
+        ("empty", json!({}), false, vec![]),
+        (
+            "include root",
+            json!({}),
+            true,
+            vec![req("apiVersion"), req("kind")],
+        ),
+        (
+            "embedded",
+            json!({"embedded": {}}),
+            false,
+            vec![req("embedded.apiVersion"), req("embedded.kind")],
+        ),
+        (
+            "nested",
+            json!({"nested": {"embedded": {}}}),
+            false,
+            vec![
+                req("nested.apiVersion"),
+                req("nested.kind"),
+                req("nested.embedded.apiVersion"),
+                req("nested.embedded.kind"),
+            ],
+        ),
+        (
+            "items",
+            json!({"items": [{}]}),
+            false,
+            vec![req("items[0].apiVersion"), req("items[0].kind")],
+        ),
+        (
+            "additionalProperties",
+            json!({"additionalProperties": {"foo": {}}}),
+            false,
+            vec![
+                req("additionalProperties[foo].apiVersion"),
+                req("additionalProperties[foo].kind"),
+            ],
+        ),
+    ];
+    for (name, object, root, want) in cases {
+        eprintln!("case {name}");
+        let errs = validate(None, &object, Some(&schema), root);
+        assert_errs(&errs, &want);
+    }
+}
+
+/// `validateEmbeddedResource`'s type checks on `apiVersion`/`kind`
+/// (validation.go:88-107).
+#[test]
+fn validate_embedded_resource_type_checks() {
+    let errs = validate(
+        None,
+        &json!({"apiVersion": 3, "kind": ""}),
+        Some(&embedded()),
+        false,
+    );
+    assert_errs(&errs, &[inv("apiVersion"), inv("kind")]);
+    let errs = validate(
+        None,
+        &json!({"apiVersion": "a/b/c", "kind": "Foo"}),
+        Some(&embedded()),
+        false,
+    );
+    assert_errs(&errs, &[inv("apiVersion")]);
+}
