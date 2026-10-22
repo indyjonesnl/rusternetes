@@ -2,7 +2,7 @@
 # Recommended settings for production deployments
 #
 # Usage:
-#   kubelet --node-name=<node-name> --config=/etc/kubernetes/kubelet-config.yaml --etcd-servers=<etcd-endpoints>
+#   kubelet --hostname-override=<node-name> --config=/etc/kubernetes/kubelet-config.yaml --etcd-servers=<etcd-endpoints>
 
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration

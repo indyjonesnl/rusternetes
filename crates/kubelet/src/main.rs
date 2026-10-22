@@ -133,14 +133,6 @@ struct Args {
     #[arg(long, default_value = "")]
     feature_gates: String,
 
-    /// Node name. Optional: upstream has no such flag and derives
-    /// `nodeName` from the hostname (`RunKubelet`, server.go:1208-1211), which
-    /// is what an unset `--node-name` does here. When set it stands in for the
-    /// node name (and, absent `--hostname-override`, the hostname) for
-    /// callers whose OS hostname is not the node name.
-    #[arg(long)]
-    node_name: Option<String>,
-
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
@@ -181,9 +173,9 @@ struct Args {
 
     /// If non-empty, use this string as the node's identification (Hostname
     /// address, `kubernetes.io/hostname` label) instead of the actual
-    /// hostname (upstream `--hostname-override`, options.go:288). Without it
-    /// the `--node-name` stands in for the hostname, as upstream derives
-    /// `nodeName` from it.
+    /// hostname (upstream `--hostname-override`, options.go:288). The node
+    /// name is derived from the hostname (`RunKubelet`, server.go:1208-1211),
+    /// so this also names the node; without it the OS hostname does.
     #[arg(long)]
     hostname_override: Option<String>,
 
@@ -460,12 +452,11 @@ async fn main() -> Result<()> {
 
     // RunKubelet: `nodeutil.GetHostname(kubeServer.HostnameOverride)`
     // (server.go:1208) then `nodeName := types.NodeName(hostname)` (:1211).
-    let (node_name, hostname) = node_ip::resolve_node_identity(
-        args.node_name.as_deref(),
-        args.hostname_override.as_deref(),
-        &|| std::fs::read_to_string("/proc/sys/kernel/hostname"),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    let (node_name, hostname) =
+        node_ip::resolve_node_identity(args.hostname_override.as_deref(), &|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+        })
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
@@ -855,16 +846,19 @@ mod feature_gates_flag_tests {
     use serial_test::serial;
 
     fn parse(gates: &str) -> Args {
-        let mut v: Vec<&str> = vec!["kubelet", "--node-name", "n"];
+        let mut v: Vec<&str> = vec!["kubelet", "--hostname-override", "n"];
         v.push(gates);
         Args::try_parse_from(v).unwrap()
     }
 
-    /// Upstream has no `--node-name`; the kubelet must start without it.
+    /// Upstream has no `--node-name` (`RunKubelet`, server.go:1208-1211): the
+    /// kubelet starts without it and refuses it, the node name comes from
+    /// `--hostname-override` or the OS hostname (#3860).
     #[test]
-    fn node_name_flag_is_optional() {
+    fn node_name_flag_is_gone() {
         let a = Args::try_parse_from(["kubelet"]).unwrap();
-        assert!(a.node_name.is_none());
+        assert!(a.hostname_override.is_none());
+        assert!(Args::try_parse_from(["kubelet", "--node-name", "n"]).is_err());
     }
 
     /// Upstream `--feature-gates` (component-base featuregate `Set`,

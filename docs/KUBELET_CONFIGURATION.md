@@ -39,7 +39,7 @@ The most explicit and discoverable method. Perfect for:
 
 ```bash
 kubelet \
-  --node-name=worker-1 \
+  --hostname-override=worker-1 \
   --etcd-servers=http://localhost:2379 \
   --volume-dir=/var/lib/kubelet/volumes \
   --root-dir=/var/lib/kubelet \
@@ -57,7 +57,7 @@ Structured YAML configuration following Kubernetes `KubeletConfiguration` API. B
 
 ```bash
 kubelet \
-  --node-name=worker-1 \
+  --hostname-override=worker-1 \
   --etcd-servers=http://localhost:2379 \
   --config=/etc/kubernetes/kubelet-config.yaml
 ```
@@ -74,7 +74,7 @@ export KUBELET_VOLUMES_PATH=/tmp/rusternetes-volumes
 export KUBELET_ROOT_DIR=/var/lib/kubelet
 export RUST_LOG=debug
 
-kubelet --node-name=node-1 --etcd-servers=http://localhost:2379
+kubelet --hostname-override=node-1 --etcd-servers=http://localhost:2379
 ```
 
 ## Configuration Precedence
@@ -93,7 +93,7 @@ When multiple configuration sources are used, they are merged in the following o
 # Environment variable sets KUBELET_VOLUMES_PATH=/env/volumes
 # CLI flag sets --volume-dir=/cli/volumes
 
-kubelet --node-name=node-1 --config=config.yaml --volume-dir=/cli/volumes
+kubelet --hostname-override=node-1 --config=config.yaml --volume-dir=/cli/volumes
 
 # Result: Uses /cli/volumes (CLI flag wins)
 ```
@@ -104,7 +104,7 @@ kubelet --node-name=node-1 --config=config.yaml --volume-dir=/cli/volumes
 
 | Flag | Type | Description |
 |------|------|-------------|
-| `--node-name` | string | Name of the node this kubelet is running on |
+| `--hostname-override` | string | Node name and hostname (default: the OS hostname; there is no `--node-name`) |
 | `--etcd-servers` | string | Comma-separated list of etcd endpoints (default: `http://localhost:2379`) |
 
 ### Optional Flags
@@ -193,7 +193,7 @@ metricsBindPort: 8082
 ```
 
 ```bash
-kubelet --node-name=dev-node \
+kubelet --hostname-override=dev-node \
         --etcd-servers=http://localhost:2379 \
         --config=kubelet-config-dev.yaml
 ```
@@ -216,7 +216,7 @@ metricsBindPort: 10255
 ```
 
 ```bash
-kubelet --node-name=worker-01 \
+kubelet --hostname-override=worker-01 \
         --etcd-servers=https://etcd-1:2379,https://etcd-2:2379,https://etcd-3:2379 \
         --config=/etc/kubernetes/kubelet-config.yaml
 ```
@@ -235,7 +235,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/kubelet \
-  --node-name=%H \
+  --hostname-override=%H \
   --etcd-servers=http://localhost:2379 \
   --config=/etc/kubernetes/kubelet-config.yaml
 Restart=always
@@ -254,7 +254,7 @@ services:
   kubelet:
     image: rusternetes/kubelet:latest
     command:
-      - "--node-name=node-1"
+      - "--hostname-override=node-1"
       - "--etcd-servers=http://etcd:2379"
       - "--volume-dir=/volumes"
       - "--log-level=debug"
@@ -270,7 +270,7 @@ services:
   kubelet:
     image: rusternetes/kubelet:latest
     command:
-      - "--node-name=node-1"
+      - "--hostname-override=node-1"
       - "--etcd-servers=http://etcd:2379"
       - "--config=/etc/kubernetes/kubelet-config.yaml"
     volumes:
@@ -285,7 +285,7 @@ Mix configuration file with CLI overrides:
 
 ```bash
 # Use config file for most settings, override volume dir via CLI
-kubelet --node-name=node-1 \
+kubelet --hostname-override=node-1 \
         --etcd-servers=http://localhost:2379 \
         --config=/etc/kubernetes/kubelet-config.yaml \
         --volume-dir=/mnt/fast-ssd/volumes
@@ -301,13 +301,13 @@ If you're currently using environment variables, here's how to migrate:
 export KUBELET_VOLUMES_PATH=/tmp/volumes
 export RUST_LOG=debug
 
-kubelet --node-name=node-1 --etcd-servers=http://localhost:2379
+kubelet --hostname-override=node-1 --etcd-servers=http://localhost:2379
 ```
 
 ### New Approach (CLI Flags)
 
 ```bash
-kubelet --node-name=node-1 \
+kubelet --hostname-override=node-1 \
         --etcd-servers=http://localhost:2379 \
         --volume-dir=/tmp/volumes \
         --log-level=debug
@@ -324,7 +324,7 @@ logLevel: debug
 ```
 
 ```bash
-kubelet --node-name=node-1 \
+kubelet --hostname-override=node-1 \
         --etcd-servers=http://localhost:2379 \
         --config=kubelet-config.yaml
 ```
@@ -336,7 +336,7 @@ Environment variables are still supported! Your existing setup will continue to 
 ```bash
 # This still works
 export KUBELET_VOLUMES_PATH=/tmp/volumes
-kubelet --node-name=node-1 --etcd-servers=http://localhost:2379
+kubelet --hostname-override=node-1 --etcd-servers=http://localhost:2379
 ```
 
 However, CLI flags and config files will override environment variables if specified.

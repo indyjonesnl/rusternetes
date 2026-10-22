@@ -325,7 +325,7 @@ services:
       # IMPORTANT: Must be an absolute path
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command:
-      - "--node-name"
+      - "--hostname-override"
       - "node-1"
       - "--etcd-servers"
       - "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"

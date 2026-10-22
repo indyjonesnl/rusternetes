@@ -163,9 +163,9 @@ services:
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     # Default command uses CLI flags (recommended for Docker Compose)
     # DNS IP matches the pinned ClusterIP in bootstrap-cluster.yaml
-    command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    command: ["--hostname-override", "node-1", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
     # Alternative: Use config file approach (uncomment to use)
-    # command: ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379", "--config", "/etc/kubernetes/kubelet-config.yaml"]
+    # command: ["--hostname-override", "node-1", "--etcd-servers", "http://etcd:2379", "--config", "/etc/kubernetes/kubelet-config.yaml"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
   kubelet2:
@@ -191,7 +191,7 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
-    command: ["--node-name", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    command: ["--hostname-override", "node-2", "--etcd-servers", "http://etcd:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy - network proxy
   # IMPORTANT: Uses host network mode to modify iptables on the host/VM

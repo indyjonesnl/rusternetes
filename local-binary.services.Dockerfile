@@ -71,7 +71,7 @@ COPY target/release/kubelet /app/kubelet
 # propagation explosion on kubelet restart. See #66 / services.Dockerfile.
 
 ENTRYPOINT ["/app/kubelet"]
-CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
+CMD ["--hostname-override", "node-1", "--etcd-servers", "http://etcd:2379"]
 
 # ---------------------------------------------------------------------
 # scheduler

@@ -465,7 +465,7 @@ RUN chmod +x /app/entrypoint.sh
 # that exhausts fs.mount-max during crash-loops. See #66.
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["--node-name", "node-1", "--etcd-servers", "http://etcd:2379"]
+CMD ["--hostname-override", "node-1", "--etcd-servers", "http://etcd:2379"]
 
 # ---------------------------------------------------------------------
 # Stage 5: scheduler runtime.

@@ -312,23 +312,16 @@ pub fn get_hostname(
 }
 
 /// RunKubelet's identity derivation (cmd/kubelet/app/server.go:1208-1211):
-/// `hostname := GetHostname(--hostname-override); nodeName := hostname`.
-/// Rusternetes keeps an optional `--node-name` as a stand-in for callers whose
-/// OS hostname is not the node name (compose containers): when given and no
-/// `--hostname-override` is set it also stands in for the hostname. Returns
-/// `(node_name, hostname)`.
+/// `hostname, err := nodeutil.GetHostname(kubeServer.HostnameOverride)`, then
+/// `nodeName := types.NodeName(hostname)`. Returns `(node_name, hostname)`,
+/// always equal: upstream has no separate node-name input (no cloud provider
+/// is consulted here, as built-in providers are removed).
 pub fn resolve_node_identity(
-    node_name: Option<&str>,
     hostname_override: Option<&str>,
     os_hostname: &dyn Fn() -> std::io::Result<String>,
 ) -> Result<(String, String), String> {
-    let node_name = node_name.map(str::trim).filter(|n| !n.is_empty());
-    let override_or_stand_in = hostname_override.or(node_name).unwrap_or("");
-    let hostname = get_hostname(override_or_stand_in, os_hostname)?;
-    let node_name = node_name
-        .map(str::to_string)
-        .unwrap_or_else(|| hostname.clone());
-    Ok((node_name, hostname))
+    let hostname = get_hostname(hostname_override.unwrap_or(""), os_hostname)?;
+    Ok((hostname.clone(), hostname))
 }
 
 /// `utilnode.GetNodeHostIPs` (pkg/util/node/node.go:65-98).
@@ -487,30 +480,25 @@ mod tests {
     #[test]
     fn resolve_node_identity_cases() {
         let os = || Ok("OsHost".to_string());
-        // Neither flag: nodeName == hostname == lowercased os hostname.
+        // No override: nodeName == hostname == lowercased os hostname.
         assert_eq!(
-            resolve_node_identity(None, None, &os).unwrap(),
+            resolve_node_identity(None, &os).unwrap(),
             ("oshost".to_string(), "oshost".to_string())
         );
-        // Override only: nodeName follows the override.
+        // An empty override is "unset" (`len(hostnameOverride) > 0`, node.go).
         assert_eq!(
-            resolve_node_identity(None, Some("Over"), &os).unwrap(),
+            resolve_node_identity(Some(""), &os).unwrap(),
+            ("oshost".to_string(), "oshost".to_string())
+        );
+        // Override: nodeName follows it, lowercased and trimmed.
+        assert_eq!(
+            resolve_node_identity(Some(" Over "), &os).unwrap(),
             ("over".to_string(), "over".to_string())
         );
-        // --node-name only: stands in for the hostname too.
+        // A blank override trims to empty: GetHostname's error.
         assert_eq!(
-            resolve_node_identity(Some("node-1"), None, &os).unwrap(),
-            ("node-1".to_string(), "node-1".to_string())
-        );
-        // Both: distinct.
-        assert_eq!(
-            resolve_node_identity(Some("node-1"), Some("h1"), &os).unwrap(),
-            ("node-1".to_string(), "h1".to_string())
-        );
-        // Blank --node-name behaves as unset.
-        assert_eq!(
-            resolve_node_identity(Some(" "), None, &os).unwrap(),
-            ("oshost".to_string(), "oshost".to_string())
+            resolve_node_identity(Some(" "), &os).unwrap_err(),
+            "empty hostname is invalid"
         );
     }
 

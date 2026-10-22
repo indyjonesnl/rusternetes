@@ -18,7 +18,7 @@
 #
 # rusternetes-kubelet uses clap KEBAB-case flags (verified via --help, NOT the
 # snake_case the brief sketched):
-#   --hostname-override=X -> --node-name=X          (required)
+#   --hostname-override=X -> --hostname-override=X  (required; nodeName derives from it)
 #   --kubeconfig=X        -> --kubeconfig=X          (selects API mode)
 #   --root-dir=X          -> --root-dir=X            (supported 1:1)
 #   (derived)             -> --api-server-url=<server from the kubeconfig>
@@ -112,7 +112,7 @@ log "from config: cluster_dns='${CLUSTER_DNS:-<none>}' cluster_domain='${CLUSTER
 # --config deliberately omitted (K8s-Duration parse gap — see header note).
 [ -n "$CONFIG_PATH" ] && log "NOTE dropping --config=$CONFIG_PATH (rusternetes-kubelet cannot parse k0s KubeletConfiguration Duration strings)"
 
-set -- --node-name="$NODE_NAME"
+set -- --hostname-override="$NODE_NAME"
 [ -n "$KUBECONFIG_PATH" ] && set -- "$@" --kubeconfig="$KUBECONFIG_PATH"
 [ -n "$API_URL" ]         && set -- "$@" --api-server-url="$API_URL"
 [ -n "$ROOT_DIR" ]        && set -- "$@" --root-dir="$ROOT_DIR"

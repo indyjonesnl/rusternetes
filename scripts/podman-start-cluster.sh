@@ -116,7 +116,7 @@ podman run -d \
   -e KUBERNETES_SERVICE_HOST_OVERRIDE=api-server \
   -e KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH} \
   localhost/rusternetes_kubelet \
-  --node-name node-1 \
+  --hostname-override node-1 \
   --etcd-servers http://etcd:2379 \
   --cluster-dns 10.96.0.10 \
   --metrics-port 10250 \
@@ -135,7 +135,7 @@ podman run -d \
   -e KUBERNETES_SERVICE_HOST_OVERRIDE=api-server \
   -e KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH} \
   localhost/rusternetes_kubelet \
-  --node-name node-2 \
+  --hostname-override node-2 \
   --etcd-servers http://etcd:2379 \
   --cluster-dns 10.96.0.10 \
   --metrics-port 10250 \

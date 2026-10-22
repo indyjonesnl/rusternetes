@@ -294,7 +294,7 @@ services:
       # `containerd` would send node-2's exec tokens to node-1's runtime, which
       # answers "404 page not found" (crates/cri/src/stream.rs stream_target).
       - CONTAINERD_STREAM_HOST=localhost
-    command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
+    command: ["--hostname-override", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
 
   # Kubelet 2
   kubelet2:
@@ -334,7 +334,7 @@ services:
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
       # Loopback — see the note on node-1's kubelet.
       - CONTAINERD_STREAM_HOST=localhost
-    command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
+    command: ["--hostname-override", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3"]
 
   # Kube-proxy runs INSIDE the containerd service's network namespace
   # (network_mode: service:containerd) so its iptables Service rules live where
