@@ -211,7 +211,7 @@ mod tests {
     /// the libraries introduced by the compatibility version (semver: 1.33).
     #[test]
     fn selector_library_gated_by_new_vs_stored_environment() {
-        let expr = "device.attributes['d'].v.isSemver()";
+        let expr = "isSemver('1.0.0')";
         let new = class_with(expr);
         let msgs = |errs: ErrorList| errs.into_iter().map(|e| e.to_string()).collect::<Vec<_>>();
 
