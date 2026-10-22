@@ -565,6 +565,7 @@ async fn async_main() -> Result<()> {
         csi_attachers,
         attach_detach_controller: args.attach_detach_controller,
         bootstrap_signer_controller: false,
+        selinux_warning_controller: false,
         terminated_pod_gc_threshold:
             rusternetes_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
         legacy_sa_token_clean_up_period:
