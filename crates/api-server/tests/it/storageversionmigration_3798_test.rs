@@ -169,3 +169,68 @@ async fn status_apply_does_not_own_spec_or_metadata() {
     assert!(o.get("f:spec").is_none(), "{out}");
     assert!(o.get("f:metadata").is_none(), "{out}");
 }
+
+fn group_listed(groups: &Value) -> bool {
+    groups["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["name"] == "storagemigration.k8s.io")
+}
+
+/// storage_storagemigration.go:41-43: a version with no storage is dropped,
+/// so with the gate off the whole group (v1beta1 is its only version) has no
+/// discovery document and is not listed.
+#[tokio::test]
+#[serial_test::serial]
+async fn discovery_hides_the_group_while_the_gate_is_off() {
+    let _g = with_feature(Feature::StorageVersionMigrator, false);
+    let api = TestApiServer::new();
+    let (status, _) = api.get("/apis/storagemigration.k8s.io/v1beta1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = api.get("/apis/storagemigration.k8s.io").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, groups) = api.get("/apis").await;
+    assert!(!group_listed(&groups), "{groups}");
+}
+
+/// With the gate on, v1beta1 is advertised and lists
+/// storageversionmigrations + /status, cluster-scoped.
+#[tokio::test]
+#[serial_test::serial]
+async fn discovery_serves_the_group_when_the_gate_is_on() {
+    let _g = with_feature(Feature::StorageVersionMigrator, true);
+    let api = TestApiServer::new();
+    let (_, groups) = api.get("/apis").await;
+    let g = groups["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "storagemigration.k8s.io")
+        .unwrap_or_else(|| panic!("group not listed: {groups}"))
+        .clone();
+    assert_eq!(g["versions"].as_array().unwrap().len(), 1, "{g}");
+    assert_eq!(g["preferredVersion"]["version"], "v1beta1");
+
+    let (status, group) = api.get("/apis/storagemigration.k8s.io").await;
+    assert_eq!(status, StatusCode::OK, "{group}");
+    assert_eq!(
+        group["preferredVersion"]["groupVersion"],
+        "storagemigration.k8s.io/v1beta1"
+    );
+
+    let (status, list) = api.get("/apis/storagemigration.k8s.io/v1beta1").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let res = list["resources"].as_array().unwrap();
+    let names: Vec<&str> = res.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "storageversionmigrations",
+            "storageversionmigrations/status"
+        ]
+    );
+    assert_eq!(res[0]["kind"], "StorageVersionMigration");
+    assert_eq!(res[0]["namespaced"], false);
+    assert_eq!(res[1]["verbs"], json!(["get", "patch", "update"]));
+}
