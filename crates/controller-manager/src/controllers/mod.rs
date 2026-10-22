@@ -65,6 +65,7 @@ pub mod replicationcontroller;
 pub mod resource_quota;
 #[allow(dead_code)]
 pub mod resourceclaim;
+pub mod selinux_warning;
 pub mod service;
 pub mod serviceaccount;
 pub mod servicecidr;
@@ -124,6 +125,7 @@ pub fn gather_metrics() -> String {
     out.push_str(&ephemeral_volume_metrics::gather());
     out.push_str(&node_lifecycle_metrics::gather());
     out.push_str(&csi_capacity_metrics::gather());
+    out.push_str(&selinux_warning::metrics::gather());
     out.push_str(&podgc_metrics::gather());
     out.push_str(&device_taint_eviction_metrics::gather());
     // Process-global `legacyregistry` (prometheus default registry): holds
