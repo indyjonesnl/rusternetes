@@ -104,30 +104,37 @@ pub trait RequestAuthenticator: Send + Sync {
 // Review clients (`AuthenticationV1Interface` / `AuthorizationV1Interface`)
 // ---------------------------------------------------------------------------
 
+/// The `(result, statusCode, err)` of the webhook review clients' `Create`
+/// (`tokenReviewer.Create`, plugin/pkg/authenticator/token/webhook/webhook.go;
+/// `subjectAccessReviewer.Create`, plugin/pkg/authorizer/webhook/webhook.go):
+/// the HTTP status code of the response, 0 when none was received, and the
+/// outcome.
+pub type ReviewResponse<T> = (u16, anyhow::Result<T>);
+
 /// `authenticationv1client.TokenReviewInterface.Create`.
 #[async_trait]
 pub trait TokenReviewClient: Send + Sync {
-    async fn create(&self, review: &TokenReview) -> anyhow::Result<TokenReview>;
+    async fn create(&self, review: &TokenReview) -> ReviewResponse<TokenReview>;
 }
 
 /// `authorizationv1client.SubjectAccessReviewInterface.Create`.
 #[async_trait]
 pub trait SubjectAccessReviewClient: Send + Sync {
-    async fn create(&self, review: &SubjectAccessReview) -> anyhow::Result<SubjectAccessReview>;
+    async fn create(&self, review: &SubjectAccessReview) -> ReviewResponse<SubjectAccessReview>;
 }
 
 #[async_trait]
 impl TokenReviewClient for ApiClient {
-    async fn create(&self, review: &TokenReview) -> anyhow::Result<TokenReview> {
-        self.post("/apis/authentication.k8s.io/v1/tokenreviews", review)
+    async fn create(&self, review: &TokenReview) -> ReviewResponse<TokenReview> {
+        self.post_with_status("/apis/authentication.k8s.io/v1/tokenreviews", review)
             .await
     }
 }
 
 #[async_trait]
 impl SubjectAccessReviewClient for ApiClient {
-    async fn create(&self, review: &SubjectAccessReview) -> anyhow::Result<SubjectAccessReview> {
-        self.post("/apis/authorization.k8s.io/v1/subjectaccessreviews", review)
+    async fn create(&self, review: &SubjectAccessReview) -> ReviewResponse<SubjectAccessReview> {
+        self.post_with_status("/apis/authorization.k8s.io/v1/subjectaccessreviews", review)
             .await
     }
 }
@@ -178,6 +185,135 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// delegated authn / authz request metrics
+// ---------------------------------------------------------------------------
+
+/// `AuthenticatorMetrics{RecordRequestTotal, RecordRequestLatency}`
+/// (plugin/pkg/authenticator/token/webhook/metrics.go) and the request half of
+/// `AuthorizerMetrics` (plugin/pkg/authorizer/webhook/metrics/metrics.go).
+pub trait ReviewMetrics: Send + Sync {
+    /// `RecordRequestTotal`.
+    fn record_request_total(&self, code: &str);
+    /// `RecordRequestLatency` (seconds).
+    fn record_request_latency(&self, code: &str, latency_secs: f64);
+}
+
+/// `noopMetrics` (webhook.go): used when no metrics are wanted.
+#[cfg(test)]
+pub struct NoopReviewMetrics;
+
+#[cfg(test)]
+impl ReviewMetrics for NoopReviewMetrics {
+    fn record_request_total(&self, _code: &str) {}
+    fn record_request_latency(&self, _code: &str, _latency_secs: f64) {}
+}
+
+/// `Buckets` of the delegated request-duration histograms
+/// (authenticatorfactory/metrics.go, authorizerfactory/metrics.go).
+const DELEGATED_BUCKETS: [f64; 8] = [0.25, 0.5, 0.7, 1.0, 1.5, 3.0, 5.0, 10.0];
+
+/// One `requestTotal` / `requestLatency` pair of a delegating factory, served
+/// from `legacyregistry` (the default registry) with `StabilityLevel: ALPHA`
+/// (help prefixed `[ALPHA] `, component-base/metrics/opts.go).
+struct DelegatedMetrics {
+    request_total: prometheus::CounterVec,
+    request_latency: prometheus::HistogramVec,
+}
+
+impl DelegatedMetrics {
+    fn new(prefix: &str) -> Self {
+        Self {
+            request_total: prometheus::CounterVec::new(
+                prometheus::Opts::new(
+                    format!("apiserver_delegated_{prefix}_request_total"),
+                    "[ALPHA] Number of HTTP requests partitioned by status code.",
+                ),
+                &["code"],
+            )
+            .expect("valid delegated request counter definition"),
+            request_latency: prometheus::HistogramVec::new(
+                prometheus::HistogramOpts::new(
+                    format!("apiserver_delegated_{prefix}_request_duration_seconds"),
+                    "[ALPHA] Request latency in seconds. Broken down by status code.",
+                )
+                .buckets(DELEGATED_BUCKETS.to_vec()),
+                &["code"],
+            )
+            .expect("valid delegated request duration definition"),
+        }
+    }
+
+    fn register(&self) {
+        let r = prometheus::default_registry();
+        r.register(Box::new(self.request_total.clone()))
+            .expect("delegated request counter registered once");
+        r.register(Box::new(self.request_latency.clone()))
+            .expect("delegated request duration registered once");
+    }
+}
+
+impl ReviewMetrics for DelegatedMetrics {
+    /// `requestTotal.WithContext(ctx).WithLabelValues(code).Inc()`.
+    fn record_request_total(&self, code: &str) {
+        self.request_total.with_label_values(&[code]).inc();
+    }
+    /// `requestLatency.WithContext(ctx).WithLabelValues(code).Observe(latency)`.
+    fn record_request_latency(&self, code: &str, latency_secs: f64) {
+        self.request_latency
+            .with_label_values(&[code])
+            .observe(latency_secs);
+    }
+}
+
+/// `apiserver_delegated_authn_request_*` (authenticatorfactory/metrics.go),
+/// registered by the package `init()`; here on first use.
+static AUTHN_METRICS: std::sync::LazyLock<Arc<DelegatedMetrics>> = std::sync::LazyLock::new(|| {
+    let m = DelegatedMetrics::new("authn");
+    m.register();
+    Arc::new(m)
+});
+
+/// `apiserver_delegated_authz_request_*` (authorizerfactory/metrics.go),
+/// registered by `NewDelegatingAuthorizerMetrics` -> `RegisterMetrics`
+/// (a `sync.Once`).
+static AUTHZ_METRICS: std::sync::LazyLock<Arc<DelegatedMetrics>> = std::sync::LazyLock::new(|| {
+    let m = DelegatedMetrics::new("authz");
+    m.register();
+    Arc::new(m)
+});
+
+/// The `AuthenticatorMetrics` `DelegatingAuthenticatorConfig.New` passes to
+/// `webhooktoken.NewFromInterface` (authenticatorfactory/delegating.go:96-99).
+pub fn delegating_authenticator_metrics() -> Arc<dyn ReviewMetrics> {
+    AUTHN_METRICS.clone()
+}
+
+/// `NewDelegatingAuthorizerMetrics` (authorizerfactory/metrics.go).
+pub fn new_delegating_authorizer_metrics() -> Arc<dyn ReviewMetrics> {
+    AUTHZ_METRICS.clone()
+}
+
+/// The metrics half of the `WithExponentialBackoff` callback in
+/// `AuthenticateToken` (webhook.go:139-150) and `Authorize`
+/// (webhook.go:256-266): with a status code the request is recorded under it;
+/// without one, only a failed request is recorded, as `<error>`.
+fn record_review_request<T>(
+    metrics: &dyn ReviewMetrics,
+    status_code: u16,
+    latency: Duration,
+    result: &anyhow::Result<T>,
+) {
+    if status_code != 0 {
+        let code = status_code.to_string();
+        metrics.record_request_total(&code);
+        metrics.record_request_latency(&code, latency.as_secs_f64());
+    } else if result.is_err() {
+        metrics.record_request_total("<error>");
+        metrics.record_request_latency("<error>", latency.as_secs_f64());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // webhook token authenticator
 // ---------------------------------------------------------------------------
 
@@ -185,14 +321,20 @@ where
 pub struct WebhookTokenAuthenticator {
     token_review: Arc<dyn TokenReviewClient>,
     retry_backoff: Backoff,
+    metrics: Arc<dyn ReviewMetrics>,
 }
 
 impl WebhookTokenAuthenticator {
     /// `webhook.NewFromInterface` (webhook.go:94-97).
-    pub fn new(token_review: Arc<dyn TokenReviewClient>, retry_backoff: Backoff) -> Self {
+    pub fn new(
+        token_review: Arc<dyn TokenReviewClient>,
+        retry_backoff: Backoff,
+        metrics: Arc<dyn ReviewMetrics>,
+    ) -> Self {
         Self {
             token_review,
             retry_backoff,
+            metrics,
         }
     }
 }
@@ -211,8 +353,11 @@ impl TokenAuthenticator for WebhookTokenAuthenticator {
             },
             status: None,
         };
-        let result = with_exponential_backoff(self.retry_backoff.clone(), || {
-            self.token_review.create(&review)
+        let result = with_exponential_backoff(self.retry_backoff.clone(), || async {
+            let start = Instant::now();
+            let (status_code, result) = self.token_review.create(&review).await;
+            record_review_request(&*self.metrics, status_code, start.elapsed(), &result);
+            result
         })
         .await
         .map_err(|e| {
@@ -1028,7 +1173,11 @@ pub fn build_authn(
         let Some(client) = client else {
             anyhow::bail!("no client provided, cannot use webhook authentication");
         };
-        let token_auth = WebhookTokenAuthenticator::new(client, Backoff::default_auth_webhook());
+        let token_auth = WebhookTokenAuthenticator::new(
+            client,
+            Backoff::default_auth_webhook(),
+            delegating_authenticator_metrics(),
+        );
         let caching = Arc::new(CachedTokenAuthenticator::new(
             Arc::new(token_auth),
             false,
@@ -1080,6 +1229,7 @@ pub struct DelegatingAuthorizer {
     authorized_ttl: Duration,
     unauthorized_ttl: Duration,
     retry_backoff: Backoff,
+    metrics: Arc<dyn ReviewMetrics>,
 }
 
 impl DelegatingAuthorizer {
@@ -1088,6 +1238,7 @@ impl DelegatingAuthorizer {
         authorized_ttl: Duration,
         unauthorized_ttl: Duration,
         retry_backoff: Backoff,
+        metrics: Arc<dyn ReviewMetrics>,
     ) -> Self {
         Self {
             client,
@@ -1095,6 +1246,7 @@ impl DelegatingAuthorizer {
             authorized_ttl,
             unauthorized_ttl,
             retry_backoff,
+            metrics,
         }
     }
 }
@@ -1177,8 +1329,11 @@ impl Authorizer for DelegatingAuthorizer {
                     spec,
                     status: None,
                 };
-                let result = with_exponential_backoff(self.retry_backoff.clone(), || {
-                    self.client.create(&review)
+                let result = with_exponential_backoff(self.retry_backoff.clone(), || async {
+                    let start = Instant::now();
+                    let (status_code, result) = self.client.create(&review).await;
+                    record_review_request(&*self.metrics, status_code, start.elapsed(), &result);
+                    result
                 })
                 .await
                 .map_err(|e| {
@@ -1248,6 +1403,7 @@ pub fn build_authz(
                 authz.cache_authorized_ttl,
                 authz.cache_unauthorized_ttl,
                 Backoff::default_auth_webhook(),
+                new_delegating_authorizer_metrics(),
             )))
         }
         AuthzMode::Other(m) if m.is_empty() => anyhow::bail!("no authorization mode specified"),
@@ -1563,19 +1719,22 @@ mod tests {
 
     #[async_trait]
     impl TokenReviewClient for FakeTokenReview {
-        async fn create(&self, review: &TokenReview) -> anyhow::Result<TokenReview> {
+        async fn create(&self, review: &TokenReview) -> ReviewResponse<TokenReview> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self
                 .transient_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
             {
-                return Err(anyhow::Error::new(api_status::ApiStatusError {
-                    code: 500,
-                    reason: "InternalError".into(),
-                    message: "boom".into(),
-                    retry_after_seconds: None,
-                }));
+                return (
+                    500,
+                    Err(anyhow::Error::new(api_status::ApiStatusError {
+                        code: 500,
+                        reason: "InternalError".into(),
+                        message: "boom".into(),
+                        retry_after_seconds: None,
+                    })),
+                );
             }
             let status = match review.spec.token.as_str() {
                 "good" => TokenReviewStatus {
@@ -1600,7 +1759,7 @@ mod tests {
             };
             let mut out = review.clone();
             out.status = Some(status);
-            Ok(out)
+            (200, Ok(out))
         }
     }
 
@@ -1618,7 +1777,7 @@ mod tests {
         async fn create(
             &self,
             review: &SubjectAccessReview,
-        ) -> anyhow::Result<SubjectAccessReview> {
+        ) -> ReviewResponse<SubjectAccessReview> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.specs.lock().unwrap().push(review.spec.clone());
             let sub = review
@@ -1628,12 +1787,15 @@ mod tests {
                 .and_then(|r| r.subresource.clone())
                 .unwrap_or_default();
             if sub == "checkpoint" {
-                return Err(anyhow::Error::new(api_status::ApiStatusError {
-                    code: 403,
-                    reason: "Forbidden".into(),
-                    message: "sar forbidden".into(),
-                    retry_after_seconds: None,
-                }));
+                return (
+                    403,
+                    Err(anyhow::Error::new(api_status::ApiStatusError {
+                        code: 403,
+                        reason: "Forbidden".into(),
+                        message: "sar forbidden".into(),
+                        retry_after_seconds: None,
+                    })),
+                );
             }
             let status = SubjectAccessReviewStatus {
                 allowed: sub == "log" || sub == "stats",
@@ -1643,7 +1805,7 @@ mod tests {
             };
             let mut out = review.clone();
             out.status = Some(status);
-            Ok(out)
+            (200, Ok(out))
         }
     }
 
@@ -1933,7 +2095,11 @@ mod tests {
     async fn transient_token_review_errors_are_retried() {
         let tr = Arc::new(FakeTokenReview::default());
         tr.transient_failures.store(2, Ordering::SeqCst);
-        let w = WebhookTokenAuthenticator::new(tr.clone(), Backoff::default_auth_webhook());
+        let w = WebhookTokenAuthenticator::new(
+            tr.clone(),
+            Backoff::default_auth_webhook(),
+            Arc::new(NoopReviewMetrics),
+        );
         let u = w.authenticate_token("good").await.unwrap().unwrap();
         assert_eq!(u.username, "alice");
         assert_eq!(tr.calls.load(Ordering::SeqCst), 3);
@@ -1941,7 +2107,11 @@ mod tests {
         // exhausted: 5 attempts (`Steps: 5`), the webhook error is returned
         let tr = Arc::new(FakeTokenReview::default());
         tr.transient_failures.store(100, Ordering::SeqCst);
-        let w = WebhookTokenAuthenticator::new(tr.clone(), Backoff::default_auth_webhook());
+        let w = WebhookTokenAuthenticator::new(
+            tr.clone(),
+            Backoff::default_auth_webhook(),
+            Arc::new(NoopReviewMetrics),
+        );
         assert!(w.authenticate_token("good").await.is_err());
         assert_eq!(tr.calls.load(Ordering::SeqCst), 5);
     }
@@ -1952,12 +2122,162 @@ mod tests {
         let w = WebhookTokenAuthenticator::new(
             Arc::new(FakeTokenReview::default()),
             Backoff::default_auth_webhook(),
+            Arc::new(NoopReviewMetrics),
         );
         assert_eq!(
             w.authenticate_token("broken").await,
             Err(AuthnError("token is broken".into()))
         );
         assert_eq!(w.authenticate_token("who").await, Ok(None));
+    }
+
+    // ---- request metrics (plugin/pkg/authenticator/token/webhook/metrics_test.go
+    // TestAuthenticatorMetrics; plugin/pkg/authorizer/webhook/webhook_v1_test.go
+    // TestV1WebhookMetrics-style recording) --------------------------------
+
+    /// `fakeAuthenticatorMetrics`: the last code recorded by each method.
+    #[derive(Default)]
+    struct FakeReviewMetrics {
+        total_code: Mutex<String>,
+        latency_code: Mutex<String>,
+    }
+
+    impl ReviewMetrics for FakeReviewMetrics {
+        fn record_request_total(&self, code: &str) {
+            *self.total_code.lock().unwrap() = code.to_string();
+        }
+        fn record_request_latency(&self, code: &str, _latency_secs: f64) {
+            *self.latency_code.lock().unwrap() = code.to_string();
+        }
+    }
+
+    /// A TokenReview backend answering with a fixed outcome: `Some(code)` is a
+    /// response with that status (2xx succeeds, otherwise an `ApiStatusError`),
+    /// `None` is a request that never got a response (the "incorrect client
+    /// certificate" scenario: the webhook is not called, an error is recorded).
+    struct FixedTokenReview(Option<u16>);
+
+    #[async_trait]
+    impl TokenReviewClient for FixedTokenReview {
+        async fn create(&self, review: &TokenReview) -> ReviewResponse<TokenReview> {
+            match self.0 {
+                None => (
+                    0,
+                    Err(anyhow::anyhow!(
+                        "x509: certificate signed by unknown authority"
+                    )),
+                ),
+                Some(code) if code < 300 => {
+                    let mut out = review.clone();
+                    out.status = Some(TokenReviewStatus {
+                        authenticated: Some(true),
+                        ..Default::default()
+                    });
+                    (code, Ok(out))
+                }
+                Some(code) => (
+                    code,
+                    Err(anyhow::Error::new(api_status::ApiStatusError {
+                        code,
+                        reason: "InternalError".into(),
+                        message: "boom".into(),
+                        retry_after_seconds: None,
+                    })),
+                ),
+            }
+        }
+    }
+
+    // TestAuthenticatorMetrics: the status code of the response is recorded
+    // for both the total and the latency; no response records `<error>`.
+    #[tokio::test(start_paused = true)]
+    async fn authenticator_metrics_record_status_code() {
+        for (name, client, expected, want_err) in [
+            ("happy path", FixedTokenReview(Some(200)), "200", false),
+            (
+                "an internal error returned from the webhook",
+                FixedTokenReview(Some(500)),
+                "500",
+                true,
+            ),
+            (
+                "incorrect client certificate used, the webhook not called, an error is recorded",
+                FixedTokenReview(None),
+                "<error>",
+                true,
+            ),
+        ] {
+            let metrics = Arc::new(FakeReviewMetrics::default());
+            let w = WebhookTokenAuthenticator::new(
+                Arc::new(client),
+                Backoff::default_auth_webhook(),
+                metrics.clone(),
+            );
+            let got = w.authenticate_token("t0k3n").await;
+            assert_eq!(got.is_err(), want_err, "{name}");
+            assert_eq!(*metrics.total_code.lock().unwrap(), expected, "{name}");
+            assert_eq!(*metrics.latency_code.lock().unwrap(), expected, "{name}");
+        }
+    }
+
+    // webhook.go:256-266 for the delegating authorizer: a 403 from the
+    // SubjectAccessReview endpoint is recorded under its code, a response
+    // with 200 under "200".
+    #[tokio::test]
+    async fn authorizer_metrics_record_status_code() {
+        let metrics = Arc::new(FakeReviewMetrics::default());
+        let sar = Arc::new(FakeSar::default());
+        let a = DelegatingAuthorizer::new(
+            sar.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Backoff::default_auth_webhook(),
+            metrics.clone(),
+        );
+        let attrs = |sub: &str| {
+            let user = UserInfo {
+                username: "alice".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            };
+            let mut a = rusternetes_common::authz::RequestAttributes::new(user, "get", "nodes");
+            a.api_version = "v1".into();
+            a.subresource = Some(sub.into());
+            a.name = Some("n1".into());
+            a
+        };
+        assert!(a.authorize_opinion(&attrs("log")).await.is_ok());
+        assert_eq!(*metrics.total_code.lock().unwrap(), "200");
+        assert_eq!(*metrics.latency_code.lock().unwrap(), "200");
+        assert!(a.authorize_opinion(&attrs("checkpoint")).await.is_err());
+        assert_eq!(*metrics.total_code.lock().unwrap(), "403");
+        assert_eq!(*metrics.latency_code.lock().unwrap(), "403");
+    }
+
+    // authenticatorfactory/metrics.go + authorizerfactory/metrics.go: the
+    // delegated metrics are served from the default registry under their
+    // upstream names.
+    #[test]
+    fn delegated_metrics_are_registered_under_upstream_names() {
+        let authn = delegating_authenticator_metrics();
+        authn.record_request_total("200");
+        authn.record_request_latency("200", 0.3);
+        let authz = new_delegating_authorizer_metrics();
+        authz.record_request_total("<error>");
+        authz.record_request_latency("<error>", 0.3);
+        let names: Vec<String> = prometheus::gather()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        for n in [
+            "apiserver_delegated_authn_request_total",
+            "apiserver_delegated_authn_request_duration_seconds",
+            "apiserver_delegated_authz_request_total",
+            "apiserver_delegated_authz_request_duration_seconds",
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} missing from {names:?}");
+        }
     }
 
     // ---- BuildAuthn / BuildAuthz (cmd/kubelet/app/auth.go) -----------------
