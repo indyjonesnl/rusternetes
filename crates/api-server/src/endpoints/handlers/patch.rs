@@ -305,7 +305,22 @@ impl<T: Object> Patcher<'_, T> {
                         applied.join(", ")
                     )));
                 }
-                for warning in applied.into_iter().chain(warnings) {
+                // Warn: the decoder's own `StrictDecodingError` (the fields
+                // the schema prunes) follows the patch document's errors
+                // (patch.go:349 `addStrictDecodingWarnings(requestContext,
+                // append(appliedStrictErrs, strictError.Errors()...))`), as a
+                // create's does (rest.go:439-446). #3469.
+                let decoded = if matches!(directive, FieldValidationMode::Warn) {
+                    self.scope
+                        .store
+                        .decode_unknown_fields(&obj)
+                        .into_iter()
+                        .map(|field| format!("unknown field \"{field}\""))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for warning in applied.into_iter().chain(warnings).chain(decoded) {
                     ctx.add_warning(warning);
                 }
             }
