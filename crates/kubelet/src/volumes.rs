@@ -131,6 +131,9 @@ pub struct VolumeManager {
     /// (`unmount_device`, `list_staged_devices`) that are not part of
     /// `VolumePlugin`. `plugin_mgr` holds the plugin as a `dyn VolumePlugin`.
     pub(crate) csi_plugin: Arc<crate::volume_plugins::csi::CsiPlugin>,
+    /// An iscsi plugin over the same host, for the global-mount enumeration
+    /// that stands in for reconstruction (`IscsiPlugin::list_global_mounts`).
+    pub(crate) iscsi_plugin: Arc<crate::volume_plugins::iscsi::IscsiPlugin>,
     /// `csiMigratedPluginManager` of `desiredStateOfWorldPopulator`
     /// (`desired_state_of_world_populator.go:131`).
     pub(crate) csi_migrated_plugin_manager: rusternetes_common::csi_migration::PluginManager,
@@ -311,6 +314,7 @@ impl VolumeManager {
             storage,
             token_manager,
             node_allocatable,
+            iscsi_plugin: Arc::new(crate::volume_plugins::iscsi::IscsiPlugin::new(host.clone())),
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
             csi_migrated_plugin_manager: Default::default(),
             intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
@@ -811,6 +815,11 @@ impl VolumeManager {
         let held = self.csi_volumes_held_by_pods();
         self.reconstruct_staged_devices();
         for unmounted in self.asw.get_unmounted_volumes() {
+            // The world is shared by every device-mountable plugin; each
+            // sweep owns the entries of its own plugin.
+            if unmounted.plugin_name != crate::pod_dirs::plugin::CSI {
+                continue;
+            }
             let key = csi_key_of(&unmounted);
             if key
                 .as_ref()
@@ -831,6 +840,193 @@ impl VolumeManager {
                 self.asw
                     .mark_volume_as_detached(&attached.volume_name, &attached.node_name);
             }
+        }
+    }
+
+    /// Release every device nothing holds or wants: the CSI staged devices
+    /// ([`Self::unmount_unused_csi_devices`]) and the iscsi global mounts
+    /// ([`Self::unmount_unused_iscsi_devices`]). `unmountDetachDevices`
+    /// (`reconciler_common.go:273-315`) is plugin-generic upstream.
+    pub async fn unmount_unused_devices(&self, desired_pods: &[Pod]) {
+        self.unmount_unused_csi_devices(desired_pods).await;
+        self.unmount_unused_iscsi_devices(desired_pods).await;
+    }
+
+    /// `DesiredStateOfWorld.VolumeExists` for iscsi: the global mount path
+    /// (`GetDeviceMountPath`) of every iscsi volume, inline or PV-backed, the
+    /// given pods want. `None` when a claim or a path could not be resolved:
+    /// an unknown desire is not "no desire".
+    async fn iscsi_device_paths_desired_by(
+        &self,
+        pods: &[Pod],
+    ) -> Option<std::collections::HashSet<String>> {
+        use crate::volume_plugins::plugin::OwnedSpec;
+
+        let plugin = self
+            .plugin_mgr
+            .find_device_mountable_plugin_by_name(crate::volume_plugins::iscsi::ISCSI_PLUGIN_NAME)
+            .ok()??;
+        let mounter = plugin.new_device_mounter().ok()?;
+        let mut desired = std::collections::HashSet::new();
+        for pod in pods {
+            let Some(volumes) = pod.spec.as_ref().and_then(|s| s.volumes.as_ref()) else {
+                continue;
+            };
+            for volume in volumes {
+                let spec = if volume.iscsi.is_some() {
+                    OwnedSpec {
+                        volume: volume.clone(),
+                        persistent_volume: None,
+                        read_only: false,
+                        migrated: false,
+                        inline_volume_spec_for_csi_migration: false,
+                    }
+                } else if volume.persistent_volume_claim.is_some() {
+                    match self.resolve_persistent_volume(pod, volume).await {
+                        Ok(Some(pv)) if pv.spec.iscsi.is_some() => OwnedSpec {
+                            volume: volume.clone(),
+                            persistent_volume: Some(pv),
+                            read_only: false,
+                            migrated: false,
+                            inline_volume_spec_for_csi_migration: false,
+                        },
+                        Ok(_) => continue,
+                        Err(e) => {
+                            debug!("Cannot resolve a claim of pod {}: {e:#}", pod.metadata.name);
+                            return None;
+                        }
+                    }
+                } else {
+                    continue;
+                };
+                match mounter.get_device_mount_path(&spec.as_spec()) {
+                    Ok(p) => {
+                        desired.insert(p);
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Cannot get iscsi device mount path of pod {}: {e:#}",
+                            pod.metadata.name
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(desired)
+    }
+
+    /// Log out of and unmount the iscsi global mounts nothing wants any more.
+    ///
+    /// `unmountDetachDevices` (`reconciler_common.go:273-315`) for the iscsi
+    /// plugin: each global mount is reconstructed into the persistent
+    /// [`ActualStateOfWorld`] (`IscsiPlugin::list_global_mounts` +
+    /// `getVolumeSpecFromGlobalMapPath`, `iscsi.go:669-711`), and those that no
+    /// pod mounts (`GetUnmountedVolumes`; a global mount still referenced by a
+    /// pod bind mount is skipped as `HasMountRefs` would fail it,
+    /// `operation_generator.go:GenerateUnmountDeviceFunc`) and the desired state
+    /// does not want go through `UnmountDevice` (`iscsiDetacher.UnmountDevice`,
+    /// `attacher.go:171-184`: `DetachDisk` then `RemoveAll`). Failures are logged
+    /// and retried next sync.
+    pub async fn unmount_unused_iscsi_devices(&self, desired_pods: &[Pod]) {
+        let Some(desired) = self.iscsi_device_paths_desired_by(desired_pods).await else {
+            return;
+        };
+        self.unmount_iscsi_devices_not_in(&desired).await;
+    }
+
+    /// [`Self::unmount_unused_iscsi_devices`] with the desired set already known.
+    pub(crate) async fn unmount_iscsi_devices_not_in(
+        &self,
+        desired: &std::collections::HashSet<String>,
+    ) {
+        let plugin_name = crate::volume_plugins::iscsi::ISCSI_PLUGIN_NAME;
+        let Ok(Some(plugin)) = self
+            .plugin_mgr
+            .find_device_mountable_plugin_by_name(plugin_name)
+        else {
+            return;
+        };
+        // A global mount a pod still bind-mounts (`GetDeviceMountRefs` +
+        // `HasMountRefs`), or whose refs cannot be read, is held.
+        let held = |path: &str| match plugin.get_device_mount_refs(path) {
+            Ok(refs) => crate::volume_plugins::util::has_mount_refs(path, &refs),
+            Err(_) => true,
+        };
+        for path in self.iscsi_plugin.list_global_mounts() {
+            if desired.contains(&path) {
+                continue;
+            }
+            if held(&path) {
+                continue;
+            }
+            self.reconstruct_iscsi_device(&path);
+        }
+        for unmounted in self.asw.get_unmounted_volumes() {
+            if unmounted.plugin_name != plugin_name {
+                continue;
+            }
+            if desired.contains(&unmounted.device_mount_path) || held(&unmounted.device_mount_path)
+            {
+                continue;
+            }
+            let Some(attached) = self.asw.get_attached_volume(&unmounted.volume_name) else {
+                continue;
+            };
+            if attached.device_may_be_mounted() {
+                self.unmount_device(&attached).await;
+            } else {
+                self.asw
+                    .mark_volume_as_detached(&attached.volume_name, &attached.node_name);
+            }
+        }
+    }
+
+    /// Record one iscsi global mount in the actual state of world as attached
+    /// and globally mounted (the stand-in for `reconciler/reconstruct.go`).
+    fn reconstruct_iscsi_device(&self, device_mount_path: &str) {
+        let plugin_name = crate::volume_plugins::iscsi::ISCSI_PLUGIN_NAME;
+        let Ok(plugin) = self.plugin_mgr.find_plugin_by_name(plugin_name) else {
+            return;
+        };
+        let Some(vol_name) = std::path::Path::new(device_mount_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let spec = match crate::volume_plugins::iscsi::get_volume_spec_from_global_map_path(
+            &vol_name,
+            device_mount_path,
+        ) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!("Cannot reconstruct the spec of iscsi device {device_mount_path}: {e:#}");
+                return;
+            }
+        };
+        let volume_name = match crate::volume_plugins::util::get_unique_volume_name_from_spec(
+            plugin,
+            &spec.as_spec(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("Cannot name iscsi device {device_mount_path}: {e}");
+                return;
+            }
+        };
+        if self.asw.volume_exists(&volume_name) {
+            return;
+        }
+        if let Err(e) = self
+            .asw
+            .mark_volume_as_attached(Some(&volume_name), spec, "", "")
+            .and_then(|()| {
+                self.asw
+                    .mark_device_as_mounted(&volume_name, "", device_mount_path, "")
+            })
+        {
+            warn!("Cannot record iscsi device {device_mount_path}: {e}");
         }
     }
 
@@ -4083,6 +4279,62 @@ mod dispatch_tests {
             .plugin_mgr
             .find_plugin_by_name("kubernetes.io/iscsi")
             .is_ok());
+    }
+
+    /// #3492: a reconstructed iscsi global mount round-trips through
+    /// `GetDeviceMountPath` to the very directory it came from (so the
+    /// desired-state comparison and `UnmountDevice` act on the same path), is
+    /// recorded as globally mounted, and a wanted one is left alone while an
+    /// unwanted one is not.
+    #[tokio::test]
+    async fn iscsi_global_mount_reconstructs_and_is_swept_by_desire() {
+        use crate::volume_plugins::util::operation_executor::DeviceMountState;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        let vm = VolumeManager::new(
+            root.clone(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let global = std::path::Path::new(&root)
+            .join("plugins/kubernetes.io/iscsi/iface-default")
+            .join("10.0.0.1:3260-iqn.2017-05.com.example:test-lun-0");
+        std::fs::create_dir_all(&global).unwrap();
+        let global_str = global.to_string_lossy().to_string();
+
+        vm.reconstruct_iscsi_device(&global_str);
+        let attached = vm.asw.get_attached_volumes();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceGloballyMounted
+        );
+        assert_eq!(attached[0].device_mount_path, global_str);
+        assert_eq!(attached[0].plugin_name, "kubernetes.io/iscsi");
+        // Reconstructing again keeps the one entry.
+        vm.reconstruct_iscsi_device(&global_str);
+        assert_eq!(vm.asw.get_attached_volumes().len(), 1);
+
+        // The same volume as a pod's inline source wants the same path.
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"containers": [], "volumes": [{"name": "i", "iscsi": {
+                "targetPortal": "10.0.0.1:3260",
+                "iqn": "iqn.2017-05.com.example:test",
+                "lun": 0, "iscsiInterface": "default"}}]}
+        }))
+        .unwrap();
+        let desired = vm.iscsi_device_paths_desired_by(&[pod]).await.unwrap();
+        assert!(desired.contains(&global_str), "{desired:?}");
+
+        // Not a mount point on this host: the enumeration sees no device, so a
+        // sweep neither unmounts nor forgets the recorded one.
+        assert!(vm.iscsi_plugin.list_global_mounts().is_empty());
+        vm.unmount_iscsi_devices_not_in(&desired).await;
+        assert_eq!(vm.asw.get_attached_volumes().len(), 1);
+        assert!(global.exists(), "a wanted device is untouched");
     }
 
     /// `fc.ProbeVolumePlugins` is registered by the kubelet

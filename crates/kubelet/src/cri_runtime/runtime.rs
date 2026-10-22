@@ -2913,11 +2913,11 @@ impl CriContainerRuntime {
         }
     }
 
-    /// NodeUnstage staged CSI devices no pod holds or wants. No-op when no
+    /// NodeUnstage staged CSI devices and unmount iscsi global mounts no pod holds or wants. No-op when no
     /// VolumeManager is attached.
-    pub async fn unmount_unused_csi_devices(&self, desired_pods: &[Pod]) {
+    pub async fn unmount_unused_devices(&self, desired_pods: &[Pod]) {
         if let Some(volumes) = self.volumes.as_ref() {
-            volumes.unmount_unused_csi_devices(desired_pods).await;
+            volumes.unmount_unused_devices(desired_pods).await;
         }
     }
 
