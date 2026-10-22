@@ -220,6 +220,21 @@ pub struct KubeletConfiguration {
     /// Serves `/logs/`; only honoured when `enableDebuggingHandlers` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_system_log_handler: Option<bool>,
+
+    /// `enableProfilingHandler` (nil defaults to true, defaults.go:283-285).
+    /// Serves `/debug/pprof/`; only honoured when `enableDebuggingHandlers` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_profiling_handler: Option<bool>,
+
+    /// `enableContentionProfiling` (zero value false). Block/mutex profiling;
+    /// only honoured when the profiling handler is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_contention_profiling: Option<bool>,
+
+    /// `enableDebugFlagsHandler` (nil defaults to true, defaults.go:286-288).
+    /// Serves `/debug/flags/v`; only honoured when `enableDebuggingHandlers` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_debug_flags_handler: Option<bool>,
 }
 
 impl KubeletConfiguration {
@@ -231,6 +246,21 @@ impl KubeletConfiguration {
     /// `*obj.EnableSystemLogHandler` after `SetDefaults_KubeletConfiguration`.
     pub fn system_log_handler_enabled(&self) -> bool {
         self.enable_system_log_handler.unwrap_or(true)
+    }
+
+    /// `*obj.EnableProfilingHandler` after `SetDefaults_KubeletConfiguration`.
+    pub fn profiling_handler_enabled(&self) -> bool {
+        self.enable_profiling_handler.unwrap_or(true)
+    }
+
+    /// `obj.EnableContentionProfiling` (plain bool upstream).
+    pub fn contention_profiling_enabled(&self) -> bool {
+        self.enable_contention_profiling.unwrap_or(false)
+    }
+
+    /// `*obj.EnableDebugFlagsHandler` after `SetDefaults_KubeletConfiguration`.
+    pub fn debug_flags_handler_enabled(&self) -> bool {
+        self.enable_debug_flags_handler.unwrap_or(true)
     }
 }
 
@@ -382,6 +412,9 @@ impl Default for KubeletConfiguration {
             log_level: None,
             cluster_service_cidr: None,
             enable_debugging_handlers: None,
+            enable_profiling_handler: None,
+            enable_contention_profiling: None,
+            enable_debug_flags_handler: None,
             enable_system_log_handler: None,
         }
     }
