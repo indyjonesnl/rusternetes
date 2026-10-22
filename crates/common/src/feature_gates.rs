@@ -322,6 +322,9 @@ pub enum Feature {
     /// `:565`). Read by `ActivePodsWithRanks.Less`
     /// (`pkg/controller/controller_utils.go:875,895`).
     LogarithmicScaleDown,
+
+    /// Upstream gate `ServiceAccountNodeAudienceRestriction`: pkg/features/kube_features.go:1773-1776 (1.33 Beta, on). Read by NodeRestriction (`plugin/pkg/admission/noderestriction/admission.go:111`).
+    ServiceAccountNodeAudienceRestriction,
 }
 
 impl Feature {
@@ -403,6 +406,7 @@ impl Feature {
             Feature::StructuredAuthenticationConfigurationJWKSMetrics => 72,
             Feature::ImageVolume => 73,
             Feature::LogarithmicScaleDown => 74,
+            Feature::ServiceAccountNodeAudienceRestriction => 75,
         }
     }
 
@@ -464,6 +468,7 @@ impl Feature {
             | Feature::DeclarativeValidationTakeover
             | Feature::StructuredAuthenticationConfigurationEgressSelector
             | Feature::StructuredAuthenticationConfigurationJWKSMetrics
+            | Feature::ServiceAccountNodeAudienceRestriction
             | Feature::ImageVolume => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
@@ -672,6 +677,8 @@ impl Feature {
             Feature::ImageVolume => true,
             // pkg/features/kube_features.go:1494-1498 (1.31 GA + LockToDefault)
             Feature::LogarithmicScaleDown => true,
+            // pkg/features/kube_features.go:1773-1776 (1.33 Beta, on)
+            Feature::ServiceAccountNodeAudienceRestriction => true,
         }
     }
 }
@@ -763,6 +770,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::StructuredAuthenticationConfigurationJWKSMetrics,
     Feature::ImageVolume,
     Feature::LogarithmicScaleDown,
+    Feature::ServiceAccountNodeAudienceRestriction,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -852,6 +860,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::StructuredAuthenticationConfigurationJWKSMetrics.default_enabled()),
     AtomicBool::new(Feature::ImageVolume.default_enabled()),
     AtomicBool::new(Feature::LogarithmicScaleDown.default_enabled()),
+    AtomicBool::new(Feature::ServiceAccountNodeAudienceRestriction.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
