@@ -50,6 +50,34 @@ pub struct ApiPodStatusInput {
     pub ephemeral_container_statuses: Option<Vec<ContainerStatus>>,
     pub qos_class: Option<String>,
     pub start_time: chrono::DateTime<chrono::Utc>,
+    /// Result of the `PodSyncHandlers` `ShouldEvict` loop
+    /// (kubelet_pods.go:1928-1936); `None` when no handler asked to evict.
+    pub should_evict: Option<ShouldEvictResponse>,
+}
+
+/// `lifecycle.ShouldEvictResponse` (pkg/kubelet/lifecycle/interfaces.go:67),
+/// the `Evict == true` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShouldEvictResponse {
+    pub reason: String,
+    pub message: String,
+}
+
+/// `activeDeadlineHandler.ShouldEvict` (pkg/kubelet/active_deadline.go:70) /
+/// `pastActiveDeadline` (:79). `pod.status` stands in for the status
+/// manager's cached status (`podStatusProvider.GetPodStatus`): this kubelet
+/// has no separate cache, so the API status is the latest status. The
+/// `recorder.Eventf` upstream emits is the caller's concern.
+pub fn active_deadline_should_evict(
+    pod: &Pod,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ShouldEvictResponse> {
+    let deadline = pod.spec.as_ref()?.active_deadline_seconds?;
+    crate::kubelet::active_deadline_elapsed(pod.status.as_ref(), deadline, now)?;
+    Some(ShouldEvictResponse {
+        reason: crate::kubelet::ACTIVE_DEADLINE_REASON.to_string(),
+        message: crate::kubelet::ACTIVE_DEADLINE_MESSAGE.to_string(),
+    })
 }
 
 /// Port of the pure part of `generateAPIPodStatus`
@@ -58,13 +86,16 @@ pub struct ApiPodStatusInput {
 pub fn generate_api_pod_status(pod: &Pod, input: ApiPodStatusInput) -> PodStatus {
     let api_phase = pod.status.as_ref().and_then(|s| s.phase.clone());
 
-    // "pods are not allowed to transition out of terminal phases"
-    // (kubelet_pods.go:1937-1945): force back to the API server's phase.
-    let phase = if crate::lifecycle::phase_is_terminal(api_phase.as_ref()) {
-        api_phase
-    } else {
-        Some(input.phase)
-    };
+    // Three-way merge (kubelet_pods.go:1906-1917): upstream merges the status
+    // manager's cached status, the runtime-derived phase and the API status.
+    // This kubelet has no status-manager cache, so oldPodStatus == pod.Status
+    // and the two terminal arms collapse into one.
+    let mut phase = Some(input.phase);
+    if !crate::lifecycle::phase_is_terminal(phase.as_ref())
+        && crate::lifecycle::phase_is_terminal(api_phase.as_ref())
+    {
+        phase = api_phase.clone();
+    }
 
     // "preserve all conditions not owned by the kubelet"
     // (kubelet_pods.go:1957-1962), then the kubelet-owned ones.
@@ -99,6 +130,21 @@ pub fn generate_api_pod_status(pod: &Pod, input: ApiPodStatusInput) -> PodStatus
                 .and_then(|s| s.message.clone())
                 .filter(|m| !m.is_empty());
         }
+    }
+
+    // "check if an internal module has requested the pod is evicted and
+    // override the reason and message" (kubelet_pods.go:1928-1936).
+    if let Some(evict) = input.should_evict {
+        phase = Some(Phase::Failed);
+        reason = Some(evict.reason);
+        message = Some(evict.message);
+    }
+
+    // "pods are not allowed to transition out of terminal phases"
+    // (kubelet_pods.go:1938-1945): force back to the API server's phase.
+    // Reason/message set above are deliberately left, as upstream does.
+    if crate::lifecycle::phase_is_terminal(api_phase.as_ref()) && phase != api_phase {
+        phase = api_phase;
     }
 
     // Fields this kubelet does not generate are carried over from the prior
@@ -163,6 +209,7 @@ mod tests {
             ephemeral_container_statuses: None,
             qos_class: Some("BestEffort".into()),
             start_time: chrono::Utc::now(),
+            should_evict: None,
         }
     }
 
@@ -262,6 +309,71 @@ mod tests {
         let s = generate_api_pod_status(&pod, i);
         assert_eq!(s.reason, None);
         assert_eq!(s.message, None);
+    }
+
+    #[test]
+    fn should_evict_overrides_phase_reason_and_message() {
+        // kubelet_pods.go:1928-1936
+        let pod = pod_with(Some(Phase::Running), vec![], None);
+        let mut i = input(Phase::Running);
+        i.should_evict = Some(ShouldEvictResponse {
+            reason: "DeadlineExceeded".into(),
+            message: "too long".into(),
+        });
+        let s = generate_api_pod_status(&pod, i);
+        assert_eq!(s.phase, Some(Phase::Failed));
+        assert_eq!(s.reason.as_deref(), Some("DeadlineExceeded"));
+        assert_eq!(s.message.as_deref(), Some("too long"));
+    }
+
+    #[test]
+    fn evict_cannot_leave_a_terminal_api_phase() {
+        // The terminal guard (:1938-1945) runs after ShouldEvict (:1928).
+        let pod = pod_with(Some(Phase::Succeeded), vec![], None);
+        let mut i = input(Phase::Running);
+        i.should_evict = Some(ShouldEvictResponse {
+            reason: "DeadlineExceeded".into(),
+            message: "m".into(),
+        });
+        let s = generate_api_pod_status(&pod, i);
+        assert_eq!(s.phase, Some(Phase::Succeeded));
+        assert_eq!(s.reason.as_deref(), Some("DeadlineExceeded"));
+    }
+
+    #[test]
+    fn terminal_phase_kept_reason_preserved() {
+        // Phase forced to the terminal API phase, so it equals the old phase
+        // and the old reason/message are preserved (:1915-1926).
+        let mut pod = pod_with(Some(Phase::Failed), vec![], None);
+        pod.status.as_mut().unwrap().reason = Some("Evicted".into());
+        let mut i = input(Phase::Running);
+        i.message = None;
+        let s = generate_api_pod_status(&pod, i);
+        assert_eq!(s.phase, Some(Phase::Failed));
+        assert_eq!(s.reason.as_deref(), Some("Evicted"));
+    }
+
+    #[test]
+    fn active_deadline_should_evict_matches_upstream() {
+        // active_deadline.go:70-80; boundary is >= (Since(start) >= allowed).
+        use chrono::Duration;
+        let now = chrono::Utc::now();
+        let mut pod = Pod::new("p", Default::default());
+        pod.spec = Some(rusternetes_common::resources::PodSpec {
+            active_deadline_seconds: Some(5),
+            ..Default::default()
+        });
+        assert_eq!(active_deadline_should_evict(&pod, now), None);
+        pod.status = Some(PodStatus {
+            start_time: Some(now - Duration::seconds(4)),
+            ..Default::default()
+        });
+        assert_eq!(active_deadline_should_evict(&pod, now), None);
+        pod.status.as_mut().unwrap().start_time = Some(now - Duration::seconds(5));
+        let r = active_deadline_should_evict(&pod, now).unwrap();
+        assert_eq!(r.reason, "DeadlineExceeded");
+        pod.spec.as_mut().unwrap().active_deadline_seconds = None;
+        assert_eq!(active_deadline_should_evict(&pod, now), None);
     }
 
     #[test]
