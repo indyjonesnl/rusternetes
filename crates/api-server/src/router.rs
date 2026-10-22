@@ -1969,6 +1969,27 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .put(handlers::devicetaintrule::update_status)
                 .patch(handlers::devicetaintrule::patch_status),
         )
+        // Internal v1alpha1 API - StorageVersions (cluster-scoped; 404 unless
+        // the StorageVersionAPI gate is on)
+        .route(
+            "/apis/internal.apiserver.k8s.io/v1alpha1/storageversions",
+            get(handlers::storageversion::list)
+                .post(handlers::storageversion::create)
+                .delete(handlers::storageversion::deletecollection),
+        )
+        .route(
+            "/apis/internal.apiserver.k8s.io/v1alpha1/storageversions/:name",
+            get(handlers::storageversion::get)
+                .put(handlers::storageversion::update)
+                .patch(handlers::storageversion::patch)
+                .delete(handlers::storageversion::delete),
+        )
+        .route(
+            "/apis/internal.apiserver.k8s.io/v1alpha1/storageversions/:name/status",
+            get(handlers::storageversion::get_status)
+                .put(handlers::storageversion::update_status)
+                .patch(handlers::storageversion::patch_status),
+        )
         // Coordination v1 API - Leases (namespace-scoped)
         .route(
             "/apis/coordination.k8s.io/v1/namespaces/:namespace/leases",

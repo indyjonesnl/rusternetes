@@ -2098,6 +2098,7 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
         "resourceclaimtemplates" => "ResourceClaimTemplate",
         "deviceclasses" => "DeviceClass",
         "devicetaintrules" => "DeviceTaintRule",
+        "storageversions" => "StorageVersion",
         other => {
             // CamelCase heuristic: capitalize first letter, remove trailing 's'
             let s = other.strip_suffix('s').unwrap_or(other);
@@ -2117,6 +2118,10 @@ fn resource_type_to_kind_and_version(resource_type: &str, api_group: &str) -> (S
     } else if resource_type == "devicetaintrules" {
         // Served only as resource.k8s.io/v1alpha3 (storage_resource.go:117-130).
         format!("{}/v1alpha3", api_group)
+    } else if resource_type == "storageversions" {
+        // Served only as internal.apiserver.k8s.io/v1alpha1
+        // (apiserverinternal/rest/storage.go v1alpha1Storage).
+        format!("{}/v1alpha1", api_group)
     } else if api_group.is_empty() {
         "v1".to_string()
     } else {

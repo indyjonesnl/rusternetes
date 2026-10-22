@@ -41,6 +41,7 @@ pub mod serde_helpers;
 pub mod service;
 pub mod service_account;
 pub mod servicecidr;
+pub mod storageversion;
 pub mod validating_admission_policy;
 pub mod volume;
 pub mod workloads;

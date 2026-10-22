@@ -408,6 +408,8 @@ fn static_resource_info(rt: &str) -> Option<(&'static str, bool)> {
         "deviceclasses" | "resourceslices" => ("/apis/resource.k8s.io/v1", false),
         // resource.k8s.io/v1alpha3 — cluster-scoped
         "devicetaintrules" => ("/apis/resource.k8s.io/v1alpha3", false),
+        // internal.apiserver.k8s.io/v1alpha1 — cluster-scoped
+        "storageversions" => ("/apis/internal.apiserver.k8s.io/v1alpha1", false),
         _ => return None,
     };
     Some(info)
