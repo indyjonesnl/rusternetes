@@ -1053,6 +1053,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_resource_v1_resources),
         )
         .route(
+            "/apis/resource.k8s.io/v1alpha3",
+            get(handlers::discovery::get_resource_v1alpha3_resources),
+        )
+        .route(
             "/apis/events.k8s.io/v1",
             get(handlers::discovery::get_events_v1_resources),
         )

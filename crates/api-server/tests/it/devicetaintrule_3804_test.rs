@@ -194,3 +194,60 @@ async fn status_apply_does_not_own_spec_or_metadata() {
     assert!(o.get("f:spec").is_none(), "{out}");
     assert!(o.get("f:metadata").is_none(), "{out}");
 }
+
+fn resource_group(groups: &Value) -> Value {
+    groups["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "resource.k8s.io")
+        .unwrap()
+        .clone()
+}
+
+/// storage_resource.go:117-130 (`v1alpha3Storage`): with the gate off no
+/// storage is installed, so the version has no discovery document and the
+/// group does not list it.
+#[tokio::test]
+#[serial_test::serial]
+async fn discovery_hides_v1alpha3_while_the_gate_is_off() {
+    let _g = with_feature(Feature::DRADeviceTaintRules, false);
+    let api = TestApiServer::new();
+    let (status, _) = api.get("/apis/resource.k8s.io/v1alpha3").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, groups) = api.get("/apis").await;
+    let g = resource_group(&groups);
+    assert_eq!(g["versions"].as_array().unwrap().len(), 1, "{g}");
+}
+
+/// With the gate on, v1alpha3 is advertised next to v1 (v1 stays preferred)
+/// and lists devicetaintrules + devicetaintrules/status, cluster-scoped.
+#[tokio::test]
+#[serial_test::serial]
+async fn discovery_serves_v1alpha3_when_the_gate_is_on() {
+    let _g = with_feature(Feature::DRADeviceTaintRules, true);
+    let api = TestApiServer::new();
+    let (_, groups) = api.get("/apis").await;
+    let g = resource_group(&groups);
+    let versions: Vec<&str> = g["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(versions, vec!["v1", "v1alpha3"], "{g}");
+    assert_eq!(g["preferredVersion"]["version"], "v1");
+
+    let (status, list) = api.get("/apis/resource.k8s.io/v1alpha3").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let res = list["resources"].as_array().unwrap();
+    let names: Vec<&str> = res.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["devicetaintrules", "devicetaintrules/status"]);
+    assert_eq!(res[0]["kind"], "DeviceTaintRule");
+    assert_eq!(res[0]["namespaced"], false);
+    assert_eq!(res[1]["verbs"], json!(["get", "patch", "update"]));
+
+    let (status, group) = api.get("/apis/resource.k8s.io/").await;
+    assert_eq!(status, StatusCode::OK, "{group}");
+    assert_eq!(group["versions"].as_array().unwrap().len(), 2, "{group}");
+}
