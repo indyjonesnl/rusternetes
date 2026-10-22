@@ -294,12 +294,12 @@ pub trait Storage: Send + Sync {
         &self,
         key: &str,
         patch: &serde_json::Value,
-        _full: &T,
+        full: &T,
     ) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        patch_status_via_update(self, key, patch).await
+        patch_status_via_update(self, key, patch, full).await
     }
 
     /// Update a resource with raw JSON value (for GC operations)
@@ -889,23 +889,41 @@ where
 /// (the `/status` subresource resets everything else,
 /// registry/core/node/strategy.go `nodeStatusStrategy.PrepareForUpdate`), and
 /// write with the fresh resourceVersion, retrying on conflict
-/// (`GuaranteedUpdate`). Deviation: the applier is schema-less (merge keys
-/// tabulated, not read from struct tags).
+/// (`GuaranteedUpdate`).
+///
+/// The list merge keys come from the served kind's patch metadata
+/// (`NewPatchMetaFromStruct(versionedObj)`, apiserver
+/// endpoints/handlers/patch.go `strategicPatchObject`). The kind is the one of
+/// `full`, the typed object the caller is patching (its `TypeMeta`), not
+/// whatever the stored JSON happens to carry; only a `full` without a kind
+/// falls back to the stored object's own `apiVersion`/`kind`.
 async fn patch_status_via_update<S, T>(
     storage: &S,
     key: &str,
     patch: &serde_json::Value,
+    full: &T,
 ) -> Result<T>
 where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
-    use rusternetes_common::patch::{apply_patch, PatchType};
+    use rusternetes_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
     const MAX_ATTEMPTS: usize = 8;
+    let typed_schema = serde_json::to_value(full)
+        .ok()
+        .and_then(|v| PatchSchema::for_object(&v));
     for attempt in 0..MAX_ATTEMPTS {
         let current: serde_json::Value = storage.get(key).await?;
-        let merged = apply_patch(&current, patch, PatchType::StrategicMergePatch)
-            .map_err(|e| Error::InvalidResource(format!("invalid status patch for {key}: {e}")))?;
+        let schema = typed_schema
+            .clone()
+            .or_else(|| PatchSchema::for_object(&current));
+        let merged = apply_patch_with_schema(
+            &current,
+            patch,
+            PatchType::StrategicMergePatch,
+            schema.as_ref(),
+        )
+        .map_err(|e| Error::InvalidResource(format!("invalid status patch for {key}: {e}")))?;
         // `nodeStatusStrategy.PrepareForUpdate` (pkg/registry/core/node/
         // strategy.go:179-187) restores only `Spec` from the stored object;
         // metadata changes carried by the patch apply (PatchNodeStatus does
@@ -1612,7 +1630,7 @@ impl Storage for StorageBackend {
             StorageBackend::Api(s) => {
                 Storage::patch_status_strategic_merge(s, key, patch, _full).await
             }
-            _ => patch_status_via_update(self, key, patch).await,
+            _ => patch_status_via_update(self, key, patch, _full).await,
         }
     }
 

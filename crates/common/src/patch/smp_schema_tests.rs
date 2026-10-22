@@ -34,7 +34,7 @@ fn merge_item_schema() -> PatchSchema {
     )
 }
 
-fn merge_item(original: Value, patch: Value) -> Result<Value, PatchError> {
+pub(super) fn merge_item(original: Value, patch: Value) -> Result<Value, PatchError> {
     apply_patch_with_schema(
         &original,
         &patch,

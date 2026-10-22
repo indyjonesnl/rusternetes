@@ -48,7 +48,7 @@ fn unknown_map_directive_is_err_bad_patch_type() {
 /// own message.
 #[test]
 fn unknown_list_directive_is_err_bad_patch_type() {
-    let orig = json!({"spec": {"containers": [{"name": "a", "image": "x"}]}});
+    let orig = json!({"apiVersion": "v1", "kind": "Pod", "spec": {"containers": [{"name": "a", "image": "x"}]}});
     assert_eq!(
         uninterpreted(smp(
             orig.clone(),
@@ -100,24 +100,24 @@ fn set_element_order_non_list_is_err_bad_arg_type() {
 #[test]
 fn set_element_order_mismatch_renders_lists_with_percent_v() {
     assert_eq!(
-        uninterpreted(smp(
-            json!({"spec": {"mergingIntList": [1, 3, 2]}}),
-            json!({"spec": {
+        uninterpreted(super::smp_schema_tests::merge_item(
+            json!({"mergingIntList": [1, 3, 2]}),
+            json!({
                 "$setElementOrder/mergingIntList": [1, 2, 3],
                 "mergingIntList": [3, 1]
-            }})
+            })
         )),
         "The order in patch list:\n[3 1]\n doesn't match $setElementOrder list:\n[1 2 3]\n"
     );
     // patch_test.go "should check if order in $setElementOrder and patch
     // list match".
     assert_eq!(
-        uninterpreted(smp(
-            json!({"spec": {"mergingList": [{"name": "1"}, {"name": "3"}, {"name": "2"}]}}),
-            json!({"spec": {
+        uninterpreted(super::smp_schema_tests::merge_item(
+            json!({"mergingList": [{"name": "1"}, {"name": "3"}, {"name": "2"}]}),
+            json!({
                 "$setElementOrder/mergingList": [{"name": "1"}, {"name": "2"}, {"name": "3"}],
                 "mergingList": [{"name": "3", "value": 3}, {"name": "1", "value": 1}]
-            }})
+            })
         )),
         "The order in patch list:\n[map[name:3 value:3] map[name:1 value:1]]\n doesn't match \
          $setElementOrder list:\n[map[name:1] map[name:2] map[name:3]]\n"
@@ -131,7 +131,7 @@ fn set_element_order_mismatch_renders_lists_with_percent_v() {
 fn missing_merge_key_is_err_no_merge_key() {
     assert_eq!(
         uninterpreted(smp(
-            json!({"spec": {"containers": [{"name": "a"}]}}),
+            json!({"apiVersion": "v1", "kind": "Pod", "spec": {"containers": [{"name": "a"}]}}),
             json!({"spec": {
                 "$setElementOrder/containers": [{"name": "a"}],
                 "containers": [{"image": "x"}]
@@ -141,7 +141,7 @@ fn missing_merge_key_is_err_no_merge_key() {
     );
     assert_eq!(
         uninterpreted(smp(
-            json!({"spec": {"containers": [{"image": "x"}]}}),
+            json!({"apiVersion": "v1", "kind": "Pod", "spec": {"containers": [{"image": "x"}]}}),
             json!({"spec": {
                 "$setElementOrder/containers": [{"name": "a"}],
                 "containers": [{"name": "a"}]

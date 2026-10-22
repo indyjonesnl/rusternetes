@@ -11,7 +11,11 @@ use serde_json::json;
 
 #[test]
 fn status_patch_merges_conditions_by_type_not_replace() {
+    // The served kind names the patch schema (strategicPatchObject builds it
+    // from the REST scope's kind); a kind-less object has no merge keys.
     let current = json!({
+        "apiVersion": "v1",
+        "kind": "Node",
         "status": {"conditions": [
             {"type": "Ready", "status": "True"},
             {"type": "MemoryPressure", "status": "False"},
