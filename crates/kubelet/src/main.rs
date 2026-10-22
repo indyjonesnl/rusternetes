@@ -63,6 +63,7 @@ mod runtime;
 mod runtime_state;
 mod server;
 mod server_auth;
+mod server_debug;
 mod server_logs;
 mod server_metrics;
 mod server_metrics_endpoints;
@@ -484,6 +485,17 @@ async fn main() -> Result<()> {
     let enable_system_log_handler = config_file
         .as_ref()
         .is_none_or(|c| c.system_log_handler_enabled());
+    // enableProfilingHandler / enableContentionProfiling / enableDebugFlagsHandler
+    // (v1beta1 defaults.go:283-288): only honoured under enableDebuggingHandlers.
+    let enable_profiling_handler = config_file
+        .as_ref()
+        .is_none_or(|c| c.profiling_handler_enabled());
+    let enable_contention_profiling = config_file
+        .as_ref()
+        .is_some_and(|c| c.contention_profiling_enabled());
+    let enable_debug_flags_handler = config_file
+        .as_ref()
+        .is_none_or(|c| c.debug_flags_handler_enabled());
 
     let runtime_config = RuntimeConfig::build(
         args.root_dir,
@@ -804,42 +816,55 @@ async fn main() -> Result<()> {
                 server: server_state.clone(),
                 checkpoints_dir: checkpoints_dir.clone(),
             };
-            app.route(
-                "/configz",
-                get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
+            let app = app
+                .route(
+                    "/configz",
+                    get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
+                )
+                .route(
+                    "/exec/:namespace/:pod/:container",
+                    get(streaming_server::handle_exec).post(streaming_server::handle_exec),
+                )
+                .route(
+                    "/exec/:namespace/:pod/:uid/:container",
+                    get(streaming_server::handle_exec_uid).post(streaming_server::handle_exec_uid),
+                )
+                .route(
+                    "/attach/:namespace/:pod/:container",
+                    get(streaming_server::handle_attach).post(streaming_server::handle_attach),
+                )
+                .route(
+                    "/attach/:namespace/:pod/:uid/:container",
+                    get(streaming_server::handle_attach_uid)
+                        .post(streaming_server::handle_attach_uid),
+                )
+                .route(
+                    "/portForward/:namespace/:pod",
+                    get(streaming_server::handle_portforward)
+                        .post(streaming_server::handle_portforward),
+                )
+                .route(
+                    "/portForward/:namespace/:pod/:uid",
+                    get(streaming_server::handle_portforward_uid)
+                        .post(streaming_server::handle_portforward_uid),
+                )
+                .route(
+                    "/containerLogs/:namespace/:pod/:container",
+                    get(streaming_server::handle_container_logs),
+                )
+                .merge(server::running_pods_router(server_state))
+                .merge(streaming_server::run_router(run_state, checkpoint_enabled));
+            // server.go:322-323 `InstallProfilingHandler` / `InstallDebugFlagsHandler`.
+            let app = server_debug::install_profiling_handler(
+                app,
+                enable_profiling_handler,
+                enable_contention_profiling,
+            );
+            server_debug::install_debug_flags_handler(
+                app,
+                enable_debug_flags_handler,
+                std::sync::Arc::new(server_debug::glog_setter),
             )
-            .route(
-                "/exec/:namespace/:pod/:container",
-                get(streaming_server::handle_exec).post(streaming_server::handle_exec),
-            )
-            .route(
-                "/exec/:namespace/:pod/:uid/:container",
-                get(streaming_server::handle_exec_uid).post(streaming_server::handle_exec_uid),
-            )
-            .route(
-                "/attach/:namespace/:pod/:container",
-                get(streaming_server::handle_attach).post(streaming_server::handle_attach),
-            )
-            .route(
-                "/attach/:namespace/:pod/:uid/:container",
-                get(streaming_server::handle_attach_uid).post(streaming_server::handle_attach_uid),
-            )
-            .route(
-                "/portForward/:namespace/:pod",
-                get(streaming_server::handle_portforward)
-                    .post(streaming_server::handle_portforward),
-            )
-            .route(
-                "/portForward/:namespace/:pod/:uid",
-                get(streaming_server::handle_portforward_uid)
-                    .post(streaming_server::handle_portforward_uid),
-            )
-            .route(
-                "/containerLogs/:namespace/:pod/:container",
-                get(streaming_server::handle_container_logs),
-            )
-            .merge(server::running_pods_router(server_state))
-            .merge(streaming_server::run_router(run_state, checkpoint_enabled))
         } else {
             server::install_debugging_disabled_handlers(app)
         };
@@ -873,6 +898,7 @@ async fn main() -> Result<()> {
                 enable_debugging_handlers,
                 true,
                 checkpoint_enabled,
+                enable_profiling_handler,
             ))
             .collect();
         let app = server::install_statusz(app, registered);

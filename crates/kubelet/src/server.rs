@@ -646,7 +646,7 @@ pub const DEBUGGING_DISABLED_PATHS: [&str; 7] = [
 
 /// `getHandlerForDisabledEndpoint` / the handler of
 /// `InstallDebuggingDisabledHandlers`: `http.Error(w, msg, 405)`.
-fn disabled_endpoint(msg: &'static str) -> axum::response::Response {
+pub(crate) fn disabled_endpoint(msg: &'static str) -> axum::response::Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
         [(
@@ -679,17 +679,28 @@ pub fn install_debugging_disabled_handlers(router: Router) -> Router {
 /// `RegisteredHandlePaths()` contribution of the debugging handlers: when
 /// enabled, `InstallAuthRequiredHandlers`' runningpods/run/checkpoint web
 /// services (exec/attach/portForward/containerLogs are [`STREAMING_PATHS`]);
-/// when disabled, [`DEBUGGING_DISABLED_PATHS`].
+/// when disabled, [`DEBUGGING_DISABLED_PATHS`]. Also the `/debug/pprof` and
+/// `/debug/flags/v` registrations of `NewServer` (server.go:322-323): `pprofBasePath` is
+/// `Handle`d when profiling is disabled and registered as the restful
+/// `/debug/pprof/{subpath:*}` route when enabled; `debugFlagPath` is always
+/// `Handle`d (disabled or enabled) under `EnableDebuggingHandlers`.
 pub fn debugging_registered_paths(
     enable_debugging_handlers: bool,
     run_and_checkpoint: bool,
     checkpoint_enabled: bool,
+    profiling_enabled: bool,
 ) -> Vec<String> {
     let mut paths: Vec<&str> = Vec::new();
     if !enable_debugging_handlers {
         paths.extend(DEBUGGING_DISABLED_PATHS);
     } else {
         paths.push("/runningpods/");
+        paths.push(if profiling_enabled {
+            "/debug/pprof/{subpath:*}"
+        } else {
+            "/debug/pprof/"
+        });
+        paths.push("/debug/flags/v");
         if run_and_checkpoint {
             paths.extend([
                 "/run/:namespace/:pod/:container",
@@ -1163,14 +1174,19 @@ mod debugging_handlers_tests {
 
     #[test]
     fn registered_paths_follow_the_gate() {
-        let on = debugging_registered_paths(true, true, true);
+        let on = debugging_registered_paths(true, true, true, true);
         assert!(on.contains(&"/runningpods/".to_string()));
         assert!(on.contains(&"/run/:namespace/:pod/:container".to_string()));
         assert!(on.contains(&"/checkpoint/:namespace/:pod/:container".to_string()));
-        assert!(!debugging_registered_paths(true, true, false)
+        assert!(!debugging_registered_paths(true, true, false, true)
             .iter()
             .any(|p| p.starts_with("/checkpoint")));
-        let off = debugging_registered_paths(false, true, true);
+        assert!(on.contains(&"/debug/pprof/{subpath:*}".to_string()));
+        assert!(on.contains(&"/debug/flags/v".to_string()));
+        let no_prof = debugging_registered_paths(true, true, true, false);
+        assert!(no_prof.contains(&"/debug/pprof/".to_string()));
+        let off = debugging_registered_paths(false, true, true, true);
+        assert!(!off.contains(&"/debug/flags/v".to_string()));
         assert_eq!(off.len(), DEBUGGING_DISABLED_PATHS.len());
         assert!(off.contains(&"/debug/pprof/".to_string()));
     }
