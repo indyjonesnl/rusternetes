@@ -111,11 +111,6 @@ fn cases() -> Vec<(&'static str, serde_json::Value, &'static str)> {
             "spec.containers[0].restartPolicyRules[0].exitCodes.operator: Unsupported value: \"\"",
         ),
         (
-            "sleep lifecycle handler with no seconds",
-            json!({"containers": [{"name": "c", "image": "n", "lifecycle": {"preStop": {"sleep": {}}}}]}),
-            "spec.containers[0].lifecycle.preStop.sleep: Invalid value: 0",
-        ),
-        (
             "exec probe with no command",
             json!({"containers": [{"name": "c", "image": "n", "livenessProbe": {"exec": {}}}]}),
             "spec.containers[0].livenessProbe.exec.command: Required value",

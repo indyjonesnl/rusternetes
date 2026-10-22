@@ -343,6 +343,7 @@ fn validate_pod_spec_for(
             spec.restart_policy.as_deref(),
             host_users,
             &containers_path.index(i),
+            opts,
         ));
         if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
             errs.push(Error::duplicate(
@@ -365,6 +366,7 @@ fn validate_pod_spec_for(
                 spec.restart_policy.as_deref(),
                 host_users,
                 &init_path.index(i),
+                opts,
             ));
             if !c.name.is_empty() && !all_names.insert(c.name.clone()) {
                 errs.push(Error::duplicate(
@@ -1252,6 +1254,7 @@ pub(crate) fn validate_container(
     pod_restart_policy: Option<&str>,
     host_users: bool,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
@@ -1287,6 +1290,7 @@ pub(crate) fn validate_container(
             p,
             grace_period,
             &fld_path.child("livenessProbe"),
+            opts,
         ));
     }
     if let Some(ref p) = c.readiness_probe {
@@ -1300,6 +1304,7 @@ pub(crate) fn validate_container(
                 p,
                 grace_period,
                 &fld_path.child("readinessProbe"),
+                opts,
             ));
         }
     }
@@ -1308,6 +1313,7 @@ pub(crate) fn validate_container(
             p,
             grace_period,
             &fld_path.child("startupProbe"),
+            opts,
         ));
     }
 
@@ -1324,6 +1330,7 @@ pub(crate) fn validate_container(
             grace_period,
             os,
             &fld_path.child("lifecycle"),
+            opts,
         ));
     }
 
@@ -1870,6 +1877,7 @@ fn validate_lifecycle(
     grace_period: Option<i64>,
     os: Option<&PodOS>,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     if let Some(ps) = &lifecycle.post_start {
@@ -1877,6 +1885,7 @@ fn validate_lifecycle(
             ps,
             grace_period,
             &fld_path.child("postStart"),
+            opts,
         ));
     }
     if let Some(pre) = &lifecycle.pre_stop {
@@ -1884,6 +1893,7 @@ fn validate_lifecycle(
             pre,
             grace_period,
             &fld_path.child("preStop"),
+            opts,
         ));
     }
     // stopSignal — only validated when set (upstream `if lifecycle.StopSignal
@@ -2334,26 +2344,35 @@ fn validate_grpc_action(grpc: &GRPCAction, fld_path: &Path) -> ErrorList {
     validate_port_num_or_name(&grpc.port, &fld_path.child("port"))
 }
 
-/// Port of upstream `validateSleepAction`: with grace period known, the sleep
-/// duration must be in `(0, gracePeriod]`. The
-/// `AllowPodLifecycleSleepActionZeroValue` gate (which permits 0) is not
-/// enabled, matching upstream defaults.
+/// Port of upstream `validateSleepAction` (validation.go:3376-3393). A nil
+/// grace period is not flagged here: the pod's own grace period error is
+/// reported elsewhere. `AllowPodLifecycleSleepActionZeroValue` permits 0.
 fn validate_sleep_action(
     sleep: &SleepAction,
     grace_period: Option<i64>,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    if let Some(gp) = grace_period {
-        if sleep.seconds <= 0 || sleep.seconds > gp {
+    let Some(gp) = grace_period else {
+        return errs;
+    };
+    if opts.allow_pod_lifecycle_sleep_action_zero_value {
+        if sleep.seconds < 0 || sleep.seconds > gp {
             errs.push(Error::invalid(
                 fld_path,
                 sleep.seconds,
-                format!(
-                    "must be greater than 0 and less than terminationGracePeriodSeconds ({gp}). Enable AllowPodLifecycleSleepActionZeroValue feature gate for zero sleep."
-                ),
+                format!("must be non-negative and less than terminationGracePeriodSeconds ({gp})"),
             ));
         }
+    } else if sleep.seconds <= 0 || sleep.seconds > gp {
+        errs.push(Error::invalid(
+            fld_path,
+            sleep.seconds,
+            format!(
+                "must be greater than 0 and less than terminationGracePeriodSeconds ({gp}). Enable AllowPodLifecycleSleepActionZeroValue feature gate for zero sleep."
+            ),
+        ));
     }
     errs
 }
@@ -2364,6 +2383,7 @@ fn validate_sleep_action(
 ///
 /// The five `Option` args mirror the `commonHandler` fields; a probe handler
 /// passes `None` for `sleep`, a lifecycle handler passes `None` for `grpc`.
+#[allow(clippy::too_many_arguments)] // mirrors upstream validateHandler + commonHandler
 fn validate_handler(
     exec: Option<&ExecAction>,
     http_get: Option<&HTTPGetAction>,
@@ -2372,6 +2392,7 @@ fn validate_handler(
     sleep: Option<&SleepAction>,
     grace_period: Option<i64>,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let mut num_handlers = 0;
@@ -2435,6 +2456,7 @@ fn validate_handler(
                 sleep,
                 grace_period,
                 &fld_path.child("sleep"),
+                opts,
             ));
         }
     }
@@ -2451,6 +2473,7 @@ fn validate_lifecycle_handler(
     handler: &LifecycleHandler,
     grace_period: Option<i64>,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     validate_handler(
         handler.exec.as_ref(),
@@ -2460,6 +2483,7 @@ fn validate_lifecycle_handler(
         handler.sleep.as_ref(),
         grace_period,
         fld_path,
+        opts,
     )
 }
 
@@ -4124,7 +4148,12 @@ fn validate_container_ports(ports: &[ContainerPort], fld_path: &Path) -> ErrorLi
 /// Port of upstream `validateProbe`: exactly one handler (via
 /// [`validate_handler`]), each numeric timing field nonnegative, and a positive
 /// `terminationGracePeriodSeconds` when set.
-fn validate_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
+fn validate_probe(
+    probe: &Probe,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     errs.extend(validate_handler(
@@ -4135,6 +4164,7 @@ fn validate_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> 
         None,
         grace_period,
         fld_path,
+        opts,
     ));
 
     // Nonnegative timing fields. Unset (None) defaults are nonnegative, so
@@ -4172,8 +4202,13 @@ fn validate_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> 
 
 /// Port of upstream `validateLivenessProbe`: a probe whose `successThreshold`,
 /// when set, must equal 1.
-fn validate_liveness_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
-    let mut errs = validate_probe(probe, grace_period, fld_path);
+fn validate_liveness_probe(
+    probe: &Probe,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    let mut errs = validate_probe(probe, grace_period, fld_path, opts);
     if let Some(st) = probe.success_threshold {
         if st != 1 {
             errs.push(Error::invalid(
@@ -4188,8 +4223,13 @@ fn validate_liveness_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &
 
 /// Port of upstream `validateStartupProbe`: same `successThreshold == 1` rule
 /// as the liveness probe.
-fn validate_startup_probe(probe: &Probe, grace_period: Option<i64>, fld_path: &Path) -> ErrorList {
-    validate_liveness_probe(probe, grace_period, fld_path)
+fn validate_startup_probe(
+    probe: &Probe,
+    grace_period: Option<i64>,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    validate_liveness_probe(probe, grace_period, fld_path, opts)
 }
 
 /// Port of upstream `validateReadinessProbe`: a probe that must not set
@@ -4198,8 +4238,9 @@ fn validate_readiness_probe(
     probe: &Probe,
     grace_period: Option<i64>,
     fld_path: &Path,
+    opts: &PodValidationOptions,
 ) -> ErrorList {
-    let mut errs = validate_probe(probe, grace_period, fld_path);
+    let mut errs = validate_probe(probe, grace_period, fld_path, opts);
     if let Some(tgps) = probe.termination_grace_period_seconds {
         errs.push(Error::invalid(
             &fld_path.child("terminationGracePeriodSeconds"),
@@ -6206,6 +6247,7 @@ mod tests {
             None,
             true,
             &Path::new("spec").child("containers").index(0),
+            &PodValidationOptions::default(),
         )
         .into_iter()
         .map(|e| e.to_string())
@@ -6827,6 +6869,7 @@ mod tests {
             None,
             true,
             &Path::new("spec").child("containers").index(0),
+            &PodValidationOptions::default(),
         )
         .into_iter()
         .map(|x| x.to_string())
@@ -6890,6 +6933,7 @@ mod tests {
             Some("Never"),
             true,
             &Path::new("spec").child("containers").index(0),
+            &PodValidationOptions::default(),
         )
         .into_iter()
         .map(|x| x.to_string())
@@ -6971,5 +7015,83 @@ mod tests {
                     && m.contains("must not be padded with whitespace")),
             "{e:?}"
         );
+    }
+
+    /// With `PodLifecycleSleepActionAllowZero` (GA, locked on in 1.35),
+    /// `GetValidationOptionsFromPodSpecAndMeta` sets
+    /// `AllowPodLifecycleSleepActionZeroValue`, so a zero sleep is valid and a
+    /// negative one reports the zero-allowed message (validation.go:3381-3386).
+    #[test]
+    fn create_allows_zero_sleep_via_gate_options() {
+        let mk = |secs: i64| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": {
+                    "terminationGracePeriodSeconds": 30,
+                    "containers": [{"name": "c", "image": "i",
+                        "lifecycle": {"preStop": {"sleep": {"seconds": secs}}}}]
+                }
+            }))
+            .unwrap()
+        };
+        let zero: Vec<String> = validate_pod_create(&mk(0), false)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(!zero.iter().any(|m| m.contains("sleep")), "{zero:?}");
+        let neg: Vec<String> = validate_pod_create(&mk(-1), false)
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            neg.iter().any(|m| m.contains("preStop.sleep")
+                && m.contains(
+                    "must be non-negative and less than terminationGracePeriodSeconds (30)"
+                )),
+            "{neg:?}"
+        );
+    }
+
+    /// `TestValidateSleepAction` (validation_test.go:27232).
+    #[test]
+    fn validate_sleep_action_cases() {
+        let strict = |gp: i64| {
+            format!("must be greater than 0 and less than terminationGracePeriodSeconds ({gp}). Enable AllowPodLifecycleSleepActionZeroValue feature gate for zero sleep.")
+        };
+        let relaxed = |gp: i64| {
+            format!("must be non-negative and less than terminationGracePeriodSeconds ({gp})")
+        };
+        // (seconds, gracePeriod, zeroEnabled, expected error)
+        let cases: [(i64, Option<i64>, bool, Option<String>); 10] = [
+            (5, Some(30), false, None),
+            (-1, Some(30), false, Some(strict(30))),
+            (5, Some(3), false, Some(strict(3))),
+            (0, Some(30), false, Some(strict(30))),
+            (0, Some(30), true, None),
+            (-1, Some(30), false, Some(strict(30))),
+            (-1, Some(30), true, Some(relaxed(30))),
+            (0, Some(0), true, None),
+            // A nil grace period is not flagged here.
+            (5, None, false, None),
+            (0, None, true, None),
+        ];
+        let fld = Path::new("root");
+        for (secs, gp, zero, want) in cases {
+            let opts = PodValidationOptions {
+                allow_pod_lifecycle_sleep_action_zero_value: zero,
+                ..Default::default()
+            };
+            let got = validate_sleep_action(&SleepAction { seconds: secs }, gp, &fld, &opts);
+            match want {
+                None => assert!(got.is_empty(), "{secs} {gp:?} {zero}: {got:?}"),
+                Some(msg) => {
+                    assert_eq!(got.len(), 1, "{secs} {gp:?} {zero}: {got:?}");
+                    assert_eq!(
+                        got[0].to_string(),
+                        format!("root: Invalid value: {secs}: {msg}")
+                    );
+                }
+            }
+        }
     }
 }

@@ -12,7 +12,7 @@
 //! gated rule. The remaining upstream options (`AllowIndivisibleHugePagesValues`,
 //! `AllowUserNamespaces*`, `AllowOnlyRecursiveSELinuxChangePolicy`,
 //! `AllowSidecarResizePolicy`, `AllowContainerRestartPolicyRules`,
-//! `AllowRestartAllContainers`, `AllowPodLifecycleSleepActionZeroValue`,
+//! `AllowRestartAllContainers`,
 //! `AllowRelaxedEnvironmentVariableValidation`, `AllowEnvFilesValidation`,
 //! `PodLevelResourcesEnabled`, `InPlacePodLevelResourcesVerticalScalingEnabled`)
 //! are tracked in #3572 because the rule they gate is not ported yet.
@@ -57,6 +57,10 @@ pub struct PodValidationOptions {
     pub allow_relaxed_dns_search_validation: bool,
     /// `AllowTaintTolerationComparisonOperators`.
     pub allow_taint_toleration_comparison_operators: bool,
+    /// `AllowPodLifecycleSleepActionZeroValue`: a `sleep` lifecycle action may
+    /// be 0 seconds (gate `PodLifecycleSleepActionAllowZero`, or the old spec
+    /// already uses a zero sleep).
+    pub allow_pod_lifecycle_sleep_action_zero_value: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -71,6 +75,10 @@ pub fn get_validation_options_from_pod_spec_and_meta(
 ) -> PodValidationOptions {
     // Defaults from the feature gates (util.go:413-434).
     let mut opts = PodValidationOptions {
+        // util.go:421.
+        allow_pod_lifecycle_sleep_action_zero_value: enabled(
+            Feature::PodLifecycleSleepActionAllowZero,
+        ),
         allow_match_label_keys_in_pod_topology_spread: enabled(
             Feature::MatchLabelKeysInPodTopologySpread,
         ),
@@ -107,6 +115,9 @@ pub fn get_validation_options_from_pod_spec_and_meta(
                     has_legacy_invalid_topology_spread_constrain_match_label_keys(old);
             }
         }
+        // util.go:477.
+        opts.allow_pod_lifecycle_sleep_action_zero_value |=
+            pod_lifecycle_sleep_action_zero_value_in_use(old);
         // util.go:464.
         opts.allow_non_local_projected_token_path = has_non_local_projected_token_path(old);
         // util.go:467-475: an old sysctl that `ValidateHostSysctl` rejects.
@@ -240,6 +251,31 @@ fn has_legacy_invalid_topology_spread_constrain_match_label_keys(spec: &PodSpec)
         )
         .is_empty()
     })
+}
+
+/// `podLifecycleSleepActionZeroValueInUse` (util.go:981-1001) over
+/// `VisitContainers(podSpec, AllContainers, ...)`: any init, regular or
+/// ephemeral container with a zero-second `preStop`/`postStart` sleep.
+fn pod_lifecycle_sleep_action_zero_value_in_use(spec: &PodSpec) -> bool {
+    let zero = |l: &Option<crate::resources::pod::Lifecycle>| {
+        l.as_ref().is_some_and(|l| {
+            [&l.pre_stop, &l.post_start].into_iter().any(|h| {
+                h.as_ref()
+                    .and_then(|h| h.sleep.as_ref())
+                    .is_some_and(|s| s.seconds == 0)
+            })
+        })
+    };
+    spec.init_containers
+        .iter()
+        .flatten()
+        .any(|c| zero(&c.lifecycle))
+        || spec.containers.iter().any(|c| zero(&c.lifecycle))
+        || spec
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .any(|c| zero(&c.lifecycle))
 }
 
 /// `hasNonLocalProjectedTokenPath` (util.go:393-408).
@@ -378,5 +414,42 @@ mod tests {
             opts(Some(&dns(&["a_b"]))).allow_relaxed_dns_search_validation
                 || enabled(Feature::RelaxedDNSSearchValidation)
         );
+    }
+
+    fn sleep_spec(hook: &str, secs: i64) -> PodSpec {
+        spec(json!({"containers": [{"name": "c", "image": "i",
+            "lifecycle": {hook: {"sleep": {"seconds": secs}}}}]}))
+    }
+
+    /// `TestValidateAllowPodLifecycleSleepActionZeroValue` (util_test.go:4654):
+    /// the gate (on in 1.35) and the old-spec zero-sleep relaxation.
+    #[test]
+    #[serial_test::serial]
+    fn allow_pod_lifecycle_sleep_action_zero_value_option() {
+        use crate::feature_gates::{with_feature, Feature};
+        let g = with_feature(Feature::PodLifecycleSleepActionAllowZero, true);
+        let cases = [
+            spec(json!({})),
+            sleep_spec("preStop", 1),
+            sleep_spec("postStart", 1),
+            sleep_spec("preStop", 0),
+            sleep_spec("postStart", 0),
+        ];
+        for old in &cases {
+            assert!(opts(Some(old)).allow_pod_lifecycle_sleep_action_zero_value);
+        }
+        drop(g);
+        let _g = with_feature(Feature::PodLifecycleSleepActionAllowZero, false);
+        assert!(!opts(Some(&spec(json!({})))).allow_pod_lifecycle_sleep_action_zero_value);
+        assert!(!opts(Some(&sleep_spec("preStop", 1))).allow_pod_lifecycle_sleep_action_zero_value);
+        assert!(
+            !opts(Some(&sleep_spec("postStart", 1))).allow_pod_lifecycle_sleep_action_zero_value
+        );
+        assert!(opts(Some(&sleep_spec("preStop", 0))).allow_pod_lifecycle_sleep_action_zero_value);
+        assert!(
+            opts(Some(&sleep_spec("postStart", 0))).allow_pod_lifecycle_sleep_action_zero_value
+        );
+        // Create (no old spec) with the gate off stays strict.
+        assert!(!opts(None).allow_pod_lifecycle_sleep_action_zero_value);
     }
 }
