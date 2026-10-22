@@ -26,6 +26,9 @@ mod events;
 #[allow(dead_code)]
 mod eviction;
 #[allow(dead_code)]
+#[cfg(target_os = "linux")]
+mod fsquota;
+#[allow(dead_code)]
 mod go_selinux;
 #[allow(dead_code)]
 mod go_selinux_label;
