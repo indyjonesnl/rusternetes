@@ -2,6 +2,7 @@ use crate::auth::UserInfo;
 use crate::error::Result;
 use crate::field_selector::{FieldRequirement, FieldSelector};
 use crate::label_selector::{LabelRequirement, LabelSelector};
+use crate::node_graph::{NodeGraph, VertexType};
 use crate::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
 };
@@ -696,21 +697,13 @@ impl Authorizer for AlwaysDenyAuthorizer {
 /// `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go` `NodeRules()`.
 ///
 /// Upstream's Node authorizer subdivides access for the resources it can tie to a
-/// node through its graph (secrets, configmaps, PVCs, leases, …) and then falls
-/// through to these statically defined rules for everything else
+/// node (secrets, configmaps, PVCs, PVs, leases, pods, nodes, …) in
+/// [`NodeAuthorizer::evaluate`], and falls through to these statically defined
+/// rules only for everything else
 /// (`plugin/pkg/auth/authorizer/node/node_authorizer.go`: "Access to other
 /// resources is not subdivided, so just evaluate against the statically defined
-/// node rules"). Pods are in that fall-through unless the
-/// `AuthorizeNodeWithSelectors` feature gate is on, which is why a kubelet's
-/// cluster-scoped `LIST pods?fieldSelector=spec.nodeName=…` is allowed.
-///
-/// Without these, a vanilla kubelet against this api-server never learns about its
-/// own pods and starts nothing:
-///
-/// ```text
-/// Failed to watch: failed to list *v1.Pod: Node <name> is not authorized to list
-/// pods in namespace ; User does not have permission to perform this action
-/// ```
+/// node rules"). The rows for subdivided resources are therefore unreachable;
+/// they are kept because they are upstream's `NodeRules()` verbatim.
 ///
 /// Entries are `(apiGroup, resource[/subresource], verbs)`.
 const NODE_RULES: &[(&str, &str, &[&str])] = &[
@@ -776,6 +769,11 @@ const NODE_RULES: &[(&str, &str, &[&str])] = &[
 
 /// True when the request matches one of the static [`NODE_RULES`].
 fn node_rules_allow(attrs: &RequestAttributes) -> bool {
+    // `rbac.RulesAllow` matches a non-resource request against non-resource
+    // URLs only; `NodeRules()` has none, so a resource row never matches it.
+    if attrs.is_non_resource_request {
+        return false;
+    }
     let target = match attrs.subresource.as_deref() {
         Some(sub) if !sub.is_empty() => format!("{}/{}", attrs.resource, sub),
         _ => attrs.resource.clone(),
@@ -787,205 +785,497 @@ fn node_rules_allow(attrs: &RequestAttributes) -> bool {
     })
 }
 
-pub struct NodeAuthorizer;
+/// Feature gates the upstream Node authorizer consults through
+/// `utilfeature.DefaultFeatureGate` (node_authorizer.go `features`), at their
+/// release-1.35 defaults (`pkg/features/kube_features.go`).
+///
+/// `AuthorizeNodeWithSelectors` is not a field: it is GA and `LockToDefault:
+/// true` since 1.34 (kube_features.go:1146-1150), so the selector-aware
+/// `authorizeNode` / `authorizePod` / `authorizeResourceSlice` branches are
+/// unconditional.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAuthorizerFeatures {
+    /// `KubeletServiceAccountTokenForCredentialProviders`: Beta, default on in
+    /// 1.35 (kube_features.go:1478-1481).
+    pub kubelet_service_account_token_for_credential_providers: bool,
+    /// `PodCertificateRequest`: Beta, default OFF in 1.35 (kube_features.go:1602-1605).
+    pub pod_certificate_request: bool,
+}
+
+impl Default for NodeAuthorizerFeatures {
+    fn default() -> Self {
+        Self {
+            kubelet_service_account_token_for_credential_providers: true,
+            pod_certificate_request: false,
+        }
+    }
+}
+
+/// `NodeAuthorizer` (plugin/pkg/auth/authorizer/node/node_authorizer.go):
+///
+///  1. a request not from a node (`NodeIdentity()` isNode=false) gets no opinion;
+///  2. a node that cannot be named gets no opinion;
+///  3. a request for a secret, configmap, persistent volume, resource claim or
+///     persistent volume claim is rejected unless the verb is get and the object
+///     is related to the requesting node through the [`NodeGraph`]:
+///     node <- configmap, node <- pod, node <- pod <- secret, node <- pod <-
+///     configmap, node <- pod <- pvc, node <- pod <- pvc <- pv, node <- pod <-
+///     pvc <- pv <- secret, node <- pod <- ResourceClaim, node <- pcr;
+///  4. for a resourceslice, access follows the edge from the slice to its node;
+///  5. other resources are authorized uniformly by the static [`NODE_RULES`].
+///
+/// The graph is kept current by `rusternetes_api_server::node_graph_populator`,
+/// the counterpart of upstream's `AddGraphEventHandlers`.
+#[derive(Clone, Default)]
+pub struct NodeAuthorizer {
+    graph: Arc<NodeGraph>,
+    features: NodeAuthorizerFeatures,
+}
+
+/// `nodeidentifier.NewDefaultNodeIdentifier().NodeIdentity`
+/// (pkg/auth/nodeidentifier/default.go:42-68): the user name must start with
+/// `system:node:` AND the user must be in `system:nodes`. Returns
+/// `(nodeName, isNode)`.
+fn node_identity(user: &UserInfo) -> (String, bool) {
+    let Some(name) = user.username.strip_prefix("system:node:") else {
+        return (String::new(), false);
+    };
+    if !user.groups.iter().any(|g| g == "system:nodes") {
+        return (String::new(), false);
+    }
+    (name.to_string(), true)
+}
+
+fn no_opinion(reason: impl Into<String>) -> Opinion {
+    Opinion::NoOpinion {
+        reason: reason.into(),
+        error: None,
+    }
+}
+
+/// `selection.Equals` requirement `field == value` among the request's parsed
+/// field selector requirements (`attrs.GetFieldSelector()`).
+fn has_field_selector_equals(attrs: &RequestAttributes, field: &str, value: &str) -> bool {
+    attrs.field_selector_requirements.iter().any(|r| {
+        r.field() == field
+            && r.operator() == crate::field_selector::FieldOperator::Equals
+            && r.value() == value
+    })
+}
 
 impl NodeAuthorizer {
-    /// Extract the node name from a node username (system:node:<nodename>)
-    fn extract_node_name(username: &str) -> Option<String> {
-        username.strip_prefix("system:node:").map(|s| s.to_string())
+    /// `NewAuthorizer(graph, identifier, rules)`.
+    pub fn new(graph: Arc<NodeGraph>) -> Self {
+        Self {
+            graph,
+            features: NodeAuthorizerFeatures::default(),
+        }
     }
 
-    /// Check if the request is for the node's own Node object
-    fn is_own_node(&self, attrs: &RequestAttributes, node_name: &str) -> bool {
-        attrs.resource == "nodes"
-            && attrs.api_group.is_empty()
-            && attrs.name.as_ref().map(|n| n == node_name).unwrap_or(false)
+    /// Override the feature gates (upstream tests assign `authz.features`).
+    pub fn with_features(mut self, features: NodeAuthorizerFeatures) -> Self {
+        self.features = features;
+        self
     }
 
-    /// Check if the resource type is one that nodes are allowed to read
-    fn is_node_allowed_resource(&self, attrs: &RequestAttributes) -> bool {
-        // Nodes can read these resources (but creation/updates are restricted)
-        let allowed_resources = [
-            ("", "services"),
-            ("", "endpoints"),
-            ("discovery.k8s.io", "endpointslices"),
-            ("", "nodes"),
-            ("", "persistentvolumes"),
-            ("", "persistentvolumeclaims"),
-            ("storage.k8s.io", "volumeattachments"),
-            ("storage.k8s.io", "csidrivers"),
-            ("storage.k8s.io", "csinodes"),
-        ];
-
-        allowed_resources
-            .iter()
-            .any(|(group, resource)| attrs.api_group == *group && attrs.resource == *resource)
+    /// The graph this authorizer reads, for the populator that feeds it.
+    pub fn graph(&self) -> &Arc<NodeGraph> {
+        &self.graph
     }
 
-    /// Check if the request is for node-related API groups
-    fn is_node_api_group(&self, attrs: &RequestAttributes) -> bool {
-        matches!(
-            attrs.api_group.as_str(),
-            "authentication.k8s.io"
-                | "authorization.k8s.io"
-                | "certificates.k8s.io"
-                | "coordination.k8s.io"
-        )
+    /// `NodeAuthorizer.Authorize` (node_authorizer.go:109-168).
+    pub fn evaluate(&self, attrs: &RequestAttributes) -> Opinion {
+        let (node_name, is_node) = node_identity(&attrs.user);
+        if !is_node {
+            // reject requests from non-nodes
+            return no_opinion("");
+        }
+        if node_name.is_empty() {
+            // reject requests from unidentifiable nodes
+            return no_opinion(format!(
+                "unknown node for user {}",
+                quoted(&attrs.user.username)
+            ));
+        }
+
+        // subdivide access to specific resources
+        if !attrs.is_non_resource_request {
+            match (attrs.api_group.as_str(), attrs.resource.as_str()) {
+                ("", "secrets") => {
+                    return self.authorize_read_namespaced_object(
+                        &node_name,
+                        VertexType::Secret,
+                        attrs,
+                    )
+                }
+                ("", "configmaps") => {
+                    return self.authorize_read_namespaced_object(
+                        &node_name,
+                        VertexType::ConfigMap,
+                        attrs,
+                    )
+                }
+                ("", "persistentvolumeclaims") => {
+                    if attrs.subresource.as_deref() == Some("status") {
+                        return self.authorize_status_update(&node_name, VertexType::Pvc, attrs);
+                    }
+                    return self.authorize_get(&node_name, VertexType::Pvc, attrs);
+                }
+                ("", "persistentvolumes") => {
+                    return self.authorize_get(&node_name, VertexType::Pv, attrs)
+                }
+                ("resource.k8s.io", "resourceclaims") => {
+                    return self.authorize_get(&node_name, VertexType::ResourceClaim, attrs)
+                }
+                ("storage.k8s.io", "volumeattachments") => {
+                    return self.authorize_get(&node_name, VertexType::Va, attrs)
+                }
+                ("", "serviceaccounts") => {
+                    return self.authorize_service_account(&node_name, attrs)
+                }
+                ("coordination.k8s.io", "leases") => {
+                    return self.authorize_lease(&node_name, attrs)
+                }
+                ("storage.k8s.io", "csinodes") => {
+                    return self.authorize_csi_node(&node_name, attrs)
+                }
+                ("resource.k8s.io", "resourceslices") => {
+                    return self.authorize_resource_slice(&node_name, attrs)
+                }
+                ("", "nodes") => return self.authorize_node(&node_name, attrs),
+                ("", "pods") => return self.authorize_pod(&node_name, attrs),
+                ("certificates.k8s.io", "podcertificaterequests") => {
+                    if self.features.pod_certificate_request {
+                        return self.authorize_pod_certificate_request(&node_name, attrs);
+                    }
+                    return no_opinion("");
+                }
+                _ => {}
+            }
+        }
+
+        // Access to other resources is not subdivided, so just evaluate against
+        // the statically defined node rules.
+        if node_rules_allow(attrs) {
+            return Opinion::Allow(String::new());
+        }
+        no_opinion("")
+    }
+
+    /// `authorizeStatusUpdate`: update/patch of a status subresource of an
+    /// object related to the node.
+    fn authorize_status_update(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        match attrs.verb.as_str() {
+            "update" | "patch" => {}
+            _ => return no_opinion("can only get/update/patch this type"),
+        }
+        if attrs.subresource.as_deref() != Some("status") {
+            return no_opinion("can only update status subresource");
+        }
+        self.authorize_object(node_name, starting_type, attrs)
+    }
+
+    /// `authorizeGet`: "get" of an object related to the node.
+    fn authorize_get(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        if attrs.verb != "get" {
+            return no_opinion("can only get individual resources of this type");
+        }
+        if attrs.subresource.as_deref().is_some_and(|s| !s.is_empty()) {
+            return no_opinion("cannot get subresource");
+        }
+        self.authorize_object(node_name, starting_type, attrs)
+    }
+
+    /// `authorizeReadNamespacedObject`: get/list/watch of a single namespaced
+    /// object related to the node.
+    fn authorize_read_namespaced_object(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        match attrs.verb.as_str() {
+            "get" | "list" | "watch" => {}
+            _ => return no_opinion("can only read resources of this type"),
+        }
+        if attrs.subresource.as_deref().is_some_and(|s| !s.is_empty()) {
+            return no_opinion("cannot read subresource");
+        }
+        if attrs.namespace.as_deref().unwrap_or("").is_empty() {
+            return no_opinion("can only read namespaced object of this type");
+        }
+        self.authorize_object(node_name, starting_type, attrs)
+    }
+
+    /// `authorize` (named apart from [`Authorizer::authorize`]).
+    fn authorize_object(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        let name = attrs.name.as_deref().unwrap_or("");
+        if name.is_empty() {
+            return no_opinion("No Object name found");
+        }
+        self.authorize_by_graph(node_name, starting_type, attrs.namespace.as_deref(), name)
+    }
+
+    /// The tail shared by `authorize` and `authorizeCreateToken`: any error or
+    /// absence of a path yields the same relationship reason.
+    fn authorize_by_graph(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Opinion {
+        match self
+            .graph
+            .has_path_from(node_name, starting_type, namespace.unwrap_or(""), name)
+        {
+            Ok(true) => Opinion::Allow(String::new()),
+            Ok(false) | Err(_) => no_opinion(format!(
+                "no relationship found between node '{node_name}' and this object"
+            )),
+        }
+    }
+
+    /// `authorizeServiceAccount`: get (feature gated) or create of the token
+    /// subresource of a service account used by a pod on the node.
+    fn authorize_service_account(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        let no_subresource = attrs.subresource.as_deref().unwrap_or("").is_empty();
+        if attrs.verb == "get" && no_subresource {
+            if !(self
+                .features
+                .kubelet_service_account_token_for_credential_providers
+                || self.features.pod_certificate_request)
+            {
+                return no_opinion("not allowed to get service accounts");
+            }
+            return self.authorize_read_namespaced_object(
+                node_name,
+                VertexType::ServiceAccount,
+                attrs,
+            );
+        }
+        self.authorize_create_token(node_name, VertexType::ServiceAccount, attrs)
+    }
+
+    /// `authorizeCreateToken`.
+    fn authorize_create_token(
+        &self,
+        node_name: &str,
+        starting_type: VertexType,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        let name = attrs.name.as_deref().unwrap_or("");
+        if attrs.verb != "create" || name.is_empty() {
+            return no_opinion("can only create tokens for individual service accounts");
+        }
+        if attrs.subresource.as_deref() != Some("token") {
+            return no_opinion("can only create token subresource of serviceaccount");
+        }
+        self.authorize_by_graph(node_name, starting_type, attrs.namespace.as_deref(), name)
+    }
+
+    /// `authorizeLease`: node leases in `kube-node-lease`, named after the node.
+    fn authorize_lease(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        let verb = attrs.verb.as_str();
+        match verb {
+            "get" | "create" | "update" | "patch" | "delete" => {}
+            _ => return no_opinion("can only get, create, update, patch, or delete a node lease"),
+        }
+        // the request must be against the system namespace reserved for node leases
+        if attrs.namespace.as_deref().unwrap_or("") != "kube-node-lease" {
+            return no_opinion(
+                "can only access leases in the \"kube-node-lease\" system namespace",
+            );
+        }
+        // note we skip this check for create, since the authorizer doesn't know
+        // the name on create; the noderestriction admission plugin checks it
+        if verb != "create" && attrs.name.as_deref().unwrap_or("") != node_name {
+            return no_opinion(
+                "can only access node lease with the same name as the requesting node",
+            );
+        }
+        Opinion::Allow(String::new())
+    }
+
+    /// `authorizeCSINode`.
+    fn authorize_csi_node(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        let verb = attrs.verb.as_str();
+        match verb {
+            "get" | "create" | "update" | "patch" | "delete" => {}
+            _ => return no_opinion("can only get, create, update, patch, or delete a CSINode"),
+        }
+        if attrs.subresource.as_deref().is_some_and(|s| !s.is_empty()) {
+            return no_opinion("cannot authorize CSINode subresources");
+        }
+        if verb != "create" && attrs.name.as_deref().unwrap_or("") != node_name {
+            return no_opinion("can only access CSINode with the same name as the requesting node");
+        }
+        Opinion::Allow(String::new())
+    }
+
+    /// `authorizeResourceSlice` (with `AuthorizeNodeWithSelectors` on).
+    fn authorize_resource_slice(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        if attrs.subresource.as_deref().is_some_and(|s| !s.is_empty()) {
+            return no_opinion("cannot authorize ResourceSlice subresources");
+        }
+        match attrs.verb.as_str() {
+            // The noderestriction admission plugin checks ResourceSlice.NodeName
+            // on create; the authorizer does not see the new object.
+            "create" => Opinion::Allow(String::new()),
+            // Checking the existing object must have established that access is
+            // allowed by recording a graph edge.
+            "get" | "update" | "patch" | "delete" => {
+                self.authorize_object(node_name, VertexType::Slice, attrs)
+            }
+            "watch" | "list" | "deletecollection" => {
+                // only allow a scoped fieldSelector
+                if has_field_selector_equals(attrs, "spec.nodeName", node_name) {
+                    return Opinion::Allow(String::new());
+                }
+                no_opinion(
+                    "can only list/watch/deletecollection resourceslices with nodeName field selector",
+                )
+            }
+            _ => no_opinion(
+                "only the following verbs are allowed for a ResourceSlice: get, watch, list, create, update, patch, delete, deletecollection",
+            ),
+        }
+    }
+
+    /// `authorizePodCertificateRequest`.
+    fn authorize_pod_certificate_request(
+        &self,
+        node_name: &str,
+        attrs: &RequestAttributes,
+    ) -> Opinion {
+        if attrs.subresource.as_deref().is_some_and(|s| !s.is_empty()) {
+            return no_opinion(
+                "nodes may not access the status subresource of PodCertificateRequests",
+            );
+        }
+        match attrs.verb.as_str() {
+            // Creates are further restricted by the noderestriction admission plugin.
+            "create" => Opinion::Allow(String::new()),
+            "get" => self.authorize_object(node_name, VertexType::Pcr, attrs),
+            "list" | "watch" => {
+                // Allow requests that have a fieldselector restricting to this node.
+                if has_field_selector_equals(attrs, "spec.nodeName", node_name) {
+                    return Opinion::Allow(String::new());
+                }
+                no_opinion(
+                    "can only list/watch podcertificaterequests with nodeName field selector",
+                )
+            }
+            verb => no_opinion(format!("nodes may not {verb} podcertificaterequests")),
+        }
+    }
+
+    /// `authorizeNode` (with `AuthorizeNodeWithSelectors` on).
+    fn authorize_node(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        let name = attrs.name.as_deref().unwrap_or("");
+        match attrs.subresource.as_deref().unwrap_or("") {
+            "" => match attrs.verb.as_str() {
+                // Use the NodeRestriction admission plugin to limit a node to
+                // creating/updating its own API object.
+                "create" | "update" | "patch" => return Opinion::Allow(String::new()),
+                "get" | "list" | "watch" => {
+                    // Compare the name directly, rather than using the graph, so
+                    // kubelets can attempt a read of their Node API object prior
+                    // to creation.
+                    if name == node_name {
+                        return Opinion::Allow(String::new());
+                    }
+                    if name.is_empty() {
+                        return no_opinion(format!(
+                            "node '{node_name}' cannot read all nodes, only its own Node object"
+                        ));
+                    }
+                    return no_opinion(format!(
+                        "node '{node_name}' cannot read '{name}', only its own Node object"
+                    ));
+                }
+                _ => {}
+            },
+            "status" => {
+                if matches!(attrs.verb.as_str(), "update" | "patch") {
+                    // NodeRestriction admission limits a node to its own status.
+                    return Opinion::Allow(String::new());
+                }
+            }
+            _ => {}
+        }
+        no_opinion("")
+    }
+
+    /// `authorizePod` (with `AuthorizeNodeWithSelectors` on).
+    ///
+    /// DEVIATION (security-conservative, not a loosening): upstream allows
+    /// `create` of `pods/eviction` here, relying on NodeRestriction
+    /// (node_authorizer.go "case eviction"). This repository has no
+    /// NodeRestriction path for evictions yet, so the grant stays withheld, as
+    /// it was before the graph port (see [`NODE_RULES`] `pods`).
+    fn authorize_pod(&self, node_name: &str, attrs: &RequestAttributes) -> Opinion {
+        let name = attrs.name.as_deref().unwrap_or("");
+        match attrs.subresource.as_deref().unwrap_or("") {
+            "" => match attrs.verb.as_str() {
+                "get" => return self.authorize_get(node_name, VertexType::Pod, attrs),
+                "list" | "watch" => {
+                    // allow a scoped fieldSelector
+                    if has_field_selector_equals(attrs, "spec.nodeName", node_name) {
+                        return Opinion::Allow(String::new());
+                    }
+                    // allow a read of a single pod known to be related to the node
+                    if !name.is_empty() {
+                        return self.authorize_object(node_name, VertexType::Pod, attrs);
+                    }
+                    return no_opinion(
+                        "can only list/watch pods with spec.nodeName field selector",
+                    );
+                }
+                // Needed for the node to create/delete mirror pods. NodeRestriction
+                // admission limits a node to mirror pods bound to itself.
+                "create" | "delete" => return Opinion::Allow(String::new()),
+                _ => {}
+            },
+            "status" => {
+                if matches!(attrs.verb.as_str(), "update" | "patch") {
+                    // Needed for the node to report status of pods it is running;
+                    // NodeRestriction limits it to pods bound to itself.
+                    return Opinion::Allow(String::new());
+                }
+            }
+            _ => {}
+        }
+        no_opinion("")
     }
 }
 
 #[async_trait]
 impl Authorizer for NodeAuthorizer {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // Check if this is a node (kubelet) making the request
-        let node_name = match Self::extract_node_name(&attrs.user.username) {
-            Some(name) => name,
-            None => return Ok(Decision::Deny("Not a node user".to_string())),
-        };
-
-        // Allow nodes to access their own Node object
-        if self.is_own_node(attrs, &node_name) {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to create/update their own Node and CSINode objects
-        if (attrs.resource == "nodes" || attrs.resource == "csinodes")
-            && matches!(attrs.verb.as_str(), "create" | "update" | "patch")
-            && attrs.name.as_ref().map(|n| n == &node_name).unwrap_or(true)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to update their own Node status
-        if attrs.resource == "nodes"
-            && attrs
-                .subresource
-                .as_ref()
-                .map(|s| s == "status")
-                .unwrap_or(false)
-            && attrs
-                .name
-                .as_ref()
-                .map(|n| n == &node_name)
-                .unwrap_or(false)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to read certain cluster-wide resources
-        if matches!(attrs.verb.as_str(), "get" | "list" | "watch")
-            && self.is_node_allowed_resource(attrs)
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to access node-related API groups
-        // (authentication, authorization, certificates, coordination)
-        if self.is_node_api_group(attrs) {
-            // Nodes can create TokenReviews, SubjectAccessReviews, CSRs, and Leases
-            if matches!(
-                attrs.verb.as_str(),
-                "create" | "get" | "list" | "watch" | "update" | "patch"
-            ) {
-                return Ok(Decision::Allow);
-            }
-        }
-
-        // Allow nodes to read/write pods bound to them
-        // Note: In a full implementation, this would check if the pod is actually
-        // bound to this specific node by querying storage. For now, we allow
-        // read access to pods and let RBAC provide additional restrictions.
-        if attrs.resource == "pods" && attrs.namespace.is_some() {
-            if matches!(
-                attrs.verb.as_str(),
-                "get" | "list" | "watch" | "update" | "patch"
-            ) {
-                return Ok(Decision::Allow);
-            }
-            // Allow updating pod status
-            if attrs.verb == "update"
-                && attrs
-                    .subresource
-                    .as_ref()
-                    .map(|s| s == "status")
-                    .unwrap_or(false)
-            {
-                return Ok(Decision::Allow);
-            }
-        }
-
-        // Allow nodes to read secrets and configmaps in namespaces
-        // Note: In a full implementation, this should verify the secret/configmap
-        // is referenced by a pod bound to this node
-        if matches!(attrs.resource.as_str(), "secrets" | "configmaps")
-            && attrs.namespace.is_some()
-            && matches!(attrs.verb.as_str(), "get" | "list" | "watch")
-        {
-            return Ok(Decision::Allow);
-        }
-
-        // Allow nodes to create events
-        if attrs.resource == "events" && attrs.verb == "create" {
-            return Ok(Decision::Allow);
-        }
-
-        // Fall through to the statically defined node rules, exactly as upstream's
-        // Node authorizer does for resources it does not subdivide. This is what
-        // authorizes the kubelet's own cluster-scoped pod list/watch.
-        if node_rules_allow(attrs) {
-            return Ok(Decision::Allow);
-        }
-
-        // Deny everything else.
-        //
-        // The namespace is rendered as a plain string, empty for a
-        // cluster-scoped request, the way upstream's node authorizer prints it
-        // (`node '%s' cannot get %s %s/%s`,
-        // plugin/pkg/auth/authorizer/node/node_authorizer.go:506-551). Using
-        // `{:?}` on the `Option` leaked Rust's `Debug` form into an API error
-        // message a real kubelet then logged verbatim:
-        //
-        //   Node ... is not authorized to delete pods in namespace Some("kube-system")
-        //   Failed to watch: failed to list *v1.Pod: Node <name> is not
-        //   authorized to list pods in namespace None
-        Ok(Decision::Deny(format!(
-            "Node {} is not authorized to {} {} in namespace {}",
-            node_name,
-            attrs.verb,
-            attrs.resource,
-            attrs.namespace.as_deref().unwrap_or("")
-        )))
+        Ok(match self.evaluate(attrs) {
+            Opinion::Allow(_) => Decision::Allow,
+            Opinion::Deny(reason) | Opinion::NoOpinion { reason, .. } => Decision::Deny(reason),
+        })
     }
 
     async fn authorize_opinion(&self, attrs: &RequestAttributes) -> Result<Opinion> {
-        // NodeIdentity requires prefix AND system:nodes (nodeidentifier/default.go:42-68).
-        // node_authorizer.go:109-118,164-168: non-node/default miss and all
-        // existing successful branches have empty reasons; unknown node name
-        // has the exact quoted identity reason. Graph/selector cases: #3672.
-        let is_node = attrs
-            .user
-            .groups
-            .iter()
-            .any(|group| group == "system:nodes");
-        let Some(name) = Self::extract_node_name(&attrs.user.username).filter(|_| is_node) else {
-            return Ok(Opinion::NoOpinion {
-                reason: String::new(),
-                error: None,
-            });
-        };
-        if name.is_empty() {
-            return Ok(Opinion::NoOpinion {
-                reason: format!("unknown node for user {}", quoted(&attrs.user.username)),
-                error: None,
-            });
-        }
-        Ok(match self.authorize(attrs).await? {
-            Decision::Allow => Opinion::Allow(String::new()),
-            Decision::Deny(_) => Opinion::NoOpinion {
-                reason: String::new(),
-                error: None,
-            },
-        })
+        Ok(self.evaluate(attrs))
     }
 
     async fn get_user_rules(
@@ -997,9 +1287,8 @@ impl Authorizer for NodeAuthorizer {
         Vec<crate::resources::NonResourceRule>,
     )> {
         // Extract node name
-        let _node_name = match Self::extract_node_name(&user.username) {
-            Some(name) => name,
-            None => return Ok((vec![], vec![])),
+        let Some(_node_name) = user.username.strip_prefix("system:node:") else {
+            return Ok((vec![], vec![]));
         };
 
         // Return a representative set of rules for nodes
@@ -1456,21 +1745,44 @@ mod tests {
 
     #[tokio::test]
     async fn node_may_list_pods_cluster_wide() {
-        let attrs = RequestAttributes::new(node_user(), "list", "pods").with_api_group("");
+        let mut attrs = RequestAttributes::new(node_user(), "list", "pods").with_api_group("");
+        attrs.set_selectors("spec.nodeName=worker-1", "");
         assert!(
             matches!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
                 Decision::Allow
             ),
             "the kubelet's own cluster-scoped pod list must be allowed"
         );
     }
 
+    /// With `AuthorizeNodeWithSelectors` GA (authorizePod), the same list
+    /// WITHOUT the node's `spec.nodeName` selector, or with another node's, is
+    /// not allowed any more.
+    #[tokio::test]
+    async fn node_may_not_list_or_watch_pods_without_its_own_selector() {
+        for verb in ["list", "watch"] {
+            for selector in ["", "spec.nodeName=other", "status.phase=Running"] {
+                let mut attrs =
+                    RequestAttributes::new(node_user(), verb, "pods").with_api_group("");
+                attrs.set_selectors(selector, "");
+                assert_eq!(
+                    NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
+                    Decision::Deny(
+                        "can only list/watch pods with spec.nodeName field selector".to_string()
+                    ),
+                    "{verb} {selector:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn node_may_watch_pods_cluster_wide() {
-        let attrs = RequestAttributes::new(node_user(), "watch", "pods").with_api_group("");
+        let mut attrs = RequestAttributes::new(node_user(), "watch", "pods").with_api_group("");
+        attrs.set_selectors("spec.nodeName=worker-1", "");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
             Decision::Allow
         ));
     }
@@ -1482,7 +1794,7 @@ mod tests {
         let attrs = RequestAttributes::new(node_user(), "list", "runtimeclasses")
             .with_api_group("node.k8s.io");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
             Decision::Allow
         ));
     }
@@ -1499,7 +1811,7 @@ mod tests {
                 .with_namespace("kube-system")
                 .with_api_group("");
             assert_eq!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
                 Decision::Allow,
                 "node should be authorized to {verb} pods; NodeRestriction narrows it"
             );
@@ -1516,7 +1828,7 @@ mod tests {
             .with_api_group("")
             .with_subresource("eviction");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
             Decision::Deny(_)
         ));
     }
@@ -1530,7 +1842,7 @@ mod tests {
             .with_api_group("");
         assert!(
             matches!(
-                NodeAuthorizer.authorize(&attrs).await.unwrap(),
+                NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
                 Decision::Deny(_)
             ),
             "nodes have read-only access to services"
@@ -1548,7 +1860,7 @@ mod tests {
         };
         let attrs = RequestAttributes::new(user, "list", "pods").with_api_group("");
         assert!(matches!(
-            NodeAuthorizer.authorize(&attrs).await.unwrap(),
+            NodeAuthorizer::default().authorize(&attrs).await.unwrap(),
             Decision::Deny(_)
         ));
     }
@@ -1819,7 +2131,7 @@ mod tests {
         // Node authorizer grants a kubelet its own Node, even chained with a
         // denying authorizer (models Node + empty-RBAC).
         let node_union = UnionAuthorizer::new(vec![
-            Arc::new(NodeAuthorizer),
+            Arc::new(NodeAuthorizer::default()),
             Arc::new(AlwaysDenyAuthorizer),
         ]);
         // NodeIdentity requires the system:nodes group (default.go:42-68).
@@ -1885,3 +2197,6 @@ mod tests {
 #[cfg(test)]
 #[path = "authz/allow_reason_tests.rs"]
 mod allow_reason_tests;
+#[cfg(test)]
+#[path = "authz/node_authorizer_tests.rs"]
+mod node_authorizer_tests;
