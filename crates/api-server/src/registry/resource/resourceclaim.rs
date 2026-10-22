@@ -188,6 +188,15 @@ impl RestCreateStrategy<ResourceClaim> for Strategy {
 }
 
 impl RestUpdateStrategy<ResourceClaim> for Strategy {
+    /// `GetResetFields` (pkg/registry/resource/resourceclaim/strategy.go:72): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("resource.k8s.io/v1alpha3", &[&["status"]])
+            .with("resource.k8s.io/v1beta1", &[&["status"]])
+            .with("resource.k8s.io/v1beta2", &[&["status"]])
+            .with("resource.k8s.io/v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -239,6 +248,15 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<ResourceClaim> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/resource/resourceclaim/strategy.go:153): metadata, spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("resource.k8s.io/v1alpha3", &[&["metadata"], &["spec"]])
+            .with("resource.k8s.io/v1beta1", &[&["metadata"], &["spec"]])
+            .with("resource.k8s.io/v1beta2", &[&["metadata"], &["spec"]])
+            .with("resource.k8s.io/v1", &[&["metadata"], &["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }

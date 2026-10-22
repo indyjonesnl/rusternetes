@@ -344,6 +344,14 @@ impl RestCreateStrategy<ValidatingAdmissionPolicy> for Strategy {
 }
 
 impl RestUpdateStrategy<ValidatingAdmissionPolicy> for Strategy {
+    /// `GetResetFields` (pkg/registry/admissionregistration/validatingadmissionpolicy/strategy.go:133): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("admissionregistration.k8s.io/v1alpha1", &[&["status"]])
+            .with("admissionregistration.k8s.io/v1beta1", &[&["status"]])
+            .with("admissionregistration.k8s.io/v1", &[&["status"]])
+    }
+
     /// strategy.go:91-93.
     fn allow_create_on_update(&self) -> bool {
         false
@@ -422,6 +430,23 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<ValidatingAdmissionPolicy> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/admissionregistration/validatingadmissionpolicy/strategy.go:173): spec, metadata.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with(
+                "admissionregistration.k8s.io/v1alpha1",
+                &[&["spec"], &["metadata"]],
+            )
+            .with(
+                "admissionregistration.k8s.io/v1beta1",
+                &[&["spec"], &["metadata"]],
+            )
+            .with(
+                "admissionregistration.k8s.io/v1",
+                &[&["spec"], &["metadata"]],
+            )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }

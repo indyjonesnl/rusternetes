@@ -68,6 +68,11 @@ impl RestCreateStrategy<VolumeAttachment> for Strategy {
 }
 
 impl RestUpdateStrategy<VolumeAttachment> for Strategy {
+    /// `GetResetFields` (pkg/registry/storage/volumeattachment/strategy.go:50): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("storage.k8s.io/v1", &[&["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -116,6 +121,11 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<VolumeAttachment> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/storage/volumeattachment/strategy.go:125): metadata, spec.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("storage.k8s.io/v1", &[&["metadata"], &["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }

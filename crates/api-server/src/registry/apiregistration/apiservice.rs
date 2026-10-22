@@ -65,6 +65,13 @@ impl RestCreateStrategy<APIService> for Strategy {
 }
 
 impl RestUpdateStrategy<APIService> for Strategy {
+    /// `GetResetFields` (staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:55): status.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("apiregistration.k8s.io/v1", &[&["status"]])
+            .with("apiregistration.k8s.io/v1beta1", &[&["status"]])
+    }
+
     /// strategy.go:94-96.
     fn allow_create_on_update(&self) -> bool {
         false
@@ -106,6 +113,16 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<APIService> for StatusStrategy {
+    /// `GetResetFields` (staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go:127): spec, metadata.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("apiregistration.k8s.io/v1", &[&["spec"], &["metadata"]])
+            .with(
+                "apiregistration.k8s.io/v1beta1",
+                &[&["spec"], &["metadata"]],
+            )
+    }
+
     /// strategy.go:151-153.
     fn allow_create_on_update(&self) -> bool {
         false
