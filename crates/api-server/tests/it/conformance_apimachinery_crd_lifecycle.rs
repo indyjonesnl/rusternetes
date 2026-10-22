@@ -2173,5 +2173,90 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
 /// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 #[tokio::test]
-#[ignore = "Ratcheting tracker — depends on CEL eval (this PR) + schema-diff engine (future, multi-week)"]
-async fn ratcheting_optional_old_self_nil_for_new_values() {}
+async fn ratcheting_optional_old_self_nil_for_new_values() {
+    let router = spawn_router();
+    let group = "rl9.example.com";
+
+    ratchet_install_crd(&router, &ratchet_lax_crd(group)).await;
+
+    // crd_validation_ratcheting.go:730-836: the schema is tightened to the
+    // optionalOldSelf rules before the object exists, so the first write sees
+    // oldSelf == optional.none().
+    let rule = json!([{
+        "rule": "!oldSelf.hasValue() || self != oldSelf.value()",
+        "optionalOldSelf": true
+    }]);
+    let leaf = json!({
+        "type": "string",
+        "maxLength": 5,
+        "x-kubernetes-validations": rule
+    });
+    let tight_spec = json!({
+        "type": "object",
+        "properties": {
+            "field": leaf,
+            "struct": {"type": "object", "properties": {"field": leaf}},
+            "list": {
+                "type": "array",
+                "maxItems": 5,
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["key"],
+                "items": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}, "field": leaf},
+                    "required": ["key"]
+                }
+            },
+            "map": {
+                "type": "object",
+                "maxProperties": 5,
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"field": leaf}
+                }
+            }
+        }
+    });
+    ratchet_tighten_crd(&router, group, &ratchet_tight_crd(group, tight_spec)).await;
+
+    let initial = json!({
+        "field": "foo",
+        "struct": {"field": "foo"},
+        "list": [
+            {"key": "foo", "field": "foo"},
+            {"key": "bar", "field": "foo"}
+        ],
+        "map": {"foo": {"field": "foo"}, "bar": {"field": "foo"}}
+    });
+    let (s, b) = ratchet_post_cr(&router, group, "t1", initial.clone()).await;
+    assert_eq!(s, 201, "create sees oldSelf = none and must pass, body={b}");
+
+    // Label-only update: every field is now unchanged, oldSelf has a value
+    // equal to self, so every rule fails (transition rules are not ratcheted).
+    let (s, body) =
+        ratchet_put_cr(&router, group, "t1", initial, Some(json!({"foo": "bar"}))).await;
+    assert!((400..500).contains(&s), "got {s}, body={body}");
+    let msg = body["message"].as_str().unwrap_or("");
+    for path in [
+        "field",
+        "struct.field",
+        "list[0].field",
+        "list[1].field",
+        "map[foo].field",
+        "map[bar].field",
+    ] {
+        assert!(msg.contains(path), "missing {path} in: {msg}");
+    }
+
+    let updated = json!({
+        "field": "new",
+        "struct": {"field": "new"},
+        "list": [
+            {"key": "foo", "field": "new"},
+            {"key": "bar", "field": "new"}
+        ],
+        "map": {"foo": {"field": "new"}, "bar": {"field": "new"}}
+    });
+    let (s, b) = ratchet_put_cr(&router, group, "t1", updated, None).await;
+    assert_eq!(s, 200, "changing all fields must pass, body={b}");
+}

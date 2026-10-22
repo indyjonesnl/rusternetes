@@ -710,6 +710,9 @@ pub struct CrRuleFailure {
     /// Whether the rule references `oldSelf` (transition rule). Transition
     /// rules are NEVER ratcheted — surfaced here so callers can preserve them.
     pub is_transition: bool,
+    /// Positions in `path` that are `additionalProperties` map keys. Upstream
+    /// renders these as `map[key]` (field.Path.Key) and properties as `.name`.
+    pub map_key_positions: Vec<usize>,
 }
 
 /// Walk `schema` and `cr_value` concurrently, evaluating every reachable
@@ -732,6 +735,7 @@ pub fn evaluate_cr_rules_with_paths(
         cr_value,
         old_value,
         &mut Vec::new(),
+        &mut Vec::new(),
         &mut evaluator,
         &mut total_cost,
         &mut failures,
@@ -745,6 +749,7 @@ fn walk_and_eval(
     node: &serde_json::Value,
     old_node: Option<&serde_json::Value>,
     path: &mut Vec<PathSeg>,
+    map_keys: &mut Vec<usize>,
     evaluator: &mut CELEvaluator,
     total_cost: &mut u64,
     failures: &mut Vec<CrRuleFailure>,
@@ -802,6 +807,7 @@ fn walk_and_eval(
                     path: path.clone(),
                     message,
                     is_transition,
+                    map_key_positions: map_keys.clone(),
                 }),
                 Err(_) => {
                     // Runtime errors are reported as failures (no ratcheting
@@ -814,6 +820,7 @@ fn walk_and_eval(
                             rule_str
                         ),
                         is_transition,
+                        map_key_positions: map_keys.clone(),
                     });
                 }
             }
@@ -834,6 +841,7 @@ fn walk_and_eval(
                         child,
                         old_child,
                         path,
+                        map_keys,
                         evaluator,
                         total_cost,
                         failures,
@@ -857,17 +865,20 @@ fn walk_and_eval(
                     let old_child = old_node
                         .and_then(|o| o.as_object())
                         .and_then(|m| m.get(key));
+                    map_keys.push(path.len());
                     path.push(PathSeg::Key(key.clone()));
                     walk_and_eval(
                         addl_schema,
                         child,
                         old_child,
                         path,
+                        map_keys,
                         evaluator,
                         total_cost,
                         failures,
                     )?;
                     path.pop();
+                    map_keys.pop();
                 }
             }
         }
@@ -886,6 +897,7 @@ fn walk_and_eval(
                         child,
                         old_child.as_ref(),
                         path,
+                        map_keys,
                         evaluator,
                         total_cost,
                         failures,
