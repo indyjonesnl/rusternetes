@@ -139,7 +139,33 @@ impl TlsConfig {
         client_ca_cert_paths: &[&str],
     ) -> Result<Arc<rustls::ServerConfig>> {
         let client_auth_roots = load_ca_roots(client_ca_cert_paths)?;
+        self.mtls_server_config_with_roots(client_auth_roots)
+    }
 
+    /// [`Self::into_mtls_server_config_for_cas`] over an in-memory PEM bundle,
+    /// without consuming `self`: the dynamic client-CA controller rebuilds the
+    /// serving config from the current bundle on every change
+    /// (`DynamicServingCertificateController.syncCerts`,
+    /// staging/src/k8s.io/apiserver/pkg/server/dynamiccertificates/tlsconfig.go:150-216,
+    /// which clones `baseTLSConfig` and swaps `ClientCAs`).
+    pub fn mtls_server_config_for_ca_bundle(
+        &self,
+        client_ca_bundle: &[u8],
+    ) -> Result<Arc<rustls::ServerConfig>> {
+        ensure_crypto_provider();
+        let roots = parse_ca_bundle("client CA bundle", client_ca_bundle)?;
+        TlsConfig {
+            cert: self.cert.clone(),
+            key: self.key.clone_key(),
+            cert_pem: None,
+        }
+        .mtls_server_config_with_roots(roots)
+    }
+
+    fn mtls_server_config_with_roots(
+        self,
+        client_auth_roots: rustls::RootCertStore,
+    ) -> Result<Arc<rustls::ServerConfig>> {
         // `allow_unauthenticated` makes the client certificate OPTIONAL, matching
         // upstream apiserver semantics: `--client-ca-file` *enables* x509
         // authentication but does not *require* a client cert (it requests one,
@@ -166,6 +192,35 @@ impl TlsConfig {
 
         Ok(Arc::new(config))
     }
+}
+
+/// Parse a PEM CA bundle into a root store. Like `cert.NewPoolFromBytes`
+/// (client-go/util/cert/pem.go), content without any certificate is an error.
+pub fn parse_ca_bundle(name: &str, pem: &[u8]) -> Result<rustls::RootCertStore> {
+    let certs = rustls_pemfile::certs(&mut &*pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("error loading CA bundle for {name:?}"))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let (added, _) = roots.add_parsable_certificates(certs);
+    if added == 0 {
+        anyhow::bail!(
+            "error loading CA bundle for {name:?}: data does not contain any valid certificates"
+        );
+    }
+    Ok(roots)
+}
+
+/// [`client_cert_verifier_for_ca_file`] over an in-memory bundle
+/// (`newCABundleAndVerifier`, dynamic_cafile_content.go).
+pub fn client_cert_verifier_for_ca_bundle(
+    name: &str,
+    pem: &[u8],
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    ensure_crypto_provider();
+    let roots = parse_ca_bundle(name, pem)?;
+    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("Failed to build client cert verifier")
 }
 
 /// Read PEM CA bundle files into one root store (the union of the bundles).

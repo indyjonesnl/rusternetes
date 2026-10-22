@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rusternetes_api_server::peer_cert_acceptor::PeerCertAcceptor;
+use rusternetes_api_server::request_header_authentication::{mtls_acceptor, RequestHeaderTrust};
 use rusternetes_api_server::router::build_router;
 use rusternetes_api_server::state::ApiServerState;
 use rusternetes_common::auth::TokenManager;
@@ -98,13 +98,6 @@ async fn start(allowed_names: &[&str]) -> Harness {
         key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server.key.serialize_der())),
         cert_pem: None,
     };
-    let server_config = tls_config
-        .into_mtls_server_config_for_cas(&[
-            client_ca_path.to_str().unwrap(),
-            proxy_ca_path.to_str().unwrap(),
-        ])
-        .expect("mtls server config");
-
     let names: Vec<String> = allowed_names.iter().map(|s| s.to_string()).collect();
     let rh_config = Arc::new(
         RequestHeaderConfig::new(
@@ -116,17 +109,19 @@ async fn start(allowed_names: &[&str]) -> Harness {
         )
         .unwrap(),
     );
-    let acceptor = PeerCertAcceptor::new(axum_server::tls_rustls::RustlsConfig::from_config(
-        server_config,
-    ))
-    .with_request_header(
-        rh_config,
-        proxy_ca_path.to_str().unwrap(),
+    let trust = RequestHeaderTrust {
+        config: rh_config,
+        client_ca_file: proxy_ca_path.to_str().unwrap().to_string(),
+    };
+    // The production wiring: dynamic CA providers watch the files, so they
+    // must outlive the server.
+    let (acceptor, reload) = mtls_acceptor(
+        tls_config,
         Some(client_ca_path.to_str().unwrap()),
+        Some(&trust),
     )
-    .expect("front-proxy trust");
-    let _ = std::fs::remove_file(&client_ca_path);
-    let _ = std::fs::remove_file(&proxy_ca_path);
+    .expect("mtls acceptor");
+    std::mem::forget(reload);
 
     let backend = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
     let state = Arc::new(ApiServerState::new(

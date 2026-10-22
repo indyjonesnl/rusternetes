@@ -615,16 +615,29 @@ async fn main() -> Result<()> {
             request_header.as_ref(),
         );
         let client_cert_authn = !client_cas.is_empty();
-        let server_config = if client_cert_authn {
+        // `--client-ca-file` / `--requestheader-client-ca-file` are dynamic CA
+        // providers: edits to the files take effect without a restart (#3426).
+        let (mtls, plain_config) = if client_cert_authn {
             info!(
                 "Client certificate authentication enabled (CAs: {})",
                 client_cas.join(", ")
             );
-            tls_config.into_mtls_server_config_for_cas(&client_cas)?
+            (
+                Some(
+                    rusternetes_api_server::request_header_authentication::mtls_acceptor(
+                        tls_config,
+                        args.client_ca_file.as_deref(),
+                        request_header.as_ref(),
+                    )?,
+                ),
+                None,
+            )
         } else {
-            tls_config.into_server_config()?
+            (
+                None,
+                Some(RustlsConfig::from_config(tls_config.into_server_config()?)),
+            )
         };
-        let rustls_config = RustlsConfig::from_config(server_config);
 
         info!("HTTPS server listening on {}", args.bind_address);
         let addr = args.bind_address.parse()?;
@@ -663,18 +676,13 @@ async fn main() -> Result<()> {
             }};
         }
 
-        if client_cert_authn {
-            let mut server = axum_server::bind(addr).acceptor(
-                rusternetes_api_server::request_header_authentication::peer_cert_acceptor(
-                    rustls_config,
-                    args.client_ca_file.as_deref(),
-                    request_header.as_ref(),
-                )?,
-            );
+        if let Some((acceptor, _ca_reload)) = mtls {
+            let mut server = axum_server::bind(addr).acceptor(acceptor);
             apply_http2_tuning!(server);
             server.serve(app.into_make_service()).await?;
         } else {
-            let mut server = axum_server::bind_rustls(addr, rustls_config);
+            let mut server =
+                axum_server::bind_rustls(addr, plain_config.expect("set when no client CA"));
             apply_http2_tuning!(server);
             server.serve(app.into_make_service()).await?;
         }
