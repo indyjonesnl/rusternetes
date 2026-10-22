@@ -21,7 +21,7 @@ redis = ["rusternetes-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common", features = ["axum-support"] }
+rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
 # api-client: StorageBackend::Api + the shared ApiStorage adapter (now lives in
 # the storage crate; resolves the old controller-manager dependency, #1146).
 rusternetes-storage = { path = "../storage", features = ["api-client"] }

@@ -121,8 +121,22 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
     apply_feature_gates(&args)?;
+
+    // options.go:244-251: after the feature gates are applied, the flagz
+    // reader exists only when ComponentFlagz is enabled.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ComponentFlagz,
+    ) {
+        rusternetes_kube_proxy::serve_metrics::set_flagz_reader(
+            rusternetes_common::flagz::flags_from_clap(&cmd, &matches),
+        );
+    }
 
     rusternetes_common::tracing::init_basic_tracing("kube-proxy", &args.log_level)?;
     info!(
