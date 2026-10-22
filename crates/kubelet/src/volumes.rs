@@ -862,8 +862,15 @@ impl VolumeManager {
                     continue;
                 }
             };
+            // A plugin whose `ConstructVolumeSpec` returns a nil spec (the
+            // `image` plugin, image.go:71-73) cannot be reconstructed
+            // (reconstruct_common.go:292-295: "got nil").
+            let Some(volume) = reconstructed.volume else {
+                warn!("Cannot reconstruct the spec of staged device {device_mount_path_str}: got nil spec");
+                continue;
+            };
             let spec = Arc::new(OwnedSpec {
-                volume: reconstructed.volume,
+                volume,
                 persistent_volume: reconstructed.persistent_volume,
                 read_only: false,
                 migrated: false,

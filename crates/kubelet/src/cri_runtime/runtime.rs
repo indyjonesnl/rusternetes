@@ -52,17 +52,30 @@ fn reserved_sandbox_id(err: &CriError) -> Option<String> {
 
 /// Marks a failed `CreateContainer` (upstream `ErrCreateContainer` with the
 /// gRPC status message as `msg`, `kuberuntime_container.go:277-282`).
-/// `Display` is the message only.
-#[derive(Debug)]
-struct CreateContainerFailed(String);
+/// `Display` and `Debug` are those of the underlying CRI error, so the error
+/// text and the gRPC status code stay visible to callers.
+struct CreateContainerFailed {
+    msg: String,
+    source: CriError,
+}
 
 impl std::fmt::Display for CreateContainerFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        std::fmt::Display::fmt(&self.source, f)
     }
 }
 
-impl std::error::Error for CreateContainerFailed {}
+impl std::fmt::Debug for CreateContainerFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for CreateContainerFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Per-probe threshold-tracking state for the liveness/startup probe state
 /// machine. Mirrors the bollard runtime's `ProbeState`.
@@ -979,7 +992,7 @@ impl CriContainerRuntime {
         // `incrementImageVolumeMetrics(err, msg, ...)` (`:1659`).
         let (is_create_err, msg) = match &res {
             Err(e) => match e.downcast_ref::<CreateContainerFailed>() {
-                Some(c) => (true, c.0.clone()),
+                Some(c) => (true, c.msg.clone()),
                 None => (false, String::new()),
             },
             Ok(_) => (false, String::new()),
@@ -1289,8 +1302,11 @@ impl CriContainerRuntime {
             .map_err(|e| {
                 // `ErrCreateContainer` with `s.Message()` (`:277-282`); the
                 // error text itself is unchanged.
-                let msg = image_volume_metrics::grpc_message(&anyhow::Error::new(e));
-                anyhow::Error::new(CreateContainerFailed(msg))
+                let msg = match &e {
+                    CriError::Rpc { source, .. } => source.message().to_string(),
+                    other => format!("{other:#}"),
+                };
+                anyhow::Error::new(CreateContainerFailed { msg, source: e })
             })?;
         // Emit Created event after the container is created — mirrors upstream
         // `startContainer` in `pkg/kubelet/kuberuntime/kuberuntime_container.go:290`:
