@@ -25,14 +25,18 @@
 //! Server-side apply is [`apply`]; this is the other half, for every write
 //! that is not an apply.
 //!
-//! DEVIATIONS, deliberate: (1) the field sets come from [`fieldset`]'s
-//! name-driven walker, not the OpenAPI schema; (2) one version per kind is
+//! DEVIATIONS, deliberate: (1) the field sets come from the kind's OpenAPI /
+//! structural schema ([`schema`], #2734) where the caller supplies one
+//! ([`FieldManager::with_schema`]), and from [`fieldset`]'s name-driven table
+//! for a kind with none; (2) one version per kind is
 //! served here, so upstream's per-manager `versionConverter` is the identity.
 
 pub mod apply;
 pub mod fieldset;
+pub mod schema;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::types::ManagedFieldsEntry;
 use chrono::{DateTime, SubsecRound, Utc};
@@ -244,6 +248,8 @@ pub struct FieldManager {
     /// `""` for the resource itself.
     subresource: String,
     reset_fields: ResetFields,
+    /// The schema of the kind (`typeconverter`), when this tree has one.
+    schema: Option<Arc<schema::Type>>,
 }
 
 impl FieldManager {
@@ -257,6 +263,23 @@ impl FieldManager {
             api_version: api_version.to_string(),
             subresource: subresource.unwrap_or_default().to_string(),
             reset_fields,
+            schema: None,
+        }
+    }
+
+    /// Drive the field sets and the merge by `schema`
+    /// (`NewDefaultFieldManager`'s `typeConverter` argument). Without one the
+    /// name-driven table answers.
+    pub fn with_schema(mut self, schema: Option<Arc<schema::Type>>) -> Self {
+        self.schema = schema;
+        self
+    }
+
+    /// `typeconverter.ObjectToTyped(obj).ToFieldSet()`.
+    pub(crate) fn fields_of(&self, obj: &Value) -> Fields {
+        match &self.schema {
+            Some(t) => Fields::of_typed(obj, t),
+            None => Fields::of(obj),
         }
     }
 
@@ -294,7 +317,7 @@ impl FieldManager {
         // `merge.Updater.Update` (update.go:167-204) with the name "current-operation"
         // as the manager.
         let exclude = self.reset_set();
-        let mut comparison = Fields::of(live).compare(&Fields::of(new));
+        let mut comparison = self.fields_of(live).compare(&self.fields_of(new));
         if !exclude.is_empty() {
             comparison = comparison.exclude(&exclude);
         }

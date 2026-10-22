@@ -90,6 +90,10 @@ pub struct ApplyOptions {
     /// The subresource being applied (`/status`, `/scale`); upstream
     /// `buildManagerInfoManager.subresource` (buildmanagerinfo.go:55-61).
     pub subresource: Option<String>,
+    /// The kind's `typeConverter` when the serving storage supplies one (a
+    /// custom resource's structural schema); a built-in's comes from
+    /// [`crate::fieldmanager::schemas::builtin`].
+    pub schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
 }
 
 impl ApplyOptions {
@@ -99,7 +103,16 @@ impl ApplyOptions {
             force: false,
             reset_fields: ResetFields::new(),
             subresource: None,
+            schema: None,
         }
+    }
+
+    pub fn with_schema(
+        mut self,
+        schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+    ) -> Self {
+        self.schema = schema;
+        self
     }
 
     pub fn with_subresource(mut self, subresource: Option<&str>) -> Self {
@@ -205,11 +218,21 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         .or_else(|| current.as_ref().and_then(|c| c.get("apiVersion")))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let kind = desired
+        .get("kind")
+        .or_else(|| current.as_ref().and_then(|c| c.get("kind")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let schema = opts
+        .schema
+        .clone()
+        .or_else(|| crate::fieldmanager::schemas::builtin(version, kind));
     let field_manager = crate::fieldmanager::FieldManager::new(
         version,
         opts.subresource.as_deref(),
         opts.reset_fields.clone(),
-    );
+    )
+    .with_schema(schema);
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
             rusternetes_common::fieldmanager::apply::retain_live_system_metadata(

@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use super::schema::{ListKind, Type};
+
 /// `fieldpath.Set`, as a trie: a path is a member when `member` is set on the
 /// node it ends at. A node may be a member and have children (`"."` in
 /// `FieldsV1`).
@@ -267,6 +269,101 @@ impl Fields {
         fields
     }
 
+    /// `ToFieldSet` of a whole object, driven by the schema `ty` of its kind
+    /// (`typed.TypedValue.ToFieldSet` over `typeconverter.ObjectToTyped`).
+    pub fn of_typed(obj: &Value, ty: &Type) -> Fields {
+        let mut fields = Fields::default();
+        if let Some(map) = obj.as_object() {
+            let mut path = Vec::new();
+            fields.struct_children(&mut path, map, ty);
+        }
+        fields
+    }
+
+    /// The members of an object: each field with the type the schema gives it.
+    fn struct_children(&mut self, path: &mut Vec<String>, map: &Map<String, Value>, ty: &Type) {
+        for (k, child) in map {
+            self.typed_field(path, k, child, ty.field(k));
+        }
+    }
+
+    /// One field: a typed walk where the schema has a type for it, the
+    /// name-driven walk where it has none.
+    fn typed_field(&mut self, path: &mut Vec<String>, name: &str, v: &Value, ty: Option<&Type>) {
+        match ty {
+            None | Some(Type::Legacy) => self.field(path, name, v),
+            Some(t) => {
+                if v.is_null() {
+                    return;
+                }
+                path.push(format!("f:{name}"));
+                self.typed(path, v, t);
+                path.pop();
+            }
+        }
+    }
+
+    /// `v`, at `path`, as a value of type `ty` (the `toFieldSetWalker`'s
+    /// `doScalar` / `doList` / `doMap`, typed/toset.go).
+    fn typed(&mut self, path: &mut Vec<String>, v: &Value, ty: &Type) {
+        if v.is_null() {
+            return;
+        }
+        match (ty, v) {
+            (Type::Scalar | Type::Legacy, _) => self.leaf(path, v),
+            (_, Value::Object(m)) if m.is_empty() => self.leaf(path, v),
+            (Type::Struct(s), Value::Object(m)) => {
+                if s.atomic {
+                    self.leaf(path, v);
+                } else {
+                    self.struct_children(path, m, ty);
+                }
+            }
+            (Type::Map { elem, atomic }, Value::Object(m)) => {
+                if *atomic {
+                    self.leaf(path, v);
+                } else {
+                    self.set.insert(path);
+                    for (k, child) in m {
+                        self.typed_field(path, k, child, Some(elem));
+                    }
+                }
+            }
+            (Type::Deduced, Value::Object(m)) => self.struct_children(path, m, ty),
+            (Type::List { elem, kind }, Value::Array(items)) => match kind {
+                ListKind::Map(keys) if !items.is_empty() => {
+                    let elements: Option<Vec<String>> = items
+                        .iter()
+                        .map(|item| typed_key_element(keys, item))
+                        .collect();
+                    match elements {
+                        Some(elements) => {
+                            for (element, item) in elements.into_iter().zip(items) {
+                                path.push(element);
+                                self.set.insert(path);
+                                if let Some(m) = item.as_object() {
+                                    self.struct_children(path, m, elem);
+                                }
+                                path.pop();
+                            }
+                        }
+                        None => self.leaf(path, v),
+                    }
+                }
+                ListKind::Set if items.iter().all(|i| !i.is_object() && !i.is_array()) => {
+                    for item in items {
+                        path.push(format!("v:{item}"));
+                        self.leaf(path, item);
+                        path.pop();
+                    }
+                }
+                _ => self.leaf(path, v),
+            },
+            // A value that does not have the shape of its type is one leaf.
+            _ => self.leaf(path, v),
+        }
+    }
+
     fn leaf(&mut self, path: &[String], v: &Value) {
         self.set.insert(path);
         self.leaves.insert(path.to_vec(), v.clone());
@@ -351,6 +448,20 @@ pub fn key_element(keys: &[&str], item: &Value) -> Option<String> {
     let mut sorted = BTreeMap::new();
     for key in keys {
         sorted.insert(*key, obj.get(*key).filter(|v| !v.is_null())?);
+    }
+    Some(format!("k:{}", serde_json::to_string(&sorted).ok()?))
+}
+
+/// `k:{...}` for an item of a `x-kubernetes-list-type: map` list: every key
+/// field, from the item or else from the schema default, as a sorted JSON
+/// object (`typed.listItemToPathElement`, typed/helpers.go). `None` when a key
+/// has neither.
+pub fn typed_key_element(keys: &[(String, Option<Value>)], item: &Value) -> Option<String> {
+    let obj = item.as_object()?;
+    let mut sorted = BTreeMap::new();
+    for (key, default) in keys {
+        let value = obj.get(key).filter(|v| !v.is_null()).or(default.as_ref())?;
+        sorted.insert(key.as_str(), value);
     }
     Some(format!("k:{}", serde_json::to_string(&sorted).ok()?))
 }

@@ -210,6 +210,14 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     fn get_reset_fields(&self) -> crate::ssa::ResetFields {
         crate::ssa::ResetFields::new()
     }
+    /// The `typeConverter` the field manager is built with
+    /// (`NewDefaultFieldManager`, installer.go:697-722) for a type whose schema
+    /// is not a built-in's: a custom resource's structural schema (#2734).
+    fn field_schema(
+        &self,
+    ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
+        None
+    }
 }
 
 /// `rest.GarbageCollectionPolicy` (rest/delete.go:40-47).
@@ -769,6 +777,14 @@ pub trait RestStorage<T: Object>: Send + Sync {
     /// field manager. Empty for a storage with no `ResetFieldsStrategy`.
     fn get_reset_fields(&self) -> crate::ssa::ResetFields {
         crate::ssa::ResetFields::new()
+    }
+
+    /// The strategy's field-manager schema, see
+    /// [`RestUpdateStrategy::field_schema`].
+    fn field_schema(
+        &self,
+    ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
+        None
     }
 
     /// What the request codec does to a body for a storage whose codec depends

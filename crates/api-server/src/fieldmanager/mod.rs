@@ -31,9 +31,13 @@
 //! registry `Object` bound and the request (the typed Update entry points and
 //! the user agent).
 //!
-//! DEVIATIONS, deliberate: (1) the field sets come from [`fieldset`]'s
-//! name-driven walker, not the OpenAPI schema; (2) one version per kind is
+//! DEVIATIONS, deliberate: (1) the field sets come from the kind's schema
+//! ([`schemas`]: the vendored OpenAPI for `apps/v1`, `batch/v1` and `Pod`, a
+//! custom resource's structural schema) and from [`fieldset`]'s name-driven
+//! table for every other built-in kind (#2734); (2) one version per kind is
 //! served here, so upstream's per-manager `versionConverter` is the identity.
+
+pub mod schemas;
 
 pub use rusternetes_common::fieldmanager::{
     apply, fieldset, is_reset_managed_fields, remove_managed_fields, Managed, ResetFields,
@@ -110,6 +114,15 @@ impl FieldManager {
             subresource,
             reset_fields,
         ))
+    }
+
+    /// The kind's `typeConverter`, see
+    /// [`rusternetes_common::fieldmanager::FieldManager::with_schema`].
+    pub fn with_schema(
+        self,
+        schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+    ) -> Self {
+        Self(self.0.with_schema(schema))
     }
 
     /// `UpdateNoErrors` (fieldmanager.go:140-160): `live` is `None` for a
