@@ -68,6 +68,7 @@ mod ssa;
 mod state;
 #[allow(dead_code)]
 mod streaming;
+mod upstream_flags;
 mod watch_cache;
 
 use anyhow::{Context, Result};
@@ -158,6 +159,11 @@ struct Args {
     #[command(flatten)]
     egress_selector: rusternetes_api_server::egress_selector::EgressSelectorArgs,
 
+    /// Upstream kube-apiserver flags accepted for kubeadm/Talos argv
+    /// compatibility (`--secure-port`, ignored-with-WARN flags, #3908).
+    #[command(flatten)]
+    upstream: upstream_flags::UpstreamCompatArgs,
+
     /// Enable TLS/HTTPS
     #[arg(long)]
     tls: bool,
@@ -166,8 +172,8 @@ struct Args {
     #[arg(long)]
     tls_cert_file: Option<String>,
 
-    /// TLS private key file (PEM format)
-    #[arg(long)]
+    /// TLS private key file (PEM format); upstream `--tls-private-key-file`
+    #[arg(long, alias = "tls-private-key-file")]
     tls_key_file: Option<String>,
 
     /// Generate self-signed certificate if TLS files not provided
@@ -336,6 +342,11 @@ async fn main() -> Result<()> {
         .map_err(|e| e.exit())
         .unwrap();
     args.authorization.mark_legacy_flags_set(&matches);
+    args.upstream.validate()?;
+    args.bind_address =
+        upstream_flags::resolve_bind_address(&args.bind_address, args.upstream.secure_port)?;
+    // Upstream serves TLS whenever a serving cert/key is configured.
+    args.tls |= upstream_flags::implies_tls(&args.tls_cert_file, &args.tls_key_file);
     // `s.Admission.Validate()` + `ApplyTo` (#3415): a bad plugin flag stops startup.
     args.admission
         .validate_and_install()
@@ -352,6 +363,9 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
     rusternetes_common::dump::install_panic_hook("api-server");
+    for msg in args.upstream.ignored_flags() {
+        warn!("{msg}");
+    }
 
     if let Some(path) = &args.admission_control_config_file {
         let yaml = std::fs::read_to_string(path)
