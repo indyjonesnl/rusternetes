@@ -1503,6 +1503,15 @@ async fn staged_device_with_an_outside_reference_is_not_unstaged() {
     assert!(target.exists());
 
     write_info(false);
+    // The failed `UnmountDevice` is in exponential backoff
+    // (`nestedpendingoperations`, 500ms after the first error), so an
+    // immediate retry is refused even though the reference is gone.
+    vm.unmount_csi_devices_not_in(&none).await;
+    assert!(
+        f.fake.calls.lock().unwrap().unstage.is_empty(),
+        "a retry inside the backoff window must not run UnmountDevice"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(550)).await;
     vm.unmount_csi_devices_not_in(&none).await;
     assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
     assert!(!target.exists());

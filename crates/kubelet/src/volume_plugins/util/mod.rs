@@ -6,6 +6,7 @@
 
 pub mod device_util;
 pub mod exec;
+pub mod exponential_backoff;
 pub mod hostutil;
 pub mod key_mutex;
 pub mod metrics;
@@ -13,6 +14,7 @@ pub mod mount_interface;
 pub mod mount_list;
 pub mod mount_ops;
 pub mod mount_utils;
+pub mod nested_pending_operations;
 pub mod nested_volumes;
 pub mod node_expander;
 pub mod operation_executor;
