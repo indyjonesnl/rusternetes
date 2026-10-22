@@ -12,7 +12,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::controllers::hpa_metrics_client::{
-    FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient, PodMetricsInfo,
+    format_milli_quantity, FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig, MetricsClient,
+    PodMetricsInfo,
 };
 use crate::controllers::hpa_replica_calculator as calc;
 
@@ -653,7 +654,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                         metric: p.metric.clone(),
                         current: MetricValueStatus {
                             value: None,
-                            average_value: Some(avg.to_string()),
+                            average_value: Some(format_milli_quantity(avg)),
                             average_utilization: None,
                         },
                     }),
@@ -707,12 +708,12 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     let replicas = current_replicas.max(1) as i64;
                     MetricValueStatus {
                         value: None,
-                        average_value: Some((v / replicas).to_string()),
+                        average_value: Some(format_milli_quantity(v / replicas)),
                         average_utilization: None,
                     }
                 } else {
                     MetricValueStatus {
-                        value: Some(v.to_string()),
+                        value: Some(format_milli_quantity(v)),
                         average_value: None,
                         average_utilization: None,
                     }
@@ -773,7 +774,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                         metric: e.metric.clone(),
                         current: MetricValueStatus {
                             value: None,
-                            average_value: Some(avg.to_string()),
+                            average_value: Some(format_milli_quantity(avg)),
                             average_utilization: None,
                         },
                     }),
@@ -1010,10 +1011,11 @@ fn go_label_selector_string(sel: Option<&rusternetes_common::types::LabelSelecto
     format!("&LabelSelector{{MatchLabels:{map},MatchExpressions:{exprs},}}")
 }
 
+/// `Target.AverageValue.MilliValue()` (horizontal.go:468,476,727).
 fn parse_target_avg(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
     t.average_value
         .as_ref()
-        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|s| crate::controllers::hpa_metrics_client::parse_milli(s))
         .ok_or_else(|| anyhow::anyhow!("metric target missing/invalid averageValue"))
 }
 
@@ -1021,7 +1023,7 @@ fn parse_target_value(t: &rusternetes_common::resources::MetricTarget) -> Result
     t.value
         .as_ref()
         .or(t.average_value.as_ref())
-        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|s| crate::controllers::hpa_metrics_client::parse_milli(s))
         .ok_or_else(|| anyhow::anyhow!("metric target missing/invalid value"))
 }
 
@@ -1285,7 +1287,7 @@ mod tests {
         use rusternetes_common::resources::{ExternalMetricSource, MetricIdentifier};
         let storage = Arc::new(MemoryStorage::new());
         let mut fake = FakeMetricsClient::new();
-        fake.external.insert("queue".to_string(), vec![90]);
+        fake.external.insert("queue".to_string(), vec![90_000]);
         let controller =
             HorizontalPodAutoscalerController::with_metrics_client(storage, Arc::new(fake));
 
@@ -1323,7 +1325,7 @@ mod tests {
         use rusternetes_common::resources::{MetricIdentifier, ObjectMetricSource};
         let storage = Arc::new(MemoryStorage::new());
         let mut fake = FakeMetricsClient::new();
-        fake.object.insert("hits".to_string(), 200);
+        fake.object.insert("hits".to_string(), 200_000);
         let controller =
             HorizontalPodAutoscalerController::with_metrics_client(storage, Arc::new(fake));
 
