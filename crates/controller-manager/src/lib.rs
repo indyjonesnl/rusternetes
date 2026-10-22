@@ -535,6 +535,23 @@ where
         }
     }));
 
+    // `newDeviceTaintEvictionController` (cmd/kube-controller-manager/app/
+    // core.go:251-284), registered only with `DynamicResourceAllocation` and
+    // `DRADeviceTaints` enabled (`requiredFeatureGates`).
+    if controllers::device_taint_eviction::feature_enabled() {
+        let s = storage_for("DeviceTaintEviction");
+        handles.push(tokio::spawn(async move {
+            let c =
+                Arc::new(controllers::device_taint_eviction::DeviceTaintEvictionController::new(s));
+            if let Err(e) = c
+                .run(controllers::device_taint_eviction::DEFAULT_CONCURRENT_SYNCS)
+                .await
+            {
+                error!("DeviceTaintEviction controller error: {}", e);
+            }
+        }));
+    }
+
     // `newCertificateSigningRequestCleanerController`
     // (cmd/kube-controller-manager/app/certificates.go:217-230).
     let s = storage_for("CertificateSigningRequestCleaner");
