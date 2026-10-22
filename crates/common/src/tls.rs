@@ -251,35 +251,6 @@ pub fn client_cert_verifier_for_ca_file(
         .context("Failed to build client cert verifier")
 }
 
-/// Parse a PEM CA bundle into a root store. Like `cert.NewPoolFromBytes`
-/// (client-go/util/cert/pem.go), content without any certificate is an error.
-pub fn parse_ca_bundle(name: &str, pem: &[u8]) -> Result<rustls::RootCertStore> {
-    let certs = rustls_pemfile::certs(&mut &*pem)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("error loading CA bundle for {name:?}"))?;
-    let mut roots = rustls::RootCertStore::empty();
-    let (added, _) = roots.add_parsable_certificates(certs);
-    if added == 0 {
-        anyhow::bail!(
-            "error loading CA bundle for {name:?}: data does not contain any valid certificates"
-        );
-    }
-    Ok(roots)
-}
-
-/// [`client_cert_verifier_for_ca_file`] over an in-memory bundle
-/// (`newCABundleAndVerifier`, dynamic_cafile_content.go).
-pub fn client_cert_verifier_for_ca_bundle(
-    name: &str,
-    pem: &[u8],
-) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
-    ensure_crypto_provider();
-    let roots = parse_ca_bundle(name, pem)?;
-    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-        .build()
-        .context("Failed to build client cert verifier")
-}
-
 /// Whether two PEM bundles share an identical certificate
 /// (`certificatesOverlap`, pkg/kubeapiserver/options/authentication.go:329-338).
 pub fn ca_files_overlap(a: &str, b: &str) -> Result<bool> {
