@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use rusternetes_common::resources::DeviceClass;
-use rusternetes_common::validation::deviceclass::validate_device_class;
+use rusternetes_common::validation::deviceclass::{
+    validate_device_class, validate_device_class_update,
+};
 use rusternetes_common::validation::field::{ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
@@ -81,7 +83,7 @@ impl RestUpdateStrategy<DeviceClass> for Strategy {
             &old.metadata,
             &Path::new("metadata"),
         ));
-        errs.extend(validate_device_class(obj));
+        errs.extend(validate_device_class_update(obj, old));
         errs
     }
 
