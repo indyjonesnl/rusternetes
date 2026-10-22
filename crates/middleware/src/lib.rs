@@ -3465,33 +3465,49 @@ pub async fn namespace_lifecycle_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let path = request.uri().path().to_string();
-    let method = request.method().clone();
+    if let Some(rejection) =
+        namespace_lifecycle_rejection(&storage, request.method(), request.uri().path()).await
+    {
+        return rejection;
+    }
+    next.run(request).await
+}
+
+/// The `Admit` of `NamespaceLifecycle` for one request: `Some(response)` is
+/// its error, `None` lets the request on. Split from the middleware so the
+/// admit step can be timed without the handler behind it
+/// (`WithControllerMetrics`, admission/metrics/metrics.go:89-100).
+pub async fn namespace_lifecycle_rejection(
+    storage: &StorageBackend,
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<Response> {
+    let method = method.clone();
 
     // Delete of an immortal namespace (`admission.go:68-70`).
     if method == axum::http::Method::DELETE {
-        if let Some(name) = immortal_namespace_delete(&path) {
-            return (
-                StatusCode::FORBIDDEN,
-                axum::Json(namespace_immortal_forbidden(name)),
-            )
-                .into_response();
+        if let Some(name) = immortal_namespace_delete(path) {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(namespace_immortal_forbidden(name)),
+                )
+                    .into_response(),
+            );
         }
-        return next.run(request).await;
+        return None;
     }
 
     let is_create = method == axum::http::Method::POST;
     let is_update = method == axum::http::Method::PUT || method == axum::http::Method::PATCH;
     let target = if is_create {
-        gated_namespace(&path)
+        gated_namespace(path)
     } else if is_update {
-        updated_namespace(&path)
+        updated_namespace(path)
     } else {
         None
     };
-    let Some(namespace) = target.map(str::to_string) else {
-        return next.run(request).await;
-    };
+    let namespace = target?.to_string();
     let resource = path.rsplit('/').next().unwrap_or("resource").to_string();
 
     let key = build_key("namespaces", None, &namespace);
@@ -3503,39 +3519,45 @@ pub async fn namespace_lifecycle_middleware(
                     "NamespaceLifecycle: rejecting create of {} in terminating namespace {}",
                     resource, namespace
                 );
-                return (
-                    StatusCode::FORBIDDEN,
-                    axum::Json(namespace_terminating_forbidden(&namespace, &resource)),
-                )
-                    .into_response();
+                return Some(
+                    (
+                        StatusCode::FORBIDDEN,
+                        axum::Json(namespace_terminating_forbidden(&namespace, &resource)),
+                    )
+                        .into_response(),
+                );
             }
         }
         // `admission.go:129-166`: a missing namespace is NotFound.
         Err(rusternetes_common::Error::NotFound(_)) => {
-            return (
-                StatusCode::NOT_FOUND,
-                axum::Json(namespace_not_found(&namespace)),
-            )
-                .into_response();
+            return Some(
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(namespace_not_found(&namespace)),
+                )
+                    .into_response(),
+            );
         }
         // `errors.NewInternalError(err)` (`admission.go:134`, `:162`).
         Err(e) => {
             warn!("NamespaceLifecycle: reading namespace {namespace}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({
-                    "kind": "Status", "apiVersion": "v1", "metadata": {},
-                    "status": "Failure",
-                    "message": format!("Internal error occurred: {e}"),
-                    "reason": "InternalError", "code": 500,
-                    "details": {"causes": [{"message": e.to_string()}]},
-                })),
-            )
-                .into_response();
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "metadata": {},
+                        "status": "Failure",
+                        "message": format!("Internal error occurred: {e}"),
+                        "reason": "InternalError", "code": 500,
+                        "details": {"causes": [{"message": e.to_string()}]},
+                    })),
+                )
+                    .into_response(),
+            );
         }
     }
 
-    next.run(request).await
+    None
 }
 
 pub async fn capture_payload(
