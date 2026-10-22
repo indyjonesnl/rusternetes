@@ -85,6 +85,100 @@ async fn next_aux_event(
     }
 }
 
+/// What the quota monitor remembers about an object between watch events, in
+/// place of the informer's `oldObj`.
+#[derive(Default)]
+struct ReplenishFilter {
+    /// pod key -> (still charged, quota-terminating, container resources signature)
+    pods: HashMap<String, (bool, bool, String)>,
+    /// service key -> quota service type ("", "NodePort", "LoadBalancer")
+    services: HashMap<String, &'static str>,
+}
+
+impl ReplenishFilter {
+    /// Whether a watch event should re-enqueue the namespace's quotas.
+    ///
+    /// Port of `QuotaMonitor.controllerFor`
+    /// (pkg/controller/resourcequota/resource_quota_monitor.go:146-172), which
+    /// registers an UpdateFunc and a DeleteFunc and NO AddFunc, and of
+    /// `DefaultUpdateFilter` (pkg/quota/v1/install/update_filter.go:31-60).
+    /// A create is already charged by quota admission, which writes
+    /// `status.used` before the object lands; recomputing right after a create
+    /// can read the quota with an in-flight charge, list the objects before the
+    /// new one is stored and CAS-erase the charge, letting a later create past
+    /// the hard limit (#2812: 3 pods under `pods=2`).
+    ///
+    /// Updates are only replenishing events when:
+    /// * pods: the quota scope changed (`IsTerminating`), a container's
+    ///   resources changed, or the pod stopped being charged
+    ///   (`QuotaV1Pod(old) && !QuotaV1Pod(new)`);
+    /// * services: `GetQuotaServiceType` changed;
+    /// * PVCs: always (upstream's `RequiresQuotaReplenish` fields are not
+    ///   modelled, so this stays conservative);
+    /// * configmaps, secrets and the rest: never (the filter returns false).
+    ///
+    /// An update for an object never seen before (no `oldObj`) enqueues.
+    fn should_replenish(&mut self, ev: &rusternetes_storage::WatchEvent) -> bool {
+        use rusternetes_storage::WatchEvent;
+        let key = extract_key(ev);
+        let kind = key.split('/').next().unwrap_or("");
+        match (kind, ev) {
+            (_, WatchEvent::Deleted(..)) => {
+                self.pods.remove(&key);
+                self.services.remove(&key);
+                true
+            }
+            ("pods", WatchEvent::Added(_, v) | WatchEvent::Modified(_, v)) => {
+                let is_add = matches!(ev, WatchEvent::Added(..));
+                let Ok(pod) = serde_json::from_str::<Pod>(v) else {
+                    return !is_add;
+                };
+                let new = (
+                    quota::is_quota_charged(&pod, Utc::now()),
+                    quota::is_terminating(&pod),
+                    pod.spec
+                        .as_ref()
+                        .and_then(|s| {
+                            serde_json::to_string(
+                                &s.containers
+                                    .iter()
+                                    .map(|c| &c.resources)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default(),
+                );
+                let old = self.pods.insert(key, new.clone());
+                if is_add {
+                    return false;
+                }
+                match old {
+                    None => true,
+                    Some(o) => o.1 != new.1 || o.2 != new.2 || (o.0 && !new.0),
+                }
+            }
+            ("services", WatchEvent::Added(_, v) | WatchEvent::Modified(_, v)) => {
+                let is_add = matches!(ev, WatchEvent::Added(..));
+                let Ok(svc) = serde_json::from_str::<Service>(v) else {
+                    return !is_add;
+                };
+                let new = match svc.spec.service_type {
+                    Some(rusternetes_common::resources::ServiceType::NodePort) => "NodePort",
+                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
+                        "LoadBalancer"
+                    }
+                    _ => "",
+                };
+                let old = self.services.insert(key, new);
+                !is_add && old.is_none_or(|o| o != new)
+            }
+            ("persistentvolumeclaims", WatchEvent::Modified(..)) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Workers draining this controller's queue: upstream `ConcurrentResourceQuotaSyncs` default,
 /// pkg/controller/resourcequota/config/v1alpha1/defaults.go:37-38, launched at cmd/kube-controller-manager/app/core.go:621.
 const CONCURRENT_RESOURCE_QUOTA_SYNCS: usize = 5;
@@ -162,6 +256,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                 .await
                 .ok();
 
+            let mut filter = ReplenishFilter::default();
             let mut resync = tokio::time::interval(std::time::Duration::from_secs(30));
             resync.tick().await;
 
@@ -186,7 +281,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     }
                     event = next_aux_event(&mut pod_watch, "Pod"), if pod_watch.is_some() => {
                         match event {
-                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            Some(ev) => {
+                                if filter.should_replenish(&ev) {
+                                    self.enqueue_quotas_for_event(&queue, &ev).await;
+                                }
+                            }
                             // Stream retired inside next_aux_event; reconnect all
                             // watches rather than run on with a dead one.
                             None => watch_broken = true,
@@ -194,7 +293,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     }
                     event = next_aux_event(&mut svc_watch, "Service"), if svc_watch.is_some() => {
                         match event {
-                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            Some(ev) => {
+                                if filter.should_replenish(&ev) {
+                                    self.enqueue_quotas_for_event(&queue, &ev).await;
+                                }
+                            }
                             // Stream retired inside next_aux_event; reconnect all
                             // watches rather than run on with a dead one.
                             None => watch_broken = true,
@@ -202,7 +305,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     }
                     event = next_aux_event(&mut cm_watch, "ConfigMap"), if cm_watch.is_some() => {
                         match event {
-                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            Some(ev) => {
+                                if filter.should_replenish(&ev) {
+                                    self.enqueue_quotas_for_event(&queue, &ev).await;
+                                }
+                            }
                             // Stream retired inside next_aux_event; reconnect all
                             // watches rather than run on with a dead one.
                             None => watch_broken = true,
@@ -210,7 +317,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     }
                     event = next_aux_event(&mut secret_watch, "Secret"), if secret_watch.is_some() => {
                         match event {
-                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            Some(ev) => {
+                                if filter.should_replenish(&ev) {
+                                    self.enqueue_quotas_for_event(&queue, &ev).await;
+                                }
+                            }
                             // Stream retired inside next_aux_event; reconnect all
                             // watches rather than run on with a dead one.
                             None => watch_broken = true,
@@ -218,7 +329,11 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                     }
                     event = next_aux_event(&mut pvc_watch, "PersistentVolumeClaim"), if pvc_watch.is_some() => {
                         match event {
-                            Some(ev) => self.enqueue_quotas_for_event(&queue, &ev).await,
+                            Some(ev) => {
+                                if filter.should_replenish(&ev) {
+                                    self.enqueue_quotas_for_event(&queue, &ev).await;
+                                }
+                            }
                             // Stream retired inside next_aux_event; reconnect all
                             // watches rather than run on with a dead one.
                             None => watch_broken = true,
@@ -1661,5 +1776,50 @@ mod tests {
         assert_eq!(usage["count/deployments.apps"], "2");
         assert_eq!(usage["count/widgets.example.com"], "1");
         assert_eq!(usage["count/jobs.batch"], "0");
+    }
+
+    fn ev_pod(kind: &str, name: &str, phase: &str) -> rusternetes_storage::WatchEvent {
+        let v = format!(
+            r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"{name}","namespace":"ns"}},"spec":{{"containers":[{{"name":"c","image":"i"}}]}},"status":{{"phase":"{phase}"}}}}"#
+        );
+        let k = format!("/registry/pods/ns/{name}");
+        match kind {
+            "add" => rusternetes_storage::WatchEvent::Added(k, v),
+            "mod" => rusternetes_storage::WatchEvent::Modified(k, v),
+            _ => rusternetes_storage::WatchEvent::Deleted(k, v),
+        }
+    }
+
+    /// Upstream registers no AddFunc (resource_quota_monitor.go:146-172): a pod
+    /// create must not recompute quota (#2812), a status-only update must not,
+    /// a pod leaving the charged set or being deleted must.
+    #[test]
+    fn replenish_filter_ignores_creates_and_plain_updates() {
+        let mut f = ReplenishFilter::default();
+        assert!(!f.should_replenish(&ev_pod("add", "p", "Pending")));
+        assert!(!f.should_replenish(&ev_pod("mod", "p", "Running")));
+        assert!(f.should_replenish(&ev_pod("mod", "p", "Succeeded")));
+        assert!(f.should_replenish(&ev_pod("del", "p", "Succeeded")));
+        // Update of a pod never seen: no oldObj to compare, enqueue.
+        assert!(f.should_replenish(&ev_pod("mod", "q", "Running")));
+    }
+
+    #[test]
+    fn replenish_filter_configmap_and_secret_only_on_delete() {
+        let mut f = ReplenishFilter::default();
+        for kind in ["configmaps", "secrets"] {
+            let k = format!("/registry/{kind}/ns/x");
+            assert!(!f.should_replenish(&rusternetes_storage::WatchEvent::Added(
+                k.clone(),
+                "{}".into()
+            )));
+            assert!(
+                !f.should_replenish(&rusternetes_storage::WatchEvent::Modified(
+                    k.clone(),
+                    "{}".into()
+                ))
+            );
+            assert!(f.should_replenish(&rusternetes_storage::WatchEvent::Deleted(k, "{}".into())));
+        }
     }
 }
