@@ -402,6 +402,13 @@ impl SchemaValidator {
         path: &str,
         _unknown_fields: &mut Vec<String>,
     ) -> Result<(), Error> {
+        // kube-openapi `SchemaValidator.Validate`
+        // (pkg/validation/validate/schema.go:131-135): a nil value runs only
+        // the type and common validators, and `typeValidator.Validate`
+        // (type.go:137) accepts nil when the schema is `Nullable`.
+        if value.is_null() && schema.nullable == Some(true) {
+            return Ok(());
+        }
         // Validate type
         if let Some(ref type_) = schema.type_ {
             Self::validate_type(type_, value, path)?;
@@ -500,6 +507,13 @@ impl SchemaValidator {
         path: &str,
         unknown_fields: &mut Vec<String>,
     ) -> Result<(), Error> {
+        // kube-openapi `SchemaValidator.Validate`
+        // (pkg/validation/validate/schema.go:131-135): a nil value runs only
+        // the type and common validators, and `typeValidator.Validate`
+        // (type.go:137) accepts nil when the schema is `Nullable`.
+        if value.is_null() && schema.nullable == Some(true) {
+            return Ok(());
+        }
         // Validate type
         if let Some(ref type_) = schema.type_ {
             Self::validate_type(type_, value, path)?;
