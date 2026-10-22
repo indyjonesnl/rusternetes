@@ -3,8 +3,8 @@
 use std::io;
 
 /// The slice of `hostutil.HostUtils` (`hostutil.go:47-73`) the unmount-device
-/// operation consumes: `DeviceOpened` and `PathIsDevice`. The remaining
-/// methods have no consumer in this kubelet yet.
+/// operation consumes: `DeviceOpened` and `PathIsDevice`. `GetFileType` is the
+/// local plugin's. The remaining methods have no consumer in this kubelet yet.
 pub trait HostUtils: Send + Sync {
     /// `DeviceOpened`: is the device (e.g. /dev/sdc) in use elsewhere on the
     /// system, i.e. still mounted.
@@ -12,6 +12,11 @@ pub trait HostUtils: Send + Sync {
 
     /// `PathIsDevice`: does the path refer to a device.
     fn path_is_device(&self, pathname: &str) -> io::Result<bool>;
+
+    /// `GetFileType` (`hostutil.go:55`, `hostutil_linux.go:`): the kind of
+    /// file at `pathname`; the local plugin reads it through
+    /// `VolumeHost.GetHostUtil()` (`local.go:280`, `:406`).
+    fn get_file_type(&self, pathname: &str) -> io::Result<FileType>;
 }
 
 /// `hostutil.HostUtil` (`hostutil_linux.go`).
@@ -93,6 +98,10 @@ fn exclusive_open_fails_on_device(pathname: &str) -> io::Result<bool> {
 }
 
 impl HostUtils for HostUtil {
+    fn get_file_type(&self, pathname: &str) -> io::Result<FileType> {
+        get_file_type(pathname)
+    }
+
     /// `HostUtil.DeviceOpened` (`hostutil_linux.go:57-59`).
     fn device_opened(&self, pathname: &str) -> io::Result<bool> {
         exclusive_open_fails_on_device(pathname)

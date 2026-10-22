@@ -1,4 +1,5 @@
 use crate::volume_plugins::csi_driver_lister::CsiDriverLister;
+use crate::volume_plugins::util::hostutil::{HostUtil, HostUtils};
 use crate::volume_plugins::util::mount_ops::Mounter;
 use rusternetes_common::auth::TokenManager;
 use rusternetes_storage::StorageBackend;
@@ -14,9 +15,8 @@ use std::sync::Arc;
 /// `create_volume`'s blocks into plugins needs exactly that, so the object is
 /// a port, not a parameter bag invented for the refactor.
 ///
-/// Only the methods with a consumer are ported. `GetMounter`, `GetHostUtil`,
-/// `GetPluginDir`, `GetPodPluginDir`, `GetPodsDir` and the block-device
-/// methods have no caller in epic #1970.
+/// Only the methods with a consumer are ported. `GetHostUtil` and
+/// `GetPodsDir` are the local plugin's (`local.go:137`, `:280`, `:634`).
 pub trait VolumeHost: Send + Sync {
     /// `GetPodVolumeDir` (`plugins.go:361`).
     fn get_pod_volume_dir(&self, pod_uid: &str, plugin_name: &str, volume_name: &str) -> String;
@@ -82,6 +82,13 @@ pub trait VolumeHost: Send + Sync {
     /// (`cmd/kubelet/app/server.go:487`).
     fn get_mounter(&self) -> &Mounter;
 
+    /// `VolumeHost.GetHostUtil` (`plugins.go:308`, `volume_host.go:158`): the kubelet's `hostutil.HostUtils`.
+    fn get_host_util(&self) -> &dyn HostUtils;
+
+    /// `VolumeHost.GetPodsDir` (`plugins.go:355`, `kubelet_getters.go:
+    /// 60-62`, `volume_host.go:130`): `<root>/pods`.
+    fn get_pods_dir(&self) -> String;
+
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         None
     }
@@ -105,6 +112,7 @@ pub struct KubeletVolumeHost {
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     csi_driver_lister: Option<CsiDriverLister>,
     mounter: Mounter,
+    host_util: Arc<dyn HostUtils>,
 }
 
 impl KubeletVolumeHost {
@@ -121,6 +129,8 @@ impl KubeletVolumeHost {
             node_allocatable,
             pod_certificate_manager: None,
             csi_driver_lister: None,
+            // `hostutil.NewHostUtil()` (`volume_host.go`).
+            host_util: Arc::new(HostUtil),
             // `mount.New("")`: systemd tried, safe-not-mounted detected
             // (`mount_linux.go:79-85`).
             mounter: Mounter::new(
@@ -135,6 +145,13 @@ impl KubeletVolumeHost {
     /// `volume_host.go:166`).
     pub fn with_csi_driver_lister(mut self, lister: CsiDriverLister) -> Self {
         self.csi_driver_lister = Some(lister);
+        self
+    }
+
+    /// Replace the host's `hostutil.HostUtils` (upstream's `FakeVolumeHost`
+    /// carries a `FakeHostUtil`).
+    pub fn with_host_util(mut self, host_util: Arc<dyn HostUtils>) -> Self {
+        self.host_util = host_util;
         self
     }
 
@@ -223,6 +240,16 @@ impl VolumeHost for KubeletVolumeHost {
         &self.mounter
     }
 
+    fn get_host_util(&self) -> &dyn HostUtils {
+        &*self.host_util
+    }
+
+    fn get_pods_dir(&self) -> String {
+        crate::pod_dirs::get_pods_dir(&self.volumes_base_path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         self.pod_certificate_manager.as_ref()
     }
@@ -239,6 +266,13 @@ mod tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
             std::collections::HashMap::new(),
         )
+    }
+
+    #[test]
+    fn pods_dir_and_host_util() {
+        let h = host();
+        assert_eq!(h.get_pods_dir(), "/var/lib/rusternetes/pods");
+        assert!(h.get_host_util().get_file_type("/tmp").is_ok());
     }
 
     /// The host is the only way a plugin learns where its directory goes, so
