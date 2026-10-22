@@ -388,6 +388,33 @@ async fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
     }
+    // `eventratelimit.Register` builds the plugin when it is enabled, and
+    // fails the server's start on a missing or invalid configuration
+    // (admission.go:46-62: `LoadConfiguration(nil)` is the empty default,
+    // which `ValidateConfiguration` rejects as "must not be empty").
+    if admission::plugins::enabled(admission::event_rate_limit::PLUGIN_NAME) {
+        let config = match &args.admission_control_config_file {
+            Some(path) => {
+                let yaml = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading --admission-control-config-file {path}"))?;
+                admission::config::plugin_configuration_for(
+                    &yaml,
+                    std::path::Path::new(path),
+                    admission::event_rate_limit::PLUGIN_NAME,
+                )
+                .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?
+            }
+            None => None,
+        };
+        let plugin = admission::event_rate_limit::EventRateLimit::from_config(config.as_deref())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to initialize plugin {}: {e}",
+                    admission::event_rate_limit::PLUGIN_NAME
+                )
+            })?;
+        admission::event_rate_limit::install(plugin);
+    }
 
     install_audit_from_flags(&args).await?;
 

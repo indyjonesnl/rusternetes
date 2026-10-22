@@ -3,6 +3,7 @@ pub mod builtin_plugins;
 pub mod caching_authorizer;
 pub mod certificates;
 pub mod config;
+pub mod event_rate_limit;
 pub mod namespace_plugins;
 pub mod plugin_metrics;
 pub mod plugins;
