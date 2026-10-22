@@ -49,6 +49,29 @@ fn vac(generate_name: &str) -> Value {
     })
 }
 
+/// Stands in for upstream's `vacprotection` controller
+/// (pkg/controller/volume/vacprotection/vac_protection_controller.go
+/// `processVAC`), which the api-server-only harness does not run. The
+/// `StorageObjectInUseProtection` plugin adds `kubernetes.io/vac-protection`
+/// on create (admission.go `admitVAC`), so a delete only sets
+/// `deletionTimestamp`; the controller then drops the finalizer once no PV or
+/// PVC references the class (none do here). Upstream's e2e body absorbs that
+/// asynchrony by polling for 30s (volumeattributesclass.go:87-110, :153-173).
+async fn reap_protection(api: &TestApiServer, uri: &str) {
+    let (s, mut obj) = send(api, "GET", uri, "application/json", None).await;
+    if s != 200 || obj["metadata"]["deletionTimestamp"].is_null() {
+        return;
+    }
+    assert_eq!(
+        obj["metadata"]["finalizers"],
+        json!(["kubernetes.io/vac-protection"]),
+        "a terminating VAC holds only the protection finalizer: {obj}"
+    );
+    obj["metadata"]["finalizers"] = json!([]);
+    let (s, body) = send(api, "PUT", uri, "application/json", Some(&obj)).await;
+    assert_eq!(s, 200, "failed to remove vac-protection: {body}");
+}
+
 fn name_of(obj: &Value) -> String {
     obj["metadata"]["name"]
         .as_str()
@@ -107,8 +130,8 @@ async fn conformance_volumeattributesclass_lifecycle() {
     );
 
     // :87-110 confirm deletion: a list by the patched selector MUST be empty
-    // (upstream polls for 30s; the in-process store is synchronous and the
-    // VAC has no PVC referencing it, so no protection finalizer holds it).
+    // (upstream polls for 30s while vacprotection removes the finalizer).
+    reap_protection(&api, &one).await;
     let (s, list) = send(
         &api,
         "GET",
@@ -174,6 +197,7 @@ async fn conformance_volumeattributesclass_lifecycle() {
     );
 
     // :153-173 confirm deletion: a list by the updated selector MUST be empty.
+    reap_protection(&api, &two).await;
     let (s, list) = send(&api, "GET", &updated_selector, "application/json", None).await;
     assert_eq!(s, 200, "failed to list VolumeAttributesClass: {list}");
     assert_eq!(
@@ -181,4 +205,27 @@ async fn conformance_volumeattributesclass_lifecycle() {
         0,
         "expected VolumeAttributesClass to be deleted: {list}"
     );
+}
+
+/// Regression for #3692: `StorageObjectInUseProtection.admitVAC` adds the
+/// finalizer on create, so delete is graceful until the controller reaps it.
+#[tokio::test]
+async fn volumeattributesclass_create_adds_protection_finalizer() {
+    let api = TestApiServer::builder().strict_namespaces().build();
+    let (s, created) = send(&api, "POST", VACS, "application/json", Some(&vac("e2e-"))).await;
+    assert_eq!(s, 201, "{created}");
+    assert_eq!(
+        created["metadata"]["finalizers"],
+        json!(["kubernetes.io/vac-protection"]),
+        "{created}"
+    );
+    let one = format!("{VACS}/{}", name_of(&created));
+    let (s, body) = send(&api, "DELETE", &one, "application/json", None).await;
+    assert_eq!(s, 200, "{body}");
+    let (s, got) = send(&api, "GET", &one, "application/json", None).await;
+    assert_eq!(s, 200, "finalizer must hold the class: {got}");
+    assert!(!got["metadata"]["deletionTimestamp"].is_null(), "{got}");
+    reap_protection(&api, &one).await;
+    let (s, got) = send(&api, "GET", &one, "application/json", None).await;
+    assert_eq!(s, 404, "{got}");
 }

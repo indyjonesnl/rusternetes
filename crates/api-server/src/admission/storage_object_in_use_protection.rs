@@ -8,10 +8,13 @@
 //! pv-protection / pvc-protection controllers once the object is unused
 //! (`pkg/controller/volume/{pvprotection,pvcprotection}`).
 //!
-//! Not ported: the `VolumeAttributesClass` branch (`admitVAC`); there is no
-//! VAC protection controller here.
+//! `admitVAC` (admission.go:132-151) does the same for a `storage.k8s.io`
+//! VolumeAttributesClass, gated by the `VolumeAttributesClass` feature gate
+//! (admission.go:76-80); the vac-protection controller removes the finalizer.
 
-use rusternetes_common::resources::volume::{PVC_PROTECTION_FINALIZER, PV_PROTECTION_FINALIZER};
+use rusternetes_common::resources::volume::{
+    PVC_PROTECTION_FINALIZER, PV_PROTECTION_FINALIZER, VAC_PROTECTION_FINALIZER,
+};
 use rusternetes_common::types::ObjectMeta;
 
 /// `admitPV` / `admitPVC` body: append `finalizer` unless present.
@@ -22,11 +25,16 @@ pub fn add_protection_finalizer(meta: &mut ObjectMeta, finalizer: &str) {
     }
 }
 
-/// The finalizer `Admit` adds for core resource `resource`, if any.
-pub fn finalizer_for(resource: &str) -> Option<&'static str> {
-    match resource {
-        "persistentvolumes" => Some(PV_PROTECTION_FINALIZER),
-        "persistentvolumeclaims" => Some(PVC_PROTECTION_FINALIZER),
+/// The finalizer `Admit` adds for `group`/`resource` (the switch on
+/// `a.GetResource().GroupResource()`, admission.go:71-84), if any.
+/// `vac_enabled` is the `VolumeAttributesClass` gate.
+pub fn finalizer_for(group: &str, resource: &str, vac_enabled: bool) -> Option<&'static str> {
+    match (group, resource) {
+        ("", "persistentvolumes") => Some(PV_PROTECTION_FINALIZER),
+        ("", "persistentvolumeclaims") => Some(PVC_PROTECTION_FINALIZER),
+        ("storage.k8s.io", "volumeattributesclasses") if vac_enabled => {
+            Some(VAC_PROTECTION_FINALIZER)
+        }
         _ => None,
     }
 }
@@ -70,13 +78,32 @@ mod tests {
     #[test]
     fn finalizer_for_resource() {
         assert_eq!(
-            finalizer_for("persistentvolumes"),
+            finalizer_for("", "persistentvolumes", true),
             Some("kubernetes.io/pv-protection")
         );
         assert_eq!(
-            finalizer_for("persistentvolumeclaims"),
+            finalizer_for("", "persistentvolumeclaims", true),
             Some("kubernetes.io/pvc-protection")
         );
-        assert_eq!(finalizer_for("pods"), None);
+        assert_eq!(finalizer_for("", "pods", true), None);
+    }
+
+    #[test]
+    fn finalizer_for_vac_needs_group_and_gate() {
+        let vac = "volumeattributesclasses";
+        assert_eq!(
+            finalizer_for("storage.k8s.io", vac, true),
+            Some("kubernetes.io/vac-protection")
+        );
+        assert_eq!(finalizer_for("storage.k8s.io", vac, false), None);
+        assert_eq!(finalizer_for("", vac, true), None);
+    }
+
+    #[test]
+    fn finalizer_for_pv_wrong_group_is_none() {
+        assert_eq!(
+            finalizer_for("example.com", "persistentvolumes", true),
+            None
+        );
     }
 }
