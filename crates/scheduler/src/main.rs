@@ -16,6 +16,7 @@ mod inter_pod_affinity_score;
 mod node_volume_limits;
 #[allow(dead_code)]
 mod plugins;
+mod pod_topology_spread_score;
 #[allow(dead_code)] // library API surface (Map accessors); partly unused by the binary
 mod profile;
 #[allow(dead_code)] // library API surface (queue introspection); partly unused by the binary

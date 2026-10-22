@@ -67,6 +67,9 @@ pub struct Profile {
     /// `InterPodAffinityArgs` (`HardPodAffinityWeight`,
     /// `IgnorePreferredTermsOfExistingPods`), read by its PreScore.
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
+    /// `PodTopologySpreadArgs` resolved (`DefaultConstraints`/`DefaultingType`),
+    /// read by its PreScore.
+    pub pod_topology_spread: crate::pod_topology_spread_score::Args,
     /// The built framework for this profile (plugins per extension point +
     /// score weights). [`Map::new_map`] rebuilds it from `plugins`.
     pub framework: Framework,
@@ -92,6 +95,7 @@ impl Profile {
             fit_scorer: crate::score::ResourceAllocationScorer::default_fit(),
             balanced_scorer: crate::score::ResourceAllocationScorer::default_balanced(),
             inter_pod_affinity: crate::inter_pod_affinity_score::Args::default(),
+            pod_topology_spread: crate::pod_topology_spread_score::Args::default(),
             framework: Framework::default(),
         };
         p.framework = p
