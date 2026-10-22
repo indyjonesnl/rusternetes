@@ -143,6 +143,9 @@ pub struct VolumeManager {
     /// `DeviceMountUncertain` by a failed `UnmountDevice` is still there to be
     /// retried. `Arc`-shared because the manager is `Clone`d per runtime attach.
     asw: Arc<crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld>,
+    /// `nodeName` of `NewVolumeManager` (`volume_manager.go:186`): the node the
+    /// kubelet runs for. Empty until [`VolumeManager::with_node_name`].
+    node_name: String,
     /// Each mounted pod volume's `Mounter.GetAttributes()` result plus the
     /// `SELinuxLabeled` bit, keyed by (pod UID, volume name). Stands in for the
     /// `VolumeInfo{Mounter, SELinuxLabeled}` map upstream's `makeMounts` reads
@@ -314,8 +317,8 @@ impl VolumeManager {
             csi_plugin: Arc::new(crate::volume_plugins::csi::CsiPlugin::new(host)),
             csi_migrated_plugin_manager: Default::default(),
             intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
-            // `NewActualStateOfWorld(nodeName, volumePluginMgr)`. The manager
-            // does not know the node name (upstream reads it from the kubelet).
+            // `NewActualStateOfWorld(nodeName, volumePluginMgr)`; rebuilt with
+            // the real node name by [`VolumeManager::with_node_name`].
             asw: Arc::new(
                 crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld::new(
                     "",
@@ -323,9 +326,26 @@ impl VolumeManager {
                 ),
             ),
             plugin_mgr,
+            node_name: String::new(),
             mounted: Arc::default(),
             pod_certificate_manager,
         }
+    }
+
+    /// Give the manager the kubelet's node name, the `nodeName` argument of
+    /// `NewVolumeManager` (`volume_manager.go:186`) that it hands to
+    /// `cache.NewActualStateOfWorld(nodeName, volumePluginMgr)` (`:202`).
+    /// Builder-time only: the world is rebuilt (it is still empty), so call
+    /// this before the manager is cloned or used.
+    pub fn with_node_name(mut self, node_name: impl Into<String>) -> Self {
+        self.node_name = node_name.into();
+        self.asw = Arc::new(
+            crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld::new(
+                self.node_name.clone(),
+                Arc::clone(&self.plugin_mgr),
+            ),
+        );
+        self
     }
 
     /// The migration tail of `createVolumeSpec`
@@ -884,7 +904,7 @@ impl VolumeManager {
             }
             if let Err(e) = self
                 .asw
-                .mark_volume_as_attached(Some(&volume_name), spec, "", "")
+                .mark_volume_as_attached(Some(&volume_name), spec, &self.node_name, "")
                 .and_then(|()| {
                     self.asw
                         .mark_device_as_mounted(&volume_name, "", &device_mount_path_str, "")
@@ -2029,6 +2049,27 @@ mod projected_mode_tests {
             ),
         )
         .unwrap();
+    }
+
+    /// #3820: the kubelet's node name reaches the world (`NewVolumeManager`'s
+    /// `nodeName`, `volume_manager.go:202`), so a reconstructed device's
+    /// `AttachedVolume` carries it (`newAttachedVolume`, `:1186-1210`).
+    #[tokio::test]
+    async fn with_node_name_reaches_reconstructed_attached_volumes() {
+        let tmp = std::env::temp_dir().join(format!("rn-asw-node-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        stage_unregistered_csi_device(&tmp, "h1");
+        let vm = VolumeManager::new(
+            tmp.to_string_lossy().to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+        .with_node_name("node-7");
+        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        let attached = vm.asw.get_attached_volumes();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].node_name, "node-7");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// #3601: the device-unmount sweep runs against ONE persistent
