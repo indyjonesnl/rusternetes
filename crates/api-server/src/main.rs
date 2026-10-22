@@ -277,6 +277,50 @@ struct Args {
     /// only `json` is supported.
     #[arg(long, default_value = "json")]
     audit_log_format: String,
+
+    /// `--audit-log-maxage` (options/audit.go:438): days to retain rotated
+    /// audit logs, by the timestamp in their name; 0 keeps them.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    audit_log_maxage: i64,
+
+    /// `--audit-log-maxbackup` (options/audit.go:440): rotated files to
+    /// retain; 0 means no limit.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    audit_log_maxbackup: i64,
+
+    /// `--audit-log-maxsize` (options/audit.go:442): megabytes before the
+    /// log is rotated; 0 means lumberjack's 100.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    audit_log_maxsize: i64,
+
+    /// `--audit-log-compress` (options/audit.go:450): gzip rotated files.
+    #[arg(long, default_value_t = false)]
+    audit_log_compress: bool,
+}
+
+/// `AuditLogOptions.Validate` (options/audit.go:453) for the rotation flags.
+fn audit_rotation_options(
+    args: &Args,
+) -> Result<rusternetes_common::audit_rotate::RotationOptions> {
+    let mut errs = Vec::new();
+    for (flag, v) in [
+        ("--audit-log-maxage", args.audit_log_maxage),
+        ("--audit-log-maxbackup", args.audit_log_maxbackup),
+        ("--audit-log-maxsize", args.audit_log_maxsize),
+    ] {
+        if v < 0 {
+            errs.push(format!("{flag} {v} can't be a negative number"));
+        }
+    }
+    if !errs.is_empty() {
+        anyhow::bail!("{}", errs.join("; "));
+    }
+    Ok(rusternetes_common::audit_rotate::RotationOptions {
+        max_size_mb: args.audit_log_maxsize as u64,
+        max_age_days: args.audit_log_maxage as u64,
+        max_backups: args.audit_log_maxbackup as usize,
+        compress: args.audit_log_compress,
+    })
 }
 
 /// `--audit-policy-file` + `--audit-log-path` build the audit pipeline.
@@ -289,6 +333,13 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
             args.audit_log_format
         );
     }
+    // `AuditLogOptions.Validate` only checks when the backend is enabled
+    // (`enabled()` is Path != "").
+    let rotation = if args.audit_log_path.is_some() {
+        audit_rotation_options(args)?
+    } else {
+        Default::default()
+    };
     let (Some(policy_file), Some(log_path)) = (&args.audit_policy_file, &args.audit_log_path)
     else {
         if args.audit_policy_file.is_some() || args.audit_log_path.is_some() {
@@ -303,9 +354,9 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
     let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
         std::sync::Arc::new(audit::StdoutAuditBackend)
     } else {
+        // `AuditLogOptions.getWriter`: a lumberjack writer over the file.
         std::sync::Arc::new(
-            rusternetes_common::audit::FileAuditBackend::new(log_path.clone())
-                .await
+            rusternetes_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
                 .with_context(|| format!("opening --audit-log-path {log_path}"))?,
         )
     };

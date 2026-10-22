@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod affinity;
 pub mod audit;
+pub mod audit_rotate;
 pub mod auth;
 pub mod authz;
 pub mod authz_filter_metrics;
