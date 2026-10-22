@@ -1604,6 +1604,191 @@ mod tests {
         }
     }
 
+    /// `mockAuthzHandler` from `authorization/union/union_test.go:30-38`:
+    /// a fixed decision, empty reason, optional error.
+    struct MockAuthz {
+        opinion: Opinion,
+        error: Option<&'static str>,
+    }
+
+    fn mock(opinion: Opinion, error: Option<&'static str>) -> Arc<dyn Authorizer> {
+        Arc::new(MockAuthz { opinion, error })
+    }
+
+    fn no_op() -> Opinion {
+        Opinion::NoOpinion {
+            reason: String::new(),
+            error: None,
+        }
+    }
+
+    #[async_trait]
+    impl Authorizer for MockAuthz {
+        async fn authorize(&self, a: &RequestAttributes) -> Result<Decision> {
+            self.authorize_outcome(a).await?.into_decision()
+        }
+        async fn authorize_outcome(&self, _: &RequestAttributes) -> Result<AuthorizationOutcome> {
+            Ok(AuthorizationOutcome {
+                opinion: self.opinion.clone(),
+                error: self.error.map(str::to_string),
+            })
+        }
+        async fn get_user_rules(
+            &self,
+            _: &UserInfo,
+            _: &str,
+        ) -> Result<(
+            Vec<crate::resources::ResourceRule>,
+            Vec<crate::resources::NonResourceRule>,
+        )> {
+            Ok((vec![], vec![]))
+        }
+    }
+
+    /// Ports of `TestAuthorizationSecondPasses`, `TestAuthorizationFirstPasses`,
+    /// `TestAuthorizationNonePasses`, `TestAuthorizationError` and
+    /// `TestAuthorizationUnequivocalDeny`
+    /// (`authorization/union/union_test.go:40-82,224-268`), plus the reason
+    /// join of `union.go:45-68` (`strings.Join(reasonlist, "\n")`, empty
+    /// reasons skipped, errors aggregated).
+    #[tokio::test]
+    async fn union_test_go_authorize_ports() {
+        let attrs = RequestAttributes::new(mk_user("a"), "get", "pods");
+        let allow = || mock(Opinion::Allow(String::new()), None);
+        let deny = |e| mock(Opinion::Deny(String::new()), e);
+
+        // SecondPasses / FirstPasses.
+        let u = UnionAuthorizer::new(vec![mock(no_op(), None), allow()]);
+        assert_eq!(u.authorize(&attrs).await.unwrap(), Decision::Allow);
+        let u = UnionAuthorizer::new(vec![allow(), mock(no_op(), None)]);
+        assert_eq!(u.authorize(&attrs).await.unwrap(), Decision::Allow);
+
+        // NonePasses: not Allow.
+        let u = UnionAuthorizer::new(vec![mock(no_op(), None), mock(no_op(), None)]);
+        assert!(!matches!(u.authorize(&attrs).await, Ok(Decision::Allow)));
+
+        // Error: two NoOpinion+error delegates -> an error, aggregated with
+        // dedup of identical messages (utilerrors.NewAggregate).
+        let u = UnionAuthorizer::new(vec![mock(no_op(), Some("foo")), mock(no_op(), Some("foo"))]);
+        let out = u.authorize_outcome(&attrs).await.unwrap();
+        assert_eq!(out.error.as_deref(), Some("foo"));
+        assert!(u.authorize(&attrs).await.is_err());
+        let u = UnionAuthorizer::new(vec![mock(no_op(), Some("a")), mock(no_op(), Some("b"))]);
+        let out = u.authorize_outcome(&attrs).await.unwrap();
+        assert_eq!(out.error.as_deref(), Some("[a, b]"));
+
+        // UnequivocalDeny cases 0-3.
+        let u = UnionAuthorizer::new(vec![]);
+        let out = u.authorize_outcome(&attrs).await.unwrap();
+        assert!(matches!(out.opinion, Opinion::NoOpinion { .. }));
+        let u = UnionAuthorizer::new(vec![mock(no_op(), None), allow(), deny(None)]);
+        assert!(matches!(
+            u.authorize_outcome(&attrs).await.unwrap().opinion,
+            Opinion::Allow(_)
+        ));
+        let u = UnionAuthorizer::new(vec![mock(no_op(), None), deny(None), allow()]);
+        assert!(matches!(
+            u.authorize_outcome(&attrs).await.unwrap().opinion,
+            Opinion::Deny(_)
+        ));
+        let u = UnionAuthorizer::new(vec![
+            mock(no_op(), None),
+            deny(Some("webhook failed closed")),
+            allow(),
+        ]);
+        let out = u.authorize_outcome(&attrs).await.unwrap();
+        assert!(matches!(out.opinion, Opinion::Deny(_)));
+        assert_eq!(out.error.as_deref(), Some("webhook failed closed"));
+
+        // Reason join: "\n" separator, empty reasons skipped.
+        let r = |s: &str| {
+            mock(
+                Opinion::NoOpinion {
+                    reason: s.into(),
+                    error: None,
+                },
+                None,
+            )
+        };
+        let u = UnionAuthorizer::new(vec![r("one"), r(""), r("two")]);
+        match u.authorize_outcome(&attrs).await.unwrap().opinion {
+            Opinion::NoOpinion { reason, .. } => assert_eq!(reason, "one\ntwo"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    struct RulesMock(
+        Vec<crate::resources::ResourceRule>,
+        Vec<crate::resources::NonResourceRule>,
+    );
+
+    #[async_trait]
+    impl Authorizer for RulesMock {
+        async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
+            Ok(Decision::Deny(String::new()))
+        }
+        async fn get_user_rules(
+            &self,
+            _: &UserInfo,
+            _: &str,
+        ) -> Result<(
+            Vec<crate::resources::ResourceRule>,
+            Vec<crate::resources::NonResourceRule>,
+        )> {
+            Ok((self.0.clone(), self.1.clone()))
+        }
+    }
+
+    /// Ports of `TestAuthorizationResourceRules` and
+    /// `TestAuthorizationNonResourceRules` (union_test.go:97-198):
+    /// `unionAuthzRulesHandler.RulesFor` concatenates rules in order.
+    #[tokio::test]
+    async fn union_rules_concatenate_in_order() {
+        use crate::resources::{NonResourceRule, ResourceRule};
+        let s = |v: &[&str]| Some(v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        let rr = |verbs: &[&str], res: &[&str], names: Option<&[&str]>| ResourceRule {
+            verbs: verbs.iter().map(|x| x.to_string()).collect(),
+            api_groups: s(&["*"]),
+            resources: s(res),
+            resource_names: names.and_then(s),
+        };
+        let nr = |url: &str| NonResourceRule {
+            verbs: vec!["get".into()],
+            non_resource_urls: s(&[url]),
+        };
+        let u = UnionAuthorizer::new(vec![
+            Arc::new(RulesMock(
+                vec![
+                    rr(&["*"], &["bindings"], None),
+                    rr(&["get", "list", "watch"], &["*"], None),
+                ],
+                vec![nr("/api")],
+            )),
+            Arc::new(RulesMock(
+                vec![
+                    rr(&["*"], &["events"], None),
+                    rr(&["get"], &["*"], Some(&["foo"])),
+                ],
+                vec![nr("/api/*")],
+            )),
+        ]);
+        let (res, non) = u.get_user_rules(&mk_user("a"), "").await.unwrap();
+        let want_res = vec![
+            rr(&["*"], &["bindings"], None),
+            rr(&["get", "list", "watch"], &["*"], None),
+            rr(&["*"], &["events"], None),
+            rr(&["get"], &["*"], Some(&["foo"])),
+        ];
+        assert_eq!(
+            serde_json::to_value(&res).unwrap(),
+            serde_json::to_value(&want_res).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&non).unwrap(),
+            serde_json::to_value(vec![nr("/api"), nr("/api/*")]).unwrap()
+        );
+    }
+
     /// #1664: the Node,RBAC union is allow-override — a `Deny` from one
     /// authorizer falls through to the next, any `Allow` wins, and only an
     /// all-deny chain denies. In particular a kubelet (`system:node:<n>`) is
