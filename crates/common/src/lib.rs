@@ -5,6 +5,7 @@ pub mod auth;
 pub mod authz;
 pub mod authz_filter_metrics;
 pub mod build_info;
+pub mod cancellation;
 pub mod cel;
 pub mod cel_authz;
 pub mod cel_authz_library;

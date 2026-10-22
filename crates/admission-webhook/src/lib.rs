@@ -4,7 +4,7 @@
 // and processing their responses.
 
 pub mod admission_metrics;
-pub mod cancellation;
+pub use rusternetes_common::cancellation;
 pub mod cel_evaluators;
 pub mod webhook_match;
 
@@ -444,14 +444,17 @@ impl AdmissionWebhookClient {
         };
         tokio::select! {
             result = self.call_webhook_coded_uncancellable(url, review, timeout, ca_bundle) => result,
-            _ = cancellation.cancelled() => Err(CallFailure {
+            // `<-ctx.Done()`: a cancel or the request deadline. Only
+            // `context.Canceled` is kept out of the metrics.
+            reason = cancellation.done() => Err(CallFailure {
                 error: rusternetes_common::Error::Internal(format!(
-                    "failed to call webhook: context canceled querying {}?timeout={}s",
+                    "failed to call webhook: {} querying {}?timeout={}s",
+                    reason,
                     url,
                     timeout.as_secs()
                 )),
                 code: 503,
-                canceled: true,
+                canceled: reason == cancellation::ContextError::Canceled,
             }),
         }
     }
@@ -1368,7 +1371,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         // Check if the request has already been cancelled before spawning
         // remote calls (validating/dispatcher.go:118-124).
         let cancellation = current_request_cancellation();
-        if cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+        if cancellation.as_ref().is_some_and(|c| c.is_done()) {
             return Err(request_timeout_error());
         }
 
@@ -2025,9 +2028,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                     // `select { case <-ctx.Done(): return
                                     // NewTimeoutError(...)` after a fail-open
                                     // (mutating/dispatcher.go:216-223).
-                                    if current_request_cancellation()
-                                        .is_some_and(|c| c.is_cancelled())
-                                    {
+                                    if current_request_cancellation().is_some_and(|c| c.is_done()) {
                                         return Err(request_timeout_error());
                                     }
                                     AdmissionReviewResponse {
@@ -6062,6 +6063,32 @@ mod dispatcher_metrics_tests {
         assert_eq!(fail_open("m-v-cancel-open", "validating"), 0);
         assert_eq!(
             request_total("m-v-cancel-open", "validating", "503", "false"),
+            1
+        );
+    }
+
+    /// A call ended by `context.DeadlineExceeded` (not `Canceled`) ends the
+    /// call too, but is NOT kept out of the rejection metric
+    /// (`errors.Is(err.Reason, context.Canceled)`, validating/dispatcher.go:180).
+    #[tokio::test]
+    async fn validating_deadline_exceeded_counts_rejection_metric() {
+        let url = serve_hanging().await;
+        let (_c, ctx) = cancellation::request_cancellation_with_deadline(Some(
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        ));
+        let r = cancellation::with_request_cancellation(
+            ctx,
+            run_validating("m-v-deadline-fail", &url, FailurePolicy::Fail),
+        )
+        .await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection(
+                "m-v-deadline-fail",
+                "validating",
+                "calling_webhook_error",
+                "503"
+            ),
             1
         );
     }
