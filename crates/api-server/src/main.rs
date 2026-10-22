@@ -55,6 +55,8 @@ use rusternetes_api_server::request_scope;
 use rusternetes_api_server::zpages;
 // The bin's own `bootstrap` copy names the lib's trust type (#3414).
 use rusternetes_api_server::request_header_authentication;
+// The bin's own `admission` copy shares the lib's webhook client (ImagePolicyWebhook).
+use rusternetes_api_server::authorization_webhook;
 #[allow(dead_code)]
 mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
@@ -367,6 +369,7 @@ async fn main() -> Result<()> {
         warn!("{msg}");
     }
 
+    let mut image_policy_config = None;
     if let Some(path) = &args.admission_control_config_file {
         let yaml = std::fs::read_to_string(path)
             .with_context(|| format!("reading --admission-control-config-file {path}"))?;
@@ -387,7 +390,14 @@ async fn main() -> Result<()> {
             std::path::Path::new(path),
         )
         .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
+        image_policy_config = admission::config::plugin_configuration_for(
+            &yaml,
+            std::path::Path::new(path),
+            "ImagePolicyWebhook",
+        )
+        .map_err(|e| anyhow::anyhow!("parsing {path}: {e}"))?;
     }
+    admission::image_policy::install_from_config(image_policy_config.as_deref())?;
 
     install_audit_from_flags(&args).await?;
 

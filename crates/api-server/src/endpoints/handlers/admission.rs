@@ -541,6 +541,22 @@ impl Admission<'_> {
             Ok(())
         })
         .await?;
+        // ImagePolicyWebhook.Validate: `NewHandler(Create, Update)` and
+        // `var _ admission.ValidationInterface` (plugin/pkg/admission/
+        // imagepolicy/admission.go:91, :284); ahead of PodSecurity as in
+        // `AllOrderedPlugins`.
+        self.plugin("ImagePolicyWebhook", op, VALIDATE, async {
+            if let (true, Some(obj), Some(namespace)) = (
+                self.resource.group.is_empty() && self.resource.resource == "pods",
+                obj,
+                self.namespace,
+            ) {
+                let pod: Pod = recast(obj)?;
+                self.validate_image_policy(&pod, namespace).await?;
+            }
+            Ok(())
+        })
+        .await?;
         self.plugin("PodSecurity", op, VALIDATE, async {
             self.validate_pod_security(ctx, op, obj, old).await
         })
@@ -877,6 +893,21 @@ impl Admission<'_> {
             spec.preemption_policy = preemption_policy;
         }
         Ok(())
+    }
+
+    /// `ImagePolicyWebhook.Validate`
+    /// (plugin/pkg/admission/imagepolicy/admission.go:126-179). The backend's
+    /// audit annotations are recorded on the request's audit event whether or
+    /// not it is denied.
+    async fn validate_image_policy(&self, pod: &Pod, namespace: &str) -> Result<()> {
+        let Some(plugin) = crate::admission::image_policy::installed() else {
+            return Ok(());
+        };
+        let decision = plugin.validate(pod, namespace, self.subresource).await;
+        if !decision.audit_annotations.is_empty() {
+            crate::audit::add_audit_annotations(&decision.audit_annotations);
+        }
+        decision.into_result()
     }
 
     /// The PodSecurity plugin's `Validate` (podsecurity/admission.go), one call

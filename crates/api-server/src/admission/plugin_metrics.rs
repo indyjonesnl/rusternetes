@@ -179,6 +179,14 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: true,
     },
+    // imagepolicy/admission.go:91 (ValidationInterface only), :284
+    // (NewHandler(Create, Update))
+    Spec {
+        name: "ImagePolicyWebhook",
+        ops: C | U,
+        admit: false,
+        validate: true,
+    },
     // antiaffinity/admission.go:45, :50
     Spec {
         name: "LimitPodHardAntiAffinityTopology",
