@@ -160,6 +160,10 @@ pub struct ControllerManagerConfig {
     /// `isDisabledByDefault: true` (`cmd/kube-controller-manager/app/bootstrap.go:35`),
     /// so it is opt-in (`--bootstrap-signer-controller`).
     pub bootstrap_signer_controller: bool,
+    /// `--terminated-pod-gc-threshold` (`PodGCControllerConfiguration.
+    /// TerminatedPodGCThreshold`, default 12500): terminated pods tolerated
+    /// before the pod GC deletes the oldest; `<= 0` disables that pass.
+    pub terminated_pod_gc_threshold: i32,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -520,6 +524,17 @@ where
         }
     }));
 
+    // `newPodGarbageCollectorController`
+    // (cmd/kube-controller-manager/app/core.go:564-576).
+    let s = storage_for("PodGarbageCollector");
+    let threshold = config.terminated_pod_gc_threshold;
+    handles.push(tokio::spawn(async move {
+        let c = Arc::new(controllers::podgc::PodGcController::new(s, threshold));
+        if let Err(e) = c.run().await {
+            error!("PodGC controller error: {}", e);
+        }
+    }));
+
     // `newCertificateSigningRequestCleanerController`
     // (cmd/kube-controller-manager/app/certificates.go:217-230).
     let s = storage_for("CertificateSigningRequestCleaner");
@@ -747,6 +762,8 @@ mod per_controller_client_tests {
                 csi_attachers: Vec::new(),
                 attach_detach_controller: false,
                 bootstrap_signer_controller: false,
+                terminated_pod_gc_threshold:
+                    controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
             },
         );
         for h in &handles {
@@ -801,6 +818,8 @@ mod csi_attach_wiring_tests {
                 csi_attachers,
                 attach_detach_controller,
                 bootstrap_signer_controller: false,
+                terminated_pod_gc_threshold:
+                    controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
             },
         );
         for h in &handles {

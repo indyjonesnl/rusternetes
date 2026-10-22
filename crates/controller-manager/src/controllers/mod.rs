@@ -47,6 +47,8 @@ pub mod node_lifecycle_queue;
 pub mod node_lifecycle_zone;
 pub mod pod_disruption_budget;
 pub(crate) mod pod_informer;
+pub mod podgc;
+pub mod podgc_metrics;
 pub mod priorityclass;
 pub mod pv_binder;
 pub mod pv_protection;
@@ -115,6 +117,7 @@ pub fn gather_metrics() -> String {
     out.push_str(&ephemeral_volume_metrics::gather());
     out.push_str(&node_lifecycle_metrics::gather());
     out.push_str(&csi_capacity_metrics::gather());
+    out.push_str(&podgc_metrics::gather());
     // Process-global `legacyregistry` (prometheus default registry): holds
     // `version_info` from `ComponentGlobalsRegistry.AddMetrics()`
     // (cmd/kube-controller-manager/app/controllermanager.go:146).
