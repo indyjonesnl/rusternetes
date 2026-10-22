@@ -258,7 +258,7 @@ pub async fn get_api_groups(
                 continue;
             }
             seen_groups.insert(name.to_string());
-            let versions = if group_v1beta1_served(name) {
+            let mut versions = if group_v1beta1_served(name) {
                 vec![
                     serde_json::json!({
                         "version": version,
@@ -291,6 +291,13 @@ pub async fn get_api_groups(
                     "freshness": "Current"
                 })]
             };
+            if group_v1alpha3_served(name) {
+                versions.push(serde_json::json!({
+                    "version": "v1alpha3",
+                    "resources": get_aggregated_resources_for_group(name, "v1alpha3"),
+                    "freshness": "Current"
+                }));
+            }
             groups.push(serde_json::json!({
                 "metadata": { "name": name },
                 "versions": versions
@@ -799,6 +806,16 @@ pub async fn get_api_groups(
         }
     }
 
+    // resource.k8s.io/v1alpha3 is served under the DRADeviceTaintRules gate.
+    if resource_v1alpha3_served() {
+        if let Some(group) = groups.iter_mut().find(|g| g.name == "resource.k8s.io") {
+            group.versions.push(GroupVersionForDiscovery {
+                group_version: "resource.k8s.io/v1alpha3".to_string(),
+                version: "v1alpha3".to_string(),
+            });
+        }
+    }
+
     // Dynamically add CRD groups to the non-aggregated discovery response.
     // kubectl uses this to find resources by GVK. Without CRD groups here,
     // kubectl create/explain fails with "no matches for kind".
@@ -932,6 +949,25 @@ fn admissionregistration_v1beta1_served() -> bool {
     )
 }
 
+/// Whether `resource.k8s.io/v1alpha3` is served: its only resource,
+/// `devicetaintrules` (+ `/status`), is installed only while the
+/// `DRADeviceTaintRules` gate is on (pkg/registry/resource/rest/
+/// storage_resource.go:117-130 `v1alpha3Storage`, `ResourceEnabled`), and
+/// upstream drops a group version that has no storage.
+fn resource_v1alpha3_served() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::DRADeviceTaintRules,
+    )
+}
+
+/// Whether `group` also serves a `v1alpha3` next to its preferred version.
+fn group_v1alpha3_served(group: &str) -> bool {
+    match group {
+        "resource.k8s.io" => resource_v1alpha3_served(),
+        _ => false,
+    }
+}
+
 /// Whether `group` also serves a `v1beta1` next to its preferred version.
 fn group_v1beta1_served(group: &str) -> bool {
     match group {
@@ -982,6 +1018,9 @@ pub fn delegate_listed_paths() -> Vec<String> {
         if group_v1beta1_served(group) {
             paths.push(format!("/apis/{group}/v1beta1"));
         }
+        if group_v1alpha3_served(group) {
+            paths.push(format!("/apis/{group}/v1alpha3"));
+        }
         if group == "autoscaling" {
             paths.push("/apis/autoscaling/v1".to_string());
         }
@@ -1000,6 +1039,7 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
         ("", "v1") | ("autoscaling", "v1") => true,
         ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
         ("admissionregistration.k8s.io", "v1beta1") => admissionregistration_v1beta1_served(),
+        ("resource.k8s.io", "v1alpha3") => resource_v1alpha3_served(),
         _ => get_api_group_names()
             .iter()
             .any(|(g, v)| *g == group && *v == version),
@@ -1046,6 +1086,9 @@ pub fn registered_kinds() -> Vec<RegisteredKind> {
         group_versions.push((group.to_string(), version.to_string()));
         if group_v1beta1_served(group) {
             group_versions.push((group.to_string(), "v1beta1".to_string()));
+        }
+        if group_v1alpha3_served(group) {
+            group_versions.push((group.to_string(), "v1alpha3".to_string()));
         }
     }
     let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or("").to_string();
@@ -1812,6 +1855,21 @@ fn get_aggregated_resources_for_group_uncategorized(
         ],
         "custom.metrics.k8s.io" => vec![],
         "external.metrics.k8s.io" => vec![],
+        // pkg/registry/resource/rest/storage_resource.go:117-130
+        // (`v1alpha3Storage`): devicetaintrules + /status, cluster-scoped.
+        "resource.k8s.io" if version == "v1alpha3" => {
+            if !resource_v1alpha3_served() {
+                return Vec::new();
+            }
+            vec![res(
+                "devicetaintrules",
+                "devicetaintrule",
+                "DeviceTaintRule",
+                false,
+                all_verbs,
+                vec![sub("status", "DeviceTaintRule", status_verbs)],
+            )]
+        }
         "resource.k8s.io" => vec![
             res(
                 "resourceclaims",
@@ -1880,7 +1938,7 @@ pub async fn get_api_group(
 
     if let Some((name, version)) = found {
         // autoscaling has both v1 and v2
-        let versions = if group_v1beta1_served(name) {
+        let mut versions = if group_v1beta1_served(name) {
             vec![
                 GroupVersionForDiscovery {
                     group_version: format!("{}/{}", name, version),
@@ -1908,6 +1966,12 @@ pub async fn get_api_group(
                 version: version.to_string(),
             }]
         };
+        if group_v1alpha3_served(name) {
+            versions.push(GroupVersionForDiscovery {
+                group_version: format!("{}/v1alpha3", name),
+                version: "v1alpha3".to_string(),
+            });
+        }
         let preferred = versions[0].clone();
         let api_group = APIGroup {
             name: name.to_string(),
@@ -3720,6 +3784,70 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         kind: "APIResourceList".to_string(),
         api_version: "v1".to_string(),
         group_version: "certificates.k8s.io/v1beta1".to_string(),
+        resources,
+    };
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
+        .into_response()
+}
+
+/// GET /apis/resource.k8s.io/v1alpha3
+/// Returns `devicetaintrules` and `devicetaintrules/status` (404 while the
+/// `DRADeviceTaintRules` gate is off, as for an API version with no storage:
+/// storage_resource.go:117-130).
+pub async fn get_resource_v1alpha3_resources() -> Response {
+    if !resource_v1alpha3_served() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the server could not find the requested resource",
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response();
+    }
+    let verbs = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+    let resources = vec![
+        APIResource {
+            name: "devicetaintrules".to_string(),
+            singular_name: "devicetaintrule".to_string(),
+            namespaced: false,
+            kind: "DeviceTaintRule".to_string(),
+            verbs: verbs(&[
+                "create",
+                "delete",
+                "deletecollection",
+                "get",
+                "list",
+                "patch",
+                "update",
+                "watch",
+            ]),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        },
+        APIResource {
+            name: "devicetaintrules/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: false,
+            kind: "DeviceTaintRule".to_string(),
+            verbs: verbs(&["get", "patch", "update"]),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        },
+    ];
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "resource.k8s.io/v1alpha3".to_string(),
         resources,
     };
     (
