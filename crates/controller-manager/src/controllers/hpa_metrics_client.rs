@@ -70,7 +70,7 @@ pub trait MetricsClient: Send + Sync {
         namespace: &str,
         selector: &LabelSelector,
         metric_selector: &str,
-    ) -> Result<PodMetricsInfo>;
+    ) -> Result<(PodMetricsInfo, DateTime<Utc>)>;
 
     /// Single ("Object" type) metric value for a referenced object.
     /// `metric_selector` as for `get_raw_metric` (horizontal.go:468).
@@ -165,10 +165,18 @@ impl MetricsClient for FakeMetricsClient {
         _namespace: &str,
         _selector: &LabelSelector,
         _metric_selector: &str,
-    ) -> Result<PodMetricsInfo> {
+    ) -> Result<(PodMetricsInfo, DateTime<Utc>)> {
         self.pods
             .get(metric)
             .cloned()
+            .map(|info| {
+                let ts = info
+                    .values()
+                    .map(|m| m.timestamp)
+                    .next()
+                    .unwrap_or_else(Utc::now);
+                (info, ts)
+            })
             .ok_or_else(|| anyhow::anyhow!("no pods metric for {metric}"))
     }
 
@@ -500,7 +508,7 @@ impl MetricsClient for HttpMetricsClient {
         namespace: &str,
         selector: &LabelSelector,
         metric_selector: &str,
-    ) -> Result<PodMetricsInfo> {
+    ) -> Result<(PodMetricsInfo, DateTime<Utc>)> {
         let body = self
             .raw_metric_body(metric, namespace, selector, metric_selector)
             .await
@@ -510,6 +518,8 @@ impl MetricsClient for HttpMetricsClient {
             anyhow::bail!("no metrics returned from custom metrics API");
         }
 
+        // client.go:147-149: the returned timestamp is `metrics.Items[0].Timestamp`.
+        let timestamp = item_timestamp(&items[0])?;
         let mut info = PodMetricsInfo::new();
         for m in items {
             // client.go:136-139: `windowSeconds` or `metricServerDefaultMetricWindow`.
@@ -533,7 +543,7 @@ impl MetricsClient for HttpMetricsClient {
                 },
             );
         }
-        Ok(info)
+        Ok((info, timestamp))
     }
 
     /// `customMetricsClient.GetObjectMetric` (metrics/client.go:152-170).
@@ -808,7 +818,7 @@ mod tests {
             FakeMetricsClient::pods_info(&[("p1", 200, None), ("p2", 200, None)]),
         );
         let sel = LabelSelector::default();
-        let info = fake
+        let (info, _) = fake
             .get_raw_metric("requests-per-second", "default", &sel, "")
             .await
             .unwrap();
@@ -1054,7 +1064,7 @@ mod tests {
             ),
         ])
         .await;
-        let info = client_for(url)
+        let (info, timestamp) = client_for(url)
             .get_raw_metric("qps", "ns", &pod_selector("web"), "env=prod")
             .await
             .unwrap();
@@ -1073,6 +1083,8 @@ mod tests {
         assert_eq!(info["web-1"].window, METRIC_SERVER_DEFAULT_METRIC_WINDOW);
         assert_eq!(info["web-0"].timestamp, ts("2026-01-01T00:00:10Z"));
         assert_eq!(info["web-1"].timestamp, ts("2026-01-01T00:00:20Z"));
+        // client.go:147-149: the returned timestamp is `Items[0].Timestamp`.
+        assert_eq!(timestamp, ts("2026-01-01T00:00:10Z"));
     }
 
     /// An empty selector is not sent at all (`VersionedParams` omits empty

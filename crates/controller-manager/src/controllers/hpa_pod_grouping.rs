@@ -31,14 +31,6 @@ pub fn initial_readiness_delay() -> Duration {
     Duration::seconds(30)
 }
 
-/// The metrics reporting window. Upstream carries this per-sample
-/// (`metric.Window`); rusternetes' `PodMetric` doesn't, so we use the standard
-/// metrics-server resolution as a fixed window — it is effectively constant in
-/// real deployments.
-pub fn metric_window() -> Duration {
-    Duration::seconds(30)
-}
-
 /// Names of the pods whose CPU metric should count toward utilization, mirroring
 /// upstream `groupPods` (CPU branch): excludes deleting/Failed/Pending pods,
 /// pods missing metrics, and unready/just-initializing pods.
@@ -48,7 +40,6 @@ pub fn ready_cpu_pods(
     now: DateTime<Utc>,
     cpu_init: Duration,
     readiness_delay: Duration,
-    window: Duration,
 ) -> HashSet<String> {
     let mut ready = HashSet::new();
     for pod in pods {
@@ -83,6 +74,10 @@ pub fn ready_cpu_pods(
                     // sample if the pod is unready, or if less than one metric
                     // window has elapsed since the last readiness transition.
                     let cond_false = cond.status == "False";
+                    // replica_calculator.go:452 `groupPods`: the per-sample
+                    // `metric.Window`, not a fixed constant.
+                    let window =
+                        Duration::from_std(metric.window).unwrap_or_else(|_| Duration::zero());
                     let window_not_elapsed = cond
                         .last_transition_time
                         .map(|lt| metric.timestamp < lt + window)
@@ -166,7 +161,6 @@ mod tests {
             now(),
             cpu_initialization_period(),
             initial_readiness_delay(),
-            metric_window(),
         );
         assert!(
             ready.is_empty(),
@@ -190,7 +184,6 @@ mod tests {
             now(),
             cpu_initialization_period(),
             initial_readiness_delay(),
-            metric_window(),
         );
         assert_eq!(ready.len(), 1);
         assert!(ready.contains("p1"));
@@ -216,11 +209,40 @@ mod tests {
             now(),
             cpu_initialization_period(),
             initial_readiness_delay(),
-            metric_window(),
         );
         assert!(
             ready.is_empty(),
             "pending/failed/missing all excluded: {ready:?}"
         );
+    }
+
+    #[test]
+    fn per_sample_window_drives_cpu_init_exclusion() {
+        // replica_calculator.go groupPods: within cpuInitializationPeriod a Ready
+        // pod is still ignored if metric.Timestamp < lastTransition + metric.Window.
+        let pods = vec![pod(
+            "p1",
+            Phase::Running,
+            Some("True"),
+            Duration::minutes(1),
+        )];
+        let mut m = metrics(&["p1"]);
+        let ready = ready_cpu_pods(
+            &pods,
+            &m,
+            now(),
+            cpu_initialization_period(),
+            initial_readiness_delay(),
+        );
+        assert!(ready.contains("p1"), "short window: counted");
+        m.get_mut("p1").unwrap().window = std::time::Duration::from_secs(100 * 365 * 86400);
+        let ready = ready_cpu_pods(
+            &pods,
+            &m,
+            now(),
+            cpu_initialization_period(),
+            initial_readiness_delay(),
+        );
+        assert!(ready.is_empty(), "long per-sample window: excluded");
     }
 }

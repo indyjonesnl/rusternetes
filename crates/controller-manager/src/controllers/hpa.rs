@@ -421,7 +421,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
             Utc::now(),
             grp::cpu_initialization_period(),
             grp::initial_readiness_delay(),
-            grp::metric_window(),
         );
         info.into_iter()
             .filter(|(k, _)| ready.contains(k))
@@ -640,7 +639,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     .transpose()
                     .map_err(|e| anyhow::anyhow!("failed to get pods metric value: {e}"))?
                     .unwrap_or_default();
-                let info = self
+                let (info, _timestamp) = self
                     .metrics_client
                     .get_raw_metric(&p.metric.name, namespace, &selector, &metric_selector)
                     .await
