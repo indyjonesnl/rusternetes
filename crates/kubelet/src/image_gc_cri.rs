@@ -171,9 +171,15 @@ impl StatsProvider for CriStatsProvider {
             return Ok(FsStats::default());
         };
         match crate::volume_plugins::metrics_statfs::fs_info(mountpoint) {
-            Ok((available, capacity, ..)) => Ok(FsStats {
+            Ok((available, capacity, _, inodes, inodes_free, _)) => Ok(FsStats {
                 capacity_bytes: Some(capacity as u64),
                 available_bytes: Some(available as u64),
+                inodes: Some(inodes as u64),
+                inodes_free: Some(inodes_free as u64),
+                device: std::fs::metadata(mountpoint).ok().map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.dev()
+                }),
             }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tracing::debug!(mountpoint, %err, "Failed to get the info of the filesystem with mountpoint");

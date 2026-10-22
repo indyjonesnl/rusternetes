@@ -107,6 +107,12 @@ pub struct GcPod {
 pub struct FsStats {
     pub capacity_bytes: Option<u64>,
     pub available_bytes: Option<u64>,
+    /// `FsStats.Inodes` / `InodesFree` (the `imagefs.inodesFree` eviction signal).
+    pub inodes: Option<u64>,
+    pub inodes_free: Option<u64>,
+    /// Device id of the filesystem (cadvisor `FsInfo.Device`), used to decide
+    /// whether the image filesystem is dedicated (`HasDedicatedImageFs`).
+    pub device: Option<u64>,
 }
 
 /// The subset of `container.Runtime` the image GC manager calls.
@@ -279,6 +285,12 @@ impl ImageGcManager {
             post_gc_hooks,
             image_records: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `ImageFsStats` of the manager's stats provider; the eviction manager
+    /// observes the `imagefs.*` signals from it (`makeSignalObservations`).
+    pub async fn image_fs_stats(&self) -> anyhow::Result<FsStats> {
+        self.stats_provider.image_fs_stats().await
     }
 
     pub fn image_records_len(&self) -> usize {
@@ -1197,6 +1209,7 @@ mod tests {
         let stats = MockStats::returning(Ok(FsStats {
             available_bytes: Some(600),
             capacity_bytes: Some(1000),
+            ..Default::default()
         }));
         let (m, _, _) = manager(policy_90_80(), stats);
         m.garbage_collect(Utc::now()).await.unwrap();
@@ -1215,6 +1228,7 @@ mod tests {
         let stats = MockStats::returning(Ok(FsStats {
             available_bytes: Some(50),
             capacity_bytes: Some(1000),
+            ..Default::default()
         }));
         let (m, rt, _) = manager(policy_90_80(), stats);
         rt.set_images(vec![make_image(0, 450)]);
@@ -1229,6 +1243,7 @@ mod tests {
         let stats = MockStats::returning(Ok(FsStats {
             available_bytes: Some(capacity / 20),
             capacity_bytes: Some(capacity),
+            ..Default::default()
         }));
         let (m, rt, rec) = manager(policy_90_80(), stats);
         // Unused and eligible, but smaller than the amount to free.
@@ -1351,6 +1366,7 @@ mod tests {
         let stats = MockStats::returning(Ok(FsStats {
             available_bytes: Some(600),
             capacity_bytes: Some(1000),
+            ..Default::default()
         }));
         let (m, rt, _) = manager(policy, stats);
         rt.set_images(vec![make_image(0, 1024)]);

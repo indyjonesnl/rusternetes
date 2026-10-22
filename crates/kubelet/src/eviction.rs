@@ -133,6 +133,19 @@ pub struct NodeStats {
     pub pid_available: u64,
     /// Total PIDs
     pub pid_total: u64,
+    /// The dedicated image filesystem, `None` when the image filesystem shares
+    /// the node filesystem's device (upstream `hasImageFs == false`: the
+    /// `imagefs.*` signals then read the same numbers as `nodefs.*`).
+    pub imagefs: Option<FsUsage>,
+}
+
+/// One filesystem's observation (`signalObservation` available/capacity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsUsage {
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+    pub inodes_free: u64,
+    pub inodes_total: u64,
 }
 
 /// Pod resource usage statistics
@@ -469,18 +482,24 @@ impl EvictionManager {
             EvictionSignal::MemoryAvailable => stats.memory_available_bytes,
             EvictionSignal::NodeFsAvailable => stats.nodefs_available_bytes,
             EvictionSignal::NodeFsInodesFree => stats.nodefs_inodes_free,
-            EvictionSignal::ImageFsAvailable => stats.nodefs_available_bytes,
-            EvictionSignal::ImageFsInodesFree => stats.nodefs_inodes_free,
+            EvictionSignal::ImageFsAvailable => stats
+                .imagefs
+                .map_or(stats.nodefs_available_bytes, |f| f.available_bytes),
+            EvictionSignal::ImageFsInodesFree => stats
+                .imagefs
+                .map_or(stats.nodefs_inodes_free, |f| f.inodes_free),
             EvictionSignal::PidAvailable => stats.pid_available,
         };
         let total = match signal {
             EvictionSignal::MemoryAvailable => stats.memory_total_bytes,
-            EvictionSignal::NodeFsAvailable | EvictionSignal::ImageFsAvailable => {
-                stats.nodefs_total_bytes
-            }
-            EvictionSignal::NodeFsInodesFree | EvictionSignal::ImageFsInodesFree => {
-                stats.nodefs_inodes_total
-            }
+            EvictionSignal::NodeFsAvailable => stats.nodefs_total_bytes,
+            EvictionSignal::ImageFsAvailable => stats
+                .imagefs
+                .map_or(stats.nodefs_total_bytes, |f| f.total_bytes),
+            EvictionSignal::NodeFsInodesFree => stats.nodefs_inodes_total,
+            EvictionSignal::ImageFsInodesFree => stats
+                .imagefs
+                .map_or(stats.nodefs_inodes_total, |f| f.inodes_total),
             EvictionSignal::PidAvailable => stats.pid_total,
         };
 
@@ -668,6 +687,114 @@ impl EvictionManager {
             });
         }
     }
+}
+
+/// `nodeReclaimFunc`: the node-level reclaim actions the eviction manager
+/// runs before evicting end-user pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeReclaimFunc {
+    /// `containerGC.DeleteAllUnusedContainers`
+    DeleteAllUnusedContainers,
+    /// `imageGC.DeleteUnusedImages`
+    DeleteUnusedImages,
+}
+
+/// `buildSignalToNodeReclaimFuncs`
+/// (`pkg/kubelet/eviction/helpers.go:1202`). The `containerfs.*` signals are
+/// not modelled (no `KubeletSeparateDiskGC`), so only the nodefs/imagefs
+/// entries are produced.
+pub fn build_signal_to_node_reclaim_funcs(
+    with_image_fs: bool,
+    split_container_image_fs: bool,
+) -> HashMap<EvictionSignal, Vec<NodeReclaimFunc>> {
+    use EvictionSignal::*;
+    use NodeReclaimFunc::*;
+    let mut m = HashMap::new();
+    // usage of an imagefs is optional
+    if with_image_fs && !split_container_image_fs {
+        // with an imagefs, nodefs pressure should just delete logs
+        m.insert(NodeFsAvailable, vec![]);
+        m.insert(NodeFsInodesFree, vec![]);
+        // with an imagefs, imagefs pressure should delete unused images
+        m.insert(
+            ImageFsAvailable,
+            vec![DeleteAllUnusedContainers, DeleteUnusedImages],
+        );
+        m.insert(
+            ImageFsInodesFree,
+            vec![DeleteAllUnusedContainers, DeleteUnusedImages],
+        );
+    } else if with_image_fs && split_container_image_fs {
+        // image gc on imagefs pressure; containers gc on containerfs pressure
+        m.insert(ImageFsAvailable, vec![DeleteUnusedImages]);
+        m.insert(ImageFsInodesFree, vec![DeleteUnusedImages]);
+        m.insert(NodeFsAvailable, vec![DeleteAllUnusedContainers]);
+        m.insert(NodeFsInodesFree, vec![DeleteAllUnusedContainers]);
+    } else {
+        // without an imagefs, nodefs pressure should delete logs, and unused
+        // images; the filesystems share a device so they share reclaim funcs
+        for sig in [
+            NodeFsAvailable,
+            NodeFsInodesFree,
+            ImageFsAvailable,
+            ImageFsInodesFree,
+        ] {
+            m.insert(sig, vec![DeleteAllUnusedContainers, DeleteUnusedImages]);
+        }
+    }
+    m
+}
+
+/// The `ImageGC` / `ContainerGC` interfaces of the eviction manager plus the
+/// summary provider used to re-observe after a reclaim.
+#[async_trait::async_trait]
+pub trait NodeReclaimer: Send + Sync {
+    /// `containerGC.DeleteAllUnusedContainers`
+    async fn delete_all_unused_containers(&self) -> Result<()>;
+    /// `imageGC.DeleteUnusedImages`
+    async fn delete_unused_images(&self) -> Result<()>;
+    /// `summaryProvider.Get(ctx, true)` reduced to the node stats.
+    async fn observe(&self) -> NodeStats;
+}
+
+impl EvictionManager {
+    /// True when no configured threshold is met by `stats`
+    /// (`len(thresholdsMet(thresholds, observations, true)) == 0`; the
+    /// `--eviction-minimum-reclaim` margin is not modelled in this manager).
+    pub fn no_thresholds_met(&self, stats: &NodeStats) -> bool {
+        !self.thresholds.iter().any(|t| {
+            [t.hard.as_ref(), t.soft.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|v| Self::compare_threshold(t.signal, v, stats))
+        })
+    }
+}
+
+/// `managerImpl.reclaimNodeLevelResources`
+/// (`eviction_manager.go:473`): runs the reclaim funcs for `signal` (errors are
+/// logged, not fatal), then re-observes; returns true if no threshold is met
+/// any more and no pod eviction is required.
+pub async fn reclaim_node_level_resources(
+    funcs: &[NodeReclaimFunc],
+    reclaimer: &dyn NodeReclaimer,
+    thresholds_check: impl Fn(&NodeStats) -> bool,
+) -> bool {
+    for f in funcs {
+        let r = match f {
+            NodeReclaimFunc::DeleteAllUnusedContainers => {
+                reclaimer.delete_all_unused_containers().await
+            }
+            NodeReclaimFunc::DeleteUnusedImages => reclaimer.delete_unused_images().await,
+        };
+        if let Err(err) = r {
+            info!(%err, "Eviction manager: unexpected error when attempting to reduce resource pressure");
+        }
+    }
+    if funcs.is_empty() {
+        return false;
+    }
+    thresholds_check(&reclaimer.observe().await)
 }
 
 impl Default for EvictionManager {
@@ -948,6 +1075,7 @@ pub fn get_node_stats(root_dir: &Path) -> NodeStats {
         nodefs_inodes_total,
         pid_available,
         pid_total,
+        imagefs: None,
     }
 }
 
@@ -1325,6 +1453,7 @@ mod tests {
             nodefs_inodes_total: 1_000_000,
             pid_available: 1,
             pid_total: 32768,
+            imagefs: None,
         };
         let active = mgr.check_eviction_needed(&stats);
         assert!(
@@ -1344,6 +1473,7 @@ mod tests {
             nodefs_inodes_total: 10_000_000,
             pid_available: 30000,
             pid_total: 32768,
+            imagefs: None,
         }
     }
 
@@ -1357,6 +1487,7 @@ mod tests {
             nodefs_inodes_total: 10_000_000,
             pid_available: 30000,
             pid_total: 32768,
+            imagefs: None,
         }
     }
 
@@ -1557,6 +1688,7 @@ mod tests {
             nodefs_inodes_total: 10_000_000,
             pid_available: 30000,
             pid_total: 32768,
+            imagefs: None,
         };
 
         let t0 = Instant::now();
@@ -1582,6 +1714,7 @@ mod tests {
             nodefs_inodes_total: 10_000_000,
             pid_available: 30000,
             pid_total: 32768,
+            imagefs: None,
         };
 
         let t0 = Instant::now();
@@ -1663,5 +1796,161 @@ mod tests {
         assert!(!is_critical_pod(&p));
         let (p, _) = candidate("b", &[], None);
         assert!(!is_critical_pod(&p));
+    }
+
+    // Ports pkg/kubelet/eviction/eviction_manager_test.go TestNodeReclaimFuncs
+    // (expectContainerGcCall / expectImageGcCall per fs layout) and
+    // helpers.go buildSignalToNodeReclaimFuncs.
+    use NodeReclaimFunc::{DeleteAllUnusedContainers, DeleteUnusedImages};
+
+    #[test]
+    fn node_reclaim_funcs_no_image_fs() {
+        let m = build_signal_to_node_reclaim_funcs(false, false);
+        for sig in [
+            EvictionSignal::NodeFsAvailable,
+            EvictionSignal::NodeFsInodesFree,
+            EvictionSignal::ImageFsAvailable,
+            EvictionSignal::ImageFsInodesFree,
+        ] {
+            assert_eq!(m[&sig], vec![DeleteAllUnusedContainers, DeleteUnusedImages]);
+        }
+    }
+
+    #[test]
+    fn node_reclaim_funcs_dedicated_image_fs() {
+        let m = build_signal_to_node_reclaim_funcs(true, false);
+        assert!(m[&EvictionSignal::NodeFsAvailable].is_empty());
+        assert!(m[&EvictionSignal::NodeFsInodesFree].is_empty());
+        assert_eq!(
+            m[&EvictionSignal::ImageFsAvailable],
+            vec![DeleteAllUnusedContainers, DeleteUnusedImages]
+        );
+        assert_eq!(
+            m[&EvictionSignal::ImageFsInodesFree],
+            vec![DeleteAllUnusedContainers, DeleteUnusedImages]
+        );
+    }
+
+    #[test]
+    fn node_reclaim_funcs_split_container_image_fs() {
+        let m = build_signal_to_node_reclaim_funcs(true, true);
+        assert_eq!(
+            m[&EvictionSignal::ImageFsAvailable],
+            vec![DeleteUnusedImages]
+        );
+        assert_eq!(
+            m[&EvictionSignal::NodeFsAvailable],
+            vec![DeleteAllUnusedContainers]
+        );
+    }
+
+    struct MockDiskGc {
+        container_calls: std::sync::atomic::AtomicUsize,
+        image_calls: std::sync::atomic::AtomicUsize,
+        /// Stats observed after GC (`summaryAfterGC`).
+        after_gc: NodeStats,
+    }
+
+    #[async_trait::async_trait]
+    impl NodeReclaimer for MockDiskGc {
+        async fn delete_all_unused_containers(&self) -> Result<()> {
+            self.container_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn delete_unused_images(&self) -> Result<()> {
+            self.image_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn observe(&self) -> NodeStats {
+            self.after_gc.clone()
+        }
+    }
+
+    fn gib(n: u64) -> u64 {
+        n * 1024 * 1024 * 1024
+    }
+
+    fn imagefs_stats(available_gib: u64) -> NodeStats {
+        NodeStats {
+            imagefs: Some(FsUsage {
+                available_bytes: gib(available_gib),
+                total_bytes: gib(16),
+                inodes_free: 1_000_000,
+                inodes_total: 1_000_000,
+            }),
+            ..healthy_stats()
+        }
+    }
+
+    fn imagefs_manager() -> EvictionManager {
+        EvictionManager::with_config(
+            vec![EvictionThreshold {
+                signal: EvictionSignal::ImageFsAvailable,
+                hard: Some(EvictionValue::Absolute(gib(1))),
+                soft: None,
+                grace_period: None,
+            }],
+            Duration::from_secs(300),
+        )
+    }
+
+    #[test]
+    fn imagefs_signal_reads_dedicated_image_fs() {
+        let mgr = imagefs_manager();
+        // Healthy nodefs, starved imagefs: only the dedicated stats trip it.
+        let mut starved = imagefs_stats(0);
+        starved.imagefs.as_mut().unwrap().available_bytes = 100 * 1024 * 1024;
+        assert!(!mgr.no_thresholds_met(&starved));
+        assert!(mgr.no_thresholds_met(&imagefs_stats(8)));
+    }
+
+    #[tokio::test]
+    async fn reclaim_gc_restores_disk_no_eviction() {
+        let mgr = imagefs_manager();
+        let gc = MockDiskGc {
+            container_calls: Default::default(),
+            image_calls: Default::default(),
+            after_gc: imagefs_stats(8),
+        };
+        let funcs = build_signal_to_node_reclaim_funcs(true, false)
+            .remove(&EvictionSignal::ImageFsAvailable)
+            .unwrap();
+        assert!(reclaim_node_level_resources(&funcs, &gc, |s| mgr.no_thresholds_met(s)).await);
+        assert_eq!(
+            gc.container_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(gc.image_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaim_gc_insufficient_still_evicts() {
+        let mgr = imagefs_manager();
+        let mut still = imagefs_stats(0);
+        still.imagefs.as_mut().unwrap().available_bytes = 100 * 1024 * 1024;
+        let gc = MockDiskGc {
+            container_calls: Default::default(),
+            image_calls: Default::default(),
+            after_gc: still,
+        };
+        let funcs = build_signal_to_node_reclaim_funcs(true, false)
+            .remove(&EvictionSignal::ImageFsAvailable)
+            .unwrap();
+        assert!(!reclaim_node_level_resources(&funcs, &gc, |s| mgr.no_thresholds_met(s)).await);
+        assert_eq!(gc.image_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reclaim_without_funcs_never_satisfies() {
+        let mgr = imagefs_manager();
+        let gc = MockDiskGc {
+            container_calls: Default::default(),
+            image_calls: Default::default(),
+            after_gc: imagefs_stats(8),
+        };
+        assert!(!reclaim_node_level_resources(&[], &gc, |s| mgr.no_thresholds_met(s)).await);
+        assert_eq!(gc.image_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
