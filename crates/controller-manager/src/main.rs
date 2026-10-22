@@ -44,6 +44,7 @@ use controllers::{
     servicecidr::ServiceCIDRController,
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
+    storageversiongc::StorageVersionGCController,
     ttl_controller::TTLController,
     vac_protection::VacProtectionController,
     volume_expansion::VolumeExpansionController,
@@ -1728,6 +1729,21 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Start storage version garbage collector (upstream
+    // `storage-version-garbage-collector-controller`; requires the
+    // APIServerIdentity and StorageVersionAPI gates).
+    if controllers::storageversiongc::gates_enabled() {
+        let svgc_controller = Arc::new(StorageVersionGCController::new(storage.clone()));
+        spawn_controller!("StorageVersionGC controller", leader_elector, {
+            let controller = svgc_controller.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("StorageVersionGC controller error: {}", e);
+                }
+            }
+        });
+    }
 
     info!("All controllers started successfully");
 

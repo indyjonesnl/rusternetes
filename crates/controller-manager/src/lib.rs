@@ -36,6 +36,7 @@ use controllers::{
     servicecidr::ServiceCIDRController,
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
+    storageversiongc::StorageVersionGCController,
     ttl_controller::TTLController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
@@ -650,6 +651,18 @@ where
             error!("ServiceCIDR controller error: {}", e);
         }
     }));
+
+    // Upstream `storage-version-garbage-collector-controller` requires both
+    // APIServerIdentity and StorageVersionAPI (core.go descriptor).
+    if controllers::storageversiongc::gates_enabled() {
+        let s = storage_for("StorageVersionGC");
+        handles.push(tokio::spawn(async move {
+            let c = Arc::new(StorageVersionGCController::new(s));
+            if let Err(e) = c.run().await {
+                error!("StorageVersionGC controller error: {}", e);
+            }
+        }));
+    }
 
     handles
 }

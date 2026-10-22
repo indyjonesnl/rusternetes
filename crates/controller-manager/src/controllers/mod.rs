@@ -68,6 +68,7 @@ pub mod statefulset;
 #[cfg(test)]
 pub mod status_subresource_double;
 pub mod storage_class;
+pub mod storageversiongc;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
 pub mod trigger_time_tracker;
