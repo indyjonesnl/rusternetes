@@ -13,7 +13,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use rusternetes_common::admission::GroupVersionKind;
+use rusternetes_common::admission::{GroupVersionKind, Operation};
 use rusternetes_common::resources::Namespace;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage, StorageBackend};
@@ -121,19 +121,89 @@ pub async fn namespace_lifecycle_gate(
     if !enabled("NamespaceLifecycle") {
         return next.run(request).await;
     }
+    let observed_op = lifecycle_operation(request.method(), request.uri().path());
+    let started = std::time::Instant::now();
+    let mut skipped = false;
     if enabled("NamespaceAutoProvision") && request.method() == axum::http::Method::POST {
         if let Some(ns) = rusternetes_middleware::create_target_namespace(request.uri().path()) {
-            if matches!(namespace_exists(&storage, ns).await, Ok(false)) {
-                return next.run(request).await;
-            }
+            skipped = matches!(namespace_exists(&storage, ns).await, Ok(false));
         }
     }
-    rusternetes_middleware::namespace_lifecycle_middleware(Extension(storage), request, next).await
+    let rejection = if skipped {
+        None
+    } else {
+        rusternetes_middleware::namespace_lifecycle_rejection(
+            &storage,
+            request.method(),
+            request.uri().path(),
+        )
+        .await
+    };
+    // `WithControllerMetrics(NamespaceLifecycle)` (admission/metrics/
+    // metrics.go:63-66, :89-100): the plugin's `Admit` is timed for every
+    // CREATE/UPDATE/DELETE, whatever the resource (`NewHandler(Create,
+    // Update, Delete)`, namespace/lifecycle/admission.go:196), and
+    // `rejected` is `err != nil`.
+    if let Some(op) = observed_op {
+        rusternetes_admission_webhook::admission_metrics::observe_admission_controller(
+            started.elapsed(),
+            rejection.is_some(),
+            &op,
+            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            "NamespaceLifecycle",
+        );
+    }
+    match rejection {
+        Some(response) => response,
+        None => next.run(request).await,
+    }
+}
+
+/// The admission operation of a request as far as `NamespaceLifecycle` is
+/// concerned: POST is CREATE, PUT/PATCH UPDATE and DELETE DELETE; a POST to a
+/// connect subresource (`exec`, `attach`, `portforward`, `proxy`) is CONNECT,
+/// which the plugin does not handle.
+fn lifecycle_operation(method: &axum::http::Method, path: &str) -> Option<Operation> {
+    use axum::http::Method;
+    if *method == Method::DELETE {
+        return Some(Operation::Delete);
+    }
+    if *method == Method::PUT || *method == Method::PATCH {
+        return Some(Operation::Update);
+    }
+    if *method == Method::POST {
+        let last = path.rsplit('/').next().unwrap_or_default();
+        if matches!(last, "exec" | "attach" | "portforward") || path.contains("/proxy") {
+            return None;
+        }
+        return Some(Operation::Create);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_operation_is_create_update_delete_not_connect() {
+        use axum::http::Method;
+        let op = |m: Method, p: &str| lifecycle_operation(&m, p);
+        assert_eq!(
+            op(Method::POST, "/api/v1/namespaces/a/pods"),
+            Some(Operation::Create)
+        );
+        assert_eq!(
+            op(Method::PATCH, "/api/v1/namespaces/a/pods/p"),
+            Some(Operation::Update)
+        );
+        assert_eq!(
+            op(Method::DELETE, "/api/v1/namespaces/a/pods/p"),
+            Some(Operation::Delete)
+        );
+        assert_eq!(op(Method::POST, "/api/v1/namespaces/a/pods/p/exec"), None);
+        assert_eq!(op(Method::GET, "/api/v1/namespaces/a/pods"), None);
+    }
 
     fn pod_kind() -> GroupVersionKind {
         GroupVersionKind {
