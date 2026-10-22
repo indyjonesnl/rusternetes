@@ -17,7 +17,8 @@ use crate::validation::metav1::validate_labels;
 use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_annotations, validate_object_meta, validate_object_meta_update,
 };
-use crate::validation::pod::validate_pod_spec;
+use crate::validation::pod::validate_pod_spec_with_options;
+use crate::validation::pod_options::get_validation_options_from_pod_template;
 use crate::validation::pod_status::{
     get_deletion_cost_from_pod_annotations, validate_pod_specific_annotations,
 };
@@ -31,8 +32,11 @@ pub fn validate_pod_template(pt: &PodTemplate) -> ErrorList {
         name_is_dns_subdomain,
         &Path::new("metadata"),
     );
-    errs.extend(validate_pod_template_spec(
+    // `GetValidationOptionsFromPodTemplate(&template.Template, nil)`
+    // (pkg/registry/core/podtemplate/strategy.go:57).
+    errs.extend(validate_pod_template_spec_with_old(
         &pt.template,
+        None,
         &Path::new("template"),
         false,
     ));
@@ -56,8 +60,11 @@ pub fn validate_pod_template_update(pt: &PodTemplate, old: &PodTemplate) -> Erro
             .unwrap_or(&empty),
     )
     .is_err();
+    // `GetValidationOptionsFromPodTemplate(&template.Template,
+    // &oldTemplate.Template)` (pkg/registry/core/podtemplate/strategy.go:97).
     errs.extend(validate_pod_template_spec_opts(
         &pt.template,
+        Some(&old.template),
         &Path::new("template"),
         false,
         allow_invalid_deletion_cost,
@@ -86,11 +93,24 @@ pub fn validate_pod_template_spec(
     fld_path: &Path,
     allow_relaxed_dns_search: bool,
 ) -> ErrorList {
-    validate_pod_template_spec_opts(template, fld_path, allow_relaxed_dns_search, false)
+    validate_pod_template_spec_opts(template, None, fld_path, allow_relaxed_dns_search, false)
+}
+
+/// [`validate_pod_template_spec`] with the options derived from the old
+/// template (`GetValidationOptionsFromPodTemplate(template, oldTemplate)`,
+/// pkg/api/pod/util.go:659), so an already-stored template stays updatable.
+pub fn validate_pod_template_spec_with_old(
+    template: &PodTemplateSpec,
+    old: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+    allow_relaxed_dns_search: bool,
+) -> ErrorList {
+    validate_pod_template_spec_opts(template, old, fld_path, allow_relaxed_dns_search, false)
 }
 
 fn validate_pod_template_spec_opts(
     template: &PodTemplateSpec,
+    old: Option<&PodTemplateSpec>,
     fld_path: &Path,
     allow_relaxed_dns_search: bool,
     allow_invalid_pod_deletion_cost: bool,
@@ -124,11 +144,12 @@ fn validate_pod_template_spec_opts(
 
     // Pod spec (also forbids ephemeral containers — upstream forbids them in a
     // pod template).
-    errs.extend(validate_pod_spec(
+    let mut opts = get_validation_options_from_pod_template(Some(template), old);
+    opts.allow_relaxed_dns_search_validation |= allow_relaxed_dns_search;
+    errs.extend(validate_pod_spec_with_options(
         &template.spec,
         &fld_path.child("spec"),
-        allow_relaxed_dns_search,
-        crate::validation::pod::allow_taint_toleration_comparison_operators(None),
+        &opts,
     ));
 
     errs
@@ -377,5 +398,40 @@ mod update_leniency_tests {
         assert!(!validate_pod_template_update(&tpl("+1"), &tpl("1")).is_empty());
         assert!(validate_pod_template_update(&tpl("+1"), &tpl("+2")).is_empty());
         assert!(!validate_pod_template(&tpl("+1")).is_empty());
+    }
+}
+
+/// `GetValidationOptionsFromPodTemplate(new, old)` (pkg/api/pod/util.go:659)
+/// reaches the template's pod spec on update: an old template that already
+/// uses a relaxed DNS search path keeps the new one updatable
+/// (`useRelaxedDNSSearchValidation(oldPodSpec)`, util.go:439), while a create
+/// of the same template stays strict.
+#[cfg(test)]
+mod old_template_options_tests {
+    use super::*;
+
+    fn tpl(search: &str) -> PodTemplate {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "t", "namespace": "d", "resourceVersion": "1"},
+            "template": {"spec": {
+                "containers": [{"name": "c", "image": "x"}],
+                "dnsConfig": {"searches": [search]}
+            }}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_derives_pod_options_from_the_old_template() {
+        let _g = crate::feature_gates::with_feature(
+            crate::feature_gates::Feature::RelaxedDNSSearchValidation,
+            false,
+        );
+        let relaxed = "my_search.example.com";
+        assert!(!validate_pod_template(&tpl(relaxed)).is_empty());
+        assert!(validate_pod_template_update(&tpl(relaxed), &tpl(relaxed)).is_empty());
+        // A strict old template does not relax the new one.
+        assert!(!validate_pod_template_update(&tpl(relaxed), &tpl("a.example.com")).is_empty());
     }
 }
