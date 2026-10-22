@@ -617,46 +617,58 @@ async fn run_connect_admission(
         version: "v1".to_string(),
         resource: resource.to_string(),
     };
-    let (mutating, mutated) = state
-        .webhook_manager
-        .run_mutating_webhooks_with_dryrun(
-            &Operation::Connect,
-            &gvk,
-            &gvr,
-            Some(namespace),
-            name,
-            Some(options.clone()),
-            None,
-            user,
-            false,
-        )
-        .await?;
-    if let AdmissionResponse::Deny(reason) = mutating {
-        return Err(Error::Forbidden(format!(
-            "admission webhook denied the request: {}",
-            reason
-        )));
-    }
-    let options = mutated.unwrap_or(options);
-    if let AdmissionResponse::Deny(reason) = state
-        .webhook_manager
-        .run_validating_webhooks(
-            &Operation::Connect,
-            &gvk,
-            &gvr,
-            Some(namespace),
-            name,
-            Some(options.clone()),
-            None,
-            user,
-        )
-        .await?
-    {
-        return Err(Error::Forbidden(format!(
-            "admission webhook denied the request: {}",
-            reason
-        )));
-    }
+    use rusternetes_admission_webhook::admission_metrics::{
+        with_step_metrics, STEP_ADMIT, STEP_VALIDATE,
+    };
+    // `WithStepMetrics` wraps the whole chain (server/options/admission.go:179),
+    // so each phase is one step observation, `rejected` being `err != nil`.
+    let options = with_step_metrics(&Operation::Connect, STEP_ADMIT, async {
+        let (mutating, mutated) = state
+            .webhook_manager
+            .run_mutating_webhooks_with_dryrun(
+                &Operation::Connect,
+                &gvk,
+                &gvr,
+                Some(namespace),
+                name,
+                Some(options.clone()),
+                None,
+                user,
+                false,
+            )
+            .await?;
+        if let AdmissionResponse::Deny(reason) = mutating {
+            return Err(Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
+        }
+        Ok(mutated.unwrap_or(options))
+    })
+    .await?;
+    with_step_metrics(&Operation::Connect, STEP_VALIDATE, async {
+        if let AdmissionResponse::Deny(reason) = state
+            .webhook_manager
+            .run_validating_webhooks(
+                &Operation::Connect,
+                &gvk,
+                &gvr,
+                Some(namespace),
+                name,
+                Some(options.clone()),
+                None,
+                user,
+            )
+            .await?
+        {
+            return Err(Error::Forbidden(format!(
+                "admission webhook denied the request: {}",
+                reason
+            )));
+        }
+        Ok(())
+    })
+    .await?;
     Ok(options)
 }
 
@@ -1351,5 +1363,73 @@ mod exec_query_bool_tests {
         assert!(!q.stdin && !q.stdout && !q.stderr && !q.tty);
         assert_eq!(q.container.as_deref(), Some("c"));
         assert_eq!(q.command, vec!["sh".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod connect_admission_step_metrics_tests {
+    use super::*;
+    use rusternetes_common::auth::TokenManager;
+    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use rusternetes_common::observability::MetricsRegistry;
+    use rusternetes_storage::{MemoryStorage, StorageBackend};
+
+    fn step(ty: &str) -> u64 {
+        prometheus::gather()
+            .into_iter()
+            .find(|f| f.name() == "apiserver_admission_step_admission_duration_seconds")
+            .and_then(|mf| {
+                mf.get_metric()
+                    .iter()
+                    .find(|m| {
+                        [
+                            ("type", ty),
+                            ("operation", "CONNECT"),
+                            ("rejected", "false"),
+                        ]
+                        .iter()
+                        .all(|(k, v)| {
+                            m.get_label()
+                                .iter()
+                                .any(|l| l.name() == *k && l.value() == *v)
+                        })
+                    })
+                    .map(|m| m.get_histogram().get_sample_count())
+            })
+            .unwrap_or(0)
+    }
+
+    /// `WithStepMetrics` wraps the whole chain
+    /// (server/options/admission.go:179) and ConnectResource admits through
+    /// it (endpoints/handlers/rest.go:199-216), so a connect request is one
+    /// `admit` and one `validate` observation (#3523).
+    #[tokio::test]
+    async fn connect_admission_observes_admit_and_validate_steps() {
+        let state = ApiServerState::new(
+            Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new()))),
+            Arc::new(TokenManager::new(b"secret")),
+            Arc::new(AlwaysAllowAuthorizer),
+            Arc::new(MetricsRegistry::new()),
+            true,
+        );
+        let user = rusternetes_common::admission::UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+        let (admit0, validate0) = (step("admit"), step("validate"));
+        run_connect_admission(
+            &state,
+            "PodExecOptions",
+            "pods/exec",
+            "default",
+            "p",
+            serde_json::json!({"kind": "PodExecOptions"}),
+            &user,
+        )
+        .await
+        .unwrap();
+        assert!(step("admit") > admit0, "admit step not observed");
+        assert!(step("validate") > validate0, "validate step not observed");
     }
 }
