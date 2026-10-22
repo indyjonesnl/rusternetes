@@ -785,6 +785,20 @@ pub struct CustomResourceDefinitionCondition {
     pub message: Option<String>,
 }
 
+/// Deserializes a field that is present, null included, as `Some(value)`.
+///
+/// Upstream decodes a custom resource into an unstructured map, so an explicit
+/// top-level `null` reaches `PruneNonNullableNullsWithoutDefaults`
+/// (schema/defaulting/prunenulls.go) and the defaulter intact, and a nullable
+/// one is stored as `null`. `Option<Value>`'s own impl would turn it into
+/// `None` and lose it. A missing field stays `None` through `#[serde(default)]`.
+fn deserialize_present<'de, D>(d: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(d).map(Some)
+}
+
 /// CustomResource represents a generic custom resource instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -796,12 +810,23 @@ pub struct CustomResource {
     #[serde(default)]
     pub metadata: ObjectMeta,
 
-    /// Spec is the custom resource's specification (schema-validated)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Spec is the custom resource's specification (schema-validated).
+    /// An explicit `spec: null` is `Some(Value::Null)`, not `None`
+    /// ([`deserialize_present`]).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub spec: Option<serde_json::Value>,
 
-    /// Status is the custom resource's status (if status subresource is enabled)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Status is the custom resource's status (if status subresource is
+    /// enabled). An explicit `status: null` is `Some(Value::Null)`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub status: Option<serde_json::Value>,
 
     /// Extra fields — CRDs with x-kubernetes-preserve-unknown-fields can have
