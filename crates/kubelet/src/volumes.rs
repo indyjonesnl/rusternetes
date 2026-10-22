@@ -978,7 +978,7 @@ impl VolumeManager {
             EMPTY,
             name,
             async {
-                match op.run().await.detailed_err {
+                match op.run_operation().await.detailed_err {
                     Some(e) => Err(format!("{e:#}")),
                     None => Ok(()),
                 }
@@ -2138,6 +2138,14 @@ mod projected_mode_tests {
         assert_eq!(
             after_first[0].device_mount_state,
             DeviceMountState::DeviceMountUncertain
+        );
+
+        // `CompleteFunc` (`operation_generator.go:910`): the failed unstage is
+        // observed under the driver-qualified plugin name.
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(
+            body.contains("storage_operation_duration_seconds_count{migrated=\"false\",operation_name=\"unmount_device\",status=\"fail-unknown\",volume_plugin=\"kubernetes.io/csi:gone.example.com\"}"),
+            "{body}"
         );
 
         // A second sweep must neither duplicate nor reset the entry.
