@@ -13,6 +13,7 @@ pub mod clustertrustbundle;
 pub mod configmap;
 pub mod controllerrevision;
 pub mod crd;
+pub mod crd_openapi_schema;
 pub mod cronjob;
 pub mod csidriver;
 pub mod csinode;
