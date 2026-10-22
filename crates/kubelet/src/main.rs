@@ -61,6 +61,7 @@ mod runtime_state;
 mod server;
 mod server_auth;
 mod server_metrics;
+mod server_metrics_endpoints;
 mod static_pod_watch;
 mod static_pods;
 mod streaming_server;
@@ -802,12 +803,14 @@ async fn main() -> Result<()> {
                 "/containerLogs/:namespace/:pod/:container",
                 get(streaming_server::handle_container_logs),
             )
+            .merge(server_metrics_endpoints::router())
             .merge(server::read_only_router(server_state));
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
         let registered: Vec<String> = ["/metrics", "/configz"]
             .into_iter()
             .chain(server::STREAMING_PATHS)
             .chain(server::READ_ONLY_PATHS)
+            .chain(server_metrics_endpoints::PATHS)
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);

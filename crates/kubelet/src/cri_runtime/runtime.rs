@@ -16,6 +16,7 @@
 //! replaced). Remaining: pod DNS config, unsafe-sysctl plumbing, and moving pod
 //! networking fully to containerd-CNI — tracked in the migration issue.
 
+use crate::server_metrics_endpoints::{observe_probe, ProbeResult, ProbeType};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -1899,6 +1900,37 @@ impl CriContainerRuntime {
         self.sandbox_id_for_pod(pod).await.ok().flatten().is_some()
     }
 
+    /// `probe_container` plus the metric half of `worker.doProbe`
+    /// (pkg/kubelet/prober/worker.go:355-365): a prober error is thrown away
+    /// without a metric, otherwise `ProberResults` (and `ProberDuration` unless
+    /// the probe failed) are observed.
+    async fn probe_observed(
+        &self,
+        probe_type: ProbeType,
+        pod: &Pod,
+        container: &rusternetes_common::resources::pod::Container,
+        probe: &rusternetes_common::resources::pod::Probe,
+    ) -> Result<bool> {
+        let start = std::time::Instant::now();
+        let result = self.probe_container(pod, container, probe).await;
+        if let Ok(ok) = &result {
+            observe_probe(
+                probe_type,
+                if *ok {
+                    ProbeResult::Successful
+                } else {
+                    ProbeResult::Failed
+                },
+                &container.name,
+                &pod.metadata.name,
+                pod.metadata.namespace.as_deref().unwrap_or_default(),
+                &pod.metadata.uid,
+                start,
+            );
+        }
+        result
+    }
+
     /// Execute a single probe attempt against a container, returning whether it
     /// succeeded. The kubelet drives the surrounding state machine (delay,
     /// period, thresholds); this performs one attempt:
@@ -2361,7 +2393,7 @@ impl CriContainerRuntime {
                 return None;
             }
             let ok = self
-                .probe_container(pod, container, startup)
+                .probe_observed(ProbeType::Startup, pod, container, startup)
                 .await
                 .unwrap_or(false);
             let failure_threshold = startup.failure_threshold.unwrap_or(3);
@@ -2419,7 +2451,10 @@ impl CriContainerRuntime {
         }
 
         // A probe error (vs a clean failure) is transient — skip without counting.
-        let healthy = match self.probe_container(pod, container, probe).await {
+        let healthy = match self
+            .probe_observed(ProbeType::Liveness, pod, container, probe)
+            .await
+        {
             Ok(h) => h,
             Err(_) => return None,
         };
@@ -2536,7 +2571,7 @@ impl CriContainerRuntime {
         }
 
         let healthy = self
-            .probe_container(pod, container, probe)
+            .probe_observed(ProbeType::Readiness, pod, container, probe)
             .await
             .unwrap_or(false);
         let success_threshold = probe.success_threshold.unwrap_or(1);
