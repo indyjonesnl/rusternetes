@@ -19,6 +19,8 @@ const RSA3072_SIG_MAX_SALT: &str = "F23DW40IhA2RgsfLvjkXC9kwUXMk91yDHdPqTzJy230F
 /// Same, salt = digest length (Go PSSSaltLengthEqualsHash).
 const RSA3072_SIG_HASH_SALT: &str = "SApof5GCv4Ws4A53S/FakT6X/rmI1vRZsxW6jHl5ByngISmk8eMjRI/sJmYH5Vr1mmAyN1XPt45OMG0dewGClHy+Q6J/1zNG6tZ7Z1Kq/nWK9rvEFB/9HpVqd+JovFpFKU7BZeXuor3SBybMAFqJUT85EURDmXseRuGWngYZGj6c9/l2HIfpK3pJtstnTwASV8hRHInrzNLDsQzEHPeuydBlP+NV/jGDE6RDWjTr//q9Uv7jvEkGXlx8Jxqe97YkIgnzL5LqGlg1mtjNmXQ0vVAgJCL7fN9x5/yKHJ8gaOUw2D5IIWnFvkzF9HLZ/5R/77he7kaIXx+6/HHMoxgIhtapaIk7BHKsXyi38i1zF+99sSr3PG0a72nguQvT7KrTF2gv+fRA0eMfdVKKGjFhuQdnzBv41FcEx37miQjimsaC0qv/H+Zjfrg2aq1CZjIpXxjwUvdqY7BQcKQ/MBGAeOwjnGqekWAQ5zYKmUCOCEbWnOPvlUycyGbCRFtUTvOf";
 
+const P224_PUB: &str = "ME4wEAYHKoZIzj0CAQYFK4EEACEDOgAEykIWJVkEkcGIKH1bTGXRxtB/R8MYVP673BeGggffCcavvTWyYou0J0fwkvqTFCSbWGlV1NWImiI=";
+
 const POD_UID: &str = "pod-uid-1";
 
 fn b64d(s: &str) -> Vec<u8> {
@@ -666,5 +668,120 @@ fn status_issued_email_matches_go_mail_parse_address() {
         let m = status_errs_with_email(addr);
         let bad = m.iter().any(|e| e.contains(MSG));
         assert_eq!(!bad, *ok, "{addr:?}: Go accepts={ok}, errors: {m:?}");
+    }
+}
+
+// ------------------------------------------- exact upstream error lists
+
+const RFC1123_SUBDOMAIN: &str = "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')";
+
+/// `TestValidatePodCertificateRequestCreate` compares the WHOLE error list
+/// (`cmp.Diff(gotErrors, tc.wantErrors)`), so each case below pins the exact
+/// type, path, value and detail of every error, not a substring.
+#[test]
+fn create_exact_error_lists_match_upstream_table() {
+    type Mutate = fn(&mut PodCertificateRequest);
+    let cases: Vec<(&str, Mutate, Vec<String>)> = vec![
+        ("valid Ed25519 PCR", |_| {}, vec![]),
+        (
+            // Go parses P-224 (x509.ParsePKIXPublicKey) and then rejects the
+            // curve; it is not a malformed key.
+            "invalid ECDSA P224 PCR",
+            |r| {
+                r.spec.pkix_public_key = b64d(P224_PUB);
+                r.spec.proof_of_possession = vec![];
+            },
+            vec!["spec.pkixPublicKey: Invalid value: \"curve P-224\": elliptic public keys must use curve P256 or P384".into()],
+        ),
+        (
+            "bad signer name",
+            |r| r.spec.signer_name = "not-valid-signername".into(),
+            vec!["spec.signerName: Invalid value: \"not-valid-signername\": must be a fully qualified domain and path of the form 'example.com/signer-name'".into()],
+        ),
+        (
+            "bad pod name",
+            |r| r.spec.pod_name = "pod-1-bad!!!!!".into(),
+            vec![format!("spec.podName: Invalid value: \"pod-1-bad!!!!!\": {RFC1123_SUBDOMAIN}")],
+        ),
+        (
+            "bad pod uid",
+            |r| {
+                // Upstream signs the empty UID (pubPKIXEmpty, proofEmpty), so
+                // the proof of possession verifies and only the UID errs.
+                let (k, s) = ed25519_key("");
+                r.spec.pod_uid = String::new();
+                r.spec.pkix_public_key = k;
+                r.spec.proof_of_possession = s;
+            },
+            vec!["spec.podUID: Invalid value: \"\": must not be empty".into()],
+        ),
+        (
+            "bad service account name",
+            |r| r.spec.service_account_name = "sa-1-bad!!!!!".into(),
+            vec![format!("spec.serviceAccountName: Invalid value: \"sa-1-bad!!!!!\": {RFC1123_SUBDOMAIN}")],
+        ),
+        (
+            "bad service account uid",
+            |r| r.spec.service_account_uid = String::new(),
+            vec!["spec.serviceAccountUID: Invalid value: \"\": must not be empty".into()],
+        ),
+        (
+            "bad node name",
+            |r| r.spec.node_name = "node-1-bad!!!!!".into(),
+            vec![format!("spec.nodeName: Invalid value: \"node-1-bad!!!!!\": {RFC1123_SUBDOMAIN}")],
+        ),
+        (
+            "bad node uid",
+            |r| r.spec.node_uid = String::new(),
+            vec!["spec.nodeUID: Invalid value: \"\": must not be empty".into()],
+        ),
+        (
+            "maxExpirationSeconds missing",
+            |r| r.spec.max_expiration_seconds = None,
+            vec!["spec.maxExpirationSeconds: Required value: must be set".into()],
+        ),
+        (
+            "maxExpirationSeconds too large",
+            |r| r.spec.max_expiration_seconds = Some(91 * 86400 + 1),
+            vec!["spec.maxExpirationSeconds: Invalid value: 7862401: must be in the range [3600, 7862400]".into()],
+        ),
+        (
+            "maxExpirationSeconds too large (Kubernetes signer)",
+            |r| {
+                r.spec.signer_name = "kubernetes.io/foo".into();
+                r.spec.max_expiration_seconds = Some(86401);
+            },
+            vec!["spec.maxExpirationSeconds: Invalid value: 86401: must be in the range [3600, 86400]".into()],
+        ),
+        (
+            "maxExpirationSeconds too small",
+            |r| r.spec.max_expiration_seconds = Some(3600 - 1),
+            vec!["spec.maxExpirationSeconds: Invalid value: 3599: must be in the range [3600, 7862400]".into()],
+        ),
+        (
+            "bad user annotations key name",
+            |r| {
+                r.spec.unverified_user_annotations =
+                    Some([("test/domain/foo".to_string(), "bar".to_string())].into())
+            },
+            vec!["spec.unverifiedUserAnnotations: Invalid value: \"test/domain/foo\": a valid label key must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]') with an optional DNS subdomain prefix and '/' (e.g. 'example.com/MyName')".into()],
+        ),
+        (
+            "bad user annotations key prefix too long",
+            |r| {
+                r.spec.unverified_user_annotations =
+                    Some([(format!("{}/foo", "a".repeat(254)), "bar".to_string())].into())
+            },
+            vec![format!(
+                "spec.unverifiedUserAnnotations: Invalid value: \"{}/foo\": prefix part must be no more than 253 bytes",
+                "a".repeat(254)
+            )],
+        ),
+    ];
+    for (name, mutate, want) in cases {
+        let mut r = valid();
+        mutate(&mut r);
+        let got = msgs(&validate_pod_certificate_request_create(&r));
+        assert_eq!(got, want, "{name}");
     }
 }
