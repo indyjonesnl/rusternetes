@@ -4,7 +4,7 @@ use crate::volume_plugins::plugin::{
     DeviceMountableVolumePlugin, DeviceUnmounter, Metrics, MetricsProvider, OwnedSpec,
 };
 use crate::volume_plugins::util::exec::{Exec, RealExec};
-use crate::volume_plugins::util::hostutil::{get_file_type, FileType};
+use crate::volume_plugins::util::hostutil::FileType;
 use crate::volume_plugins::util::key_mutex::KeyMutex;
 use crate::volume_plugins::util::metrics::{new_metrics_block, MetricsBlock, MetricsNil};
 use crate::volume_plugins::util::mount_interface::{MountInterface, SafeFormatAndMount};
@@ -68,11 +68,13 @@ impl LocalPlugin {
     /// [`MounterArgs::recorder`] here.
     pub fn new(host: Arc<dyn VolumeHost>) -> Self {
         let mounter: Arc<dyn MountInterface> = Arc::new(host.get_mounter().clone());
+        // `kvh.GetHostUtil().GetFileType` (`local.go:137`, `:280`).
+        let file_type_host = host.clone();
         Self {
             host,
             volume_locks: Arc::new(KeyMutex::new_hashed(0)),
             mounter,
-            file_type: Arc::new(get_file_type),
+            file_type: Arc::new(move |p| file_type_host.get_host_util().get_file_type(p)),
         }
     }
 
@@ -434,11 +436,9 @@ impl LocalMounter {
     /// `filterPodMounts` (`local.go:631-639`): only mount paths inside the
     /// kubelet pod directory.
     fn filter_pod_mounts(&self, refs: Vec<String>) -> Vec<String> {
-        let pods_dir =
-            crate::pod_dirs::get_pods_dir(self.volume.plugin.host.get_volumes_base_path());
         let prefix = format!(
             "{}{}",
-            pods_dir.to_string_lossy(),
+            self.volume.plugin.host.get_pods_dir(),
             std::path::MAIN_SEPARATOR
         );
         refs.into_iter()
