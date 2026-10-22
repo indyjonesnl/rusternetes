@@ -779,12 +779,16 @@ where
 /// `OperationName: "unmount_device"` and the `OperationFunc` closure
 /// ([`Self::run`]).
 ///
-/// Not ported: `CompleteFunc` (`util.OperationCompleteHook`, the per-operation
-/// metrics hook) and `EventRecorderFunc` (nil upstream too): the kubelet has no
-/// operation executor yet to consume either (#1970).
+/// `CompleteFunc` is [`Self::complete_func`]
+/// (`util.OperationCompleteHook(GetFullQualifiedPluginNameForVolume(..),
+/// "unmount_device")`, `:910`), run by [`Self::run_operation`] the way
+/// `GeneratedOperations.Run` (`pkg/volume/util/types/types.go:68-85`) wraps
+/// the `OperationFunc`. Not ported: `EventRecorderFunc` (nil upstream too).
 pub struct GeneratedUnmountDevice<'a> {
     /// `OperationName`.
     pub operation_name: &'static str,
+    /// `CompleteFunc`.
+    pub complete_func: crate::volume_plugins::util::metrics::OperationCompleteHook,
     device_mountable_volume_plugin: &'a dyn DeviceMountableVolumePlugin,
     volume_device_unmounter: Box<dyn DeviceUnmounter>,
     volume_device_mounter: Box<dyn DeviceMounter>,
@@ -842,8 +846,16 @@ pub fn generate_unmount_device_func<'a>(
                 .generate_error_detailed("UnmountDevice.NewDeviceMounter failed", Some(&e))
         })?;
 
+    let complete_func = crate::volume_plugins::util::metrics::operation_complete_hook(
+        &crate::volume_plugins::util::metrics::get_full_qualified_plugin_name_for_volume(
+            device_mountable_volume_plugin.name(),
+            Some(&device_to_detach.volume_spec.as_spec()),
+        ),
+        "unmount_device",
+    );
     Ok(GeneratedUnmountDevice {
         operation_name: "unmount_device",
+        complete_func,
         device_mountable_volume_plugin,
         volume_device_unmounter,
         volume_device_mounter,
@@ -854,6 +866,15 @@ pub fn generate_unmount_device_func<'a>(
 }
 
 impl GeneratedUnmountDevice<'_> {
+    /// `GeneratedOperations.Run` (`types.go:68-85`): the `OperationFunc`, then
+    /// `CompleteFunc` with its detailed error and migrated status.
+    pub async fn run_operation(&self) -> OperationContext {
+        let ctx = self.run().await;
+        self.complete_func
+            .complete(ctx.detailed_err.as_ref(), Some(ctx.migrated));
+        ctx
+    }
+
     /// The `unmountDeviceFunc` closure (`operation_generator.go:830-896`).
     pub async fn run(&self) -> OperationContext {
         let device_to_detach = self.device_to_detach;
