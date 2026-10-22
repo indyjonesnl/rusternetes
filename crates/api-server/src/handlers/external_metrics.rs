@@ -39,9 +39,13 @@ pub async fn list_external_metrics(
 
     // External metrics are authorized as a resource named by the metric, in the
     // external.metrics.k8s.io group, scoped to the requesting namespace.
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", &metric_name)
-        .with_api_group("external.metrics.k8s.io")
-        .with_namespace(&namespace);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        crate::request_scope::list_or_watch_verb(),
+        &metric_name,
+    )
+    .with_api_group("external.metrics.k8s.io")
+    .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));

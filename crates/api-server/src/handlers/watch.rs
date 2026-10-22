@@ -418,6 +418,18 @@ pub fn snapshot_cutoff(rev: i64, items: &[serde_json::Value]) -> u64 {
     .unwrap_or(rev as u64)
 }
 
+/// The resource a watch is authorized as. A custom resource's `resource_type`
+/// is its storage key type, `{group with '_'}_{plural}`
+/// (`handlers/custom_resource.rs`); `RequestInfo` (and so the filter) has the
+/// plural. Built-in resource types carry no such prefix.
+fn authorized_resource<'a>(resource_type: &'a str, api_group: &str) -> &'a str {
+    if api_group.is_empty() {
+        return resource_type;
+    }
+    let prefix = format!("{}_", api_group.replace('.', "_"));
+    resource_type.strip_prefix(&prefix).unwrap_or(resource_type)
+}
+
 /// (Named `watch_snapshot`, not `list_*`: this is the WATCH path, whose start
 /// revision legitimately IS the store revision -- see
 /// `list_resource_version_floor_guard_test`.)
@@ -577,9 +589,13 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_namespace(&namespace)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authorized_resource(resource_type, api_group),
+    )
+    .with_namespace(&namespace)
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -1137,8 +1153,12 @@ where
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authorized_resource(resource_type, api_group),
+    )
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -3107,8 +3127,12 @@ pub async fn watch_cluster_scoped_json(
 ) -> Result<Response> {
     info!("Starting JSON watch for cluster-scoped {}", resource_type);
 
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authorized_resource(resource_type, api_group),
+    )
+    .with_api_group(api_group);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
@@ -3340,9 +3364,13 @@ pub async fn watch_namespaced_json(
         namespace, resource_type
     );
 
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "watch", resource_type)
-        .with_api_group(api_group)
-        .with_namespace(&namespace);
+    let attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authorized_resource(resource_type, api_group),
+    )
+    .with_api_group(api_group)
+    .with_namespace(&namespace);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}

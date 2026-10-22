@@ -147,6 +147,14 @@ pub(crate) async fn authorize(
     }
     if let Some(ns) = namespace {
         attrs = attrs.with_namespace(ns);
+    } else if let (true, Some(name)) = (
+        resource.group.is_empty() && resource.resource == "namespaces",
+        name,
+    ) {
+        // requestinfo.go:194-197: a request on `/namespaces/{name}[/status|
+        // /finalize]` carries the namespace's own name as its Namespace, so a
+        // Role in that namespace grants it; the filter authorizes that.
+        attrs = attrs.with_namespace(name);
     }
     if let Some(name) = name {
         attrs = attrs.with_name(name);

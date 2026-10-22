@@ -54,8 +54,12 @@ pub async fn list(
     debug!("Listing componentstatuses");
 
     // Check authorization
-    let attrs =
-        RequestAttributes::new(auth_ctx.user, "list", "componentstatuses").with_api_group("");
+    let attrs = RequestAttributes::new(
+        auth_ctx.user,
+        crate::request_scope::list_or_watch_verb(),
+        "componentstatuses",
+    )
+    .with_api_group("");
 
     if let Decision::Deny(reason) = _state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));

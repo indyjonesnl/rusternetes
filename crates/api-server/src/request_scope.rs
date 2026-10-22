@@ -95,3 +95,106 @@ pub fn with_request_selectors(attr: &RequestAttributes) -> std::borrow::Cow<'_, 
         None => Cow::Borrowed(attr),
     }
 }
+
+/// `attr` with `RequestInfo.Name` when the request's own list/watch names its
+/// object through an exact `metadata.name` field selector
+/// (requestinfo.go:247-253), which `GetAuthorizerAttributes` hands to the
+/// authorizer as `Attributes.GetName()` (authorization.go:111-119).
+///
+/// Every list/watch handler builds its attributes without a name; this fills
+/// it in once, where [`api_version_for`] and [`with_request_selectors`] fill
+/// the version and selectors, instead of at ~100 call sites. Only for `attr`
+/// about the request's own resource, verb and scope, so a check on another
+/// object made inside the request is left alone. Dropped together with the
+/// per-handler checks (#3515).
+pub fn with_request_name(attr: &RequestAttributes) -> std::borrow::Cow<'_, RequestAttributes> {
+    use std::borrow::Cow;
+    if attr.name.as_deref().is_some_and(|n| !n.is_empty())
+        || !matches!(attr.verb.as_str(), "list" | "watch")
+    {
+        return Cow::Borrowed(attr);
+    }
+    let name = REQUEST_INFO
+        .try_with(|info| {
+            (info.is_resource_request
+                && !info.name.is_empty()
+                && info.verb == attr.verb
+                && info.resource == attr.resource
+                && info.api_group == attr.api_group
+                && info.subresource == attr.subresource.clone().unwrap_or_default()
+                && info.namespace == attr.namespace.clone().unwrap_or_default())
+            .then(|| info.name.clone())
+        })
+        .ok()
+        .flatten();
+    match name {
+        Some(name) => {
+            let mut a = attr.clone();
+            a.name = Some(name);
+            Cow::Owned(a)
+        }
+        None => Cow::Borrowed(attr),
+    }
+}
+
+/// The verb of a list handler's own check: `watch` when `RequestInfo` derived
+/// it (`?watch=true`, requestinfo.go:241-245) for a handler that serves the
+/// request as a list, `list` otherwise.
+pub fn list_or_watch_verb() -> &'static str {
+    let watch = REQUEST_INFO
+        .try_with(|info| info.is_resource_request && info.verb == "watch")
+        .unwrap_or(false);
+    if watch {
+        "watch"
+    } else {
+        "list"
+    }
+}
+
+/// The authorizer the handlers (and the `WithAuthorization` filter) use: the
+/// configured one, with [`with_request_name`] applied to every check.
+pub struct RequestInfoAuthorizer {
+    inner: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>,
+}
+
+impl RequestInfoAuthorizer {
+    pub fn new(inner: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl rusternetes_common::authz::Authorizer for RequestInfoAuthorizer {
+    async fn authorize(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> rusternetes_common::Result<rusternetes_common::authz::Decision> {
+        self.inner.authorize(&with_request_name(attrs)).await
+    }
+    async fn authorize_opinion(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> rusternetes_common::Result<rusternetes_common::authz::Opinion> {
+        self.inner
+            .authorize_opinion(&with_request_name(attrs))
+            .await
+    }
+    async fn authorize_outcome(
+        &self,
+        attrs: &RequestAttributes,
+    ) -> rusternetes_common::Result<rusternetes_common::authz::AuthorizationOutcome> {
+        self.inner
+            .authorize_outcome(&with_request_name(attrs))
+            .await
+    }
+    async fn get_user_rules(
+        &self,
+        user: &rusternetes_common::auth::UserInfo,
+        namespace: &str,
+    ) -> rusternetes_common::Result<(
+        Vec<rusternetes_common::resources::ResourceRule>,
+        Vec<rusternetes_common::resources::NonResourceRule>,
+    )> {
+        self.inner.get_user_rules(user, namespace).await
+    }
+}

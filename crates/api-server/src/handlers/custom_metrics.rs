@@ -502,10 +502,13 @@ pub async fn list_custom_metrics(
     );
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "list", &resource_type)
+    // `RequestInfo` of `.../namespaces/{ns}/{resource}/{metric}` (the
+    // `/*/` wildcard-less form): resource, and the metric as the name. What
+    // the `WithAuthorization` filter authorizes (requestinfo.go:211-221).
+    let attrs = RequestAttributes::new(auth_ctx.user, "get", &resource_type)
         .with_api_group("custom.metrics.k8s.io")
         .with_namespace(&namespace)
-        .with_subresource(&metric_name);
+        .with_name(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -525,7 +528,8 @@ pub async fn list_custom_metrics(
 }
 
 /// `GET .../namespaces/{namespace}/metrics/{metric}`: get.go:49-58 rewrites
-/// it to resource `namespaces`, name = the namespace, no namespace scope.
+/// it to resource `namespaces`, name = the namespace, no namespace scope, for
+/// the provider; the request is authorized as the filter sees the path.
 pub async fn get_namespace_metric(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
@@ -535,10 +539,13 @@ pub async fn get_namespace_metric(
     debug!("Getting namespace metric {} for {}", metric_name, namespace);
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "get", "namespaces")
+    // The provider rewrites this to resource `namespaces` (get.go:49-58), but
+    // authorization is the filter's, from `RequestInfo` of the path as sent:
+    // resource `metrics`, name = the metric, in the namespace.
+    let attrs = RequestAttributes::new(auth_ctx.user, "get", "metrics")
         .with_api_group("custom.metrics.k8s.io")
-        .with_name(&namespace)
-        .with_subresource(&metric_name);
+        .with_namespace(&namespace)
+        .with_name(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
