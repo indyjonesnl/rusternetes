@@ -765,11 +765,15 @@ impl CustomBlockVolumeMapper for CsiBlockMapper {
 
         // Treat the absence of the CSI driver as a transient error.
         // See https://github.com/kubernetes/kubernetes/issues/120268
-        let client = CsiDriverClient::new(&self.driver_name).map_err(|e| {
-            transient(format!(
-                "kubernetes.io/csi: blockMapper.SetUpDevice failed to get CSI client: {e}"
-            ))
-        })?;
+        let client = CsiDriverClient::new(&self.driver_name)
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: blockMapper.SetUpDevice failed to get CSI client: {e}"
+                ))
+            })?
+            // `createCSIOperationContext(m.spec, csiTimeout)` (`csi_block.go:378`,
+            // `:445`, `:519`; a nil spec is not migrated).
+            .with_migrated(self.spec.as_ref().is_some_and(|s| s.migrated));
 
         // Call NodeStageVolume.
         match self
@@ -813,11 +817,15 @@ impl CustomBlockVolumeMapper for CsiBlockMapper {
             .await?;
         let access_mode = Self::access_mode(&spec);
 
-        let client = CsiDriverClient::new(&self.driver_name).map_err(|e| {
-            transient(format!(
-                "kubernetes.io/csi: blockMapper.MapPodDevice failed to get CSI client: {e}"
-            ))
-        })?;
+        let client = CsiDriverClient::new(&self.driver_name)
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: blockMapper.MapPodDevice failed to get CSI client: {e}"
+                ))
+            })?
+            // `createCSIOperationContext(m.spec, csiTimeout)` (`csi_block.go:378`,
+            // `:445`, `:519`; a nil spec is not migrated).
+            .with_migrated(self.spec.as_ref().is_some_and(|s| s.migrated));
 
         // Call NodePublishVolume.
         self.publish_volume_for_block(&client, &access_mode, csi_source, attachment.as_ref())
@@ -837,11 +845,15 @@ impl CustomBlockVolumeUnmapper for CsiBlockMapper {
     async fn tear_down_device(&self, _global_map_path: &str, _device_path: &str) -> Result<()> {
         // Treat the absence of the CSI driver as a transient error.
         // See https://github.com/kubernetes/kubernetes/issues/120268
-        let client = CsiDriverClient::new(&self.driver_name).map_err(|e| {
-            transient(format!(
-                "kubernetes.io/csi: blockMapper.TearDownDevice failed to get CSI client: {e}"
-            ))
-        })?;
+        let client = CsiDriverClient::new(&self.driver_name)
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: blockMapper.TearDownDevice failed to get CSI client: {e}"
+                ))
+            })?
+            // `createCSIOperationContext(m.spec, csiTimeout)` (`csi_block.go:378`,
+            // `:445`, `:519`; a nil spec is not migrated).
+            .with_migrated(self.spec.as_ref().is_some_and(|s| s.migrated));
 
         // Call NodeUnstageVolume.
         let staging_path = self.staging_path();
@@ -868,11 +880,15 @@ impl CustomBlockVolumeUnmapper for CsiBlockMapper {
 
         // Treat the absence of the CSI driver as a transient error.
         // See https://github.com/kubernetes/kubernetes/issues/120268
-        let client = CsiDriverClient::new(&self.driver_name).map_err(|e| {
-            transient(format!(
-                "kubernetes.io/csi: blockMapper.UnmapPodDevice failed to get CSI client: {e}"
-            ))
-        })?;
+        let client = CsiDriverClient::new(&self.driver_name)
+            .map_err(|e| {
+                transient(format!(
+                    "kubernetes.io/csi: blockMapper.UnmapPodDevice failed to get CSI client: {e}"
+                ))
+            })?
+            // `createCSIOperationContext(m.spec, csiTimeout)` (`csi_block.go:378`,
+            // `:445`, `:519`; a nil spec is not migrated).
+            .with_migrated(self.spec.as_ref().is_some_and(|s| s.migrated));
 
         // Call NodeUnpublishVolume. Even if publishPath does not exist -
         // previous NodePublish may have timed out and Kubernetes makes sure

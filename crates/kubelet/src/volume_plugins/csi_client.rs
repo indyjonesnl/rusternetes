@@ -8,7 +8,8 @@
 //! first RPC dials.
 
 use super::csi_drivers_store::csi_drivers;
-use super::plugin::Metrics;
+use super::plugin::{Metrics, Spec};
+use super::util::metrics::record_csi_operation_latency_metrics;
 use hyper_util::rt::TokioIo;
 use rusternetes_common::quantity::{Format, Quantity};
 use rusternetes_common::resources::PersistentVolumeAccessMode;
@@ -155,6 +156,21 @@ pub struct NodeInfo {
 pub struct CsiDriverClient {
     driver_name: String,
     endpoint: PathBuf,
+    /// The `Migrated` field of the `additionalInfo` that
+    /// `createCSIOperationContext` (`csi_util.go:198-204`) stores in the
+    /// operation's `context.Context` and `RecordMetricsInterceptor`
+    /// (`csi_metrics.go:112-136`) reads back. Rust has no `context.Value`; the
+    /// operation's client carries it instead. False by default, like an
+    /// operation whose context has no `additionalInfo` (`csi_metrics.go:126`).
+    migrated: bool,
+}
+
+/// `createCSIOperationContext` (`csi_util.go:198-204`), the part that feeds
+/// metrics: `migrated = volumeSpec.Migrated` for a non-nil spec, false for nil
+/// (`csi_attacher.go:557`, `csi_mounter.go:447`: "could not get spec info on
+/// whether this is a migrated operation because c.spec is nil").
+pub fn csi_operation_migrated(volume_spec: Option<&Spec<'_>>) -> bool {
+    volume_spec.is_some_and(|s| s.migrated)
 }
 
 impl CsiDriverClient {
@@ -174,7 +190,28 @@ impl CsiDriverClient {
         Self {
             driver_name: driver_name.to_string(),
             endpoint: endpoint.into(),
+            migrated: false,
         }
+    }
+
+    /// Mark this client's calls as belonging to an operation on `volume_spec`
+    /// (`createCSIOperationContext(volumeSpec, ..)`, `csi_util.go:198`), so the
+    /// `migrated` label of `csi_operations_seconds` follows `Spec.Migrated`.
+    pub fn with_operation_spec(mut self, volume_spec: Option<&Spec<'_>>) -> Self {
+        self.migrated = csi_operation_migrated(volume_spec);
+        self
+    }
+
+    /// Like [`Self::with_operation_spec`] for a caller that already holds the
+    /// spec's `Migrated` flag.
+    pub fn with_migrated(mut self, migrated: bool) -> Self {
+        self.migrated = migrated;
+        self
+    }
+
+    /// The `migrated` value the metrics interceptor labels calls with.
+    pub fn migrated(&self) -> bool {
+        self.migrated
     }
 
     pub fn driver_name(&self) -> &str {
@@ -202,23 +239,41 @@ impl CsiDriverClient {
     /// Run `fut` under [`CSI_TIMEOUT`], mapping a timeout to the
     /// `DeadlineExceeded` status `context.WithTimeout` produces upstream.
     #[allow(clippy::result_large_err)] // tonic::Status is tonic's own error type
+    ///
+    /// Also the port of `MetricsManager.RecordMetricsInterceptor`
+    /// (`csi_metrics.go:112-136`, installed by `newGrpcConn`,
+    /// `csi_client.go:543`): the call's duration and gRPC status are recorded
+    /// under `method` with the operation's `migrated` label.
     async fn call<T>(
         &self,
+        method: &str,
         fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     ) -> Result<T, tonic::Status> {
-        match tokio::time::timeout(CSI_TIMEOUT, fut).await {
+        let start = std::time::Instant::now();
+        let result = match tokio::time::timeout(CSI_TIMEOUT, fut).await {
             Ok(r) => r.map(|r| r.into_inner()),
             Err(_) => Err(tonic::Status::deadline_exceeded(
                 "context deadline exceeded",
             )),
-        }
+        };
+        record_csi_operation_latency_metrics(
+            &self.driver_name,
+            method,
+            result.as_ref().err(),
+            start.elapsed(),
+            if self.migrated { "true" } else { "false" },
+        );
+        result
     }
 
     /// `nodeGetCapabilities` (`csi_client.go:692-709`).
     async fn node_get_capabilities(&self) -> Result<Vec<NodeRpcType>, CsiError> {
         let mut c = self.node_client()?;
         let resp = self
-            .call(c.node_get_capabilities(NodeGetCapabilitiesRequest {}))
+            .call(
+                "/csi.v1.Node/NodeGetCapabilities",
+                c.node_get_capabilities(NodeGetCapabilitiesRequest {}),
+            )
             .await
             .map_err(|s| CsiError::Failed(s.to_string()))?;
         Ok(resp
@@ -245,7 +300,10 @@ impl CsiDriverClient {
     pub async fn node_get_info(&self) -> Result<NodeInfo, CsiError> {
         let mut c = self.node_client()?;
         let resp = self
-            .call(c.node_get_info(NodeGetInfoRequest {}))
+            .call(
+                "/csi.v1.Node/NodeGetInfo",
+                c.node_get_info(NodeGetInfoRequest {}),
+            )
             .await
             .map_err(|s| CsiError::Failed(s.to_string()))?;
         Ok(NodeInfo {
@@ -377,7 +435,10 @@ impl CsiDriverClient {
                 fs_group,
             )),
         };
-        match self.call(c.node_publish_volume(req)).await {
+        match self
+            .call("/csi.v1.Node/NodePublishVolume", c.node_publish_volume(req))
+            .await
+        {
             Ok(_) => Ok(()),
             // A non-final error means the publish may still be in flight.
             Err(s) if !is_final_error(&s) => Err(CsiError::UncertainProgress(s.to_string())),
@@ -398,10 +459,13 @@ impl CsiDriverClient {
             return Err(CsiError::Failed("missing target path".into()));
         }
         let mut c = self.node_client()?;
-        self.call(c.node_unpublish_volume(NodeUnpublishVolumeRequest {
-            volume_id: vol_id.to_string(),
-            target_path: target_path.to_string(),
-        }))
+        self.call(
+            "/csi.v1.Node/NodeUnpublishVolume",
+            c.node_unpublish_volume(NodeUnpublishVolumeRequest {
+                volume_id: vol_id.to_string(),
+                target_path: target_path.to_string(),
+            }),
+        )
         .await
         .map(|_| ())
         .map_err(|s| CsiError::Failed(s.to_string()))
@@ -451,7 +515,10 @@ impl CsiDriverClient {
             )),
             secrets: opts.secrets.clone(),
         };
-        match self.call(c.node_expand_volume(req)).await {
+        match self
+            .call("/csi.v1.Node/NodeExpandVolume", c.node_expand_volume(req))
+            .await
+        {
             Ok(resp) => Ok(Quantity::from_value(resp.capacity_bytes, Format::BinarySI)),
             Err(s) if !is_final_error(&s) => Err(NodeExpandError::UncertainProgress(s.to_string())),
             Err(s) => Err(NodeExpandError::Grpc(Box::new(s))),
@@ -475,11 +542,14 @@ impl CsiDriverClient {
         }
         let mut c = self.node_client()?;
         let resp = self
-            .call(c.node_get_volume_stats(NodeGetVolumeStatsRequest {
-                volume_id: vol_id.to_string(),
-                volume_path: target_path.to_string(),
-                staging_target_path: String::new(),
-            }))
+            .call(
+                "/csi.v1.Node/NodeGetVolumeStats",
+                c.node_get_volume_stats(NodeGetVolumeStatsRequest {
+                    volume_id: vol_id.to_string(),
+                    volume_path: target_path.to_string(),
+                    staging_target_path: String::new(),
+                }),
+            )
             .await
             .map_err(|s| CsiError::Failed(s.to_string()))?;
 
@@ -570,7 +640,10 @@ impl CsiDriverClient {
             secrets,
             volume_context,
         };
-        match self.call(c.node_stage_volume(req)).await {
+        match self
+            .call("/csi.v1.Node/NodeStageVolume", c.node_stage_volume(req))
+            .await
+        {
             Ok(_) => Ok(()),
             Err(s) if !is_final_error(&s) => Err(CsiError::UncertainProgress(s.to_string())),
             Err(s) => Err(CsiError::Failed(s.to_string())),
@@ -590,10 +663,13 @@ impl CsiDriverClient {
             return Err(CsiError::Failed("missing staging target path".into()));
         }
         let mut c = self.node_client()?;
-        self.call(c.node_unstage_volume(NodeUnstageVolumeRequest {
-            volume_id: vol_id.to_string(),
-            staging_target_path: staging_target_path.to_string(),
-        }))
+        self.call(
+            "/csi.v1.Node/NodeUnstageVolume",
+            c.node_unstage_volume(NodeUnstageVolumeRequest {
+                volume_id: vol_id.to_string(),
+                staging_target_path: staging_target_path.to_string(),
+            }),
+        )
         .await
         .map(|_| ())
         .map_err(|s| CsiError::Failed(s.to_string()))
@@ -1233,5 +1309,49 @@ mod tests {
             e.to_string(),
             "driver name never.registered.example.com not found in the list of registered CSI drivers"
         );
+    }
+
+    fn spec_with_migrated(migrated: bool) -> super::super::plugin::OwnedSpec {
+        super::super::plugin::OwnedSpec {
+            volume: serde_json::from_value(serde_json::json!({"name": "v"})).unwrap(),
+            persistent_volume: None,
+            read_only: false,
+            migrated,
+            inline_volume_spec_for_csi_migration: false,
+        }
+    }
+
+    /// `TestCreateCSIOperationContext` (`csi_util_test.go:160-205`): nil spec
+    /// and `Migrated: false` give "false", `Migrated: true` gives "true".
+    #[test]
+    fn create_csi_operation_context_migrated_follows_spec() {
+        assert!(!csi_operation_migrated(None));
+        let migrated = spec_with_migrated(true);
+        assert!(csi_operation_migrated(Some(&migrated.as_spec())));
+        let not_migrated = spec_with_migrated(false);
+        assert!(!csi_operation_migrated(Some(&not_migrated.as_spec())));
+        let c = CsiDriverClient::with_endpoint("drv", "/x")
+            .with_operation_spec(Some(&migrated.as_spec()));
+        assert!(c.migrated());
+        assert!(!CsiDriverClient::with_endpoint("drv", "/x").migrated());
+    }
+
+    /// `RecordMetricsInterceptor` (`csi_metrics.go:112-136`): an RPC made by a
+    /// client of a migrated operation is recorded with `migrated="true"`, a
+    /// plain one with `"false"`.
+    #[tokio::test]
+    async fn rpc_metrics_carry_the_operations_migrated_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("csi.sock");
+        let _srv = serve(caps(&[NodeRpcType::StageUnstageVolume]), &sock);
+        let migrated = spec_with_migrated(true);
+        let c = CsiDriverClient::with_endpoint("migrated.metrics.drv", &sock)
+            .with_operation_spec(Some(&migrated.as_spec()));
+        c.node_supports_stage_unstage().await.unwrap();
+        let c = CsiDriverClient::with_endpoint("plain.metrics.drv", &sock);
+        c.node_supports_stage_unstage().await.unwrap();
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains("csi_operations_seconds_count{driver_name=\"migrated.metrics.drv\",grpc_status_code=\"OK\",method_name=\"/csi.v1.Node/NodeGetCapabilities\",migrated=\"true\"} 1"), "{body}");
+        assert!(body.contains("csi_operations_seconds_count{driver_name=\"plain.metrics.drv\",grpc_status_code=\"OK\",method_name=\"/csi.v1.Node/NodeGetCapabilities\",migrated=\"false\"} 1"), "{body}");
     }
 }

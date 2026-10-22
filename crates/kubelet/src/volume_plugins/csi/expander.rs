@@ -75,8 +75,10 @@ impl NodeExpandableVolumePlugin for CsiPlugin {
             }
         };
 
+        // `createCSIOperationContext(resizeOptions.VolumeSpec, csiTimeout)`
+        // (`expander.go:66`).
         let client = match CsiDriverClient::new(&csi_source.driver) {
-            Ok(c) => c,
+            Ok(c) => c.with_operation_spec(Some(spec)),
             // Treat the absence of the CSI driver as a transient error
             // See https://github.com/kubernetes/kubernetes/issues/120268
             Err(e) => {
