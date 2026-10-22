@@ -1740,14 +1740,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         }
                     }
                     // Pod affinity (hard requirements and scoring)
-                    let (pod_affinity_ok, pod_affinity_score) =
-                        check_pod_affinity(node, pod, all_pods, nodes);
+                    let (pod_affinity_ok, _) = check_pod_affinity(node, pod, all_pods, nodes);
                     if inter_pod_filter_on && !pod_affinity_ok {
                         diag.add_plugin_status(names::INTER_POD_AFFINITY);
                         return None;
                     }
                     // Pod anti-affinity (hard requirements and penalty scoring)
-                    let (pod_anti_affinity_ok, pod_anti_affinity_penalty) =
+                    let (pod_anti_affinity_ok, _) =
                         check_pod_anti_affinity(node, pod, all_pods, nodes);
                     if inter_pod_filter_on && !pod_anti_affinity_ok {
                         diag.add_plugin_status(names::INTER_POD_AFFINITY);
@@ -1774,8 +1773,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     Some(NodeEval {
                         node,
                         node_affinity_score,
-                        pod_affinity_score,
-                        pod_anti_affinity_penalty,
                         topology_penalty,
                     })
                 }
@@ -1936,22 +1933,55 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                                 .collect();
                             (names::IMAGE_LOCALITY, Some(v))
                         }
-                        // Deviation (tracked in #3454): the raw per-node
-                        // affinity / spread numbers are still the compiled-in
-                        // `check_pod_affinity` /
-                        // `check_topology_spread_constraints` heuristics, but
-                        // they now go through the upstream NormalizeScore and
-                        // plugin weight like every other plugin.
+                        // Deviation (tracked in #3815): PodTopologySpread's raw
+                        // per-node number below is still the compiled-in
+                        // `check_topology_spread_constraints` heuristic.
                         names::INTER_POD_AFFINITY => {
-                            let mut v: Vec<i64> = feasible
-                                .iter()
-                                .map(|e| {
-                                    i64::from(e.pod_affinity_score)
-                                        - i64::from(e.pod_anti_affinity_penalty)
-                                })
-                                .collect();
-                            crate::score::normalize_inter_pod_affinity(&mut v);
-                            (names::INTER_POD_AFFINITY, Some(v))
+                            // interpodaffinity/scoring.go PreScore + Score +
+                            // NormalizeScore. A PreScore `Skip` leaves the
+                            // plugin out of RunScorePlugins.
+                            let namespaces =
+                                if crate::inter_pod_affinity_score::needs_namespaces(pod, all_pods)
+                                {
+                                    match self.data.list_namespaces().await {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            warn!(
+                                                "InterPodAffinity: failed to list namespaces: {}",
+                                                e
+                                            );
+                                            return None;
+                                        }
+                                    }
+                                } else {
+                                    Vec::new()
+                                };
+                            match crate::inter_pod_affinity_score::pre_score(
+                                pod,
+                                nodes,
+                                all_pods,
+                                &namespaces,
+                                &profile.inter_pod_affinity,
+                            ) {
+                                Ok(Some(state)) => {
+                                    let mut v: Vec<i64> = feasible
+                                        .iter()
+                                        .map(|e| {
+                                            crate::inter_pod_affinity_score::score(&state, e.node)
+                                        })
+                                        .collect();
+                                    crate::score::normalize_inter_pod_affinity(&mut v);
+                                    (names::INTER_POD_AFFINITY, Some(v))
+                                }
+                                Ok(None) => (names::INTER_POD_AFFINITY, None),
+                                Err(e) => {
+                                    warn!(
+                                        "running PreScore plugin {:?} failed with: {}",
+                                        plugin, e
+                                    );
+                                    return None;
+                                }
+                            }
                         }
                         names::POD_TOPOLOGY_SPREAD => {
                             let mut v: Vec<i64> = feasible
@@ -2849,8 +2879,6 @@ fn random_offset(num_nodes: usize) -> usize {
 struct NodeEval<'a> {
     node: &'a Node,
     node_affinity_score: i32,
-    pod_affinity_score: i32,
-    pod_anti_affinity_penalty: i32,
     topology_penalty: i32,
 }
 

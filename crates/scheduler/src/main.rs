@@ -12,6 +12,7 @@ mod diagnosis;
 mod framework;
 #[allow(dead_code)] // library API surface (Framework accessors); partly unused by the binary
 mod framework_runtime;
+mod inter_pod_affinity_score;
 mod node_volume_limits;
 #[allow(dead_code)]
 mod plugins;
