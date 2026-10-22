@@ -330,8 +330,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // `New` (scheduler.go:282-341): the per-profile QueueingHintMap feeds
         // the scheduling queue; PrioritySort is the only queue-sort plugin.
+        // The DynamicResources hints read claims through this lister, which the
+        // ResourceClaim feed keeps current.
+        let claim_cache = crate::queue::dra_hints::ResourceClaimCache::default();
         let queueing_hint_map =
-            hints::build_queueing_hint_map_per_profile(self.profiles.profiles());
+            hints::build_queueing_hint_map_per_profile(self.profiles.profiles(), &claim_cache);
         // `unionedGVKs` (scheduler.go:635-647) decides which resource
         // handlers `addAllEventHandlers` installs below.
         let gvk_map = crate::resource_events::unioned_gvks(&queueing_hint_map);
@@ -356,6 +359,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             &queue,
             &gvk_map,
             self.interval,
+            &claim_cache,
         );
         queue.run();
 
@@ -4256,7 +4260,7 @@ mod tests {
         let profiles = crate::profile::Map::new_map(vec![profile]).unwrap();
         let scheduler = Scheduler::new_with_profiles(Arc::clone(&storage), 60, profiles);
         let err = scheduler
-            .try_schedule_pod("pods/default/abc")
+            .try_schedule_pod(&test_queue(), "pods/default/abc")
             .await
             .expect_err("a filter Error must abort the cycle");
         let msg = err.to_string();
