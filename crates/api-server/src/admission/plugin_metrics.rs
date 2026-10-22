@@ -179,6 +179,14 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: true,
     },
+    // gc/gc_admission.go:71 (ValidationInterface only), :51
+    // (NewHandler(Create, Update))
+    Spec {
+        name: "OwnerReferencesPermissionEnforcement",
+        ops: C | U,
+        admit: false,
+        validate: true,
+    },
     // antiaffinity/admission.go:45, :50
     Spec {
         name: "LimitPodHardAntiAffinityTopology",
