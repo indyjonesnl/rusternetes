@@ -1786,6 +1786,13 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.update_strategy.field_schema()
     }
 
+    fn field_converter(
+        &self,
+    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
+    {
+        self.update_strategy.field_converter()
+    }
+
     async fn get(&self, ctx: &RequestContext, name: &str, options: &GetOptions) -> Result<T> {
         Store::get(self, ctx, name, options).await
     }

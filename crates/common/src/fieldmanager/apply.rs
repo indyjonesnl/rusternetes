@@ -16,12 +16,15 @@
 //!   `Apply` (:76-92) gives an object with no managers a `before-first-apply`
 //!   Update entry; `internal/conflict.go` -- `NewConflictError`.
 //!
-//! DEVIATIONS, deliberate: (1) the sets come from [`fieldset`]'s name-driven
-//! walker, not the OpenAPI schema (#2734); (2) one version per kind is served,
-//! so the per-manager `versionConverter` is the identity (#2736 part 1);
-//! (3) `prune` is the net effect of `prune` + `addBackOwnedItems` +
-//! `addBackDanglingItems` -- the fields the applier owned last time, and no
-//! one owns now, are removed -- rather than three passes over typed values;
+//! DEVIATIONS, deliberate: (1) the sets come from the kind's schema where the
+//! caller supplies one (#2734), else [`fieldset`]'s name-driven walker; (2) the
+//! per-manager `versionConverter` is [`super::versionconverter`] when the
+//! caller supplies a converter, the identity otherwise (#2736 part 1);
+//! (3) for a kind with no converter `prune` is the net effect of `prune` +
+//! `addBackOwnedItems` + `addBackDanglingItems` -- the fields the applier
+//! owned last time, and no one owns now, are removed -- rather than three
+//! passes over typed values; with a converter it is
+//! [`FieldManager::prune_versioned`] (no `addBackDanglingItems`);
 //! (4) `reconcileManagedFieldsWithSchemaChanges` needs the schema and is
 //! skipped; (5) the live object's `managedFields` that do not decode (written
 //! by the former engine) are treated as absent instead of failing the apply.
@@ -31,9 +34,10 @@ use serde_json::{Map, Value};
 
 use super::fieldset::{field_kind, key_element, typed_key_element, FieldKind, Set};
 use super::schema::{ListKind, Type};
+use super::versionconverter::UpdateFailure;
 use super::{
     build_manager_identifier, remove_managed_fields, strip_set, FieldManager, Managed,
-    ManagerIdentity, VersionedSet, OPERATION_APPLY,
+    VersionedSet, OPERATION_APPLY,
 };
 
 /// `skipNonAppliedManager.beforeApplyManagerName` (skipnonapplied.go:47).
@@ -89,7 +93,7 @@ impl FieldManager {
         config: &Value,
         manager: &str,
         force: bool,
-    ) -> Result<Value, Vec<ApplyConflict>> {
+    ) -> Result<Value, UpdateFailure> {
         let mut live_json = live.cloned().unwrap_or_else(|| Value::Object(Map::new()));
         let managed = live
             .and_then(|l| l.pointer("/metadata/managedFields"))
@@ -97,6 +101,17 @@ impl FieldManager {
             .and_then(|e: Vec<_>| Managed::decode(&e).ok())
             .unwrap_or_default();
         remove_managed_fields(&mut live_json);
+        // structuredMergeManager.Apply (structuredmerge.go:123-126): the live
+        // object is converted to the version being applied.
+        if live.is_some() && self.converter.is_some() {
+            live_json = self
+                .convert_to(&live_json, &self.api_version)
+                .map_err(|e| {
+                    UpdateFailure::Convert(format!(
+                        "failed to convert live object to proper version: {e}"
+                    ))
+                })?;
+        }
         let mut config = config.clone();
         remove_managed_fields(&mut config);
 
@@ -131,17 +146,19 @@ impl FieldManager {
         mut managed: Managed,
         manager: &str,
         force: bool,
-    ) -> Result<(Value, Managed), Vec<ApplyConflict>> {
+    ) -> Result<(Value, Managed), UpdateFailure> {
         // skipNonAppliedManager.Apply: an object with no managers first gets
         // an Update entry for the fields it already has.
         if managed.fields.is_empty() && live_exists {
-            managed = self.update_managed(
-                &Value::Object(Map::new()),
-                live,
-                managed,
-                BEFORE_FIRST_APPLY,
-                true,
-            );
+            managed = self
+                .update_managed(
+                    &Value::Object(Map::new()),
+                    live,
+                    managed,
+                    BEFORE_FIRST_APPLY,
+                    true,
+                )
+                .map_err(UpdateFailure::Convert)?;
         }
 
         // buildManagerInfoManager.Apply.
@@ -159,7 +176,10 @@ impl FieldManager {
 
         // Updater.Apply (update.go:209-254).
         let mut merged = self.merge(live, config);
-        let last_set = managed.fields.get(&id).map(|vs| vs.set.clone());
+        let last = managed
+            .fields
+            .get(&id)
+            .map(|vs| (vs.set.clone(), vs.api_version.clone()));
         let mut set = self.fields_of(config).set;
         let exclude = self.reset_set();
         if !exclude.is_empty() {
@@ -173,56 +193,24 @@ impl FieldManager {
                 applied: true,
             },
         );
-        if let Some(last) = last_set.filter(|s| !s.is_empty()) {
-            // prune: what the applier owned last time, and no manager owns
-            // now (its own new set included), goes.
-            let mut owned = Set::new();
-            for vs in managed.fields.values() {
-                owned = owned.union(&vs.set);
-            }
-            for path in last.difference(&owned).members() {
-                remove_path(&mut merged, &path);
+        if let Some((last, last_version)) = last.filter(|(s, _)| !s.is_empty()) {
+            if self.converter.is_some() {
+                merged = self.prune_versioned(&merged, &managed, &last, &last_version)?;
+            } else {
+                // prune: what the applier owned last time, and no manager
+                // owns now (its own new set included), goes.
+                let mut owned = Set::new();
+                for vs in managed.fields.values() {
+                    owned = owned.union(&vs.set);
+                }
+                for path in last.difference(&owned).members() {
+                    remove_path(&mut merged, &path);
+                }
             }
         }
 
         // Updater.update (update.go:73-164), conflict half.
-        let mut comparison = self.fields_of(live).compare(&self.fields_of(&merged));
-        if !exclude.is_empty() {
-            comparison = comparison.exclude(&exclude);
-        }
-        let changed = comparison.modified.union(&comparison.added);
-        let mut conflicts = Vec::new();
-        for (other, vs) in &managed.fields {
-            if *other == id {
-                continue;
-            }
-            let conflict_set = vs.set.intersection(&changed);
-            if conflict_set.is_empty() {
-                continue;
-            }
-            let owner: ManagerIdentity = serde_json::from_str(other).unwrap_or_default();
-            for path in conflict_set.members() {
-                conflicts.push(ApplyConflict {
-                    manager: owner.manager.clone(),
-                    path: path_string(&path),
-                });
-            }
-        }
-        if !force && !conflicts.is_empty() {
-            conflicts.sort_by(|a, b| a.manager.cmp(&b.manager));
-            return Err(conflicts);
-        }
-        for (other, vs) in managed.fields.iter_mut() {
-            if *other == id {
-                continue;
-            }
-            let conflict_set = vs.set.intersection(&changed);
-            vs.set = vs
-                .set
-                .difference(&conflict_set)
-                .difference(&comparison.removed);
-        }
-        managed.fields.retain(|_, vs| !vs.set.is_empty());
+        self.update_versions(live, &merged, &mut managed, Some(&id), force)?;
 
         // stripMetaManager.Apply.
         if let Some(vs) = managed.fields.get_mut(&id) {
@@ -392,7 +380,7 @@ pub fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
 
 /// `RemoveItems` for one path element chain: drop the field, list item or
 /// set value the path names.
-fn remove_path(value: &mut Value, path: &[String]) {
+pub(super) fn remove_path(value: &mut Value, path: &[String]) {
     let Some((first, rest)) = path.split_first() else {
         return;
     };
@@ -429,7 +417,7 @@ fn remove_path(value: &mut Value, path: &[String]) {
 }
 
 /// `Path.String()` (fieldpath/path.go): `.spec.containers[name="c"]`.
-fn path_string(path: &[String]) -> String {
+pub(super) fn path_string(path: &[String]) -> String {
     let mut out = String::new();
     for element in path {
         if let Some(name) = element.strip_prefix("f:") {

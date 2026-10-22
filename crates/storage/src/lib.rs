@@ -837,6 +837,7 @@ where
     T: Serialize + DeserializeOwned + Send + Sync,
 {
     use rusternetes_common::fieldmanager::apply::retain_live_system_metadata;
+    use rusternetes_common::fieldmanager::versionconverter::UpdateFailure;
     use rusternetes_common::fieldmanager::{FieldManager, ResetFields};
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
@@ -855,12 +856,13 @@ where
         let mut applied =
             match manager.apply_value(current.as_ref(), apply_config, field_manager, force) {
                 Ok(v) => v,
-                Err(conflicts) => {
+                Err(UpdateFailure::Conflicts(conflicts)) => {
                     return Err(Error::Conflict(format!(
                         "Apply failed with {} conflict(s) for {key}",
                         conflicts.len()
                     )))
                 }
+                Err(UpdateFailure::Convert(e)) => return Err(Error::Internal(e)),
             };
         retain_live_system_metadata(&mut applied, current.as_ref());
         let written = if current.is_some() {
