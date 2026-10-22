@@ -486,6 +486,8 @@ pub struct Kubelet {
     /// `imageGC{High,Low}ThresholdPercent` (kubelet.go:509-515). `None` keeps
     /// image GC off (tests / callers that do not configure it).
     image_gc_policy: Option<crate::image_gc::ImageGcPolicy>,
+    /// `nodeStatusMaxImages` (v1beta1 default 50, -1 = no cap).
+    node_status_max_images: i32,
     /// `lastStatusReportTime` + `delayAfterNodeStatusChange`
     /// (pkg/kubelet/kubelet.go:1374, :1370).
     status_report_state: Mutex<StatusReportState>,
@@ -864,6 +866,7 @@ impl Kubelet {
             file_check_frequency: Duration::from_secs(20),
             node_status_report_frequency: Duration::from_secs(300),
             image_gc_policy: None,
+            node_status_max_images: 50,
             status_report_state: Mutex::new(StatusReportState::default()),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
             sysctl_allowlist: crate::sysctl::Allowlist::new(&allowed_unsafe_sysctls),
@@ -957,6 +960,11 @@ impl Kubelet {
 
     /// Enable image garbage collection with the policy `NewMainKubelet` builds
     /// from the KubeletConfiguration (kubelet.go:509-515).
+    pub fn with_node_status_max_images(mut self, max: i32) -> Self {
+        self.node_status_max_images = max;
+        self
+    }
+
     pub fn with_image_gc_policy(mut self, policy: crate::image_gc::ImageGcPolicy) -> Self {
         self.image_gc_policy = Some(policy);
         self
@@ -1185,6 +1193,7 @@ impl Kubelet {
                     let manager = Arc::new(manager);
                     let _ = self.image_gc_manager.set(manager.clone());
                     tokio::spawn(manager.clone().run_detect_loop());
+                    tokio::spawn(manager.clone().run_image_cache_loop());
                     tokio::spawn(manager.run_gc_loop());
                 }
                 Err(err) => anyhow::bail!("failed to initialize image manager: {err}"),
@@ -1898,6 +1907,18 @@ impl Kubelet {
         // maintains the provided-node-ip annotation and, with an external
         // cloud provider, leaves provider-set addresses alone.
         self.run_node_address_setter(&mut node);
+
+        // `nodestatus.Images(kl.nodeStatusMaxImages, kl.imageManager.GetImageList)`
+        // (kubelet_node_status.go:683): publish the image cache.
+        if let Some(mgr) = self.image_gc_manager.get() {
+            if let Err(err) = crate::node_status::set_images(
+                &mut node,
+                self.node_status_max_images,
+                mgr.get_image_list(),
+            ) {
+                warn!(%err, "Failed to set some node status fields");
+            }
+        }
 
         // Allocatable follows capacity on every sync, extended resources
         // included (nodestatus/setters.go MachineInfo, :292-316). A client

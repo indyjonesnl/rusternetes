@@ -78,6 +78,10 @@ pub struct KubeletConfiguration {
     )]
     pub node_status_report_frequency: Option<std::time::Duration>,
 
+    /// `nodeStatusMaxImages`: cap on `node.status.images` (default 50, -1 = no cap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_status_max_images: Option<i32>,
+
     /// `imageMinimumGCAge` (`metav1.Duration`, Go duration string).
     #[serde(
         default,
@@ -340,6 +344,7 @@ impl Default for KubeletConfiguration {
             streaming_connection_idle_timeout: None,
             node_status_update_frequency: None,
             node_status_report_frequency: None,
+            node_status_max_images: None,
             image_minimum_gc_age: None,
             image_maximum_gc_age: None,
             image_gc_high_threshold_percent: None,
@@ -394,6 +399,11 @@ impl KubeletConfiguration {
     /// `nodeStatusUpdateFrequency` with the upstream default applied (10s).
     pub fn effective_node_status_update_frequency(&self) -> std::time::Duration {
         nonzero_or(self.node_status_update_frequency, 10)
+    }
+
+    /// `nodeStatusMaxImages` with the v1beta1 default (50).
+    pub fn effective_node_status_max_images(&self) -> i32 {
+        self.node_status_max_images.unwrap_or(50)
     }
 
     /// `imageMinimumGCAge` with the upstream default applied (120s).

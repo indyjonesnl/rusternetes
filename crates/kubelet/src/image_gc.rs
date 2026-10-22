@@ -80,6 +80,9 @@ pub struct Image {
     pub size: i64,
     pub runtime_handler: String,
     pub pinned: bool,
+    /// `Image.RepoTags` / `RepoDigests` (reported as node.status.images names).
+    pub repo_tags: Vec<String>,
+    pub repo_digests: Vec<String>,
 }
 
 /// The `container.Container` fields `detectImages` reads.
@@ -222,6 +225,8 @@ pub struct ImageGcManager {
     recorder: Arc<dyn NodeEventSink>,
     post_gc_hooks: Vec<PostImageGcHook>,
     image_records: Mutex<HashMap<String, ImageRecord>>,
+    /// `imageCache`: the latest `ListImages` result, sorted by size.
+    image_cache: Mutex<Vec<Image>>,
 }
 
 /// `getImageTuple`: with `RuntimeClassInImageCriAPI` records are indexed by
@@ -284,6 +289,7 @@ impl ImageGcManager {
             recorder,
             post_gc_hooks,
             image_records: Mutex::new(HashMap::new()),
+            image_cache: Mutex::new(Vec::new()),
         })
     }
 
@@ -299,6 +305,37 @@ impl ImageGcManager {
 
     pub fn get_image_record(&self, name: &str) -> Option<ImageRecord> {
         self.image_records.lock().unwrap().get(name).cloned()
+    }
+
+    /// `imageCache.set`: sorts by `ByImageSize` (size descending, ties by id
+    /// descending) and replaces the cache.
+    pub fn set_image_cache(&self, mut images: Vec<Image>) {
+        images.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| b.id.cmp(&a.id)));
+        *self.image_cache.lock().unwrap() = images;
+    }
+
+    /// `GetImageList`: the cached image list, sorted by size descending.
+    pub fn get_image_list(&self) -> anyhow::Result<Vec<Image>> {
+        Ok(self.image_cache.lock().unwrap().clone())
+    }
+
+    /// `Start`'s second goroutine (`image_gc_manager.go:Start`): refresh the
+    /// image cache from `ListImages` every 30 seconds (first run immediately,
+    /// as `wait.Until`).
+    pub async fn run_image_cache_loop(self: Arc<Self>) {
+        let mut t = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            t.tick().await;
+            self.refresh_image_cache().await;
+        }
+    }
+
+    /// One iteration of the cache-refresh goroutine.
+    pub async fn refresh_image_cache(&self) {
+        match self.runtime.list_images().await {
+            Ok(images) => self.set_image_cache(images),
+            Err(err) => tracing::warn!(%err, "Failed to update image list"),
+        }
     }
 
     /// `Start`'s first goroutine (`image_gc_manager.go:Start`): `detectImages`
@@ -1481,5 +1518,37 @@ mod tests {
         assert_eq!("10.0 GiB", format_size(10 * 1024 * 1024 * 1024));
         assert_eq!("512 B", format_size(512));
         assert_eq!("1.5 KiB", format_size(1536));
+    }
+
+    // `imageCache.set` / `GetImageList` (image_gc_manager.go:143-172, 240):
+    // the cache is sorted by ByImageSize (size desc, ties by id desc) on write.
+    #[tokio::test]
+    async fn image_cache_refresh_sorts_by_size_descending() {
+        let (m, rt, _) = manager(policy_90_80(), MockStats::returning(Ok(FsStats::default())));
+        assert!(m.get_image_list().unwrap().is_empty());
+        rt.set_images(vec![
+            make_image(1, 3),
+            make_image(2, 1),
+            make_image(3, 4),
+            make_image(4, 3),
+        ]);
+        m.refresh_image_cache().await;
+        let ids: Vec<String> = m
+            .get_image_list()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, vec!["image-3", "image-4", "image-1", "image-2"]);
+    }
+
+    #[tokio::test]
+    async fn image_cache_replaced_by_each_refresh() {
+        let (m, rt, _) = manager(policy_90_80(), MockStats::returning(Ok(FsStats::default())));
+        rt.set_images(vec![make_image(1, 3)]);
+        m.refresh_image_cache().await;
+        rt.set_images(vec![]);
+        m.refresh_image_cache().await;
+        assert!(m.get_image_list().unwrap().is_empty());
     }
 }
