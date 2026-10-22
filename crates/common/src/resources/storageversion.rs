@@ -137,3 +137,63 @@ pub struct StorageVersionList {
     #[serde(default)]
     pub items: Vec<StorageVersion>,
 }
+
+/// `SetCommonEncodingVersion`
+/// (`staging/src/k8s.io/apiserver/pkg/storageversion/updater.go:40-80`, with
+/// `setStatusCondition` :94-116): recompute `commonEncodingVersion` and the
+/// `AllEncodingVersionsEqual` condition from `status.storageVersions`.
+pub fn set_common_encoding_version(sv: &mut StorageVersion) {
+    let old_common = sv.status.common_encoding_version.take();
+    if let Some(first) = sv.status.storage_versions.first() {
+        let first_version = first.encoding_version.clone();
+        if sv
+            .status
+            .storage_versions
+            .iter()
+            .all(|s| s.encoding_version == first_version)
+        {
+            sv.status.common_encoding_version = Some(first_version);
+        }
+    }
+
+    let is_set = sv.status.common_encoding_version.is_some();
+    let new = StorageVersionCondition {
+        condition_type: ALL_ENCODING_VERSIONS_EQUAL.to_string(),
+        status: if is_set { "True" } else { "False" }.to_string(),
+        observed_generation: sv.metadata.generation.unwrap_or(0),
+        last_transition_time: Some(Utc::now()),
+        reason: if is_set {
+            "CommonEncodingVersionSet"
+        } else {
+            "CommonEncodingVersionUnset"
+        }
+        .to_string(),
+        message: if is_set {
+            "Common encoding version set"
+        } else {
+            "Common encoding version unset"
+        }
+        .to_string(),
+    };
+    let force_transition = matches!(
+        (&old_common, &sv.status.common_encoding_version),
+        (Some(o), Some(n)) if o != n
+    );
+    match sv
+        .status
+        .conditions
+        .iter_mut()
+        .find(|c| c.condition_type == new.condition_type)
+    {
+        None => sv.status.conditions.push(new),
+        Some(existing) => {
+            if existing.status != new.status || force_transition {
+                existing.last_transition_time = new.last_transition_time;
+            }
+            existing.status = new.status;
+            existing.reason = new.reason;
+            existing.message = new.message;
+            existing.observed_generation = new.observed_generation;
+        }
+    }
+}
