@@ -434,6 +434,13 @@ pub async fn watch_custom_resources(
             let target_version = target_version.clone();
             let storage = storage.clone();
             Box::pin(async move {
+                // A watch decodes its events through the storage codec, which
+                // runs `dropInvalidMetadata` on the root `metadata`
+                // (customresource_handler.go:1280-1283, 1415-1421) (#3950).
+                let mut val = val;
+                crate::registry::apiextensions::customresource::drop_invalid_root_metadata(
+                    &mut val,
+                );
                 let cr: CustomResource = match serde_json::from_value(val.clone()) {
                     Ok(c) => c,
                     Err(_) => return val,
