@@ -8,8 +8,8 @@
 //! conditions the kubelet does not own.
 //!
 //! Slice 1 of #3808: the two Running-transition sites in `kubelet.rs` are
-//! migrated. Slice 2 (#3901): the create-error Pending write too. The rest
-//! are tracked in the issue.
+//! migrated. Slice 2 (#3901): create-error, app-start-error and init-failure
+//! writes too, plus reason/message preservation.
 
 use rusternetes_common::{
     resources::{pod::HostIP, ContainerStatus, Pod, PodCondition, PodIP, PodStatus},
@@ -81,10 +81,38 @@ pub fn generate_api_pod_status(pod: &Pod, input: ApiPodStatusInput) -> PodStatus
         .unwrap_or_default();
     conditions.extend(input.conditions);
 
+    // "preserve the reason and message which is associated with the phase"
+    // (kubelet_pods.go:1915-1926). Upstream's generated status never carries
+    // a reason/message, so the old status' wins when the phase is unchanged.
+    // Here a caller-supplied Some(..) plays the role of upstream's explicit
+    // overrides (the ShouldEvict block, :1929-1935, and the status-manager
+    // rejection paths): it is kept as-is.
+    let (mut reason, mut message) = (input.reason, input.message);
+    let old_phase = pod.status.as_ref().and_then(|s| s.phase.clone());
+    if phase == old_phase {
+        let old = pod.status.as_ref();
+        if reason.is_none() {
+            reason = old.and_then(|s| s.reason.clone()).filter(|r| !r.is_empty());
+        }
+        if message.is_none() {
+            message = old
+                .and_then(|s| s.message.clone())
+                .filter(|m| !m.is_empty());
+        }
+    }
+
+    // Fields this kubelet does not generate are carried over from the prior
+    // status: upstream writes status via a patch (status_manager.go
+    // patchPodStatus), so omitted fields survive; our write is a full update.
+    let prior = pod.status.as_ref();
+
     PodStatus {
         phase,
-        message: input.message,
-        reason: input.reason,
+        message,
+        reason,
+        resize: prior.and_then(|s| s.resize.clone()),
+        resource_claim_statuses: prior.and_then(|s| s.resource_claim_statuses.clone()),
+        nominated_node_name: prior.and_then(|s| s.nominated_node_name.clone()),
         host_ip: input.host_ip,
         host_i_ps: input.host_ips,
         pod_ip: input.pod_ip,
@@ -203,5 +231,44 @@ mod tests {
         let pod = pod_with(Some(Phase::Succeeded), vec![], None);
         let s = generate_api_pod_status(&pod, input(Phase::Running));
         assert_eq!(s.phase, Some(Phase::Succeeded));
+    }
+
+    #[test]
+    fn preserves_reason_and_message_when_phase_unchanged() {
+        // kubelet_pods.go:1915-1926
+        let mut pod = pod_with(Some(Phase::Running), vec![], None);
+        {
+            let st = pod.status.as_mut().unwrap();
+            st.reason = Some("Restarting".into());
+            st.message = Some("Liveness probe failed".into());
+        }
+        let mut i = input(Phase::Running);
+        i.message = None;
+        let s = generate_api_pod_status(&pod, i);
+        assert_eq!(s.reason.as_deref(), Some("Restarting"));
+        assert_eq!(s.message.as_deref(), Some("Liveness probe failed"));
+    }
+
+    #[test]
+    fn drops_reason_and_message_when_phase_changes() {
+        let mut pod = pod_with(Some(Phase::Pending), vec![], None);
+        {
+            let st = pod.status.as_mut().unwrap();
+            st.reason = Some("FailedToStart".into());
+            st.message = Some("boom".into());
+        }
+        let mut i = input(Phase::Running);
+        i.message = None;
+        let s = generate_api_pod_status(&pod, i);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.message, None);
+    }
+
+    #[test]
+    fn carries_over_fields_the_kubelet_does_not_generate() {
+        let mut pod = pod_with(Some(Phase::Pending), vec![], None);
+        pod.status.as_mut().unwrap().nominated_node_name = Some("n1".into());
+        let s = generate_api_pod_status(&pod, input(Phase::Running));
+        assert_eq!(s.nominated_node_name.as_deref(), Some("n1"));
     }
 }
