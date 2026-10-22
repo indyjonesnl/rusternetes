@@ -671,6 +671,25 @@ pub(crate) fn request_meta(req: &axum::extract::Request) -> RequestMeta {
     }
 }
 
+/// `WithLatencyTrackers` (endpoints/filters/webhook_duration.go:36-61): install
+/// the per-request trackers for every request except watches. Placed outside
+/// authentication and audit (server/config.go:1084), so both can read/write
+/// them; `instrument_request` reuses the instance.
+///
+/// The Go filter also wraps the ResponseWriter in `writeLatencyTracker`
+/// (response-write tracking); that part is not ported (axum bodies stream
+/// outside the handler chain) and is tracked as a follow-up.
+pub async fn with_latency_trackers_filter(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let attrs = crate::audit::request_info(req.method(), req.uri().path(), req.uri().query());
+    if attrs.verb == "watch" {
+        return next.run(req).await;
+    }
+    with_latency_trackers(Arc::new(LatencyTrackers::new()), next.run(req)).await
+}
+
 /// `InstrumentRouteFunc` (metrics.go:633-650) as a middleware: time the inner
 /// handler and call [`monitor_request`].
 pub async fn instrument_request(
@@ -682,7 +701,12 @@ pub async fn instrument_request(
     let started = std::time::Instant::now();
     // `WithLatencyTrackers` (filters/webhook_duration.go:36-61) installs the
     // trackers for every request except watches.
-    let trackers = (meta.verb != "watch").then(|| Arc::new(LatencyTrackers::new()));
+    // When the outer [`with_latency_trackers_filter`] already installed them
+    // (so authentication and audit share them), reuse that instance.
+    let outer_trackers = rusternetes_common::latency_trackers::latency_trackers_from_context();
+    let install_here = outer_trackers.is_none() && meta.verb != "watch";
+    let trackers =
+        outer_trackers.or_else(|| install_here.then(|| Arc::new(LatencyTrackers::new())));
     // Upgraded CONNECTs (exec/attach/portforward) return their 101 at once and
     // splice in a detached task, so the gauge must travel with the connection:
     // `RecordLongRunning` wraps the blocking `ServeHTTP` (rest.go:218). The
@@ -707,8 +731,8 @@ pub async fn instrument_request(
         }
     }
     let resp = match &trackers {
-        Some(t) => with_latency_trackers(t.clone(), next.run(req)).await,
-        None => next.run(req).await,
+        Some(t) if install_here => with_latency_trackers(t.clone(), next.run(req)).await,
+        _ => next.run(req).await,
     };
     // `RecordLongRunning` wraps watch serving (handlers/get.go:283), connect
     // handlers (handlers/rest.go:218) and `StreamObject` for logs
