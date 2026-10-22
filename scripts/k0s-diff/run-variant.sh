@@ -61,8 +61,17 @@ if [ "${K0S_DIFF_REBUILD:-0}" = 1 ] || ! docker image inspect "$img" >/dev/null 
       bash "$here/build-swap-binaries.sh" "$swap"
       ;;
   esac
-  log "building image $img"
-  docker compose -f "$f" build
+  case "$swap" in
+    kube-proxy|dns)
+      # Workload swaps build the node image once, with the CONTAINERD_RS_BINARY
+      # build-arg, in the pre-up block below — a plain build here would be a
+      # redundant first build of the same image.
+      ;;
+    *)
+      log "building image $img"
+      docker compose -f "$f" build
+      ;;
+  esac
 fi
 
 # --- v5/v6 workload-swap pre-up: local registry + pushed pod image ------------
@@ -74,6 +83,8 @@ fi
 # starts trusting it). apply-workload-swap.sh later references the image by this
 # same registry host:port.
 REGISTRY_HOSTPORT=""
+# Host port of the throwaway registry; override if 5000 is taken on the host.
+registry_port="${K0S_DIFF_REGISTRY_PORT:-5000}"
 case "$swap" in
   kube-proxy|dns)
     # The pinned v0.1.3 runtime baked in the node image cannot pull a local
@@ -99,18 +110,18 @@ case "$swap" in
     log "baking newer containerd-rs (env-feature) into the $v node image"
     docker compose -f "$f" build --build-arg CONTAINERD_RS_BINARY=.build/containerd-rs
 
-    # Local throwaway HTTP registry, host-published on :5000 (independent of the
-    # k0s-diff-net). Push via localhost:5000 — docker auto-trusts localhost as an
+    # Local throwaway HTTP registry, host-published on :${registry_port} (independent of the
+    # k0s-diff-net). Push via localhost:${registry_port} — docker auto-trusts localhost as an
     # insecure registry, so no daemon config is needed.
     if ! docker ps --format '{{.Names}}' | grep -qx k0s-diff-registry; then
       docker rm -f k0s-diff-registry >/dev/null 2>&1 || true
-      log "starting local registry k0s-diff-registry on :5000"
-      docker run -d --name k0s-diff-registry --restart unless-stopped -p 5000:5000 registry:2 >/dev/null
-      for _ in $(seq 1 30); do curl -fsS "http://localhost:5000/v2/" >/dev/null 2>&1 && break; sleep 1; done
+      log "starting local registry k0s-diff-registry on :${registry_port}"
+      docker run -d --name k0s-diff-registry --restart unless-stopped -p "${registry_port}:5000" registry:2 >/dev/null
+      for _ in $(seq 1 30); do curl -fsS "http://localhost:${registry_port}/v2/" >/dev/null 2>&1 && break; sleep 1; done
     fi
     bash "$here/build-swap-images.sh" "$swap" >/dev/null
     tag="${K8S_VERSION#v}"
-    push_img="localhost:5000/rusternetes-${swap}:${tag}"
+    push_img="localhost:${registry_port}/rusternetes-${swap}:${tag}"
     docker tag "k0s-diff-rusternetes-${swap}:${tag}" "$push_img"
     log "pushing $push_img"
     docker push "$push_img" >/dev/null
@@ -120,7 +131,7 @@ case "$swap" in
     # registry through BEFORE `up` — no recreate needed. Export the insecure-
     # registry env so the single `up` below starts containerd-rs already trusting
     # the registry over HTTP (same repo, pulled by the gateway ref).
-    REGISTRY_HOSTPORT="${K0S_DIFF_NET_GATEWAY}:5000"
+    REGISTRY_HOSTPORT="${K0S_DIFF_NET_GATEWAY}:${registry_port}"
     export CONTAINERD_RS_INSECURE_REGISTRIES="$REGISTRY_HOSTPORT"
     log "insecure registry for containerd-rs: $REGISTRY_HOSTPORT (image ref ${REGISTRY_HOSTPORT}/rusternetes-${swap}:${tag})"
     ;;
