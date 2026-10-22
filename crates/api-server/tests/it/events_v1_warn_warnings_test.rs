@@ -1,5 +1,5 @@
 //! `?fieldValidation=Warn` on an `events.k8s.io/v1` body must answer with one
-//! `Warning: 299` header per strict-decoding violation (#3694).
+//! `Warning: 299` header per strict-decoding violation (#3694), and so must a PATCH of one (#3697).
 //!
 //! Upstream decodes the body into the *versioned* object and records strict
 //! decoding errors as warnings on the request's recorder
@@ -93,5 +93,90 @@ async fn create_ignore_emits_no_warning() {
     let uri = format!("/apis/events.k8s.io/v1/namespaces/{NS}/events?fieldValidation=Ignore");
     let (status, warnings) = send("POST", &uri, &body("w-ignore")).await;
     assert_eq!(status, StatusCode::CREATED);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+/// PATCH a freshly created `events.k8s.io/v1` Event with `patch`.
+async fn patch(query: &str, content_type: &str, patch: &Value) -> (StatusCode, Vec<String>, Value) {
+    let api = TestApiServer::new();
+    let mut base = body("w-patch");
+    base.as_object_mut().unwrap().remove("bogusField");
+    let (code, _) = api
+        .send(
+            "POST",
+            &format!("/apis/events.k8s.io/v1/namespaces/{NS}/events"),
+            Some("application/json"),
+            Some(&base),
+        )
+        .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let uri = format!("/apis/events.k8s.io/v1/namespaces/{NS}/events/w-patch{query}");
+    let (status, headers, _bytes, v) = api
+        .send_full(
+            "PATCH",
+            &uri,
+            Some(content_type),
+            None,
+            Some(serde_json::to_vec(patch).unwrap()),
+        )
+        .await;
+    let warnings = headers
+        .get_all("warning")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    (status, warnings, v)
+}
+
+#[tokio::test]
+async fn merge_patch_warn_emits_unknown_field_warning() {
+    let (status, warnings, v) = patch(
+        "?fieldValidation=Warn",
+        "application/merge-patch+json",
+        &json!({"bogusField": "x", "metadata": {"labels": {"a": "b"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("299 ") && w.contains("unknown field \\\"bogusField\\\"")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_patch_ignore_emits_no_warning() {
+    let (status, warnings, _) = patch(
+        "?fieldValidation=Ignore",
+        "application/merge-patch+json",
+        &json!({"bogusField": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[tokio::test]
+async fn merge_patch_strict_rejects_unknown_field() {
+    let (status, _, v) = patch(
+        "?fieldValidation=Strict",
+        "application/merge-patch+json",
+        &json!({"bogusField": "x"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(v.to_string().contains("bogusField"), "{v}");
+}
+
+#[tokio::test]
+async fn merge_patch_warn_without_unknown_field_is_silent() {
+    let (status, warnings, _) = patch(
+        "?fieldValidation=Warn",
+        "application/merge-patch+json",
+        &json!({"metadata": {"labels": {"a": "b"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert!(warnings.is_empty(), "{warnings:?}");
 }
