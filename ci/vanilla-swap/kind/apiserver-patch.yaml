@@ -54,6 +54,13 @@ template: |
           - "--tls-cert-file=/etc/kubernetes/pki/apiserver.crt"
           - "--tls-key-file=/etc/kubernetes/pki/apiserver.key"
           - "--client-ca-file=/etc/kubernetes/pki/ca.crt"
+          # kubeadm front-proxy PKI (front-proxy-ca.crt / front-proxy-client, CN
+          # front-proxy-client), same flag set kubeadm passes the vanilla apiserver (#3423).
+          - "--requestheader-client-ca-file=/etc/kubernetes/pki/front-proxy-ca.crt"
+          - "--requestheader-allowed-names=front-proxy-client"
+          - "--requestheader-username-headers=X-Remote-User"
+          - "--requestheader-group-headers=X-Remote-Group"
+          - "--requestheader-extra-headers-prefix=X-Remote-Extra-"
           # Default is AlwaysAllow like upstream (#3266); kubeadm passes this.
           - "--authorization-mode=Node,RBAC"
           - "--storage-backend=sqlite"

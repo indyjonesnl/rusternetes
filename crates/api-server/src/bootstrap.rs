@@ -1634,12 +1634,15 @@ fn resolve_cluster_ca(ca_cert_pem: Option<&str>) -> Option<String> {
 /// what is published here when the flags are given (#3414).
 ///
 /// Without `--requestheader-client-ca-file` upstream publishes no
-/// request-header keys. This api-server's compose/all-in-one bring-up passes
-/// no front-proxy flags yet, and the aggregator proxy still signs with the
-/// cluster CA and sends the standard headers
-/// (`handlers::aggregator::build_proxy_headers`), so extension API servers
-/// need those keys; until the bring-up passes the flags, the effective
-/// configuration keeps being published as the fallback (tracked in #3423).
+/// request-header keys (the `requestHeaderConfig != nil` guard at config.go:346),
+/// and neither does this: the bring-up passes the front-proxy flags
+/// (`scripts/generate-certs.sh` emits the front-proxy CA + client cert, as
+/// kubeadm's `KubeadmCertFrontProxyCA` / `KubeadmCertFrontProxyClient` do), so
+/// the former "effective config" fallback is gone (#3423).
+///
+/// Deviation: `ClientCA` falls back to the cluster CA when `--client-ca-file`
+/// is unset, where upstream publishes nothing; extension API servers verify the
+/// proxied caller's identity chain against it.
 pub fn cluster_authentication_info(
     ca_cert_pem: Option<&str>,
     client_ca_file: Option<&str>,
@@ -1666,12 +1669,7 @@ pub fn cluster_authentication_info(
     }
     rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
         client_ca,
-        request_header_username_headers: Some(vec!["X-Remote-User".to_string()]),
-        request_header_uid_headers: None,
-        request_header_group_headers: Some(vec!["X-Remote-Group".to_string()]),
-        request_header_extra_header_prefixes: Some(vec!["X-Remote-Extra-".to_string()]),
-        request_header_allowed_names: Some(Vec::new()),
-        request_header_ca: ca,
+        ..Default::default()
     }
 }
 
@@ -3376,5 +3374,67 @@ mod advertise_address_tests {
         let es: EndpointSlice = storage.get(ENDPOINTSLICE_KEY).await.unwrap();
         assert_eq!(es.address_type, "IPv4");
         assert_eq!(es.endpoints[0].addresses, vec!["10.0.0.5".to_string()]);
+    }
+}
+
+/// `ClusterAuthenticationInfo` publication (#3423). Upstream
+/// `pkg/controlplane/apiserver/config.go:344-357`: `ClientCA` always, the
+/// request-header keys only when `ToAuthenticationRequestHeaderConfig` is
+/// non-nil, i.e. `--requestheader-client-ca-file` is set.
+#[cfg(test)]
+mod cluster_authentication_info_tests {
+    use super::*;
+    use crate::request_header_authentication::RequestHeaderAuthenticationArgs;
+
+    const CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+    const FRONT_PROXY_PEM: &str = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn unset_request_header_ca_publishes_no_request_header_keys() {
+        let info = cluster_authentication_info(Some(CA_PEM), None, None);
+        assert_eq!(info.client_ca.as_deref(), Some(CA_PEM));
+        assert_eq!(info.request_header_username_headers, None);
+        assert_eq!(info.request_header_uid_headers, None);
+        assert_eq!(info.request_header_group_headers, None);
+        assert_eq!(info.request_header_extra_header_prefixes, None);
+        assert_eq!(info.request_header_allowed_names, None);
+        assert_eq!(info.request_header_ca, None);
+    }
+
+    #[test]
+    fn set_request_header_ca_publishes_the_flags() {
+        let dir = std::env::temp_dir().join(format!("rt-3423-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca_file = dir.join("front-proxy-ca.crt");
+        std::fs::write(&ca_file, FRONT_PROXY_PEM).unwrap();
+        let args = RequestHeaderAuthenticationArgs {
+            username_headers: vec!["X-Remote-User".into()],
+            group_headers: vec!["X-Remote-Group".into()],
+            extra_headers_prefix: vec!["X-Remote-Extra-".into()],
+            client_ca_file: ca_file.to_string_lossy().into_owned(),
+            allowed_names: vec!["front-proxy-client".into()],
+            ..Default::default()
+        };
+        let trust = args.resolve(None).unwrap().unwrap();
+        let info = cluster_authentication_info(Some(CA_PEM), None, Some(&trust));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(info.client_ca.as_deref(), Some(CA_PEM));
+        assert_eq!(info.request_header_ca.as_deref(), Some(FRONT_PROXY_PEM));
+        assert_eq!(
+            info.request_header_username_headers,
+            Some(vec!["X-Remote-User".to_string()])
+        );
+        assert_eq!(
+            info.request_header_group_headers,
+            Some(vec!["X-Remote-Group".to_string()])
+        );
+        assert_eq!(
+            info.request_header_extra_header_prefixes,
+            Some(vec!["X-Remote-Extra-".to_string()])
+        );
+        assert_eq!(
+            info.request_header_allowed_names,
+            Some(vec!["front-proxy-client".to_string()])
+        );
     }
 }
