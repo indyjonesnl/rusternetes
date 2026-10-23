@@ -134,7 +134,28 @@ async fn custom_resource_fallback(
     if parts.len() >= 2 {
         let group = parts[0];
         let version = parts[1];
-        match handlers::aggregator::resolve_aggregator_target(&state, group, version).await {
+        // Routing is driven by the handlers the apiservice-registration
+        // controller installed (kube-aggregator `AddAPIService` mounts a
+        // `proxyHandler` per APIService on the mux). A version with no mounted
+        // handler is not aggregated. Only when no registration controller is
+        // running (a router built without the startup hooks) is the APIService
+        // resolved from storage per request.
+        let resolved = match crate::aggregator_mux::active_handler_manager() {
+            Some(mgr) => match mgr.proxy_handler(group, version) {
+                Some(h) => {
+                    handlers::aggregator::resolve_aggregator_target_for_handler(
+                        state.storage.as_ref(),
+                        group,
+                        version,
+                        &h,
+                    )
+                    .await
+                }
+                None => Ok(None),
+            },
+            None => handlers::aggregator::resolve_aggregator_target(&state, group, version).await,
+        };
+        match resolved {
             Ok(Some(target)) => {
                 let path_and_query = match uri.query() {
                     Some(q) => format!("{}?{}", uri.path(), q),
@@ -180,7 +201,30 @@ async fn custom_resource_fallback(
         if resp.status() != StatusCode::NOT_FOUND {
             return Ok(resp);
         }
-        // Not built-in or CRD: an aggregated APIService group is still served.
+        // Not built-in or CRD: an aggregated APIService group is still served,
+        // by the `apiGroupHandler` the registration controller mounted for it
+        // (handler_apis.go `apiGroupHandler.ServeHTTP`).
+        if let Some(mgr) = crate::aggregator_mux::active_handler_manager() {
+            return Ok(match mgr.serve_api_group(group_name) {
+                Some(crate::aggregator_mux::ApiGroupResponse::Group(g)) => {
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(g.to_string()))
+                        .unwrap()
+                }
+                // `http.Error(w, "", http.StatusNotFound)`
+                Some(crate::aggregator_mux::ApiGroupResponse::NotFound) => {
+                    axum::response::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+                // No group handler mounted / no APIServices: the delegate's
+                // answer (the built-in 404 above).
+                Some(crate::aggregator_mux::ApiGroupResponse::Delegate) | None => resp,
+            });
+        }
         let aggregated = handlers::aggregator::list_registered_apiservice_groups(&state).await;
         if let Some(g) = aggregated
             .into_iter()

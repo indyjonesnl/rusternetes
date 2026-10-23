@@ -14,6 +14,7 @@ pub mod negotiated_error;
 pub mod request_scope;
 pub mod request_timeout;
 pub use rusternetes_admission_webhook as admission_webhook;
+pub mod aggregator_mux;
 pub mod apiserver_identity;
 pub mod apiservice_registration;
 pub mod autoregister;

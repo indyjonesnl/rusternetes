@@ -199,12 +199,43 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
         .pointer("/spec/caBundle")
         .and_then(|v| v.as_str())
         .and_then(decode_ca_bundle);
-
     let svc_port = apiservice
         .pointer("/spec/service/port")
         .and_then(|v| v.as_i64())
         .map(|p| p as u16);
+    resolve_backend_target(
+        storage,
+        group,
+        version,
+        svc_ns,
+        svc_name,
+        svc_port,
+        insecure_skip_tls_verify,
+        ca_bundle,
+    )
+    .await
+}
 
+/// The tail of `proxyHandler.ServeHTTP` once the APIService is known to be
+/// available: `serviceResolver.ResolveEndpoint(ns, name, port)` and the
+/// transport settings (handler_proxy.go `ServeHTTP`, `updateAPIService`).
+/// Shared by the storage-resolving path and the per-APIService handler path
+/// ([`resolve_aggregator_target_for_handler`]).
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    reason = "the Err is the axum error Response the handler returns as-is"
+)]
+async fn resolve_backend_target<S: Storage + Send + Sync>(
+    storage: &S,
+    group: &str,
+    version: &str,
+    svc_ns: &str,
+    svc_name: &str,
+    svc_port: Option<u16>,
+    insecure_skip_tls_verify: bool,
+    ca_bundle: Option<Vec<u8>>,
+) -> Result<Option<AggregatorTarget>, Response> {
     // Resolve a reachable backend address. The api-server runs in its own
     // network namespace WITHOUT kube-proxy iptables, so it cannot reach the
     // backend's ClusterIP — it must talk to a backing pod IP directly (same as
@@ -234,6 +265,62 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
             )))
         }
     }
+}
+
+/// Resolve the backend for a request routed to a per-APIService
+/// [`crate::aggregator_mux::ProxyHandler`]: the `proxyHandler.ServeHTTP`
+/// decision ladder (handler_proxy.go `ServeHTTP`) followed by endpoint
+/// resolution. `Ok(None)` means "serve with the local delegate" (the
+/// handler's `localDelegate`, here the built-in/CRD routes).
+#[allow(
+    clippy::result_large_err,
+    reason = "the Err is the axum error Response the handler returns as-is"
+)]
+pub async fn resolve_aggregator_target_for_handler<S: Storage + Send + Sync>(
+    storage: &S,
+    group: &str,
+    version: &str,
+    handler: &crate::aggregator_mux::ProxyHandler,
+) -> Result<Option<AggregatorTarget>, Response> {
+    use crate::aggregator_mux::ProxyDecision;
+    match handler.decide() {
+        ProxyDecision::Delegate | ProxyDecision::Local => Ok(None),
+        ProxyDecision::ServiceUnavailable => {
+            Err(service_unavailable_response("service unavailable"))
+        }
+        ProxyDecision::Error(msg) => Err(proxy_error_response(&msg)),
+        ProxyDecision::Proxy(info) => {
+            let ca_bundle = info.ca_bundle.as_deref().and_then(decode_ca_bundle);
+            resolve_backend_target(
+                storage,
+                group,
+                version,
+                &info.service_namespace,
+                &info.service_name,
+                Some(info.service_port as u16),
+                info.insecure_skip_tls_verify,
+                ca_bundle,
+            )
+            .await
+        }
+    }
+}
+
+/// `proxyError(w, req, err.Error(), http.StatusInternalServerError)`.
+fn proxy_error_response(message: &str) -> Response {
+    let status_body = serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": message,
+        "reason": "InternalError",
+        "code": 500,
+    });
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(status_body.to_string()))
+        .unwrap()
 }
 
 /// Build the set of HTTP headers the aggregator forwards on a proxied request.
