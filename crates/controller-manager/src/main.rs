@@ -1563,6 +1563,27 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the device taint eviction controller
+    // (`newDeviceTaintEvictionController`, cmd/kube-controller-manager/app/
+    // core.go:251-284; `requiredFeatureGates`: DynamicResourceAllocation and
+    // DRADeviceTaints).
+    if controllers::device_taint_eviction::feature_enabled() {
+        let device_taint_eviction = Arc::new(
+            controllers::device_taint_eviction::DeviceTaintEvictionController::new(storage.clone()),
+        );
+        spawn_controller!("DeviceTaintEviction controller", leader_elector, {
+            let controller = device_taint_eviction.clone();
+            async move {
+                if let Err(e) = controller
+                    .run(controllers::device_taint_eviction::DEFAULT_CONCURRENT_SYNCS)
+                    .await
+                {
+                    tracing::error!("DeviceTaintEviction controller error: {}", e);
+                }
+            }
+        });
+    }
+
     // Start the CSR cleaner (`newCertificateSigningRequestCleanerController`,
     // cmd/kube-controller-manager/app/certificates.go:217-230).
     let csr_cleaner = Arc::new(controllers::csr_cleaner::CsrCleanerController::new(

@@ -17,6 +17,8 @@ pub mod csi_topology;
 pub mod csr_cleaner;
 pub mod daemonset;
 pub mod deployment;
+pub mod device_taint_eviction;
+pub mod device_taint_eviction_metrics;
 pub mod dynamic_provisioner;
 pub mod endpoints;
 pub mod endpoints_tracker;
@@ -73,6 +75,7 @@ pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
 pub mod trigger_time_tracker;
 pub mod ttl_controller;
+pub mod typed_workqueue;
 #[cfg(test)]
 pub mod uid_precondition_double;
 #[allow(dead_code)]
@@ -120,6 +123,7 @@ pub fn gather_metrics() -> String {
     out.push_str(&node_lifecycle_metrics::gather());
     out.push_str(&csi_capacity_metrics::gather());
     out.push_str(&podgc_metrics::gather());
+    out.push_str(&device_taint_eviction_metrics::gather());
     // Process-global `legacyregistry` (prometheus default registry): holds
     // `version_info` from `ComponentGlobalsRegistry.AddMetrics()`
     // (cmd/kube-controller-manager/app/controllermanager.go:146).

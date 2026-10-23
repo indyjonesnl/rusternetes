@@ -228,6 +228,13 @@ pub struct DeviceToleration {
         deserialize_with = "empty_string_as_none"
     )]
     pub operator: Option<TolerationOperator>,
+
+    /// `TolerationSeconds` (resource/v1 types.go:1422): how long a
+    /// `NoExecute` taint is tolerated, counted from the taint's `timeAdded`.
+    /// Absent means "tolerate forever"; negative values count as zero
+    /// (`devicetainteviction.claimEvictionTime`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toleration_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -413,6 +420,13 @@ pub struct DeviceRequestAllocationResult {
     /// `ShareID` (types.go:1686; gated by `DRAConsumableCapacity`).
     #[serde(rename = "shareID", default, skip_serializing_if = "Option::is_none")]
     pub share_id: Option<String>,
+
+    /// `Tolerations` (resource/v1 types.go:1649): the tolerations of the
+    /// request that were needed to allocate this device, copied by the
+    /// allocator. The device taint eviction controller reads them to decide
+    /// whether (and when) a `NoExecute` taint evicts the claim's pods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<DeviceToleration>,
 
     /// `ConsumedCapacity` (types.go:1699; gated by `DRAConsumableCapacity`).
     /// Quantities are kept as strings, like the rest of this module.
