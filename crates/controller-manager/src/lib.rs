@@ -161,6 +161,11 @@ pub struct ControllerManagerConfig {
     /// `isDisabledByDefault: true` (`cmd/kube-controller-manager/app/bootstrap.go:35`),
     /// so it is opt-in (`--bootstrap-signer-controller`).
     pub bootstrap_signer_controller: bool,
+    /// Run the SELinux warning controller (`selinux-warning-controller`,
+    /// `isDisabledByDefault: true`, requires the `SELinuxChangePolicy` gate;
+    /// `cmd/kube-controller-manager/app/core.go:1107`). Opt-in
+    /// (`--selinux-warning-controller`).
+    pub selinux_warning_controller: bool,
     /// `--terminated-pod-gc-threshold` (`PodGCControllerConfiguration.
     /// TerminatedPodGCThreshold`, default 12500): terminated pods tolerated
     /// before the pod GC deletes the oldest; `<= 0` disables that pass.
@@ -393,6 +398,19 @@ where
         handles.push(tokio::spawn(async move {
             if let Err(e) = c.run().await {
                 error!("BootstrapSigner controller error: {e}");
+            }
+        }));
+    }
+
+    // `newSELinuxWarningControllerDescriptor` (core.go:1107), disabled by default.
+    if config.selinux_warning_controller && controllers::selinux_warning::feature_gates_enabled() {
+        let s = storage_for("SELinuxWarning");
+        let c = Arc::new(controllers::selinux_warning::SELinuxWarningController::new(
+            s,
+        ));
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = c.run().await {
+                error!("SELinux warning controller error: {e}");
             }
         }));
     }
@@ -775,6 +793,7 @@ mod per_controller_client_tests {
                 csi_attachers: Vec::new(),
                 attach_detach_controller: false,
                 bootstrap_signer_controller: false,
+                selinux_warning_controller: false,
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
             },
@@ -831,6 +850,7 @@ mod csi_attach_wiring_tests {
                 csi_attachers,
                 attach_detach_controller,
                 bootstrap_signer_controller: false,
+                selinux_warning_controller: false,
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
             },
