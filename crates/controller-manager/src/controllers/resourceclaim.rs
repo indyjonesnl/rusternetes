@@ -1,8 +1,9 @@
+use crate::controllers::device_taint_eviction::tolerates_taint;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use rusternetes_common::resources::{
     AllocationResult, DeviceAllocationResult, DeviceClass, DeviceRequestAllocationResult,
-    ResourceClaim, ResourceClaimStatus, ResourceSlice,
+    DeviceToleration, ResourceClaim, ResourceClaimStatus, ResourceSlice,
 };
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
@@ -211,7 +212,7 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
 
                 // Find suitable devices from ResourceSlices
                 let devices = self
-                    .find_suitable_devices(&device_class, exact.count)
+                    .find_suitable_devices(&device_class, exact.count, &exact.tolerations)
                     .await?;
 
                 if devices.is_empty() {
@@ -233,6 +234,11 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
                         pool: device.pool,
                         device: device.device_name,
                         admin_access: None,
+                        // `Tolerations: internal.lookupRequest(claim).tolerations()`
+                        // (allocator_incubating.go:300): the request's tolerations
+                        // are recorded in the result so the device-taint-eviction
+                        // controller honours them.
+                        tolerations: exact.tolerations.clone(),
                         ..Default::default()
                     });
                 }
@@ -285,6 +291,7 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
         &self,
         device_class: &DeviceClass,
         count: Option<i64>,
+        tolerations: &[DeviceToleration],
     ) -> Result<Vec<AllocatedDevice>> {
         let mut suitable_devices = Vec::new();
         let required_count = count.unwrap_or(1) as usize;
@@ -310,7 +317,19 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
                 // 4. Check node affinity constraints
 
                 // For now, we'll do basic matching
-                let is_suitable = self.device_matches_class(&device.name, device_class);
+                let mut is_suitable = self.device_matches_class(&device.name, device_class);
+
+                // `allTaintsTolerated` (allocator_stable.go:1107): every taint on
+                // the device must be tolerated by some toleration of the request.
+                // Upstream gates this on the DeviceTaints feature (GA/on here).
+                if is_suitable
+                    && !device
+                        .taints
+                        .iter()
+                        .all(|t| tolerations.iter().any(|tol| tolerates_taint(tol, t)))
+                {
+                    is_suitable = false;
+                }
 
                 if is_suitable {
                     suitable_devices.push(AllocatedDevice {
@@ -437,9 +456,103 @@ mod tests {
         };
 
         let devices = controller
-            .find_suitable_devices(&device_class, Some(1))
+            .find_suitable_devices(&device_class, Some(1), &[])
             .await
             .unwrap();
         assert_eq!(devices.len(), 0);
+    }
+
+    // Ports the toleration cases of `allocatortesting` TestAllocator
+    // (allocator_testing.go:3738 tolerated taint, :3790 tolerations in result).
+    async fn run_allocation(
+        taints: serde_json::Value,
+        tolerations: serde_json::Value,
+    ) -> Vec<DeviceRequestAllocationResult> {
+        let storage = Arc::new(MemoryStorage::new());
+        let class: DeviceClass = serde_json::from_value(serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1", "kind": "DeviceClass",
+            "metadata": {"name": "class-a"}, "spec": {}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("deviceclasses", None, "class-a"), &class)
+            .await
+            .unwrap();
+        let slice: ResourceSlice = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "slice-0"},
+            "spec": {"driver": "drv", "nodeName": "n1",
+                "pool": {"name": "n1", "resourceSliceCount": 1},
+                "devices": [{"name": "dev-0", "taints": taints}]}
+        }))
+        .unwrap();
+        storage
+            .create(&build_key("resourceslices", None, "slice-0"), &slice)
+            .await
+            .unwrap();
+        let mut claim: ResourceClaim = serde_json::from_value(serde_json::json!({
+            "apiVersion": "resource.k8s.io/v1",
+            "kind": "ResourceClaim",
+            "metadata": {"name": "claim-0", "namespace": "default"},
+            "spec": {"devices": {"requests": [{
+                "name": "req-0",
+                "exactly": {
+                    "deviceClassName": "class-a",
+                    "count": 1,
+                    "tolerations": tolerations,
+                }
+            }]}}
+        }))
+        .unwrap();
+        storage
+            .create(
+                &build_key("resourceclaims", Some("default"), "claim-0"),
+                &claim,
+            )
+            .await
+            .unwrap();
+        let controller = ResourceClaimController::new(storage.clone());
+        controller.reconcile_claim(&mut claim).await.unwrap();
+        let stored: ResourceClaim = storage
+            .get(&build_key("resourceclaims", Some("default"), "claim-0"))
+            .await
+            .unwrap();
+        stored
+            .status
+            .and_then(|s| s.allocation)
+            .map(|a| a.devices.results)
+            .unwrap_or_default()
+    }
+
+    fn no_execute_taint() -> serde_json::Value {
+        serde_json::json!([{"key": "example.com/taint", "value": "tainted", "effect": "NoExecute"}])
+    }
+
+    #[tokio::test]
+    async fn allocation_copies_request_tolerations_into_result() {
+        let tol = serde_json::json!([
+            {"key": "example.com/taint", "operator": "Exists", "effect": "NoExecute",
+             "tolerationSeconds": 60}
+        ]);
+        let results = run_allocation(no_execute_taint(), tol).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].device, "dev-0");
+        assert_eq!(results[0].tolerations.len(), 1);
+        assert_eq!(results[0].tolerations[0].toleration_seconds, Some(60));
+    }
+
+    #[tokio::test]
+    async fn allocation_skips_device_with_untolerated_taint() {
+        assert!(run_allocation(no_execute_taint(), serde_json::json!([]))
+            .await
+            .is_empty());
+        let other = serde_json::json!([{"key": "other", "operator": "Exists"}]);
+        assert!(run_allocation(no_execute_taint(), other).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allocation_untainted_device_has_empty_tolerations() {
+        let results = run_allocation(serde_json::json!([]), serde_json::json!([])).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].tolerations.is_empty());
     }
 }
