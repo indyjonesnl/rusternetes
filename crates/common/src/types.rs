@@ -48,11 +48,21 @@ pub struct ObjectMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
 
-    /// Generation is a sequence number representing a specific generation of the desired state
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generation is a sequence number representing a specific generation of the desired state.
+    /// Go: plain `int64` `json:"generation,omitempty"` (meta/v1/types.go), so
+    /// zero is absent (#2955).
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_helpers::zero_as_none",
+        skip_serializing_if = "crate::serde_helpers::is_none_or_zero"
+    )]
     pub generation: Option<i64>,
 
     /// CreationTimestamp is the creation time
+    // Go 1.35: `CreationTimestamp Time `json:"creationTimestamp,omitempty,omitzero"``
+    // (meta/v1/types.go:188). `omitzero` + `(*Time).IsZero` (time.go:60)
+    // drops an unset timestamp, so it is NOT emitted as `null` (it was before
+    // `omitzero` was added). Keep skipping `None`.
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "k8s_time::serialize",
@@ -1347,6 +1357,19 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"continue\":\"abc123\""));
         assert!(json.contains("\"remainingItemCount\":42"));
+    }
+
+    #[test]
+    fn unset_creation_timestamp_is_omitted_like_omitzero() {
+        // meta/v1/types.go:188 `omitempty,omitzero` on a `Time` value.
+        let mut meta = ObjectMeta::new("x");
+        meta.creation_timestamp = None;
+        let v = serde_json::to_value(&meta).unwrap();
+        assert!(v.get("creationTimestamp").is_none());
+        // and an explicit null on the wire decodes to None
+        let m: ObjectMeta =
+            serde_json::from_str(r#"{"name":"x","creationTimestamp":null}"#).unwrap();
+        assert!(m.creation_timestamp.is_none());
     }
 
     #[test]
