@@ -26,6 +26,8 @@ const LISTS: &[(&str, &str)] = &[
         "resource.k8s.io/v1.ResourceClaimTemplate",
     ),
     ("ResourceSliceList", "resource.k8s.io/v1.ResourceSlice"),
+    // resource/v1alpha3/generated.proto:152 (only v1alpha3 serves it in 1.35)
+    ("DeviceTaintRuleList", "DeviceTaintRule"),
 ];
 
 #[test]
@@ -57,4 +59,41 @@ fn served_list_kinds_registered_with_upstream_numbers() {
             "{list}: item schema {item} is not registered"
         );
     }
+}
+
+/// resource/v1alpha3/generated.proto:135-:240: DeviceTaintRule{metadata=1,
+/// spec=2,status=3}, Spec{deviceSelector=1,taint=2}, Selector{driver=2,
+/// pool=3,device=4}, Status{conditions=1}. Upstream's
+/// pkg/registry/resource/devicetaintrule/storage/storage_test.go round-trips
+/// through the storage codec; this pins the wire shape of that round trip.
+#[test]
+fn device_taint_rule_protobuf_roundtrip() {
+    let r = ProtoRegistry::new();
+    let rule = serde_json::json!({
+        "metadata": {"name": "r1"},
+        "spec": {
+            "deviceSelector": {"driver": "d.example.com", "pool": "p", "device": "dev"},
+            "taint": {"key": "k", "value": "v", "effect": "NoExecute"}
+        },
+        "status": {"conditions": [{
+            "type": "EvictionInProgress", "status": "False",
+            "reason": "NoEvictions", "message": "m"
+        }]}
+    });
+    let bytes = r.encode_message("DeviceTaintRule", &rule).unwrap();
+    let back = r.decode_message("DeviceTaintRule", &bytes).unwrap();
+    assert_eq!(
+        back["spec"]["deviceSelector"],
+        rule["spec"]["deviceSelector"]
+    );
+    assert_eq!(back["spec"]["taint"]["effect"], "NoExecute");
+    assert_eq!(back["spec"]["taint"]["key"], "k");
+    assert_eq!(
+        back["status"]["conditions"][0]["type"],
+        "EvictionInProgress"
+    );
+    let list = serde_json::json!({"metadata": {}, "items": [rule]});
+    let bytes = r.encode_message("DeviceTaintRuleList", &list).unwrap();
+    let back = r.decode_message("DeviceTaintRuleList", &bytes).unwrap();
+    assert_eq!(back["items"][0]["spec"]["taint"]["value"], "v");
 }

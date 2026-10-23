@@ -12849,6 +12849,101 @@ impl ProtoRegistry {
             },
         );
 
+        // ========== resource.k8s.io/v1alpha3 DeviceTaintRule ==========
+        // resource/v1alpha3/generated.proto:135-:240 (release-1.35). Only
+        // v1alpha3 serves the kind in 1.35; v1/v1beta1/v1beta2 have none, so
+        // the bare names are unique. DeviceTaint is shared with ResourceSlice.
+        // DeviceTaintRule { metadata=1, spec=2, status=3 }
+        schemas.insert(
+            "DeviceTaintRule".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "spec".into(),
+                            FieldType::Message("DeviceTaintRuleSpec".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "status".into(),
+                            FieldType::Message("DeviceTaintRuleStatus".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // DeviceTaintRuleList { metadata=1, items=2 }
+        schemas.insert(
+            "DeviceTaintRuleList".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ListMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "items".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "DeviceTaintRule".into(),
+                            ))),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        // DeviceTaintRuleSpec { deviceSelector=1, taint=2 }
+        schemas.insert(
+            "DeviceTaintRuleSpec".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "deviceSelector".into(),
+                            FieldType::Message("DeviceTaintSelector".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        ("taint".into(), FieldType::Message("DeviceTaint".into())),
+                    ),
+                ]),
+            },
+        );
+        // DeviceTaintRuleStatus { conditions=1 }
+        schemas.insert(
+            "DeviceTaintRuleStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "conditions".into(),
+                        FieldType::Repeated(Box::new(FieldType::Message("Condition".into()))),
+                    ),
+                )]),
+            },
+        );
+        // DeviceTaintSelector { driver=2, pool=3, device=4 } (1 is unused)
+        schemas.insert(
+            "DeviceTaintSelector".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (2, ("driver".into(), FieldType::String)),
+                    (3, ("pool".into(), FieldType::String)),
+                    (4, ("device".into(), FieldType::String)),
+                ]),
+            },
+        );
+
         // NodeAllocatableResourceMapping { capacityKey=1,
         //                                  allocationMultiplier=2 (Quantity) }
         schemas.insert(
@@ -15569,6 +15664,7 @@ mod tests {
         "ResourceClaim",
         "ResourceClaimTemplate",
         "ResourceQuota",
+        "DeviceTaintRule",
         "ResourceSlice",
         "Role",
         "RoleBinding",
