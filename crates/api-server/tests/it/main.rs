@@ -419,6 +419,7 @@ mod custom_external_metrics_selectors_test;
 mod custom_metrics_list_shape_test;
 mod custom_metrics_restmapper_test;
 mod custom_resource_root_meta_unknown_test;
+mod custom_resource_strict_pruner_paths_test;
 mod custom_resource_stored_meta_test;
 mod external_metrics_shape_test;
 mod list_exact_all_handlers_test;
