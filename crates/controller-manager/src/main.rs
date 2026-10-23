@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
     // Start DaemonSet controller
     let daemonset_controller = Arc::new(DaemonSetController::with_pod_informer(
         storage.clone(),
-        pod_informer,
+        pod_informer.clone(),
     ));
     spawn_controller!("DaemonSet controller", leader_elector, {
         let controller = daemonset_controller.clone();
@@ -1041,7 +1041,10 @@ async fn main() -> Result<()> {
     });
 
     // Start Job controller
-    let job_controller = Arc::new(JobController::new(storage.clone()));
+    let job_controller = Arc::new(JobController::with_pod_informer(
+        storage.clone(),
+        pod_informer,
+    ));
     spawn_controller!("Job controller", leader_elector, {
         let controller = job_controller.clone();
         async move {
