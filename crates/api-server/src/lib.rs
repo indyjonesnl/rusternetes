@@ -1,6 +1,7 @@
 pub mod abac;
 pub mod admission;
 pub mod audit;
+pub mod audit_webhook;
 pub mod authorization_config;
 pub mod authorization_config_metrics;
 pub mod authorization_filter;
