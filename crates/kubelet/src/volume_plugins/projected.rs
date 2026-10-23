@@ -684,7 +684,8 @@ impl Mounter for ProjectedMounter {
     /// (`TestInvalidPathProjected`). `MakeNestedMountpoints` (`:205`) follows,
     /// and a failed write runs the `defer` teardown (`:209-222`).
     ///
-    /// Not ported (tracked on #2537): the memory-medium tmpfs mount itself and
+    /// The wrapped emptyDir is the `Medium: Memory` one (`:59-67`), so the
+    /// volume is a tmpfs. Not ported (tracked on #2537):
     /// `deleteServiceAccountToken(podUID)` on `TearDownAt` (`:454`).
     async fn set_up_at(&self, dir: &str, args: &crate::volume_plugins::MounterArgs) -> Result<()> {
         let volume_dir = dir;
@@ -699,14 +700,19 @@ impl Mounter for ProjectedMounter {
             );
         })?;
 
-        crate::volume_plugins::empty_dir::setup_dir(volume_dir)
-            .context("Failed to create projected volume directory")?;
-        let meta_dir = crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
+        // `wrappedVolumeSpec()` is a `Medium: Memory` emptyDir
+        // (projected.go:59-67): a tmpfs on the volume dir, then
+        // `SetReady(getMetaDir())` (empty_dir.go:284).
+        crate::volume_plugins::util::new_wrapper_mounter(
             &self.host,
             &self.volume.name,
-            &self.pod.metadata.uid,
-        );
-        crate::volume_plugins::util::set_ready(&meta_dir);
+            Some("Memory"),
+            &self.pod,
+        )
+        .await?
+        .set_up_at(volume_dir, args)
+        .await
+        .context("Failed to create projected volume directory")?;
         crate::volume_plugins::util::nested_volumes::make_nested_mountpoints(
             &self.volume.name,
             std::path::Path::new(volume_dir),
@@ -715,10 +721,17 @@ impl Mounter for ProjectedMounter {
 
         if let Err(e) = write_payload(std::path::Path::new(volume_dir), &payload, args.fs_group) {
             tracing::error!("Error writing payload to dir: {}", e);
-            // emptyDir `TearDownAt` removes the ready dir, then the volume dir.
-            let _ = std::fs::remove_dir_all(&meta_dir);
-            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
-                tracing::error!("error tearing down volume {}: {}", self.volume.name, td);
+            // `defer` teardown: `unmounter.TearDown()` -> `UnmountViaEmptyDir`
+            // (ready dir, umount of the tmpfs, volume dir).
+            if let Err(td) = crate::volume_plugins::util::unmount_via_empty_dir(
+                &self.host,
+                volume_dir,
+                &self.volume.name,
+                &self.pod.metadata.uid,
+            )
+            .await
+            {
+                tracing::error!("Error tearing down volume {}: {}", self.volume.name, td);
             }
             return Err(anyhow!(e));
         }

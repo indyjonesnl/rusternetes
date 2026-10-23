@@ -38,50 +38,6 @@ pub fn setup_emptydir_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Return true if `path` is already a mount point (its device differs from its
-/// parent's). Used to make tmpfs setup/teardown idempotent.
-fn is_mount_point(path: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let p = std::path::Path::new(path);
-    match (p.metadata(), p.parent().map(|pp| pp.metadata())) {
-        (Ok(m), Some(Ok(pm))) => m.dev() != pm.dev(),
-        _ => false,
-    }
-}
-
-/// Mount a tmpfs at `dir` for a `medium: Memory` emptyDir volume.
-///
-/// K8s ref: `pkg/volume/emptydir/empty_dir.go` — Memory-medium emptyDir is a
-/// tmpfs mount. Mounting it on the host volume dir (rather than as a
-/// per-container Docker `--tmpfs`) makes the data persist across container
-/// restarts for the pod lifetime, and reports `fs_type=tmpfs` to the
-/// conformance emptyDir-tmpfs tests. Relies on the kubelet's volume bind being
-/// `rshared` so the mount propagates to the host daemon's namespace. Idempotent
-/// (no-op if already mounted). A failed mount is returned, as upstream does.
-pub(crate) fn mount_tmpfs_for_emptydir(dir: &str, size_bytes: Option<u64>) -> anyhow::Result<()> {
-    if is_mount_point(dir) {
-        return Ok(()); // already mounted (pod re-sync) — keep the existing tmpfs + data
-    }
-    let mut opts = String::from("mode=0777");
-    if let Some(bytes) = size_bytes {
-        opts.push_str(&format!(",size={}", bytes));
-    }
-    // `setupTmpfs` returns the mount error (`empty_dir.go:324-362`,
-    // `return ed.mounter.MountSensitiveWithoutSystemd(...)`), so SetUp fails.
-    let out = std::process::Command::new("mount")
-        .args(["-t", "tmpfs", "-o", &opts, "tmpfs", dir])
-        .output()
-        .map_err(|e| anyhow::anyhow!("could not exec mount for tmpfs at {dir}: {e}"))?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "failed to mount tmpfs at {dir}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    info!("Mounted tmpfs for Memory emptyDir at {}", dir);
-    Ok(())
-}
-
 /// `mount.Interface.MountSensitiveWithoutSystemd`
 /// (`staging/src/k8s.io/mount-utils/mount_linux.go`): `mount -t <fstype>
 /// [-o <options>] <source> <target>`, reporting the command output on failure.

@@ -78,11 +78,17 @@ impl VolumePlugin for EmptyDirPlugin {
         spec.volume.empty_dir.is_some()
     }
 
+    /// `NewMounter` (`empty_dir.go:141-165`): `plugin.host.GetMounter()` and
+    /// the real mount detector, unless the host injects others.
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+        let deps = self
+            .host
+            .empty_dir_mount_deps()
+            .unwrap_or_else(EmptyDirMountDeps::real);
         Ok(Box::new(EmptyDirMounter {
             pod: pod.clone(),
-            mounter: Arc::new(RealMounter),
-            mount_detector: Arc::new(RealMountDetector),
+            mounter: deps.mounter,
+            mount_detector: deps.detector,
             meta_dir: self.get_meta_dir(&pod.metadata.uid, &spec.volume.name),
             path: self
                 .host
@@ -190,6 +196,10 @@ pub(crate) trait MountDetector: Send + Sync {
 /// The `mount.Interface.MountSensitiveWithoutSystemd` call emptyDir's setup
 /// makes (`staging/src/k8s.io/mount-utils/mount.go`).
 pub(crate) trait Mount: Send + Sync {
+    /// `IsLikelyNotMountPoint` (`mount-utils/mount.go`), which `SetUpAt`
+    /// asks its mounter (`empty_dir.go:236`).
+    fn is_likely_not_mount_point(&self, dir: &str) -> std::io::Result<bool>;
+
     fn mount_sensitive_without_systemd(
         &self,
         source: &str,
@@ -289,6 +299,10 @@ impl Unmount for RealMounter {
 }
 
 impl Mount for RealMounter {
+    fn is_likely_not_mount_point(&self, dir: &str) -> std::io::Result<bool> {
+        crate::pod_dirs::is_likely_not_mount_point(Path::new(dir))
+    }
+
     /// `mount -t <fstype> -o <options> <source> <target>`
     /// (`mount_linux.go` `doMount`, without the systemd-run wrapper).
     fn mount_sensitive_without_systemd(
@@ -299,6 +313,26 @@ impl Mount for RealMounter {
         options: &[String],
     ) -> Result<()> {
         crate::runtime::mount_fs(source, target, fstype, options)
+    }
+}
+
+/// The `mount.Interface` and `mountDetector` an emptyDir mounter is built with
+/// (`newMounterInternal`, `empty_dir.go:128-139`). A [`VolumeHost`] may inject
+/// others (upstream's `FakeVolumeHost` injects `mount.NewFakeMounter`), so the
+/// plugins that wrap an emptyDir can be tested without mounting a tmpfs.
+#[derive(Clone)]
+pub struct EmptyDirMountDeps {
+    pub(crate) mounter: Arc<dyn Mount>,
+    pub(crate) detector: Arc<dyn MountDetector>,
+}
+
+impl EmptyDirMountDeps {
+    /// `mount.New("")` and `&realMountDetector{mounter}`.
+    pub fn real() -> Self {
+        Self {
+            mounter: Arc::new(RealMounter),
+            detector: Arc::new(RealMountDetector),
+        }
     }
 }
 
@@ -351,6 +385,42 @@ impl Unmounter for EmptyDirUnmounter {
 }
 
 impl EmptyDirMounter {
+    /// `setupTmpfs` (`empty_dir.go:320-340`): `setupDir`, then mount a tmpfs
+    /// unless `dir` already is one (SetUp is idempotent). The mount goes
+    /// through the injected mounter, as upstream's
+    /// `ed.mounter.MountSensitiveWithoutSystemd("tmpfs", dir, "tmpfs", options, nil)`.
+    ///
+    /// Deviation (pre-existing): options start with `mode=0777`, which
+    /// `generateTmpfsMountOptions` (`empty_dir.go:573-584`) does not emit; it
+    /// keeps the tmpfs root world-writable irrespective of the host umask.
+    /// `size=` follows `generateTmpfsMountOptions`; `noswap` is not ported.
+    fn setup_tmpfs(&self, dir: &str) -> Result<()> {
+        setup_dir(dir)?;
+        // Make SetUp idempotent.
+        let (medium, is_mnt, _) = self.mount_detector.get_mount_medium(dir, "Memory")?;
+        // If the directory is a mountpoint with medium memory, there is no
+        // work to do since we are already in the desired state.
+        if is_mnt && medium == Medium::Memory {
+            return Ok(());
+        }
+        let mut options = vec!["mode=0777".to_string()];
+        if let Some(bytes) = self
+            .empty_dir
+            .size_limit
+            .as_deref()
+            .and_then(crate::runtime::parse_quantity_bytes)
+            .filter(|b| *b > 0)
+        {
+            options.push(format!("size={bytes}"));
+        }
+        info!(
+            "pod {}: mounting tmpfs for volume {}",
+            self.pod.metadata.uid, self.volume_name
+        );
+        self.mounter
+            .mount_sensitive_without_systemd("tmpfs", dir, "tmpfs", &options)
+    }
+
     /// `setupHugepages` (`empty_dir.go:343-385`).
     fn setup_hugepages(&self, dir: &str) -> Result<()> {
         setup_dir(dir)?;
@@ -644,7 +714,7 @@ impl Mounter for EmptyDirMounter {
         let empty_dir = &self.empty_dir;
         // SetUpAt (empty_dir.go:234-261): IsLikelyNotMountPoint, tolerating a
         // missing dir, then the ready-file short circuit.
-        let not_mnt = match crate::pod_dirs::is_likely_not_mount_point(Path::new(volume_dir)) {
+        let not_mnt = match self.mounter.is_likely_not_mount_point(volume_dir) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             Err(e) => return Err(anyhow!("IsLikelyNotMountPoint({volume_dir:?}): {e}")),
@@ -682,21 +752,9 @@ impl Mounter for EmptyDirMounter {
             // setupDir's errors are returned by upstream, not swallowed.
             Medium::Default => setup_dir(volume_dir)?,
             Medium::HugePages => self.setup_hugepages(volume_dir)?,
-            // Memory: `setupTmpfs` calls `setupDir` first.
-            Medium::Memory => setup_dir(volume_dir)?,
+            Medium::Memory => self.setup_tmpfs(volume_dir)?,
         }
 
-        // Memory-medium emptyDir is a tmpfs. Mount it on the host volume dir
-        // (propagated to the host daemon via the kubelet's rshared bind) so
-        // it persists across container restarts AND reports fs_type=tmpfs.
-        // K8s ref: pkg/volume/emptydir/empty_dir.go setupTmpfs.
-        if medium == Medium::Memory {
-            let size_bytes = empty_dir
-                .size_limit
-                .as_deref()
-                .and_then(crate::runtime::parse_quantity_bytes);
-            crate::runtime::mount_tmpfs_for_emptydir(volume_dir, size_bytes)?;
-        }
         // `volume.NewVolumeOwnership(ed, dir, mounterArgs.FsGroup, nil
         // /*fsGroupChangePolicy*/, ..).ChangePermissions()` (empty_dir.go:277-278)
         // after the medium is set up. emptyDir's `GetAttributes` is
@@ -715,6 +773,79 @@ impl Mounter for EmptyDirMounter {
         // (empty_dir.go:283-286): the error is returned.
         self.assign_quota(volume_dir, args.desired_size)
     }
+}
+
+/// `(source, target, fstype, options)` of one recorded mount.
+#[cfg(test)]
+pub(crate) type MountCall = (String, String, String, Vec<String>);
+
+/// Test double for `mount.NewFakeMounter`: records every
+/// `MountSensitiveWithoutSystemd` call instead of mounting, and treats a
+/// target as a mount point once it was "mounted" (as `FakeMounter`'s
+/// `MountPoints` do), so idempotent `SetUpAt` paths can be driven.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingMount {
+    /// `(source, target, fstype, options)` per call.
+    pub(crate) calls: std::sync::Mutex<Vec<MountCall>>,
+}
+
+#[cfg(test)]
+impl RecordingMount {
+    fn is_mounted(&self, dir: &str) -> bool {
+        self.calls.lock().unwrap().iter().any(|c| c.1 == dir)
+    }
+}
+
+#[cfg(test)]
+impl Mount for RecordingMount {
+    fn is_likely_not_mount_point(&self, dir: &str) -> std::io::Result<bool> {
+        Ok(!self.is_mounted(dir))
+    }
+
+    fn mount_sensitive_without_systemd(
+        &self,
+        source: &str,
+        target: &str,
+        fstype: &str,
+        options: &[String],
+    ) -> Result<()> {
+        self.calls.lock().unwrap().push((
+            source.into(),
+            target.into(),
+            fstype.into(),
+            options.to_vec(),
+        ));
+        Ok(())
+    }
+}
+
+/// Detector over a [`RecordingMount`]: a mounted target is a memory mount.
+#[cfg(test)]
+struct RecordedDetector(Arc<RecordingMount>);
+
+#[cfg(test)]
+impl MountDetector for RecordedDetector {
+    fn get_mount_medium(&self, path: &str, _m: &str) -> Result<(Medium, bool, Option<u64>)> {
+        if self.0.is_mounted(path) {
+            Ok((Medium::Memory, true, None))
+        } else {
+            Ok((Medium::Default, false, None))
+        }
+    }
+}
+
+/// Deps whose mounter records, plus a handle on the recorder.
+#[cfg(test)]
+pub(crate) fn fake_mount_deps() -> (EmptyDirMountDeps, Arc<RecordingMount>) {
+    let rec = Arc::new(RecordingMount::default());
+    (
+        EmptyDirMountDeps {
+            mounter: rec.clone(),
+            detector: Arc::new(RecordedDetector(rec.clone())),
+        },
+        rec,
+    )
 }
 
 #[cfg(test)]
@@ -878,7 +1009,12 @@ mod tests {
     /// point does not exist, so `mount(8)` fails whether or not we are root.
     #[test]
     fn tmpfs_mount_failure_is_returned() {
-        let r = crate::runtime::mount_tmpfs_for_emptydir("/nonexistent/emptydir/mountpoint", None);
+        let r = RealMounter.mount_sensitive_without_systemd(
+            "tmpfs",
+            "/nonexistent/emptydir/mountpoint",
+            "tmpfs",
+            &["mode=0777".to_string()],
+        );
         assert!(r.is_err());
     }
 
@@ -1416,31 +1552,6 @@ mod tests {
                 return Err(anyhow!("GetMountMedium error"));
             }
             Ok((Medium::HugePages, self.is_mnt, self.page_size))
-        }
-    }
-
-    type MountCall = (String, String, String, Vec<String>);
-
-    #[derive(Default)]
-    struct RecordingMount {
-        calls: std::sync::Mutex<Vec<MountCall>>,
-    }
-
-    impl Mount for RecordingMount {
-        fn mount_sensitive_without_systemd(
-            &self,
-            source: &str,
-            target: &str,
-            fstype: &str,
-            options: &[String],
-        ) -> Result<()> {
-            self.calls.lock().unwrap().push((
-                source.into(),
-                target.into(),
-                fstype.into(),
-                options.to_vec(),
-            ));
-            Ok(())
         }
     }
 
