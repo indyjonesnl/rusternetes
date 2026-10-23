@@ -267,8 +267,10 @@ mod tests {
     /// `AnotherSort` and the `Bind` plugin, beside the in-tree ones.
     fn fake_registry() -> Registry {
         let mut r = Registry::in_tree();
-        r.register("QueueSort", &[ExtensionPoint::QueueSort]);
-        r.register("AnotherSort", &[ExtensionPoint::QueueSort]);
+        r.register("QueueSort", &[ExtensionPoint::QueueSort])
+            .unwrap();
+        r.register("AnotherSort", &[ExtensionPoint::QueueSort])
+            .unwrap();
         r
     }
 
