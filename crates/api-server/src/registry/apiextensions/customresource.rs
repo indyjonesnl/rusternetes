@@ -56,7 +56,6 @@ use rusternetes_common::resources::{
     prune_custom_resource, CustomResource, CustomResourceDefinition,
     CustomResourceSubresourceScale, ResourceScope, Scale, ScaleSpec, ScaleStatus,
 };
-use rusternetes_common::schema_validation::SchemaValidator;
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, ErrorType, Path};
 use rusternetes_common::validation::metav1::is_qualified_name;
@@ -409,8 +408,15 @@ impl Strategy {
     /// reports them (as `metadata.<field>`) for every typed resource, from
     /// the request body, before this runs (#3399).
     fn unknown_fields(&self, cr: &CustomResource) -> Vec<String> {
+        let (mut paths, meta) = self.unknown_field_paths(cr);
+        paths.extend(meta);
+        paths
+    }
+
+    /// [`Self::unknown_fields`] as `(pruner paths, embedded-metadata paths)`.
+    fn unknown_field_paths(&self, cr: &CustomResource) -> (Vec<String>, Vec<String>) {
         let Some(structural) = self.structural_schema() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut paths = Vec::new();
         if self.crd.spec.preserve_unknown_fields != Some(true) {
@@ -425,11 +431,10 @@ impl Strategy {
                 );
             }
         }
-        paths.extend(
-            self.coerce_embedded_metadata(&mut cr.clone(), false, true)
-                .1,
-        );
-        paths
+        let meta = self
+            .coerce_embedded_metadata(&mut cr.clone(), false, true)
+            .1;
+        (paths, meta)
     }
 
     /// The served version's structural schema (`structuralSchemas[gv.Version]`).
@@ -959,57 +964,39 @@ impl CustomResourceRest {
         Ok(())
     }
 
-    /// The strict-decoding errors of the bespoke handlers: unknown top-level
-    /// fields, unknown fields of `metadata` (also in embedded objects), and
-    /// unknown nested fields of `spec` (customresource_handler.go:1406-1470).
+    /// The strict decoder's verdict: `schemaCoercingDecoder.Decode` returns
+    /// `runtime.NewStrictDecodingError` of an `unknown field "<path>"` for each
+    /// path `unstructuredSchemaCoercer.apply` reports
+    /// (customresource_handler.go:1338-1342): the pruner's paths
+    /// (`PruneWithOptions` with `TrackUnknownFieldPaths`, :1427-1435; none
+    /// when the CRD preserves unknown fields, :1426) and the embedded
+    /// `metadata` paths (:1442-1449). See [`Strategy::unknown_fields`].
+    ///
+    /// A PATCH reports the first path as the typed conversion of the patched
+    /// object does (`.spec.x: field not declared in schema`), which the
+    /// conformance spec for a CR PATCH expects (field_validation.go:458-461,
+    /// :607-610).
     fn check_strict(&self, cr: &CustomResource) -> Result<()> {
         if self.strict == StrictMode::Off {
             return Ok(());
         }
-        let crd = self.crd();
-        let crd_preserves = crd.spec.preserve_unknown_fields == Some(true);
-        let schema = self
-            .strategy
-            .crd_version()
-            .and_then(|v| v.schema.as_ref())
-            .and_then(|s| s.open_apiv3_schema.as_ref());
-        let schema_preserves = schema
-            .map(|s| s.x_kubernetes_preserve_unknown_fields == Some(true))
-            .unwrap_or(false);
-        let preserves = crd_preserves || schema_preserves;
-
-        if !cr.extra.is_empty() && !preserves {
-            let unknown: Vec<&String> = cr.extra.keys().collect();
-            return Err(Error::InvalidResource(match self.strict {
-                StrictMode::Patch => format!(".{}: field not declared in schema", unknown[0]),
-                _ => format!("strict decoding error: unknown field \"{}\"", unknown[0]),
-            }));
-        }
-        // The unknown fields of every embedded `metadata`
-        // (`schemaobjectmeta.CoerceWithOptions`, :1442-1449), which feed the
-        // `StrictDecodingError` (:1338-1342).
-        if let Some(path) = self
-            .strategy
-            .coerce_embedded_metadata(&mut cr.clone(), false, true)
-            .1
-            .first()
-        {
-            return Err(Error::InvalidResource(match self.strict {
-                StrictMode::Patch => format!(".{path}: field not declared in schema"),
-                _ => format!("strict decoding error: unknown field \"{path}\""),
-            }));
-        }
-        if !preserves {
-            if let Some(spec_schema) = schema
-                .and_then(|s| s.properties.as_ref())
-                .and_then(|p| p.get("spec"))
-            {
-                if let Some(spec) = &cr.spec {
-                    SchemaValidator::validate_strict(spec_schema, spec, "spec")?;
-                }
-            }
-        }
-        Ok(())
+        let (pruned, meta) = self.strategy.unknown_field_paths(cr);
+        let Some(first) = meta.first().or(pruned.first()) else {
+            return Ok(());
+        };
+        let paths = pruned.iter().chain(&meta);
+        Err(Error::InvalidResource(match self.strict {
+            // The typed conversion's walk is not ported: the first embedded
+            // `metadata` path wins, then the first pruned one.
+            StrictMode::Patch => format!(".{first}: field not declared in schema"),
+            _ => format!(
+                "strict decoding error: {}",
+                paths
+                    .map(|p| format!("unknown field \"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }))
     }
 
     fn check_write(&self, cr: &CustomResource) -> Result<()> {
