@@ -586,6 +586,10 @@ async fn main() -> Result<()> {
 
     // API Priority and Fairness: installed before the router is built, which
     // layers it on the protected routes when present (#2704).
+    post_start_hooks::register_generic_server_hooks(
+        post_start_hooks::global(),
+        args.enable_priority_and_fairness,
+    );
     if args.enable_priority_and_fairness {
         let engine = Arc::new(flow_control::FlowControlEngine::with_limits(
             storage.clone(),
