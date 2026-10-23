@@ -29,7 +29,7 @@ use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
 use rusternetes_common::validation::crd::is_crd_condition_true;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
-    resources::{CustomResource, CustomResourceDefinition, Scale},
+    resources::{CustomResource, CustomResourceDefinition, ResourceScope, Scale},
     schema_validation::SchemaValidator,
     List, Result,
 };
@@ -48,10 +48,13 @@ async fn serving_crd(
     version: &str,
     plural: &str,
     subresource: Option<&str>,
+    namespace: Option<&str>,
+    verb: &str,
 ) -> Result<Arc<CustomResourceDefinition>> {
     let crd = get_crd_for_resource(state, &format!("{plural}.{group}"))
         .await
         .map_err(|_| serving_not_found())?;
+    check_scope(&crd, namespace, verb)?;
     check_serving(&crd, version, subresource)?;
     Ok(Arc::new(crd))
 }
@@ -60,6 +63,27 @@ fn serving_not_found() -> rusternetes_common::Error {
     rusternetes_common::Error::NotFound(
         "the server could not find the requested resource".to_string(),
     )
+}
+
+/// Verbs that may address a namespaced resource across all namespaces
+/// (customresource_handler.go:225, `possiblyAcrossAllNamespacesVerbs`).
+const POSSIBLY_ACROSS_ALL_NAMESPACES_VERBS: [&str; 2] = ["list", "watch"];
+
+/// The scope gate of `crdHandler.ServeHTTP` (customresource_handler.go:
+/// 268-280): "if the scope in the CRD and the scope in request differ (with
+/// exception of the verbs in possiblyAcrossAllNamespacesVerbs for namespaced
+/// resources), pass request to the delegate, which is supposed to lead to a
+/// 404".
+fn check_scope(crd: &CustomResourceDefinition, namespace: Option<&str>, verb: &str) -> Result<()> {
+    let namespaced_crd = matches!(crd.spec.scope, ResourceScope::Namespaced);
+    let namespaced_req = namespace.is_some_and(|n| !n.is_empty());
+    if !namespaced_crd && namespaced_req {
+        return Err(serving_not_found());
+    }
+    if namespaced_crd && !namespaced_req && !POSSIBLY_ACROSS_ALL_NAMESPACES_VERBS.contains(&verb) {
+        return Err(serving_not_found());
+    }
+    Ok(())
 }
 
 /// The version/subresource/condition gates of `crdHandler.ServeHTTP`
@@ -200,7 +224,16 @@ pub async fn create_custom_resource(
     body: Bytes,
 ) -> Result<Response> {
     info!("Creating custom resource {group}/{version}/{plural}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "create",
+    )
+    .await?;
     if just_created(&crd) {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -229,7 +262,16 @@ pub async fn get_custom_resource(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "get",
+    )
+    .await?;
     endpoints::get_resource(
         &state,
         &scope(&state, &crd, &version, None, StrictMode::Off),
@@ -251,7 +293,16 @@ pub async fn list_custom_resources(
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
     // Find the CRD for this resource type
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "list",
+    )
+    .await?;
 
     // Check authorization
     let attrs = if let Some(ref ns) = namespace {
@@ -370,7 +421,16 @@ pub async fn deletecollection_custom_resources(
         "DeleteCollection custom resources {}/{}/{} (ns={:?}) params={:?}",
         group, version, plural, namespace, params
     );
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "deletecollection",
+    )
+    .await?;
     endpoints::delete_collection(
         &state,
         &scope(&state, &crd, &version, None, StrictMode::Off),
@@ -400,7 +460,16 @@ pub async fn watch_custom_resources(
     namespace: Option<String>,
     watch_params: crate::handlers::watch::WatchParams,
 ) -> Result<axum::response::Response> {
-    let crd = serving_crd(&state, group, version, plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        group,
+        version,
+        plural,
+        None,
+        namespace.as_deref(),
+        "watch",
+    )
+    .await?;
 
     // Same selectable-path gate LIST applies: reject selectors on paths the
     // CRD version did not declare via `x-kubernetes-selectable-fields`.
@@ -541,7 +610,16 @@ pub async fn update_custom_resource(
     body: Bytes,
 ) -> Result<Response> {
     info!("Updating custom resource {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "update",
+    )
+    .await?;
     endpoints::update_resource(
         &state,
         &scope(&state, &crd, &version, None, strict_mode(&params, false)),
@@ -585,7 +663,16 @@ pub async fn patch_custom_resource(
 ) -> Result<Response> {
     info!("Patching custom resource {group}/{version}/{plural}: {name}");
     let (params, content_type, body) = patch_request(req).await?;
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "patch",
+    )
+    .await?;
     endpoints::patch_resource(
         &state,
         &scope(&state, &crd, &version, None, strict_mode(&params, true)),
@@ -614,7 +701,16 @@ pub async fn patch_custom_resource_status(
 ) -> Result<Response> {
     info!("Patching custom resource status {group}/{version}/{plural}: {name}");
     let (params, content_type, body) = patch_request(req).await?;
-    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        Some("status"),
+        namespace.as_deref(),
+        "patch",
+    )
+    .await?;
     endpoints::patch_resource(
         &state,
         &scope(
@@ -649,7 +745,16 @@ pub async fn delete_custom_resource(
     body: Bytes,
 ) -> Result<Response> {
     info!("Deleting custom resource {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "delete",
+    )
+    .await?;
     endpoints::delete_resource(
         &state,
         &scope(&state, &crd, &version, None, StrictMode::Off),
@@ -1101,7 +1206,16 @@ pub async fn get_custom_resource_status(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource status {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        Some("status"),
+        namespace.as_deref(),
+        "get",
+    )
+    .await?;
     endpoints::get_resource(
         &state,
         &scope(&state, &crd, &version, Some("status"), StrictMode::Off),
@@ -1130,7 +1244,16 @@ pub async fn update_custom_resource_status(
     body: Bytes,
 ) -> Result<Response> {
     info!("Updating custom resource status {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, Some("status")).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        Some("status"),
+        namespace.as_deref(),
+        "update",
+    )
+    .await?;
     endpoints::update_resource(
         &state,
         &scope(
@@ -1198,7 +1321,16 @@ pub async fn get_custom_resource_scale(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource scale {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "get",
+    )
+    .await?;
     endpoints::get_resource(
         &state,
         &scale_scope(&state, &crd, &version)?,
@@ -1226,7 +1358,16 @@ pub async fn update_custom_resource_scale(
     body: Bytes,
 ) -> Result<Response> {
     info!("Updating custom resource scale {group}/{version}/{plural}: {name}");
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "update",
+    )
+    .await?;
     endpoints::update_resource(
         &state,
         &scale_scope(&state, &crd, &version)?,
@@ -1255,7 +1396,16 @@ pub async fn patch_custom_resource_scale(
 ) -> Result<Response> {
     info!("Patching custom resource scale {group}/{version}/{plural}: {name}");
     let (params, content_type, body) = patch_request(req).await?;
-    let crd = serving_crd(&state, &group, &version, &plural, None).await?;
+    let crd = serving_crd(
+        &state,
+        &group,
+        &version,
+        &plural,
+        None,
+        namespace.as_deref(),
+        "patch",
+    )
+    .await?;
     endpoints::patch_resource(
         &state,
         &scale_scope(&state, &crd, &version)?,
