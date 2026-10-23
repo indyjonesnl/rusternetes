@@ -1,5 +1,6 @@
-//! The workqueue and worker behind the CRD naming, establishing,
-//! nonstructuralschema and apiapproval controllers.
+//! The workqueue and worker behind the CRD naming and establishing
+//! controllers, and the workers of the nonstructuralschema and apiapproval
+//! controllers (each on its own queue, five workers, as apiserver.go:247-248).
 //!
 //! Upstream: each controller owns a rate-limited workqueue fed by informer
 //! events (`AddFunc`/`UpdateFunc`/`DeleteFunc` -> `queue.Add(key)`,
@@ -34,6 +35,12 @@ use super::condition_controllers::ConditionControllers;
 use super::customresourcedefinition::{ControllerRateLimiter, CrdRest, CRD_FINALIZER_WORKERS};
 use super::finalizer_queue::FinalizerQueue;
 
+#[derive(Clone, Copy, Debug)]
+enum ConditionKind {
+    NonStructural,
+    ApiApproval,
+}
+
 #[derive(Default)]
 struct Queue {
     order: VecDeque<String>,
@@ -50,6 +57,15 @@ pub struct CrdControllers {
     /// The CRD finalizer's own workqueue (crd_finalizer.go:73-76), drained by
     /// [`CRD_FINALIZER_WORKERS`] workers.
     pub(super) finalizer: Arc<FinalizerQueue>,
+    /// The nonstructuralschema controller's own workqueue
+    /// (`non_structural_schema_condition_controller`), drained by
+    /// [`CRD_FINALIZER_WORKERS`] workers (`go nonStructuralSchemaController.
+    /// RunWithContext(5, ...)`, apiserver.go:247).
+    pub(super) non_structural: Arc<FinalizerQueue>,
+    /// The apiapproval controller's own workqueue
+    /// (`kubernetes_api_approval_conformant_condition_controller`), five
+    /// workers (apiserver.go:248).
+    pub(super) api_approval: Arc<FinalizerQueue>,
     pub(super) conditions: ConditionControllers,
 }
 
@@ -61,6 +77,8 @@ impl Default for CrdControllers {
             started: AtomicBool::new(false),
             limiter: Mutex::new(ControllerRateLimiter::new()),
             finalizer: Arc::default(),
+            non_structural: Arc::default(),
+            api_approval: Arc::default(),
             conditions: ConditionControllers::default(),
         }
     }
@@ -71,6 +89,8 @@ impl Drop for CrdControllers {
     fn drop(&mut self) {
         self.notify.notify_one();
         self.finalizer.wake_all();
+        self.non_structural.wake_all();
+        self.api_approval.wake_all();
     }
 }
 
@@ -85,6 +105,15 @@ impl CrdControllers {
             q.order.push_back(name.to_string());
         }
         self.notify.notify_one();
+    }
+
+    /// `c.queue.Add(key)` of the nonstructuralschema and apiapproval
+    /// controllers' `enqueue` (nonstructuralschema_controller.go:239-248,
+    /// apiapproval_controller.go:233-242), called from their `AddFunc` and
+    /// `UpdateFunc`. A `DeleteFunc` does not enqueue (they only forget).
+    pub fn add_conditions(&self, name: &str) {
+        self.non_structural.add(name);
+        self.api_approval.add(name);
     }
 
     /// `queue.AddRateLimited(key)`: `add` after the per-item backoff.
@@ -148,6 +177,43 @@ impl CrdControllers {
         });
     }
 
+    /// `go wait.UntilWithContext(ctx, c.runWorker, time.Second)` of the
+    /// nonstructuralschema / apiapproval controllers (`processNextWorkItem`,
+    /// nonstructuralschema_controller.go:219-237): `Forget` on success,
+    /// `AddRateLimited` on error, then `Done`.
+    fn spawn_condition_worker(self: &Arc<Self>, kind: ConditionKind, storage: Arc<StorageBackend>) {
+        let weak = Arc::downgrade(self);
+        let queue = match kind {
+            ConditionKind::NonStructural => self.non_structural.clone(),
+            ConditionKind::ApiApproval => self.api_approval.clone(),
+        };
+        tokio::spawn(async move {
+            loop {
+                let Some(controllers) = weak.upgrade() else {
+                    return;
+                };
+                let Some(key) = queue.get() else {
+                    drop(controllers);
+                    queue.notified().await;
+                    continue;
+                };
+                let rest = CrdRest::with_controllers(storage.clone(), controllers.clone());
+                let result = match kind {
+                    ConditionKind::NonStructural => rest.sync_non_structural(&key).await,
+                    ConditionKind::ApiApproval => rest.sync_api_approval(&key).await,
+                };
+                match result {
+                    Ok(()) => queue.forget(&key),
+                    Err(e) => {
+                        warn!("customresourcedefinition {key}: {kind:?} controller failed: {e}");
+                        queue.add_rate_limited(&key);
+                    }
+                }
+                queue.done(&key);
+            }
+        });
+    }
+
     /// The worker, started once on the first add through a [`CrdRest`]
     /// (`go wait.UntilWithContext(ctx, c.runWorker, time.Second)`). It holds
     /// the controllers only weakly: when the last handle goes, it exits.
@@ -163,6 +229,12 @@ impl CrdControllers {
         // c.runWorker, time.Second) }` (crd_finalizer.go:283-285).
         for _ in 0..CRD_FINALIZER_WORKERS {
             self.spawn_finalizer_worker(storage.clone());
+        }
+        // `go nonStructuralSchemaController.RunWithContext(5, ..)`,
+        // `go apiApprovalController.RunWithContext(5, ..)` (apiserver.go:247-248).
+        for _ in 0..CRD_FINALIZER_WORKERS {
+            self.spawn_condition_worker(ConditionKind::NonStructural, storage.clone());
+            self.spawn_condition_worker(ConditionKind::ApiApproval, storage.clone());
         }
         let weak = Arc::downgrade(self);
         let notify = self.notify.clone();
@@ -186,5 +258,26 @@ impl CrdControllers {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each condition controller has a workqueue of its own
+    /// (nonstructuralschema_controller.go:66-69, apiapproval_controller.go:
+    /// 66-69): an `Add` reaches both, dedups per queue, and is independent of
+    /// the naming/establishing queue.
+    #[test]
+    fn condition_controllers_have_their_own_queues() {
+        let c = CrdControllers::default();
+        c.add_conditions("a.example.com");
+        c.add_conditions("a.example.com");
+        assert_eq!(c.non_structural.get().as_deref(), Some("a.example.com"));
+        assert_eq!(c.non_structural.get(), None);
+        assert_eq!(c.api_approval.get().as_deref(), Some("a.example.com"));
+        assert_eq!(c.api_approval.get(), None);
+        assert_eq!(c.pop(), None, "the naming queue was not fed");
     }
 }
