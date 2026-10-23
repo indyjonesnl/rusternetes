@@ -666,8 +666,15 @@ async fn main() -> Result<()> {
     }
 
     // Create shared state with CA certificate and Prometheus client
+    // `generic.Plugin.ValidateInitialization` starts the MutatingAdmissionPolicy
+    // source when the gate is on (generic/plugin.go:137-198); `None` otherwise.
+    let mutating_admission_policy =
+        admission::policy_install::new_mutating_policy_plugin(storage.clone(), authorizer.clone())
+            .await;
+
     let state = Arc::new(
         ApiServerState::new(storage, token_manager, authorizer, metrics, args.skip_auth)
+            .with_mutating_admission_policy(mutating_admission_policy)
             .with_service_cluster_ip_ranges(&service_ranges)
             .with_ca_cert(ca_cert_pem)
             .with_crd_controllers(crd_controllers)
