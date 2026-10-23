@@ -57,6 +57,31 @@ where
     }
 }
 
+/// Deserialize half of the canonical mechanism for a Go plain (non-pointer)
+/// scalar with `json:",omitempty"` (#2955): such a field is absent on the wire
+/// when zero, so Go cannot tell `0`/`false` from unset. We model it as
+/// `Option<T>` and fold the zero value to `None` on decode, so `Some(0)` is
+/// unrepresentable after decoding and `None` vs `Some(0)` comparisons (e.g.
+/// `generation != old.generation`) agree with Go.
+///
+/// Use as `#[serde(default, deserialize_with = "zero_as_none",
+/// skip_serializing_if = "is_none_or_zero")]`. A Go *pointer* scalar
+/// (`*int32`) is different: `Some(0)` is meaningful there, keep a plain
+/// `Option<T>`. A plain scalar without `omitempty` is a plain `T`.
+pub fn zero_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + PartialEq + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.filter(|v| *v != T::default()))
+}
+
+/// Serialize half of the mechanism: Go's `omitempty` drops a zero scalar, so
+/// both `None` and `Some(zero)` are omitted.
+pub fn is_none_or_zero<T: Default + PartialEq>(value: &Option<T>) -> bool {
+    value.as_ref().is_none_or(|v| *v == T::default())
+}
+
 /// Historical name of [`empty_as_none`].
 pub use self::empty_as_none as empty_string_as_none;
 
@@ -509,6 +534,44 @@ mod tests {
         assert!(w.v.is_empty() && w.n == 0 && w.s.is_empty());
         let w: W = serde_json::from_str(r#"{"v":[1,2],"n":3,"s":"x"}"#).unwrap();
         assert_eq!((w.v, w.n, w.s.as_str()), (vec![1, 2], 3, "x"));
+    }
+
+    #[test]
+    fn zero_as_none_and_is_none_or_zero() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct W {
+            #[serde(
+                default,
+                deserialize_with = "zero_as_none",
+                skip_serializing_if = "is_none_or_zero"
+            )]
+            n: Option<i64>,
+            #[serde(
+                default,
+                deserialize_with = "zero_as_none",
+                skip_serializing_if = "is_none_or_zero"
+            )]
+            b: Option<bool>,
+        }
+        let w: W = serde_json::from_str(r#"{"n":0,"b":false}"#).unwrap();
+        assert_eq!(w, W { n: None, b: None });
+        let w: W = serde_json::from_str(r#"{"n":null}"#).unwrap();
+        assert_eq!(w, W { n: None, b: None });
+        let w: W = serde_json::from_str(r#"{"n":3,"b":true}"#).unwrap();
+        assert_eq!(
+            w,
+            W {
+                n: Some(3),
+                b: Some(true)
+            }
+        );
+        // Some(zero) built in code is still omitted, as Go omitempty would.
+        let z = W {
+            n: Some(0),
+            b: Some(false),
+        };
+        assert_eq!(serde_json::to_string(&z).unwrap(), "{}");
+        assert_eq!(serde_json::to_string(&w).unwrap(), r#"{"n":3,"b":true}"#);
     }
 
     #[test]
