@@ -5133,7 +5133,7 @@ pub fn validate_pod_spec_update(
     }
 
     let mut munged_json = serde_json::to_value(&munged).unwrap_or_default();
-    let mut old_json = serde_json::to_value(old).unwrap_or_default();
+    let old_json = serde_json::to_value(old).unwrap_or_default();
     // Backfill null/missing fields in `new` with the corresponding value
     // from `old` before DeepEqual. Implements partial-update semantics
     // matching K8s' defaulting + admission pipeline re-running on every
@@ -5147,9 +5147,13 @@ pub fn validate_pod_spec_update(
     // `"resources":{}` because Go's `omitempty` does not detect empty
     // structs) would falsely trip the immutability fence even on an
     // empty client-side update.
-    strip_empty_objects(&mut munged_json);
-    strip_empty_objects(&mut old_json);
-    if munged_json != old_json {
+    // The fence compares the stripped copies, but the diff text is built from
+    // the unstripped values: upstream diffs the munged typed specs directly
+    // (validation.go:5833), so an empty `nodeSelector: {}` renders as `{}`.
+    let (mut stripped_munged, mut stripped_old) = (munged_json.clone(), old_json.clone());
+    strip_empty_objects(&mut stripped_munged);
+    strip_empty_objects(&mut stripped_old);
+    if stripped_munged != stripped_old {
         // validation.go:5830-5834: the message carries a diff of old vs munged.
         all_errs.push(Error::forbidden(
             &spec,
@@ -5540,6 +5544,27 @@ mod tests {
             )
         );
         assert_eq!(e.detail, want);
+    }
+
+    /// validation.go:5833 diffs the typed specs, so an empty (non-nil)
+    /// `nodeSelector` context line renders `{}`, not `null`.
+    #[test]
+    fn pod_spec_update_diff_keeps_empty_node_selector() {
+        let spec = |node: &str| -> PodSpec {
+            serde_json::from_value(serde_json::json!({
+                "containers": [{"name": "c", "image": "i"}],
+                "restartPolicy": "Always",
+                "nodeSelector": {},
+                "nodeName": node
+            }))
+            .unwrap()
+        };
+        let errs = validate_pod_spec_update(&spec("a"), &spec("b"), false);
+        let e = errs
+            .iter()
+            .find(|e| e.detail.starts_with("pod updates may not change"))
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert!(e.detail.contains("\"NodeSelector\": {},\n"), "{}", e.detail);
     }
 
     #[test]
