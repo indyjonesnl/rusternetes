@@ -33,7 +33,13 @@ use super::policy_dispatch::ParamScope;
 use super::policy_mutating::{
     compile_policy, MutatingEvaluator, NamespaceObjects, ObjectDefaulter, TypeConverters,
 };
-use super::policy_source::{Informer, ParamInformerFactory, PolicySource, RestMapper, RestMapping};
+use super::policy_plugin::{HookSource, MutatingPolicyPlugin};
+use super::policy_registry::{EquivalentResourceRegistry, StorageNamespaceLister};
+use super::policy_source::{
+    Informer, ParamInformerFactory, PolicySource, RestMapper, RestMapping, StorageInformer,
+    StorageParamInformerFactory,
+};
+use rusternetes_common::authz::Authorizer;
 use rusternetes_common::resources::mutating_admission_policy::{
     MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
 };
@@ -362,6 +368,94 @@ impl ObjectDefaulter for SchemeObjectDefaulter {
     }
 }
 
+type MutatingSource =
+    PolicySource<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingEvaluator>;
+
+/// The generic `Source[H]` the plugin reads, over the compiled policy source.
+impl HookSource for MutatingSource {
+    fn has_synced(&self) -> bool {
+        PolicySource::has_synced(self)
+    }
+
+    fn hooks(
+        &self,
+    ) -> Option<
+        super::policy_source::Hooks<
+            MutatingAdmissionPolicy,
+            MutatingAdmissionPolicyBinding,
+            MutatingEvaluator,
+        >,
+    > {
+        PolicySource::hooks(self)
+    }
+}
+
+/// The storage resource type (`/registry/{type}/`) a param resource lives
+/// under: built-in groups are keyed by resource name, custom resources by
+/// `{group}_{plural}` (`registry::apiextensions::customresource::storage_prefix`).
+fn param_storage_type(gvr: &GroupVersionResource) -> String {
+    if rusternetes_discovery::restmapper::is_builtin_group(&gvr.group) {
+        gvr.resource.clone()
+    } else {
+        crate::registry::apiextensions::customresource::storage_prefix(&gvr.group, &gvr.resource)
+    }
+}
+
+/// `generic.Plugin.ValidateInitialization` (generic/plugin.go:137-198) for the
+/// mutating plugin: when the `MutatingAdmissionPolicy` feature is enabled
+/// (`if !c.enabled { return nil }`, :139-143), build the source over the
+/// policy and binding informers (`SetExternalKubeInformerFactory`), the REST
+/// mapper (`SetRESTMapper`) and the authorizer (`SetAuthorizer`), and start it
+/// (`go c.source.Run(pluginContext)`, :178-183), together with the informers
+/// the informer factory starts. Returns `None` while the gate is off, so
+/// nothing watches storage and `Admission::admit` skips the plugin, exactly
+/// as upstream constructs no source for a disabled plugin.
+///
+/// The gate is read once, at startup, as upstream reads it in
+/// `InspectFeatureGates`. The plugin's per-request check
+/// ([`MutatingPolicyPlugin::enabled`]) still applies.
+pub async fn new_mutating_policy_plugin<S: Storage + 'static>(
+    storage: Arc<S>,
+    authorizer: Arc<dyn Authorizer>,
+) -> Option<Arc<MutatingPolicyPlugin>> {
+    if !MutatingPolicyPlugin::enabled() {
+        return None;
+    }
+    let policies = StorageInformer::<MutatingAdmissionPolicy>::new("mutatingadmissionpolicies");
+    let bindings =
+        StorageInformer::<MutatingAdmissionPolicyBinding>::new("mutatingadmissionpolicybindings");
+    let crds = CrdSnapshot::spawn(storage.clone()).await;
+    let source = new_mutating_policy_source(
+        policies.clone(),
+        bindings.clone(),
+        Arc::new(StorageParamInformerFactory::new(
+            storage.clone(),
+            |gvr: &GroupVersionResource| param_storage_type(gvr),
+        )),
+        Arc::new(DiscoveryRestMapper::new(crds)),
+    );
+    tokio::spawn(policies.run(storage.clone()));
+    tokio::spawn(bindings.run(storage.clone()));
+    tokio::spawn({
+        let source = source.clone();
+        async move {
+            // `policy source context unexpectedly closed` (plugin.go:179-182).
+            if let Err(e) = source.run().await {
+                tracing::error!("policy source context unexpectedly closed: {e}");
+            }
+        }
+    });
+    Some(Arc::new(MutatingPolicyPlugin {
+        source,
+        namespaces: Arc::new(StorageNamespaceLister::new(storage.clone())),
+        mapper: Arc::new(EquivalentResourceRegistry::from_discovery()),
+        namespace_objects: Arc::new(StorageNamespaceObjects::new(storage)),
+        type_converters: Arc::new(RegistryTypeConverters),
+        defaulter: Arc::new(SchemeObjectDefaulter),
+        authorizer,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,9 +470,161 @@ mod tests {
         }
     }
 
+    fn config_map_attributes() -> super::super::policy_matching::Attributes {
+        super::super::policy_matching::Attributes {
+            kind: gvk("", "v1", "ConfigMap"),
+            resource: GroupVersionResource {
+                group: String::new(),
+                version: "v1".into(),
+                resource: "configmaps".into(),
+            },
+            subresource: String::new(),
+            namespace: "default".into(),
+            name: "cm".into(),
+            operation: rusternetes_common::admission::Operation::Create,
+            object: Some(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "cm", "namespace": "default"},
+                "data": {}
+            })),
+            old_object: None,
+            user_info: None,
+            dry_run: false,
+            operation_options: None,
+        }
+    }
+
+    /// generic/plugin.go:139-143: a disabled plugin builds no source.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_is_not_installed_while_the_gate_is_off() {
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+            false,
+        );
+        let plugin = new_mutating_policy_plugin(
+            Arc::new(MemoryStorage::new()),
+            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+        )
+        .await;
+        assert!(plugin.is_none());
+    }
+
+    /// The installed plugin runs a stored policy and binding end to end:
+    /// informers -> source -> matcher -> mutating dispatcher.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn installed_plugin_applies_a_stored_policy() {
+        use super::super::policy_mutating::ReinvocationContext;
+        let _g = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+            true,
+        );
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create(
+                "/registry/mutatingadmissionpolicies/p",
+                &serde_json::json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1beta1",
+                    "kind": "MutatingAdmissionPolicy",
+                    "metadata": {"name": "p"},
+                    "spec": {
+                        "failurePolicy": "Fail",
+                        // Stored as the registry strategy defaults them.
+                        "matchConstraints": {
+                            "matchPolicy": "Equivalent",
+                            "namespaceSelector": {},
+                            "objectSelector": {},
+                            "resourceRules": [{
+                            "apiGroups": [""], "apiVersions": ["v1"],
+                            "operations": ["CREATE"], "resources": ["configmaps"]
+                        }]},
+                        "reinvocationPolicy": "Never",
+                        "mutations": [{
+                            "patchType": "JSONPatch",
+                            "jsonPatch": {"expression":
+                                "[JSONPatch{op: \"add\", path: \"/data/mutated\", value: \"yes\"}]"}
+                        }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/mutatingadmissionpolicybindings/b",
+                &serde_json::json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1beta1",
+                    "kind": "MutatingAdmissionPolicyBinding",
+                    "metadata": {"name": "b"},
+                    "spec": {"policyName": "p", "matchResources": {
+                        "matchPolicy": "Equivalent",
+                        "namespaceSelector": {},
+                        "objectSelector": {}
+                    }}
+                }),
+            )
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/namespaces/default",
+                &serde_json::json!({
+                    "apiVersion": "v1", "kind": "Namespace",
+                    "metadata": {"name": "default"}
+                }),
+            )
+            .await
+            .unwrap();
+        let plugin = new_mutating_policy_plugin(
+            storage.clone(),
+            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+        )
+        .await
+        .expect("installed while the gate is on");
+
+        let mut mutated = None;
+        let mut last = String::new();
+        for _ in 0..500 {
+            let mut attr = config_map_attributes();
+            // Not ready until the source has compiled its first hooks.
+            let r = plugin
+                .admit(&mut attr, Arc::new(ReinvocationContext::new(false)))
+                .await;
+            last = format!("{r:?} {:?}", attr.object);
+            if r.is_ok() && attr.object.as_ref().unwrap()["data"]["mutated"] == "yes" {
+                mutated = attr.object;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            mutated.is_some(),
+            "the stored policy was not applied in 5s: {last}"
+        );
+    }
+
+    #[test]
+    fn param_resources_are_keyed_like_the_stores_write_them() {
+        let gvr = |g: &str, r: &str| GroupVersionResource {
+            group: g.into(),
+            version: "v1".into(),
+            resource: r.into(),
+        };
+        assert_eq!(param_storage_type(&gvr("", "configmaps")), "configmaps");
+        assert_eq!(
+            param_storage_type(&gvr("apps", "deployments")),
+            "deployments"
+        );
+        assert_eq!(
+            param_storage_type(&gvr("example.com", "widgets")),
+            "example_com_widgets"
+        );
+    }
+
     #[tokio::test]
     async fn mutating_source_compiles_policies_with_compile_policy() {
-        use super::super::policy_source::{StorageInformer, StorageParamInformerFactory};
         let storage = Arc::new(MemoryStorage::new());
         storage
             .create(

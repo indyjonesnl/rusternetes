@@ -13,8 +13,9 @@
 //! ValidatingAdmissionPolicy and ResourceQuota
 //! ([`crate::admission::resourcequota`]). MutatingAdmissionPolicy is wired
 //! ahead of the mutating webhooks behind `Feature::MutatingAdmissionPolicy`
-//! ([`crate::admission::policy_plugin`]), but no policy source is installed
-//! in the state yet (the `patch/` package is #2996), so it does nothing.
+//! ([`crate::admission::policy_plugin`]); the server installs it at startup
+//! when the gate is on ([`crate::admission::policy_install::new_mutating_policy_plugin`]),
+//! and it does nothing otherwise.
 //!
 //! The in-tree plugins ahead of them run first, in `AllOrderedPlugins` order
 //! (plugins.go:70-101), for the resources on this path that they handle:
