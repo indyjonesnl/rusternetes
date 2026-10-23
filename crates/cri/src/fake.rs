@@ -345,6 +345,38 @@ fake_runtime_service! {
         Ok(Response::new(v1::RemoveContainerResponse {}))
     }
 
+    /// `PodSandboxStatus` (upstream `FakeRuntimeService.PodSandboxStatus`,
+    /// `fake_runtime_service.go`): the stored sandbox's id/metadata/state/labels
+    /// with `Network.Ip` = `FakePodSandboxIPs[0]` (`192.168.192.168`), so a
+    /// kubelet waiting for a pod IP observes one instead of timing out.
+    async fn pod_sandbox_status(
+        &self,
+        request: Request<v1::PodSandboxStatusRequest>,
+    ) -> Result<Response<v1::PodSandboxStatusResponse>, Status> {
+        let id = request.into_inner().pod_sandbox_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("PodSandboxStatus");
+        let Some(sb) = st.sandboxes.iter().find(|s| s.id == id) else {
+            return Err(Status::not_found(format!("pod sandbox {id} not found")));
+        };
+        let status = v1::PodSandboxStatus {
+            id: sb.id.clone(),
+            metadata: sb.metadata.clone(),
+            state: sb.state,
+            labels: sb.labels.clone(),
+            annotations: sb.annotations.clone(),
+            network: Some(v1::PodSandboxNetworkStatus {
+                ip: "192.168.192.168".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(v1::PodSandboxStatusResponse {
+            status: Some(status),
+            ..Default::default()
+        }))
+    }
+
         type GetContainerEventsStream =
             tokio_stream::Empty<Result<v1::ContainerEventResponse, Status>>;
 
@@ -357,7 +389,6 @@ fake_runtime_service! {
     }
     stubs {
         version: VersionRequest => VersionResponse,
-        pod_sandbox_status: PodSandboxStatusRequest => PodSandboxStatusResponse,
         container_status: ContainerStatusRequest => ContainerStatusResponse,
         update_container_resources: UpdateContainerResourcesRequest => UpdateContainerResourcesResponse,
         reopen_container_log: ReopenContainerLogRequest => ReopenContainerLogResponse,
