@@ -179,6 +179,9 @@ impl HostUtils for FakeHostUtil {
     fn path_is_device(&self, _pathname: &str) -> io::Result<bool> {
         copy(&self.path_is_device)
     }
+    fn get_file_type(&self, _pathname: &str) -> io::Result<super::hostutil::FileType> {
+        Err(io::Error::other("FakeHostUtil: GetFileType is not faked"))
+    }
 }
 
 struct Fixture {
