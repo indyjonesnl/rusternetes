@@ -237,6 +237,82 @@ struct Args {
     /// `--audit-log-compress` (options/audit.go:450): gzip rotated files.
     #[arg(long, default_value_t = false)]
     audit_log_compress: bool,
+
+    /// `--audit-webhook-config-file` (options/audit.go:539): kubeconfig
+    /// defining the audit webhook.
+    #[arg(long)]
+    audit_webhook_config_file: Option<String>,
+
+    /// `--audit-webhook-initial-backoff` (options/audit.go:541); the
+    /// deprecated `--audit-webhook-batch-initial-backoff` sets the same value.
+    #[arg(
+        long,
+        alias = "audit-webhook-batch-initial-backoff",
+        default_value = "10s",
+        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+    )]
+    audit_webhook_initial_backoff: std::time::Duration,
+
+    /// `--audit-webhook-version` (options/audit.go:547).
+    #[arg(long, default_value = "audit.k8s.io/v1")]
+    audit_webhook_version: String,
+
+    /// `--audit-webhook-mode` (AuditBatchOptions.AddFlags, options/audit.go:357):
+    /// batch, blocking or blocking-strict.
+    #[arg(long, default_value = "batch")]
+    audit_webhook_mode: String,
+
+    /// `--audit-webhook-batch-buffer-size` (options/audit.go:362).
+    #[arg(long, default_value_t = 10000, allow_negative_numbers = true)]
+    audit_webhook_batch_buffer_size: i64,
+
+    /// `--audit-webhook-batch-max-size` (options/audit.go:365).
+    #[arg(long, default_value_t = 400, allow_negative_numbers = true)]
+    audit_webhook_batch_max_size: i64,
+
+    /// `--audit-webhook-batch-max-wait` (options/audit.go:367).
+    #[arg(
+        long,
+        default_value = "30s",
+        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+    )]
+    audit_webhook_batch_max_wait: std::time::Duration,
+
+    /// `--audit-webhook-batch-throttle-enable` (options/audit.go:370).
+    #[arg(long, default_value_t = true, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    audit_webhook_batch_throttle_enable: bool,
+
+    /// `--audit-webhook-batch-throttle-qps` (options/audit.go:372).
+    #[arg(long, default_value_t = 10.0, allow_negative_numbers = true)]
+    audit_webhook_batch_throttle_qps: f32,
+
+    /// `--audit-webhook-batch-throttle-burst` (options/audit.go:375).
+    #[arg(long, default_value_t = 15, allow_negative_numbers = true)]
+    audit_webhook_batch_throttle_burst: i64,
+}
+
+/// The `AuditWebhookOptions` the `--audit-webhook-*` flags describe.
+fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::WebhookOptions {
+    use rusternetes_api_server::audit_webhook::{BatchConfig, BatchOptions, WebhookOptions};
+    // `int` flags: a negative value is kept so `Validate` can reject it.
+    let pos = |v: i64| v.max(0) as usize;
+    WebhookOptions {
+        config_file: args.audit_webhook_config_file.clone(),
+        initial_backoff: args.audit_webhook_initial_backoff,
+        group_version: args.audit_webhook_version.clone(),
+        batch: BatchOptions {
+            mode: args.audit_webhook_mode.clone(),
+            batch_config: BatchConfig {
+                buffer_size: pos(args.audit_webhook_batch_buffer_size),
+                max_batch_size: pos(args.audit_webhook_batch_max_size),
+                max_batch_wait: args.audit_webhook_batch_max_wait,
+                throttle_enable: args.audit_webhook_batch_throttle_enable,
+                throttle_qps: args.audit_webhook_batch_throttle_qps,
+                throttle_burst: pos(args.audit_webhook_batch_throttle_burst),
+                async_delegate: true,
+            },
+        },
+    }
 }
 
 /// `AuditLogOptions.Validate` (options/audit.go:453) for the rotation flags.
@@ -281,10 +357,19 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
     } else {
         Default::default()
     };
-    let (Some(policy_file), Some(log_path)) = (&args.audit_policy_file, &args.audit_log_path)
-    else {
-        if args.audit_policy_file.is_some() || args.audit_log_path.is_some() {
-            warn!("auditing needs both --audit-policy-file and --audit-log-path; it is off");
+    // `AuditWebhookOptions.Validate` (only when the webhook is enabled).
+    let webhook = audit_webhook_options(args);
+    let errs = webhook.validate();
+    if !errs.is_empty() {
+        anyhow::bail!("invalid audit webhook flags: {}", errs.join(", "));
+    }
+    // `ApplyTo` (options/audit.go:280-338): without a policy no events are
+    // recorded for either backend.
+    let Some(policy_file) = &args.audit_policy_file else {
+        if args.audit_log_path.is_some() || webhook.enabled() {
+            warn!(
+                "no audit policy file provided, no events will be recorded for the log or webhook backend"
+            );
         }
         return Ok(());
     };
@@ -292,14 +377,29 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
         .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
     let policy = audit::Policy::from_yaml(&yaml)
         .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
-    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
-        std::sync::Arc::new(audit::StdoutAuditBackend)
-    } else {
-        // `AuditLogOptions.getWriter`: a lumberjack writer over the file.
-        std::sync::Arc::new(
-            rusternetes_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
-                .with_context(|| format!("opening --audit-log-path {log_path}"))?,
-        )
+    let mut sinks: Vec<std::sync::Arc<dyn rusternetes_common::audit::AuditBackend>> = Vec::new();
+    if let Some(log_path) = &args.audit_log_path {
+        sinks.push(if log_path == "-" {
+            std::sync::Arc::new(audit::StdoutAuditBackend)
+        } else {
+            // `AuditLogOptions.getWriter`: a lumberjack writer over the file.
+            std::sync::Arc::new(
+                rusternetes_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
+                    .with_context(|| format!("opening --audit-log-path {log_path}"))?,
+            )
+        });
+    }
+    if webhook.enabled() {
+        sinks.push(webhook.new_backend()?.0);
+    }
+    // `c.AuditBackend = appendBackend(logBackend, dynamicBackend)`.
+    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = match sinks.len() {
+        0 => {
+            warn!("auditing needs --audit-log-path or --audit-webhook-config-file; it is off");
+            return Ok(());
+        }
+        1 => sinks.remove(0),
+        _ => std::sync::Arc::new(rusternetes_api_server::audit_webhook::UnionBackend(sinks)),
     };
     audit::install_audit(audit::AuditConfig { policy, sink });
     Ok(())

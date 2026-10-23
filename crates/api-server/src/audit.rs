@@ -13,8 +13,8 @@
 //!
 //! Not yet ported (tracked in the PR): the RequestObject body,
 //! impersonated users, the ResponseStarted -> ResponseComplete split of a
-//! long-running request, the Panic stage, the webhook backend flags, log
-//! rotation and the `legacy` format.
+//! long-running request, the Panic stage and the `legacy` format. The webhook
+//! backend lives in `audit_webhook.rs`.
 
 use axum::{
     extract::Request,
