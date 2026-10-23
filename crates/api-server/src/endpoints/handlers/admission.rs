@@ -1055,11 +1055,36 @@ impl Admission<'_> {
         )
         .await?;
         match attr.object {
-            Some(after) if after != before => serde_json::from_value(after).map_err(|e| {
-                Error::Internal(format!(
-                    "failed to decode the object mutated by admission: {e}"
-                ))
-            }),
+            Some(mut after) if after != before => {
+                // policy/mutating/dispatcher.go:274: the patched object is
+                // defaulted (a custom resource by `unstructuredDefaulter`,
+                // customresource_handler.go:1240-1249), where the patch is
+                // applied rather than by the final conversion.
+                if !self.resource.group.is_empty() {
+                    let key = rusternetes_storage::build_key(
+                        "customresourcedefinitions",
+                        None,
+                        &format!("{}.{}", self.resource.resource, self.resource.group),
+                    );
+                    if let Ok(crd) = self
+                        .state
+                        .storage
+                        .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+                        .await
+                    {
+                        rusternetes_common::resources::crd::default_custom_resource_value(
+                            &crd,
+                            &self.resource.version,
+                            &mut after,
+                        );
+                    }
+                }
+                serde_json::from_value(after).map_err(|e| {
+                    Error::Internal(format!(
+                        "failed to decode the object mutated by admission: {e}"
+                    ))
+                })
+            }
             _ => Ok(obj),
         }
     }
@@ -1410,8 +1435,9 @@ impl<T: Object> ValidateObject<T> for DeleteValidation<'_> {
 /// otherwise.
 pub struct MutatingAdmission<'a, T: Object> {
     pub admission: &'a Admission<'a>,
-    /// The mutating-webhook dispatcher decodes a webhook's patched object,
-    /// so it is defaulted and converted as any request body is.
+    /// The mutating-webhook dispatcher defaults a webhook's patched object
+    /// where it is applied; here it is converted to the storage version, which
+    /// coerces it without defaulting again.
     pub scope: &'a RequestScope<T>,
 }
 
@@ -1429,7 +1455,7 @@ impl<T: Object> TransformFunc<T> for MutatingAdmission<'_, T> {
                     .await?
             }
         };
-        self.scope.convert(&mut obj)?;
+        self.scope.convert_admitted(&mut obj)?;
         // Dedup owner references again after mutating admission:
         // update.go:185-189 and patch.go:691-697 (`patch` only dedups here).
         super::rest::dedup_owner_references_and_add_warning(&mut obj, ctx, true);
