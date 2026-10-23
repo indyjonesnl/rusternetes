@@ -427,21 +427,13 @@ Available stacks:
 
 Override files compose on top of the base stack:
 
-- **`compose.dind.all-in-one.yml`** repoints the container-runtime socket from
-  Podman's `/run/podman/podman.sock` to Docker's `/var/run/docker.sock`. Apply
-  it on Docker-only hosts for the all-in-one stack, which still runs the
-  kubelet's runtime client against a host runtime socket:
-  ```bash
-  docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
-  ```
-  The multi-container stacks (`compose.yml` / `compose.sqlite.yml` /
-  `compose.redis.yml`) and the **node-conformance** stack
-  (`compose.node-conformance.yml`) no longer need a socket override — they run
-  pods via the bundled `containerd` service over the shared `containerd-run`
-  volume (`CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock`),
-  so they
-  work unchanged on Docker or Podman. (The old `compose.dind.yml` override was
-  removed once those stacks migrated to containerd.)
+- No runtime-socket override is needed any more. Every stack —
+  multi-container, **node-conformance** and the **all-in-one** pair — runs pods
+  via a bundled `containerd` service over the shared `containerd-run` volume
+  (`CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock`), so
+  they work unchanged on Docker or Podman. (The old `compose.dind.yml` and
+  `compose.dind.all-in-one.yml` overrides were removed once the stacks
+  migrated to containerd.)
 - **`compose.local-binary.*`** bind host-built release binaries into the images
   to skip the in-container cargo build.
 
@@ -451,12 +443,14 @@ A whole cluster in one container, embedded SQLite, no etcd:
 
 ```bash
 export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
-docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d
+docker compose -f compose.all-in-one.yml up -d
 bash scripts/bootstrap-cluster.sh
 ```
 
-The container runs privileged (kube-proxy needs `CAP_NET_ADMIN`/`NET_RAW` for
-iptables) and mounts the runtime socket plus the volume directory. Use
+The `rusternetes` container runs privileged (kube-proxy needs
+`CAP_NET_ADMIN`/`NET_RAW` for iptables), shares the bundled `containerd`
+service's network namespace (so Service rules land where the pod IPs live) and
+mounts that service's CRI socket plus the volume directory. Use
 `--disable-proxy` where iptables is unavailable.
 
 ### Bare metal

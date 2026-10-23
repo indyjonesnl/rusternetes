@@ -20,7 +20,7 @@ if ! curl -sk --max-time 5 https://localhost:6443/healthz >/dev/null 2>&1; then
     echo "ERROR: API server at https://localhost:6443 is not reachable." >&2
     echo "Start the cluster first, e.g.:" >&2
     echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes" >&2
-    echo "  docker compose -f compose.all-in-one.yml -f compose.dind.all-in-one.yml up -d" >&2
+    echo "  docker compose -f compose.all-in-one.yml up -d" >&2
     echo "  bash scripts/bootstrap-cluster.sh" >&2
     exit 1
 fi

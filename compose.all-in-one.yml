@@ -1,7 +1,8 @@
 # All-in-one rusternetes with embedded SQLite storage.
 #
-# Single container — no etcd, no Redis, no external dependencies.
-# The entire cluster runs as one binary with SQLite for state.
+# One rusternetes container (the whole cluster as one binary, SQLite state)
+# plus a bundled containerd CRI runtime container. No etcd, no Redis, no host
+# container-runtime socket.
 #
 # Usage:
 #   podman compose -f compose.all-in-one.yml build
@@ -24,17 +25,15 @@ services:
     # `privileged: true` covers NET_ADMIN / NET_RAW (kube-proxy iptables)
     # plus the kubelet's mount / cgroup manipulation, so one knob.
     privileged: true
-    ports:
-      - "6443:6443"
-      - "10250:10250"
-      - "10257:10257"
-    networks:
-      - rusternetes-net
+    depends_on:
+      - containerd
+    # Joins containerd's netns (see the `containerd` service): host ports,
+    # the network attachment and aliases live on that service.
+    network_mode: "service:containerd"
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      - containerd-run:/run/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       # CSI attach/detach socket dir (#3746), off by default; uncomment together
       # with the "--csi-attacher" block in `command:` below. The in-process
       # controller-manager dials the driver socket from inside this container, so
@@ -46,7 +45,7 @@ services:
       - sqlite-data:/data/db
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command:
       - "--storage-backend"
@@ -69,12 +68,44 @@ services:
       # ships iptables / iproute2 for that — see all-in-one.Dockerfile.
       - "--console-dir"
       - "/app/console"
-      - "--network"
-      - "rusternetes-network"
       - "--cluster-dns"
       - "10.96.0.10"
       - "--volume-dir"
       - "${KUBELET_VOLUMES_PATH}"
+
+  # CRI runtime: containerd (CRI plugin) + Youki, bundled exactly like the
+  # `containerd` service in compose.sqlite.yml. The all-in-one binary talks CRI
+  # v1 to it over the shared `containerd-run` volume instead of a host
+  # Podman/Docker socket, so this stack runs unchanged on Docker or Podman.
+  # containerd owns the pod network namespace (cni0 bridge, iptables), so the
+  # `rusternetes` service joins THIS service's netns (network_mode below):
+  # the in-process kube-proxy then programs Service DNAT rules where the pod
+  # IPs live, and the node IP the kubelet advertises is reachable by pods.
+  # Single node: CNI_CONF_FROM_NODE_IPAM stays unset, so the cluster-wide
+  # conflist baked into the image applies (main.rs keeps node_net: None).
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: containerd.Dockerfile
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "10250:10250"
+      - "10257:10257"
+    networks:
+      - rusternetes-net
+    volumes:
+      - containerd-run:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      # rshared so the tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate to where containerd resolves container bind mounts.
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
 
 networks:
   rusternetes-net:
@@ -84,3 +115,8 @@ networks:
 volumes:
   sqlite-data:
     name: rusternetes-sqlite-data
+  # CRI socket shared from the containerd service to the rusternetes binary.
+  containerd-run:
+    name: rusternetes-containerd-run
+  containerd-data:
+    name: rusternetes-containerd-data
