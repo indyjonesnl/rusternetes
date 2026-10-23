@@ -35,29 +35,20 @@ pub struct PolicySpec {
     pub non_resource_path: String,
 }
 
-/// Go's `encoding/json` treats `null` as a no-op, leaving the zero value.
-fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
-}
-
 /// `v0.Policy` (`pkg/apis/abac/v0/types.go`): the unversioned legacy format.
 /// Keys are lowercased before decoding (Go's json matches case-insensitively).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V0Policy {
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub user: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub group: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub readonly: bool,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub resource: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub namespace: String,
 }
 
@@ -65,26 +56,32 @@ pub struct V0Policy {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V1beta1Policy {
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub spec: V1beta1PolicySpec,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V1beta1PolicySpec {
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub user: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub group: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub readonly: bool,
-    #[serde(rename = "apigroup", deserialize_with = "null_default")]
+    #[serde(
+        rename = "apigroup",
+        deserialize_with = "rusternetes_common::serde_helpers::null_default"
+    )]
     pub api_group: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub resource: String,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
     pub namespace: String,
-    #[serde(rename = "nonresourcepath", deserialize_with = "null_default")]
+    #[serde(
+        rename = "nonresourcepath",
+        deserialize_with = "rusternetes_common::serde_helpers::null_default"
+    )]
     pub non_resource_path: String,
 }
 

@@ -4,7 +4,7 @@
 //! under `/registry/ranges/`.
 
 use crate::types::{ObjectMeta, TypeMeta};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,26 +19,10 @@ pub struct RangeAllocation {
     /// The allocation bit array, base64 in JSON as Go encodes `[]byte`.
     #[serde(
         default,
-        serialize_with = "serialize_bytes",
-        deserialize_with = "deserialize_bytes"
+        serialize_with = "crate::serde_helpers::bytes_b64::serialize",
+        deserialize_with = "crate::serde_helpers::bytes_b64::deserialize"
     )]
     pub data: Vec<u8>,
-}
-
-fn serialize_bytes<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        data,
-    ))
-}
-
-fn deserialize_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-    // Go marshals a nil `[]byte` as `null`.
-    let Some(encoded) = Option::<String>::deserialize(d)? else {
-        return Ok(Vec::new());
-    };
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
