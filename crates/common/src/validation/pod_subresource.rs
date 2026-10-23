@@ -362,7 +362,10 @@ pub fn validate_pod_resize(new: &Pod, old: &Pod) -> ErrorList {
     if is_pod_level_resources_set(old_spec) || is_pod_level_resources_set(new_spec) {
         // pods with pod-level resources cannot be resized without the
         // InPlacePodLevelResourcesVerticalScaling feature gate being enabled.
-        if !enabled(Feature::InPlacePodLevelResourcesVerticalScaling) {
+        // `opts.InPlacePodLevelResourcesVerticalScalingEnabled`, derived as
+        // strategy.go does via `GetValidationOptionsFromPodSpecAndMeta`.
+        let opts = get_validation_options_from_pod_spec_and_meta(Some(new_spec), Some(old_spec));
+        if !opts.in_place_pod_level_resources_vertical_scaling_enabled {
             errs.push(Error::forbidden(
                 &Path::new(""),
                 "resize of pods with pod-level resources is forbidden when InPlacePodLevelResourcesVerticalScalingEnabled feature gate is disabled",
