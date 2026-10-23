@@ -25,7 +25,7 @@ const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Not ported: `Recycle` (`nfs.go:156-173`, the PV controller's recycler
 /// pod, not a kubelet concern). The `MetricsProvider` embedded in `nfs`
 /// (`volume.NewMetricsStatFS`, `nfs.go:131`, `:150`) is on the concrete
-/// mounter/unmounter; the `Mounter`/`Unmounter` traits do not yet require it.
+/// mounter/unmounter, which the `Mounter`/`Unmounter` supertrait requires.
 pub struct NfsPlugin {
     host: Arc<dyn VolumeHost>,
 }

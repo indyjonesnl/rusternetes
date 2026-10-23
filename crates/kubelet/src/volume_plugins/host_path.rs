@@ -241,8 +241,37 @@ impl crate::volume_plugins::Unmounter for HostPathUnmounter {
     }
 }
 
+impl crate::volume_plugins::plugin::MetricsProvider for HostPathMounter {
+    /// `volume.MetricsNil` (`host_path.go:215`, `:344`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for HostPathUnmounter {
+    /// `volume.MetricsNil` (`host_path.go:215`, `:344`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// `hostPath` embeds `volume.MetricsNil` (`host_path.go:215`, `:344`):
+    /// the unmounter reports "not supported" through the `Unmounter`
+    /// supertrait.
+    #[test]
+    fn unmounter_reports_metrics_not_supported() {
+        use crate::volume_plugins::plugin::MetricsProvider;
+        let want = crate::volume_plugins::util::metrics::NOT_SUPPORTED;
+        let m = super::HostPathUnmounter;
+        assert_eq!(m.get_metrics().unwrap_err().to_string(), want);
+    }
+
     use super::*;
     use crate::runtime::{check_host_path_type, HostPathCheck};
     use rusternetes_common::resources::{PersistentVolume, Volume};

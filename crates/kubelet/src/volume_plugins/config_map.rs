@@ -67,10 +67,12 @@ impl VolumePlugin for ConfigMapPlugin {
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+        let path = self
+            .host
+            .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name);
         Ok(Box::new(ConfigMapMounter {
-            path: self
-                .host
-                .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
+            metrics: crate::volume_plugins::metrics_cached::cached_du(&path),
+            path,
             volume_name: spec.volume.name.clone(),
             namespace: pod
                 .metadata
@@ -95,12 +97,12 @@ impl VolumePlugin for ConfigMapPlugin {
         pod_uid: &str,
     ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
         Ok(Box::new(
-            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
-                host: self.host.clone(),
-                plugin_name: self.name(),
-                vol_name: vol_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-            },
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
+                self.host.clone(),
+                self.name(),
+                vol_name,
+                pod_uid,
+            ),
         ))
     }
 
@@ -135,6 +137,15 @@ struct ConfigMapMounter {
     /// `configMapVolumeMounter.pod` (`configmap.go:134`), read by
     /// `MakeNestedMountpoints`.
     pod: Pod,
+    /// Embedded `volume.MetricsProvider` (`configmap.go:100`).
+    metrics: crate::volume_plugins::metrics_cached::CachedMetrics,
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for ConfigMapMounter {
+    /// `volume.NewCachedMetrics(volume.NewMetricsDu(getPath(..)))` (`configmap.go:100`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        self.metrics.get_metrics()
+    }
 }
 
 #[async_trait]
@@ -344,6 +355,21 @@ mod tests {
         assert_eq!(payload.len(), 2);
     }
 
+    /// `volume.Mounter` embeds `MetricsProvider` (`volume.go:162`): the
+    /// configMap mounter answers `NewCachedMetrics(NewMetricsDu(path))`
+    /// (`configmap.go:100`), reachable through the trait object, and a second
+    /// call returns the cached result even after the directory changes.
+    #[test]
+    fn mounter_exposes_cached_du_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), vec![0u8; 4096]).unwrap();
+        let m: Box<dyn Mounter> = Box::new(mounter(dir.path(), false));
+        let first = m.get_metrics().unwrap();
+        assert!(first.used.is_some());
+        std::fs::write(dir.path().join("g"), vec![0u8; 1 << 20]).unwrap();
+        assert_eq!(m.get_metrics().unwrap(), first);
+    }
+
     /// `if !(errors.IsNotFound(err) && optional)` (`configmap.go:168`): only a
     /// NotFound is tolerated for an optional ConfigMap; any other error fails.
     #[test]
@@ -356,6 +382,7 @@ mod tests {
 
     fn mounter(dir: &std::path::Path, optional: bool) -> ConfigMapMounter {
         ConfigMapMounter {
+            metrics: crate::volume_plugins::metrics_cached::cached_du(&dir.to_string_lossy()),
             path: dir.to_string_lossy().into_owned(),
             volume_name: "cfg".into(),
             namespace: "ns".into(),
@@ -466,6 +493,7 @@ mod tests {
             .await
             .unwrap();
         let m = ConfigMapMounter {
+            metrics: crate::volume_plugins::metrics_cached::cached_du(""),
             path: dir.to_string_lossy().into_owned(),
             volume_name: "cfg".into(),
             namespace: "ns".into(),

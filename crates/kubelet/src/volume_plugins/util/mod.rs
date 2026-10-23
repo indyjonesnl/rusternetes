@@ -345,6 +345,36 @@ pub(crate) struct WrappedEmptyDirUnmounter {
     pub(crate) plugin_name: &'static str,
     pub(crate) vol_name: String,
     pub(crate) pod_uid: String,
+    /// Embedded `volume.MetricsProvider`: `NewCachedMetrics(NewMetricsDu(..))`
+    /// for the four plugins above (`configmap.go:115`, `secret.go:119`,
+    /// `downwardapi.go:116`, `projected.go:132`); `MetricsNil` for gitRepo
+    /// (`git_repo.go:141`).
+    pub(crate) metrics: Box<dyn crate::volume_plugins::plugin::MetricsProvider + Send + Sync>,
+}
+
+impl WrappedEmptyDirUnmounter {
+    /// The four DU-backed plugins' unmounter.
+    pub(crate) fn new(
+        host: std::sync::Arc<dyn crate::volume_plugins::VolumeHost>,
+        plugin_name: &'static str,
+        vol_name: &str,
+        pod_uid: &str,
+    ) -> Self {
+        let path = host.get_pod_volume_dir(pod_uid, plugin_name, vol_name);
+        Self {
+            host,
+            plugin_name,
+            vol_name: vol_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            metrics: Box::new(crate::volume_plugins::metrics_cached::cached_du(&path)),
+        }
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for WrappedEmptyDirUnmounter {
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        self.metrics.get_metrics()
+    }
 }
 
 #[async_trait::async_trait]

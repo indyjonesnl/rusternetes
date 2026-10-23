@@ -509,6 +509,12 @@ pub(crate) mod tests {
     /// `FakeVolume`'s mounter: only `GetPath` is read by node expansion.
     struct FakeMounter;
 
+    impl crate::volume_plugins::plugin::MetricsProvider for FakeMounter {
+        fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+            Ok(Default::default())
+        }
+    }
+
     #[async_trait]
     impl Mounter for FakeMounter {
         fn get_path(&self) -> String {
