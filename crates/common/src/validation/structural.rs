@@ -981,6 +981,7 @@ fn validate_nested_value_validation_completeness(
 }
 
 pub mod defaulting;
+pub mod listtype;
 pub mod objectmeta;
 pub mod prune;
 pub mod prunenulls;
