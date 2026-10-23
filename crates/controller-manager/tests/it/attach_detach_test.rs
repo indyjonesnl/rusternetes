@@ -791,3 +791,114 @@ async fn verify_safe_to_detach_passes_when_not_in_use_or_node_missing() {
         .await
         .is_ok());
 }
+
+// ---- periodic VerifyVolumesAreAttached (reconciler.go:117-145) ----
+// `GenerateVolumesAreAttachedFunc` (operation_generator.go:194-234) marks a
+// volume whose attachment is not `status.attached` as detached, which drops it
+// from `GetVolumesToReportAttached`; `attachDesiredVolumes` reports it again
+// once `Attach` sees `status.attached`.
+
+async fn set_va_attached(s: &MemoryStorage, attached: bool) {
+    let key = build_key(
+        "volumeattachments",
+        None,
+        &attachment_name("vol-1", DRIVER, "node-1"),
+    );
+    let mut va: VolumeAttachment = s.get(&key).await.unwrap();
+    va.status = Some(serde_json::from_value(json!({"attached": attached})).unwrap());
+    s.update(&key, &va).await.unwrap();
+}
+
+async fn attached_setup() -> (Arc<MemoryStorage>, AttachDetachController<MemoryStorage>) {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_volume(&s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(&s).await;
+    // Create the VA with a controller that does not sync, then hand over to
+    // one whose first pass probes it (a restarted controller: zero timeOfLastSync).
+    controller(&s)
+        .with_disable_reconciliation_sync(true)
+        .reconcile_all()
+        .await
+        .unwrap();
+    (s.clone(), controller(&s))
+}
+
+#[tokio::test]
+async fn sync_drops_unattached_volume_from_node_status_until_confirmed() {
+    let (s, c) = attached_setup().await;
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+
+    // First pass syncs (zero timeOfLastSync): the VA never became attached.
+    c.reconcile_all().await.unwrap();
+    // The mark takes effect on the next report.
+    c.reconcile_all().await.unwrap();
+    assert!(node_attached(&s, "node-1").await.is_empty());
+    assert_eq!(vas(&s).await.len(), 1, "the attachment itself is kept");
+
+    // The driver confirms: attachDesiredVolumes reports it again.
+    set_va_attached(&s, true).await;
+    c.reconcile_all().await.unwrap();
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+}
+
+#[tokio::test]
+async fn sync_keeps_attached_volume_reported() {
+    let (s, c) = attached_setup().await;
+    set_va_attached(&s, true).await;
+    c.reconcile_all().await.unwrap();
+    c.reconcile_all().await.unwrap();
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+}
+
+#[tokio::test]
+async fn sync_disabled_or_under_one_second_keeps_unattached_volume_reported() {
+    for c in [
+        |s: &Arc<MemoryStorage>| controller(s).with_disable_reconciliation_sync(true),
+        |s: &Arc<MemoryStorage>| controller(s).with_reconciler_sync_period(WAIT),
+    ] {
+        let s = Arc::new(MemoryStorage::new());
+        seed_node(&s, "node-1", None).await;
+        seed_volume(&s, json!(["ReadWriteOnce"])).await;
+        seed_pod_p(&s).await;
+        let c = c(&s);
+        for _ in 0..3 {
+            c.reconcile_all().await.unwrap();
+        }
+        assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+    }
+}
+
+#[tokio::test]
+async fn sync_waits_for_the_period_between_probes() {
+    let s = Arc::new(MemoryStorage::new());
+    seed_node(&s, "node-1", None).await;
+    seed_volume(&s, json!(["ReadWriteOnce"])).await;
+    seed_pod_p(&s).await;
+    controller(&s)
+        .with_disable_reconciliation_sync(true)
+        .reconcile_all()
+        .await
+        .unwrap();
+    let c = controller(&s).with_reconciler_sync_period(std::time::Duration::from_secs(3600));
+    c.reconcile_all().await.unwrap(); // first sync (zero time) marks the VA
+    c.reconcile_all().await.unwrap();
+    set_va_attached(&s, true).await;
+    c.reconcile_all().await.unwrap(); // confirmed, reported again
+    set_va_attached(&s, false).await;
+    for _ in 0..2 {
+        c.reconcile_all().await.unwrap(); // period not elapsed: no probe
+    }
+    assert_eq!(node_attached(&s, "node-1").await, vec![unique()]);
+}
+
+#[tokio::test]
+async fn marked_detached_volume_is_still_deleted_when_no_longer_desired() {
+    let (s, c) = attached_setup().await;
+    c.reconcile_all().await.unwrap();
+    c.reconcile_all().await.unwrap();
+    assert!(node_attached(&s, "node-1").await.is_empty());
+    s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
+    c.reconcile_all().await.unwrap();
+    assert!(vas(&s).await.is_empty());
+}

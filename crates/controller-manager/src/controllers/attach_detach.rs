@@ -49,7 +49,24 @@
 //!   `status.volumesInUse`. A node NotFound skips the check; a read error
 //!   fails the detach. A failed detach re-adds the volume to the report
 //!   (`reconciler.go` `AddVolumeToReportAsAttached`, `:294-300`).
-//!   `VerifyVolumesAreAttached` (the periodic `syncStates` probe) is NOT ported.
+//!
+//! - periodic `VerifyVolumesAreAttached` (`reconciler.go` `reconciliationLoopFunc`
+//!   `:117-131`, `sync`/`syncStates` `:133-145`; `operation_executor.go`
+//!   `VerifyVolumesAreAttached` `:801`; `operation_generator.go`
+//!   `GenerateVolumesAreAttachedFunc` `:161-246`; `csi_attacher.go`
+//!   `VolumesAreAttached` `:198-250`, `csi_plugin.go` `skipAttach` `:858`;
+//!   test `csi_attacher_test.go` `TestAttacherVolumesAreAttached` `:652`):
+//!   every `ReconcilerSyncLoopPeriod` (default 60s,
+//!   `config/v1alpha1/defaults.go:38`; off with
+//!   `--disable-attach-detach-reconcile-sync`, ignored below 1s) each owned
+//!   attachment is probed; one whose `status.attached` is false (or whose
+//!   driver has `attachRequired: false`, pretended attached) is
+//!   `MarkVolumeAsDetached`: it leaves the node's `volumesAttached` report
+//!   until `attachDesiredVolumes` sees it attached again. Deviation: this
+//!   controller has no in-memory ASW (the VolumeAttachments are the actual
+//!   state), so "removed from the ASW" is the `marked_detached` set, and a
+//!   marked attachment that is no longer desired is still deleted rather than
+//!   leaked.
 //!
 //! - `.../reconciler/reconciler.go` `reportMultiAttachError` (`:376`), reported
 //!   once per volume/node (`MultiAttachErrorReported`, `:352`, reset when the
@@ -272,6 +289,32 @@ pub struct AttachDetachController<S: Storage> {
     plugin_manager: PluginManager,
     /// `intreeToCSITranslator`.
     translator: CsiTranslator,
+    /// `reconcilerSyncDuration` (`ReconcilerSyncLoopPeriod`).
+    sync_period: Duration,
+    /// `disableReconciliationSync`.
+    disable_reconciliation_sync: bool,
+    /// `timeOfLastSync`; `None` is the zero `time.Time`, so the first pass syncs.
+    time_of_last_sync: Mutex<Option<std::time::Instant>>,
+    /// Attachments `MarkVolumeAsDetached` dropped from the actual state of
+    /// world, by VolumeAttachment name.
+    marked_detached: Mutex<HashSet<String>>,
+}
+
+/// `ReconcilerSyncLoopPeriod` default (`config/v1alpha1/defaults.go:38`).
+pub const DEFAULT_RECONCILER_SYNC_PERIOD: Duration = Duration::from_secs(60);
+
+/// One spec of `csiAttacher.VolumesAreAttached` (`csi_attacher.go:203-249`):
+/// a driver with `attachRequired: false` is pretended attached (`skipAttach`,
+/// `csi_plugin.go:858`; no CSIDriver means attach); otherwise the attachment's
+/// own `status.attached`, and a missing attachment is not attached.
+pub fn volume_is_attached(
+    driver: Option<&CSIDriver>,
+    attachment: Option<&VolumeAttachment>,
+) -> bool {
+    if driver.is_some_and(|d| d.spec.attach_required == Some(false)) {
+        return true;
+    }
+    attachment.is_some_and(|a| a.status.as_ref().is_some_and(|s| s.attached))
 }
 
 impl<S: Storage + 'static> AttachDetachController<S> {
@@ -285,7 +328,21 @@ impl<S: Storage + 'static> AttachDetachController<S> {
             detach_requested: Default::default(),
             plugin_manager: PluginManager::new(),
             translator: CsiTranslator::new(),
+            sync_period: DEFAULT_RECONCILER_SYNC_PERIOD,
+            disable_reconciliation_sync: false,
+            time_of_last_sync: Mutex::new(None),
+            marked_detached: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn with_reconciler_sync_period(mut self, d: Duration) -> Self {
+        self.sync_period = d;
+        self
+    }
+
+    pub fn with_disable_reconciliation_sync(mut self, v: bool) -> Self {
+        self.disable_reconciliation_sync = v;
+        self
     }
 
     pub fn with_max_wait_for_unmount(mut self, d: Duration) -> Self {
@@ -728,9 +785,18 @@ impl<S: Storage + 'static> AttachDetachController<S> {
         // The volumes each node reports as attached
         // (`GetVolumesToReportAttached`): every owned attachment not already
         // being deleted.
+        // A volume `VerifyVolumesAreAttached` marked detached is not reported
+        // until it is confirmed attached again (`DeleteVolumeNode` ->
+        // `removeVolumeFromReportAsAttached`). The set only keeps attachments
+        // that still exist.
+        let marked: HashSet<String> = {
+            let mut m = self.marked_detached.lock().unwrap();
+            m.retain(|n| vas.iter().any(|v| &v.metadata.name == n));
+            m.clone()
+        };
         let mut report: HashMap<String, BTreeSet<String>> = HashMap::new();
         for (va, r) in &attached {
-            if va.metadata.deletion_timestamp.is_none() {
+            if va.metadata.deletion_timestamp.is_none() && !marked.contains(&va.metadata.name) {
                 report
                     .entry(va.spec.node_name.clone())
                     .or_default()
@@ -840,6 +906,10 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 .lock()
                 .unwrap()
                 .remove(&va.metadata.name);
+            self.marked_detached
+                .lock()
+                .unwrap()
+                .remove(&va.metadata.name);
             info!(
                 "deleted VolumeAttachment {} (volume {unique}, node {})",
                 va.metadata.name, va.spec.node_name
@@ -868,6 +938,22 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 // AttachStateAttached: "touch it to reset detachRequestedTime"
                 // (reconciler.go:342-346).
                 self.detach_requested.lock().unwrap().remove(name);
+                // A marked-detached attachment is attached again once the
+                // driver confirms it: `Attach` waits for `status.attached`
+                // and then `MarkVolumeAsAttached` (`csi_attacher.go:120`).
+                if marked.contains(name) {
+                    let confirmed = vas
+                        .iter()
+                        .find(|v| &v.metadata.name == name)
+                        .is_some_and(|v| v.status.as_ref().is_some_and(|s| s.attached));
+                    if confirmed {
+                        self.marked_detached.lock().unwrap().remove(name);
+                        report
+                            .entry(w.node.clone())
+                            .or_default()
+                            .insert(unique_volume_name(&w.driver, &w.handle));
+                    }
+                }
                 continue;
             }
             if !w.multi_attach
@@ -949,20 +1035,75 @@ impl<S: Storage + 'static> AttachDetachController<S> {
                 failed += 1;
             }
         }
+
+        // reconciliationLoopFunc (reconciler.go:117-131): reconcile, then sync.
+        self.maybe_sync(&attached, &drivers);
+
         if failed > 0 {
             anyhow::bail!("unable to update {failed} nodes");
         }
         Ok(())
+    }
+
+    /// `reconciliationLoopFunc` tail (`reconciler.go:122-130`).
+    fn maybe_sync(
+        &self,
+        attached: &[(&VolumeAttachment, CsiRef)],
+        drivers: &HashMap<String, CSIDriver>,
+    ) {
+        if self.disable_reconciliation_sync {
+            debug!("Skipping reconciling attached volumes still attached since it is disabled");
+            return;
+        }
+        if self.sync_period < Duration::from_secs(1) {
+            debug!("Skipping reconciling attached volumes still attached since it is set to less than one second");
+            return;
+        }
+        let mut last = self.time_of_last_sync.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed() <= self.sync_period) {
+            return;
+        }
+        self.sync_states(attached, drivers);
+        // `defer rc.updateSyncTime()`.
+        *last = Some(std::time::Instant::now());
+    }
+
+    /// `syncStates` (`reconciler.go:142`) -> `VerifyVolumesAreAttached`
+    /// (`operation_executor.go:801`) -> `GenerateVolumesAreAttachedFunc`
+    /// (`operation_generator.go:194-234`): probe every attachment, and
+    /// `MarkVolumeAsDetached` the ones that are not attached.
+    fn sync_states(
+        &self,
+        attached: &[(&VolumeAttachment, CsiRef)],
+        drivers: &HashMap<String, CSIDriver>,
+    ) {
+        let mut marked = self.marked_detached.lock().unwrap();
+        for (va, r) in attached {
+            if va.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            if !volume_is_attached(drivers.get(&r.driver), Some(va))
+                && marked.insert(va.metadata.name.clone())
+            {
+                info!(
+                    "VerifyVolumesAreAttached determined volume {} is no longer attached to node {}, therefore it was marked as detached.",
+                    unique_volume_name(&r.driver, &r.handle),
+                    va.spec.node_name
+                );
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        migration_supported_on_node, multi_attach_messages, MIGRATED_PLUGINS_ANNOTATION_KEY,
+        migration_supported_on_node, multi_attach_messages, volume_is_attached,
+        MIGRATED_PLUGINS_ANNOTATION_KEY,
     };
     use rusternetes_common::csi_migration::PluginManager;
     use rusternetes_common::resources::csi::CSINode;
+    use rusternetes_common::resources::csi::{CSIDriver, VolumeAttachment};
 
     fn csi_node(ann: Option<&str>) -> CSINode {
         let mut n: CSINode = serde_json::from_value(
@@ -1006,6 +1147,46 @@ mod tests {
             migration_supported_on_node(&pm, px, Some(&csi_node(Some("kubernetes.io/aws-ebs")))),
             Ok(false)
         );
+    }
+
+    fn va(attached: Option<bool>) -> VolumeAttachment {
+        let mut v = serde_json::json!({"metadata": {"name": "a"},
+            "spec": {"attacher": "d", "nodeName": "n", "source": {"persistentVolumeName": "pv"}}});
+        if let Some(a) = attached {
+            v["status"] = serde_json::json!({"attached": a});
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn driver(attach_required: Option<bool>) -> CSIDriver {
+        let mut spec = serde_json::json!({});
+        if let Some(a) = attach_required {
+            spec["attachRequired"] = a.into();
+        }
+        serde_json::from_value(serde_json::json!({"metadata": {"name": "d"}, "spec": spec}))
+            .unwrap()
+    }
+
+    /// `TestAttacherVolumesAreAttached` (`csi_attacher_test.go:652`): the
+    /// attachment's own status; a missing attachment and an absent status are
+    /// not attached; `attachRequired: false` is pretended attached.
+    #[test]
+    fn volume_is_attached_matches_csi_attacher() {
+        assert!(volume_is_attached(None, Some(&va(Some(true)))));
+        assert!(!volume_is_attached(None, Some(&va(Some(false)))));
+        assert!(!volume_is_attached(None, Some(&va(None))));
+        assert!(!volume_is_attached(None, None));
+        // CSIDriver without attachRequired, or true: attach is required.
+        assert!(!volume_is_attached(
+            Some(&driver(None)),
+            Some(&va(Some(false)))
+        ));
+        assert!(!volume_is_attached(Some(&driver(Some(true))), None));
+        assert!(volume_is_attached(Some(&driver(Some(false))), None));
+        assert!(volume_is_attached(
+            Some(&driver(Some(false))),
+            Some(&va(Some(false)))
+        ));
     }
 
     /// `Test_ReportMultiAttachError` (`reconciler_test.go:1279`): ns1/pod1 is
