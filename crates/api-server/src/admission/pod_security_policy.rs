@@ -1640,6 +1640,10 @@ mod cases;
 mod fixtures;
 
 #[cfg(test)]
+#[path = "pod_security_fixture_gen.rs"]
+mod fixture_gen;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusternetes_common::resources::pod::Pod;
