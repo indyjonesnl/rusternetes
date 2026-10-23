@@ -30,6 +30,7 @@ fn kubelet_config_is_cni_only_no_netstack_surface() {
         node_ip: String::new(),
         cloud_provider: String::new(),
         hostname_override: String::new(),
+        service_account: Default::default(),
     };
 
     // Sanity: the default config is equivalent on the fields we set.
