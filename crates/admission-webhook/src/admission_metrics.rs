@@ -608,6 +608,11 @@ pub(crate) mod tests {
             .value() as u64
     }
 
+    /// `counter`, but 0 for a series that was never observed.
+    pub(crate) fn counter_or_zero(name: &str, labels: &[(&str, &str)]) -> u64 {
+        find(name, labels).map_or(0, |m| m.get_counter().value() as u64)
+    }
+
     /// `expectHistogramCountTotal`.
     pub(crate) fn hist_count(name: &str, labels: &[(&str, &str)]) -> u64 {
         find(name, labels)
