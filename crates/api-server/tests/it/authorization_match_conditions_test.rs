@@ -273,3 +273,21 @@ async fn selector_requirements_are_visible_to_match_conditions() {
     assert!(matches!(o, Opinion::Allow(_)), "{o:?}");
     assert_eq!(n.load(Ordering::SeqCst), 1);
 }
+
+// compile.go:70-72, :91: the compiler is built from
+// `MustBaseEnvSet(DefaultCompatibilityVersion())` and compiles against its
+// `StoredExpressions` environment, which carries every library at its latest
+// version and ignores feature gates. A library function therefore compiles
+// whatever the compatibility version (#3410). No library is removed yet, so
+// nothing is rejected on this path today.
+#[test]
+fn library_functions_compile_in_the_stored_environment() {
+    for expr in [
+        "isQuantity('1Gi')",
+        "isIP(request.user)",
+        "request.user.matches('^system:')",
+    ] {
+        let got = CelMatcher::compile(&[mc(expr)]);
+        assert!(got.is_ok(), "{expr}: {got:?}");
+    }
+}

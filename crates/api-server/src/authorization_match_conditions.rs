@@ -11,6 +11,7 @@
 
 use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
 use rusternetes_common::cel_authz::compile_authorization_expression;
+use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -63,6 +64,9 @@ impl CelMatcher {
         fld_path: &Path,
     ) -> (Option<Self>, ErrorList) {
         let mut errs = ErrorList::new();
+        // `NewDefaultCompiler` (compile.go:70-72):
+        // `NewCompiler(MustBaseEnvSet(DefaultCompatibilityVersion()))`.
+        let env_set = EnvSet::must_base_env_set(cel_versions::default_compatibility_version());
         let match_conditions = fld_path.child("matchConditions");
         if conditions.len() > 64 {
             // `field.TooMany(fldPath.Child("matchConditions"), len, 64)` (validation.go:785)
@@ -100,6 +104,15 @@ impl CelMatcher {
                     errs.push(FieldError::invalid(&path, c.expression.as_str(), e));
                     continue;
                 }
+            }
+            // `CompileCELExpression` always compiles against
+            // `envSet.Env(environment.StoredExpressions)` (compile.go:91):
+            // a function no library declares is an undeclared reference.
+            if let Some(e) =
+                cel_versions::compile_failure(&c.expression, &env_set, EnvType::StoredExpressions)
+            {
+                errs.push(FieldError::invalid(&path, c.expression.as_str(), e));
+                continue;
             }
             expressions.push(c.expression.clone());
         }
