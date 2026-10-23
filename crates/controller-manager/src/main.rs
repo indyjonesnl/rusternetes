@@ -336,11 +336,19 @@ struct Args {
 
     /// Namespace of the leader-election Lease
     /// (`--leader-elect-resource-namespace`, kube-system by default).
-    #[arg(long, default_value = "kube-system")]
+    #[arg(
+        long,
+        alias = "leader-elect-resource-namespace",
+        default_value = "kube-system"
+    )]
     leader_election_resource_namespace: String,
 
     /// Name of the leader-election Lease (`--leader-elect-resource-name`).
-    #[arg(long, default_value = "kube-controller-manager")]
+    #[arg(
+        long,
+        alias = "leader-elect-resource-name",
+        default_value = "kube-controller-manager"
+    )]
     leader_election_resource_name: String,
 
     /// Leader election lease duration in seconds
@@ -408,7 +416,17 @@ struct Args {
     /// Allocate `node.spec.podCIDR` from `--cluster-cidr` (node IPAM). Off by
     /// default, matching upstream kube-controller-manager. Requires
     /// `--cluster-cidr` when enabled.
-    #[arg(long)]
+    /// A pflag bool: bare `--allocate-node-cidrs` or `=true|false` (kubeadm
+    /// passes `--allocate-node-cidrs=true`,
+    /// `cmd/kubeadm/app/phases/controlplane/manifests.go:352`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        action = clap::ArgAction::Set
+    )]
     allocate_node_cidrs: bool,
 
     /// NoExecute taints per second applied to nodes of a healthy zone
@@ -470,6 +488,163 @@ struct Args {
         value_parser = parse_clean_up_period
     )]
     legacy_service_account_token_clean_up_period: std::time::Duration,
+
+    /// Upstream `--leader-elect` (`leaderelectionconfig.go:26-30`), a pflag
+    /// bool: bare or `=true` enables; overrides `--enable-leader-election`.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    leader_elect: Option<bool>,
+
+    /// Upstream `--leader-elect-lease-duration` (Go duration, e.g. `15s`).
+    #[arg(long)]
+    leader_elect_lease_duration: Option<String>,
+
+    /// Upstream `--leader-elect-renew-deadline` (Go duration, e.g. `10s`).
+    #[arg(long)]
+    leader_elect_renew_deadline: Option<String>,
+
+    /// Upstream `--leader-elect-retry-period` (Go duration, e.g. `2s`).
+    #[arg(long)]
+    leader_elect_retry_period: Option<String>,
+
+    /// Upstream `--leader-elect-resource-lock`; only `leases` is supported
+    /// (`leaderelectionconfig.go:48-50`).
+    #[arg(long)]
+    leader_elect_resource_lock: Option<String>,
+
+    /// Upstream `--profiling` (`controller-manager/options/debugging.go:46`).
+    /// Accepted for argv compatibility; no pprof handlers are served.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    profiling: Option<bool>,
+
+    /// Upstream `--contention-profiling` (`debugging.go:48`). Accepted, ignored.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    contention_profiling: Option<bool>,
+
+    /// Upstream `--controllers` (`controller-manager/options/generic.go:65`).
+    /// Accepted for argv compatibility; the controller set is not selectable
+    /// yet, so it is ignored with a WARN.
+    #[arg(long, value_delimiter = ',')]
+    controllers: Vec<String>,
+
+    /// Upstream `--use-service-account-credentials`
+    /// (`cloud-provider/options/kubecloudshared.go:57`). Accepted, ignored.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    use_service_account_credentials: Option<bool>,
+
+    /// Upstream `--configure-cloud-routes` (`kubecloudshared.go:67`, default
+    /// true). Accepted, ignored.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    configure_cloud_routes: Option<bool>,
+
+    /// Upstream `--root-ca-file` (`serviceaccountcontroller.go:38`). Accepted, ignored.
+    #[arg(long)]
+    root_ca_file: Option<String>,
+
+    /// Upstream `--service-account-private-key-file`
+    /// (`serviceaccountcontroller.go:36`). Accepted, ignored.
+    #[arg(long)]
+    service_account_private_key_file: Option<String>,
+
+    /// Upstream `--cluster-signing-cert-file` (`csrsigningcontroller.go:38`).
+    /// Accepted, ignored.
+    #[arg(long)]
+    cluster_signing_cert_file: Option<String>,
+
+    /// Upstream `--cluster-signing-key-file` (`csrsigningcontroller.go:39`).
+    /// Accepted, ignored.
+    #[arg(long)]
+    cluster_signing_key_file: Option<String>,
+}
+
+/// Effective leader-election settings after resolving the upstream flag
+/// names (`--leader-elect*`) over the native `--leader-election-*` ones.
+#[derive(Debug, PartialEq)]
+struct LeaderElectionSettings {
+    enabled: bool,
+    lease_duration: std::time::Duration,
+    renew_deadline: std::time::Duration,
+    retry_period: std::time::Duration,
+}
+
+impl Args {
+    /// Upstream flag names win over the native ones when given (same shape as
+    /// the scheduler, #3907).
+    fn leader_election_settings(&self) -> Result<LeaderElectionSettings, String> {
+        let dur =
+            |flag: &str, v: &Option<String>, native: u64| -> Result<std::time::Duration, String> {
+                match v {
+                    None => Ok(std::time::Duration::from_secs(native)),
+                    Some(s) => {
+                        let ns = rusternetes_common::go_duration::parse_go_duration(s)
+                            .map_err(|e| format!("invalid value {s:?} for --{flag}: {e}"))?;
+                        Ok(std::time::Duration::from_nanos(ns.max(0) as u64))
+                    }
+                }
+            };
+        if let Some(lock) = &self.leader_elect_resource_lock {
+            if lock != "leases" {
+                return Err(format!(
+                    "invalid --leader-elect-resource-lock {lock:?}: only \"leases\" is supported"
+                ));
+            }
+        }
+        Ok(LeaderElectionSettings {
+            enabled: self.leader_elect.unwrap_or(self.enable_leader_election),
+            lease_duration: dur(
+                "leader-elect-lease-duration",
+                &self.leader_elect_lease_duration,
+                self.leader_election_lease_duration,
+            )?,
+            renew_deadline: dur(
+                "leader-elect-renew-deadline",
+                &self.leader_elect_renew_deadline,
+                self.leader_election_renew_deadline,
+            )?,
+            retry_period: dur(
+                "leader-elect-retry-period",
+                &self.leader_elect_retry_period,
+                self.leader_election_retry_period,
+            )?,
+        })
+    }
+
+    /// Names of accepted-but-unimplemented upstream flags that were given.
+    fn ignored_upstream_flags(&self) -> Vec<&'static str> {
+        let given = [
+            (self.profiling == Some(true), "--profiling"),
+            (
+                self.contention_profiling == Some(true),
+                "--contention-profiling",
+            ),
+            (!self.controllers.is_empty(), "--controllers"),
+            (
+                self.use_service_account_credentials.is_some(),
+                "--use-service-account-credentials",
+            ),
+            (
+                self.configure_cloud_routes.is_some(),
+                "--configure-cloud-routes",
+            ),
+            (self.root_ca_file.is_some(), "--root-ca-file"),
+            (
+                self.service_account_private_key_file.is_some(),
+                "--service-account-private-key-file",
+            ),
+            (
+                self.cluster_signing_cert_file.is_some(),
+                "--cluster-signing-cert-file",
+            ),
+            (
+                self.cluster_signing_key_file.is_some(),
+                "--cluster-signing-key-file",
+            ),
+        ];
+        given
+            .into_iter()
+            .filter(|(g, _)| *g)
+            .map(|(_, n)| n)
+            .collect()
+    }
 }
 
 /// Parse a Go duration (`time.ParseDuration`) for a clap flag.
@@ -733,6 +908,13 @@ async fn main() -> Result<()> {
 
     rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
 
+    for flag in args.ignored_upstream_flags() {
+        warn!("{flag} is accepted for upstream argv compatibility and ignored (not implemented)");
+    }
+    let le = args
+        .leader_election_settings()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     // In-cluster static-pod path: run as an api-server client, no storage handle.
     if args.kubeconfig.is_some() {
         info!(
@@ -833,7 +1015,7 @@ async fn main() -> Result<()> {
     let cloud_provider: Option<Arc<dyn CloudProvider>> = None;
 
     // Initialize leader election if enabled
-    let leader_elector = if args.enable_leader_election {
+    let leader_elector = if le.enabled {
         let identity = args
             .leader_election_identity
             .clone()
@@ -867,9 +1049,9 @@ async fn main() -> Result<()> {
                         "kube-controller-manager",
                     ),
                 ),
-                lease_duration: std::time::Duration::from_secs(args.leader_election_lease_duration),
-                renew_deadline: std::time::Duration::from_secs(args.leader_election_renew_deadline),
-                retry_period: std::time::Duration::from_secs(args.leader_election_retry_period),
+                lease_duration: le.lease_duration,
+                renew_deadline: le.renew_deadline,
+                retry_period: le.retry_period,
                 release_on_cancel: false,
                 name: args.leader_election_resource_name.clone(),
                 callbacks: rusternetes_common::leaderelection::LeaderCallbacks {
@@ -2000,5 +2182,131 @@ mod pv_recycler_flag_tests {
         assert!(err.to_string().starts_with(
             "failed to probe volume plugins when starting persistentvolume controller: failed to read file path /nonexistent/pod.yaml: "
         ));
+    }
+}
+
+/// Upstream-argv fixtures (#3908 / #1882): feed the real kubeadm argv to our
+/// clap definition and assert it parses with the expected effective values.
+#[cfg(test)]
+mod upstream_argv_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Secure-serving flags owned by open PR #3538 (bind-address, authn/authz
+    /// kubeconfigs, CA files). Drop entries here as that PR lands.
+    const PENDING_3538: &[&str] = &[
+        "--bind-address",
+        "--authentication-kubeconfig",
+        "--authorization-kubeconfig",
+        "--client-ca-file",
+        "--requestheader-client-ca-file",
+    ];
+
+    fn fixture_argv(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .filter(|a| {
+                let name = a.split('=').next().unwrap();
+                !PENDING_3538.contains(&name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn kubeadm_kube_controller_manager_argv_parses() {
+        let argv = fixture_argv(include_str!(
+            "../tests/fixtures/kubeadm-kube-controller-manager.args"
+        ));
+        let args = Args::try_parse_from(&argv).expect("kubeadm argv must parse");
+        assert!(args.allocate_node_cidrs);
+        assert_eq!(args.cluster_cidr.as_deref(), Some("10.244.0.0/16"));
+        assert_eq!(
+            args.service_cluster_ip_range.as_deref(),
+            Some("10.96.0.0/12")
+        );
+        assert_eq!(args.cluster_name, "kubernetes");
+        assert_eq!(
+            args.kubeconfig.as_deref(),
+            Some("/etc/kubernetes/controller-manager.conf")
+        );
+        let le = args.leader_election_settings().unwrap();
+        assert!(le.enabled);
+        assert_eq!(le.lease_duration, Duration::from_secs(15));
+        // The accepted-but-ignored flags are reported, never silent.
+        assert_eq!(
+            args.ignored_upstream_flags(),
+            vec![
+                "--controllers",
+                "--use-service-account-credentials",
+                "--root-ca-file",
+                "--service-account-private-key-file",
+                "--cluster-signing-cert-file",
+                "--cluster-signing-key-file",
+            ]
+        );
+    }
+
+    // component-base leaderelectionconfig.go:26-57 names; Go durations.
+    #[test]
+    fn upstream_leader_elect_flags_resolve() {
+        let a = Args::try_parse_from([
+            "kube-controller-manager",
+            "--leader-elect",
+            "--leader-elect-lease-duration=30s",
+            "--leader-elect-renew-deadline=20s",
+            "--leader-elect-retry-period=5s",
+            "--leader-elect-resource-lock=leases",
+            "--leader-elect-resource-name=cm",
+            "--leader-elect-resource-namespace=ns",
+        ])
+        .unwrap();
+        let s = a.leader_election_settings().unwrap();
+        assert_eq!(
+            s,
+            LeaderElectionSettings {
+                enabled: true,
+                lease_duration: Duration::from_secs(30),
+                renew_deadline: Duration::from_secs(20),
+                retry_period: Duration::from_secs(5),
+            }
+        );
+        assert_eq!(a.leader_election_resource_name, "cm");
+        assert_eq!(a.leader_election_resource_namespace, "ns");
+    }
+
+    #[test]
+    fn native_leader_election_flags_unchanged() {
+        let a = Args::try_parse_from(["cm", "--enable-leader-election"]).unwrap();
+        let s = a.leader_election_settings().unwrap();
+        assert!(s.enabled);
+        assert_eq!(s.retry_period, Duration::from_secs(2));
+        let a = Args::try_parse_from(["cm", "--enable-leader-election", "--leader-elect=false"])
+            .unwrap();
+        assert!(!a.leader_election_settings().unwrap().enabled);
+    }
+
+    #[test]
+    fn invalid_lock_and_duration_rejected() {
+        let a = Args::try_parse_from(["cm", "--leader-elect-resource-lock=configmaps"]).unwrap();
+        assert!(a.leader_election_settings().is_err());
+        let a = Args::try_parse_from(["cm", "--leader-elect-lease-duration=abc"]).unwrap();
+        assert!(a.leader_election_settings().is_err());
+    }
+
+    #[test]
+    fn allocate_node_cidrs_pflag_bool_forms() {
+        assert!(!Args::try_parse_from(["cm"]).unwrap().allocate_node_cidrs);
+        assert!(
+            Args::try_parse_from(["cm", "--allocate-node-cidrs"])
+                .unwrap()
+                .allocate_node_cidrs
+        );
+        assert!(
+            !Args::try_parse_from(["cm", "--allocate-node-cidrs=false"])
+                .unwrap()
+                .allocate_node_cidrs
+        );
     }
 }
