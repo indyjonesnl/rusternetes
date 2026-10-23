@@ -22,8 +22,6 @@
 //! Not ported here, and still served by the bespoke handlers:
 //! - list and watch, tracked in #2135;
 //! - table conversion;
-//! - `x-kubernetes-list-type` map/set uniqueness (`listtype.ValidateListSetsAndMaps`)
-//!   is [`Strategy::list_type_errors`].
 //!
 //! `schemaobjectmeta.Validate` (embedded resources) and the `hasBlockingErr`
 //! gate before the CEL rules run in `Strategy::validate`/`validate_update` and
