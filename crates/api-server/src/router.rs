@@ -83,6 +83,36 @@ async fn api_groups_with_aggregated_resources(
                 else {
                     continue;
                 };
+                // Serve the discovery manager's merged document
+                // (kube-aggregator handler_discovery.go `discoveryManager`:
+                // the aggregated `/apis` handler serves what
+                // `syncAPIService` merged, with its `freshness`). A GV the
+                // manager has not merged yet, or one it could only mark
+                // Stale with no resources (backend not Available yet), falls
+                // back to the per-request fetch below -- a deviation kept
+                // until the manager's resync covers that window.
+                if let Some(entry) = rusternetes_api_server::apiservice_registration::merged_discovery()
+                    .groups()
+                    .get(&group)
+                    .and_then(|vs| vs.get(&version))
+                    .filter(|e| {
+                        e.freshness == rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Current
+                            || !e.resources.is_empty()
+                    })
+                {
+                    ver["resources"] = serde_json::Value::Array(entry.resources.clone());
+                    ver["freshness"] = serde_json::Value::String(
+                        match entry.freshness {
+                            rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Current => {
+                                "Current"
+                            }
+                            rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Stale => "Stale",
+                        }
+                        .to_string(),
+                    );
+                    changed = true;
+                    continue;
+                }
                 if let Some(resources) =
                     handlers::aggregator::aggregated_discovery_resources(&state, &group, &version)
                         .await

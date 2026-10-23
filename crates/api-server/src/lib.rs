@@ -1,3 +1,8 @@
+// The router module is compiled into both this lib and the bin; it names the
+// shared process-global state through the extern crate path, which `self`
+// aliases here.
+extern crate self as rusternetes_api_server;
+
 pub mod abac;
 pub mod admission;
 pub mod audit;
@@ -14,6 +19,7 @@ pub mod negotiated_error;
 pub mod request_scope;
 pub mod request_timeout;
 pub use rusternetes_admission_webhook as admission_webhook;
+pub mod aggregated_discovery;
 pub mod apiserver_identity;
 pub mod apiservice_registration;
 pub mod autoregister;
