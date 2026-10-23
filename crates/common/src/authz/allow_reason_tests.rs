@@ -288,7 +288,7 @@ async fn builtin_and_node_reasons_match_upstream() {
         Opinion::Allow(String::new())
     );
     assert_eq!(
-        NodeAuthorizer
+        NodeAuthorizer::default()
             .authorize_opinion(&attrs("alice"))
             .await
             .unwrap(),
@@ -298,7 +298,7 @@ async fn builtin_and_node_reasons_match_upstream() {
         }
     );
     assert_eq!(
-        NodeAuthorizer
+        NodeAuthorizer::default()
             .authorize_opinion(&attrs("system:node:"))
             .await
             .unwrap(),
@@ -345,13 +345,19 @@ async fn node_default_and_success_reasons_are_empty() {
     let mut own_node = own.clone();
     own_node.resource = "nodes".into();
     assert_eq!(
-        NodeAuthorizer.authorize_opinion(&own_node).await.unwrap(),
+        NodeAuthorizer::default()
+            .authorize_opinion(&own_node)
+            .await
+            .unwrap(),
         Opinion::Allow(String::new())
     );
     let mut unknown = own.clone();
     unknown.resource = "not-a-node-resource".into();
     assert_eq!(
-        NodeAuthorizer.authorize_opinion(&unknown).await.unwrap(),
+        NodeAuthorizer::default()
+            .authorize_opinion(&unknown)
+            .await
+            .unwrap(),
         Opinion::NoOpinion {
             reason: String::new(),
             error: None
@@ -360,7 +366,10 @@ async fn node_default_and_success_reasons_are_empty() {
     let mut no_group = own_node;
     no_group.user.groups.clear();
     assert_eq!(
-        NodeAuthorizer.authorize_opinion(&no_group).await.unwrap(),
+        NodeAuthorizer::default()
+            .authorize_opinion(&no_group)
+            .await
+            .unwrap(),
         Opinion::NoOpinion {
             reason: String::new(),
             error: None

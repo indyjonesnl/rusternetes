@@ -221,6 +221,7 @@ mod networking_rbac_decode_when_absent_test;
 mod networkpolicy_default_policytypes_test;
 mod networkpolicy_handler_test;
 mod networkpolicy_update_validation_test;
+mod node_authorizer_graph_test;
 mod node_generic_store_test;
 mod node_handler_test;
 mod node_restriction_pcr_test;
