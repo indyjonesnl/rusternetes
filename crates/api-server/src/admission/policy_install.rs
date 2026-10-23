@@ -30,6 +30,7 @@ use rusternetes_storage::{build_prefix, Storage, WatchEvent};
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
+use super::policy_matching::EquivalentResourceMapper;
 use super::policy_mutating::{
     compile_policy, MutatingEvaluator, NamespaceObjects, ObjectDefaulter, TypeConverters,
 };
@@ -179,6 +180,143 @@ impl CrdSnapshot {
             }
         });
         snapshot
+    }
+}
+
+/// The `EquivalentResourceMapper` the matcher reads: the built-in registry
+/// ([`EquivalentResourceRegistry::from_discovery`], installer.go:1127) plus
+/// every established CustomResourceDefinition.
+///
+/// Ported from staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/
+/// customresource_handler.go:762-768 (`getOrCreateServingInfoFor`): for every
+/// version in `crd.Spec.Versions` (served or not), `RegisterKindFor(resource,
+/// "", kind)`, plus `"status"` with the same kind when the version has a status
+/// subresource and `"scale"` with `autoscaling/v1 Scale` when it has a scale
+/// subresource. The resource and kind are `crd.Status.AcceptedNames` (:716-736,
+/// which `getOrCreateServingInfoFor` requires non-empty; here `spec.names` is
+/// the fallback until status is populated).
+///
+/// Deviation (stated): upstream builds a fresh registry per CRD serving-info
+/// (:651), dropped with the CRD's storage on update/delete. Here one registry
+/// is rebuilt from the [`CrdSnapshot`] whenever the CRD set changed, which has
+/// the same lifetime semantics (a deleted or renamed CRD leaves no entries).
+/// Only Established CRDs are registered, as only those get a serving-info
+/// (customresource_handler.go `ServeHTTP` :300-313).
+pub struct CrdEquivalentRegistry {
+    builtin: EquivalentResourceRegistry,
+    crds: Arc<CrdSnapshot>,
+    cached: Mutex<Option<(u64, Arc<EquivalentResourceRegistry>)>>,
+}
+
+impl CrdEquivalentRegistry {
+    pub fn new(builtin: EquivalentResourceRegistry, crds: Arc<CrdSnapshot>) -> Self {
+        Self {
+            builtin,
+            crds,
+            cached: Mutex::new(None),
+        }
+    }
+
+    fn crd_registry(&self) -> Arc<EquivalentResourceRegistry> {
+        let generation = self.crds.generation();
+        let mut cached = self.cached.lock().unwrap();
+        if let Some((g, r)) = cached.as_ref() {
+            if *g == generation {
+                return r.clone();
+            }
+        }
+        let reg = Arc::new(EquivalentResourceRegistry::new());
+        for crd in self
+            .crds
+            .values()
+            .iter()
+            .filter(|c| rusternetes_discovery::crd_established(c))
+        {
+            register_crd(&reg, crd);
+        }
+        *cached = Some((generation, reg.clone()));
+        reg
+    }
+}
+
+/// customresource_handler.go:754-769 for one CRD document.
+fn register_crd(reg: &EquivalentResourceRegistry, crd: &Value) {
+    let text = |ptr: &str| crd.pointer(ptr).and_then(|v| v.as_str()).unwrap_or("");
+    let group = text("/spec/group");
+    let accepted = |field: &str| match text(&format!("/status/acceptedNames/{field}")) {
+        "" => text(&format!("/spec/names/{field}")),
+        s => s,
+    };
+    let (plural, kind) = (accepted("plural"), accepted("kind"));
+    if plural.is_empty() || kind.is_empty() {
+        return;
+    }
+    for ver in crd
+        .pointer("/spec/versions")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = ver.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let resource = GroupVersionResource {
+            group: group.to_string(),
+            version: name.to_string(),
+            resource: plural.to_string(),
+        };
+        let own_kind = GroupVersionKind {
+            group: group.to_string(),
+            version: name.to_string(),
+            kind: kind.to_string(),
+        };
+        // `GetSubresourcesForVersion`: the per-version field, or the
+        // top-level (v1beta1-era) one.
+        let has = |sub: &str| {
+            ver.pointer(&format!("/subresources/{sub}"))
+                .is_some_and(|v| !v.is_null())
+                || crd
+                    .pointer(&format!("/spec/subresources/{sub}"))
+                    .is_some_and(|v| !v.is_null())
+        };
+        reg.register_kind_for(resource.clone(), "", own_kind.clone());
+        if has("status") {
+            reg.register_kind_for(resource.clone(), "status", own_kind);
+        }
+        if has("scale") {
+            reg.register_kind_for(
+                resource,
+                "scale",
+                GroupVersionKind {
+                    group: "autoscaling".into(),
+                    version: "v1".into(),
+                    kind: "Scale".into(),
+                },
+            );
+        }
+    }
+}
+
+impl EquivalentResourceMapper for CrdEquivalentRegistry {
+    fn equivalent_resources_for(
+        &self,
+        resource: &GroupVersionResource,
+        subresource: &str,
+    ) -> Vec<GroupVersionResource> {
+        let builtin = self.builtin.equivalent_resources_for(resource, subresource);
+        if !builtin.is_empty() {
+            return builtin;
+        }
+        self.crd_registry()
+            .equivalent_resources_for(resource, subresource)
+    }
+
+    fn kind_for(&self, resource: &GroupVersionResource, subresource: &str) -> GroupVersionKind {
+        let builtin = self.builtin.kind_for(resource, subresource);
+        if !builtin.kind.is_empty() {
+            return builtin;
+        }
+        self.crd_registry().kind_for(resource, subresource)
     }
 }
 
@@ -432,7 +570,7 @@ pub async fn new_mutating_policy_plugin<S: Storage + 'static>(
             storage.clone(),
             |gvr: &GroupVersionResource| param_storage_type(gvr),
         )),
-        Arc::new(DiscoveryRestMapper::new(crds)),
+        Arc::new(DiscoveryRestMapper::new(crds.clone())),
     );
     tokio::spawn(policies.run(storage.clone()));
     tokio::spawn(bindings.run(storage.clone()));
@@ -448,7 +586,10 @@ pub async fn new_mutating_policy_plugin<S: Storage + 'static>(
     Some(Arc::new(MutatingPolicyPlugin {
         source,
         namespaces: Arc::new(StorageNamespaceLister::new(storage.clone())),
-        mapper: Arc::new(EquivalentResourceRegistry::from_discovery()),
+        mapper: Arc::new(CrdEquivalentRegistry::new(
+            EquivalentResourceRegistry::from_discovery(),
+            crds,
+        )),
         namespace_objects: Arc::new(StorageNamespaceObjects::new(storage)),
         type_converters: Arc::new(RegistryTypeConverters),
         defaulter: Arc::new(SchemeObjectDefaulter),
@@ -870,5 +1011,87 @@ mod tests {
         assert!(c.has_type_converter(&gvk("", "v1", "ConfigMap")));
         assert!(c.has_type_converter(&gvk("apps", "v1", "Deployment")));
         assert!(!c.has_type_converter(&gvk("example.com", "v1", "Widget")));
+    }
+
+    fn equiv_crd(established: bool) -> Value {
+        serde_json::json!({
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "kind": "Widget"},
+                "versions": [
+                    {"name": "v1", "served": true, "storage": true,
+                     "subresources": {"status": {}, "scale": {"specReplicasPath": ".spec.replicas"}}},
+                    {"name": "v2", "served": false, "storage": false}
+                ]
+            },
+            "status": {"conditions": [{"type": "Established",
+                "status": if established { "True" } else { "False" }}]}
+        })
+    }
+
+    fn equiv_gvr(g: &str, v: &str, r: &str) -> GroupVersionResource {
+        GroupVersionResource {
+            group: g.into(),
+            version: v.into(),
+            resource: r.into(),
+        }
+    }
+
+    /// customresource_handler.go:762-768: every version (served or not) is
+    /// registered for "", "status" when subresources.status is set, and
+    /// "scale" as autoscaling/v1 Scale; built-ins still resolve.
+    #[test]
+    fn crd_resources_are_registered_as_equivalent() {
+        let crds = Arc::new(CrdSnapshot::default());
+        crds.apply("widgets.example.com", equiv_crd(true));
+        let reg = CrdEquivalentRegistry::new(EquivalentResourceRegistry::from_discovery(), crds);
+        let v1 = equiv_gvr("example.com", "v1", "widgets");
+        let v2 = equiv_gvr("example.com", "v2", "widgets");
+        assert_eq!(
+            reg.equivalent_resources_for(&v1, ""),
+            vec![v1.clone(), v2.clone()]
+        );
+        assert_eq!(
+            reg.equivalent_resources_for(&v2, ""),
+            vec![v1.clone(), v2.clone()]
+        );
+        assert_eq!(reg.kind_for(&v2, ""), gvk("example.com", "v2", "Widget"));
+        assert_eq!(
+            reg.kind_for(&v1, "status"),
+            gvk("example.com", "v1", "Widget")
+        );
+        assert_eq!(
+            reg.kind_for(&v1, "scale"),
+            gvk("autoscaling", "v1", "Scale")
+        );
+        // v2 has no status subresource: only v1 registered "status", and the
+        // equivalents are keyed by group-resource (mapper.go), not version.
+        assert_eq!(reg.kind_for(&v2, "status"), gvk("", "", ""));
+        assert_eq!(
+            reg.equivalent_resources_for(&v2, "status"),
+            vec![v1.clone()]
+        );
+        // Built-ins are untouched.
+        assert!(!reg
+            .equivalent_resources_for(&equiv_gvr("", "v1", "pods"), "")
+            .is_empty());
+    }
+
+    /// A CRD that is not Established has no serving info, and a deleted CRD
+    /// drops out (upstream drops the per-CRD registry with its storage).
+    #[test]
+    fn unestablished_and_deleted_crds_are_not_registered() {
+        let crds = Arc::new(CrdSnapshot::default());
+        let reg =
+            CrdEquivalentRegistry::new(EquivalentResourceRegistry::from_discovery(), crds.clone());
+        let v1 = equiv_gvr("example.com", "v1", "widgets");
+        crds.apply("widgets.example.com", equiv_crd(false));
+        assert!(reg.equivalent_resources_for(&v1, "").is_empty());
+        crds.apply("widgets.example.com", equiv_crd(true));
+        assert_eq!(reg.equivalent_resources_for(&v1, "").len(), 2);
+        crds.remove("widgets.example.com");
+        assert!(reg.equivalent_resources_for(&v1, "").is_empty());
+        assert_eq!(reg.kind_for(&v1, ""), gvk("", "", ""));
     }
 }
