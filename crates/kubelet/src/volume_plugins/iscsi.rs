@@ -5,10 +5,8 @@
 //!
 //! Not ported (each noted at its call site):
 //!
-//! - `Mounter`/`Unmounter` do not embed `MetricsProvider` as a supertrait
-//!   (#3483); the filesystem mounter/unmounter implement it directly with
-//!   `volume.NewMetricsStatFS` (`iscsi.go:128`, `:194`), and the block
-//!   mapper's `NewMetricsBlock` is ported ([`super::util::metrics`]).
+//! - `GetMetrics` failing with partial metrics (the trait returns
+//!   `Result<Metrics>`, not upstream's `(*Metrics, error)`).
 //! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`iscsi.go:286`, `:294`):
 //!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of

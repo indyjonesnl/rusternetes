@@ -567,6 +567,24 @@ pub(crate) struct FcDiskMounter {
     pub mounted_with_selinux_context: Arc<AtomicBool>,
 }
 
+impl crate::volume_plugins::plugin::MetricsProvider for FcDiskMounter {
+    /// `fcDisk` embeds `volume.MetricsNil` (`fc.go:353`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for FcDiskUnmounter {
+    /// `fcDisk` embeds `volume.MetricsNil` (`fc.go:353`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
+    }
+}
+
 #[async_trait]
 impl super::Mounter for FcDiskMounter {
     fn get_path(&self) -> String {
