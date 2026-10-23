@@ -19,12 +19,13 @@
 //! | `ContainerStopSignals` | Alpha, off | `lifecycle.stopSignal` |
 //! | `ResourceHealthStatus` | Alpha, off | `allocatedResourcesStatus` of container statuses |
 //! | `GenericWorkload` | Alpha, off | `spec.workloadRef` |
+//! | `EnvFiles` | Beta, on (modelled for a test that forces it off) | `env[].valueFrom.fileKeyRef` |
 //!
 //! The gates `DropDisabledPodFields` also names that are on by default in 1.35
 //! (`UserNamespacesSupport`, `SupplementalGroupsPolicy`, `ProcMountType`,
 //! `NodeInclusionPolicyInPodTopologySpread`, `MatchLabelKeysInPodAffinity`,
 //! `SidecarContainers`, `RecursiveReadOnlyMounts`, `PodLifecycleSleepAction`,
-//! `ContainerRestartRules`, `HostnameOverride`, `EnvFiles`, `ImageVolume`,
+//! `ContainerRestartRules`, `HostnameOverride`, `ImageVolume`,
 //! `SELinuxChangePolicy`, `DynamicResourceAllocation`,
 //! `PodObservedGenerationTracking`) drop nothing, so they are not modelled.
 //! `InPlacePodVerticalScaling` (on, GA-locked), `PodLevelResources` and
@@ -32,7 +33,7 @@
 //! turn them off in a test.
 
 use crate::feature_gates::{enabled, Feature};
-use crate::resources::pod::{Container, Lifecycle};
+use crate::resources::pod::{Container, EnvVar, Lifecycle};
 use crate::resources::{ContainerStatus, Pod, PodSpec, PodStatus};
 
 /// `podutil.DropDisabledPodFields(pod, oldPod)` (util.go:697-718): drops the
@@ -90,7 +91,52 @@ fn drop_disabled_fields(spec: &mut PodSpec, old: Option<&PodSpec>) {
         }
     }
 
+    drop_file_key_ref_in_use(spec, old);
     drop_container_stop_signals(spec, old);
+}
+
+/// `dropFileKeyRefInUse` (util.go:823-836): `env[].valueFrom.fileKeyRef` of
+/// every container kind goes away when `EnvFiles` is off and the old spec
+/// held none.
+fn drop_file_key_ref_in_use(spec: &mut PodSpec, old: Option<&PodSpec>) {
+    if enabled(Feature::EnvFiles) || pod_file_key_ref_in_use(old) {
+        return;
+    }
+    let wipe = |env: &mut Option<Vec<EnvVar>>| {
+        for var in env.iter_mut().flatten() {
+            if let Some(source) = var.value_from.as_mut() {
+                source.file_key_ref = None;
+            }
+        }
+    };
+    spec.containers.iter_mut().for_each(|c| wipe(&mut c.env));
+    spec.init_containers
+        .iter_mut()
+        .flatten()
+        .for_each(|c| wipe(&mut c.env));
+    spec.ephemeral_containers
+        .iter_mut()
+        .flatten()
+        .for_each(|c| wipe(&mut c.env));
+}
+
+/// `podFileKeyRefInUse` (util.go:838-856): any container kind.
+fn pod_file_key_ref_in_use(spec: Option<&PodSpec>) -> bool {
+    let Some(spec) = spec else { return false };
+    let uses = |env: &Option<Vec<EnvVar>>| {
+        env.iter().flatten().any(|v| {
+            v.value_from
+                .as_ref()
+                .is_some_and(|s| s.file_key_ref.is_some())
+        })
+    };
+    spec.containers.iter().any(|c| uses(&c.env))
+        || spec.init_containers.iter().flatten().any(|c| uses(&c.env))
+        || spec
+            .ephemeral_containers
+            .iter()
+            .flatten()
+            .any(|c| uses(&c.env))
 }
 
 /// `podLevelResourcesInUse` (util.go:1316-1336).
@@ -255,5 +301,139 @@ fn for_each_container_status(status: &mut PodStatus, mut f: impl FnMut(&mut Cont
         &mut status.ephemeral_container_statuses,
     ] {
         list.iter_mut().flatten().for_each(&mut f);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `TestDropFileKeyRefInUse` and `TestPodFileKeyRefInUse`
+    //! (pkg/api/pod/util_test.go:5400-5920).
+    use super::*;
+    use crate::feature_gates::with_feature;
+    use crate::resources::pod::{EnvVarSource, EphemeralContainer, FileKeySelector};
+
+    fn file_env(name: &str) -> EnvVar {
+        EnvVar {
+            name: name.into(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                config_map_key_ref: None,
+                secret_key_ref: None,
+                field_ref: None,
+                resource_field_ref: None,
+                file_key_ref: Some(FileKeySelector {
+                    volume_name: "v".into(),
+                    path: "/p".into(),
+                    key: Some("k".into()),
+                    optional: None,
+                }),
+            }),
+        }
+    }
+
+    fn plain_env(name: &str) -> EnvVar {
+        EnvVar {
+            name: name.into(),
+            value: Some("x".into()),
+            value_from: None,
+        }
+    }
+
+    fn container(env: Option<Vec<EnvVar>>) -> Container {
+        Container {
+            name: "c".into(),
+            env,
+            ..Default::default()
+        }
+    }
+
+    fn spec_with(env: Vec<EnvVar>) -> PodSpec {
+        PodSpec {
+            containers: vec![container(Some(env))],
+            ..Default::default()
+        }
+    }
+
+    fn has_ref(spec: &PodSpec) -> bool {
+        pod_file_key_ref_in_use(Some(spec))
+    }
+
+    #[test]
+    fn gate_off_and_no_old_spec_drops() {
+        let _g = with_feature(Feature::EnvFiles, false);
+        let mut spec = spec_with(vec![plain_env("A"), file_env("B")]);
+        drop_file_key_ref_in_use(&mut spec, None);
+        assert!(!has_ref(&spec));
+        // only the ref goes: the env var and its (now empty) source stay
+        let env = spec.containers[0].env.as_ref().unwrap();
+        assert_eq!(env.len(), 2);
+        assert!(env[1].value_from.is_some());
+        assert_eq!(env[0].value.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn gate_off_and_old_spec_without_a_ref_drops() {
+        let _g = with_feature(Feature::EnvFiles, false);
+        let old = spec_with(vec![plain_env("A")]);
+        let mut spec = spec_with(vec![file_env("B")]);
+        drop_file_key_ref_in_use(&mut spec, Some(&old));
+        assert!(!has_ref(&spec));
+    }
+
+    #[test]
+    fn gate_off_and_old_spec_with_a_ref_keeps() {
+        let _g = with_feature(Feature::EnvFiles, false);
+        let old = spec_with(vec![file_env("A")]);
+        let mut spec = spec_with(vec![file_env("B")]);
+        drop_file_key_ref_in_use(&mut spec, Some(&old));
+        assert!(has_ref(&spec));
+    }
+
+    #[test]
+    fn gate_on_keeps() {
+        let _g = with_feature(Feature::EnvFiles, true);
+        let mut spec = spec_with(vec![file_env("B")]);
+        drop_file_key_ref_in_use(&mut spec, None);
+        assert!(has_ref(&spec));
+    }
+
+    #[test]
+    fn drops_in_every_container_kind_and_tolerates_nil_env() {
+        let _g = with_feature(Feature::EnvFiles, false);
+        let mut spec = PodSpec {
+            containers: vec![container(None), container(Some(vec![file_env("A")]))],
+            init_containers: Some(vec![container(Some(vec![file_env("B")]))]),
+            ephemeral_containers: Some(vec![EphemeralContainer {
+                name: "e".into(),
+                env: Some(vec![file_env("C")]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert!(has_ref(&spec));
+        drop_file_key_ref_in_use(&mut spec, None);
+        assert!(!has_ref(&spec));
+        assert!(spec.containers[0].env.is_none());
+    }
+
+    #[test]
+    fn in_use_checks_every_container_kind() {
+        assert!(!pod_file_key_ref_in_use(None));
+        assert!(!has_ref(&spec_with(vec![plain_env("A")])));
+        assert!(!has_ref(&PodSpec {
+            containers: vec![container(None)],
+            ..Default::default()
+        }));
+        assert!(has_ref(&PodSpec {
+            init_containers: Some(vec![container(Some(vec![file_env("A")]))]),
+            ..Default::default()
+        }));
+        assert!(has_ref(&PodSpec {
+            ephemeral_containers: Some(vec![EphemeralContainer {
+                env: Some(vec![file_env("A")]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }));
     }
 }

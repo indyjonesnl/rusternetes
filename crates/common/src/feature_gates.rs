@@ -325,6 +325,10 @@ pub enum Feature {
 
     /// Upstream gate `ServiceAccountNodeAudienceRestriction`: pkg/features/kube_features.go:1773-1776 (1.33 Beta, on). Read by NodeRestriction (`plugin/pkg/admission/noderestriction/admission.go:111`).
     ServiceAccountNodeAudienceRestriction,
+
+    /// Upstream gate `EnvFiles` (1.34 Alpha, 1.35 Beta on; `pkg/features/kube_features.go:308`).
+    /// Read by `dropFileKeyRefInUse` (`pkg/api/pod/util.go:823`).
+    EnvFiles,
 }
 
 impl Feature {
@@ -407,6 +411,7 @@ impl Feature {
             Feature::ImageVolume => 73,
             Feature::LogarithmicScaleDown => 74,
             Feature::ServiceAccountNodeAudienceRestriction => 75,
+            Feature::EnvFiles => 76,
         }
     }
 
@@ -469,6 +474,7 @@ impl Feature {
             | Feature::StructuredAuthenticationConfigurationEgressSelector
             | Feature::StructuredAuthenticationConfigurationJWKSMetrics
             | Feature::ServiceAccountNodeAudienceRestriction
+            | Feature::EnvFiles
             | Feature::ImageVolume => PreRelease::Beta,
             Feature::NodeDeclaredFeatures
             | Feature::DRADeviceTaints
@@ -679,6 +685,8 @@ impl Feature {
             Feature::LogarithmicScaleDown => true,
             // pkg/features/kube_features.go:1773-1776 (1.33 Beta, on)
             Feature::ServiceAccountNodeAudienceRestriction => true,
+            // 1.35 Beta, on (kube_features.go:1299).
+            Feature::EnvFiles => true,
         }
     }
 }
@@ -771,6 +779,7 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::ImageVolume,
     Feature::LogarithmicScaleDown,
     Feature::ServiceAccountNodeAudienceRestriction,
+    Feature::EnvFiles,
 ];
 
 /// Total number of feature gates. Derived from [`ALL_FEATURES`].
@@ -861,6 +870,7 @@ static STATES: [AtomicBool; NUM_FEATURES] = [
     AtomicBool::new(Feature::ImageVolume.default_enabled()),
     AtomicBool::new(Feature::LogarithmicScaleDown.default_enabled()),
     AtomicBool::new(Feature::ServiceAccountNodeAudienceRestriction.default_enabled()),
+    AtomicBool::new(Feature::EnvFiles.default_enabled()),
 ];
 
 /// Returns whether `feature` is currently enabled in this process.
