@@ -553,8 +553,9 @@ mod tests {
         let (_root, host) = new_test_host();
         let p = GitRepoPlugin::new(host);
         let r = p.construct_volume_spec("vol1", "/ignored").unwrap();
-        assert_eq!(r.volume.name, "vol1");
-        assert!(r.volume.legacy_sources.git_repo.is_some());
+        let volume = r.volume.unwrap();
+        assert_eq!(volume.name, "vol1");
+        assert!(volume.legacy_sources.git_repo.is_some());
     }
 
     /// `expectedCommand` (`git_repo_test.go:69-74`).

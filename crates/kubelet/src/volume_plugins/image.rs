@@ -76,18 +76,17 @@ impl VolumePlugin for ImagePlugin {
     }
 
     /// `ConstructVolumeSpec` (`image.go:71-73`): `volume.ReconstructedVolume{}`,
-    /// no error. **Inherited deviation:** upstream's zero value has a nil
-    /// `Spec`; our [`ReconstructedVolume`] carries a mandatory `Volume`
-    /// (see its doc), so an empty `image` volume named `vol_name` stands in.
+    /// no error: a nil `Spec`, which `reconstructVolume` rejects with "got nil"
+    /// (`reconstruct_common.go:292-295`).
     fn construct_volume_spec(
         &self,
-        vol_name: &str,
+        _vol_name: &str,
         _mount_path: &str,
     ) -> Result<ReconstructedVolume> {
-        crate::volume_plugins::util::reconstructed_volume(
-            vol_name,
-            serde_json::json!({"image": {}}),
-        )
+        Ok(ReconstructedVolume {
+            volume: None,
+            persistent_volume: None,
+        })
     }
 }
 
@@ -240,7 +239,7 @@ mod tests {
     #[test]
     fn construct_volume_spec_succeeds_without_a_spec() {
         let rv = ImagePlugin::new().construct_volume_spec("v", "/m").unwrap();
-        assert_eq!(rv.volume.name, "v");
+        assert!(rv.volume.is_none());
         assert!(rv.persistent_volume.is_none());
     }
 }

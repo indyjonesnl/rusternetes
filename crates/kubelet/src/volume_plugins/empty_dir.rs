@@ -1132,8 +1132,8 @@ mod tests {
         let r = plugin()
             .construct_volume_spec("scratch", "/ignored")
             .unwrap();
-        assert_eq!(r.volume.name, "scratch");
-        assert!(r.volume.empty_dir.is_some());
+        assert_eq!(r.volume.as_ref().unwrap().name, "scratch");
+        assert!(r.volume.as_ref().unwrap().empty_dir.is_some());
         assert!(r.persistent_volume.is_none());
     }
 

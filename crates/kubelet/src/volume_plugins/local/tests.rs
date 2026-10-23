@@ -615,7 +615,7 @@ fn construct_volume_spec() {
         let rec = plug
             .construct_volume_spec(TEST_PV_NAME, vol_path.to_str().unwrap())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(rec.volume.name, TEST_PV_NAME, "{name}");
+        assert_eq!(rec.volume.unwrap().name, TEST_PV_NAME, "{name}");
         let pv = rec.persistent_volume.expect(name);
         assert_eq!(pv.metadata.name, TEST_PV_NAME);
         assert_eq!(
