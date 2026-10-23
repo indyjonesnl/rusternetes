@@ -41,6 +41,9 @@ struct Inner {
     network_error: Option<String>,
     runtime_error: Option<String>,
     storage_error: Option<String>,
+    /// `containerRuntimeReadyExpected` (kubelet.go:1344): false during the
+    /// node-initialization grace period so not-ready logs stay at debug.
+    container_runtime_ready_expected: bool,
 }
 
 /// Mirrors upstream `runtimeState`.
@@ -55,7 +58,20 @@ impl RuntimeState {
             network_error: Some(ERR_NETWORK_UNKNOWN.to_string()),
             runtime_error: None,
             storage_error: None,
+            container_runtime_ready_expected: false,
         }))
+    }
+
+    /// Set by `fastStatusUpdateOnce` when it exits (kubelet.go:1346-1348,
+    /// `fastNodeStatusUpdate` deferred block, kubelet_node_status.go:376-382).
+    pub fn set_container_runtime_ready_expected(&self) {
+        self.0.lock().unwrap().container_runtime_ready_expected = true;
+    }
+
+    /// Current value of `containerRuntimeReadyExpected`.
+    #[cfg(test)]
+    pub fn container_runtime_ready_expected(&self) -> bool {
+        self.0.lock().unwrap().container_runtime_ready_expected
     }
 
     /// `runtimeErrors` (runtime.go:130-150).
@@ -123,12 +139,20 @@ impl RuntimeState {
             return;
         };
         let mut s = self.0.lock().unwrap();
+        // klogErrorS is demoted to V(4) until containerRuntimeReadyExpected
+        // (kubelet.go:3129-3132) to avoid error spam at node startup.
+        let expected = s.container_runtime_ready_expected;
         s.network_error = match condition(&rs, NETWORK_READY) {
             Some(c) if c.status => None,
-            c => Some(format!(
-                "container runtime network not ready: {}",
-                fmt_condition(c)
-            )),
+            c => {
+                let msg = format!("container runtime network not ready: {}", fmt_condition(c));
+                if expected {
+                    tracing::error!("{msg}");
+                } else {
+                    tracing::debug!("{msg}");
+                }
+                Some(msg)
+            }
         };
         match condition(&rs, RUNTIME_READY) {
             Some(c) if c.status => {
@@ -136,8 +160,13 @@ impl RuntimeState {
                 s.last_base_runtime_sync = Some(Instant::now());
             }
             c => {
-                s.runtime_error =
-                    Some(format!("container runtime not ready: {}", fmt_condition(c)));
+                let msg = format!("container runtime not ready: {}", fmt_condition(c));
+                if expected {
+                    tracing::error!("{msg}");
+                } else {
+                    tracing::debug!("{msg}");
+                }
+                s.runtime_error = Some(msg);
             }
         }
     }
