@@ -67,7 +67,9 @@ where
     fn into_response(self) -> Response {
         // For now, default to JSON
         // In full implementation, check Accept header and return protobuf if requested
-        match serde_json::to_vec(&self.data) {
+        match rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(
+            || serde_json::to_vec(&self.data),
+        ) {
             Ok(body) => Response::builder()
                 .status(self.status)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -118,7 +120,9 @@ where
 {
     // For now, always use JSON since protobuf encoding needs type metadata
     // In full implementation, this would check content_type and encode appropriately
-    match serde_json::to_vec(&data) {
+    match rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+        serde_json::to_vec(&data)
+    }) {
         Ok(body) => Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, ContentType::Json.mime_type())
@@ -578,5 +582,33 @@ mod tests {
         assert_eq!(decoded.name, "x");
         assert!(tm.api_version.is_empty());
         assert!(tm.kind.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+    use std::sync::Arc;
+
+    /// `TrackSerializeResponseObjectLatency` (responsewriters/writers.go:354):
+    /// the serializer call feeds the request's serialization tracker.
+    #[tokio::test]
+    async fn serializing_a_response_feeds_the_serialization_tracker() {
+        struct Slow;
+        impl Serialize for Slow {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+                s.serialize_str("x")
+            }
+        }
+        let t = Arc::new(LatencyTrackers::new());
+        with_latency_trackers(t.clone(), async {
+            let _ = ApiResponse::new(Slow).into_response();
+            let _ = create_response(Slow, StatusCode::OK, ContentType::Json);
+        })
+        .await;
+        assert!(t.serialization.get_latency() >= std::time::Duration::from_millis(30));
+        assert_eq!(t.transform.get_latency(), std::time::Duration::ZERO);
     }
 }

@@ -191,8 +191,7 @@ impl EtcdStorage {
 
     /// Read a key's current `mod_revision`, or [`Error::NotFound`].
     async fn read_mod_revision(client: &mut Client, key: &str) -> Result<i64> {
-        let resp = client
-            .get(key, None)
+        let resp = crate::latency::tracked(client.get(key, None))
             .await
             .map_err(|e| Error::Storage(format!("Failed to read resource: {}", e)))?;
         resp.kvs()
@@ -253,8 +252,7 @@ impl EtcdStorage {
                 .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
                 .and_then(vec![self.put_op(key, json, ttl).await?])
                 .or_else(vec![TxnOp::get(key, None)]);
-            let resp = client
-                .txn(txn)
+            let resp = crate::latency::tracked(client.txn(txn))
                 .await
                 .map_err(|e| write_error("Failed to update resource", e))?;
             if resp.succeeded() {
@@ -302,8 +300,7 @@ impl EtcdStorage {
                 get_options = get_options.with_revision(rev);
             }
 
-            let resp = client
-                .get(next_start.clone(), Some(get_options))
+            let resp = crate::latency::tracked(client.get(next_start.clone(), Some(get_options)))
                 .await
                 .map_err(|e| match revision {
                     Some(rev) => {
@@ -324,9 +321,14 @@ impl EtcdStorage {
                 let mod_revision = kv.mod_revision();
                 self.sizes.update_key(key_str, json.len(), mod_revision);
 
-                // Inject resourceVersion and deserialize in one step
-                let json_with_rv = Self::inject_resource_version(json, mod_revision);
-                match serde_json::from_str::<T>(&json_with_rv) {
+                // Inject resourceVersion and deserialize in one step.
+                // `DecodeListItem` times exactly the codec decode
+                // (etcd3/decoder.go:78-84).
+                let decoded = crate::latency::tracked_decode(|| {
+                    let json_with_rv = Self::inject_resource_version(json, mod_revision);
+                    serde_json::from_str::<T>(&json_with_rv)
+                });
+                match decoded {
                     Ok(value) => {
                         results.push(value);
                     }
@@ -414,8 +416,7 @@ impl Storage for EtcdStorage {
             .when(vec![Compare::mod_revision(key, CompareOp::Equal, 0)])
             .and_then(vec![self.put_op(key, &json, ttl).await?]);
 
-        let txn_resp = client
-            .txn(txn)
+        let txn_resp = crate::latency::tracked(client.txn(txn))
             .await
             .map_err(|e| write_error("Failed to create resource", e))?;
 
@@ -444,8 +445,7 @@ impl Storage for EtcdStorage {
     {
         let mut client = self.client.clone();
 
-        let resp = client
-            .get(key, None)
+        let resp = crate::latency::tracked(client.get(key, None))
             .await
             .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
 
@@ -504,8 +504,7 @@ impl Storage for EtcdStorage {
                 .and_then(vec![self.put_op(key, &json, ttl).await?])
                 .or_else(vec![TxnOp::get(key, None)]);
 
-            let txn_resp = client
-                .txn(txn)
+            let txn_resp = crate::latency::tracked(client.txn(txn))
                 .await
                 .map_err(|e| write_error("Failed to update resource", e))?;
 
@@ -580,8 +579,7 @@ impl Storage for EtcdStorage {
                 .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
                 .and_then(vec![TxnOp::delete(key, None)])
                 .or_else(vec![TxnOp::get(key, None)]);
-            let resp = client
-                .txn(txn)
+            let resp = crate::latency::tracked(client.txn(txn))
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
             if resp.succeeded() {
@@ -610,8 +608,7 @@ impl Storage for EtcdStorage {
     ) -> Result<()> {
         let mut client = self.client.clone();
         for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
-            let resp = client
-                .get(key, None)
+            let resp = crate::latency::tracked(client.get(key, None))
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to read resource: {}", e)))?;
             let kv = resp
@@ -631,8 +628,7 @@ impl Storage for EtcdStorage {
                 .when(vec![Compare::mod_revision(key, CompareOp::Equal, expected)])
                 .and_then(vec![TxnOp::delete(key, None)])
                 .or_else(vec![TxnOp::get(key, None)]);
-            let resp = client
-                .txn(txn)
+            let resp = crate::latency::tracked(client.txn(txn))
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
             if resp.succeeded() {
@@ -679,8 +675,7 @@ impl Storage for EtcdStorage {
                 .with_range(range_end.clone())
                 .with_limit(page_size)
                 .with_keys_only();
-            let resp = client
-                .get(next_start.clone(), Some(opts))
+            let resp = crate::latency::tracked(client.get(next_start.clone(), Some(opts)))
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to list keys: {}", e)))?;
             let kvs = resp.kvs();
@@ -906,8 +901,7 @@ impl Storage for EtcdStorage {
         // the current revision in its header and no payload. (`keys_only`
         // would be a hair cheaper but is outside the RPC subset — and
         // pointless here, since this range matches at most one key.)
-        let resp = client
-            .get("/", None)
+        let resp = crate::latency::tracked(client.get("/", None))
             .await
             .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
         Ok(resp.header().map(|h| h.revision()).unwrap_or(0))
@@ -935,7 +929,7 @@ impl Storage for EtcdStorage {
         }
 
         let opts = GetOptions::new().with_revision(revision);
-        match client.get("/registry/", Some(opts)).await {
+        match crate::latency::tracked(client.get("/registry/", Some(opts))).await {
             Ok(_) => Ok(false), // revision still available
             Err(etcd_client::Error::GRpcStatus(status)) => {
                 let compacted = status.code() == tonic::Code::OutOfRange

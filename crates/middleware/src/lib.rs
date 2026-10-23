@@ -1630,13 +1630,17 @@ pub async fn normalize_content_type_middleware(
                                 // body that reaches here therefore always
                                 // carries ObjectMeta and must convert, never
                                 // 406.
-                                let converted = match neg.target {
+                                let body_is_table = body_kind == "Table";
+                                // `TrackTransformResponseObjectLatency`
+                                // (handlers/response.go:335) times
+                                // `doTransformObject`.
+                                let converted = rusternetes_common::latency_trackers::track_transform_response_object_latency_sync(|| match neg.target {
                                     // A handler that already produced a Table
                                     // (its list path branches on `wants_table`)
                                     // is passed through verbatim — re-running
                                     // `convert_to_table` would wrap the whole
                                     // Table as a single row of a generic table.
-                                    AsTarget::Table if body_kind == "Table" => v,
+                                    AsTarget::Table if body_is_table => v,
                                     AsTarget::Table => convert_to_table(v),
                                     AsTarget::PartialObjectMetadata => {
                                         convert_to_partial_object_metadata(v)
@@ -1644,10 +1648,13 @@ pub async fn normalize_content_type_middleware(
                                     AsTarget::PartialObjectMetadataList => {
                                         convert_to_partial_object_metadata_list(v)
                                     }
-                                };
+                                });
+                                // `TrackSerializeResponseObjectLatency`
+                                // (responsewriters/writers.go:354).
+                                let (new_body, new_ct) = rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
                                 let converted_json = serde_json::to_vec(&converted)
                                     .unwrap_or_else(|_| json_bytes.to_vec());
-                                let (new_body, new_ct) = match neg.wire {
+                                match neg.wire {
                                     AsWire::Json => (
                                         converted_json,
                                         format!(
@@ -1689,7 +1696,8 @@ pub async fn normalize_content_type_middleware(
                                             ),
                                         )
                                     }
-                                };
+                                }
+                                });
                                 let mut resp = Response::from_parts(parts, Body::from(new_body));
                                 if let Ok(hv) = axum::http::HeaderValue::from_str(&new_ct) {
                                     resp.headers_mut()

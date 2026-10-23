@@ -74,7 +74,9 @@ where
 {
     let mut attempt = 0u32;
     loop {
-        match op().await {
+        // Each attempt is one storage round trip (etcd3/latency_tracker.go);
+        // the backoff sleep is not storage latency.
+        match crate::latency::tracked(op()).await {
             Err(e) if is_busy(&e.to_string()) && attempt + 1 < policy.attempts => {
                 attempt += 1;
                 tokio::time::sleep(policy.step * attempt).await;

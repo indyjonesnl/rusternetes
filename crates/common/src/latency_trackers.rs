@@ -6,9 +6,10 @@
 //! All ten `LatencyTrackers` fields exist. The mutating/validating webhook and
 //! APF queue-wait trackers feed `MonitorRequest`; authentication feeds the
 //! `WithAuthentication` filter; every non-zero tracker feeds
-//! `AuditAnnotationsFromLatencyTrackers`. Storage, transform, serialization,
-//! response-write and decode are declared with their `Track*` helpers but their
-//! call sites are not wired yet (tracked as follow-ups). Authorization is
+//! `AuditAnnotationsFromLatencyTrackers`. Storage (every etcd/rhino round
+//! trip), list-item decode, response transform and response serialization are
+//! wired at their call sites. Response-write is not (axum writes the body
+//! after the handler chain returns; tracked as a follow-up). Authorization is
 //! retained per request (max) and is not subtracted by `MonitorRequest` from
 //! the SLI latency.
 
@@ -196,6 +197,35 @@ pub async fn track_serialize_response_object_latency<F: Future>(f: F) -> F::Outp
     }
 }
 
+/// Synchronous [`track_transform_response_object_latency`]: Go's
+/// `TrackTransformResponseObjectLatency(ctx, func())` takes a plain func, and
+/// most of our transform code is synchronous.
+pub fn track_transform_response_object_latency_sync<R>(f: impl FnOnce() -> R) -> R {
+    match latency_trackers_from_context() {
+        Some(t) => {
+            let started = Instant::now();
+            let out = f();
+            t.transform.track_duration(started.elapsed());
+            out
+        }
+        None => f(),
+    }
+}
+
+/// Synchronous [`track_serialize_response_object_latency`]
+/// (`TrackSerializeResponseObjectLatency(ctx, func())`, webhook_duration.go:232).
+pub fn track_serialize_response_object_latency_sync<R>(f: impl FnOnce() -> R) -> R {
+    match latency_trackers_from_context() {
+        Some(t) => {
+            let started = Instant::now();
+            let out = f();
+            t.serialization.track_duration(started.elapsed());
+            out
+        }
+        None => f(),
+    }
+}
+
 /// `AuditAnnotationsFromLatencyTrackers`: one annotation per non-zero
 /// tracker, valued with Go's `Duration.String`. `None` when the request
 /// carries no trackers (`!ok` -> nil).
@@ -284,6 +314,27 @@ mod tests {
         })
         .await;
         assert_eq!(t.apf_queue_wait.get_latency(), Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn sync_transform_and_serialize_helpers_sum_into_their_trackers() {
+        // No trackers: just runs.
+        assert_eq!(track_transform_response_object_latency_sync(|| 3), 3);
+        let t = Arc::new(LatencyTrackers::new());
+        with_latency_trackers(t.clone(), async {
+            for _ in 0..2 {
+                track_transform_response_object_latency_sync(|| {
+                    std::thread::sleep(Duration::from_millis(10))
+                });
+                track_serialize_response_object_latency_sync(|| {
+                    std::thread::sleep(Duration::from_millis(10))
+                });
+            }
+        })
+        .await;
+        assert!(t.transform.get_latency() >= Duration::from_millis(20));
+        assert!(t.serialization.get_latency() >= Duration::from_millis(20));
+        assert_eq!(t.decode.get_latency(), Duration::ZERO);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ pub mod etcd;
 mod etcd_endpoint;
 mod event_bus;
 pub mod event_recorder;
+pub(crate) mod latency;
 pub mod lease_lock;
 pub mod memory;
 pub mod metadata;
