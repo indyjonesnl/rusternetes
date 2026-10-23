@@ -45,3 +45,4 @@ pub mod scale;
 pub mod scheduling;
 pub mod snapshot;
 pub mod storage;
+pub mod storagemigration;
