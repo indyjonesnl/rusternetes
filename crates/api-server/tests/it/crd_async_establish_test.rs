@@ -160,3 +160,33 @@ async fn status_write_wakes_the_controllers() {
     })
     .await;
 }
+
+/// The apiapproval controller is its own informer-driven controller
+/// (apiapproval_controller.go:73-77, `RunWithContext(5, ..)` at
+/// apiserver.go:248): the create response carries no
+/// `KubernetesAPIApprovalPolicyConformant` condition, and the controller's
+/// own `UpdateStatus` adds it shortly after (#2128).
+#[tokio::test]
+async fn api_approval_condition_arrives_after_create() {
+    let api = TestApiServer::new();
+    let mut body = widget_crd();
+    body["metadata"]["name"] = json!("widgets.example.k8s.io");
+    body["spec"]["group"] = json!("example.k8s.io");
+    body["metadata"]["annotations"] =
+        json!({"api-approved.kubernetes.io": "https://github.com/kubernetes/kubernetes/pull/1"});
+    let (status, out) = api.post(CRDS, &body).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    assert!(
+        condition(&out, "KubernetesAPIApprovalPolicyConformant").is_none(),
+        "create returned the controller's condition: {out}"
+    );
+    let got = wait_for(&api, "widgets.example.k8s.io", |c| {
+        condition(c, "KubernetesAPIApprovalPolicyConformant").is_some()
+    })
+    .await;
+    assert_eq!(
+        condition(&got, "KubernetesAPIApprovalPolicyConformant").unwrap()["status"],
+        "True",
+        "{got}"
+    );
+}

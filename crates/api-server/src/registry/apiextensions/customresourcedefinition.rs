@@ -580,11 +580,18 @@ impl CrdRest {
         }
     }
 
-    /// The informer's event handler: queue the CRD for the controllers
-    /// (naming_controller.go:343-363), starting their worker on first use.
+    /// The informer's event handler: queue the CRD for the naming and
+    /// establishing controllers (naming_controller.go:343-363), starting their worker on first use.
     fn enqueue(&self, name: &str) {
         self.controllers.ensure_started(self.store.storage.clone());
         self.controllers.add(name);
+    }
+
+    /// The nonstructuralschema and apiapproval controllers' `AddFunc` /
+    /// `UpdateFunc`: `queue.Add(key)` on each of their own queues.
+    fn enqueue_conditions(&self, name: &str) {
+        self.controllers.ensure_started(self.store.storage.clone());
+        self.controllers.add_conditions(name);
     }
 
     fn finalizer_event(
@@ -699,51 +706,51 @@ impl CrdRest {
             controllers::sync_establishing(old).unwrap_or_else(|| old.clone())
         })
         .await?;
-        self.sync_conditions(name).await?;
         Ok(names_changed)
     }
 
-    /// The nonstructuralschema and apiapproval controllers' `sync`
-    /// (condition_controllers.rs), each a status write of its own.
-    async fn sync_conditions(&self, name: &str) -> Result<()> {
+    /// The nonstructuralschema controller's `sync`
+    /// (nonstructuralschema_controller.go:135-188) for one key off its queue.
+    pub(super) async fn sync_non_structural(&self, name: &str) -> Result<()> {
         let Some(crd) = self.get_crd(name).await? else {
             return Ok(());
         };
-        if self
-            .controllers
-            .conditions
-            .sync_non_structural(&crd)
-            .is_some()
-        {
-            let written = self
-                .update_status(name, &|old| {
-                    self.controllers
-                        .conditions
-                        .sync_non_structural(old)
-                        .unwrap_or_else(|| old.clone())
-                })
-                .await?;
-            if let Some(out) = written {
-                self.controllers.conditions.record_non_structural(&out);
-            }
+        let conditions = &self.controllers.conditions;
+        if conditions.sync_non_structural(&crd).is_none() {
+            return Ok(());
         }
-        if self
-            .controllers
-            .conditions
-            .sync_api_approval(&crd)
-            .is_some()
-        {
-            let written = self
-                .update_status(name, &|old| {
-                    self.controllers
-                        .conditions
-                        .sync_api_approval(old)
-                        .unwrap_or_else(|| old.clone())
-                })
-                .await?;
-            if let Some(out) = written {
-                self.controllers.conditions.record_api_approval(&out);
-            }
+        let written = self
+            .update_status(name, &|old| {
+                conditions
+                    .sync_non_structural(old)
+                    .unwrap_or_else(|| old.clone())
+            })
+            .await?;
+        if let Some(out) = written {
+            conditions.record_non_structural(&out);
+        }
+        Ok(())
+    }
+
+    /// The apiapproval controller's `sync` (apiapproval_controller.go:130-173)
+    /// for one key off its queue.
+    pub(super) async fn sync_api_approval(&self, name: &str) -> Result<()> {
+        let Some(crd) = self.get_crd(name).await? else {
+            return Ok(());
+        };
+        let conditions = &self.controllers.conditions;
+        if conditions.sync_api_approval(&crd).is_none() {
+            return Ok(());
+        }
+        let written = self
+            .update_status(name, &|old| {
+                conditions
+                    .sync_api_approval(old)
+                    .unwrap_or_else(|| old.clone())
+            })
+            .await?;
+        if let Some(out) = written {
+            conditions.record_api_approval(&out);
         }
         Ok(())
     }
@@ -788,6 +795,9 @@ impl CrdRest {
         if self.sync_one(name).await? {
             self.sync_group_except(&crd.spec.group, name).await?;
         }
+        // Their `UpdateFunc` enqueues a resync on the nonstructuralschema
+        // and apiapproval controllers' queues too.
+        self.enqueue_conditions(name);
         // The finalizer's `UpdateFunc` for a resync, `oldObj` being `newObj`
         // (crd_finalizer.go:348-352): "always requeue resyncs just in case".
         if let Some(crd) = self.get_crd(name).await? {
@@ -1192,6 +1202,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
         // The create event wakes the controllers; the response is the object
         // as written, without their conditions.
         self.enqueue(&created.metadata.name);
+        self.enqueue_conditions(&created.metadata.name);
         self.finalizer_event(None, &created);
         Ok(created)
     }
@@ -1222,6 +1233,7 @@ impl RestStorage<CustomResourceDefinition> for CrdRest {
             return Ok((updated, created));
         }
         self.enqueue(name);
+        self.enqueue_conditions(name);
         self.finalizer_event(recorded.take().as_ref(), &updated);
         Ok((updated, created))
     }
@@ -1395,6 +1407,7 @@ impl RestStorage<CustomResourceDefinition> for CrdStatusRest {
         if !options.dry_run {
             self.controllers.ensure_started(self.store.storage.clone());
             self.controllers.add(name);
+            self.controllers.add_conditions(name);
             let old = recorded.take();
             let new = out.0.clone();
             finalizer_event(&self.controllers, &self.store.storage, old.as_ref(), &new);
@@ -1686,10 +1699,12 @@ impl CrdRest {
         match event {
             CrdEvent::Add(new) => {
                 self.enqueue(&new.metadata.name);
+                self.enqueue_conditions(&new.metadata.name);
                 self.finalizer_event(None, new);
             }
             CrdEvent::Update(old, new) => {
                 self.enqueue(&new.metadata.name);
+                self.enqueue_conditions(&new.metadata.name);
                 self.finalizer_event(Some(old), new);
             }
             CrdEvent::Delete(old) => {
