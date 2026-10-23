@@ -196,6 +196,7 @@ impl VolumePlugin for GitRepoPlugin {
                 plugin_name: self.name(),
                 vol_name: vol_name.to_string(),
                 pod_uid: pod_uid.to_string(),
+                metrics: Box::new(crate::volume_plugins::util::metrics::MetricsNil),
             },
         ))
     }
@@ -417,6 +418,15 @@ fn go_path_clean(path: &str) -> String {
         (true, _) => format!("/{joined}"),
         (false, true) => ".".to_string(),
         (false, false) => joined,
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for GitRepoVolumeMounter {
+    /// `volume.MetricsNil` (`git_repo.go:141`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
     }
 }
 

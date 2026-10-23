@@ -15,8 +15,9 @@ use rusternetes_common::resources::Pod;
 /// `cri_runtime::runtime::get_image_volumes` and
 /// `cri_runtime::translate::mounts_with`.
 ///
-/// Not ported: the embedded `volume.MetricsNil` (no plugin here exposes
-/// volume metrics yet, as for the nfs plugin).
+/// The embedded `volume.MetricsNil` (`image.go:33`) is the
+/// [`MetricsProvider`](crate::volume_plugins::plugin::MetricsProvider) impl
+/// on `ImageVolume`.
 pub struct ImagePlugin;
 
 impl ImagePlugin {
@@ -127,6 +128,15 @@ impl Unmounter for ImageVolume {
     /// `TearDownAt` (`image.go:91`): nothing.
     async fn tear_down_at(&self, _dir: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for ImageVolume {
+    /// `volume.MetricsNil` (`image.go:33`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
     }
 }
 

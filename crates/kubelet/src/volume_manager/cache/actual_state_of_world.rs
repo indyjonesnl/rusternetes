@@ -1871,6 +1871,12 @@ mod tests {
         id: &'static str,
     }
 
+    impl crate::volume_plugins::plugin::MetricsProvider for FakeMounter {
+        fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+            Ok(Default::default())
+        }
+    }
+
     #[async_trait]
     impl Mounter for FakeMounter {
         fn get_path(&self) -> String {

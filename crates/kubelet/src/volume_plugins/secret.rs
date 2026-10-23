@@ -61,11 +61,13 @@ impl VolumePlugin for SecretPlugin {
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+        let path = self
+            .host
+            .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name);
         Ok(Box::new(SecretMounter {
             host: self.host.clone(),
-            path: self
-                .host
-                .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
+            metrics: crate::volume_plugins::metrics_cached::cached_du(&path),
+            path,
             volume_name: spec.volume.name.clone(),
             namespace: pod
                 .metadata
@@ -86,12 +88,12 @@ impl VolumePlugin for SecretPlugin {
         pod_uid: &str,
     ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
         Ok(Box::new(
-            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
-                host: self.host.clone(),
-                plugin_name: self.name(),
-                vol_name: vol_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-            },
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
+                self.host.clone(),
+                self.name(),
+                vol_name,
+                pod_uid,
+            ),
         ))
     }
 
@@ -170,6 +172,15 @@ struct SecretMounter {
     /// `secretVolumeMounter.pod` (`secret.go:155`), read by
     /// `MakeNestedMountpoints`.
     pod: Pod,
+    /// Embedded `volume.MetricsProvider` (`secret.go:104`).
+    metrics: crate::volume_plugins::metrics_cached::CachedMetrics,
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for SecretMounter {
+    /// `volume.NewCachedMetrics(volume.NewMetricsDu(getPath(..)))` (`secret.go:104`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        self.metrics.get_metrics()
+    }
 }
 
 #[async_trait]

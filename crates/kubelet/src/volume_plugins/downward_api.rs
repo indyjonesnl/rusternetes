@@ -56,11 +56,13 @@ impl VolumePlugin for DownwardApiPlugin {
     }
 
     async fn new_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<Box<dyn Mounter>> {
+        let path = self
+            .host
+            .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name);
         Ok(Box::new(DownwardApiMounter {
             host: self.host.clone(),
-            path: self
-                .host
-                .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
+            metrics: crate::volume_plugins::metrics_cached::cached_du(&path),
+            path,
             // The whole Volume is cloned (not just its `downward_api` source)
             // because the final log line names `volume.name`, and the whole
             // Pod is cloned because a `fieldRef` can name any of its fields —
@@ -82,12 +84,12 @@ impl VolumePlugin for DownwardApiPlugin {
         pod_uid: &str,
     ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
         Ok(Box::new(
-            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
-                host: self.host.clone(),
-                plugin_name: self.name(),
-                vol_name: vol_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-            },
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
+                self.host.clone(),
+                self.name(),
+                vol_name,
+                pod_uid,
+            ),
         ))
     }
 
@@ -112,6 +114,15 @@ struct DownwardApiMounter {
     volume: Volume,
     pod: Pod,
     node_allocatable: HashMap<String, String>,
+    /// Embedded `volume.MetricsProvider` (`downwardapi.go:102`).
+    metrics: crate::volume_plugins::metrics_cached::CachedMetrics,
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for DownwardApiMounter {
+    /// `volume.NewCachedMetrics(volume.NewMetricsDu(getPath(..)))` (`downwardapi.go:102`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        self.metrics.get_metrics()
+    }
 }
 
 #[async_trait]
@@ -367,6 +378,7 @@ mod tests {
 
     fn mounter_for(dir: &std::path::Path, items: serde_json::Value) -> DownwardApiMounter {
         DownwardApiMounter {
+            metrics: crate::volume_plugins::metrics_cached::cached_du(""),
             host: std::sync::Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
                 "/var/lib/rusternetes".to_string(),
                 None,
@@ -564,6 +576,7 @@ mod tests {
     async fn set_up_nil_default_mode_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let m = DownwardApiMounter {
+            metrics: crate::volume_plugins::metrics_cached::cached_du(""),
             host: std::sync::Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
                 "/var/lib/rusternetes".to_string(),
                 None,

@@ -105,6 +105,12 @@ async fn host_path_set_up_at_does_not_make_sense() {
 async fn set_up_with_args_delegates_to_set_up_at_get_path() {
     use std::sync::Mutex;
     struct Rec(Mutex<Vec<(String, Option<i64>)>>);
+    impl crate::volume_plugins::plugin::MetricsProvider for Rec {
+        fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+            Ok(Default::default())
+        }
+    }
+
     #[async_trait::async_trait]
     impl Mounter for Rec {
         fn get_path(&self) -> String {

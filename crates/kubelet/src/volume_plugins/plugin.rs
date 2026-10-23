@@ -332,11 +332,10 @@ pub trait AttachableVolumePlugin: DeviceMountableVolumePlugin {
 /// `NodeUnpublishVolume`. An idiom difference, not a mechanism change.
 /// `Send + Sync` for the reason given on [`Mounter`].
 ///
-/// Upstream's `Unmounter` embeds `Volume`, i.e. `GetPath` plus a
-/// `MetricsProvider`; only `GetPath` is ported, as the metrics half has no
-/// consumer on the teardown path.
+/// Embeds `Volume` as upstream does: `GetPath` plus [`MetricsProvider`]
+/// (`volume.go:36`, `:64-68`).
 #[async_trait]
-pub trait Unmounter: Send + Sync {
+pub trait Unmounter: Send + Sync + MetricsProvider {
     /// `Volume::GetPath` (`volume.go:36`).
     fn get_path(&self) -> String;
 
@@ -427,7 +426,7 @@ impl Eq for MounterRecorder {}
 /// `:359`). `ActualStateOfWorld` holding an `Arc<dyn Mounter>` is only `Sync`
 /// if the mounter is, so Rust makes explicit the sharing Go leaves implicit.
 #[async_trait]
-pub trait Mounter: Send + Sync {
+pub trait Mounter: Send + Sync + MetricsProvider {
     /// `Volume::GetPath` (`volume.go:36`).
     fn get_path(&self) -> String;
 
