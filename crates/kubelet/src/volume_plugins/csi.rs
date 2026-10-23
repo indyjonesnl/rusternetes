@@ -55,6 +55,7 @@ mod vol_data_key {
     pub const NODE_NAME: &str = "nodeName";
     pub const ATTACHMENT_ID: &str = "attachmentID";
     pub const VOLUME_LIFECYCLE_MODE: &str = "volumeLifecycleMode";
+    pub const SELINUX_MOUNT_CONTEXT: &str = "seLinuxMountContext";
 }
 
 /// `globalMountInGlobalPath` (`csi_attacher.go:46`).
@@ -350,6 +351,7 @@ impl VolumePlugin for CsiPlugin {
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
             token_manager: self.host.get_service_account_token_func().clone(),
+            need_selinux_relabel: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -577,6 +579,10 @@ struct CsiMounter {
     /// token when the backend has no api-server to ask (see
     /// [`CsiMounter::pod_service_account_token_attrs`]).
     token_manager: rusternetes_common::auth::TokenManager,
+    /// `csiMountMgr.needSELinuxRelabel` (`csi_mounter.go:72`): set by `SetUpAt`
+    /// when the volume was not mounted with `-o context=` and its filesystem
+    /// supports SELinux labels; read by `GetAttributes`.
+    need_selinux_relabel: std::sync::atomic::AtomicBool,
 }
 
 fn transient(msg: String) -> anyhow::Error {
@@ -1047,13 +1053,14 @@ impl Mounter for CsiMounter {
 
     /// `csiMountMgr.GetAttributes` (`csi_mounter.go:418-424`):
     /// `{ReadOnly: c.readOnly, Managed: !c.readOnly, SELinuxRelabel:
-    /// c.needSELinuxRelabel}`. `needSELinuxRelabel` is the SELinux mount
-    /// context negotiation, which is not ported (#2312), so it is false.
+    /// c.needSELinuxRelabel}`.
     fn get_attributes(&self) -> Attributes {
         Attributes {
             read_only: self.read_only,
             managed: !self.read_only,
-            selinux_relabel: false,
+            selinux_relabel: self
+                .need_selinux_relabel
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1063,8 +1070,8 @@ impl Mounter for CsiMounter {
     /// `:333-352`): `VOLUME_MOUNT_GROUP` delegation to the driver, else the
     /// kubelet-side ownership change gated by `CSIDriver.Spec.FSGroupPolicy`.
     ///
-    /// Not ported: SELinux mount context and the post-publish SELinux-support
-    /// probe. See #2312.
+    /// The SELinux mount context (`csi_mounter.go:262-273`, `:286-288`) and the
+    /// post-publish `GetSELinuxSupport` probe (`:329-335`) are ported.
     async fn set_up_at(
         &self,
         dir_str: &str,
@@ -1230,8 +1237,29 @@ impl Mounter for CsiMounter {
             vol_attribs.extend(token_attrs);
         }
 
+        // `csi_mounter.go:262-273`: with the SELinuxMountReadWriteOncePod gate,
+        // a driver that supports `-o context=` and a pod label mount with it.
+        // `SupportsSELinuxContextMount` reads `CSIDriver.Spec.SELinuxMount`; the
+        // CSIDriver was already fetched above (a missing one is `(false, nil)`).
+        let mut selinux_label_mount = false;
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            let support = csi_driver
+                .as_ref()
+                .and_then(|d| d.spec.se_linux_mount)
+                .unwrap_or(false);
+            if support && !args.selinux_label.is_empty() {
+                mount_options = crate::volume_plugins::util::selinux::add_selinux_mount_option(
+                    mount_options,
+                    &args.selinux_label,
+                );
+                selinux_label_mount = true;
+            }
+        }
+
         // Save volume info in pod dir; persisted for teardown.
-        let volume_data = HashMap::from([
+        let mut volume_data = HashMap::from([
             (
                 vol_data_key::SPEC_VOL_ID.to_string(),
                 self.spec_name.clone(),
@@ -1251,6 +1279,12 @@ impl Mounter for CsiMounter {
                 get_attachment_name(&self.volume_id, &self.driver_name, &self.node_name),
             ),
         ]);
+        if selinux_label_mount {
+            volume_data.insert(
+                vol_data_key::SELINUX_MOUNT_CONTEXT.to_string(),
+                args.selinux_label.clone(),
+            );
+        }
         if let Err(e) = save_volume_data(parent_dir, &volume_data) {
             error!("kubernetes.io/csi: mounter.SetUpAt failed to save volume info data: {e}");
             if let Err(re) = remove_mount_dir(dir) {
@@ -1306,7 +1340,19 @@ impl Mounter for CsiMounter {
             return Err(e.into());
         }
 
-        // `csi_mounter.go:333-352`: the driver does not apply the fsGroup, so
+        // `csi_mounter.go:329-335`: not mounted with `-o context=`, so ask the
+        // host whether the filesystem supports SELinux labels. The volume is
+        // mounted, hence UncertainProgress on failure.
+        if !selinux_label_mount {
+            let relabel = crate::volume_plugins::util::hostutil::get_selinux_support(dir_str)
+                .map_err(|e| {
+                    CsiError::UncertainProgress(format!("error checking for SELinux support: {e}"))
+                })?;
+            self.need_selinux_relabel
+                .store(relabel, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // `csi_mounter.go:337-352`: the driver does not apply the fsGroup, so
         // the kubelet must. The mount succeeded, so a failure here is
         // UncertainProgress (the volume must still be cleaned up).
         if !driver_supports_volume_mount_group
