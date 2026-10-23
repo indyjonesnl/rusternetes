@@ -4256,7 +4256,7 @@ mod tests {
         let profiles = crate::profile::Map::new_map(vec![profile]).unwrap();
         let scheduler = Scheduler::new_with_profiles(Arc::clone(&storage), 60, profiles);
         let err = scheduler
-            .try_schedule_pod("pods/default/abc")
+            .try_schedule_pod(&test_queue(), "pods/default/abc")
             .await
             .expect_err("a filter Error must abort the cycle");
         let msg = err.to_string();
