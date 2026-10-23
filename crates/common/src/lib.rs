@@ -59,6 +59,7 @@ pub mod resources;
 pub mod sa_keys;
 pub mod schema_validation;
 pub mod self_signed;
+pub mod serde_helpers;
 pub mod service_ip_ranges;
 pub mod serviceaccount;
 pub mod signal;
@@ -75,12 +76,4 @@ pub use error::{Error, Result};
 pub use pagination::{paginate, PaginationError, PaginationParams};
 pub use types::{List, ListMeta, Status, StatusCause, StatusDetails};
 
-/// Deserialize null as the default value for a type.
-/// Use with `#[serde(deserialize_with = "crate::deserialize_null_default")]`
-pub fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + serde::Deserialize<'de>,
-{
-    Ok(<Option<T> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
-}
+pub use serde_helpers::null_default as deserialize_null_default;

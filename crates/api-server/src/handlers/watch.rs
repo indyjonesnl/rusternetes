@@ -49,7 +49,7 @@ pub struct WatchParams {
     /// Resource version to watch from
     #[serde(
         rename = "resourceVersion",
-        deserialize_with = "deserialize_empty_string_as_none",
+        deserialize_with = "rusternetes_common::serde_helpers::empty_as_none",
         default
     )]
     pub resource_version: Option<String>,
@@ -87,17 +87,6 @@ pub struct WatchParams {
         default
     )]
     pub send_initial_events: Option<bool>,
-}
-
-/// Deserialize empty strings as None for resourceVersion
-fn deserialize_empty_string_as_none<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 /// Normalize a resourceVersion value: treat empty string as None (= "start from current")
