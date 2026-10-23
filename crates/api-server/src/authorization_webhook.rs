@@ -365,6 +365,24 @@ impl WebhookClientConfig {
         self
     }
 
+    /// The same client over a dialer selected by the egress selector
+    /// (`rest.Config.Dial`).
+    pub fn build_egress_client(
+        &self,
+        dialer: crate::egress_selector::Dialer,
+    ) -> anyhow::Result<crate::egress_http::EgressHttpClient> {
+        let tls = crate::egress_http::tls_client_config(
+            self.ca_pem.as_deref(),
+            self.insecure_skip_tls_verify,
+            self.identity_pem.as_deref(),
+        )?;
+        Ok(crate::egress_http::EgressHttpClient::new(
+            dialer,
+            tls,
+            self.timeout,
+        ))
+    }
+
     pub fn build_client(&self) -> anyhow::Result<reqwest::Client> {
         let mut b = reqwest::Client::builder().timeout(self.timeout);
         if self.insecure_skip_tls_verify {
@@ -526,7 +544,7 @@ struct BackoffError {
 }
 
 pub struct WebhookAuthorizer {
-    client: reqwest::Client,
+    client: WebhookHttp,
     config: WebhookClientConfig,
     version: SarVersion,
     response_cache: ExpireCache,
@@ -559,7 +577,7 @@ impl WebhookAuthorizer {
             ),
         };
         Ok(Self {
-            client: config.build_client()?,
+            client: WebhookHttp::for_config(&config)?,
             config,
             version,
             response_cache: ExpireCache::new(RESPONSE_CACHE_SIZE),
@@ -712,47 +730,48 @@ impl WebhookAuthorizer {
             spec,
             status: SarStatus::default(),
         };
-        let mut req = self
+        let resp = self
             .client
-            .post(&self.config.server)
-            .header("Accept", "application/json")
-            .json(&body);
-        if let Some(t) = &self.config.bearer_token {
-            req = req.bearer_auth(t);
-        } else if let Some((u, p)) = &self.config.basic_auth {
-            req = req.basic_auth(u, Some(p));
-        }
-        let resp = req.send().await.map_err(|e| CallError {
-            retry: is_connection_reset(&e),
-            result: if e.is_timeout() { "timeout" } else { "error" },
-            message: e.to_string(),
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
+            .post_json(&self.config, &body)
+            .await
+            .map_err(|e| CallError {
+                retry: e.connection_reset,
+                result: if e.timeout { "timeout" } else { "error" },
+                message: e.message,
+            })?;
+        let status = resp.status;
+        if !(200..300).contains(&status) {
             // DefaultShouldRetry: apierrors.IsInternalError / IsTimeout /
             // IsTooManyRequests, or any error that suggests a client delay
             // (a Retry-After header), util/webhook/webhook.go:47-56.
             let suggests_delay = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
+                .retry_after
+                .as_deref()
                 .is_some_and(|v| v.trim().parse::<u64>().is_ok());
-            let retry = matches!(status.as_u16(), 500 | 504 | 408 | 429) || suggests_delay;
+            let retry = matches!(status, 500 | 504 | 408 | 429) || suggests_delay;
             return Err(CallError {
-                message: format!("webhook returned HTTP {status}"),
+                message: format!(
+                    "webhook returned HTTP {status} {}",
+                    reqwest::StatusCode::from_u16(status)
+                        .ok()
+                        .and_then(|c| c.canonical_reason())
+                        .unwrap_or("")
+                )
+                .trim_end()
+                .to_string(),
                 retry,
                 // `statusCode == http.StatusGatewayTimeout` / apierrors.IsTimeout.
-                result: if matches!(status.as_u16(), 504 | 408) {
+                result: if matches!(status, 504 | 408) {
                     "timeout"
                 } else {
                     "error"
                 },
             });
         }
-        let parsed: SarResponse = resp.json().await.map_err(|e| CallError {
+        let parsed: SarResponse = serde_json::from_slice(&resp.body).map_err(|e| CallError {
             message: format!("decoding webhook response: {e}"),
             retry: false,
-            result: if e.is_timeout() { "timeout" } else { "error" },
+            result: "error",
         })?;
         Ok(parsed.status)
     }
@@ -789,6 +808,100 @@ impl WebhookAuthorizer {
             tokio::time::sleep(backoff.step()).await;
         }
         Err(last)
+    }
+}
+
+/// A response read in full, whichever client made the call.
+struct WebhookResponse {
+    status: u16,
+    retry_after: Option<String>,
+    body: bytes::Bytes,
+}
+
+/// The webhook's HTTP client: reqwest, or, when the egress selector has a
+/// `controlplane` selection, a client dialing through its `Dialer`.
+enum WebhookHttp {
+    Reqwest(reqwest::Client),
+    Egress(Box<crate::egress_http::EgressHttpClient>),
+}
+
+impl WebhookHttp {
+    /// `BuildAuthorizer` (pkg/controlplane/apiserver/config.go:254-259): when
+    /// there is an egress selector, `Lookup(ControlPlane)` becomes
+    /// `authorizationConfig.CustomDial` (`webhookutil.LoadKubeconfig`'s
+    /// `clientConfig.Dial`, util/webhook/webhook.go:157). `Lookup` yielding no
+    /// dialer leaves the default transport.
+    fn for_config(config: &WebhookClientConfig) -> anyhow::Result<Self> {
+        let dial = crate::egress_selector::egress_selector()
+            .and_then(|s| s.lookup(crate::egress_selector::EgressType::ControlPlane));
+        match dial {
+            Some(d) => Ok(Self::Egress(Box::new(config.build_egress_client(d)?))),
+            None => Ok(Self::Reqwest(config.build_client()?)),
+        }
+    }
+
+    async fn post_json<T: Serialize>(
+        &self,
+        config: &WebhookClientConfig,
+        body: &T,
+    ) -> Result<WebhookResponse, crate::egress_http::EgressHttpError> {
+        use crate::egress_http::EgressHttpError;
+        match self {
+            Self::Reqwest(client) => {
+                let resp =
+                    config
+                        .post(client)
+                        .json(body)
+                        .send()
+                        .await
+                        .map_err(|e| EgressHttpError {
+                            connection_reset: is_connection_reset(&e),
+                            timeout: e.is_timeout(),
+                            message: e.to_string(),
+                        })?;
+                let status = resp.status().as_u16();
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = resp.bytes().await.map_err(|e| EgressHttpError {
+                    connection_reset: is_connection_reset(&e),
+                    timeout: e.is_timeout(),
+                    message: format!("decoding webhook response: {e}"),
+                })?;
+                Ok(WebhookResponse {
+                    status,
+                    retry_after,
+                    body,
+                })
+            }
+            Self::Egress(client) => {
+                let mut headers = Vec::new();
+                if let Some(t) = &config.bearer_token {
+                    headers.push(("authorization", format!("Bearer {t}")));
+                } else if let Some((u, p)) = &config.basic_auth {
+                    use base64::Engine;
+                    let cred = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+                    headers.push(("authorization", format!("Basic {cred}")));
+                }
+                let payload = serde_json::to_vec(body).map_err(|e| EgressHttpError {
+                    message: e.to_string(),
+                    timeout: false,
+                    connection_reset: false,
+                })?;
+                let resp = client.post_json(&config.server, &headers, payload).await?;
+                Ok(WebhookResponse {
+                    status: resp.status,
+                    retry_after: resp
+                        .headers
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                    body: resp.body,
+                })
+            }
+        }
     }
 }
 
