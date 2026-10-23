@@ -177,6 +177,12 @@ impl Controller for Fake {
     ) -> Result<Response<DeleteSnapshotResponse>, Status> {
         Err(Status::unimplemented("attacher test"))
     }
+    async fn controller_expand_volume(
+        &self,
+        _r: Request<ControllerExpandVolumeRequest>,
+    ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
+        Err(Status::unimplemented("attacher test"))
+    }
 }
 
 struct Env {
