@@ -53,7 +53,8 @@
 use rusternetes_common::admission::AdmissionRequest;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_cost::{
-    charge_budget, CostOptions, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
+    charge_budget, BudgetError, CostOptions, MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES,
+    RUNTIME_CEL_COST_BUDGET, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
 };
 use rusternetes_common::resources::MatchCondition;
 use serde_json::Value;
@@ -342,6 +343,228 @@ impl AuditAnnotationEvaluator {
             },
         }
     }
+}
+
+/// What one `spec.validations[*]` entry carries into [`validate_budgeted`].
+pub struct ValidationItem<'a> {
+    pub expression: &'a str,
+    pub message_expression: Option<&'a str>,
+    pub message: Option<&'a str>,
+}
+
+/// The cost of each `spec.variables[*]` evaluation, charged lazily.
+///
+/// Upstream composes variables lazily (`cel/composition.go`
+/// `variableAccessor.Callback`): a variable is evaluated, and its actual cost
+/// reported (`reportCost`), the first time an expression resolves it, and
+/// `evaluationActivation.Evaluate` (`activation.go:132-141`) charges the
+/// accumulated cost (`GetAndResetCost`) against the filter's budget. Here
+/// variables are evaluated eagerly, so the recorded cost is charged on the
+/// first expression that references the variable (directly, or through
+/// another variable's expression). Deviation: upstream's laziness also
+/// follows `&&`/`||`/`?:` short-circuiting; this counts a textual reference.
+#[derive(Default)]
+pub struct VariableCosts {
+    entries: std::collections::HashMap<String, (u64, Vec<String>)>,
+    charged: std::collections::HashSet<String>,
+}
+
+fn referenced_variables(expression: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (i, _) in expression.match_indices("variables.") {
+        let rest = &expression[i + "variables.".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end > 0 {
+            names.push(rest[..end].to_string());
+        }
+    }
+    names
+}
+
+impl VariableCosts {
+    /// Record the actual cost of evaluating variable `name`.
+    pub fn record(&mut self, name: &str, expression: &str, cost: u64) {
+        self.entries
+            .insert(name.to_string(), (cost, referenced_variables(expression)));
+    }
+
+    /// `compositionCtx.GetAndResetCost()` for `expression`: the cost of every
+    /// not-yet-charged variable it reaches.
+    pub fn composition_cost(&mut self, expression: &str) -> i64 {
+        let mut total: i64 = 0;
+        let mut pending = referenced_variables(expression);
+        while let Some(name) = pending.pop() {
+            if self.charged.contains(&name) {
+                continue;
+            }
+            let Some((cost, deps)) = self.entries.get(&name) else {
+                continue;
+            };
+            total = total.saturating_add(i64::try_from(*cost).unwrap_or(i64::MAX));
+            pending.extend(deps.iter().cloned());
+            self.charged.insert(name);
+        }
+        total
+    }
+}
+
+/// `evaluationActivation.Evaluate` (`activation.go:132-189`) for one
+/// expression: evaluate with cost tracking, then charge the composition and
+/// actual cost against `remaining`. `Err` stops all further evaluation.
+fn evaluate_charged(
+    evaluator: &mut CELEvaluator,
+    expression: &str,
+    context: &CELContext,
+    variables: &mut VariableCosts,
+    remaining: i64,
+) -> Result<(Result<cel::Value, String>, i64), BudgetError> {
+    let (value, cost) = evaluator.evaluate_with_cost(expression, context, CostOptions::default());
+    let remaining = charge_budget(
+        Some(variables.composition_cost(expression)),
+        cost,
+        remaining,
+    )?;
+    Ok((
+        value.map_err(|e| format!("expression '{expression}' resulted in error: {e}")),
+        remaining,
+    ))
+}
+
+/// Ported from `validating/validator.go` `Validate` (:73-218) over
+/// `cel/condition.go` `ForInput` (:90-111): the validations share one
+/// `RuntimeCELCostBudget` (`dispatcher.go:220`); the `messageExpression`s run
+/// afterwards on what is left of it (:128-129), for every validation with one,
+/// passing or not. Running out of budget in either stops evaluation:
+///
+/// * validations: `Err` is the one error decision replacing all others
+///   (:108-119); the caller applies `failurePolicy` (`policyDecisionActionForError`).
+/// * messageExpressions: every validation that did not itself error becomes
+///   an error decision `failed messageExpression: <detail>` (:136-139).
+///
+/// A messageExpression that merely fails falls back to `message`, then to
+/// `failed expression: <expression>` (:140-181).
+pub fn validate_budgeted(
+    items: &[ValidationItem<'_>],
+    evaluator: &mut CELEvaluator,
+    context: &CELContext,
+    message_context: &CELContext,
+    variables: &mut VariableCosts,
+) -> Result<Vec<ValidationOutcome>, String> {
+    let mut remaining = RUNTIME_CEL_COST_BUDGET;
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let (value, left) = evaluate_charged(
+            evaluator,
+            item.expression.trim(),
+            context,
+            variables,
+            remaining,
+        )
+        .map_err(|e| e.detail)?;
+        remaining = left;
+        results.push(value);
+    }
+
+    // `messageFilter.ForInput` (:128): `err` is kept, not returned.
+    let mut messages: Vec<Option<Result<cel::Value, String>>> = Vec::with_capacity(items.len());
+    let mut message_budget_error: Option<String> = None;
+    for item in items {
+        let expr = item.message_expression.map(str::trim).unwrap_or("");
+        if expr.is_empty() {
+            messages.push(None);
+            continue;
+        }
+        match evaluate_charged(evaluator, expr, message_context, variables, remaining) {
+            Ok((value, left)) => {
+                remaining = left;
+                messages.push(Some(value));
+            }
+            Err(e) => {
+                message_budget_error = Some(e.detail);
+                break;
+            }
+        }
+    }
+    // `messageResults` is nil when `ForInput` returned an error.
+    if message_budget_error.is_some() {
+        messages.clear();
+    }
+
+    Ok(items
+        .iter()
+        .zip(results)
+        .enumerate()
+        .map(|(i, (item, result))| match result {
+            Err(message) => ValidationOutcome::Error { message },
+            Ok(_) if message_budget_error.is_some() => ValidationOutcome::Error {
+                message: format!(
+                    "failed messageExpression: {}",
+                    message_budget_error.as_deref().unwrap_or_default()
+                ),
+            },
+            Ok(cel::Value::Bool(true)) => ValidationOutcome::Pass,
+            Ok(cel::Value::Bool(false)) => {
+                let mut message = String::new();
+                if let Some(Some(Ok(cel::Value::String(s)))) = messages.get(i) {
+                    message = s.trim().to_string();
+                    // validator.go:154-163: deny excessively long or multi-line.
+                    if message.len() as i64 > MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES
+                        || message.contains('\n')
+                    {
+                        message.clear();
+                    }
+                }
+                if message.is_empty() {
+                    message = item.message.unwrap_or("").trim().to_string();
+                }
+                if message.is_empty() {
+                    message = format!("failed expression: {}", item.expression.trim());
+                }
+                ValidationOutcome::Fail { message }
+            }
+            Ok(other) => ValidationOutcome::Error {
+                message: format!("CEL expression did not return a boolean: {other:?}"),
+            },
+        })
+        .collect())
+}
+
+/// `auditAnnotationFilter.ForInput` (`validator.go:183-217`): the annotations
+/// start from a fresh `RuntimeCELCostBudget` (:184 passes `runtimeCELCostBudget`,
+/// not what the validations left). Running out of it is `Err`, the one error
+/// decision that replaces the whole result (:185-195).
+pub fn audit_annotations_budgeted(
+    items: &[(&str, &str)],
+    evaluator: &mut CELEvaluator,
+    context: &CELContext,
+    variables: &mut VariableCosts,
+) -> Result<Vec<AuditAnnotationOutcome>, String> {
+    let mut remaining = RUNTIME_CEL_COST_BUDGET;
+    let mut out = Vec::with_capacity(items.len());
+    for (key, expr) in items {
+        let expr = expr.trim();
+        let (value, left) = evaluate_charged(evaluator, expr, context, variables, remaining)
+            .map_err(|e| e.detail)?;
+        remaining = left;
+        out.push(match value {
+            Ok(cel::Value::Null) => AuditAnnotationOutcome::Skip,
+            Ok(cel::Value::String(s)) if s.trim().is_empty() => AuditAnnotationOutcome::Skip,
+            Ok(cel::Value::String(s)) => AuditAnnotationOutcome::Emit {
+                key: key.to_string(),
+                value: s.trim().to_string(),
+            },
+            Ok(other) => AuditAnnotationOutcome::Emit {
+                key: key.to_string(),
+                value: format!("{other:?}"),
+            },
+            Err(e) => AuditAnnotationOutcome::Error {
+                message: format!("auditAnnotation '{key}' valueExpression '{expr}' failed: {e}"),
+            },
+        });
+    }
+    Ok(out)
 }
 
 /// The request authorizer a policy plugin evaluates with: the caching

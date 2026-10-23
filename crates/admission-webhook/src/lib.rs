@@ -11,6 +11,8 @@ pub mod webhook_match;
 mod match_conditions_budget_tests;
 #[cfg(test)]
 mod vap_authorizer_tests;
+#[cfg(test)]
+mod vap_cost_budget_tests;
 
 use rusternetes_common::latency_trackers::latency_trackers_from_context;
 use rusternetes_common::{
@@ -2630,6 +2632,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             // Evaluate spec.variables, building a "variables" Map for CEL access.
             // CEL expressions reference variables as `variables.NAME`, which means
             // "variables" must be a Map variable in the CEL context.
+            let mut variable_costs = crate::cel_evaluators::VariableCosts::default();
             if let Some(vars) = policy
                 .get("spec")
                 .and_then(|s| s.get("variables"))
@@ -2647,7 +2650,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         continue;
                     }
                     // Evaluate the variable expression and add to the variables map
-                    match evaluator.evaluate_to_value(var_expr, &context) {
+                    let (var_result, var_cost) = evaluator.evaluate_with_cost(
+                        var_expr,
+                        &context,
+                        rusternetes_common::cel_cost::CostOptions::default(),
+                    );
+                    // Charged to the budget when first referenced, see `VariableCosts`.
+                    variable_costs.record(var_name, var_expr, var_cost);
+                    match var_result {
                         Ok(val) => {
                             var_map.insert(
                                 cel::objects::Key::String(std::sync::Arc::new(
@@ -2693,35 +2703,94 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 .and_then(|f| f.as_str())
                 .unwrap_or("Fail");
 
-            // Evaluate validations.
-            // Source of truth: `crate::cel_evaluators::ValidationEvaluator`.
-            if let Some(validations) = policy
+            // Evaluate validations, then auditAnnotations, under the shared
+            // RuntimeCELCostBudget. Source of truth: `validating/validator.go`
+            // `Validate`, see `crate::cel_evaluators::validate_budgeted`.
+            let validation_nodes: Vec<&serde_json::Value> = policy
                 .get("spec")
                 .and_then(|s| s.get("validations"))
                 .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter(|x| {
+                            !x.get("expression")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("")
+                                .is_empty()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let validation_items: Vec<crate::cel_evaluators::ValidationItem<'_>> = validation_nodes
+                .iter()
+                .map(|v| crate::cel_evaluators::ValidationItem {
+                    expression: v.get("expression").and_then(|e| e.as_str()).unwrap_or(""),
+                    message_expression: v.get("messageExpression").and_then(|m| m.as_str()),
+                    message: v.get("message").and_then(|m| m.as_str()),
+                })
+                .collect();
+            let audit_items: Vec<(&str, &str)> = policy
+                .get("spec")
+                .and_then(|s| s.get("auditAnnotations"))
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|x| {
+                            (
+                                x.get("key").and_then(|k| k.as_str()).unwrap_or(""),
+                                x.get("valueExpression")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(""),
+                            )
+                        })
+                        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // validator.go:108-119, 185-195: running out of budget is the one
+            // decision, an error handled by `failurePolicy`
+            // (`policyDecisionActionForError`); it replaces every other decision.
+            let evaluated = crate::cel_evaluators::validate_budgeted(
+                &validation_items,
+                &mut evaluator,
+                &context,
+                &message_context,
+                &mut variable_costs,
+            )
+            .and_then(|outcomes| {
+                crate::cel_evaluators::audit_annotations_budgeted(
+                    &audit_items,
+                    &mut evaluator,
+                    &context,
+                    &mut variable_costs,
+                )
+                .map(|audits| (outcomes, audits))
+            });
+            let (validation_outcomes, audit_outcomes) = match evaluated {
+                Ok(r) => r,
+                Err(message) => {
+                    tracing::warn!(
+                        "CEL evaluation error for policy {}: {}",
+                        policy_name,
+                        message
+                    );
+                    if failure_policy == "Fail" {
+                        return Err(rusternetes_common::Error::InvalidResource(format!(
+                            "ValidatingAdmissionPolicy {} evaluation error: {}",
+                            policy_name, message
+                        )));
+                    }
+                    continue;
+                }
+            };
+
             {
-                for validation in validations {
+                for (validation, outcome) in validation_nodes.into_iter().zip(validation_outcomes) {
                     let expression = validation
                         .get("expression")
                         .and_then(|e| e.as_str())
                         .unwrap_or("");
-                    if expression.is_empty() {
-                        continue;
-                    }
-                    let message_expression =
-                        validation.get("messageExpression").and_then(|m| m.as_str());
-                    let static_message = validation.get("message").and_then(|m| m.as_str());
-
-                    let outcome =
-                        crate::cel_evaluators::ValidationEvaluator::evaluate_one_with_message_context(
-                            expression,
-                            message_expression,
-                            static_message,
-                            &mut evaluator,
-                            &context,
-                            &message_context,
-                        );
-
                     match outcome {
                         crate::cel_evaluators::ValidationOutcome::Pass => {
                             tracing::debug!(
@@ -2776,8 +2845,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 }
             }
 
-            // Evaluate auditAnnotations.
-            // Source of truth: `crate::cel_evaluators::AuditAnnotationEvaluator`.
+            // Report auditAnnotations (evaluated above).
             //
             // Upstream emits resolved annotations on the audit event under
             // `<policy-name>/<key>` once we have an audit sink, we will plumb
@@ -2785,27 +2853,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             // expression is exercised (catching regressions) without being
             // silently dropped. A `valueExpression` returning `null` skips the
             // annotation per upstream `validator.go`.
-            if let Some(audit_annotations) = policy
-                .get("spec")
-                .and_then(|s| s.get("auditAnnotations"))
-                .and_then(|a| a.as_array())
             {
-                for annotation in audit_annotations {
-                    let key = annotation.get("key").and_then(|k| k.as_str()).unwrap_or("");
-                    let value_expression = annotation
-                        .get("valueExpression")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if key.is_empty() || value_expression.is_empty() {
-                        continue;
-                    }
-
-                    let outcome = crate::cel_evaluators::AuditAnnotationEvaluator::evaluate_one(
-                        key,
-                        value_expression,
-                        &mut evaluator,
-                        &context,
-                    );
+                for outcome in audit_outcomes {
                     match outcome {
                         crate::cel_evaluators::AuditAnnotationOutcome::Emit { key, value } => {
                             tracing::info!(
@@ -2818,9 +2867,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                         crate::cel_evaluators::AuditAnnotationOutcome::Skip => {
                             tracing::debug!(
-                                "VAP {} audit annotation {} skipped (valueExpression returned null)",
-                                policy_name,
-                                key
+                                "VAP {} audit annotation skipped (valueExpression returned null)",
+                                policy_name
                             );
                         }
                         crate::cel_evaluators::AuditAnnotationOutcome::Error { message } => {
