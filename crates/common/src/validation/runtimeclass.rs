@@ -51,7 +51,7 @@ const HUGEPAGES_PREFIX: &str = "hugepages-";
 const REQUESTS_HUGEPAGES_PREFIX: &str = "requests.hugepages-";
 
 /// Mirrors upstream `IsHugePageResourceName`.
-fn is_huge_page_resource_name(name: &str) -> bool {
+pub(crate) fn is_huge_page_resource_name(name: &str) -> bool {
     name.starts_with(HUGEPAGES_PREFIX)
 }
 
@@ -82,7 +82,7 @@ fn is_extended_resource_name(name: &str) -> bool {
 
 /// Mirrors upstream `validateResourceName` (`pkg/apis/core/validation`):
 /// must be a qualified name, and if unprefixed must be a standard resource.
-fn validate_resource_name(name: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_resource_name(name: &str, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     for msg in is_qualified_name(name) {
         errs.push(Error::invalid(fld_path, name.to_string(), msg));

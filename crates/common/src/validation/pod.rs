@@ -553,6 +553,22 @@ fn validate_pod_spec_for(
         ));
     }
 
+    // `:4645`: pod-level resources, behind `PodLevelResourcesEnabled`.
+    if opts.pod_level_resources_enabled {
+        let pod_claim_names: std::collections::BTreeSet<String> = spec
+            .resource_claims
+            .iter()
+            .flatten()
+            .map(|c| c.name.clone())
+            .collect();
+        errs.extend(crate::validation::pod_resources::validate_pod_resources(
+            spec,
+            &pod_claim_names,
+            fld_path,
+            opts,
+        ));
+    }
+
     // readinessGates / schedulingGates (upstream `:4657` and `:4658`).
     if let Some(ref gates) = spec.readiness_gates {
         errs.extend(validate_readiness_gates(
