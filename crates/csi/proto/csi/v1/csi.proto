@@ -13,7 +13,8 @@
 // holds exactly the Node-service RPCs the kubelet's volume plugin calls
 // (`pkg/volume/csi/csi_client.go`), plus the Identity.GetPluginCapabilities and
 // Controller (CreateVolume/DeleteVolume/ControllerGetCapabilities/
-// CreateSnapshot/DeleteSnapshot/ListVolumes) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
+// CreateSnapshot/DeleteSnapshot/ListVolumes/ControllerExpandVolume) RPCs plus the
+// GroupController (VolumeGroupSnapshot, spec v1.9.0) RPCs of the external-provisioner client. The `csi_secret` field option is omitted: it
 // only drives log redaction in Go's `protosanitizer` and has no wire effect.
 // Replace with the verbatim file when the spec repo is vendored.
 
@@ -37,6 +38,14 @@ service Controller {
   rpc ControllerGetCapabilities (ControllerGetCapabilitiesRequest) returns (ControllerGetCapabilitiesResponse) {}
   rpc CreateSnapshot (CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
   rpc DeleteSnapshot (DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
+  rpc ControllerExpandVolume (ControllerExpandVolumeRequest) returns (ControllerExpandVolumeResponse) {}
+}
+
+service GroupController {
+  rpc GroupControllerGetCapabilities (GroupControllerGetCapabilitiesRequest) returns (GroupControllerGetCapabilitiesResponse) {}
+  rpc CreateVolumeGroupSnapshot (CreateVolumeGroupSnapshotRequest) returns (CreateVolumeGroupSnapshotResponse) {}
+  rpc DeleteVolumeGroupSnapshot (DeleteVolumeGroupSnapshotRequest) returns (DeleteVolumeGroupSnapshotResponse) {}
+  rpc GetVolumeGroupSnapshot (GetVolumeGroupSnapshotRequest) returns (GetVolumeGroupSnapshotResponse) {}
 }
 
 service Node {
@@ -402,6 +411,7 @@ message Snapshot {
   string source_volume_id = 3;
   google.protobuf.Timestamp creation_time = 4;
   bool ready_to_use = 5;
+  string group_snapshot_id = 6;
 }
 
 message DeleteSnapshotRequest {
@@ -410,3 +420,74 @@ message DeleteSnapshotRequest {
 }
 
 message DeleteSnapshotResponse {}
+
+// ControllerExpandVolume (csi.pb.go:3803-3889; fields 1-4 / 1-2).
+message ControllerExpandVolumeRequest {
+  string volume_id = 1;
+  CapacityRange capacity_range = 2;
+  map<string, string> secrets = 3;
+  VolumeCapability volume_capability = 4;
+}
+
+message ControllerExpandVolumeResponse {
+  int64 capacity_bytes = 1;
+  bool node_expansion_required = 2;
+}
+
+// GroupController service (csi.pb.go:5114-5700, `GroupControllerClient` at
+// :6901). CSI spec v1.9.0 -- the version Kubernetes 1.35 vendors -- names these
+// the VolumeGroupSnapshot RPCs; CreateVolumeGroup etc. do not exist in v1.9.0.
+message GroupControllerGetCapabilitiesRequest {}
+
+message GroupControllerGetCapabilitiesResponse {
+  repeated GroupControllerServiceCapability capabilities = 1;
+}
+
+message GroupControllerServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT = 1;
+    }
+    Type type = 1;
+  }
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message CreateVolumeGroupSnapshotRequest {
+  string name = 1;
+  repeated string source_volume_ids = 2;
+  map<string, string> secrets = 3;
+  map<string, string> parameters = 4;
+}
+
+message CreateVolumeGroupSnapshotResponse {
+  VolumeGroupSnapshot group_snapshot = 1;
+}
+
+message VolumeGroupSnapshot {
+  string group_snapshot_id = 1;
+  repeated Snapshot snapshots = 2;
+  google.protobuf.Timestamp creation_time = 3;
+  bool ready_to_use = 4;
+}
+
+message DeleteVolumeGroupSnapshotRequest {
+  string group_snapshot_id = 1;
+  repeated string snapshot_ids = 2;
+  map<string, string> secrets = 3;
+}
+
+message DeleteVolumeGroupSnapshotResponse {}
+
+message GetVolumeGroupSnapshotRequest {
+  string group_snapshot_id = 1;
+  repeated string snapshot_ids = 2;
+  map<string, string> secrets = 3;
+}
+
+message GetVolumeGroupSnapshotResponse {
+  VolumeGroupSnapshot group_snapshot = 1;
+}
