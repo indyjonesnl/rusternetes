@@ -494,7 +494,7 @@ if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/nu
     print_step "Restarting cluster with discovered gateway..."
     echo "DOCKER_GATEWAY=${RUSTERNETES_BRIDGE_GATEWAY}" > "$PROJECT_ROOT/.env"
     echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> "$PROJECT_ROOT/.env"
-    "$CONTAINER_RT" compose -f "$PROJECT_ROOT/compose.all-in-one.yml" -f "$PROJECT_ROOT/compose.dind.all-in-one.yml" up -d
+    "$CONTAINER_RT" compose -f "$PROJECT_ROOT/compose.all-in-one.yml" up -d
     print_success "Cluster restarted with gateway $RUSTERNETES_BRIDGE_GATEWAY"
     echo "  .env file written: $PROJECT_ROOT/.env"
 fi
@@ -533,9 +533,21 @@ else
     # image on that stack, so kube-dns is wired manually to the container IP.
     # The compose files pin the network name to `rusternetes-network`.
     DNS_NETWORK="rusternetes-network"
-    AIO_DNS_IP=$($CONTAINER_RT inspect rusternetes \
-        --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
-        2>/dev/null || true)
+    # The all-in-one container joins the bundled containerd container's network
+    # namespace (network_mode: service:containerd), so it has no network
+    # settings of its own: its address is the containerd container's.
+    AIO_DNS_IP=""
+    if $CONTAINER_RT inspect rusternetes >/dev/null 2>&1; then
+        for aio_net_container in rusternetes rusternetes-containerd; do
+            AIO_DNS_IP=$($CONTAINER_RT inspect "$aio_net_container" \
+                --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
+                2>/dev/null || true)
+            if [ -n "$AIO_DNS_IP" ] && [ "$AIO_DNS_IP" != "<no value>" ]; then
+                break
+            fi
+            AIO_DNS_IP=""
+        done
+    fi
 
     if [ -n "$AIO_DNS_IP" ] && [ "$AIO_DNS_IP" != "<no value>" ]; then
         print_step "Wiring kube-dns Service to the all-in-one rusternetes container..."

@@ -1,8 +1,9 @@
 # All-in-one rusternetes with Redis storage.
 #
-# Two containers: the rusternetes binary (API server, scheduler,
-# controller manager, kubelet) and Redis. Rhino's RedisBackend is
-# embedded in the binary — no separate rhino server needed.
+# Three containers: the rusternetes binary (API server, scheduler,
+# controller manager, kubelet), Redis, and a bundled containerd CRI runtime.
+# Rhino's RedisBackend is embedded in the binary — no separate rhino server
+# needed.
 #
 # Usage:
 #   podman compose -f compose.all-in-one-redis.yml build
@@ -39,23 +40,18 @@ services:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
     container_name: rusternetes
     privileged: true
-    ports:
-      - "6443:6443"
-      - "10250:10250"
-      - "10257:10257"
     depends_on:
       redis:
         condition: service_healthy
-    networks:
-      rusternetes-net:
-        ipv4_address: 10.89.0.10
-        aliases:
-          - api-server
+      containerd:
+        condition: service_started
+    # Joins containerd's netns (see the `containerd` service): host ports,
+    # the network attachment and aliases live on that service.
+    network_mode: "service:containerd"
     volumes:
       - ./.rusternetes/certs:/etc/kubernetes/pki:ro
-      - /run/podman/podman.sock:/run/podman/podman.sock:rw,z
-      - /run/podman/podman.sock:/var/run/docker.sock:rw,z
-      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw
+      - containerd-run:/run/containerd
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       # CSI attach/detach socket dir (#3746), off by default; uncomment together
       # with the "--csi-attacher" block in `command:` below. The in-process
       # controller-manager dials the driver socket from inside this container, so
@@ -66,7 +62,7 @@ services:
       #   - /var/lib/kubelet/plugins/csi-hostpath:/var/lib/kubelet/plugins/csi-hostpath:rw
     environment:
       - RUST_LOG=info
-      - DOCKER_HOST=unix:///run/podman/podman.sock
+      - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=10.89.0.10
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}
     command:
@@ -88,12 +84,47 @@ services:
       - "--disable-proxy"
       - "--console-dir"
       - "/app/console"
-      - "--network"
-      - "rusternetes-network"
       - "--cluster-dns"
       - "10.96.0.10"
       - "--volume-dir"
       - "${KUBELET_VOLUMES_PATH}"
+
+  # CRI runtime: containerd (CRI plugin) + Youki, bundled exactly like the
+  # `containerd` service in compose.sqlite.yml. The all-in-one binary talks CRI
+  # v1 to it over the shared `containerd-run` volume instead of a host
+  # Podman/Docker socket, so this stack runs unchanged on Docker or Podman.
+  # containerd owns the pod network namespace (cni0 bridge, iptables), so the
+  # `rusternetes` service joins THIS service's netns (network_mode below):
+  # the in-process kube-proxy then programs Service DNAT rules where the pod
+  # IPs live, and the node IP the kubelet advertises is reachable by pods.
+  # Single node: CNI_CONF_FROM_NODE_IPAM stays unset, so the cluster-wide
+  # conflist baked into the image applies (main.rs keeps node_net: None).
+  containerd:
+    image: rusternetes-containerd:latest
+    build:
+      context: .
+      dockerfile: containerd.Dockerfile
+    container_name: rusternetes-containerd
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "10250:10250"
+      - "10257:10257"
+    networks:
+      rusternetes-net:
+        ipv4_address: 10.89.0.10
+        aliases:
+          - api-server
+    volumes:
+      - containerd-run:/run/containerd
+      # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
+      # filesystem, not the container's own overlay rootfs — nested overlay
+      # mounts fail with "invalid argument". A named volume is host-fs-backed.
+      - containerd-data:/var/lib/containerd
+      # rshared so the tmpfs mounts the kubelet makes for Memory-medium emptyDir
+      # volumes propagate to where containerd resolves container bind mounts.
+      - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
 
 networks:
   rusternetes-net:
@@ -106,3 +137,8 @@ networks:
 volumes:
   redis-data:
     name: rusternetes-redis-data
+  # CRI socket shared from the containerd service to the rusternetes binary.
+  containerd-run:
+    name: rusternetes-containerd-run
+  containerd-data:
+    name: rusternetes-containerd-data

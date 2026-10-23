@@ -3,7 +3,6 @@
 # Use with:
 #   cargo build --release -p rusternetes --features sqlite
 #   docker compose -f compose.all-in-one.yml \
-#                  -f compose.dind.all-in-one.yml \
 #                  -f compose.local-binary.all-in-one.yml \
 #                  up -d --no-build
 #
