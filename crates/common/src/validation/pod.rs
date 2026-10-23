@@ -542,6 +542,14 @@ fn validate_pod_spec_for(
                 &sc_path.child("appArmorProfile"),
             ));
         }
+        // `validatePodSpecSecurityContext` (validation.go:5573).
+        if let Some(ref policy) = sc.se_linux_change_policy {
+            errs.extend(validate_se_linux_change_policy(
+                policy,
+                &sc_path.child("seLinuxChangePolicy"),
+                opts,
+            ));
+        }
     }
 
     // resourceClaims (upstream `validatePodSpec`,
@@ -1424,6 +1432,33 @@ pub(crate) fn validate_container(
     }
 
     errs
+}
+
+/// `validSELinuxChangePolicies` (validation.go:5504), sorted as `sets.List`.
+const SE_LINUX_CHANGE_POLICIES: &[&str] = &["MountOption", "Recursive"];
+
+/// `validateSELinuxChangePolicy` (validation.go:5506-5525).
+fn validate_se_linux_change_policy(
+    policy: &str,
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    if opts.allow_only_recursive_se_linux_change_policy {
+        if policy != "Recursive" {
+            return vec![Error::not_supported(
+                fld_path,
+                policy.to_string(),
+                &["Recursive"],
+            )];
+        }
+    } else if !SE_LINUX_CHANGE_POLICIES.contains(&policy) {
+        return vec![Error::not_supported(
+            fld_path,
+            policy.to_string(),
+            SE_LINUX_CHANGE_POLICIES,
+        )];
+    }
+    Vec::new()
 }
 
 const PULL_POLICIES: &[&str] = &["Always", "Never", "IfNotPresent"];
