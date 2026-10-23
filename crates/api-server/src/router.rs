@@ -369,8 +369,29 @@ async fn custom_resource_fallback(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let _crd = crd.unwrap();
+    let crd = crd.unwrap();
     debug!("Found CRD {} for request", crd_name);
+
+    // customresource_handler.go:268-280 crdHandler.ServeHTTP: "if the scope in
+    // the CRD and the scope in request differ (with exception of the verbs in
+    // possiblyAcrossAllNamespacesVerbs for namespaced resources), pass request
+    // to the delegate, which is supposed to lead to a 404."
+    //
+    //   namespacedCRD, namespacedReq := crd.Spec.Scope == apiextensionsv1.NamespaceScoped, len(requestInfo.Namespace) > 0
+    //   if !namespacedCRD && namespacedReq { delegate; return }
+    //   if namespacedCRD && !namespacedReq && !possiblyAcrossAllNamespacesVerbs.Has(requestInfo.Verb) { delegate; return }
+    //
+    // possiblyAcrossAllNamespacesVerbs = list, watch (customresource_handler.go:226),
+    // i.e. a GET on a collection; a GET with a name is `get`.
+    let namespaced_crd = crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced;
+    let namespaced_req = namespace.is_some_and(|ns| !ns.is_empty());
+    let possibly_across_all_namespaces = method == Method::GET && name.is_none();
+    if (!namespaced_crd && namespaced_req)
+        || (namespaced_crd && !namespaced_req && !possibly_across_all_namespaces)
+    {
+        debug!("CRD {crd_name} scope differs from request scope, returning 404");
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     // Route to the appropriate custom resource handler based on method and path
     let response = match (method.clone(), name, subresource) {
