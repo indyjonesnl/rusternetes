@@ -4292,3 +4292,136 @@ async fn object_selector_skips_webhook_for_nonmatching_configmap() {
         "stored configmap must be unmutated when objectSelector does not match"
     );
 }
+
+/// Mutating mock that removes `data[<key>]`.
+async fn start_mutator_remove_data(key: String) -> (String, oneshot::Sender<()>) {
+    let (tx, rx) = oneshot::channel();
+    let route = warp::post()
+        .and(warp::body::json())
+        .map(move |r: AdmissionReview| {
+            let request = r.request.expect("request");
+            let patch = vec![PatchOperation {
+                op: PatchOp::Remove,
+                path: format!("/data/{key}"),
+                value: None,
+                from: None,
+            }];
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&patch).unwrap());
+            warp::reply::json(&wrap(AdmissionReviewResponse {
+                uid: request.uid,
+                allowed: true,
+                status: None,
+                patch: Some(b64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }))
+        });
+    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+        rx.await.ok();
+    });
+    tokio::spawn(srv);
+    (format!("http://{}", addr), tx)
+}
+
+/// `mutatingDispatcher.callAttrMutatingHook` (webhook/mutating/dispatcher.go:390)
+/// runs `GetObjectDefaulter().Default` on the object each webhook's patch
+/// produced (`unstructuredDefaulter`, customresource_handler.go:1240-1249), so
+/// the next webhook sees a defaulted object even when the previous one removed
+/// the defaulted field. Webhook 2 only mutates if `data.defaulted` is present.
+#[tokio::test]
+async fn mutating_webhook_patch_of_a_cr_is_defaulted_before_the_next_webhook() {
+    let mem = Arc::new(MemoryStorage::new());
+    let manager = AdmissionWebhookManager::new(mem.clone());
+    let crd: rusternetes_common::resources::CustomResourceDefinition =
+        serde_json::from_value(json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "foos.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "foos", "singular": "foo", "kind": "Foo", "listKind": "FooList"},
+                "scope": "Namespaced",
+                "versions": [{
+                    "name": "v1", "served": true, "storage": true,
+                    "schema": {"openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {"data": {
+                            "type": "object",
+                            "properties": {
+                                "defaulted": {"type": "string", "default": "d"},
+                                "mutation-stage-1": {"type": "string"}
+                            }
+                        }}
+                    }}
+                }]
+            }
+        }))
+        .unwrap();
+    mem.create(
+        &build_key("customresourcedefinitions", None, "foos.example.com"),
+        &crd,
+    )
+    .await
+    .unwrap();
+
+    let (url1, _s1) = start_mutator_remove_data("defaulted".into()).await;
+    let (url2, _s2) = start_mutator_data_stage("defaulted".into(), "mutation-stage-1".into()).await;
+    let cfg = MutatingWebhookConfiguration {
+        api_version: "admissionregistration.k8s.io/v1".to_string(),
+        kind: "MutatingWebhookConfiguration".to_string(),
+        metadata: rusternetes_common::types::ObjectMeta::new("mutate-cr-default"),
+        webhooks: Some(vec![
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating("remove-defaulted.k8s.io", url1, vec![], None, None)
+            },
+            MutatingWebhook {
+                rules: vec![rule_for("example.com", "v1", "foos")],
+                ..mutating("needs-defaulted.k8s.io", url2, vec![], None, None)
+            },
+        ]),
+    };
+    mem.create(
+        &build_key("mutatingwebhookconfigurations", None, "mutate-cr-default"),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let cr = Some(json!({
+        "apiVersion": "example.com/v1",
+        "kind": "Foo",
+        "metadata": {"name": "cr-instance-1", "namespace": "default"},
+        "data": {"defaulted": "d"}
+    }));
+    let (_resp, mutated) = manager
+        .run_mutating_webhooks(
+            &Operation::Create,
+            &GroupVersionKind {
+                group: "example.com".into(),
+                version: "v1".into(),
+                kind: "Foo".into(),
+            },
+            &GroupVersionResource {
+                group: "example.com".into(),
+                version: "v1".into(),
+                resource: "foos".into(),
+            },
+            Some("default"),
+            "cr-instance-1",
+            cr,
+            None,
+            &admin_user_info(),
+        )
+        .await
+        .unwrap();
+    let obj = mutated.expect("mutated CR");
+    assert_eq!(
+        obj["data"],
+        json!({"defaulted": "d", "mutation-stage-1": "yes"}),
+        "webhook 2 must see the default webhook 1's patch removed"
+    );
+}

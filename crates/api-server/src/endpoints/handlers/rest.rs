@@ -114,6 +114,17 @@ impl<T: Object> RequestScope<T> {
         self.store.decode_coerce(obj)
     }
 
+    /// [`Self::convert`] for the object mutating admission produced:
+    /// `GetObjectConvertor().Convert(VersionedObject, Object, nil)`
+    /// (webhook/mutating/dispatcher.go:236) is the codec's converter, which
+    /// coerces but does not default (`schemaCoercingConverter`).
+    pub(super) fn convert_admitted(&self, obj: &mut T) -> Result<()> {
+        if let Some(convert) = self.convert_to_internal {
+            convert(obj);
+        }
+        self.store.convert_coerce(obj)
+    }
+
     /// `scope.FieldManager` (installer.go:697-722 `NewDefaultFieldManager`):
     /// the Update path's field manager for this resource or subresource.
     pub(super) fn field_manager(&self) -> crate::fieldmanager::FieldManager {

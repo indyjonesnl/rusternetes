@@ -2079,13 +2079,26 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                             ignore_client_call_failures,
                         );
                     }
+                    // `changed` is judged on the patched object before it is
+                    // defaulted (dispatcher.go:385 precedes :390).
+                    let changed = object != object_before_call;
+                    // dispatcher.go:390 `GetObjectDefaulter().Default(
+                    // attr.VersionedObject)`, run when a non-empty patch was
+                    // applied (:340-342): a custom resource is defaulted by
+                    // `unstructuredDefaulter` (customresource_handler.go:1240),
+                    // so the next webhook sees the defaults a patch removed.
+                    if !patches.is_empty() {
+                        if let Some(ref mut obj) = object {
+                            self.default_post_patch(gvr, obj).await;
+                        }
+                    }
                     all_patches.extend(patches);
 
                     // dispatcher.go:192-198: a webhook whose patch changed the
                     // object requires every previously invoked IfNeeded webhook
                     // to be reinvoked and asks the reinvoker for a second pass;
                     // an IfNeeded webhook is then remembered as reinvocable.
-                    if object != object_before_call {
+                    if changed {
                         reinvoke_ctx.require_reinvoking_previously_invoked_plugins();
                         should_reinvoke = true;
                     }
@@ -2124,6 +2137,28 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         };
 
         Ok((response, object, should_reinvoke))
+    }
+
+    /// `o.GetObjectDefaulter().Default(attr.VersionedObject)` for a custom
+    /// resource (see the call site). Nothing when the GVR has no CRD: a
+    /// built-in type is defaulted by its typed decode.
+    async fn default_post_patch(&self, gvr: &GroupVersionResource, object: &mut Value) {
+        if gvr.group.is_empty() {
+            return;
+        }
+        let crd_name = format!("{}.{}", gvr.resource, gvr.group);
+        let key = rusternetes_storage::build_key("customresourcedefinitions", None, &crd_name);
+        if let Ok(crd) = self
+            .storage
+            .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+            .await
+        {
+            rusternetes_common::resources::crd::default_custom_resource_value(
+                &crd,
+                &gvr.version,
+                object,
+            );
+        }
     }
 
     /// Look up the CRD for the given GVR and prune any field the mutating

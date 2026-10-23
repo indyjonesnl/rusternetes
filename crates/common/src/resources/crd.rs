@@ -914,6 +914,37 @@ pub fn prune_custom_resource_value(
     }
 }
 
+/// `unstructuredDefaulter.Default` for a CR held as a raw JSON [`Value`]:
+/// `structuraldefaulting.Default(u.UnstructuredContent(),
+/// structuralSchemas[gv.Version])`.
+///
+/// Upstream runs it on the object a mutating webhook's (or mutating admission
+/// policy's) patch produced, so the next plugin sees a defaulted object
+/// (`staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/mutating/dispatcher.go:390`,
+/// `.../policy/mutating/dispatcher.go:274`).
+///
+/// K8s ref: `staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/customresource_handler.go:1240-1249`
+pub fn default_custom_resource_value(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    value: &mut serde_json::Value,
+) {
+    let Some(schema) = crd
+        .spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)
+        .and_then(|v| v.schema.as_ref())
+        .and_then(|s| s.open_apiv3_schema.as_ref())
+    else {
+        return;
+    };
+    let Ok(structural) = crate::validation::structural::new_structural(schema) else {
+        return;
+    };
+    crate::validation::structural::defaulting::default(value, Some(&structural));
+}
+
 /// Prune a [`CustomResource`] struct in-place against its CRD's structural schema.
 ///
 /// Removes fields from `cr.extra`, `cr.spec`, and `cr.status` that are not

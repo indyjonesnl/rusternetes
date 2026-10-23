@@ -796,6 +796,15 @@ pub trait RestStorage<T: Object>: Send + Sync {
         Ok(())
     }
 
+    /// What the storage codec's converter does to an object converted to the
+    /// storage version, i.e. the mutating-admission result: a custom
+    /// resource's `schemaCoercingConverter` (customresource_handler.go:
+    /// 1348-1384), the coercer without the defaulter. Nothing for every other
+    /// storage.
+    fn convert_coerce(&self, _obj: &mut T) -> Result<()> {
+        Ok(())
+    }
+
     /// The decoder's strict-decoding verdict on a body, judged before
     /// [`Self::decode_coerce`] prunes the unknown fields away
     /// (`schemaCoercingDecoder.Decode`, customresource_handler.go:1338-1342).
