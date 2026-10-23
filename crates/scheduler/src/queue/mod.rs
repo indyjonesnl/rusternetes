@@ -13,6 +13,7 @@
 //!   functions, and `buildQueueingHintMap`.
 
 pub mod csi_hints;
+pub mod dra_hints;
 pub mod events;
 pub mod heap;
 pub mod hints;

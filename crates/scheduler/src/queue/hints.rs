@@ -101,6 +101,7 @@ pub fn build_queueing_hint_map(plugins: &[(String, Vec<ClusterEventWithHint>)]) 
 /// each profile contributes the events of the plugins it enables.
 pub fn build_queueing_hint_map_per_profile<'a>(
     profiles: impl IntoIterator<Item = &'a Profile>,
+    claims: &super::dra_hints::ResourceClaimCache,
 ) -> QueueingHintMapPerProfile {
     profiles
         .into_iter()
@@ -109,7 +110,7 @@ pub fn build_queueing_hint_map_per_profile<'a>(
                 .framework
                 .enqueue_extension_plugins()
                 .iter()
-                .map(|name| (name.to_string(), events_to_register(name, p)))
+                .map(|name| (name.to_string(), events_to_register(name, p, claims)))
                 .collect();
             (p.scheduler_name.clone(), build_queueing_hint_map(&plugins))
         })
@@ -119,7 +120,11 @@ pub fn build_queueing_hint_map_per_profile<'a>(
 /// `EventsToRegister` of every in-tree plugin (feature gates at their 1.35
 /// defaults). Plugins without `EnqueueExtensions` get
 /// `UnrollWildCardResource` (`fillEnqueueExtensions`, `framework.go:673-689`).
-pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEventWithHint> {
+pub fn events_to_register(
+    plugin_name: &str,
+    profile: &Profile,
+    claims: &super::dra_hints::ResourceClaimCache,
+) -> Vec<ClusterEventWithHint> {
     use ActionType as A;
     use EventResource as R;
     let ev = |r: R, a: A| ClusterEventWithHint::new(ClusterEvent::new(r, a));
@@ -268,14 +273,30 @@ pub fn events_to_register(plugin_name: &str, profile: &Profile) -> Vec<ClusterEv
                 Arc::new(super::csi_hints::is_schedulable_after_volume_attachment_deleted),
             ),
         ],
-        // dynamicresources/dynamicresources.go:262-304
+        // dynamicresources/dynamicresources.go:211-244
         names::DYNAMIC_RESOURCES => vec![
             ev(
                 R::Node,
                 A::ADD | A::UPDATE_NODE_LABEL | A::UPDATE_NODE_ALLOCATABLE,
             ),
-            ev(R::ResourceClaim, A::ADD | A::UPDATE),
-            ev(R::Pod, A::UPDATE_POD_GENERATED_RESOURCE_CLAIM),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::ResourceClaim, A::ADD | A::UPDATE),
+                {
+                    let claims = claims.clone();
+                    Arc::new(move |pod, old, new| {
+                        super::dra_hints::is_schedulable_after_claim_change(&claims, pod, old, new)
+                    })
+                },
+            ),
+            ClusterEventWithHint::with_hint(
+                ClusterEvent::new(R::Pod, A::UPDATE_POD_GENERATED_RESOURCE_CLAIM),
+                {
+                    let claims = claims.clone();
+                    Arc::new(move |pod, old, new| {
+                        super::dra_hints::is_schedulable_after_pod_change(&claims, pod, old, new)
+                    })
+                },
+            ),
             ev(R::DeviceClass, A::ADD | A::UPDATE),
             ev(R::ResourceSlice, A::ADD | A::UPDATE),
         ],
