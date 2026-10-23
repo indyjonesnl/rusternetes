@@ -24,7 +24,7 @@
 //! and Overhead initialisation) are now exercised end-to-end *in-process*
 //! against the real api-server routes by
 //! `crates/api-server/tests/runtimeclass_router_test.rs` — no live cluster
-//! required — so their stubs run green and delegate to that file. Only the
+//! required — so their empty delegating stubs were removed (#1762) in favour of that file. Only the
 //! "Pod reaches Running phase" assertion still needs a live kubelet container
 //! runtime and stays `#[ignore]`d. The pure-shape invariants in each test
 //! (struct building, serde round-trips) also run and must pass.
@@ -172,20 +172,9 @@ fn runtimeclass_deserialises_from_canonical_json() {
     assert_eq!(tols[0].effect.as_deref(), Some("NoSchedule"));
 }
 
-/// [sig-node] RuntimeClass API operations — live CRUD
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-///
-/// Previously `#[ignore]`d as needing a live API server. The full
-/// create → get → list → patch → delete sequence is now exercised
-/// in-process against the real api-server routes (no live cluster) by
-/// `runtimeclass_crud_lifecycle` in
-/// `crates/api-server/tests/runtimeclass_router_test.rs`.
-#[test]
-fn runtimeclass_api_crud_lifecycle() {
-    // Covered in-process; see crates/api-server/tests/runtimeclass_router_test.rs
-    // (`runtimeclass_crud_lifecycle`).
-}
+// (Not mirrored here, #1762: the spec runs against the real api-server routes in
+// `crates/api-server/tests/it/runtimeclass_router_test.rs::runtimeclass_crud_lifecycle`; an empty
+// test here would only claim coverage.)
 
 // ===========================================================================
 // 2. Reject Pod requesting a DELETED RuntimeClass
@@ -216,20 +205,9 @@ fn pod_with_deleted_runtime_class_spec_preserves_runtime_class_name() {
     );
 }
 
-/// [sig-node] RuntimeClass reject deleted — admission rejection
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-///
-/// Previously `#[ignore]`d as needing a live API server. The admission
-/// rejection (create RC → accept Pod → delete RC → reject new Pod, original
-/// Pod unaffected) is now exercised in-process against the real api-server
-/// routes by `pod_referencing_deleted_runtimeclass_is_rejected` in
-/// `crates/api-server/tests/runtimeclass_router_test.rs`.
-#[test]
-fn pod_requesting_deleted_runtime_class_is_rejected_on_admission() {
-    // Covered in-process; see crates/api-server/tests/runtimeclass_router_test.rs
-    // (`pod_referencing_deleted_runtimeclass_is_rejected`).
-}
+// (Not mirrored here, #1762: the spec runs against the real api-server routes in
+// `crates/api-server/tests/it/runtimeclass_router_test.rs::pod_referencing_deleted_runtimeclass_is_rejected`; an empty
+// test here would only claim coverage.)
 
 // ===========================================================================
 // 3. Schedule Pod with RuntimeClass but WITHOUT PodOverhead
@@ -381,20 +359,6 @@ fn runtimeclass_scheduling_toleration_survives_roundtrip() {
     assert_eq!(tols[0].effect.as_deref(), Some("NoSchedule"));
 }
 
-/// [sig-node] RuntimeClass schedule with PodOverhead — Overhead initialisation
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtimeclass.go
-///
-/// Previously `#[ignore]`d. In rusternetes the Overhead initialisation half
-/// ("initialize its Overhead": inject RuntimeClass.overhead.podFixed into
-/// pod.spec.overhead) happens at api-server admission, not the scheduler, and
-/// is now exercised in-process by `pod_overhead_injected_from_runtimeclass`
-/// (overhead present) and `pod_without_overhead_runtimeclass_has_no_injected_overhead`
-/// (overhead absent) in `crates/api-server/tests/runtimeclass_router_test.rs`.
-/// The remaining "Pod reaches Running phase" half still needs a live kubelet
-/// runtime — see `pod_with_runtime_class_no_overhead_scheduled_and_running`.
-#[test]
-fn pod_with_runtime_class_overhead_is_scheduled_and_overhead_initialised() {
-    // Overhead initialisation covered in-process; see
-    // crates/api-server/tests/runtimeclass_router_test.rs.
-}
+// (Not mirrored here, #1762: the spec runs against the real api-server routes in
+// `crates/api-server/tests/it/runtimeclass_router_test.rs::pod_overhead_injected_from_runtimeclass / pod_without_overhead_runtimeclass_has_no_injected_overhead`; an empty
+// test here would only claim coverage.)
