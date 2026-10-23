@@ -201,7 +201,19 @@ pub const EVENTS_V1_PATCH_CONVERSION: crate::endpoints::handlers::RequestVersion
     crate::endpoints::handlers::RequestVersionConversion {
         to_request_version: core_event_json_to_events_v1,
         from_request_version: events_v1_json_onto_core_event,
+        strict_decode: Some(strict_decode_events_v1),
     };
+
+/// Strict-decodes a patched `events.k8s.io/v1` document in that version
+/// (patch.go:331-363: the patched JSON is decoded into the versioned object).
+fn strict_decode_events_v1(
+    params: &std::collections::HashMap<String, String>,
+    patched: &[u8],
+) -> rusternetes_common::Result<Vec<String>> {
+    let v1: EventV1 = serde_json::from_slice(patched)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+    crate::handlers::validation::validate_strict_fields(params, patched, &v1)
+}
 
 /// Server-side apply on `events.k8s.io/v1`: the apply configuration is written
 /// against that version, so the live object is merged in it and the result

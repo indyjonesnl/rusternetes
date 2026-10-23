@@ -94,7 +94,22 @@ pub struct RequestVersionConversion {
     /// the round trip only if the reverse conversion can see the object it came
     /// off.
     pub from_request_version: fn(&serde_json::Value, serde_json::Value) -> serde_json::Value,
+
+    /// Strict-decodes the patched document **in the request's version**,
+    /// returning its `fieldValidation=Warn` warnings or the strict error.
+    ///
+    /// Upstream decodes the patched JSON into the versioned object
+    /// (`jsonPatcher.applyPatchToCurrentObject`, patch.go:331-363, and
+    /// `applyPatchToObject`, :750-780, with `returnUnknownFields`), so the
+    /// strictness verdict is the versioned schema's. Judged on the converted
+    /// hub object instead, a field the request version does not name is already
+    /// gone and never reported. `None` keeps the hub-object check.
+    pub strict_decode: Option<StrictDecodeFn>,
 }
+
+/// See [`RequestVersionConversion::strict_decode`]: the request's query
+/// parameters and the patched request-version document in, warnings out.
+pub type StrictDecodeFn = fn(&HashMap<String, String>, &[u8]) -> Result<Vec<String>>;
 
 impl<T: Object> RequestScope<T> {
     /// The `apiVersion` a request body must carry, if it carries one.
