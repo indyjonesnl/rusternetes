@@ -53,7 +53,13 @@ impl RhinoStorage<SqliteBackend> {
             compact_interval: Duration::from_secs(300),
             ..Default::default()
         };
+        Self::with_config(config).await
+    }
 
+    /// Like [`Self::new`] but with an explicit rhino [`SqliteConfig`], e.g. a
+    /// short `busy_timeout` to exercise lock contention (#3877).
+    pub async fn with_config(config: SqliteConfig) -> Result<Self> {
+        let db_path = config.dsn.clone();
         let backend = SqliteBackend::new(config)
             .await
             .map_err(|e| Error::Storage(format!("Failed to create SQLite backend: {}", e)))?;
