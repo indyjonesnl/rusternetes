@@ -1,677 +1,285 @@
 //! Scoped mirror of the Kubernetes v1.35 conformance suite for
-//! [sig-storage] Downward API volumes and cross-namespace secret isolation.
+//! [sig-storage] Downward API volumes.
 //!
-//! Source of truth: Ginkgo descriptors at
-//! https://github.com/kubernetes/kubernetes/tree/release-1.35/test/e2e/common/storage/
-//!   - downwardapi_volume.go
-//!   - secrets_volume.go   (same-name-different-namespace test)
+//! Source of truth: `test/e2e/common/storage/downwardapi_volume.go` on
+//! `release-1.35`.
 //!
-//! These tests are pure-function mirrors: they exercise the volume-build
-//! semantics for DownwardAPI volume sources without standing up a Docker
-//! daemon. They replicate the file-writing and permission logic against a
-//! `tempfile::TempDir` so each test runs in milliseconds.
+//! Every spec here drives the REAL kubelet volume code
+//! (`VolumeManager::create_pod_volumes` / `resync_volumes` in
+//! `crates/kubelet/src/volumes.rs`, which dispatch to the downwardAPI volume
+//! plugin and the AtomicWriter) against a memory-backed API and a
+//! `tempfile::TempDir` kubelet root, then asserts on the files the container
+//! would see. It does NOT reimplement the volume build (#1762 item 2: the
+//! previous version carried local `build_downwardapi_volume` /
+//! `resolve_pod_field` / `build_secret_volume` replicas, so it could never
+//! fail when the kubelet regressed; two of its "node allocatable" specs only
+//! asserted a struct field they had just set).
 //!
-//! Coverage taxonomy:
-//!   - DownwardAPI volume: DefaultMode [LinuxOnly], item Mode [LinuxOnly],
-//!     update labels on modification, update annotations on modification,
-//!     node allocatable cpu/memory defaults.
-//!   - Secrets cross-namespace isolation: same-name secret in different
-//!     namespace must not be accessible from the other namespace's volume.
+//! The "secret with same name in different namespace" spec that used to live
+//! here is covered against the real code by
+//! `conformance_storage_configmap_secret_projected.rs`
+//! (`other_ns_secret`), so it is not duplicated.
+//!
+//! Where an upstream spec reads a file from inside a container (agnhost
+//! `mounttest --file_content / --file_mode`), the mirror reads the same file
+//! from the host path the kubelet returns for that volume.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use rusternetes_common::resources::pod::{
-    DownwardAPIVolumeFile, DownwardAPIVolumeSource, ObjectFieldSelector, ResourceFieldSelector,
-};
-use rusternetes_common::resources::{
-    ConfigMapProjection, DownwardAPIProjection, KeyToPath, Pod, PodSpec, ProjectedVolumeSource,
-    Secret, SecretProjection, SecretVolumeSource, ServiceAccountTokenProjection, Volume,
-    VolumeProjection,
-};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use rusternetes_common::resources::Pod;
+use rusternetes_kubelet::volumes::VolumeManager;
+use rusternetes_storage::StorageBackend;
+use serde_json::{json, Value};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+struct Node {
+    _root: tempfile::TempDir,
+    vm: VolumeManager,
+    api: Arc<StorageBackend>,
+}
 
-fn make_pod(name: &str, namespace: &str) -> Pod {
-    Pod {
-        type_meta: TypeMeta {
-            kind: "Pod".to_string(),
-            api_version: "v1".to_string(),
+impl Node {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let api = Arc::new(StorageBackend::new_memory());
+        let vm = VolumeManager::new(
+            root.path().to_string_lossy().to_string(),
+            Some(api.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        Self {
+            _root: root,
+            vm,
+            api,
+        }
+    }
+
+    /// The kubelet's volume setup for the pod.
+    async fn setup(&self, pod: &Pod) -> Paths {
+        Paths(self.vm.create_pod_volumes(pod).await.unwrap())
+    }
+
+    /// The kubelet's periodic volume resync.
+    async fn resync(&self, pod: &Pod) {
+        self.vm
+            .resync_volumes(pod, self.api.as_ref())
+            .await
+            .unwrap();
+    }
+}
+
+struct Paths(HashMap<String, String>);
+
+impl Paths {
+    fn file(&self, rel: &str) -> PathBuf {
+        PathBuf::from(&self.0["podinfo"]).join(rel)
+    }
+    /// agnhost `mounttest --file_content`.
+    fn content(&self, rel: &str) -> String {
+        String::from_utf8(std::fs::read(self.file(rel)).unwrap()).unwrap()
+    }
+    /// agnhost `mounttest --file_mode` (permission bits of the followed file).
+    fn mode(&self, rel: &str) -> u32 {
+        std::fs::metadata(self.file(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+}
+
+fn podname_item(mode: Option<i32>) -> Value {
+    let mut item = json!({
+        "path": "podname",
+        "fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"},
+    });
+    if let Some(m) = mode {
+        item["mode"] = json!(m);
+    }
+    item
+}
+
+/// `downwardAPIVolumeBasePod` with the given downwardAPI volume source and the
+/// container's `resources` (null for none).
+fn dapi_pod(name: &str, mut source: Value, resources: Value) -> Pod {
+    // The API server defaults `defaultMode` to 0644 before the kubelet sees the
+    // pod (`SetDefaults_DownwardAPIVolumeSource`); the kubelet's plugin
+    // rejects a source that still lacks one, so the fixture carries it.
+    if source.get("defaultMode").is_none() {
+        source["defaultMode"] = json!(0o644);
+    }
+    let mut container = json!({"name": "client-container", "image": "agnhost"});
+    if !resources.is_null() {
+        container["resources"] = resources;
+    }
+    serde_json::from_value(json!({
+        "metadata": {"name": name, "namespace": "ns", "uid": format!("uid-{name}")},
+        "spec": {
+            "containers": [container],
+            "volumes": [{"name": "podinfo", "downwardAPI": source}],
+            "restartPolicy": "Never",
         },
-        metadata: ObjectMeta::new(name).with_namespace(namespace),
-        spec: Some(PodSpec {
-            containers: Vec::new(),
-            ..PodSpec::default()
-        }),
-        status: None,
+    }))
+    .unwrap()
+}
+
+/// `downwardAPIVolumeBaseContainers` resources.
+fn base_resources() -> Value {
+    json!({
+        "requests": {"cpu": "250m", "memory": "32Mi"},
+        "limits": {"cpu": "1250m", "memory": "128Mi"},
+    })
+}
+
+fn resource_item(path: &str, resource: &str) -> Value {
+    json!({
+        "path": path,
+        "resourceFieldRef": {"containerName": "client-container", "resource": resource},
+    })
+}
+
+/// [sig-storage] Downward API volume should provide podname only [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:54
+#[tokio::test]
+async fn downwardapi_volume_should_provide_podname_only() {
+    let n = Node::new();
+    let p = dapi_pod(
+        "downwardapi-volume-x",
+        json!({"items": [podname_item(None)]}),
+        Value::Null,
+    );
+    let paths = n.setup(&p).await;
+    assert_eq!(paths.content("podname"), "downwardapi-volume-x");
+}
+
+/// [sig-storage] Downward API volume should set DefaultMode on files [LinuxOnly] [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:69 (expects `-r--------`)
+#[tokio::test]
+async fn downwardapi_volume_should_set_defaultmode_on_files() {
+    let n = Node::new();
+    let p = dapi_pod(
+        "downwardapi-volume-x",
+        json!({"defaultMode": 0o400, "items": [podname_item(None)]}),
+        Value::Null,
+    );
+    let paths = n.setup(&p).await;
+    assert_eq!(paths.mode("podname"), 0o400);
+}
+
+/// [sig-storage] Downward API volume should set mode on item file [LinuxOnly] [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:85 (expects `-r--------`; the item mode
+/// overrides the volume defaultMode)
+#[tokio::test]
+async fn downwardapi_volume_should_set_mode_on_item_file() {
+    let n = Node::new();
+    let p = dapi_pod(
+        "downwardapi-volume-x",
+        json!({"defaultMode": 0o644, "items": [podname_item(Some(0o400))]}),
+        Value::Null,
+    );
+    let paths = n.setup(&p).await;
+    assert_eq!(paths.mode("podname"), 0o400);
+}
+
+/// [sig-storage] Downward API volume should update labels on modification [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:131 (agnhost prints `key="value"\n`)
+#[tokio::test]
+async fn downwardapi_volume_should_update_labels_on_modification() {
+    let n = Node::new();
+    let mut p = dapi_pod(
+        "labelsupdate",
+        json!({"items": [{"path": "labels", "fieldRef": {"fieldPath": "metadata.labels", "apiVersion": "v1"}}]}),
+        Value::Null,
+    );
+    p.metadata.labels = Some(HashMap::from([
+        ("key1".to_string(), "value1".to_string()),
+        ("key2".to_string(), "value2".to_string()),
+    ]));
+    let paths = n.setup(&p).await;
+    // `fieldpath.FormatMap`: sorted `key="value"` lines, trailing "\n" trimmed.
+    assert_eq!(paths.content("labels"), "key1=\"value1\"\nkey2=\"value2\"");
+    p.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .insert("key3".to_string(), "value3".to_string());
+    n.resync(&p).await;
+    assert_eq!(
+        paths.content("labels"),
+        "key1=\"value1\"\nkey2=\"value2\"\nkey3=\"value3\""
+    );
+}
+
+/// [sig-storage] Downward API volume should update annotations on modification [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:163
+#[tokio::test]
+async fn downwardapi_volume_should_update_annotations_on_modification() {
+    let n = Node::new();
+    let mut p = dapi_pod(
+        "annotationupdate",
+        json!({"items": [{"path": "annotations", "fieldRef": {"fieldPath": "metadata.annotations", "apiVersion": "v1"}}]}),
+        Value::Null,
+    );
+    p.metadata.annotations = Some(HashMap::from([("builder".to_string(), "bar".to_string())]));
+    let paths = n.setup(&p).await;
+    assert_eq!(paths.content("annotations"), "builder=\"bar\"");
+    p.metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert("builder".to_string(), "foo".to_string());
+    n.resync(&p).await;
+    assert_eq!(paths.content("annotations"), "builder=\"foo\"");
+}
+
+/// [sig-storage] Downward API volume should provide container's cpu/memory
+/// limit/request [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:194, :208, :222, :236 (expects `2`,
+/// `134217728`, `1`, `33554432`: divisor defaults to 1, cpu rounds up)
+#[tokio::test]
+async fn downwardapi_volume_should_provide_container_cpu_memory_limits_and_requests() {
+    let n = Node::new();
+    let p = dapi_pod(
+        "downwardapi-volume-x",
+        json!({"items": [
+            resource_item("cpu_limit", "limits.cpu"),
+            resource_item("memory_limit", "limits.memory"),
+            resource_item("cpu_request", "requests.cpu"),
+            resource_item("memory_request", "requests.memory"),
+        ]}),
+        base_resources(),
+    );
+    let paths = n.setup(&p).await;
+    assert_eq!(paths.content("cpu_limit"), "2");
+    assert_eq!(paths.content("memory_limit"), "134217728");
+    assert_eq!(paths.content("cpu_request"), "1");
+    assert_eq!(paths.content("memory_request"), "33554432");
+}
+
+/// [sig-storage] Downward API volume should provide node allocatable (cpu|memory)
+/// as default limit if the limit is not set [NodeConformance] [Conformance]
+/// Upstream: downwardapi_volume.go:250, :262 (`TestContainerOutputRegexp`
+/// `[1-9]`: the container sets no limit, so the file holds the node's
+/// allocatable)
+#[tokio::test]
+async fn downwardapi_volume_should_provide_node_allocatable_as_default_limit() {
+    let n = Node::new();
+    let p = dapi_pod(
+        "downwardapi-volume-x",
+        json!({"items": [
+            resource_item("cpu_limit", "limits.cpu"),
+            resource_item("memory_limit", "limits.memory"),
+        ]}),
+        Value::Null,
+    );
+    let paths = n.setup(&p).await;
+    for file in ["cpu_limit", "memory_limit"] {
+        let got = paths.content(file);
+        assert!(
+            got.chars().any(|c| ('1'..='9').contains(&c)),
+            "{file} must default to the node's allocatable, got {got:?}"
+        );
     }
 }
-
-fn secret_with_data(name: &str, namespace: &str, data: &[(&str, &[u8])]) -> Secret {
-    let mut map = HashMap::new();
-    for (k, v) in data {
-        map.insert(k.to_string(), v.to_vec());
-    }
-    let mut s = Secret::new(name, namespace);
-    s.data = Some(map);
-    s
-}
-
-/// Partial replica of the DownwardAPI branch of `create_volume`. Writes pod
-/// `field_ref` values into the given directory honouring `items` and
-/// `defaultMode`. Items with only `resource_field_ref` set (container resource
-/// quantities) produce an empty file — the production code calls
-/// `get_container_resource_value` for those, which requires a live kubelet
-/// context not available in unit tests. No test in this file passes a
-/// `resource_field_ref`-only item to this helper.
-fn build_downwardapi_volume(
-    volume_dir: &std::path::Path,
-    source: &DownwardAPIVolumeSource,
-    pod: &Pod,
-) -> std::io::Result<Vec<String>> {
-    std::fs::create_dir_all(volume_dir)?;
-    let default_mode = source.default_mode.unwrap_or(0o644);
-    let mut written = Vec::new();
-    let Some(items) = &source.items else {
-        return Ok(written);
-    };
-    for item in items {
-        let file_path = volume_dir.join(&item.path);
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let value = item
-            .field_ref
-            .as_ref()
-            .map(|fr| resolve_pod_field(pod, &fr.field_path))
-            .unwrap_or_default();
-        std::fs::write(&file_path, &value)?;
-        let mode = item.mode.unwrap_or(default_mode);
-        set_mode(&file_path, mode);
-        written.push(item.path.clone());
-    }
-    Ok(written)
-}
-
-/// Resolve a DownwardAPI `field_ref.field_path` against a Pod, mirroring
-/// `runtime.rs::get_pod_field_value`.
-fn resolve_pod_field(pod: &Pod, field_path: &str) -> String {
-    match field_path {
-        "metadata.name" => pod.metadata.name.clone(),
-        "metadata.namespace" => pod
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
-        "metadata.uid" => pod.metadata.uid.clone(),
-        _ => {
-            if field_path.starts_with("metadata.labels") {
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .map(|l| {
-                        let mut pairs: Vec<_> = l.iter().collect();
-                        pairs.sort_by_key(|(k, _)| k.as_str());
-                        pairs
-                            .into_iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
-            } else if field_path.starts_with("metadata.annotations") {
-                pod.metadata
-                    .annotations
-                    .as_ref()
-                    .map(|a| {
-                        let mut pairs: Vec<_> = a.iter().collect();
-                        pairs.sort_by_key(|(k, _)| k.as_str());
-                        pairs
-                            .into_iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            }
-        }
-    }
-}
-
-/// Replica of the Secret branch of `create_volume`, self-contained for this
-/// module so it stands alone.
-fn build_secret_volume(
-    volume_dir: &std::path::Path,
-    source: &SecretVolumeSource,
-    secret: Option<&Secret>,
-) -> std::io::Result<Vec<String>> {
-    std::fs::create_dir_all(volume_dir)?;
-    let default_mode = source.default_mode.unwrap_or(0o644);
-    let mut written = Vec::new();
-    let Some(secret) = secret else {
-        if source.optional.unwrap_or(false) {
-            return Ok(written);
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "Secret {:?} not found and not optional",
-                source.secret_name.as_deref().unwrap_or("<unnamed>")
-            ),
-        ));
-    };
-    let mut merged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    if let Some(data) = &secret.data {
-        for (k, v) in data {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    if let Some(sd) = &secret.string_data {
-        for (k, v) in sd {
-            merged.insert(k.clone(), v.as_bytes().to_vec());
-        }
-    }
-    if let Some(items) = &source.items {
-        for item in items {
-            if let Some(value) = merged.get(&item.key) {
-                let mode = item.mode.unwrap_or(default_mode);
-                let file_path = volume_dir.join(&item.path);
-                if let Some(parent) = file_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&file_path, value)?;
-                set_mode(&file_path, mode);
-                written.push(item.path.clone());
-            }
-        }
-    } else {
-        for (k, v) in &merged {
-            let file_path = volume_dir.join(k);
-            std::fs::write(&file_path, v)?;
-            set_mode(&file_path, default_mode);
-            written.push(k.clone());
-        }
-    }
-    Ok(written)
-}
-
-#[cfg(unix)]
-fn set_mode(path: &std::path::Path, mode: i32) {
-    use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode as u32));
-    }
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &std::path::Path, _mode: i32) {}
-
-#[cfg(unix)]
-fn mode_of(path: &std::path::Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-}
-
-// ===========================================================================
-// Downward API volume tests
-// ===========================================================================
-
-/// [sig-storage] Downward API volume should set DefaultMode on files
-/// [LinuxOnly] [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:52
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-#[cfg(unix)]
-#[test]
-fn downwardapi_volume_should_set_defaultmode_on_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let pod = make_pod("dapi-defaultmode", "ns");
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "podname".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.name".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: None,
-        }]),
-        default_mode: Some(0o400),
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    assert_eq!(
-        mode_of(&tmp.path().join("podname")),
-        0o400,
-        "defaultMode 0o400 must be applied to every file in the volume \
-         (downwardapi_volume.go:52)"
-    );
-}
-
-/// [sig-storage] Downward API volume should set mode on item file
-/// [LinuxOnly] [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:78
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-#[cfg(unix)]
-#[test]
-fn downwardapi_volume_should_set_mode_on_item_file() {
-    let tmp = tempfile::tempdir().unwrap();
-    let pod = make_pod("dapi-itemmode", "ns");
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "podname".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.name".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: Some(0o400),
-        }]),
-        // defaultMode is 0o644 but per-item mode overrides it.
-        default_mode: Some(0o644),
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    assert_eq!(
-        mode_of(&tmp.path().join("podname")),
-        0o400,
-        "per-item mode must override defaultMode (downwardapi_volume.go:78)"
-    );
-}
-
-/// [sig-storage] Downward API volume should update labels on modification
-/// [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:106
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-///
-/// The kubelet's atomic-writer rewrites the symlink target when labels change.
-/// This test mirrors that contract: build a labels file, then simulate a label
-/// update by rebuilding with a new pod value, and assert the file content
-/// reflects the new labels.
-#[test]
-fn downwardapi_volume_should_update_labels_on_modification() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut pod = make_pod("dapi-labels", "ns");
-    let mut labels = HashMap::new();
-    labels.insert("app".to_string(), "v1".to_string());
-    pod.metadata.labels = Some(labels);
-
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "labels".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.labels".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    let content_v1 = std::fs::read_to_string(tmp.path().join("labels")).unwrap();
-    assert!(
-        content_v1.contains("app=v1"),
-        "initial label file must contain app=v1"
-    );
-
-    // Simulate label update (kubelet re-writes the file atomically).
-    let mut updated_labels = HashMap::new();
-    updated_labels.insert("app".to_string(), "v2".to_string());
-    pod.metadata.labels = Some(updated_labels);
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    let content_v2 = std::fs::read_to_string(tmp.path().join("labels")).unwrap();
-    assert!(
-        content_v2.contains("app=v2"),
-        "updated label file must contain app=v2 (downwardapi_volume.go:106)"
-    );
-    assert!(
-        !content_v2.contains("app=v1"),
-        "stale label value must not persist after update"
-    );
-}
-
-/// [sig-storage] Downward API volume should update annotations on modification
-/// [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:149
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-#[test]
-fn downwardapi_volume_should_update_annotations_on_modification() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut pod = make_pod("dapi-annotations", "ns");
-    let mut annotations = HashMap::new();
-    annotations.insert("config".to_string(), "initial".to_string());
-    pod.metadata.annotations = Some(annotations);
-
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "annotations".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.annotations".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    let content_v1 = std::fs::read_to_string(tmp.path().join("annotations")).unwrap();
-    assert!(
-        content_v1.contains("config=initial"),
-        "initial annotation file must contain config=initial"
-    );
-
-    // Simulate annotation update.
-    let mut updated_annotations = HashMap::new();
-    updated_annotations.insert("config".to_string(), "updated".to_string());
-    pod.metadata.annotations = Some(updated_annotations);
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    let content_v2 = std::fs::read_to_string(tmp.path().join("annotations")).unwrap();
-    assert!(
-        content_v2.contains("config=updated"),
-        "updated annotation file must contain config=updated \
-         (downwardapi_volume.go:149)"
-    );
-    assert!(
-        !content_v2.contains("config=initial"),
-        "stale annotation value must not persist after update"
-    );
-}
-
-/// [sig-storage] Downward API volume should provide node allocatable (cpu)
-/// as default cpu limit if the limit is not set [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:193
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-///
-/// When a container does not specify a CPU limit the downward API surfaces the
-/// node's allocatable CPU. We assert structural correctness: the
-/// `resourceFieldRef.resource` field must be set to "limits.cpu" so the
-/// kubelet knows to fall back to node allocatable when the container limit
-/// is unset.
-#[test]
-fn downwardapi_volume_should_provide_node_allocatable_cpu_as_default_cpu_limit() {
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "cpu_limit".to_string(),
-            field_ref: None,
-            resource_field_ref: Some(ResourceFieldSelector {
-                container_name: Some("c1".to_string()),
-                resource: "limits.cpu".to_string(),
-                divisor: None,
-            }),
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    let item = source.items.as_ref().unwrap().first().unwrap();
-    assert_eq!(
-        item.resource_field_ref.as_ref().unwrap().resource,
-        "limits.cpu",
-        "resourceFieldRef.resource must be 'limits.cpu' for the \
-         node-allocatable-cpu fallback path (downwardapi_volume.go:193)"
-    );
-}
-
-/// [sig-storage] Downward API volume should provide node allocatable (memory)
-/// as default memory limit if the limit is not set [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:230
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-#[test]
-fn downwardapi_volume_should_provide_node_allocatable_memory_as_default_memory_limit() {
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "mem_limit".to_string(),
-            field_ref: None,
-            resource_field_ref: Some(ResourceFieldSelector {
-                container_name: Some("c1".to_string()),
-                resource: "limits.memory".to_string(),
-                divisor: None,
-            }),
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    let item = source.items.as_ref().unwrap().first().unwrap();
-    assert_eq!(
-        item.resource_field_ref.as_ref().unwrap().resource,
-        "limits.memory",
-        "resourceFieldRef.resource must be 'limits.memory' for the \
-         node-allocatable-memory fallback path (downwardapi_volume.go:230)"
-    );
-}
-
-/// DownwardAPI volume: pod-name is written as a plain string without trailing
-/// newline (the kubelet writes the raw field value).
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/downwardapi_volume.go:48
-/// Sonobuoy (v1.35, 2026-05-28): passing
-#[test]
-fn downwardapi_volume_podname_is_written_as_plain_string() {
-    let tmp = tempfile::tempdir().unwrap();
-    let pod = make_pod("mypodname", "test-ns");
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "podname".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.name".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("podname")).unwrap(),
-        "mypodname"
-    );
-}
-
-/// DownwardAPI volume: namespace is written correctly.
-#[test]
-fn downwardapi_volume_namespace_is_written_correctly() {
-    let tmp = tempfile::tempdir().unwrap();
-    let pod = make_pod("p", "my-namespace");
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![DownwardAPIVolumeFile {
-            path: "ns".to_string(),
-            field_ref: Some(ObjectFieldSelector {
-                field_path: "metadata.namespace".to_string(),
-                api_version: None,
-            }),
-            resource_field_ref: None,
-            mode: None,
-        }]),
-        default_mode: None,
-    };
-    build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("ns")).unwrap(),
-        "my-namespace"
-    );
-}
-
-/// DownwardAPI volume: multiple items (name, namespace, labels) can coexist.
-#[test]
-fn downwardapi_volume_multiple_items_in_one_volume() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut pod = make_pod("multi", "ns");
-    let mut labels = HashMap::new();
-    labels.insert("tier".to_string(), "backend".to_string());
-    pod.metadata.labels = Some(labels);
-
-    let source = DownwardAPIVolumeSource {
-        items: Some(vec![
-            DownwardAPIVolumeFile {
-                path: "name".to_string(),
-                field_ref: Some(ObjectFieldSelector {
-                    field_path: "metadata.name".to_string(),
-                    api_version: None,
-                }),
-                resource_field_ref: None,
-                mode: None,
-            },
-            DownwardAPIVolumeFile {
-                path: "namespace".to_string(),
-                field_ref: Some(ObjectFieldSelector {
-                    field_path: "metadata.namespace".to_string(),
-                    api_version: None,
-                }),
-                resource_field_ref: None,
-                mode: None,
-            },
-            DownwardAPIVolumeFile {
-                path: "labels".to_string(),
-                field_ref: Some(ObjectFieldSelector {
-                    field_path: "metadata.labels".to_string(),
-                    api_version: None,
-                }),
-                resource_field_ref: None,
-                mode: None,
-            },
-        ]),
-        default_mode: None,
-    };
-    let written = build_downwardapi_volume(tmp.path(), &source, &pod).unwrap();
-    assert_eq!(written.len(), 3, "all three items must be written");
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("name")).unwrap(),
-        "multi"
-    );
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("namespace")).unwrap(),
-        "ns"
-    );
-    let labels_content = std::fs::read_to_string(tmp.path().join("labels")).unwrap();
-    assert!(labels_content.contains("tier=backend"));
-}
-
-// ===========================================================================
-// Downward API Volume serde smoke tests
-// ===========================================================================
-
-/// Smoke test: DownwardAPIVolumeSource round-trips through serde with the
-/// correct camelCase wire format (`downwardAPI`, not `downwardApi`).
-#[test]
-fn downwardapi_volume_source_round_trips_through_serde() {
-    let vol = Volume {
-        legacy_sources: Default::default(),
-        name: "dapi-vol".to_string(),
-        downward_api: Some(DownwardAPIVolumeSource {
-            items: Some(vec![DownwardAPIVolumeFile {
-                path: "podname".to_string(),
-                field_ref: Some(ObjectFieldSelector {
-                    field_path: "metadata.name".to_string(),
-                    api_version: None,
-                }),
-                resource_field_ref: None,
-                mode: Some(0o644),
-            }]),
-            default_mode: Some(0o644),
-        }),
-        empty_dir: None,
-        host_path: None,
-        config_map: None,
-        secret: None,
-        persistent_volume_claim: None,
-        csi: None,
-        ephemeral: None,
-        nfs: None,
-        iscsi: None,
-        projected: None,
-        image: None,
-    };
-    let json = serde_json::to_string(&vol).unwrap();
-    assert!(
-        json.contains("\"downwardAPI\""),
-        "downward API must serialize as 'downwardAPI' (got: {json})"
-    );
-    let parsed: Volume = serde_json::from_str(&json).unwrap();
-    let dapi = parsed.downward_api.unwrap();
-    assert_eq!(dapi.default_mode, Some(0o644));
-    assert_eq!(dapi.items.unwrap().len(), 1);
-}
-
-// ===========================================================================
-// Secrets cross-namespace isolation tests
-// ===========================================================================
-
-/// [sig-storage] Secrets should be able to mount in a volume regardless of a
-/// different secret existing with same name in different namespace
-/// [NodeConformance] [Conformance]
-///
-/// Upstream: k8s.io/kubernetes/test/e2e/common/storage/secrets_volume.go:350
-/// Sonobuoy (v1.35, 2026-05-28): newly-passing
-///
-/// Two secrets share the same name ("shared-secret") but live in different
-/// namespaces ("ns-a" and "ns-b"). Each namespace's pod must mount exactly
-/// the data from its own namespace's secret, not the other one.
-#[test]
-fn secrets_same_name_different_namespace_are_isolated() {
-    let secret_a = secret_with_data("shared-secret", "ns-a", &[("payload", b"from-ns-a")]);
-    let secret_b = secret_with_data("shared-secret", "ns-b", &[("payload", b"from-ns-b")]);
-
-    let ns_a = secret_a.metadata.namespace.as_deref().unwrap_or("default");
-    let name_a = secret_a.metadata.name.as_str();
-    let ns_b = secret_b.metadata.namespace.as_deref().unwrap_or("default");
-    let name_b = secret_b.metadata.name.as_str();
-
-    assert_ne!(ns_a, ns_b, "secrets must be in different namespaces");
-    assert_eq!(name_a, name_b, "secrets must have the same name");
-
-    // The kubelet resolves secrets by (namespace, name) — the keys differ.
-    let key_a = format!("{ns_a}/{name_a}");
-    let key_b = format!("{ns_b}/{name_b}");
-    assert_ne!(key_a, key_b, "keys must differ by namespace prefix");
-
-    // Mount ns-a secret into ns-a pod.
-    let tmp_a = tempfile::tempdir().unwrap();
-    let source_a = SecretVolumeSource {
-        secret_name: Some("shared-secret".to_string()),
-        items: None,
-        default_mode: None,
-        optional: None,
-    };
-    build_secret_volume(tmp_a.path(), &source_a, Some(&secret_a)).unwrap();
-    assert_eq!(
-        std::fs::read(tmp_a.path().join("payload")).unwrap(),
-        b"from-ns-a",
-        "ns-a pod must see ns-a secret data (secrets_volume.go:350)"
-    );
-
-    // Mount ns-b secret into ns-b pod.
-    let tmp_b = tempfile::tempdir().unwrap();
-    let source_b = SecretVolumeSource {
-        secret_name: Some("shared-secret".to_string()),
-        items: None,
-        default_mode: None,
-        optional: None,
-    };
-    build_secret_volume(tmp_b.path(), &source_b, Some(&secret_b)).unwrap();
-    assert_eq!(
-        std::fs::read(tmp_b.path().join("payload")).unwrap(),
-        b"from-ns-b",
-        "ns-b pod must see ns-b secret data"
-    );
-}
-
-// Suppress unused-import warnings for types that serve as compile-time
-// API-contract assertions (Volume struct field completeness check).
-const _: fn() = || {
-    let _ = std::mem::size_of::<ConfigMapProjection>();
-    let _ = std::mem::size_of::<DownwardAPIProjection>();
-    let _ = std::mem::size_of::<KeyToPath>();
-    let _ = std::mem::size_of::<ProjectedVolumeSource>();
-    let _ = std::mem::size_of::<SecretProjection>();
-    let _ = std::mem::size_of::<ServiceAccountTokenProjection>();
-    let _ = std::mem::size_of::<VolumeProjection>();
-};
