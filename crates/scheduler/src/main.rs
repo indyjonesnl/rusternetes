@@ -114,9 +114,18 @@ struct Args {
     #[arg(long)]
     insecure_skip_tls_verify: bool,
 
-    /// Metrics server port
-    #[arg(long, default_value = "8081")]
-    metrics_port: u16,
+    /// `SecureServing` (`--secure-port`, `--bind-address`, `--tls-cert-file`, ...)
+    /// of kube-scheduler (cmd/kube-scheduler/app/options/options.go:119-128).
+    #[command(flatten)]
+    secure_serving: rusternetes_middleware::secure_serving::options::SecureServingFlags,
+
+    /// `Authentication` (`--authentication-kubeconfig`, `--client-ca-file`, ...).
+    #[command(flatten)]
+    authentication: rusternetes_middleware::secure_serving::options::AuthenticationFlags,
+
+    /// `Authorization` (`--authorization-kubeconfig`, ...).
+    #[command(flatten)]
+    authorization: rusternetes_middleware::secure_serving::options::AuthorizationFlags,
 
     /// Enable leader election (for HA)
     #[arg(long)]
@@ -267,6 +276,56 @@ fn install_statusz(app: Router, flags: rusternetes_common::flagz::NamedFlagSetsR
     })
 }
 
+/// The `SecureServing` / `Authentication` / `Authorization` options of
+/// kube-scheduler with the command line applied
+/// (cmd/kube-scheduler/app/options/options.go:119-128).
+fn component_secure_serving(
+    args: &Args,
+) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
+    let mut c = rusternetes_middleware::secure_serving::ComponentSecureServing::for_scheduler();
+    c.apply_flags(
+        &args.secure_serving,
+        &args.authentication,
+        &args.authorization,
+    );
+    c
+}
+
+/// `utilerrors.NewAggregate(errs).Error()` of the options `Validate`.
+fn aggregate_errors(errs: &[String]) -> String {
+    if errs.len() == 1 {
+        errs[0].clone()
+    } else {
+        format!("[{}]", errs.join(", "))
+    }
+}
+
+/// Serve `/metrics`, `/statusz` and `/flagz` over the secure port behind the
+/// authentication and authorization filters, as
+/// `cmd/kube-scheduler/app/server.go:250-254` + `:340-352` (`buildHandlerChain`)
+/// do. There is no insecure port upstream, and a failure to set up secure
+/// serving is fatal.
+async fn serve_secure(
+    args: &Args,
+    gather: impl Fn() -> String + Clone + Send + Sync + 'static,
+    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+) -> Result<()> {
+    let component = component_secure_serving(args);
+    let errs = component.validate();
+    if !errs.is_empty() {
+        anyhow::bail!("{}", aggregate_errors(&errs));
+    }
+    let app = install_statusz(
+        Router::new().route("/metrics", get(move || async move { gather() })),
+        flags,
+    );
+    component
+        .serve(app)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start secure serving: {e}"))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cmd = <Args as clap::CommandFactory>::command();
@@ -328,7 +387,7 @@ async fn main() -> Result<()> {
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
             StorageConfig::Sqlite {
-                path: args.data_dir,
+                path: args.data_dir.clone(),
             }
         }
         _ => {
@@ -346,18 +405,7 @@ async fn main() -> Result<()> {
     // Initialize metrics
     let metrics = Arc::new(MetricsRegistry::new().with_scheduler_metrics()?);
     let metrics_clone = metrics.clone();
-
-    let metrics_addr = format!("0.0.0.0:{}", args.metrics_port);
-    info!("Starting metrics server on {}", metrics_addr);
-
-    tokio::spawn(async move {
-        let app = install_statusz(
-            Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
-            flags,
-        );
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
-    });
+    serve_secure(&args, move || metrics_clone.gather(), flags).await?;
 
     // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler (SIGTERM+SIGINT)
     // cancels the run context.
@@ -491,16 +539,7 @@ async fn run_api_mode(
     // Metrics server (same as storage mode).
     let metrics = Arc::new(MetricsRegistry::new().with_scheduler_metrics()?);
     let metrics_clone = metrics.clone();
-    let metrics_addr = format!("0.0.0.0:{}", args.metrics_port);
-    info!("Starting metrics server on {}", metrics_addr);
-    tokio::spawn(async move {
-        let app = install_statusz(
-            Router::new().route("/metrics", get(|| async move { metrics_clone.gather() })),
-            flags,
-        );
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
-    });
+    serve_secure(&args, move || metrics_clone.gather(), flags).await?;
 
     // Resolve connection params. A kubeconfig wins for both server URL and CA;
     // --api-server-url overrides the server URL when provided.
@@ -633,5 +672,38 @@ mod tests {
         parse(&["--profiling=false", "--contention-profiling=true"])
             .expect("--profiling/--contention-profiling must parse");
         parse(&["--profiling"]).expect("bare --profiling is a pflag bool");
+    }
+}
+
+#[cfg(test)]
+mod secure_serving_flag_tests {
+    use super::*;
+
+    // cmd/kube-scheduler/app/options/options.go:119-128 (DefaultKubeSchedulerPort)
+    #[test]
+    fn default_secure_port_is_10259() {
+        let args = Args::try_parse_from(["scheduler"]).unwrap();
+        let c = component_secure_serving(&args);
+        assert_eq!(c.secure_serving.bind_port, 10259);
+    }
+
+    // `--secure-port` / `--bind-address` (apiserver SecureServingOptions.AddFlags)
+    #[test]
+    fn secure_port_and_bind_address_flags_apply() {
+        let args = Args::try_parse_from([
+            "scheduler",
+            "--secure-port=1234",
+            "--bind-address=127.0.0.1",
+        ])
+        .unwrap();
+        let c = component_secure_serving(&args);
+        assert_eq!(c.secure_serving.bind_port, 1234);
+        assert_eq!(c.secure_serving.bind_address.to_string(), "127.0.0.1");
+    }
+
+    // upstream has no plain-HTTP metrics port, so the flag is gone
+    #[test]
+    fn insecure_metrics_port_flag_is_gone() {
+        assert!(Args::try_parse_from(["scheduler", "--metrics-port=8081"]).is_err());
     }
 }
