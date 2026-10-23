@@ -495,9 +495,7 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::{
-            STEP_ADMIT as ADMIT, STEP_VALIDATE as VALIDATE,
-        };
+        use rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
         // NamespaceExists.Validate (exists/admission.go:55-86), registered for
         // Create, Update and Delete; it follows NamespaceLifecycle in
         // `AllOrderedPlugins` (plugins.go:69-72), ahead of the other
@@ -581,24 +579,6 @@ impl Admission<'_> {
                         pod,
                     )
                     .await?;
-                }
-            }
-            Ok(())
-        })
-        .await?;
-        // NodeRestriction on a pod DELETE (admission.go:257-270). It is an
-        // Admit-only plugin upstream, so it is observed under `admit`; the
-        // delete path runs only the validating half here.
-        self.plugin("NodeRestriction", op, ADMIT, async {
-            if *op == Operation::Delete && self.is_core("pods") {
-                let old: Option<Pod> = old.map(recast).transpose()?;
-                if let Some(old) = old.as_ref() {
-                    crate::handlers::node_restriction::admit_pod_delete(
-                        &rusternetes_middleware::AuthContext {
-                            user: self.user.clone(),
-                        },
-                        old,
-                    )?;
                 }
             }
             Ok(())
@@ -1185,6 +1165,80 @@ impl Admission<'_> {
         decoded
     }
 
+    /// The mutating chain for a DELETE, which `AdmissionToValidateObjectDeleteFunc`
+    /// runs before the validating one (registry/rest/delete.go:177-218):
+    /// `Admit` with a nil object and the stored one as `old`, when the chain
+    /// `Handles(DELETE)`. The same `WithStepMetrics` as any admit phase wraps
+    /// it (server/options/admission.go:179).
+    ///
+    /// Nothing is mutated: the in-tree plugins that handle DELETE
+    /// (NodeRestriction, Priority, NamespaceLifecycle, NamespaceExists) only
+    /// reject or do nothing, mutating webhooks see no object to patch
+    /// (webhook/mutating/dispatcher.go:346), and the mutating admission policy
+    /// plugin does not handle DELETE (`policy_plugin.rs`).
+    pub async fn admit_delete<T: Object>(&self, old: &T) -> Result<()> {
+        use rusternetes_admission_webhook::admission_metrics::{with_step_metrics, STEP_ADMIT};
+        with_step_metrics(&Operation::Delete, STEP_ADMIT, self.admit_delete_chain(old)).await
+    }
+
+    async fn admit_delete_chain<T: Object>(&self, old: &T) -> Result<()> {
+        use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
+        let op = Operation::Delete;
+        // NodeRestriction.Admit on a pod DELETE (admission.go:257-270); it
+        // is an Admit-only plugin.
+        self.plugin("NodeRestriction", &op, ADMIT, async {
+            if self.is_core("pods") {
+                let pod: Pod = recast(old)?;
+                crate::handlers::node_restriction::admit_pod_delete(
+                    &rusternetes_middleware::AuthContext {
+                        user: self.user.clone(),
+                    },
+                    &pod,
+                )?;
+            }
+            Ok(())
+        })
+        .await?;
+        // Priority.Admit handles DELETE but acts only on a Pod CREATE
+        // (priority/admission.go:64-66, :112).
+        self.plugin("Priority", &op, ADMIT, async { Ok(()) })
+            .await?;
+        if !plugin_enabled("MutatingAdmissionWebhook") {
+            return self.admit_delete_deny(old.metadata());
+        }
+        let name = old.metadata().name.clone();
+        let mut webhook_ctx = rusternetes_admission_webhook::WebhookReinvokeContext::default();
+        let (response, _, _) = self
+            .state
+            .webhook_manager
+            .run_mutating_webhooks_pass(
+                &op,
+                self.kind,
+                &self.request_resource(),
+                self.namespace,
+                &name,
+                None,
+                Some(to_value(old)?),
+                &self.user_info(),
+                self.dry_run,
+                false,
+                &mut webhook_ctx,
+            )
+            .await?;
+        if let AdmissionResponse::Deny(reason) = &response {
+            return Err(denied(reason));
+        }
+        self.admit_delete_deny(old.metadata())
+    }
+
+    /// AlwaysDeny is last in `AllOrderedPlugins`, after the webhooks.
+    fn admit_delete_deny(&self, meta: &rusternetes_common::types::ObjectMeta) -> Result<()> {
+        if plugin_enabled("AlwaysDeny") {
+            return Err(self.always_deny(meta));
+        }
+        Ok(())
+    }
+
     /// The validating plugins: `ValidationInterface.Validate`. `obj` is `None`
     /// on DELETE, `old` is `None` on CREATE.
     pub async fn validate<T: Object>(
@@ -1398,6 +1452,7 @@ pub struct DeleteValidation<'a> {
 #[async_trait]
 impl<T: Object> ValidateObject<T> for DeleteValidation<'_> {
     async fn validate(&self, ctx: &RequestContext, obj: &T) -> Result<()> {
+        self.admission.admit_delete(obj).await?;
         self.admission
             .validate::<T>(ctx, Operation::Delete, None, Some(obj))
             .await
