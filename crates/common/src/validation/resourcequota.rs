@@ -86,7 +86,7 @@ fn is_extended_resource_name(name: &str) -> bool {
 }
 
 /// `helper.IsIntegerResourceName`.
-fn is_integer_resource_name(name: &str) -> bool {
+pub(crate) fn is_integer_resource_name(name: &str) -> bool {
     INTEGER_RESOURCES.contains(&name) || is_extended_resource_name(name)
 }
 
