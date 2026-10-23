@@ -212,6 +212,15 @@ pub fn validate_pod_certificate_request_create(req: &PodCertificateRequest) -> E
                         errs.push(pop_err());
                     }
                 }
+                PublicKey::UnsupportedCurve(name) => {
+                    // validation.go: "elliptic public keys must use curve
+                    // P256 or P384" (sic; P521 is allowed too).
+                    errs.push(Error::invalid(
+                        &pkix_path(),
+                        format!("curve {name}"),
+                        "elliptic public keys must use curve P256 or P384",
+                    ));
+                }
                 PublicKey::Ecdsa(verify) => {
                     // ecdsa.VerifyASN1 over sha256(podUID), whatever the curve.
                     if !verify(&digest, sig) {
@@ -259,12 +268,16 @@ enum PublicKey {
     /// Verifies an ASN.1/DER signature over a prehashed digest.
     Ecdsa(EcdsaVerifier),
     Rsa(rsa::RsaPublicKey),
+    /// A key on a curve Go's `x509.ParsePKIXPublicKey` accepts but the
+    /// validator rejects (P-224): `pub.Curve.Params().Name`.
+    UnsupportedCurve(&'static str),
 }
 
 const OID_RSA: &str = "1.2.840.113549.1.1.1";
 const OID_EC: &str = "1.2.840.10045.2.1";
 const OID_ED25519: &str = "1.3.101.112";
 const OID_X25519: &str = "1.3.101.110";
+const OID_P224: &str = "1.3.132.0.33";
 const OID_P256: &str = "1.2.840.10045.3.1.7";
 const OID_P384: &str = "1.3.132.0.34";
 const OID_P521: &str = "1.3.132.0.35";
@@ -330,6 +343,12 @@ fn parse_pkix_public_key(der: &[u8]) -> Result<PublicKey, PkixError> {
                             .map(|s| vk.verify_prehash(&left_pad(digest, 66), &s).is_ok())
                             .unwrap_or(false)
                     })))
+                }
+                OID_P224 => {
+                    // Go parses (and checks the point is on the curve), then
+                    // validation.go rejects the curve.
+                    p224::PublicKey::from_public_key_der(der).map_err(|_| PkixError::Invalid)?;
+                    Ok(PublicKey::UnsupportedCurve("P-224"))
                 }
                 _ => Err(PkixError::Invalid),
             }

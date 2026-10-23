@@ -54,6 +54,7 @@ prost-types.workspace = true
 # ValidatePodCertificateRequestCreate: ed25519 / ECDSA P-256,384,521 / RSA-PSS).
 p256 = "0.13"
 p384 = "0.13"
+p224 = { version = "0.13", features = ["pkcs8"] }
 p521 = "0.13"
 rsa = { version = "0.9", features = ["sha2"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
