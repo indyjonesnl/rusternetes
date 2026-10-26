@@ -4,6 +4,7 @@
 // and processing their responses.
 
 pub mod admission_metrics;
+pub mod cancellation;
 pub mod cel_evaluators;
 pub mod webhook_match;
 
@@ -12,6 +13,7 @@ mod match_conditions_budget_tests;
 #[cfg(test)]
 mod vap_authorizer_tests;
 
+use cancellation::{current_request_cancellation, RequestCancellation};
 use rusternetes_common::latency_trackers::latency_trackers_from_context;
 use rusternetes_common::{
     admission::{
@@ -118,11 +120,18 @@ struct CallFailure {
     error: rusternetes_common::Error,
     /// `int(err.Status.ErrStatus.Code)`, for the metrics.
     code: i32,
+    /// `errors.Is(err.Reason, context.Canceled)`: the request, not the
+    /// webhook, ended the call.
+    canceled: bool,
 }
 
 impl From<rusternetes_common::Error> for CallFailure {
     fn from(error: rusternetes_common::Error) -> Self {
-        Self { error, code: 503 }
+        Self {
+            error,
+            code: 503,
+            canceled: false,
+        }
     }
 }
 
@@ -148,7 +157,9 @@ fn observe_webhook_call(
     match result {
         Err(f) => {
             let rejected = !ignore_client_call_failures;
-            if rejected {
+            // "Ignore context cancelled from webhook metrics"
+            // (validating/dispatcher.go:179-182, mutating/dispatcher.go:174-177).
+            if rejected && !f.canceled {
                 observe_webhook_rejection(
                     name,
                     step_type,
@@ -158,7 +169,9 @@ fn observe_webhook_call(
                 );
             }
             observe_webhook(name, elapsed, rejected, operation, step_type, f.code);
-            if ignore_client_call_failures {
+            // A cancelled call is not a fail-open
+            // (validating/dispatcher.go:201-204, mutating/dispatcher.go:206-209).
+            if ignore_client_call_failures && !f.canceled {
                 observe_webhook_fail_open(name, step_type);
             }
         }
@@ -252,6 +265,17 @@ fn validating_task_panic(name: &str, policy: &FailurePolicy, r: &str) -> Result<
     }
     Err(rusternetes_common::Error::Internal(format!(
         "ValidatingAdmissionWebhook/{name} has panicked: {r}"
+    )))
+}
+
+/// `apierrors.NewTimeoutError("request did not complete within requested
+/// timeout", 0)` (validating/dispatcher.go:122, mutating/dispatcher.go:219):
+/// the request context is done, so there is no point in calling on.
+fn request_timeout_error() -> rusternetes_common::Error {
+    rusternetes_common::Error::Status(Box::new(rusternetes_common::types::Status::failure(
+        "Timeout: request did not complete within requested timeout",
+        "Timeout",
+        504,
     )))
 }
 
@@ -399,6 +423,46 @@ impl AdmissionWebhookClient {
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
     ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
+        self.call_webhook_cancellable(url, review, timeout, ca_bundle, None)
+            .await
+    }
+
+    /// [`Self::call_webhook_coded`] that ends with a `context.Canceled`
+    /// [`CallFailure`] when `cancellation` trips first.
+    async fn call_webhook_cancellable(
+        &self,
+        url: &str,
+        review: &AdmissionReview,
+        timeout: Duration,
+        ca_bundle: Option<&[u8]>,
+        cancellation: Option<RequestCancellation>,
+    ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
+        let Some(cancellation) = cancellation else {
+            return self
+                .call_webhook_coded_uncancellable(url, review, timeout, ca_bundle)
+                .await;
+        };
+        tokio::select! {
+            result = self.call_webhook_coded_uncancellable(url, review, timeout, ca_bundle) => result,
+            _ = cancellation.cancelled() => Err(CallFailure {
+                error: rusternetes_common::Error::Internal(format!(
+                    "failed to call webhook: context canceled querying {}?timeout={}s",
+                    url,
+                    timeout.as_secs()
+                )),
+                code: 503,
+                canceled: true,
+            }),
+        }
+    }
+
+    async fn call_webhook_coded_uncancellable(
+        &self,
+        url: &str,
+        review: &AdmissionReview,
+        timeout: Duration,
+        ca_bundle: Option<&[u8]>,
+    ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
         // Outer tokio deadline mirrors K8s admissionContext.WithTimeout — if the
         // entire call exceeds the budget, the future is dropped/aborted.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/generic/webhook.go
@@ -539,6 +603,7 @@ impl AdmissionWebhookClient {
                     "Webhook returned status: {}",
                     response.status()
                 )),
+                canceled: false,
             });
         }
 
@@ -1219,6 +1284,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 &Err(CallFailure {
                                     error: e,
                                     code: 500,
+                                    canceled: false,
                                 }),
                                 ignore,
                             );
@@ -1299,6 +1365,13 @@ impl<S: Storage> AdmissionWebhookManager<S> {
             return Ok(AdmissionResponse::Allow);
         }
 
+        // Check if the request has already been cancelled before spawning
+        // remote calls (validating/dispatcher.go:118-124).
+        let cancellation = current_request_cancellation();
+        if cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+            return Err(request_timeout_error());
+        }
+
         // Phase 2: Call all matching webhooks in parallel.
         // K8s dispatches all validating webhooks concurrently via goroutines.
         // See: dispatcher.go lines 126-131
@@ -1325,11 +1398,13 @@ impl<S: Storage> AdmissionWebhookManager<S> {
 
             // Task-locals do not cross `spawn`: carry the trackers in.
             let trackers = latency_trackers_from_context();
+            let cancellation = cancellation.clone();
             handles.push(tokio::spawn(async move {
                 let client = AdmissionWebhookClient::new();
                 let ca_ref = ca_data.as_deref();
                 let t = std::time::Instant::now();
-                let call = client.call_webhook_coded(&url, &review, timeout, ca_ref);
+                let call =
+                    client.call_webhook_cancellable(&url, &review, timeout, ca_ref, cancellation);
                 // `wd.ValidatingWebhookTracker.Track(do)`
                 // (validating/dispatcher.go:298-301).
                 let result = match &trackers {
@@ -1868,6 +1943,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                 &Err(CallFailure {
                                     error: e,
                                     code: 500,
+                                    canceled: false,
                                 }),
                                 ignore,
                             );
@@ -1899,9 +1975,13 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     // `wd.MutatingWebhookTracker.Track(do)`
                     // (mutating/dispatcher.go:298-301).
                     let started = std::time::Instant::now();
-                    let call =
-                        self.client
-                            .call_webhook_coded(&resolved_url, &review, timeout, ca_bundle);
+                    let call = self.client.call_webhook_cancellable(
+                        &resolved_url,
+                        &review,
+                        timeout,
+                        ca_bundle,
+                        current_request_cancellation(),
+                    );
                     let call_result = match latency_trackers_from_context() {
                         Some(wd) => wd.mutating_webhook.track(call).await,
                         None => call.await,
@@ -1942,6 +2022,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                                         "Mutating webhook {} failed (Ignore): {}",
                                         webhook.name, e
                                     );
+                                    // `select { case <-ctx.Done(): return
+                                    // NewTimeoutError(...)` after a fail-open
+                                    // (mutating/dispatcher.go:216-223).
+                                    if current_request_cancellation()
+                                        .is_some_and(|c| c.is_cancelled())
+                                    {
+                                        return Err(request_timeout_error());
+                                    }
                                     AdmissionReviewResponse {
                                         uid: request.uid.clone(),
                                         allowed: true,
@@ -5646,7 +5734,7 @@ mod tests {
 #[cfg(test)]
 mod dispatcher_metrics_tests {
     use super::*;
-    use crate::admission_metrics::tests::{counter, hist_count, hist_count_or_zero};
+    use crate::admission_metrics::tests::{counter_or_zero, hist_count, hist_count_or_zero};
     use rusternetes_common::admission::AdmissionStatus;
     use rusternetes_common::resources::{
         MutatingWebhook, OperationType, Rule, RuleWithOperations, SideEffectClass,
@@ -5829,7 +5917,7 @@ mod dispatcher_metrics_tests {
     }
 
     fn request_total(name: &str, ty: &str, code: &str, rejected: &str) -> u64 {
-        counter(
+        counter_or_zero(
             "apiserver_admission_webhook_request_total",
             &[
                 ("name", name),
@@ -5842,7 +5930,7 @@ mod dispatcher_metrics_tests {
     }
 
     fn rejection(name: &str, ty: &str, error_type: &str, code: &str) -> u64 {
-        counter(
+        counter_or_zero(
             "apiserver_admission_webhook_rejection_count",
             &[
                 ("name", name),
@@ -5867,7 +5955,7 @@ mod dispatcher_metrics_tests {
     }
 
     fn fail_open(name: &str, ty: &str) -> u64 {
-        counter(
+        counter_or_zero(
             "apiserver_admission_webhook_fail_open_count",
             &[("name", name), ("type", ty)],
         )
@@ -5937,6 +6025,144 @@ mod dispatcher_metrics_tests {
         .unwrap();
         assert_eq!(fail_open("m-v-open", "validating"), 1);
         assert_eq!(request_total("m-v-open", "validating", "503", "false"), 1);
+    }
+
+    /// A webhook that never answers within the test.
+    async fn serve_hanging() -> String {
+        let app = axum::Router::new().route(
+            "/admit",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                axum::http::StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        format!("http://{addr}/admit")
+    }
+
+    /// Run `f` as a request that is cancelled 200ms in.
+    async fn cancelled_after_call_starts<F: std::future::Future>(f: F) -> F::Output {
+        let (canceller, ctx) = cancellation::request_cancellation();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        cancellation::with_request_cancellation(ctx, f).await
+    }
+
+    /// validating/dispatcher.go:179-184: a call ended by `context.Canceled`
+    /// on a Fail webhook is rejected and timed, but `ObserveWebhookRejection`
+    /// is skipped.
+    #[tokio::test]
+    async fn validating_cancelled_fail_skips_rejection_metric() {
+        let url = serve_hanging().await;
+        let r = cancelled_after_call_starts(run_validating(
+            "m-v-cancel-fail",
+            &url,
+            FailurePolicy::Fail,
+        ))
+        .await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection(
+                "m-v-cancel-fail",
+                "validating",
+                "calling_webhook_error",
+                "503"
+            ),
+            0
+        );
+        assert_eq!(
+            request_total("m-v-cancel-fail", "validating", "503", "true"),
+            1
+        );
+    }
+
+    /// validating/dispatcher.go:201-204: on Ignore a cancelled call logs
+    /// "Context canceled when calling webhook" instead of `ObserveWebhookFailOpen`.
+    #[tokio::test]
+    async fn validating_cancelled_ignore_is_not_fail_open() {
+        let url = serve_hanging().await;
+        cancelled_after_call_starts(run_validating(
+            "m-v-cancel-open",
+            &url,
+            FailurePolicy::Ignore,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(fail_open("m-v-cancel-open", "validating"), 0);
+        assert_eq!(
+            request_total("m-v-cancel-open", "validating", "503", "false"),
+            1
+        );
+    }
+
+    /// validating/dispatcher.go:118-124: an already cancelled request makes no
+    /// remote call and fails with a 504 Timeout.
+    #[tokio::test]
+    async fn validating_precancelled_request_makes_no_call() {
+        let (canceller, ctx) = cancellation::request_cancellation();
+        canceller.cancel();
+        let r = cancellation::with_request_cancellation(
+            ctx,
+            run_validating(
+                "m-v-precancel",
+                "http://127.0.0.1:1/admit",
+                FailurePolicy::Fail,
+            ),
+        )
+        .await;
+        match r {
+            Err(rusternetes_common::Error::Status(s)) => assert_eq!(s.code, Some(504)),
+            other => panic!("expected a 504 Timeout status, got {other:?}"),
+        }
+        assert_eq!(
+            request_total("m-v-precancel", "validating", "503", "true"),
+            0
+        );
+    }
+
+    /// mutating/dispatcher.go:174-177, :206-223: cancelled on Ignore is
+    /// neither a rejection nor a fail-open, and the dispatcher stops with a
+    /// 504 Timeout because the parent context is done.
+    #[tokio::test]
+    async fn mutating_cancelled_ignore_stops_with_timeout() {
+        let url = serve_hanging().await;
+        let r = cancelled_after_call_starts(run_mutating(
+            "m-m-cancel-open",
+            &url,
+            FailurePolicy::Ignore,
+        ))
+        .await;
+        match r {
+            Err(rusternetes_common::Error::Status(s)) => assert_eq!(s.code, Some(504)),
+            other => panic!("expected a 504 Timeout status, got {other:?}"),
+        }
+        assert_eq!(fail_open("m-m-cancel-open", "admit"), 0);
+        assert_eq!(
+            rejection("m-m-cancel-open", "admit", "calling_webhook_error", "503"),
+            0
+        );
+    }
+
+    /// mutating/dispatcher.go:174-177: cancelled on Fail skips only the
+    /// rejection counter.
+    #[tokio::test]
+    async fn mutating_cancelled_fail_skips_rejection_metric() {
+        let url = serve_hanging().await;
+        let r =
+            cancelled_after_call_starts(run_mutating("m-m-cancel-fail", &url, FailurePolicy::Fail))
+                .await;
+        assert!(r.is_err());
+        assert_eq!(
+            rejection("m-m-cancel-fail", "admit", "calling_webhook_error", "503"),
+            0
+        );
+        assert_eq!(request_total("m-m-cancel-fail", "admit", "503", "true"), 1);
     }
 
     /// client-go turns a non-2xx response into a `StatusError` carrying the
