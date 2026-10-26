@@ -19,6 +19,7 @@
 //! cache for DeviceClass); here they are plain list/watches.
 
 use crate::data_plane::DataPlane;
+use crate::queue::dra_hints::ResourceClaimCache;
 use crate::queue::{
     ActionType, ClusterEvent, EventObject, EventResource, PriorityQueue, QueueingHintMapPerProfile,
 };
@@ -71,6 +72,9 @@ fn object_key(m: &ObjectMeta) -> String {
     format!("{}/{}", m.namespace.as_deref().unwrap_or(""), m.name)
 }
 
+/// Mirrors an upsert (`false`) / delete (`true`) into an informer-style cache.
+type StoreFn<T> = Box<dyn Fn(&T, bool) + Send + Sync>;
+
 /// `buildEvtResHandler` (`eventhandlers.go:535-579`) for one resource. Our
 /// watches deliver only the new object, so the last-seen copy per key
 /// supplies the informer's `oldObj`.
@@ -79,6 +83,9 @@ pub struct ResourceEventHandler<T> {
     resource: EventResource,
     at: ActionType,
     seen: HashMap<String, T>,
+    /// The informer cache the handler runs behind: kept current before an
+    /// event is dispatched, so hint functions reading it see the new state.
+    store: Option<StoreFn<T>>,
 }
 
 impl<T: Watched> ResourceEventHandler<T> {
@@ -88,6 +95,7 @@ impl<T: Watched> ResourceEventHandler<T> {
             resource,
             at,
             seen: HashMap::new(),
+            store: None,
         }
     }
 
@@ -106,6 +114,9 @@ impl<T: Watched> ResourceEventHandler<T> {
     /// ones updates. An unchanged resourceVersion never fires (informer
     /// resync period 0, `options.go:336`), so relists stay quiet.
     pub fn on_upsert(&mut self, obj: T) {
+        if let Some(store) = &self.store {
+            store(&obj, false);
+        }
         let key = object_key(obj.meta());
         match self.seen.insert(key, obj.clone()) {
             None => {
@@ -127,6 +138,9 @@ impl<T: Watched> ResourceEventHandler<T> {
 
     /// `DeleteFunc`: only objects the handler knew about.
     pub fn on_delete(&mut self, obj: T) {
+        if let Some(store) = &self.store {
+            store(&obj, true);
+        }
         if self.seen.remove(&object_key(obj.meta())).is_none() {
             return;
         }
@@ -230,6 +244,7 @@ fn spawn_api_feed<T: Watched>(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_feed<T: Watched, S: Storage + Send + Sync + 'static>(
     data: &DataPlane<S>,
     queue: &Arc<PriorityQueue>,
@@ -238,11 +253,13 @@ fn start_feed<T: Watched, S: Storage + Send + Sync + 'static>(
     prefix: &str,
     path: &'static str,
     retry: Duration,
+    store: Option<StoreFn<T>>,
 ) {
     let Some(at) = gvk_map.get(&resource).copied() else {
         return;
     };
-    let handler = ResourceEventHandler::<T>::new(Arc::clone(queue), resource, at);
+    let mut handler = ResourceEventHandler::<T>::new(Arc::clone(queue), resource, at);
+    handler.store = store;
     match data {
         DataPlane::Api(api) => spawn_api_feed::<T>(api, path, handler),
         DataPlane::Storage(s) => {
@@ -264,6 +281,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
     queue: &Arc<PriorityQueue>,
     gvk_map: &HashMap<EventResource, ActionType>,
     retry: Duration,
+    claims: &ResourceClaimCache,
 ) {
     use EventResource as R;
     start_feed::<CSINode, S>(
@@ -274,6 +292,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "csinodes",
         "/apis/storage.k8s.io/v1/csinodes",
         retry,
+        None,
     );
     start_feed::<CSIDriver, S>(
         data,
@@ -283,6 +302,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "csidrivers",
         "/apis/storage.k8s.io/v1/csidrivers",
         retry,
+        None,
     );
     start_feed::<CSIStorageCapacity, S>(
         data,
@@ -292,6 +312,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "csistoragecapacities",
         "/apis/storage.k8s.io/v1/csistoragecapacities",
         retry,
+        None,
     );
     start_feed::<PersistentVolume, S>(
         data,
@@ -301,6 +322,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "persistentvolumes",
         "/api/v1/persistentvolumes",
         retry,
+        None,
     );
     start_feed::<PersistentVolumeClaim, S>(
         data,
@@ -310,6 +332,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "persistentvolumeclaims",
         "/api/v1/persistentvolumeclaims",
         retry,
+        None,
     );
     start_feed::<StorageClass, S>(
         data,
@@ -319,6 +342,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "storageclasses",
         "/apis/storage.k8s.io/v1/storageclasses",
         retry,
+        None,
     );
     start_feed::<VolumeAttachment, S>(
         data,
@@ -328,6 +352,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "volumeattachments",
         "/apis/storage.k8s.io/v1/volumeattachments",
         retry,
+        None,
     );
     // DynamicResourceAllocation is GA/on in 1.35 (`eventhandlers.go:638-668`).
     start_feed::<ResourceClaim, S>(
@@ -338,6 +363,16 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "resourceclaims",
         "/apis/resource.k8s.io/v1/resourceclaims",
         retry,
+        Some(Box::new({
+            let claims = claims.clone();
+            move |claim: &ResourceClaim, deleted| {
+                if deleted {
+                    claims.remove(claim)
+                } else {
+                    claims.insert(claim.clone())
+                }
+            }
+        })),
     );
     start_feed::<ResourceSlice, S>(
         data,
@@ -347,6 +382,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "resourceslices",
         "/apis/resource.k8s.io/v1/resourceslices",
         retry,
+        None,
     );
     start_feed::<DeviceClass, S>(
         data,
@@ -356,6 +392,7 @@ pub fn add_resource_event_handlers<S: Storage + Send + Sync + 'static>(
         "deviceclasses",
         "/apis/resource.k8s.io/v1/deviceclasses",
         retry,
+        None,
     );
 }
 

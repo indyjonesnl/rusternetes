@@ -118,7 +118,10 @@ mod tests {
         let queue = PriorityQueue::new(
             priority_sort_less(),
             PriorityQueueOptions {
-                queueing_hint_map: build_queueing_hint_map_per_profile([&profile]),
+                queueing_hint_map: build_queueing_hint_map_per_profile(
+                    [&profile],
+                    &Default::default(),
+                ),
                 pre_enqueue_plugin_map: build_pre_enqueue_plugin_map([&profile]),
                 ..Default::default()
             },
