@@ -2342,25 +2342,11 @@ mod upstream_argv_tests {
     use super::*;
     use std::time::Duration;
 
-    /// Secure-serving flags owned by open PR #3538 (bind-address, authn/authz
-    /// kubeconfigs, CA files). Drop entries here as that PR lands.
-    const PENDING_3538: &[&str] = &[
-        "--bind-address",
-        "--authentication-kubeconfig",
-        "--authorization-kubeconfig",
-        "--client-ca-file",
-        "--requestheader-client-ca-file",
-    ];
-
     fn fixture_argv(text: &str) -> Vec<String> {
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(String::from)
-            .filter(|a| {
-                let name = a.split('=').next().unwrap();
-                !PENDING_3538.contains(&name)
-            })
             .collect()
     }
 
