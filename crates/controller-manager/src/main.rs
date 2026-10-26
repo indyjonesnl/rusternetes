@@ -140,6 +140,13 @@ struct Args {
     #[arg(long = "token-cleaner-controller", default_value_t = false)]
     token_cleaner_controller: bool,
 
+    /// Run the SELinux warning controller (`selinux-warning-controller`):
+    /// events and a metric when pods sharing a volume use conflicting SELinux
+    /// labels. Disabled by default upstream; requires the
+    /// `SELinuxChangePolicy` feature gate.
+    #[arg(long = "selinux-warning-controller", default_value_t = false)]
+    selinux_warning_controller: bool,
+
     /// `--terminated-pod-gc-threshold`: number of terminated pods that can
     /// exist before the pod garbage collector starts deleting the oldest.
     /// `<= 0` disables that pass (default 12500, podgc config defaults.go:34).
@@ -824,6 +831,7 @@ async fn run_api_mode(
         csi_attachers: Vec::new(),
         attach_detach_controller: false,
         bootstrap_signer_controller: false,
+        selinux_warning_controller: false,
         terminated_pod_gc_threshold: args.terminated_pod_gc_threshold,
         token_cleaner_controller: false,
         // Route HPA metric fetches through the same kubeconfig-derived
@@ -1550,6 +1558,21 @@ async fn main() -> Result<()> {
             async move {
                 if let Err(e) = controller.run().await {
                     tracing::error!("TokenCleaner controller error: {e}");
+                }
+            }
+        });
+    }
+
+    // `newSELinuxWarningControllerDescriptor` (core.go:1107), opt-in.
+    if args.selinux_warning_controller && controllers::selinux_warning::feature_gates_enabled() {
+        let selinux_warning = Arc::new(
+            controllers::selinux_warning::SELinuxWarningController::new(storage.clone()),
+        );
+        spawn_controller!("SELinuxWarning controller", leader_elector, {
+            let controller = selinux_warning.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("SELinuxWarning controller error: {e}");
                 }
             }
         });
