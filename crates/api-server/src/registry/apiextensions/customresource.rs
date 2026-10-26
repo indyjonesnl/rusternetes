@@ -353,6 +353,20 @@ impl Strategy {
         prune_custom_resource(&self.crd, &self.version, cr);
     }
 
+    /// What `schemaCoercingConverter` does to an object converted to the
+    /// storage version (customresource_handler.go:1357-1384): the
+    /// `unstructuredSchemaCoercer.apply` of [`Self::coerce`] and nothing
+    /// else. It does not default: a mutating webhook's or policy's patch is
+    /// defaulted where it is applied (dispatcher.go:390), not here.
+    fn coerce_converted(&self, cr: &mut CustomResource) {
+        cr.api_version = self.api_version();
+        if cr.kind.is_empty() {
+            cr.kind = self.crd.spec.names.kind.clone();
+        }
+        self.prune_non_nullable_nulls(cr);
+        prune_custom_resource(&self.crd, &self.version, cr);
+    }
+
     /// `structuraldefaulting.PruneNonNullableNullsWithoutDefaults(u.Object,
     /// v.structuralSchemas[gv.Version])` (customresource_handler.go:1439),
     /// run only when `!v.preserveUnknownFields` (:1432) and before the
@@ -932,6 +946,19 @@ impl CustomResourceRest {
         &self.strategy.crd
     }
 
+    /// `unstructuredSchemaCoercer.apply` (:1442-1449): a malformed embedded
+    /// `metadata` fails the decode, which the handler reports through
+    /// `transformDecodeError` (handlers/rest.go:251-253).
+    fn check_embedded_metadata(&self, obj: &mut CustomResource) -> Result<()> {
+        if let (Some(err), _) = self.strategy.coerce_embedded_metadata(obj, false, false) {
+            return Err(Error::BadRequest(format!(
+                "{} in version {:?} cannot be handled as a {}: {err}",
+                obj.kind, self.strategy.version, obj.kind
+            )));
+        }
+        Ok(())
+    }
+
     /// The strict-decoding errors of the bespoke handlers: unknown top-level
     /// fields, unknown fields of `metadata` (also in embedded objects), and
     /// unknown nested fields of `spec` (customresource_handler.go:1406-1470).
@@ -1032,16 +1059,14 @@ impl RestStorage<CustomResource> for CustomResourceRest {
     /// defaulted and pruned as it is decoded, so admission sees the result.
     fn decode_coerce(&self, obj: &mut CustomResource) -> Result<()> {
         self.strategy.coerce(obj);
-        // `unstructuredSchemaCoercer.apply` (:1442-1449): a malformed embedded
-        // `metadata` fails the decode, which the handler reports through
-        // `transformDecodeError` (handlers/rest.go:251-253).
-        if let (Some(err), _) = self.strategy.coerce_embedded_metadata(obj, false, false) {
-            return Err(Error::BadRequest(format!(
-                "{} in version {:?} cannot be handled as a {}: {err}",
-                obj.kind, self.strategy.version, obj.kind
-            )));
-        }
-        Ok(())
+        self.check_embedded_metadata(obj)
+    }
+
+    /// `schemaCoercingConverter.ConvertToVersion` (customresource_handler.go:
+    /// 1371-1384): the coercer without the defaulter.
+    fn convert_coerce(&self, obj: &mut CustomResource) -> Result<()> {
+        self.strategy.coerce_converted(obj);
+        self.check_embedded_metadata(obj)
     }
 
     /// The strict-decoding verdict, on the body as sent.
@@ -1585,6 +1610,16 @@ mod prune_nulls_tests {
             obj.spec.unwrap(),
             json!({"nullable": null, "defaulted": "d", "nested": {}})
         );
+    }
+
+    /// `schemaCoercingConverter` (customresource_handler.go:1348-1384) runs the
+    /// coercer but not the defaulter: nulls and unknown fields go, an absent
+    /// defaulted field stays absent.
+    #[test]
+    fn converter_coerces_without_defaulting() {
+        let mut obj = cr(json!({"plain": null, "nullable": null, "unknown": 1}));
+        strategy(false).coerce_converted(&mut obj);
+        assert_eq!(obj.spec.unwrap(), json!({"nullable": null}));
     }
 
     /// customresource_handler.go:1432: only when `!preserveUnknownFields`.
