@@ -222,11 +222,116 @@ fn table_is_sorted_and_complete() {
 /// current is served; equal or before is not.
 #[test]
 fn should_serve_for_version_ga_build() {
-    assert!(should_serve_for_version((1, 36), (1, 35)));
-    assert!(should_serve_for_version((2, 0), (1, 35)));
-    assert!(!should_serve_for_version((1, 35), (1, 35)));
-    assert!(!should_serve_for_version((1, 16), (1, 35)));
-    assert!(!should_serve_for_version((0, 99), (1, 35)));
+    assert!(should_serve_for_version((1, 36)));
+    assert!(should_serve_for_version((2, 0)));
+    assert!(!should_serve_for_version((1, 35)));
+    assert!(!should_serve_for_version((1, 16)));
+    assert!(!should_serve_for_version((0, 99)));
+}
+
+fn ev(
+    current: (u32, u32),
+    is_alpha: bool,
+    is_alpha_zero: bool,
+    strict: bool,
+    one_more: bool,
+) -> ResourceExpirationEvaluator {
+    ResourceExpirationEvaluator {
+        current_version: current,
+        is_alpha,
+        is_alpha_zero,
+        strict_removed_handling_in_alpha: strict,
+        serve_removed_apis_one_more_release: one_more,
+    }
+}
+
+/// `Test_resourceExpirationEvaluator_isNotRemoved`
+/// (`server/deleted_kinds_test.go:179-261`), every case.
+#[test]
+fn resource_expiration_evaluator_is_not_removed() {
+    let cases: [(&str, ResourceExpirationEvaluator, (u32, u32), bool); 8] = [
+        (
+            "removed-in-curr",
+            ev((1, 20), false, false, false, false),
+            (1, 20),
+            false,
+        ),
+        (
+            "removed-in-curr-but-deferred",
+            ev((1, 20), false, false, false, true),
+            (1, 20),
+            true,
+        ),
+        (
+            "removed-in-curr-but-alpha",
+            ev((1, 20), true, false, false, false),
+            (1, 20),
+            true,
+        ),
+        (
+            "removed-in-curr-but-alpha-but-strict",
+            ev((1, 20), true, false, true, false),
+            (1, 20),
+            false,
+        ),
+        (
+            "removed-in-curr-but-alpha-but-strict-and-alpha-zero",
+            ev((1, 20), true, true, true, false),
+            (1, 20),
+            true,
+        ),
+        (
+            "removed-in-prev-deferral-does-not-help",
+            ev((1, 21), false, false, false, true),
+            (1, 20),
+            false,
+        ),
+        (
+            "removed-in-prev-major",
+            ev((2, 20), false, false, false, true),
+            (1, 20),
+            false,
+        ),
+        (
+            "removed-in-future",
+            ev((1, 20), false, false, false, false),
+            (1, 21),
+            true,
+        ),
+    ];
+    for (name, e, removed, want) in cases {
+        assert_eq!(e.should_serve_for_version(removed), want, "{name}");
+    }
+}
+
+/// `Test_newResourceExpirationEvaluator` (`deleted_kinds_test.go:36-77`).
+#[test]
+fn new_resource_expiration_evaluator_prerelease() {
+    let n = |pre: &str| ResourceExpirationEvaluator::new((1, 20), pre, None, None).unwrap();
+    assert_eq!(
+        n("beta.0.62+a5d22854a2ac21"),
+        ev((1, 20), false, false, false, false)
+    );
+    assert_eq!(
+        n("alpha.0.62+a5d22854a2ac21"),
+        ev((1, 20), true, true, false, false)
+    );
+    assert_eq!(
+        n("alpha.1.62+a5d22854a2ac21"),
+        ev((1, 20), true, false, false, false)
+    );
+    assert_eq!(n(""), ev((1, 20), false, false, false, false));
+}
+
+/// The two env switches (`deleted_kinds.go:100-118`), parsed with `strconv.ParseBool`.
+#[test]
+fn resource_expiration_evaluator_env_switches() {
+    let e = ResourceExpirationEvaluator::new((1, 20), "alpha.1", Some("true"), Some("0")).unwrap();
+    assert_eq!(e, ev((1, 20), true, false, true, false));
+    let e = ResourceExpirationEvaluator::new((1, 20), "", Some("F"), Some("T")).unwrap();
+    assert_eq!(e, ev((1, 20), false, false, false, true));
+    assert!(ResourceExpirationEvaluator::new((1, 20), "", Some("yes"), None).is_err());
+    assert!(ResourceExpirationEvaluator::new((1, 20), "", None, Some("")).is_err());
 }
 
 /// A still-served deprecated kind keeps its deprecation:

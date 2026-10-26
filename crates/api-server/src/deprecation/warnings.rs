@@ -21,17 +21,13 @@ use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use super::{is_deprecated, lookup, warning_message, CURRENT_MAJOR_MINOR};
+use super::{
+    is_deprecated, lookup, should_serve_for_version, warning_message, CURRENT_MAJOR_MINOR,
+};
 
 /// `truncateAtTotalRunes` / `truncateItemRunes` (filters/warning.go:38-41).
 const TRUNCATE_AT_TOTAL_RUNES: usize = 4 * 1024;
 const TRUNCATE_ITEM_RUNES: usize = 256;
-
-/// `ShouldServeForVersion` for a GA build (deleted_kinds.go:150-172): serve
-/// iff the removal version is after the current one.
-fn should_serve_for_version(removed: (u32, u32)) -> bool {
-    removed > CURRENT_MAJOR_MINOR
-}
 
 /// The route's accumulated warnings (installer.go:781-797): the deprecation
 /// message when the kind is deprecated and still served.
