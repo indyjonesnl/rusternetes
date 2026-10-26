@@ -79,12 +79,6 @@ impl WatchSource for StorageBackend {
     }
 }
 
-/// Maximum number of events to retain in the history ring buffer per prefix
-/// while the prefix has at least one live external watcher.
-/// K8s default watch cache capacity is 1000 events.
-/// 5000 × 26 prefixes × ~3KB = ~390MB of memory.
-const HISTORY_CAPACITY: usize = 500;
-
 /// Replay-ring size retained for a prefix that is BOTH unwatched and quiet
 /// (#1089). The full ring is only needed to replay history to reconnecting
 /// watchers; for a prefix nothing is watching and nothing is writing, a small
@@ -110,7 +104,7 @@ const HISTORY_IDLE_CAPACITY: usize = 16;
 
 /// How long a prefix must go without a write before the idle reclaim will trim
 /// its replay ring. A prefix still receiving writes keeps the full
-/// [`HISTORY_CAPACITY`], because that is precisely the ring an arriving
+/// dynamic capacity (see [`next_capacity`]), because that is precisely the ring an arriving
 /// watcher needs in order to subscribe at all.
 const QUIET_BEFORE_IDLE_TRIM: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -131,6 +125,9 @@ const WATCH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_s
 pub struct CachedWatchEvent {
     pub event: WatchEventData,
     pub revision: i64,
+    /// When this event entered the cache (upstream `watchCacheEvent.RecordTime`).
+    /// Drives the dynamic ring resize ([`next_capacity`]).
+    pub recorded: std::time::Instant,
 }
 
 /// The event data (simplified from WatchEvent).
@@ -166,6 +163,10 @@ pub struct WatchCache {
     /// gutting the ring of a prefix that is still being written is exactly
     /// what breaks an arriving watcher (see [`HISTORY_IDLE_CAPACITY`]).
     last_write: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Per-prefix dynamic ring capacity (upstream `watchCache.capacity`),
+    /// between [`LOWER_BOUND_CAPACITY`] and the upper bound. Lock order:
+    /// always after `history`.
+    capacities: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl WatchCache {
@@ -184,6 +185,7 @@ impl WatchCache {
             history: Arc::new(RwLock::new(HashMap::new())),
             floors: Arc::new(RwLock::new(HashMap::new())),
             last_write: Arc::new(RwLock::new(HashMap::new())),
+            capacities: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -280,6 +282,7 @@ impl WatchCache {
         let history_ref = self.history.clone();
         let last_write_ref = Arc::clone(&self.last_write);
         let floors_ref = self.floors.clone();
+        let capacities_ref = Arc::clone(&self.capacities);
 
         tokio::spawn(async move {
             info!(
@@ -388,6 +391,7 @@ impl WatchCache {
                                         CachedWatchEvent {
                                             event: WatchEventData::Added(key, Arc::new(value)),
                                             revision: rev,
+                                            recorded: std::time::Instant::now(),
                                         }
                                     }
                                     Ok(WatchEvent::Modified(key, value)) => {
@@ -395,6 +399,7 @@ impl WatchCache {
                                         CachedWatchEvent {
                                             event: WatchEventData::Modified(key, Arc::new(value)),
                                             revision: rev,
+                                            recorded: std::time::Instant::now(),
                                         }
                                     }
                                     Ok(WatchEvent::Deleted(key, prev_value)) => {
@@ -405,6 +410,7 @@ impl WatchCache {
                                                 Arc::new(prev_value),
                                             ),
                                             revision: rev,
+                                            recorded: std::time::Instant::now(),
                                         }
                                     }
                                     Err(_) => {
@@ -420,7 +426,6 @@ impl WatchCache {
                                         HashMap<String, VecDeque<CachedWatchEvent>>,
                                     > = history_ref.write().await;
                                     let buf = hist.entry(prefix_owned.clone()).or_default();
-                                    buf.push_back(cached.clone());
                                     // Stamp write activity so the idle sweep can
                                     // tell "unwatched" from "quiet".
                                     last_write_ref
@@ -438,13 +443,16 @@ impl WatchCache {
                                     // a livelock — see HISTORY_IDLE_CAPACITY.
                                     // Reclaim for genuinely quiet prefixes is
                                     // the idle sweep's job (#1089).
-                                    let cap = HISTORY_CAPACITY;
-                                    let mut trimmed_to: Option<i64> = None;
-                                    while buf.len() > cap {
-                                        if let Some(popped) = buf.pop_front() {
-                                            trimmed_to = Some(popped.revision);
-                                        }
-                                    }
+                                    // Lock order is floors -> capacities
+                                    // everywhere; do not hold `caps` across
+                                    // the floors update below.
+                                    let trimmed_to = {
+                                        let mut caps = capacities_ref.write().await;
+                                        let cap = caps
+                                            .entry(prefix_owned.clone())
+                                            .or_insert(LOWER_BOUND_CAPACITY);
+                                        append_to_ring(buf, cap, cached.clone())
+                                    };
                                     if let Some(rev) = trimmed_to {
                                         let mut floors = floors_ref.write().await;
                                         let f = floors.entry(prefix_owned.clone()).or_insert(0);
@@ -544,7 +552,10 @@ impl WatchCache {
         }
         let mut hist = self.history.write().await;
         let mut floors = self.floors.write().await;
+        let mut caps = self.capacities.write().await;
         for prefix in idle_prefixes {
+            // A quiet prefix gives its grown capacity back too.
+            caps.remove(&prefix);
             if let Some(buf) = hist.get_mut(&prefix) {
                 if buf.len() > HISTORY_IDLE_CAPACITY {
                     let drop_n = buf.len() - HISTORY_IDLE_CAPACITY;
@@ -652,7 +663,7 @@ impl WatchCache {
             if cached.revision > since {
                 gap.push(cached);
             }
-            if gap.len() > HISTORY_CAPACITY {
+            if gap.len() > capacity_upper_bound(EVENT_FRESH_DURATION) {
                 return floor;
             }
         }
@@ -664,9 +675,17 @@ impl WatchCache {
             return current; // someone else already extended it
         }
         let buf = hist.entry(prefix.to_string()).or_default();
-        if buf.len() + gap.len() > HISTORY_CAPACITY {
+        let mut caps = self.capacities.write().await;
+        let cap = caps
+            .entry(prefix.to_string())
+            .or_insert(LOWER_BOUND_CAPACITY);
+        let new_len = buf.len() + gap.len();
+        if new_len > capacity_upper_bound(EVENT_FRESH_DURATION) {
             return current;
         }
+        // The backfilled history is part of the ring: it must fit, so the next
+        // append does not evict what was just recovered.
+        *cap = (*cap).max(new_len);
         for ev in gap.into_iter().rev() {
             if ev.revision <= current {
                 buf.push_front(ev);
@@ -682,6 +701,100 @@ impl WatchCache {
 const BACKFILL_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
 /// Upper bound on one ring backfill.
 const BACKFILL_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Lower bound of a prefix ring's dynamic capacity
+/// (`defaultLowerBoundCapacity`,
+/// `staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache.go:60`).
+const LOWER_BOUND_CAPACITY: usize = 100;
+/// Base upper bound of a prefix ring's dynamic capacity
+/// (`defaultUpperBoundCapacity = 100 * 1024`, `watch_cache.go:63`).
+const DEFAULT_UPPER_BOUND_CAPACITY: usize = 100 * 1024;
+/// `DefaultEventFreshDuration = defaultBookmarkFrequency + 15*time.Second`
+/// (`cacher.go:71`, `defaultBookmarkFrequency = time.Minute` at `:75`): the
+/// minimum history the ring tries to keep.
+const EVENT_FRESH_DURATION: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Port of `capacityUpperBound` (`watch_cache.go:210-229`).
+fn capacity_upper_bound(fresh: std::time::Duration) -> usize {
+    if fresh <= EVENT_FRESH_DURATION {
+        return DEFAULT_UPPER_BOUND_CAPACITY;
+    }
+    // `math.Ceil(math.Log2(fresh / DefaultEventFreshDuration))`
+    let mut exponent = (fresh.as_secs_f64() / EVENT_FRESH_DURATION.as_secs_f64())
+        .log2()
+        .ceil() as u32;
+    // `math.Floor(math.Log2(math.MaxInt32 / defaultUpperBoundCapacity))`
+    // (integer division, as in Go's untyped-constant-then-int conversion).
+    let max_exponent = ((i32::MAX as usize / DEFAULT_UPPER_BOUND_CAPACITY) as f64)
+        .log2()
+        .floor() as u32;
+    if exponent > max_exponent {
+        exponent = max_exponent;
+    }
+    DEFAULT_UPPER_BOUND_CAPACITY << exponent
+}
+
+/// Port of `resizeCacheLocked` (`watch_cache.go:373-388`): the capacity the
+/// ring should have before `event_time`'s event is appended. `buf` is the ring
+/// oldest-first, `capacity` its current capacity.
+///
+/// - doubles (up to `upper`) when the ring is full and its oldest event is
+///   still fresher than `fresh`;
+/// - halves (down to `lower`) when full and the event a quarter of the
+///   capacity back from the newest is already older than `fresh`.
+fn next_capacity(
+    buf: &VecDeque<CachedWatchEvent>,
+    capacity: usize,
+    event_time: std::time::Instant,
+    fresh: std::time::Duration,
+    lower: usize,
+    upper: usize,
+) -> usize {
+    let full = capacity > 0 && buf.len() == capacity;
+    if !full {
+        return capacity;
+    }
+    let age = |at: std::time::Instant| event_time.saturating_duration_since(at);
+    if age(buf[0].recorded) < fresh {
+        return capacity.max(capacity.saturating_mul(2).min(upper));
+    }
+    // `w.cache[(w.endIndex-w.capacity/4)%w.capacity]`; full => len == capacity.
+    let quarter = buf[(buf.len() - capacity / 4) % capacity].recorded;
+    if age(quarter) > fresh {
+        return capacity.min((capacity / 2).max(lower));
+    }
+    capacity
+}
+
+/// Append `ev` to a prefix ring, resizing first exactly as upstream's
+/// `updateCache` does (`watch_cache.go:359-368`) and evicting the oldest event
+/// when still full. Returns the revision of the last evicted event, which the
+/// caller must fold into the prefix's replay floor.
+fn append_to_ring(
+    buf: &mut VecDeque<CachedWatchEvent>,
+    capacity: &mut usize,
+    ev: CachedWatchEvent,
+) -> Option<i64> {
+    // A ring backfilled or seeded past its capacity keeps what it holds.
+    *capacity = (*capacity).max(buf.len());
+    *capacity = next_capacity(
+        buf,
+        *capacity,
+        ev.recorded,
+        EVENT_FRESH_DURATION,
+        LOWER_BOUND_CAPACITY,
+        capacity_upper_bound(EVENT_FRESH_DURATION),
+    );
+    buf.push_back(ev);
+    let mut trimmed_to = None;
+    // A shrink leaves len > capacity by one or more; evict until it fits.
+    while buf.len() > *capacity {
+        if let Some(popped) = buf.pop_front() {
+            trimmed_to = Some(popped.revision);
+        }
+    }
+    trimmed_to
+}
 
 /// Revision of a stored object's JSON, from `"resourceVersion":"<digits>"`.
 fn extract_rv(value: &str) -> i64 {
@@ -702,14 +815,17 @@ fn cache_event(ev: WatchEvent) -> CachedWatchEvent {
         WatchEvent::Added(key, value) => CachedWatchEvent {
             revision: extract_rv(&value),
             event: WatchEventData::Added(key, Arc::new(value)),
+            recorded: std::time::Instant::now(),
         },
         WatchEvent::Modified(key, value) => CachedWatchEvent {
             revision: extract_rv(&value),
             event: WatchEventData::Modified(key, Arc::new(value)),
+            recorded: std::time::Instant::now(),
         },
         WatchEvent::Deleted(key, prev) => CachedWatchEvent {
             revision: extract_rv(&prev),
             event: WatchEventData::Deleted(key, Arc::new(prev)),
+            recorded: std::time::Instant::now(),
         },
     }
 }
@@ -1040,6 +1156,7 @@ mod tests {
             ));
             tx.send(CachedWatchEvent {
                 revision: rev,
+                recorded: std::time::Instant::now(),
                 event: WatchEventData::Added(format!("/registry/secrets/ns/k{rev}"), val),
             })
             .unwrap();
@@ -1265,6 +1382,7 @@ mod tests {
         CachedWatchEvent {
             event: WatchEventData::Added(format!("k{rev}"), Arc::new("{}".to_string())),
             revision: rev,
+            recorded: std::time::Instant::now(),
         }
     }
 
@@ -1371,5 +1489,91 @@ mod tests {
         );
 
         drop(rx_a); // keep the receiver alive across the GC sweep above
+    }
+
+    // ---- dynamic capacity: ports of watch_cache_test.go TestDynamicCache /
+    // TestCapacityUpperBound (release-1.35) ----
+
+    fn ring_at(
+        n: usize,
+        interval: std::time::Duration,
+    ) -> (VecDeque<CachedWatchEvent>, std::time::Instant) {
+        let base = std::time::Instant::now();
+        let buf = (0..n)
+            .map(|i| {
+                let mut e = make_event(i as i64 + 1);
+                e.recorded = base + interval * i as u32;
+                e
+            })
+            .collect();
+        // The event about to be appended arrives one interval after the last.
+        (buf, base + interval * n as u32)
+    }
+
+    #[test]
+    fn capacity_upper_bound_matches_upstream_table() {
+        let d = EVENT_FRESH_DURATION;
+        let u = DEFAULT_UPPER_BOUND_CAPACITY;
+        assert_eq!(capacity_upper_bound(d), u);
+        assert_eq!(capacity_upper_bound(std::time::Duration::from_secs(45)), u);
+        assert_eq!(capacity_upper_bound(d * 4), 4 * u);
+        assert_eq!(capacity_upper_bound(d * 3), 4 * u);
+        assert_eq!(capacity_upper_bound(d * (1 << 20)), u << 14);
+    }
+
+    #[test]
+    fn dynamic_cache_resizes_like_upstream() {
+        let d = EVENT_FRESH_DURATION;
+        let over = d + std::time::Duration::from_secs(1);
+        // (name, interval, lower, upper, expected capacity)
+        let cases: [(&str, std::time::Duration, usize, usize, usize); 5] = [
+            ("events inside fresh duration expand", d / 6, 2, 10, 10),
+            ("events outside fresh duration, no change", d / 4, 2, 10, 5),
+            ("recent quarter stale shrinks", over, 2, 10, 2),
+            ("shrink honours lower bound", over, 3, 10, 3),
+            ("expand honours upper bound", d / 6, 2, 8, 8),
+        ];
+        for (name, interval, lower, upper, want) in cases {
+            let (buf, now) = ring_at(5, interval);
+            assert_eq!(next_capacity(&buf, 5, now, d, lower, upper), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn burst_keeps_whole_history_instead_of_evicting_at_a_fixed_ring() {
+        // #3762: a fixed 500 ring 410s a watcher that is >500 events behind;
+        // upstream grows the ring while the oldest event is still fresh.
+        let mut buf = VecDeque::new();
+        let mut cap = LOWER_BOUND_CAPACITY;
+        let mut evicted = None;
+        for rev in 1..=3000 {
+            evicted = evicted.or(append_to_ring(&mut buf, &mut cap, make_event(rev)));
+        }
+        assert_eq!(evicted, None, "nothing older than 75s may be evicted");
+        assert_eq!(buf.len(), 3000);
+        assert!(cap >= 3000, "capacity grew to {cap}");
+    }
+
+    #[test]
+    fn stale_ring_shrinks_and_reports_evicted_revision() {
+        let d = EVENT_FRESH_DURATION;
+        let over = d + std::time::Duration::from_secs(1);
+        let (mut buf, now) = ring_at(LOWER_BOUND_CAPACITY * 2, over);
+        let mut cap = LOWER_BOUND_CAPACITY * 2;
+        let mut ev = make_event(10_000);
+        ev.recorded = now;
+        let evicted = append_to_ring(&mut buf, &mut cap, ev);
+        assert_eq!(cap, LOWER_BOUND_CAPACITY);
+        assert_eq!(buf.len(), LOWER_BOUND_CAPACITY);
+        // 201 events held, 100 kept: the newest 99 old ones + the new one.
+        assert_eq!(evicted, Some(101));
+        assert_eq!(buf.back().unwrap().revision, 10_000);
+    }
+
+    #[test]
+    fn not_full_ring_never_resizes() {
+        let d = EVENT_FRESH_DURATION;
+        let (buf, now) = ring_at(4, d / 6);
+        assert_eq!(next_capacity(&buf, 5, now, d, 2, 10), 5);
     }
 }
