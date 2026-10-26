@@ -578,6 +578,30 @@ where
         }
     }));
 
+    // `newKubeAPIServerSignerClusterTrustBundledPublisherController`
+    // (cmd/kube-controller-manager/app/certificates.go:289-353), gated on
+    // the ClusterTrustBundle feature gate; skipped without a root CA.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
+    ) {
+        let s = storage_for("ClusterTrustBundlePublisher");
+        match controllers::clustertrustbundle_publisher::ClusterTrustBundlePublisher::for_kube_apiserver_serving(
+            s,
+            config.ca_cert_pem.as_deref(),
+        ) {
+            Ok(Some(c)) => {
+                let c = Arc::new(c);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = c.run().await {
+                        error!("ClusterTrustBundle publisher error: {}", e);
+                    }
+                }));
+            }
+            Ok(None) => {}
+            Err(e) => error!("ClusterTrustBundle publisher not started: {}", e),
+        }
+    }
+
     let s = storage_for("Namespace");
     let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {
