@@ -383,6 +383,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             tokio::spawn(async move { pods.run().await });
             tokio::spawn(async move { nodes.run().await });
             tokio::spawn(async move { priority_classes.run().await });
+            api.volumes.spawn();
 
             let mut pod_sub = api.pods.subscribe();
             let mut node_sub = api.nodes.subscribe();
