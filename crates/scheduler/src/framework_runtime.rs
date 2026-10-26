@@ -422,16 +422,44 @@ impl Registry {
             (SCHEDULING_GATES, &[PreEnqueue][..]),
             (GANG_SCHEDULING, &[PreEnqueue, Reserve, Permit][..]),
         ] {
-            r.register(name, points);
+            r.register(name, points)
+                .expect("in-tree plugin names are unique");
         }
         r
     }
 
-    /// Register a plugin (`Registry.Register`, also used for out-of-tree
-    /// plugins / test fakes).
-    pub fn register(&mut self, name: &str, points: &[ExtensionPoint]) {
+    /// `Registry.Register` (framework/runtime/registry.go): add a plugin, or
+    /// fail if one with the same name exists (the existing entry is kept).
+    pub fn register(&mut self, name: &str, points: &[ExtensionPoint]) -> Result<(), String> {
+        if self.plugins.contains_key(name) {
+            return Err(format!("a plugin named {name} already exists"));
+        }
         self.plugins
             .insert(name.to_string(), points.iter().copied().collect());
+        Ok(())
+    }
+
+    /// `Registry.Unregister`: remove a plugin, or fail if none has that name.
+    pub fn unregister(&mut self, name: &str) -> Result<(), String> {
+        if self.plugins.remove(name).is_none() {
+            return Err(format!("no plugin named {name} exists"));
+        }
+        Ok(())
+    }
+
+    /// `Registry.Merge`: register every plugin of `other`, stopping at the
+    /// first duplicate. As in Go, plugins merged before the error stay in `self`
+    /// (map iteration order there is random; ours is too).
+    /// `scheduler.New` uses it to add `WithFrameworkOutOfTreeRegistry` to
+    /// `NewInTreeRegistry` (scheduler.go).
+    pub fn merge(&mut self, other: &Registry) -> Result<(), String> {
+        for (name, points) in &other.plugins {
+            if self.plugins.contains_key(name) {
+                return Err(format!("a plugin named {name} already exists"));
+            }
+            self.plugins.insert(name.clone(), points.clone());
+        }
+        Ok(())
     }
 
     fn get(&self, name: &str) -> Option<&HashSet<ExtensionPoint>> {
@@ -797,13 +825,14 @@ mod tests {
                 QueueSort, PreFilter, Filter, PostFilter, PreScore, Score, Reserve, Permit,
                 PreBind, Bind, PostBind,
             ],
-        );
-        r.register(QUEUE_SORT, &[QueueSort]);
-        r.register(BIND, &[Bind]);
-        r.register(SCORE1, &[PreScore, Score]);
-        r.register(SCORE2, &[PreScore, Score]);
-        r.register(SCORE_WITH_NORMALIZE1, &[Score]);
-        r.register(NOT_SCORE, &[Filter]);
+        )
+        .unwrap();
+        r.register(QUEUE_SORT, &[QueueSort]).unwrap();
+        r.register(BIND, &[Bind]).unwrap();
+        r.register(SCORE1, &[PreScore, Score]).unwrap();
+        r.register(SCORE2, &[PreScore, Score]).unwrap();
+        r.register(SCORE_WITH_NORMALIZE1, &[Score]).unwrap();
+        r.register(NOT_SCORE, &[Filter]).unwrap();
         r
     }
 
@@ -1126,5 +1155,57 @@ mod tests {
         };
         let merged = merge_plugins(default_plugins(), Some(&star));
         assert_eq!(merged.multi_point.enabled, vec![Plugin::new("X")]);
+    }
+
+    // registry_test.go TestMerge / TestRegister / TestUnregister.
+    fn reg(entries: &[(&str, &[ExtensionPoint])]) -> Registry {
+        let mut r = Registry::default();
+        for (n, p) in entries {
+            r.register(n, p).unwrap();
+        }
+        r
+    }
+
+    fn same(a: &Registry, b: &Registry) -> bool {
+        a.plugins == b.plugins
+    }
+
+    #[test]
+    fn registry_merge() {
+        use ExtensionPoint::*;
+        let mut p = reg(&[("pluginFactory1", &[Filter])]);
+        p.merge(&reg(&[("pluginFactory2", &[Score])])).unwrap();
+        assert!(same(
+            &p,
+            &reg(&[("pluginFactory1", &[Filter]), ("pluginFactory2", &[Score])])
+        ));
+
+        let mut p = reg(&[("pluginFactory1", &[Filter])]);
+        let err = p.merge(&reg(&[("pluginFactory1", &[Score])])).unwrap_err();
+        assert_eq!(err, "a plugin named pluginFactory1 already exists");
+        assert!(same(&p, &reg(&[("pluginFactory1", &[Filter])])));
+    }
+
+    #[test]
+    fn registry_register() {
+        use ExtensionPoint::*;
+        let mut r = Registry::default();
+        r.register("pluginFactory1", &[Filter]).unwrap();
+        assert!(same(&r, &reg(&[("pluginFactory1", &[Filter])])));
+        let err = r.register("pluginFactory1", &[Score]).unwrap_err();
+        assert_eq!(err, "a plugin named pluginFactory1 already exists");
+        assert!(same(&r, &reg(&[("pluginFactory1", &[Filter])])));
+    }
+
+    #[test]
+    fn registry_unregister() {
+        use ExtensionPoint::*;
+        let mut r = reg(&[("pluginFactory1", &[Filter]), ("pluginFactory2", &[Score])]);
+        r.unregister("pluginFactory1").unwrap();
+        assert!(same(&r, &reg(&[("pluginFactory2", &[Score])])));
+        let mut empty = Registry::default();
+        let err = empty.unregister("pluginFactory1").unwrap_err();
+        assert_eq!(err, "no plugin named pluginFactory1 exists");
+        assert!(same(&empty, &Registry::default()));
     }
 }
