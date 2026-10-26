@@ -65,6 +65,7 @@ mod server;
 mod server_auth;
 mod server_metrics;
 mod server_metrics_endpoints;
+mod static_pod_url;
 mod static_pod_watch;
 mod static_pods;
 mod streaming_server;
@@ -416,6 +417,13 @@ async fn main() -> Result<()> {
 
     // fileCheckFrequency from the config file (None => upstream default 20s).
     let file_check_frequency = config_file.as_ref().and_then(|c| c.file_check_frequency);
+    // httpCheckFrequency / staticPodURL / staticPodURLHeader (kubelet.go:366-391).
+    let http_check_frequency = config_file.as_ref().and_then(|c| c.http_check_frequency);
+    let static_pod_url = config_file.as_ref().and_then(|c| c.static_pod_url.clone());
+    let static_pod_url_header = config_file
+        .as_ref()
+        .and_then(|c| c.static_pod_url_header.clone())
+        .unwrap_or_default();
     // nodeStatusReportFrequency (5m default, or nodeStatusUpdateFrequency when
     // only that was set explicitly; defaults.go).
     let node_status_report_frequency = config_file
@@ -653,6 +661,8 @@ async fn main() -> Result<()> {
         .with_pod_manifest_path(args.pod_manifest_path.clone())
         .with_node_status_update_frequency(node_status_update_frequency)
         .with_file_check_frequency(file_check_frequency)
+        .with_http_check_frequency(http_check_frequency)
+        .with_static_pod_url(static_pod_url.as_deref(), &static_pod_url_header)?
         .with_node_status_report_frequency(node_status_report_frequency)
         .with_runtime_request_timeout(runtime_request_timeout)
         .with_crash_loop_backoff_max(crash_loop_backoff_max)

@@ -16,14 +16,69 @@ pub const CONFIG_SOURCE_ANNOTATION: &str = "kubernetes.io/config.source";
 pub const CONFIG_MIRROR_ANNOTATION: &str = "kubernetes.io/config.mirror";
 pub const CONFIG_HASH_ANNOTATION: &str = "kubernetes.io/config.hash";
 
+/// `kubetypes.FileSource` / `kubetypes.HTTPSource` (pkg/kubelet/types/pod_update.go).
+pub const SOURCE_FILE: &str = "file";
+pub const SOURCE_HTTP: &str = "http";
+
+/// `maxConfigLength` (pkg/kubelet/config/common.go:52): 10MB.
+pub const MAX_CONFIG_LENGTH: usize = 10 * (1 << 20);
+
+/// Decode a manifest-URL body: a single Pod first, then a PodList
+/// (`sourceURL.extractFromURL`, pkg/kubelet/config/http.go:107-141).
+/// Every pod gets `applyDefaults` for the HTTP source.
+pub fn parse_http_manifest(data: &[u8], url: &str, node_name: &str) -> Result<Vec<Pod>> {
+    // JSON is valid YAML, so one parser covers both (utilyaml.ToJSON).
+    let value: serde_yaml::Value = serde_yaml::from_slice(data)
+        .with_context(|| format!("{url}: received data that is neither JSON nor YAML"))?;
+    let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind == "PodList" {
+        #[derive(serde::Deserialize)]
+        struct List {
+            #[serde(default)]
+            items: Vec<Pod>,
+        }
+        let list: List =
+            serde_yaml::from_value(value).with_context(|| format!("{url}: invalid pods list"))?;
+        let mut pods = Vec::with_capacity(list.items.len());
+        for mut item in list.items {
+            // Items of a list carry no kind of their own on the wire.
+            if item.type_meta.kind.is_empty() {
+                item.type_meta.kind = "Pod".to_string();
+            }
+            let pod = finish_decoded_pod(item, url)?;
+            pods.push(normalize_static_pod_from(pod, node_name, SOURCE_HTTP)?);
+        }
+        return Ok(pods);
+    }
+    let pod: Pod = serde_yaml::from_value(value).with_context(|| {
+        format!(
+            "{url}: received '{}', but couldn't parse as single or multiple pods",
+            String::from_utf8_lossy(data)
+        )
+    })?;
+    let pod = finish_decoded_pod(pod, url)?;
+    Ok(vec![normalize_static_pod_from(
+        pod,
+        node_name,
+        SOURCE_HTTP,
+    )?])
+}
+
 /// Parse one manifest file (YAML or JSON) into a Pod. Rejects non-Pod kinds
 /// and pods without a name.
 pub fn parse_manifest(bytes: &[u8], file_name: &str) -> Result<Pod> {
-    let mut pod: Pod = if file_name.ends_with(".json") {
+    let pod: Pod = if file_name.ends_with(".json") {
         serde_json::from_slice(bytes).with_context(|| format!("parsing {file_name} as JSON"))?
     } else {
         serde_yaml::from_slice(bytes).with_context(|| format!("parsing {file_name} as YAML"))?
     };
+    finish_decoded_pod(pod, file_name)
+}
+
+/// Kind/name checks plus the decode-time defaulting shared by the file and
+/// URL sources (`tryDecodeSinglePod` / `tryDecodePodList`,
+/// `pkg/kubelet/config/common.go`).
+fn finish_decoded_pod(mut pod: Pod, file_name: &str) -> Result<Pod> {
     if pod.type_meta.kind != "Pod" {
         bail!("{file_name}: kind must be Pod");
     }
@@ -76,7 +131,14 @@ pub fn pod_config_hash(pod: &Pod) -> String {
 /// Apply static-pod defaults, mirroring upstream applyDefaults
 /// (pkg/kubelet/config/common.go): name suffix "-<node>", default namespace,
 /// pin spec.nodeName, stamp config.source/config.hash, deterministic UID.
-pub fn normalize_static_pod(mut pod: Pod, node_name: &str) -> Result<Pod> {
+pub fn normalize_static_pod(pod: Pod, node_name: &str) -> Result<Pod> {
+    normalize_static_pod_from(pod, node_name, SOURCE_FILE)
+}
+
+/// `applyDefaults` for a given source (`kubetypes.FileSource` /
+/// `kubetypes.HTTPSource`); the source is stamped into
+/// `kubernetes.io/config.source` and mixed into the derived UID.
+pub fn normalize_static_pod_from(mut pod: Pod, node_name: &str, source: &str) -> Result<Pod> {
     pod.metadata.name = format!("{}-{}", pod.metadata.name, node_name);
     if pod.metadata.namespace.as_deref().unwrap_or("").is_empty() {
         pod.metadata.namespace = Some("default".to_string());
@@ -90,14 +152,19 @@ pub fn normalize_static_pod(mut pod: Pod, node_name: &str) -> Result<Pod> {
     let hash = pod_config_hash(&pod);
     // UID derived from the hash: stable while the manifest is unchanged, so
     // container labels and status writers agree across kubelet restarts.
-    let h = Sha256::digest(format!("static:{node_name}:{hash}").as_bytes());
+    let uid_seed = if source == SOURCE_FILE {
+        format!("static:{node_name}:{hash}")
+    } else {
+        format!("static-{source}:{node_name}:{hash}")
+    };
+    let h = Sha256::digest(uid_seed.as_bytes());
     pod.metadata.uid = format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]
     );
 
     let ann = pod.metadata.annotations.get_or_insert_with(HashMap::new);
-    ann.insert(CONFIG_SOURCE_ANNOTATION.to_string(), "file".to_string());
+    ann.insert(CONFIG_SOURCE_ANNOTATION.to_string(), source.to_string());
     ann.insert(CONFIG_HASH_ANNOTATION.to_string(), hash);
     Ok(pod)
 }

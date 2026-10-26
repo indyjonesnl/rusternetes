@@ -46,6 +46,24 @@ pub struct KubeletConfiguration {
     )]
     pub file_check_frequency: Option<std::time::Duration>,
 
+    /// `staticPodURL`: manifest URL polled for static pods
+    /// (`kubeCfg.StaticPodURL`, pkg/kubelet/kubelet.go:388).
+    #[serde(
+        rename = "staticPodURL",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub static_pod_url: Option<String>,
+
+    /// `staticPodURLHeader`: HTTP headers sent when fetching `staticPodURL`
+    /// (`kubeCfg.StaticPodURLHeader`, pkg/kubelet/kubelet.go:366-373).
+    #[serde(
+        rename = "staticPodURLHeader",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub static_pod_url_header: Option<std::collections::BTreeMap<String, Vec<String>>>,
+
     /// `httpCheckFrequency` (`metav1.Duration`, Go duration string).
     #[serde(
         default,
@@ -340,6 +358,8 @@ impl Default for KubeletConfiguration {
             volume_plugin_dir: None,
             sync_frequency: None,
             file_check_frequency: None,
+            static_pod_url: None,
+            static_pod_url_header: None,
             http_check_frequency: None,
             streaming_connection_idle_timeout: None,
             node_status_update_frequency: None,
@@ -1095,6 +1115,11 @@ mod tests {
                     nodeStatusUpdateFrequency: 4s\nstreamingConnectionIdleTimeout: 30m\n\
                     imageMinimumGCAge: 0s\ncpuCFSQuotaPeriod: 50ms\n\
                     shutdownGracePeriod: 30s\nshutdownGracePeriodCriticalPods: 10s\n";
+        let u: KubeletConfiguration =
+            serde_yaml::from_str("staticPodURL: http://x/p\nstaticPodURLHeader:\n  X-A: [a, b]\n")
+                .unwrap();
+        assert_eq!(u.static_pod_url.as_deref(), Some("http://x/p"));
+        assert_eq!(u.static_pod_url_header.unwrap()["X-A"], ["a", "b"]);
         let c: KubeletConfiguration = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(c.effective_file_check_frequency(), s(5));
         assert_eq!(c.effective_http_check_frequency(), s(60));
