@@ -4667,17 +4667,18 @@ impl ProtoRegistry {
         );
 
         // IngressClassParametersReference
-        // Field #1 is `aPIGroup` (not `apiGroup`) per upstream
-        // k8s.io/api/networking/v1/generated.proto. K8s's Go-to-proto
-        // generator lower-cases only the first character of a trailing
-        // acronym in the field name, producing the unusual capitalisation.
-        // Match it verbatim — the wire shape must equal the upstream
-        // schema for typed clients to deserialize correctly.
+        // Field #1 is named `aPIGroup` in upstream
+        // k8s.io/api/networking/v1/generated.proto (the Go field is `APIGroup`),
+        // but only the proto/Go name; the JSON tag is `apiGroup`
+        // (`IngressClassParametersReference.APIGroup *string
+        // `json:"apiGroup,omitempty"``, types.go). The registry keys by JSON
+        // name, so using `aPIGroup` here dropped `apiGroup` on encode and
+        // emitted a bogus `aPIGroup` key on decode.
         schemas.insert(
             "IngressClassParametersReference".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("aPIGroup".into(), FieldType::String)),
+                    (1, ("apiGroup".into(), FieldType::String)),
                     (2, ("kind".into(), FieldType::String)),
                     (3, ("name".into(), FieldType::String)),
                     (4, ("scope".into(), FieldType::String)),
@@ -4759,9 +4760,12 @@ impl ProtoRegistry {
                     (1, ("host".into(), FieldType::String)),
                     (
                         2,
+                        // `IngressRuleValue` is embedded with `json:",inline"`
+                        // (networking/v1 types.go `IngressRule`), so `http` sits
+                        // directly on the rule in JSON.
                         (
                             "ingressRuleValue".into(),
-                            FieldType::Message("IngressRuleValue".into()),
+                            FieldType::InlineMessage("IngressRuleValue".into()),
                         ),
                     ),
                 ]),
