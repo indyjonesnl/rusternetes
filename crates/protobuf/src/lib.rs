@@ -7048,6 +7048,10 @@ impl ProtoRegistry {
                 (1, ("name".into(), FieldType::String)),
                 (2, ("generateName".into(), FieldType::String)),
                 (3, ("namespace".into(), FieldType::String)),
+                // Deprecated, never populated by the server, but still declared
+                // at field 4 in `meta/v1/generated.proto` (ObjectMeta.selfLink);
+                // carried so client-supplied bytes survive a decode/encode.
+                (4, ("selfLink".into(), FieldType::String)),
                 (5, ("uid".into(), FieldType::String)),
                 (6, ("resourceVersion".into(), FieldType::String)),
                 (7, ("generation".into(), FieldType::Int)),

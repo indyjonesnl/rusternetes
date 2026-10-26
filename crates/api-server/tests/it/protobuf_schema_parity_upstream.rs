@@ -714,11 +714,6 @@ fn registry_parity_with_upstream() {
 /// round-trip is knowingly lossy.
 fn completeness_skip(msg: &str, field_number: u32) -> bool {
     match (msg, field_number) {
-        // selfLink: deprecated in k8s 1.16, removed from server responses;
-        // our ObjectMeta intentionally omits it (mirrors the JSON parity
-        // test's KNOWN_GAPS). Not modelled on either codec.
-        ("ObjectMeta", 4) => true,
-
         // Legacy / removed in-tree volume plugins. Our Volume struct does not
         // implement these provider-specific sources (same KNOWN_GAPS set the
         // JSON parity test allowlists), so the registry has no field for them.
