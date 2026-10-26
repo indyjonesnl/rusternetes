@@ -223,6 +223,129 @@ fn detect_bridge_network() -> Option<(String, String)> {
 pub const DEFAULT_CLUSTER_CIDR: &str = "10.96.0.0/12";
 pub const DEFAULT_NODEPORT_RANGE: &str = "30000:32767";
 
+/// The IP family one proxier instance programs. Upstream creates one proxier
+/// per family (`NewDualStackProxier`, pkg/proxy/iptables/proxier.go:93-126)
+/// and each only ever sees the Services/Endpoints of its own family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpFamily {
+    #[default]
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    /// Family of an IP literal, `None` if it does not parse. Mirrors
+    /// `netutils.IsIPv6String` as used by `proxyutil.GetClusterIPByFamily`
+    /// (pkg/proxy/util/utils.go:190).
+    pub fn of(ip: &str) -> Option<Self> {
+        match ip.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V4(_) => Some(Self::V4),
+            std::net::IpAddr::V6(_) => Some(Self::V6),
+        }
+    }
+
+    /// Prefix length of a single-host match (`-d <ip>/<n>`).
+    fn host_prefix(self) -> u8 {
+        match self {
+            Self::V4 => 32,
+            Self::V6 => 128,
+        }
+    }
+
+    /// `ip6tables*` counterpart of an `iptables*` binary, keeping the
+    /// directory and backend variant (`iptables-nft-restore` ->
+    /// `ip6tables-nft-restore`). Upstream: `cmdIP6Tables = "ip6tables"`,
+    /// `cmdIP6TablesRestore = "ip6tables-restore"`
+    /// (pkg/util/iptables/iptables.go:142-150, `newInternal` picks per
+    /// protocol).
+    pub fn binary(self, iptables_binary: &str) -> String {
+        if self == Self::V4 {
+            return iptables_binary.to_string();
+        }
+        let path = std::path::Path::new(iptables_binary);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(iptables_binary);
+        let v6 = name.replacen("iptables", "ip6tables", 1);
+        match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => dir.join(v6).to_string_lossy().into_owned(),
+            None => v6,
+        }
+    }
+
+    /// Per-endpoint chain name. IPv4 keeps the existing dotted-quad form; an
+    /// IPv6 address cannot be embedded (`:` and length — iptables chain names
+    /// are capped at 28 bytes), so it is hashed like upstream's
+    /// `servicePortEndpointChainName` (proxier.go:643-647, `KUBE-SEP-` + 16
+    /// base32 chars). Rusternetes deviation: FNV-1a instead of SHA-256 to
+    /// avoid a new dependency; the name is only an internal identifier.
+    fn sep_chain(self, cluster_ip: &str, port: u16, proto: &str, idx: usize) -> String {
+        match self {
+            Self::V4 => format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx),
+            Self::V6 => format!("KUBE-SEP-{}", chain_hash(cluster_ip, port, proto, idx)),
+        }
+    }
+
+    /// `xt_recent` list name for session affinity (same keying as the SEP chain).
+    fn affinity_name(self, cluster_ip: &str, port: u16, proto: &str, idx: usize) -> String {
+        match self {
+            Self::V4 => format!("AFFINITY-{}-{}-{}", cluster_ip.replace('.', ""), port, idx),
+            Self::V6 => format!("AFFINITY-{}", chain_hash(cluster_ip, port, proto, idx)),
+        }
+    }
+}
+
+/// 16 base32 chars of an FNV-1a 64-bit hash over `ip/port/proto/idx`.
+fn chain_hash(cluster_ip: &str, port: u16, proto: &str, idx: usize) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{cluster_ip}/{port}/{proto}/{idx}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (0..12)
+        .map(|i| ALPHABET[((h >> (59 - 5 * i)) & 31) as usize] as char)
+        .collect()
+}
+
+/// Go's `net.JoinHostPort`: IPv6 literals are bracketed (`[fd00::1]:80`),
+/// which `iptables --to-destination` requires.
+fn join_host_port(ip: &str, port: u16) -> String {
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+/// The Service's ClusterIP for `family`, or `None`. Port of
+/// `proxyutil.GetClusterIPByFamily` (pkg/proxy/util/utils.go:190-214): with
+/// no `ipFamilies` fall back to the single `clusterIP` (skew tolerance),
+/// otherwise take `clusterIPs[i]` where `ipFamilies[i]` matches.
+pub fn cluster_ip_for_family(
+    service: &rusternetes_common::resources::Service,
+    family: IpFamily,
+) -> Option<String> {
+    use rusternetes_common::resources::service::IPFamily;
+    let spec = &service.spec;
+    let families = spec.ip_families.as_deref().unwrap_or_default();
+    if families.is_empty() {
+        let ip = spec
+            .cluster_ip
+            .as_deref()
+            .filter(|i| !i.is_empty() && *i != "None")?;
+        return (IpFamily::of(ip) == Some(family)).then(|| ip.to_string());
+    }
+    let want = match family {
+        IpFamily::V4 => IPFamily::IPv4,
+        IpFamily::V6 => IPFamily::IPv6,
+    };
+    let idx = families.iter().position(|f| *f == want)?;
+    let ip = spec.cluster_ips.as_deref()?.get(idx)?;
+    (!ip.is_empty() && ip != "None").then(|| ip.clone())
+}
+
 /// Masquerade mark, matching upstream kube-proxy's `--iptables-masquerade-bit`
 /// default of 14 (`1 << 14` = `0x4000`).
 /// K8s ref: pkg/proxy/iptables/proxier.go — `masqueradeMark`.
@@ -244,6 +367,9 @@ pub struct IptablesManager {
     /// Chain for pod hostPort DNAT (KUBE-HOSTPORTS).
     /// Populated by `build_hostport_rules` from the pod list each sync.
     hostports_chain: String,
+    /// IP family this instance programs (one manager per family, as upstream
+    /// runs one proxier per family).
+    ip_family: IpFamily,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
     /// Matching `iptables-restore` (same backend family as `iptables_cmd`).
@@ -307,6 +433,7 @@ impl IptablesManager {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             hostports_chain: "KUBE-HOSTPORTS".to_string(),
+            ip_family: IpFamily::V4,
             iptables_cmd: "/usr/sbin/iptables".to_string(),
             restore_cmd: "iptables-restore".to_string(),
             cluster_cidr: DEFAULT_CLUSTER_CIDR.to_string(),
@@ -319,7 +446,20 @@ impl IptablesManager {
     }
 
     pub fn new(cluster_cidr: String, nodeport_range: String) -> Self {
+        Self::new_for_family(IpFamily::V4, cluster_cidr, nodeport_range)
+    }
+
+    /// Manager for one IP family; `ip6tables*` for IPv6.
+    pub fn new_for_family(
+        ip_family: IpFamily,
+        cluster_cidr: String,
+        nodeport_range: String,
+    ) -> Self {
         let (iptables_cmd, restore_cmd) = detect_iptables();
+        let (iptables_cmd, restore_cmd) = (
+            ip_family.binary(&iptables_cmd),
+            ip_family.binary(&restore_cmd),
+        );
         let bridge_network = detect_bridge_network();
         // Probe whether the xt_recent module is available by trying a dummy check rule.
         // If the module is missing, stderr contains "Couldn't load" or "No such file".
@@ -360,6 +500,7 @@ impl IptablesManager {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
             hostports_chain: "KUBE-HOSTPORTS".to_string(),
+            ip_family,
             iptables_cmd,
             restore_cmd,
             cluster_cidr,
@@ -1850,6 +1991,8 @@ impl IptablesManager {
         pods: &[rusternetes_common::resources::Pod],
         node_name: &str,
     ) -> String {
+        let family = self.ip_family;
+        let mask = family.host_prefix();
         let mut rules = String::new();
 
         // iptables-restore format: table header, chain definitions, rules, COMMIT
@@ -1858,13 +2001,16 @@ impl IptablesManager {
         rules.push_str(&format!(":{} - [0:0]\n", self.nodeports_chain));
         // KUBE-HOSTPORTS lines (chain header + DNAT rules) emitted in-place
         // so the entire NAT table is replaced atomically with one restore.
-        rules.push_str(&self.build_hostport_chain_block(pods, node_name));
+        // hostPort DNAT is programmed from IPv4 podIPs only for now.
+        let hostport_pods: &[rusternetes_common::resources::Pod] =
+            if family == IpFamily::V4 { pods } else { &[] };
+        rules.push_str(&self.build_hostport_chain_block(hostport_pods, node_name));
 
         // Build DNAT rules for each service
         for service in services {
-            let cluster_ip = match &service.spec.cluster_ip {
-                Some(ip) if !ip.is_empty() && ip != "None" => ip,
-                _ => continue,
+            // Only this family's ClusterIP (GetClusterIPByFamily).
+            let Some(cluster_ip) = cluster_ip_for_family(service, family) else {
+                continue;
             };
 
             let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
@@ -1887,6 +2033,9 @@ impl IptablesManager {
                     .get(&svc_key)
                     .map(|eps| {
                         eps.iter()
+                            // An IPv6 proxier must not see IPv4 endpoints and
+                            // vice versa (EndpointSlice addressType split).
+                            .filter(|(ip, _, _)| IpFamily::of(ip) == Some(family))
                             .filter(|(_, port_name, ep_port)| {
                                 // Match by port name (most reliable)
                                 if svc_port.name.is_some()
@@ -1941,11 +2090,9 @@ impl IptablesManager {
                     // Combine recent --set with DNAT in one rule so --set only
                     // fires for packets that actually DNAT (correct protocol).
                     for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
-                        let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
-                        let recent_name =
-                            format!("AFFINITY-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
-                        let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
+                        let sep_chain = family.sep_chain(&cluster_ip, port, &proto, idx);
+                        let recent_name = family.affinity_name(&cluster_ip, port, &proto, idx);
+                        let dnat_target = join_host_port(endpoint_ip, *endpoint_port);
 
                         // Define the per-endpoint chain
                         rules.push_str(&format!(":{} - [0:0]\n", sep_chain));
@@ -1958,8 +2105,8 @@ impl IptablesManager {
 
                         // Service chain: affinity check (--rcheck) jumps to SEP if recent
                         rules.push_str(&format!(
-                            "-A {} -d {}/32 -p {} --dport {} -m recent --name {} --rcheck --seconds {} --reap -j {}\n",
-                            self.services_chain, cluster_ip, proto, port,
+                            "-A {} -d {}/{} -p {} --dport {} -m recent --name {} --rcheck --seconds {} --reap -j {}\n",
+                            self.services_chain, cluster_ip, mask, proto, port,
                             recent_name, affinity_timeout, sep_chain
                         ));
                     }
@@ -1969,12 +2116,11 @@ impl IptablesManager {
                     // and unconditionally jumps to that endpoint's SEP chain.
                     for (idx, (_endpoint_ip, _endpoint_port)) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
-                        let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                        let sep_chain = family.sep_chain(&cluster_ip, port, &proto, idx);
 
                         let mut rule = format!(
-                            "-A {} -d {}/32 -p {} --dport {}",
-                            self.services_chain, cluster_ip, proto, port
+                            "-A {} -d {}/{} -p {} --dport {}",
+                            self.services_chain, cluster_ip, mask, proto, port
                         );
                         if !is_last {
                             let prob = 1.0 / (n - idx) as f64;
@@ -1991,12 +2137,12 @@ impl IptablesManager {
                     // No session affinity or single endpoint: direct DNAT
                     for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
-                        let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
+                        let dnat_target = join_host_port(endpoint_ip, *endpoint_port);
                         let comment = format!("rusternetes service {}:{}", cluster_ip, port);
 
                         let mut rule = format!(
-                            "-A {} -d {}/32 -p {} --dport {}",
-                            self.services_chain, cluster_ip, proto, port
+                            "-A {} -d {}/{} -p {} --dport {}",
+                            self.services_chain, cluster_ip, mask, proto, port
                         );
                         if !is_last {
                             let prob = 1.0 / (n - idx) as f64;
@@ -2023,9 +2169,9 @@ impl IptablesManager {
         // KUBE-SVC chain and thus shares affinity state with ClusterIP traffic.
         // K8s ref: pkg/proxy/iptables/proxier.go — writeServiceToEndpointRules
         for service in services {
-            let cluster_ip = match &service.spec.cluster_ip {
-                Some(ip) if !ip.is_empty() && ip != "None" => ip,
-                _ => continue,
+            // Only this family's ClusterIP (GetClusterIPByFamily).
+            let Some(cluster_ip) = cluster_ip_for_family(service, family) else {
+                continue;
             };
 
             let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
@@ -2046,6 +2192,9 @@ impl IptablesManager {
                     .get(&svc_key)
                     .map(|eps| {
                         eps.iter()
+                            // An IPv6 proxier must not see IPv4 endpoints and
+                            // vice versa (EndpointSlice addressType split).
+                            .filter(|(ip, _, _)| IpFamily::of(ip) == Some(family))
                             .filter(|(_, port_name, ep_port)| {
                                 if svc_port.name.is_some()
                                     && svc_port.name.as_deref() == port_name.as_deref()
@@ -2090,10 +2239,8 @@ impl IptablesManager {
                     // probability fallback rules in the nodeports chain.
                     let timeout_str = affinity_timeout.to_string();
                     for (idx, _) in endpoints.iter().enumerate() {
-                        let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
-                        let recent_name =
-                            format!("AFFINITY-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                        let sep_chain = family.sep_chain(&cluster_ip, port, &proto, idx);
+                        let recent_name = family.affinity_name(&cluster_ip, port, &proto, idx);
 
                         // Affinity check: if client IP was recently seen, jump to SEP chain
                         rules.push_str(&format!(
@@ -2106,8 +2253,7 @@ impl IptablesManager {
                     // Probability-based fallback for new connections
                     for (idx, _) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
-                        let sep_chain =
-                            format!("KUBE-SEP-{}-{}-{}", cluster_ip.replace('.', ""), port, idx);
+                        let sep_chain = family.sep_chain(&cluster_ip, port, &proto, idx);
 
                         let mut rule = format!(
                             "-A {} -p {} --dport {}",
@@ -2128,7 +2274,7 @@ impl IptablesManager {
                     // No session affinity or single endpoint: direct DNAT
                     for (idx, (endpoint_ip, endpoint_port)) in endpoints.iter().enumerate() {
                         let is_last = idx == n - 1;
-                        let dnat_target = format!("{}:{}", endpoint_ip, endpoint_port);
+                        let dnat_target = join_host_port(endpoint_ip, *endpoint_port);
 
                         let mut rule = format!(
                             "-A {} -p {} --dport {}",
@@ -2666,6 +2812,122 @@ mod tests {
             .collect();
         m.insert(key, v);
         m
+    }
+
+    // Dual-stack: one manager per family. Upstream: pkg/proxy/iptables
+    // NewDualStackProxier (proxier.go:93) + GetClusterIPByFamily
+    // (pkg/proxy/util/utils.go:190, tests in utils_test.go).
+    use super::{cluster_ip_for_family, IpFamily};
+    use rusternetes_common::resources::service::IPFamily;
+
+    fn dual_stack_service() -> Service {
+        let mut svc = make_service(
+            "ds",
+            "default",
+            "10.96.0.7",
+            ServiceType::ClusterIP,
+            vec![ServicePort {
+                name: None,
+                protocol: "TCP".to_string(),
+                port: 80,
+                target_port: None,
+                node_port: None,
+                app_protocol: None,
+            }],
+            None,
+            None,
+        );
+        svc.spec.ip_families = Some(vec![IPFamily::IPv4, IPFamily::IPv6]);
+        svc.spec.cluster_ips = Some(vec!["10.96.0.7".into(), "fd00:10:96::7".into()]);
+        svc
+    }
+
+    #[test]
+    fn cluster_ip_by_family_matches_upstream() {
+        let ds = dual_stack_service();
+        assert_eq!(
+            cluster_ip_for_family(&ds, IpFamily::V4).as_deref(),
+            Some("10.96.0.7")
+        );
+        assert_eq!(
+            cluster_ip_for_family(&ds, IpFamily::V6).as_deref(),
+            Some("fd00:10:96::7")
+        );
+        // Skew: no ipFamilies -> single clusterIP, matched by its own family.
+        let mut legacy = dual_stack_service();
+        legacy.spec.ip_families = None;
+        assert_eq!(cluster_ip_for_family(&legacy, IpFamily::V6), None);
+        assert!(cluster_ip_for_family(&legacy, IpFamily::V4).is_some());
+        // Headless.
+        legacy.spec.cluster_ip = Some("None".into());
+        assert_eq!(cluster_ip_for_family(&legacy, IpFamily::V4), None);
+    }
+
+    #[test]
+    fn ip6tables_binary_names() {
+        assert_eq!(
+            IpFamily::V6.binary("/usr/sbin/iptables"),
+            "/usr/sbin/ip6tables"
+        );
+        assert_eq!(
+            IpFamily::V6.binary("iptables-nft-restore"),
+            "ip6tables-nft-restore"
+        );
+        assert_eq!(IpFamily::V6.binary("iptables-restore"), "ip6tables-restore");
+        assert_eq!(IpFamily::V4.binary("iptables-restore"), "iptables-restore");
+    }
+
+    #[tokio::test]
+    async fn dual_stack_each_family_programs_only_its_own() {
+        let svc = dual_stack_service();
+        let eps = make_endpointslice_map(
+            "default",
+            "ds",
+            &[("10.244.0.5", None, 8080), ("fd00:244::5", None, 8080)],
+        );
+        let v4 = IptablesManager::for_testing(false)
+            .build_nat_rules(std::slice::from_ref(&svc), &eps, &[], "n")
+            .await;
+        assert!(v4.contains("-d 10.96.0.7/32 -p tcp --dport 80"), "{v4}");
+        assert!(v4.contains("--to-destination 10.244.0.5:8080"), "{v4}");
+        assert!(!v4.contains("fd00"), "{v4}");
+
+        let mut m6 = IptablesManager::for_testing(false);
+        m6.ip_family = IpFamily::V6;
+        let v6 = m6.build_nat_rules(&[svc], &eps, &[], "n").await;
+        assert!(
+            v6.contains("-d fd00:10:96::7/128 -p tcp --dport 80"),
+            "{v6}"
+        );
+        assert!(v6.contains("--to-destination [fd00:244::5]:8080"), "{v6}");
+        assert!(
+            !v6.contains("10.96.0.7") && !v6.contains("10.244.0.5"),
+            "{v6}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv6_affinity_chain_names_fit_iptables_limit() {
+        let mut svc = dual_stack_service();
+        svc.spec.session_affinity = Some("ClientIP".into());
+        let eps = make_endpointslice_map(
+            "default",
+            "ds",
+            &[("fd00:244::5", None, 8080), ("fd00:244::6", None, 8080)],
+        );
+        let mut m6 = IptablesManager::for_testing(true);
+        m6.ip_family = IpFamily::V6;
+        let v6 = m6.build_nat_rules(&[svc], &eps, &[], "n").await;
+        let chains: Vec<&str> = v6
+            .lines()
+            .filter_map(|l| l.strip_prefix(":KUBE-SEP-"))
+            .collect();
+        assert_eq!(chains.len(), 2, "{v6}");
+        for c in chains {
+            let name = format!("KUBE-SEP-{}", c.split(' ').next().unwrap());
+            assert!(name.len() <= 28 && !name.contains(':'), "{name}");
+        }
+        assert!(v6.contains("--to-destination [fd00:244::5]:8080"), "{v6}");
     }
 
     #[tokio::test]
