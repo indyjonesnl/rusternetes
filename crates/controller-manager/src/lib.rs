@@ -165,6 +165,10 @@ pub struct ControllerManagerConfig {
     /// TerminatedPodGCThreshold`, default 12500): terminated pods tolerated
     /// before the pod GC deletes the oldest; `<= 0` disables that pass.
     pub terminated_pod_gc_threshold: i32,
+    /// Run the bootstrap token cleaner. Upstream registers it
+    /// `isDisabledByDefault: true` (`cmd/kube-controller-manager/app/bootstrap.go:59`),
+    /// so it is opt-in (`--token-cleaner-controller`).
+    pub token_cleaner_controller: bool,
 }
 
 /// Run the controller-manager against a storage backend directly (all-in-one
@@ -393,6 +397,17 @@ where
         handles.push(tokio::spawn(async move {
             if let Err(e) = c.run().await {
                 error!("BootstrapSigner controller error: {e}");
+            }
+        }));
+    }
+
+    // `newTokenCleanerController` (bootstrap.go:55-80), disabled by default.
+    if config.token_cleaner_controller {
+        let s = storage_for("TokenCleaner");
+        let c = Arc::new(controllers::bootstrap_token_cleaner::TokenCleaner::new(s));
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = c.run().await {
+                error!("TokenCleaner controller error: {e}");
             }
         }));
     }
@@ -794,6 +809,7 @@ mod per_controller_client_tests {
                 bootstrap_signer_controller: false,
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
+                token_cleaner_controller: false,
             },
         );
         for h in &handles {
@@ -850,6 +866,7 @@ mod csi_attach_wiring_tests {
                 bootstrap_signer_controller: false,
                 terminated_pod_gc_threshold:
                     controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
+                token_cleaner_controller: false,
             },
         );
         for h in &handles {
