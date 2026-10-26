@@ -8413,7 +8413,7 @@ impl ProtoRegistry {
                     push_length_delimited_field(&mut inner, 1, &raw);
                     push_length_delimited_field(buf, tag, &inner);
                 } else if (inner_type == "Time" || inner_type == "MicroTime") && val.is_string() {
-                    let bytes = encode_timestamp(val);
+                    let bytes = encode_timestamp(val, inner_type == "MicroTime");
                     push_length_delimited_field(buf, tag, &bytes);
                 } else if let Some(inner) =
                     self.encode_message(inner_type, &wrap_json_schema_union(inner_type, val))
@@ -8504,7 +8504,7 @@ impl ProtoRegistry {
                         let inner = if (inner_type == "Time" || inner_type == "MicroTime")
                             && v.is_string()
                         {
-                            Some(encode_timestamp(v))
+                            Some(encode_timestamp(v, inner_type == "MicroTime"))
                         } else {
                             self.encode_message(inner_type, &wrap_json_schema_union(inner_type, v))
                         };
@@ -8519,13 +8519,20 @@ impl ProtoRegistry {
                 // K8s IntOrString proto: field 1 (type, int32), field 2
                 // (intVal, int32), field 3 (strVal, string). type=0 means
                 // intVal is set; type=1 means strVal is set.
+                // Ported from apimachinery util/intstr/generated.pb.go
+                // `IntOrString.MarshalToSizedBuffer`: all three fields are
+                // written unconditionally (plain, non-pointer scalars), so a
+                // string value still carries `intVal = 0` and an int value an
+                // empty `strVal`.
                 let mut inner = Vec::new();
                 if let Some(s) = val.as_str() {
                     push_varint_field(&mut inner, 1, 1);
+                    push_varint_field(&mut inner, 2, 0);
                     push_string_field(&mut inner, 3, s.as_bytes());
                 } else if let Some(n) = json_to_i64(val) {
                     push_varint_field(&mut inner, 1, 0);
                     push_varint_field(&mut inner, 2, n as u64);
+                    push_string_field(&mut inner, 3, b"");
                 }
                 push_length_delimited_field(buf, tag, &inner);
             }
@@ -14113,11 +14120,9 @@ fn encode_list_meta_native(m: &rusternetes_common::types::ListMeta) -> Vec<u8> {
 fn encode_metav1_time(s: &str) -> Option<Vec<u8>> {
     let dt = chrono::DateTime::parse_from_rfc3339(s).ok()?;
     let mut buf = Vec::with_capacity(12);
+    // metav1.Time: seconds + an explicit `nanos = 0` (time_proto.go ProtoTime).
     push_varint_field(&mut buf, 1, dt.timestamp() as u64);
-    let nanos = dt.timestamp_subsec_nanos();
-    if nanos != 0 {
-        push_varint_field(&mut buf, 2, nanos as u64);
-    }
+    push_varint_field(&mut buf, 2, 0);
     Some(buf)
 }
 
@@ -14399,12 +14404,18 @@ fn json_bytes_value(val: &Value) -> Vec<u8> {
     Vec::new()
 }
 
-/// Encode a JSON timestamp string (RFC3339 — possibly with fractional
-/// seconds for MicroTime) into the K8s `Time` / `MicroTime` proto:
-///     message Time { int64 seconds = 1; int32 nanos = 2; }
-/// Falls back to a zero-length message on parse failure, matching the
-/// decoder which emits `Value::Null` for `seconds == 0 && nanos == 0`.
-fn encode_timestamp(val: &Value) -> Vec<u8> {
+/// Encode a JSON timestamp string (RFC3339) into the K8s `Time` / `MicroTime`
+/// proto: `message Timestamp { int64 seconds = 1; int32 nanos = 2; }`.
+///
+/// Ported from apimachinery `pkg/apis/meta/v1/time_proto.go` (`Time.ProtoTime`)
+/// and `micro_time_proto.go` (`MicroTime.ProtoMicroTime`): the generated
+/// `Timestamp.MarshalToSizedBuffer` writes BOTH varint fields unconditionally,
+/// even when zero (so a whole-second `Time` carries an explicit `nanos = 0`),
+/// `Time` always sends `nanos = 0` (sub-second precision is deliberately not
+/// serialised), and `MicroTime` sends nanos truncated to microseconds. Falls
+/// back to a zero-length message on parse failure, matching the decoder which
+/// emits `Value::Null` for `seconds == 0 && nanos == 0`.
+fn encode_timestamp(val: &Value, micro: bool) -> Vec<u8> {
     let Some(s) = val.as_str() else {
         return Vec::new();
     };
@@ -14414,15 +14425,14 @@ fn encode_timestamp(val: &Value) -> Vec<u8> {
     let Some(dt) = parsed else {
         return Vec::new();
     };
-    let seconds = dt.timestamp();
-    let nanos = dt.timestamp_subsec_nanos() as i32;
+    let nanos = if micro {
+        (dt.timestamp_subsec_nanos() / 1_000) * 1_000
+    } else {
+        0
+    };
     let mut buf = Vec::new();
-    if seconds != 0 {
-        push_varint_field(&mut buf, 1, seconds as u64);
-    }
-    if nanos != 0 {
-        push_varint_field(&mut buf, 2, nanos as u64);
-    }
+    push_varint_field(&mut buf, 1, dt.timestamp() as u64);
+    push_varint_field(&mut buf, 2, u64::from(nanos));
     buf
 }
 
