@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rusternetes_common::admission::GroupVersionKind;
 use rusternetes_common::admission::Operation as AdmissionOperation;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
@@ -400,6 +401,59 @@ fn create_admission_request(r: &PatchRequest<'_>) -> Value {
     request
 }
 
+/// Unknown field paths of `object` when decoded as the typed `kind`; `None`
+/// for a kind with no typed model here (the `*unstructured.Unstructured`
+/// branch, json_patch.go:102-103, which has nothing to decode strictly).
+fn unknown_fields_of(kind: &GroupVersionKind, object: &Value) -> Option<Vec<String>> {
+    use crate::handlers::validation::find_unknown_fields_via_schema as f;
+    use rusternetes_common::resources as r;
+    Some(match (kind.group.as_str(), kind.kind.as_str()) {
+        ("", "Pod") => f::<r::Pod>(object),
+        ("", "ReplicationController") => f::<r::ReplicationController>(object),
+        ("", "Service") => f::<r::Service>(object),
+        ("", "LimitRange") => f::<r::LimitRange>(object),
+        ("", "PersistentVolumeClaim") => f::<r::volume::PersistentVolumeClaim>(object),
+        ("apps", "Deployment") => f::<r::Deployment>(object),
+        ("apps", "DaemonSet") => f::<r::DaemonSet>(object),
+        ("apps", "StatefulSet") => f::<r::StatefulSet>(object),
+        ("apps", "ReplicaSet") => f::<r::ReplicaSet>(object),
+        ("batch", "Job") => f::<r::Job>(object),
+        ("batch", "CronJob") => f::<r::CronJob>(object),
+        _ => return None,
+    })
+}
+
+/// The strict typed decode of the patched object (json_patch.go:87 encodes
+/// with `Strict: true`, :111 `jsonSerializer.Decode(patchedJS, ...)` and wraps
+/// a failure in `apierrors.NewInternalError`), e.g.
+/// `strict decoding error: unknown field "spec.bogus"`.
+///
+/// Deliberate deviation: upstream's input is the typed object re-encoded, so
+/// it never carries a field the type lacks. Ours is the stored JSON, which may
+/// carry fields our structs do not model, so only unknown fields the patch
+/// itself introduced are reported.
+fn strict_decode_check(
+    kind: &GroupVersionKind,
+    before: &Value,
+    patched: &Value,
+) -> Result<(), PatchError> {
+    let Some(after) = unknown_fields_of(kind, patched) else {
+        return Ok(());
+    };
+    let existing = unknown_fields_of(kind, before).unwrap_or_default();
+    let introduced: Vec<String> = after
+        .into_iter()
+        .filter(|f| !existing.contains(f))
+        .map(|f| format!("unknown field \"{f}\""))
+        .collect();
+    if introduced.is_empty() {
+        return Ok(());
+    }
+    Err(PatchError::Status(rusternetes_common::Error::Internal(
+        format!("strict decoding error: {}", introduced.join(", ")),
+    )))
+}
+
 #[async_trait]
 impl Patcher for JsonPatcher {
     /// `jsonPatcher.Patch` (json_patch.go:72-116), over the unstructured
@@ -428,7 +482,14 @@ impl Patcher for JsonPatcher {
             .clone()
             .unwrap_or(Value::Null);
         match apply(&object, &ops) {
-            Ok(patched) => Ok(patched),
+            Ok(patched) => {
+                strict_decode_check(
+                    &request.versioned_attributes.versioned_kind,
+                    &object,
+                    &patched,
+                )?;
+                Ok(patched)
+            }
             // If a json patch fails a test operation, the patch must not be
             // applied (json_patch.go:94-97).
             Err(ApplyError::TestFailed) => Ok(object),
@@ -525,6 +586,31 @@ mod tests {
     fn containers(names: &[&str]) -> Value {
         let c: Vec<Value> = names.iter().map(|n| json!({"name": n})).collect();
         json!({"spec": {"template": {"spec": {"containers": c}}}})
+    }
+
+    #[test]
+    fn patch_introducing_unknown_field_is_a_strict_decoding_error() {
+        // json_patch.go:87,111: the patched JSON is strict-decoded into the
+        // typed object; an unknown field is an InternalError.
+        let o = json!({"spec": {"replicas": 1}});
+        let err = run(
+            r#"[JSONPatch{op: "add", path: "/spec/bogus", value: "x"}]"#,
+            o,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("strict decoding error: unknown field \"spec.bogus\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn patch_leaving_known_fields_decodes() {
+        ok(
+            r#"[JSONPatch{op: "replace", path: "/spec/replicas", value: 3}]"#,
+            json!({"spec": {"replicas": 1}}),
+            json!({"spec": {"replicas": 3}}),
+        );
     }
 
     #[test]
