@@ -68,6 +68,38 @@ impl AuthObservations {
         serviceaccount_metrics().legacy_tokens_total.inc();
     }
 
+    /// Check the special `warnafter` field for projected service account token
+    /// transition (`pkg/serviceaccount/claims.go:265-276`): a token used after
+    /// its `warnafter` is stale -- record the
+    /// `authentication.k8s.io/stale-token` audit annotation and bump
+    /// `serviceaccount_stale_tokens_total`; one used before it bumps
+    /// `serviceaccount_valid_tokens_total`. An absent or zero `warnafter`
+    /// observes nothing. Only the observation: the token stays valid.
+    pub fn observe_warnafter(
+        &mut self,
+        subject: &str,
+        warnafter: Option<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(warnafter) = warnafter.filter(|w| *w != 0) else {
+            return;
+        };
+        // `nowTime.After(warnafter.Time())`: exact, not truncated to seconds.
+        let threshold = chrono::DateTime::from_timestamp(warnafter, 0).unwrap_or_default();
+        if now > threshold {
+            let seconds_after_warn = now.timestamp() - warnafter;
+            self.add_audit_annotation(
+                "authentication.k8s.io/stale-token",
+                &format!(
+                    "subject: {subject}, seconds after warning threshold: {seconds_after_warn}"
+                ),
+            );
+            serviceaccount_metrics().stale_tokens_total.inc();
+        } else {
+            serviceaccount_metrics().valid_tokens_total.inc();
+        }
+    }
+
     /// `warning.AddWarning(ctx, "", text)`: an empty warning is dropped and a
     /// repeated one recorded once (endpoints/filters/warning.go:69-92).
     pub fn add_warning(&mut self, text: &str) {
@@ -100,6 +132,10 @@ pub struct ServiceAccountMetrics {
     pub legacy_manual_token_uses_total: prometheus::IntCounter,
     pub legacy_auto_token_uses_total: prometheus::IntCounter,
     pub invalid_legacy_auto_token_uses_total: prometheus::IntCounter,
+    /// `staleTokensTotal` (metrics.go:41).
+    pub stale_tokens_total: prometheus::IntCounter,
+    /// `validTokensTotal` (metrics.go:81).
+    pub valid_tokens_total: prometheus::IntCounter,
 }
 
 /// The counters, registered on first use (`RegisterMetrics`'s
@@ -131,6 +167,14 @@ pub fn serviceaccount_metrics() -> &'static ServiceAccountMetrics {
             invalid_legacy_auto_token_uses_total: counter(
                 "invalid_legacy_auto_token_uses_total",
                 "Cumulative invalid auto-generated legacy tokens used",
+            ),
+            stale_tokens_total: counter(
+                "stale_tokens_total",
+                "Cumulative stale projected service account tokens used",
+            ),
+            valid_tokens_total: counter(
+                "valid_tokens_total",
+                "Cumulative valid projected service account tokens used",
             ),
         }
     })
@@ -585,7 +629,7 @@ pub async fn validate_service_account_token(
     if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
         validate_legacy_service_account_token(storage, token, claims, legacy_lookup, obs).await
     } else {
-        validate_service_account_claims(storage, claims).await
+        validate_service_account_claims(storage, claims, obs).await
     }
 }
 
@@ -814,6 +858,7 @@ async fn patch_secret_with_last_used_date(
 pub async fn validate_service_account_claims(
     storage: &StorageBackend,
     claims: &rusternetes_common::auth::ServiceAccountClaims,
+    obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     use rusternetes_common::resources::{Node, Pod, Secret, ServiceAccount};
 
@@ -927,6 +972,12 @@ pub async fn validate_service_account_claims(
             }
         }
     }
+
+    obs.observe_warnafter(
+        &claims.sub,
+        kube.and_then(|k| k.warnafter),
+        chrono::Utc::now(),
+    );
     Ok(())
 }
 
@@ -3530,6 +3581,57 @@ pub async fn capture_payload(
 
 #[cfg(test)]
 mod tests {
+    use super::AuthObservations;
+    use chrono::TimeZone;
+
+    fn at(secs: i64, nanos: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.timestamp_opt(secs, nanos).unwrap()
+    }
+
+    // claims.go:265-276
+    #[test]
+    fn warnafter_absent_or_zero_observes_nothing() {
+        let mut obs = AuthObservations::default();
+        obs.observe_warnafter("system:serviceaccount:ns:sa", None, at(1000, 0));
+        obs.observe_warnafter("system:serviceaccount:ns:sa", Some(0), at(1000, 0));
+        assert!(obs.audit_annotations.is_empty());
+    }
+
+    #[test]
+    fn warnafter_in_future_counts_valid_without_annotation() {
+        let before = super::serviceaccount_metrics().valid_tokens_total.get();
+        let mut obs = AuthObservations::default();
+        obs.observe_warnafter("sub", Some(2000), at(1000, 0));
+        // exactly at the threshold is not After()
+        obs.observe_warnafter("sub", Some(2000), at(2000, 0));
+        assert!(obs.audit_annotations.is_empty());
+        assert!(super::serviceaccount_metrics().valid_tokens_total.get() >= before + 2);
+    }
+
+    #[test]
+    fn warnafter_in_past_annotates_stale_token() {
+        let before = super::serviceaccount_metrics().stale_tokens_total.get();
+        let mut obs = AuthObservations::default();
+        obs.observe_warnafter("system:serviceaccount:ns:sa", Some(1000), at(1090, 500));
+        assert_eq!(
+            obs.audit_annotations,
+            vec![(
+                "authentication.k8s.io/stale-token".to_string(),
+                "subject: system:serviceaccount:ns:sa, seconds after warning threshold: 90"
+                    .to_string()
+            )]
+        );
+        assert!(super::serviceaccount_metrics().stale_tokens_total.get() > before);
+    }
+
+    #[test]
+    fn warnafter_sub_second_past_is_stale() {
+        let mut obs = AuthObservations::default();
+        obs.observe_warnafter("sub", Some(1000), at(1000, 1));
+        assert_eq!(obs.audit_annotations.len(), 1);
+        assert!(obs.audit_annotations[0].1.ends_with(": 0"));
+    }
+
     /// `TrackAuthenticationLatency` (filters/authentication.go:69): the guard
     /// records into the request's tracker on drop, and is a no-op without one.
     #[tokio::test]
