@@ -28,12 +28,8 @@ encode-bytes | extensions.v1beta1.Deployment | #3057 | fixture carries the legac
 encode-bytes | extensions.v1beta1.ReplicaSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
 
 # --- prega: pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
-decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1beta1.ConversionReview | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
-decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1beta1.CustomResourceDefinition | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
 
 # --- apiext: apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
-decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1.ConversionReview | #3057 | apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
-decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1.CustomResourceDefinition | #3057 | apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
 
 # --- obsgen: typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
 typed,typed-wire | admissionregistration.k8s.io.v1.ValidatingAdmissionPolicy | #2958 | typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)

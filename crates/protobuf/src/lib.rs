@@ -36,7 +36,7 @@ const WIRE_32BIT: u8 = 5;
 // decoder drops an empty one, except pointer strings (POINTER_STRINGS, #2952).
 pub mod plain_zero_scalars;
 mod versioned_schemas;
-use plain_zero_scalars::{PLAIN_ZERO_SCALARS, POINTER_STRINGS};
+use plain_zero_scalars::{ALWAYS_WRITTEN_SCALARS, PLAIN_ZERO_SCALARS, POINTER_STRINGS};
 
 /// Whether `field` of `msg_type` is a Go `*string` (or pointer to a string
 /// alias). Its marshaller writes a non-nil pointer even when empty
@@ -45,14 +45,36 @@ use plain_zero_scalars::{PLAIN_ZERO_SCALARS, POINTER_STRINGS};
 /// wire is a real explicit "" (#2952). A plain `string` is written
 /// unconditionally and dropped by JSON omitempty, so empty means absent.
 fn is_pointer_string(msg_type: &str, field: &str) -> bool {
+    let msg_type = bare_message_name(msg_type);
     POINTER_STRINGS
         .binary_search_by(|(m, _)| (*m).cmp(msg_type))
         .is_ok_and(|i| POINTER_STRINGS[i].1.contains(&field))
 }
 
+/// The message name of a registry key: a group-qualified key
+/// (`<group>/<version>.<Message>`, group names contain dots) is reduced to the
+/// text after the last dot; the plain-scalar tables below are keyed by bare
+/// message name (derived from the GA `types.go`; non-GA versions share them).
+fn bare_message_name(msg_type: &str) -> &str {
+    msg_type.rsplit('.').next().unwrap_or(msg_type)
+}
+
+/// Whether the Go marshaller writes `field` of `msg_type` unconditionally: a
+/// non-pointer scalar is emitted even when zero (`dAtA[i] = 0`, an empty
+/// `i -= len(m.Name)` in generated.pb.go), so a zero its JSON twin drops
+/// (`omitempty`) still reaches the wire. A group-qualified key (`<group>/<version>.<Message>`) is looked up by
+/// its bare message name.
+fn is_always_written(msg_type: &str, field: &str) -> bool {
+    let bare = bare_message_name(msg_type);
+    ALWAYS_WRITTEN_SCALARS
+        .binary_search_by(|(m, _)| (*m).cmp(bare))
+        .is_ok_and(|i| ALWAYS_WRITTEN_SCALARS[i].1.contains(&field))
+}
+
 /// Remove the zero-valued plain scalars of `msg_type` (see
 /// [`PLAIN_ZERO_SCALARS`]) from a decoded message.
 fn drop_plain_zero_scalars(msg_type: &str, value: &mut Value) {
+    let msg_type = bare_message_name(msg_type);
     let Ok(i) = PLAIN_ZERO_SCALARS.binary_search_by(|(m, _)| (*m).cmp(msg_type)) else {
         return;
     };
@@ -2276,6 +2298,42 @@ impl ProtoRegistry {
                             FieldType::Message("JSONSchemaPropsOrBool".into()),
                         ),
                     ),
+                    (
+                        31,
+                        (
+                            "patternProperties".into(),
+                            FieldType::MessageMap("JSONSchemaProps".into()),
+                        ),
+                    ),
+                    (
+                        32,
+                        (
+                            "dependencies".into(),
+                            FieldType::MessageMap("JSONSchemaPropsOrStringArray".into()),
+                        ),
+                    ),
+                    (
+                        33,
+                        (
+                            "additionalItems".into(),
+                            FieldType::Message("JSONSchemaPropsOrBool".into()),
+                        ),
+                    ),
+                    (
+                        34,
+                        (
+                            "definitions".into(),
+                            FieldType::MessageMap("JSONSchemaProps".into()),
+                        ),
+                    ),
+                    (
+                        35,
+                        (
+                            "externalDocs".into(),
+                            FieldType::Message("ExternalDocumentation".into()),
+                        ),
+                    ),
+                    (36, ("example".into(), FieldType::JsonRaw)),
                     (37, ("nullable".into(), FieldType::Bool)),
                     (
                         38,
@@ -7911,7 +7969,7 @@ impl ProtoRegistry {
         let schema = self.schemas.get(msg_type)?;
         let mut value = self.decode_with_schema(schema, msg_type, data);
         drop_plain_zero_scalars(msg_type, &mut value);
-        Some(value)
+        Some(unwrap_json_schema_union(msg_type, value))
     }
 
     /// Decode protobuf bytes using a specific schema
@@ -8321,14 +8379,17 @@ impl ProtoRegistry {
     /// type is not registered.
     pub fn encode_message(&self, msg_type: &str, value: &Value) -> Option<Vec<u8>> {
         let schema = self.schemas.get(msg_type)?;
-        Some(self.encode_with_schema(schema, value))
+        // The JSON form of the apiextensions unions is the bare bool/array/
+        // schema (see `unwrap_json_schema_union`); lift it to the message.
+        let value = wrap_json_schema_union(msg_type, value);
+        Some(self.encode_with_schema(schema, msg_type, &value))
     }
 
     /// Encode a JSON value (expected `Value::Object`) using the supplied
     /// schema. Non-object values produce an empty payload (a missing message
     /// on the wire), matching what an absent JSON field would emit at the
     /// caller.
-    fn encode_with_schema(&self, schema: &MessageSchema, value: &Value) -> Vec<u8> {
+    fn encode_with_schema(&self, schema: &MessageSchema, msg_type: &str, value: &Value) -> Vec<u8> {
         let mut buf = Vec::new();
         let obj = match value.as_object() {
             Some(o) => o,
@@ -8347,11 +8408,14 @@ impl ProtoRegistry {
                 continue;
             }
 
-            let Some(val) = obj.get(name) else { continue };
-            if val.is_null() {
+            let absent = obj.get(name).is_none_or(Value::is_null);
+            if absent {
+                if is_always_written(msg_type, name) {
+                    encode_go_zero_scalar(&mut buf, *tag, field_type);
+                }
                 continue;
             }
-            self.encode_field(&mut buf, *tag, field_type, val);
+            self.encode_field(&mut buf, *tag, field_type, &obj[name]);
         }
 
         buf
@@ -8593,7 +8657,7 @@ impl ProtoRegistry {
         if sub.is_empty() {
             return;
         }
-        let inner = self.encode_with_schema(inner_schema, &Value::Object(sub));
+        let inner = self.encode_with_schema(inner_schema, inner_type, &Value::Object(sub));
         push_length_delimited_field(buf, tag, &inner);
     }
 
@@ -11850,9 +11914,7 @@ impl ProtoRegistry {
                         3,
                         (
                             "objects".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "RawExtension".into(),
-                            ))),
+                            FieldType::Repeated(Box::new(FieldType::JsonRaw)),
                         ),
                     ),
                 ]),
@@ -11867,9 +11929,7 @@ impl ProtoRegistry {
                         2,
                         (
                             "convertedObjects".into(),
-                            FieldType::Repeated(Box::new(FieldType::Message(
-                                "RawExtension".into(),
-                            ))),
+                            FieldType::Repeated(Box::new(FieldType::JsonRaw)),
                         ),
                     ),
                     (3, ("result".into(), FieldType::Message("Status".into()))),
@@ -13982,6 +14042,9 @@ impl ProtoRegistry {
 /// `apiextensions/v1/generated.pb.go`. Already-wrapped values pass through.
 fn wrap_json_schema_union<'a>(inner_type: &str, val: &'a Value) -> std::borrow::Cow<'a, Value> {
     use std::borrow::Cow;
+    // A group-qualified key (`apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrBool`)
+    // carries the same union shape as the bare GA name.
+    let inner_type = inner_type.rsplit('.').next().unwrap_or(inner_type);
     let wrapped = match (inner_type, val) {
         ("JSONSchemaPropsOrArray", Value::Array(_)) => json!({ "jSONSchemas": val }),
         ("JSONSchemaPropsOrArray", Value::Object(m)) if m.is_empty() => return Cow::Borrowed(val),
@@ -14010,6 +14073,34 @@ fn wrap_json_schema_union<'a>(inner_type: &str, val: &'a Value) -> std::borrow::
         _ => return Cow::Borrowed(val),
     };
     Cow::Owned(wrapped)
+}
+
+/// Inverse of [`wrap_json_schema_union`]: collapse a decoded
+/// `JSONSchemaPropsOr{Array,Bool,StringArray}` message into the JSON form Go
+/// serialises (`apiextensions/v1/marshal.go` `MarshalJSON`): the bool, the
+/// array or the bare schema.
+fn unwrap_json_schema_union(inner_type: &str, value: Value) -> Value {
+    let Value::Object(mut m) = value else {
+        return value;
+    };
+    match inner_type.rsplit('.').next().unwrap_or(inner_type) {
+        // `if s.Schema != nil { schema }; if !s.Allows { false }; true`
+        "JSONSchemaPropsOrBool" => match m.remove("schema") {
+            Some(schema) => schema,
+            None => Value::Bool(m.get("allows").and_then(Value::as_bool).unwrap_or(false)),
+        },
+        // `if len(s.JSONSchemas) > 0 { array }; schema`
+        "JSONSchemaPropsOrArray" => match m.remove("jSONSchemas") {
+            Some(arr) if arr.as_array().is_some_and(|a| !a.is_empty()) => arr,
+            _ => m.remove("schema").unwrap_or(Value::Object(m)),
+        },
+        // `if len(s.Property) > 0 { array }; if s.Schema != nil { schema }; null`
+        "JSONSchemaPropsOrStringArray" => match m.remove("property") {
+            Some(arr) if arr.as_array().is_some_and(|a| !a.is_empty()) => arr,
+            _ => m.remove("schema").unwrap_or(Value::Null),
+        },
+        _ => Value::Object(m),
+    }
 }
 
 /// Encode a [`Status`] to the native K8s protobuf envelope:
@@ -14345,6 +14436,20 @@ fn encode_status_cause_native(c: &rusternetes_common::types::StatusCause) -> Vec
 
 // --- low-level wire helpers (encode side) -----------------------------------
 
+/// Write the zero value Go's marshaller emits for an absent non-pointer scalar
+/// (see [`is_always_written`]). Other field types are left alone.
+fn encode_go_zero_scalar(buf: &mut Vec<u8>, tag: u32, field_type: &FieldType) {
+    match field_type {
+        FieldType::String => push_string_field(buf, tag, b""),
+        FieldType::Int | FieldType::Bool => push_varint_field(buf, tag, 0),
+        FieldType::Double => {
+            encode_varint(buf, ((tag as u64) << 3) | 1);
+            buf.extend_from_slice(&0f64.to_bits().to_le_bytes());
+        }
+        _ => {}
+    }
+}
+
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         buf.push(((value & 0x7f) as u8) | 0x80);
@@ -14578,10 +14683,11 @@ mod tests {
     /// (the EndpointSubset / NodeStatus bug class). NEVER add a new entry here to
     /// silence the guard below — populate the schema instead.
     const ALLOWED_EMPTY_SCHEMAS: &[&str] = &[
-        "Patch",                                                 // opaque patch body
-        "CustomResourceSubresourceStatus",                       // empty message in the proto
+        "Patch",                                                        // opaque patch body
+        "CustomResourceSubresourceStatus", // empty message in the proto
         "internal.apiserver.k8s.io/v1alpha1.StorageVersionSpec", // empty message in the proto
-        "scheduling.k8s.io/v1alpha1.BasicSchedulingPolicy",      // empty message in the proto
+        "scheduling.k8s.io/v1alpha1.BasicSchedulingPolicy", // empty message in the proto
+        "apiextensions.k8s.io/v1beta1.CustomResourceSubresourceStatus", // empty message in the proto
     ];
 
     #[test]
@@ -15381,6 +15487,20 @@ mod tests {
     /// legitimate.
     const PROTO_SPECIAL_LEAF_TYPES: &[&str] = &["Time", "MicroTime"];
 
+    /// The apiextensions `JSONSchemaPropsOr{Array,Bool,StringArray}` unions are
+    /// structs on the wire but a bare bool/array/schema in JSON
+    /// (`unwrap_json_schema_union`): a synthesized value with both members set
+    /// cannot survive that collapse, so the synthesizers treat them as leaves.
+    /// Covered by the golden CRD fixtures and `crd_items_roundtrip.rs`.
+    fn is_json_schema_union(t: &str) -> bool {
+        matches!(
+            t.rsplit('.').next(),
+            Some(
+                "JSONSchemaPropsOrArray" | "JSONSchemaPropsOrBool" | "JSONSchemaPropsOrStringArray"
+            )
+        )
+    }
+
     #[test]
     fn test_all_protobuf_schemas_reference_registered_types() {
         let registry = ProtoRegistry::new();
@@ -15464,7 +15584,7 @@ mod tests {
         use serde_json::{Map, Value};
         // Time/MicroTime JSON forms are RFC3339 strings whose re-encode is not
         // byte-identical to an arbitrary synthesized instant; skip them.
-        if PROTO_SPECIAL_LEAF_TYPES.contains(&t) {
+        if PROTO_SPECIAL_LEAF_TYPES.contains(&t) || is_json_schema_union(t) {
             return Value::Null;
         }
         if path.iter().any(|p| p == t) || path.len() > 5 {
@@ -15504,6 +15624,9 @@ mod tests {
         names.sort();
         let mut failures: Vec<String> = Vec::new();
         for name in &names {
+            if is_json_schema_union(name) {
+                continue;
+            }
             let mut path = Vec::new();
             let synth = proto_synth_message(&reg, name, &mut path);
             let Some(bytes1) = reg.encode_message(name, &synth) else {
@@ -15897,21 +16020,27 @@ mod tests {
     fn test_extra_value_map_encodes_upstream_wire() {
         let reg = ProtoRegistry::new();
         let v = json!({"username": "u", "extra": {"k": ["a", "b"]}});
+        // `UserInfo.Uid` is a plain `string` (`uid,omitempty`): the Go marshaller
+        // writes it even when empty (authentication/v1 generated.pb.go
+        // `UserInfo.MarshalToSizedBuffer`), so `uid` (field 2) is `0x12 0x00`.
         assert_eq!(
             reg.encode_message("UserInfo", &v).unwrap(),
-            extra_wire(&[0x0a, 0x01, b'u'], 0x22)
+            extra_wire(&[0x0a, 0x01, b'u', 0x12, 0x00], 0x22)
         );
         let v = json!({"user": "u", "extra": {"k": ["a", "b"]}});
+        let mut want = extra_wire(&[0x1a, 0x01, b'u'], 0x2a);
+        want.extend_from_slice(&[0x32, 0x00]); // uid (field 6), plain string, written empty
         assert_eq!(
             reg.encode_message("SubjectAccessReviewSpec", &v).unwrap(),
-            extra_wire(&[0x1a, 0x01, b'u'], 0x2a)
+            want
         );
         // An empty list still emits the entry with an empty ExtraValue value
         // (gogo marshals a non-nullable map value unconditionally).
         let v = json!({"extra": {"k": []}});
         assert_eq!(
             reg.encode_message("UserInfo", &v).unwrap(),
-            vec![0x22, 0x05, 0x0a, 0x01, b'k', 0x12, 0x00]
+            // username (1) and uid (2) are plain strings: written empty.
+            vec![0x0a, 0x00, 0x12, 0x00, 0x22, 0x05, 0x0a, 0x01, b'k', 0x12, 0x00]
         );
         let back = reg
             .decode_message("UserInfo", &reg.encode_message("UserInfo", &v).unwrap())

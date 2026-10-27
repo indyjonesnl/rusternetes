@@ -12,9 +12,10 @@ group-qualified key `<group>/<version>.<Message>` (core: `<version>.<Message>`).
 `encode_native` / `decode_k8s_resource` already prefer that key over the bare
 kind (see `ProtoRegistry::decode_k8s_resource`).
 
-Source of truth (kubernetes release-1.35), per package:
-  staging/src/k8s.io/api/<group>/<version>/generated.proto   (field numbers/types)
-  staging/src/k8s.io/api/<group>/<version>/types.go          (`json:",inline"` embeds)
+Source of truth (kubernetes release-1.35), per package (k8s.io/api/<group>/<version>
+or k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/<version>):
+  <package>/generated.proto   (field numbers/types)
+  <package>/types.go          (`json:",inline"` embeds)
   staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto (WatchEvent)
 
 Messages of OTHER packages (core/v1 PodTemplateSpec, meta/v1 ObjectMeta, ...)
@@ -27,6 +28,7 @@ Usage:
 Env: K8S_SRC=<path to a kubernetes checkout> (default: ../kubernetes next to
 the repo, or any ancestor's sibling `kubernetes`).
 """
+import glob
 import os
 import re
 import sys
@@ -70,6 +72,8 @@ PACKAGES = [
     ("k8s.io/api/scheduling/v1alpha1", "scheduling.k8s.io/v1alpha1", ["Workload"]),
     ("k8s.io/api/storagemigration/v1beta1", "storagemigration.k8s.io/v1beta1",
      ["StorageVersionMigration"]),
+    ("k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1",
+     "apiextensions.k8s.io/v1beta1", ["CustomResourceDefinition"]),
 ]
 
 PROTO_SCALARS = {
@@ -129,22 +133,37 @@ def parse_messages(text):
     return out
 
 
-def parse_inline(types_go):
-    """{(struct, protobuf field name)} for `json:",inline"` embeds."""
-    inline = set()
-    cur = None
-    for line in types_go.splitlines():
-        m = re.match(r"^type (\w+) struct \{", line)
-        if m:
-            cur = m.group(1)
+def parse_go_fields(pkg_dir):
+    """Scan the package's `types*.go` struct tags.
+
+    Returns ({(struct, protobuf name)} of `json:",inline"` embeds,
+             {(struct, protobuf name): json name}).
+    The registry names a field by its JSON key, which differs from the proto
+    field name for some (`$ref`, `x-kubernetes-embedded-resource`, ...).
+    """
+    inline, jsonname = set(), {}
+    for path in sorted(glob.glob(os.path.join(pkg_dir, "types*.go"))):
+        if path.endswith("_test.go"):
             continue
-        if line.startswith("}"):
-            cur = None
-        if cur and 'json:",inline"' in line:
+        cur = None
+        for line in open(path).read().splitlines():
+            m = re.match(r"^type (\w+) struct \{", line)
+            if m:
+                cur = m.group(1)
+                continue
+            if line.startswith("}"):
+                cur = None
+            if not cur:
+                continue
+            js = re.search(r'json:"([^",]*)', line)
             pb = re.search(r'protobuf:"[^"]*name=(\w+)', line)
-            if pb:
+            if not (js and pb):
+                continue
+            if 'json:",inline"' in line:
                 inline.add((cur, pb.group(1)))
-    return inline
+            elif js.group(1) and js.group(1) != "-":
+                jsonname[(cur, pb.group(1))] = js.group(1)
+    return inline, jsonname
 
 
 def rust_type(typ, mk, mv, pkg, local, refs):
@@ -173,6 +192,9 @@ def scalar_or_msg(typ, pkg, local, refs, ext):
         return "T::" + PROTO_SCALARS[typ]
     if typ in SPECIAL:
         return "T::" + SPECIAL[typ]
+    if typ == "JSON":
+        # apiextensions `JSON { optional bytes raw = 1 }`: the raw JSON body.
+        return "T::JsonRaw"
     if typ in local:
         refs.add(typ)
         return f'T::Message("{pkg}.{typ}".into())'
@@ -189,7 +211,7 @@ def main():
     for pdir, key, roots in PACKAGES:
         proto = open(os.path.join(src, pdir, "generated.proto")).read()
         msgs = parse_messages(proto)
-        inline = parse_inline(open(os.path.join(src, pdir, "types.go")).read())
+        inline, jsonname = parse_go_fields(os.path.join(src, pdir))
         want, todo = [], list(roots)
         while todo:
             n = todo.pop()
@@ -200,9 +222,9 @@ def main():
             want.append(n)
             for _, _, _, typ, mk, mv in msgs[n]:
                 for t in (typ, mv):
-                    if t in msgs and t not in want:
+                    if t in msgs and t not in want and t not in ("JSON", "ExtraValue"):
                         todo.append(t)
-        out.append(f"    // ===== {key} (k8s.io/api/{pdir.split('k8s.io/api/')[1]}/generated.proto) =====")
+        out.append(f"    // ===== {key} ({pdir}/generated.proto) =====")
         for n in sorted(want):
             rows = []
             for num, fname, label, typ, mk, mv in msgs[n]:
@@ -214,7 +236,8 @@ def main():
                         t = t.replace("T::Message(", "T::InlineMessage(", 1)
                     if label == "repeated":
                         t = f"T::Repeated(Box::new({t}))"
-                rows.append(f'            ({num}, "{fname}", {t}),')
+                jname = jsonname.get((n, fname), fname)
+                rows.append(f'            ({num}, "{jname}", {t}),')
             out.append(f'    schemas.insert(\n        "{key}.{n}".into(),\n        m(vec![\n'
                        + "\n".join(rows) + "\n        ]),\n    );")
     body = "\n".join(out)

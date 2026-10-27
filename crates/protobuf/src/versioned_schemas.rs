@@ -411,12 +411,6 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
     );
     // ===== authorization.k8s.io/v1beta1 (k8s.io/api/authorization/v1beta1/generated.proto) =====
     schemas.insert(
-        "authorization.k8s.io/v1beta1.ExtraValue".into(),
-        m(vec![
-            (1, "items", T::Repeated(Box::new(T::String))),
-        ]),
-    );
-    schemas.insert(
         "authorization.k8s.io/v1beta1.LocalSubjectAccessReview".into(),
         m(vec![
             (1, "metadata", T::Message("ObjectMeta".into())),
@@ -2056,6 +2050,233 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         m(vec![
             (1, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
             (2, "resourceVersion", T::String),
+        ]),
+    );
+    // ===== apiextensions.k8s.io/v1beta1 (k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1/generated.proto) =====
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceColumnDefinition".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "type", T::String),
+            (3, "format", T::String),
+            (4, "description", T::String),
+            (5, "priority", T::Int),
+            (6, "JSONPath", T::String),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceConversion".into(),
+        m(vec![
+            (1, "strategy", T::String),
+            (2, "webhookClientConfig", T::Message("apiextensions.k8s.io/v1beta1.WebhookClientConfig".into())),
+            (3, "conversionReviewVersions", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinition".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionSpec".into())),
+            (3, "status", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinitionCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+            (6, "observedGeneration", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinitionNames".into(),
+        m(vec![
+            (1, "plural", T::String),
+            (2, "singular", T::String),
+            (3, "shortNames", T::Repeated(Box::new(T::String))),
+            (4, "kind", T::String),
+            (5, "listKind", T::String),
+            (6, "categories", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinitionSpec".into(),
+        m(vec![
+            (1, "group", T::String),
+            (2, "version", T::String),
+            (3, "names", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionNames".into())),
+            (4, "scope", T::String),
+            (5, "validation", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceValidation".into())),
+            (6, "subresources", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceSubresources".into())),
+            (7, "versions", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionVersion".into())))),
+            (8, "additionalPrinterColumns", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.CustomResourceColumnDefinition".into())))),
+            (11, "selectableFields", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.SelectableField".into())))),
+            (9, "conversion", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceConversion".into())),
+            (10, "preserveUnknownFields", T::Bool),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinitionStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionCondition".into())))),
+            (2, "acceptedNames", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceDefinitionNames".into())),
+            (3, "storedVersions", T::Repeated(Box::new(T::String))),
+            (4, "observedGeneration", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceDefinitionVersion".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "served", T::Bool),
+            (3, "storage", T::Bool),
+            (7, "deprecated", T::Bool),
+            (8, "deprecationWarning", T::String),
+            (4, "schema", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceValidation".into())),
+            (5, "subresources", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceSubresources".into())),
+            (6, "additionalPrinterColumns", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.CustomResourceColumnDefinition".into())))),
+            (9, "selectableFields", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.SelectableField".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceSubresourceScale".into(),
+        m(vec![
+            (1, "specReplicasPath", T::String),
+            (2, "statusReplicasPath", T::String),
+            (3, "labelSelectorPath", T::String),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceSubresourceStatus".into(),
+        m(vec![
+
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceSubresources".into(),
+        m(vec![
+            (1, "status", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceSubresourceStatus".into())),
+            (2, "scale", T::Message("apiextensions.k8s.io/v1beta1.CustomResourceSubresourceScale".into())),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.CustomResourceValidation".into(),
+        m(vec![
+            (1, "openAPIV3Schema", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.ExternalDocumentation".into(),
+        m(vec![
+            (1, "description", T::String),
+            (2, "url", T::String),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.JSONSchemaProps".into(),
+        m(vec![
+            (1, "id", T::String),
+            (2, "$schema", T::String),
+            (3, "$ref", T::String),
+            (4, "description", T::String),
+            (5, "type", T::String),
+            (6, "format", T::String),
+            (7, "title", T::String),
+            (8, "default", T::JsonRaw),
+            (9, "maximum", T::Double),
+            (10, "exclusiveMaximum", T::Bool),
+            (11, "minimum", T::Double),
+            (12, "exclusiveMinimum", T::Bool),
+            (13, "maxLength", T::Int),
+            (14, "minLength", T::Int),
+            (15, "pattern", T::String),
+            (16, "maxItems", T::Int),
+            (17, "minItems", T::Int),
+            (18, "uniqueItems", T::Bool),
+            (19, "multipleOf", T::Double),
+            (20, "enum", T::Repeated(Box::new(T::JsonRaw))),
+            (21, "maxProperties", T::Int),
+            (22, "minProperties", T::Int),
+            (23, "required", T::Repeated(Box::new(T::String))),
+            (24, "items", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrArray".into())),
+            (25, "allOf", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())))),
+            (26, "oneOf", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())))),
+            (27, "anyOf", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())))),
+            (28, "not", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (29, "properties", T::MessageMap("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (30, "additionalProperties", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrBool".into())),
+            (31, "patternProperties", T::MessageMap("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (32, "dependencies", T::MessageMap("apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrStringArray".into())),
+            (33, "additionalItems", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrBool".into())),
+            (34, "definitions", T::MessageMap("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (35, "externalDocs", T::Message("apiextensions.k8s.io/v1beta1.ExternalDocumentation".into())),
+            (36, "example", T::JsonRaw),
+            (37, "nullable", T::Bool),
+            (38, "x-kubernetes-preserve-unknown-fields", T::Bool),
+            (39, "x-kubernetes-embedded-resource", T::Bool),
+            (40, "x-kubernetes-int-or-string", T::Bool),
+            (41, "x-kubernetes-list-map-keys", T::Repeated(Box::new(T::String))),
+            (42, "x-kubernetes-list-type", T::String),
+            (43, "x-kubernetes-map-type", T::String),
+            (44, "x-kubernetes-validations", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.ValidationRule".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrArray".into(),
+        m(vec![
+            (1, "schema", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (2, "jSONSchemas", T::Repeated(Box::new(T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrBool".into(),
+        m(vec![
+            (1, "allows", T::Bool),
+            (2, "schema", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.JSONSchemaPropsOrStringArray".into(),
+        m(vec![
+            (1, "schema", T::Message("apiextensions.k8s.io/v1beta1.JSONSchemaProps".into())),
+            (2, "property", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.SelectableField".into(),
+        m(vec![
+            (1, "jsonPath", T::String),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.ServiceReference".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+            (3, "path", T::String),
+            (4, "port", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.ValidationRule".into(),
+        m(vec![
+            (1, "rule", T::String),
+            (2, "message", T::String),
+            (3, "messageExpression", T::String),
+            (4, "reason", T::String),
+            (5, "fieldPath", T::String),
+            (6, "optionalOldSelf", T::Bool),
+        ]),
+    );
+    schemas.insert(
+        "apiextensions.k8s.io/v1beta1.WebhookClientConfig".into(),
+        m(vec![
+            (3, "url", T::String),
+            (1, "service", T::Message("apiextensions.k8s.io/v1beta1.ServiceReference".into())),
+            (2, "caBundle", T::Bytes),
         ]),
     );
 }
