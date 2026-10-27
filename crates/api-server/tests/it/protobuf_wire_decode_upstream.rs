@@ -70,6 +70,11 @@ fn special(t: &str) -> bool {
 /// name-aware `intentional_field_skip`. The synthesized input and the decoded
 /// output are both keyed by the JSON name so the registry can be exercised.
 fn jname(msg: &str, field: &str) -> String {
+    // Go field `APIGroup` is proto `aPIGroup` but JSON `apiGroup`
+    // (networking/v1 types.go `IngressClassParametersReference`).
+    if (msg, field) == ("IngressClassParametersReference", "aPIGroup") {
+        return "apiGroup".into();
+    }
     // Only the formerly skip-listed messages are renamed; every other
     // message (e.g. core/v1 `DaemonEndpoint.Port`) is keyed by its proto name.
     if !matches!(
