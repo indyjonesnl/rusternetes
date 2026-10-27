@@ -35,6 +35,7 @@ const WIRE_32BIT: u8 = 5;
 // present in JSON, so they stay. Plain strings need no table: the string
 // decoder drops an empty one, except pointer strings (POINTER_STRINGS, #2952).
 pub mod plain_zero_scalars;
+mod versioned_schemas;
 use plain_zero_scalars::{PLAIN_ZERO_SCALARS, POINTER_STRINGS};
 
 /// Whether `field` of `msg_type` is a Go `*string` (or pointer to a string
@@ -2987,6 +2988,9 @@ impl ProtoRegistry {
         Self::register_authorization_v1_selectors(&mut schemas);
         Self::register_certificates_v1(&mut schemas);
         Self::register_certificates_v1beta1_pod_certificate_request(&mut schemas);
+        // Last: group-qualified schemas for non-GA versions / kinds the bare
+        // registry lacks (generated from upstream generated.proto).
+        versioned_schemas::register(&mut schemas);
 
         ProtoRegistry { schemas }
     }
