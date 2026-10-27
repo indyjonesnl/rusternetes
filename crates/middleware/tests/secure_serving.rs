@@ -61,6 +61,11 @@ fn client(identity: Option<reqwest::Identity>) -> reqwest::Client {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn secure_port_authenticates_and_authorizes_like_the_upstream_chain() {
+    // RemoteKubeConfigFileOptional assumes no cluster: CI pods run with a
+    // service account, so hide the in-cluster env (this test owns its process
+    // under nextest; the file holds a single test).
+    std::env::remove_var("KUBERNETES_SERVICE_HOST");
+    std::env::remove_var("KUBERNETES_SERVICE_HOST_OVERRIDE");
     let trusted = pki("client-ca");
     let other = pki("other-ca");
     let dir = tempfile::tempdir().unwrap();
