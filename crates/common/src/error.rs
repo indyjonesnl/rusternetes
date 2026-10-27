@@ -384,6 +384,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Debug)]
 pub struct ErrorStatus(pub crate::types::Status);
 
+#[cfg(feature = "axum-support")]
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
