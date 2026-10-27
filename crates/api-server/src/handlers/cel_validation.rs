@@ -22,7 +22,10 @@
 //!      estimated cost budget — sufficient to reject obviously expensive
 //!      rules at compile time and runaway evaluations at runtime.
 
-use rusternetes_common::cel_cost::{CostEvalError, CostOptions, RUNTIME_CEL_COST_BUDGET};
+use rusternetes_common::cel_cost::{
+    CostEvalError, CostOptions, MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES,
+    RUNTIME_CEL_COST_BUDGET,
+};
 use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
 use rusternetes_common::resources::{
     CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
@@ -103,11 +106,116 @@ fn evaluate_rule_with_budget(
     }
 }
 
+/// Why `evalMessageExpression` did not produce a message.
+#[derive(Debug, PartialEq, Eq)]
+enum MessageExpressionError {
+    /// `cel.ErrorTypeInternal` / `cel.ErrorTypeInvalid`: stops every further
+    /// rule (the budget is left at -1).
+    Stop(String),
+    /// A plain `cel.Error`: logged at V(2), the rule's `message` is used and
+    /// evaluation continues with the cost charged.
+    Fallback(String),
+}
+
+/// `evalMessageExpression` (`validation.go:694-747`): evaluate `expression`
+/// under `opts` (`PerCallLimit`), charge its actual cost to
+/// `remaining_budget`, and return the trimmed message string.
+///
+/// Upstream's caller (`validation.go:476-491`) turns `Stop` into an error and
+/// returns -1 as the remaining budget, and falls back to the rule's `message`
+/// (`ruleMessageOrDefault`) on `Fallback`.
+fn eval_message_expression(
+    evaluator: &mut CELEvaluator,
+    expression: &str,
+    ctx: &CELContext,
+    remaining_budget: &mut i64,
+    opts: CostOptions,
+) -> std::result::Result<String, MessageExpressionError> {
+    let (result, rt_cost) = evaluator.evaluate_with_cost(expression, ctx, opts);
+    // `*rtCost > math.MaxInt64 || int64(*rtCost) > remainingBudget`
+    if rt_cost > i64::MAX as u64 || rt_cost as i64 > *remaining_budget {
+        *remaining_budget = -1;
+        return Err(MessageExpressionError::Stop(
+            "messageExpression evaluation failed due to running out of cost budget, no further validation rules will be run"
+                .to_string(),
+        ));
+    }
+    let value = match result {
+        Err(CostEvalError::LimitExceeded) => {
+            *remaining_budget = -1;
+            return Err(MessageExpressionError::Stop(format!(
+                "no further validation rules will be run due to call cost exceeds limit for messageExpression: {expression:?}"
+            )));
+        }
+        Err(e) => {
+            *remaining_budget -= rt_cost as i64;
+            return Err(MessageExpressionError::Fallback(format!(
+                "messageExpression evaluation failed due to: {e}"
+            )));
+        }
+        Ok(v) => v,
+    };
+    *remaining_budget -= rt_cost as i64;
+    let cel::Value::String(message) = value else {
+        return Err(MessageExpressionError::Fallback(
+            "messageExpression failed to convert to string".to_string(),
+        ));
+    };
+    // `strings.TrimSpace`; `len` is in bytes; `hasNewlines` matches `[\n]+`.
+    let trimmed = message.trim();
+    if trimmed.len() as i64 > MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES {
+        Err(MessageExpressionError::Fallback(format!(
+            "messageExpression beyond allowable length of {MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES}"
+        )))
+    } else if trimmed.contains('\n') {
+        Err(MessageExpressionError::Fallback(
+            "messageExpression should not contain line breaks".to_string(),
+        ))
+    } else if trimmed.is_empty() {
+        Err(MessageExpressionError::Fallback(
+            "messageExpression should evaluate to a non-empty string".to_string(),
+        ))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+/// The failure detail of `validateExpressions` (`validation.go:469-496`):
+/// the evaluated `messageExpression` when it succeeds, else the rule's
+/// `message`. `Err` is the message of an error that stops every further rule.
+fn failure_detail(
+    evaluator: &mut CELEvaluator,
+    message_expression: &str,
+    message: &str,
+    ctx: &CELContext,
+    remaining_budget: &mut i64,
+) -> std::result::Result<String, String> {
+    if message_expression.is_empty() {
+        return Ok(message.to_string());
+    }
+    match eval_message_expression(
+        evaluator,
+        message_expression,
+        ctx,
+        remaining_budget,
+        CostOptions::default(),
+    ) {
+        Ok(detail) => Ok(detail),
+        Err(MessageExpressionError::Stop(e)) => Err(e),
+        Err(MessageExpressionError::Fallback(e)) => {
+            tracing::debug!("{e}");
+            Ok(message.to_string())
+        }
+    }
+}
+
 /// A single CEL validation rule extracted from `x-kubernetes-validations[]`.
 #[derive(Debug, Clone)]
 pub struct ValidationRule {
     pub rule: String,
     pub message: String,
+    /// `messageExpression`; empty when unset.
+    pub message_expression: String,
     /// Path inside the schema this rule was attached to, as a vector of
     /// property names (`["spec", "replicas"]`). Used to locate the JSON node
     /// the rule applies to on the incoming CR.
@@ -147,9 +255,15 @@ fn collect_rules_recursive(
                     .and_then(|v| v.as_str())
                     .unwrap_or("failed rule")
                     .to_string();
+                let message_expression = obj
+                    .get("messageExpression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 out.push(ValidationRule {
                     rule,
                     message,
+                    message_expression,
                     path: path.clone(),
                     optional_old_self: obj
                         .get("optionalOldSelf")
@@ -748,7 +862,15 @@ pub fn validate_cr_rules(
             Err(stop) => return Err(Error::InvalidResource(stop)),
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
-                return Err(Error::InvalidResource(r.message.clone()));
+                let detail = failure_detail(
+                    &mut evaluator,
+                    &r.message_expression,
+                    &r.message,
+                    &ctx,
+                    &mut remaining_budget,
+                )
+                .map_err(Error::InvalidResource)?;
+                return Err(Error::InvalidResource(detail));
             }
             Ok(Err(e)) => {
                 return Err(Error::InvalidResource(format!(
@@ -870,6 +992,11 @@ fn walk_and_eval(
                 .unwrap_or("failed rule")
                 .to_string();
 
+            let message_expression = obj
+                .get("messageExpression")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
             let is_transition = rule_references_old_self(rule_str);
             // Skip transition rules on CREATE.
             // ...unless `optionalOldSelf` (validation.go:401-418).
@@ -898,12 +1025,22 @@ fn walk_and_eval(
                 // are not ratcheted").
                 Err(stop) => return Err(Error::InvalidResource(stop)),
                 Ok(Ok(true)) => {}
-                Ok(Ok(false)) => failures.push(CrRuleFailure {
-                    path: path.clone(),
-                    message,
-                    is_transition,
-                    map_key_positions: map_keys.clone(),
-                }),
+                Ok(Ok(false)) => {
+                    let message = failure_detail(
+                        evaluator,
+                        message_expression,
+                        &message,
+                        &ctx,
+                        remaining_budget,
+                    )
+                    .map_err(Error::InvalidResource)?;
+                    failures.push(CrRuleFailure {
+                        path: path.clone(),
+                        message,
+                        is_transition,
+                        map_key_positions: map_keys.clone(),
+                    })
+                }
                 Ok(Err(_)) => {
                     // Runtime errors are reported as failures (no ratcheting
                     // for malformed evaluation either). Render the rule body
@@ -1198,6 +1335,7 @@ mod tests {
             .map(|_| ValidationRule {
                 rule: rule.to_string(),
                 message: "failed rule".to_string(),
+                message_expression: String::new(),
                 path: vec!["spec".to_string()],
                 optional_old_self: false,
             })
@@ -1264,6 +1402,179 @@ mod tests {
         assert!(err.to_string().contains(OUT_OF_COST_BUDGET));
         assert!(calls > 1, "one evaluation must fit in the budget");
         assert!(remaining < 0);
+    }
+
+    /// `validation_test.go` `TestMessageExpression` (:3169-3340): the rule is
+    /// `false`, `self` is `{"str": "a string"}`; the field error detail, and the
+    /// remaining budget (0 = not asserted, as upstream).
+    #[test]
+    fn message_expression_cases_of_upstream_test_message_expression() {
+        let long = format!("\"{}\"", "a".repeat(5121));
+        let max = RUNTIME_CEL_COST_BUDGET;
+        // (name, message, messageExpression, budget, per-call limit, detail, budget left)
+        let cases: Vec<(&str, &str, String, i64, u64, &str, i64)> = vec![
+            (
+                "no cost",
+                "",
+                "\"static string\"".into(),
+                300,
+                1_000_000,
+                "static string",
+                300,
+            ),
+            (
+                "takes precedence",
+                "invisible",
+                "\"this is messageExpression\"".into(),
+                max,
+                1_000_000,
+                "this is messageExpression",
+                0,
+            ),
+            (
+                "non-string falls back",
+                "",
+                "true".into(),
+                max,
+                1_000_000,
+                "failed rule",
+                max,
+            ),
+            (
+                "limit exceeded",
+                "",
+                "\"string 1\" + \"string 2\" + \"string 3\"".into(),
+                1,
+                1_000_000,
+                "messageExpression evaluation failed due to running out of cost budget",
+                -1,
+            ),
+            (
+                "str concat budget",
+                "",
+                "\"str1 \" + self.str".into(),
+                50,
+                1_000_000,
+                "str1 a string",
+                46,
+            ),
+            (
+                "cost preserved on error",
+                "message not messageExpression",
+                "\"str1 \" + [\"a\", \"b\", \"c\", \"d\"][4]".into(),
+                50,
+                1_000_000,
+                "message not messageExpression",
+                47,
+            ),
+            (
+                "cost preserved on error (no message)",
+                "",
+                "\"str1 \" + [\"a\", \"b\", \"c\", \"d\"][4]".into(),
+                50,
+                1_000_000,
+                "failed rule",
+                47,
+            ),
+            (
+                "per-call limit",
+                "",
+                "\"string 1\" + \"string 2\" + \"string 3\"".into(),
+                max,
+                1,
+                "call cost exceeds limit for messageExpression",
+                -1,
+            ),
+            (
+                "newline",
+                "message not messageExpression",
+                "\"str with \\na newline\"".into(),
+                max,
+                1_000_000,
+                "message not messageExpression",
+                0,
+            ),
+            (
+                ">5120 bytes",
+                "message not messageExpression",
+                long,
+                max,
+                1_000_000,
+                "message not messageExpression",
+                0,
+            ),
+            (
+                "empty",
+                "message not messageExpression",
+                "string(\"\")".into(),
+                max,
+                1_000_000,
+                "message not messageExpression",
+                0,
+            ),
+            (
+                "only spaces",
+                "message not messageExpression",
+                "string(\"     \")".into(),
+                max,
+                1_000_000,
+                "message not messageExpression",
+                0,
+            ),
+        ];
+        for (name, message, me, budget, limit, want, want_budget) in cases {
+            let mut ctx = CELContext::new();
+            ctx.add_json_variable("self", &json!({"str": "a string"}))
+                .unwrap();
+            let mut evaluator = CELEvaluator::new();
+            let mut remaining = budget;
+            let opts = CostOptions {
+                limit: Some(limit),
+                ..CostOptions::default()
+            };
+            let detail =
+                match eval_message_expression(&mut evaluator, &me, &ctx, &mut remaining, opts) {
+                    Ok(d) => d,
+                    Err(MessageExpressionError::Stop(e)) => e,
+                    Err(MessageExpressionError::Fallback(_)) => {
+                        if message.is_empty() {
+                            "failed rule".to_string()
+                        } else {
+                            message.to_string()
+                        }
+                    }
+                };
+            assert!(
+                detail.contains(want),
+                "{name}: got {detail:?}, want {want:?}"
+            );
+            if want_budget != 0 {
+                assert_eq!(remaining, want_budget, "{name}: remaining budget");
+            }
+        }
+    }
+
+    /// End to end: the evaluated `messageExpression` is the error returned for
+    /// a failing rule, taking precedence over `message`; a failing
+    /// `messageExpression` falls back to `message`.
+    #[test]
+    fn failing_rule_reports_evaluated_message_expression() {
+        let cr = cr_with_nums(3);
+        let mk = |me: &str| {
+            vec![ValidationRule {
+                rule: "self.nums.size() > 10".to_string(),
+                message: "static message".to_string(),
+                message_expression: me.to_string(),
+                path: vec!["spec".to_string()],
+                optional_old_self: false,
+            }]
+        };
+        let e = validate_cr_rules(&mk("'got ' + string(self.nums.size())"), &cr, None)
+            .expect_err("rule fails");
+        assert_eq!(err_text(e), "Invalid resource: got 3");
+        let e = validate_cr_rules(&mk("self.nums[9] == 1 ? 'a' : 'b'"), &cr, None)
+            .expect_err("rule fails");
+        assert!(err_text(e).contains("static message"));
     }
 
     /// `preexistingExpressions.RuleEnv` (validation.go:158-163): a new rule is
