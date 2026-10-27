@@ -267,3 +267,24 @@ async fn watch_routes_exist_and_follow_the_gate() {
         assert_eq!(s, StatusCode::OK, "{path}");
     }
 }
+
+/// storage_test.go `TestGet` + `TestDelete`: a created request reads back
+/// with its spec, deletes, and is then NotFound.
+#[tokio::test]
+#[serial_test::serial]
+async fn get_and_delete_round_trip() {
+    let _gate = with_feature(Feature::PodCertificateRequest, true);
+    let api = TestApiServer::new();
+    let (s, body) = api.post(PCRS, &pcr("p")).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+
+    let (s, got) = api.get(&format!("{PCRS}/p")).await;
+    assert_eq!(s, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["podUID"], "pod-uid-1", "{got}");
+    assert_eq!(got["spec"]["pkixPublicKey"], PUB, "{got}");
+
+    let (s, body) = api.delete(&format!("{PCRS}/p")).await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+    let (s, body) = api.get(&format!("{PCRS}/p")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
+}
