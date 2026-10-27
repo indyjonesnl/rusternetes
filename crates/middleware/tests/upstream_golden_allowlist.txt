@@ -4,10 +4,8 @@
 # Never add a line to hide a regression: every line must name its tracking issue.
 
 # --- obsgen: typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
-typed,typed-wire | admissionregistration.k8s.io.v1.ValidatingAdmissionPolicy | #2958 | typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
 
 # --- crdtyped: typed CRD status lacks observedGeneration (status and status.conditions[]); typed-wire also hits the JSONSchemaProps codec gap
-typed,typed-wire | apiextensions.k8s.io.v1.CustomResourceDefinition | #2958 | typed CRD status lacks observedGeneration (status and status.conditions[]); typed-wire also hits the JSONSchemaProps codec gap
 
 # --- vct: typed StatefulSet volumeClaimTemplates[] serialises an empty apiVersion/kind (TypeMeta has no skip-if-empty)
 typed | apps.v1.StatefulSet | #2958 | typed StatefulSet volumeClaimTemplates[] serialises an empty apiVersion/kind (TypeMeta has no skip-if-empty)

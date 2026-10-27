@@ -748,6 +748,11 @@ pub struct CustomResourceDefinitionStatus {
     /// StoredVersions lists all versions that have ever been persisted
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_versions: Option<Vec<String>>,
+
+    /// ObservedGeneration is the generation of the CRD the controller last
+    /// acted on (apiextensions/v1 CustomResourceDefinitionStatus)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 }
 
 /// CustomResourceDefinitionCondition describes a condition of a CRD
@@ -761,6 +766,11 @@ pub struct CustomResourceDefinitionCondition {
     /// Status is the status of the condition (True, False, Unknown)
     #[serde(default)]
     pub status: String,
+
+    /// ObservedGeneration represents the .metadata.generation the condition
+    /// was set based upon (apiextensions/v1 CustomResourceDefinitionCondition)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
 
     /// LastTransitionTime is when the condition last transitioned
     #[serde(skip_serializing_if = "Option::is_none")]

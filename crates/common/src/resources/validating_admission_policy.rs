@@ -365,6 +365,11 @@ pub struct PolicyCondition {
     #[serde(default)]
     pub status: String,
 
+    /// ObservedGeneration represents the .metadata.generation the condition
+    /// was set based upon (metav1.Condition.observedGeneration)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+
     /// LastTransitionTime is the last time the condition transitioned
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_transition_time: Option<String>,
