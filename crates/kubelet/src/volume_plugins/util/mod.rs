@@ -325,6 +325,7 @@ pub(crate) fn reconstructed_volume(
     let mut volume = source;
     volume["name"] = serde_json::Value::String(name.to_string());
     Ok(crate::volume_plugins::ReconstructedVolume {
+        selinux_mount_context: String::new(),
         volume: Some(serde_json::from_value(volume)?),
         persistent_volume: None,
     })

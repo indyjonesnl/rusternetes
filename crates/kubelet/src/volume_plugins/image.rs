@@ -85,6 +85,7 @@ impl VolumePlugin for ImagePlugin {
     ) -> Result<ReconstructedVolume> {
         Ok(ReconstructedVolume {
             volume: None,
+            selinux_mount_context: String::new(),
             persistent_volume: None,
         })
     }

@@ -909,6 +909,9 @@ impl VolumeManager {
                 warn!("Cannot reconstruct the spec of staged device {device_mount_path_str}: got nil spec");
                 continue;
             };
+            // `reconstructedVolume.seLinuxMountContext` (`reconstruct_common.go:387`)
+            // feeds `MarkDeviceAsMounted` (`reconstruct.go:120-131`).
+            let reconstructed_selinux_mount_context = reconstructed.selinux_mount_context;
             let spec = Arc::new(OwnedSpec {
                 volume,
                 persistent_volume: reconstructed.persistent_volume,
@@ -933,8 +936,12 @@ impl VolumeManager {
                 .asw
                 .mark_volume_as_attached(Some(&volume_name), spec, &self.node_name, "")
                 .and_then(|()| {
-                    self.asw
-                        .mark_device_as_mounted(&volume_name, "", &device_mount_path_str, "")
+                    self.asw.mark_device_as_mounted(
+                        &volume_name,
+                        "",
+                        &device_mount_path_str,
+                        &reconstructed_selinux_mount_context,
+                    )
                 })
             {
                 warn!("Cannot record staged device {device_mount_path_str}: {e}");
