@@ -554,6 +554,58 @@ pub async fn toleration_restriction_validate_with(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ExtendedResourceToleration
+// ---------------------------------------------------------------------------
+
+/// `ExtendedResourceToleration.Admit`
+/// (plugin/pkg/admission/extendedresourcetoleration/admission.go:56-95): for
+/// each extended resource a container (or init container) requests, add a
+/// `<resource>:Exists:NoSchedule` toleration. The caller gates on Create/Update
+/// of the `pods` resource with no subresource. Names are visited sorted
+/// (`resources.List()`), and `AddOrUpdateTolerationInPod`
+/// (pkg/apis/core/helper/helpers.go:411-433) replaces a toleration with the same
+/// key/effect/operator/value, else appends.
+pub fn extended_resource_toleration_admit(pod: &mut Pod) {
+    let Some(spec) = pod.spec.as_mut() else {
+        return;
+    };
+    let mut resources = std::collections::BTreeSet::new();
+    for c in spec
+        .containers
+        .iter()
+        .chain(spec.init_containers.iter().flatten())
+    {
+        if let Some(requests) = c.resources.as_ref().and_then(|r| r.requests.as_ref()) {
+            for name in requests.keys() {
+                if rusternetes_common::quota::is_extended_resource_name(name) {
+                    resources.insert(name.clone());
+                }
+            }
+        }
+    }
+    for resource in resources {
+        let new = Toleration {
+            key: Some(resource),
+            operator: Some("Exists".to_string()),
+            value: None,
+            effect: Some("NoSchedule".to_string()),
+            toleration_seconds: None,
+        };
+        let tolerations = spec.tolerations.get_or_insert_with(Vec::new);
+        let s = |o: &Option<String>| o.clone().unwrap_or_default();
+        match tolerations.iter_mut().find(|t| {
+            s(&t.key) == s(&new.key)
+                && s(&t.effect) == s(&new.effect)
+                && s(&t.operator) == s(&new.operator)
+                && s(&t.value) == s(&new.value)
+        }) {
+            Some(existing) => *existing = new,
+            None => tolerations.push(new),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,5 +1002,85 @@ mod tests {
         // wrong kind / missing kind
         assert!(load_toleration_configuration("kind: Other\napiVersion: v1\n").is_err());
         assert!(load_toleration_configuration("default: []\n").is_err());
+    }
+
+    fn erpod(reqs: &[(&str, &str)], init: &[&str], tols: Option<Vec<Toleration>>) -> Pod {
+        let v = serde_json::json!({
+            "metadata": {"name": "p"},
+            "spec": {
+                "containers": [{"name": "c", "image": "i", "resources": {"requests":
+                    reqs.iter().map(|(k, v)| (k.to_string(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>()}}],
+                "initContainers": init.iter().map(|k| serde_json::json!({"name": "i", "image": "i",
+                    "resources": {"requests": {*k: "1"}}})).collect::<Vec<_>>(),
+            }
+        });
+        let mut pod: Pod = serde_json::from_value(v).unwrap();
+        pod.spec.as_mut().unwrap().tolerations = tols;
+        pod
+    }
+
+    fn ert(key: &str, op: &str, effect: &str) -> Toleration {
+        Toleration {
+            key: Some(key.into()),
+            operator: Some(op.into()),
+            value: None,
+            effect: Some(effect.into()),
+            toleration_seconds: None,
+        }
+    }
+
+    /// `TestAdmit` (extendedresourcetoleration/admission_test.go).
+    #[test]
+    fn extended_resource_toleration_cases() {
+        let tols = |p: &Pod| p.spec.as_ref().unwrap().tolerations.clone();
+        // no extended resources: unchanged (stays None)
+        let mut p = erpod(&[("cpu", "1"), ("kubernetes.io/foo", "1")], &[], None);
+        extended_resource_toleration_admit(&mut p);
+        assert_eq!(tols(&p), None);
+        // container + init container, sorted, existing preserved
+        let mut p = erpod(
+            &[("example.com/device-b", "1")],
+            &["example.com/device-a"],
+            Some(vec![ert("foo", "Exists", "NoSchedule")]),
+        );
+        extended_resource_toleration_admit(&mut p);
+        assert_eq!(
+            tols(&p).unwrap(),
+            vec![
+                ert("foo", "Exists", "NoSchedule"),
+                ert("example.com/device-a", "Exists", "NoSchedule"),
+                ert("example.com/device-b", "Exists", "NoSchedule"),
+            ]
+        );
+        // already present: no duplicate
+        let mut p = erpod(
+            &[("example.com/device-a", "1")],
+            &[],
+            Some(vec![ert("example.com/device-a", "Exists", "NoSchedule")]),
+        );
+        extended_resource_toleration_admit(&mut p);
+        assert_eq!(tols(&p).unwrap().len(), 1);
+        // same key, different effect: both kept
+        let mut p = erpod(
+            &[("example.com/device-a", "1")],
+            &[],
+            Some(vec![ert("example.com/device-a", "Exists", "NoExecute")]),
+        );
+        extended_resource_toleration_admit(&mut p);
+        assert_eq!(tols(&p).unwrap().len(), 2);
+        // wildcard toleration preserved, new one added
+        let mut p = erpod(
+            &[("example.com/device-a", "1")],
+            &[],
+            Some(vec![Toleration {
+                key: None,
+                operator: Some("Exists".into()),
+                value: None,
+                effect: None,
+                toleration_seconds: None,
+            }]),
+        );
+        extended_resource_toleration_admit(&mut p);
+        assert_eq!(tols(&p).unwrap().len(), 2);
     }
 }

@@ -345,6 +345,20 @@ impl Admission<'_> {
         })
         .await?;
 
+        // ExtendedResourceToleration.Admit registers for Create and Update
+        // (extendedresourcetoleration/admission.go:44); it follows
+        // PodTolerationRestriction in `AllOrderedPlugins`. An Update never
+        // targets a subresource.
+        self.plugin("ExtendedResourceToleration", op, ADMIT, async {
+            if let Some(pod) = pod.as_mut() {
+                if create || self.subresource.is_none() {
+                    crate::admission::pod_plugins::extended_resource_toleration_admit(pod);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+
         // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
         // the class must exist, and its overhead is set on the pod.
         self.plugin("RuntimeClass", op, ADMIT, async {
