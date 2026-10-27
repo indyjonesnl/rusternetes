@@ -149,6 +149,10 @@ pub const PLAIN_ZERO_SCALARS: &[(&str, &[&str])] = &[
         &["chapAuthDiscovery", "chapAuthSession", "readOnly"],
     ),
     (
+        "JSONSchemaProps",
+        &["exclusiveMaximum", "exclusiveMinimum", "nullable", "uniqueItems", "x-kubernetes-embedded-resource", "x-kubernetes-int-or-string"],
+    ),
+    (
         "JobStatus",
         &["active", "failed", "succeeded"],
     ),
@@ -391,6 +395,10 @@ pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
         &["distinctAttribute", "matchAttribute"],
     ),
     (
+        "DeviceRequestAllocationResult",
+        &["shareID"],
+    ),
+    (
         "Endpoint",
         &["hostname", "nodeName", "zone"],
     ),
@@ -445,6 +453,10 @@ pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
     (
         "IngressSpec",
         &["ingressClassName"],
+    ),
+    (
+        "JSONSchemaProps",
+        &["$ref", "x-kubernetes-list-type", "x-kubernetes-map-type"],
     ),
     (
         "JobSpec",
@@ -532,7 +544,7 @@ pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
     ),
     (
         "Preconditions",
-        &["resourceVersion"],
+        &["resourceVersion", "uid"],
     ),
     (
         "ResourceSliceSpec",
@@ -591,6 +603,10 @@ pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
         &["failurePolicy", "matchPolicy", "sideEffects"],
     ),
     (
+        "ValidationRule",
+        &["reason"],
+    ),
+    (
         "VolumeAttachmentSource",
         &["persistentVolumeName"],
     ),
@@ -609,5 +625,768 @@ pub const POINTER_STRINGS: &[(&str, &[&str])] = &[
     (
         "WindowsSecurityContextOptions",
         &["gmsaCredentialSpec", "gmsaCredentialSpecName", "runAsUserName"],
+    ),
+];
+
+/// Non-pointer scalar (`string`/`bool`/`int*`/`float*`, aliases resolved)
+/// fields tagged `omitempty` upstream, by message name, sorted by name. The Go
+/// marshaller writes these even when zero, so the encoder does too.
+#[rustfmt::skip]
+pub const ALWAYS_WRITTEN_SCALARS: &[(&str, &[&str])] = &[
+    (
+        "APIResource",
+        &["group", "storageVersionHash", "version"],
+    ),
+    (
+        "APIServiceCondition",
+        &["message", "reason"],
+    ),
+    (
+        "APIServiceSpec",
+        &["group", "insecureSkipTLSVerify", "version"],
+    ),
+    (
+        "APIVersionDiscovery",
+        &["freshness"],
+    ),
+    (
+        "AWSElasticBlockStoreVolumeSource",
+        &["fsType", "partition", "readOnly"],
+    ),
+    (
+        "AdmissionRequest",
+        &["name", "namespace", "requestSubResource", "subResource"],
+    ),
+    (
+        "AzureFilePersistentVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "AzureFileVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "BoundObjectReference",
+        &["apiVersion", "kind", "name", "uid"],
+    ),
+    (
+        "CSIPersistentVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "CephFSPersistentVolumeSource",
+        &["path", "readOnly", "secretFile", "user"],
+    ),
+    (
+        "CephFSVolumeSource",
+        &["path", "readOnly", "secretFile", "user"],
+    ),
+    (
+        "CertificateSigningRequestCondition",
+        &["message", "reason"],
+    ),
+    (
+        "CertificateSigningRequestSpec",
+        &["uid", "username"],
+    ),
+    (
+        "CinderPersistentVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "CinderVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "ComponentCondition",
+        &["error", "message"],
+    ),
+    (
+        "Condition",
+        &["observedGeneration"],
+    ),
+    (
+        "ConfigMapNodeConfigSource",
+        &["resourceVersion", "uid"],
+    ),
+    (
+        "Container",
+        &["image", "imagePullPolicy", "stdin", "stdinOnce", "terminationMessagePath", "terminationMessagePolicy", "tty", "workingDir"],
+    ),
+    (
+        "ContainerImage",
+        &["sizeBytes"],
+    ),
+    (
+        "ContainerPort",
+        &["hostIP", "hostPort", "name", "protocol"],
+    ),
+    (
+        "ContainerRestartRule",
+        &["action"],
+    ),
+    (
+        "ContainerRestartRuleOnExitCodes",
+        &["operator"],
+    ),
+    (
+        "ContainerStateTerminated",
+        &["containerID", "message", "reason", "signal"],
+    ),
+    (
+        "ContainerStateWaiting",
+        &["message", "reason"],
+    ),
+    (
+        "ContainerStatus",
+        &["containerID"],
+    ),
+    (
+        "CreateOptions",
+        &["fieldManager", "fieldValidation"],
+    ),
+    (
+        "CronJobSpec",
+        &["concurrencyPolicy"],
+    ),
+    (
+        "CrossVersionObjectReference",
+        &["apiVersion"],
+    ),
+    (
+        "CustomResourceColumnDefinition",
+        &["description", "format", "priority"],
+    ),
+    (
+        "CustomResourceDefinitionCondition",
+        &["message", "observedGeneration", "reason"],
+    ),
+    (
+        "CustomResourceDefinitionNames",
+        &["listKind", "singular"],
+    ),
+    (
+        "CustomResourceDefinitionSpec",
+        &["preserveUnknownFields"],
+    ),
+    (
+        "CustomResourceDefinitionStatus",
+        &["observedGeneration"],
+    ),
+    (
+        "CustomResourceDefinitionVersion",
+        &["deprecated"],
+    ),
+    (
+        "DaemonSetCondition",
+        &["message", "reason"],
+    ),
+    (
+        "DaemonSetSpec",
+        &["minReadySeconds"],
+    ),
+    (
+        "DaemonSetStatus",
+        &["numberAvailable", "numberUnavailable", "observedGeneration", "updatedNumberScheduled"],
+    ),
+    (
+        "DaemonSetUpdateStrategy",
+        &["type"],
+    ),
+    (
+        "DeploymentCondition",
+        &["message", "reason"],
+    ),
+    (
+        "DeploymentSpec",
+        &["minReadySeconds", "paused"],
+    ),
+    (
+        "DeploymentStatus",
+        &["availableReplicas", "observedGeneration", "readyReplicas", "replicas", "unavailableReplicas", "updatedReplicas"],
+    ),
+    (
+        "DeploymentStrategy",
+        &["type"],
+    ),
+    (
+        "DeviceSubRequest",
+        &["allocationMode", "count"],
+    ),
+    (
+        "DeviceTaint",
+        &["value"],
+    ),
+    (
+        "DeviceToleration",
+        &["effect", "key", "operator", "value"],
+    ),
+    (
+        "EmptyDirVolumeSource",
+        &["medium"],
+    ),
+    (
+        "EndpointAddress",
+        &["hostname"],
+    ),
+    (
+        "EnvFromSource",
+        &["prefix"],
+    ),
+    (
+        "EnvVar",
+        &["value"],
+    ),
+    (
+        "EphemeralContainer",
+        &["targetContainerName"],
+    ),
+    (
+        "EphemeralContainerCommon",
+        &["image", "imagePullPolicy", "stdin", "stdinOnce", "terminationMessagePath", "terminationMessagePolicy", "tty", "workingDir"],
+    ),
+    (
+        "Event",
+        &["action", "count", "deprecatedCount", "message", "note", "reason", "reportingController", "type"],
+    ),
+    (
+        "EventSource",
+        &["component", "host"],
+    ),
+    (
+        "ExactDeviceRequest",
+        &["allocationMode", "count"],
+    ),
+    (
+        "ExternalDocumentation",
+        &["description", "url"],
+    ),
+    (
+        "FCVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "FieldSelectorAttributes",
+        &["rawSelector"],
+    ),
+    (
+        "FlexPersistentVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "FlexVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "FlockerVolumeSource",
+        &["datasetName", "datasetUUID"],
+    ),
+    (
+        "FlowSchemaCondition",
+        &["message", "reason", "status", "type"],
+    ),
+    (
+        "GCEPersistentDiskVolumeSource",
+        &["fsType", "partition", "readOnly"],
+    ),
+    (
+        "GetOptions",
+        &["resourceVersion"],
+    ),
+    (
+        "GitRepoVolumeSource",
+        &["directory", "revision"],
+    ),
+    (
+        "GlusterfsPersistentVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "GlusterfsVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "HTTPGetAction",
+        &["host", "path", "scheme"],
+    ),
+    (
+        "HTTPIngressPath",
+        &["path"],
+    ),
+    (
+        "HorizontalPodAutoscalerCondition",
+        &["message", "reason"],
+    ),
+    (
+        "ISCSIPersistentVolumeSource",
+        &["chapAuthDiscovery", "chapAuthSession", "fsType", "iscsiInterface", "readOnly"],
+    ),
+    (
+        "ISCSIVolumeSource",
+        &["chapAuthDiscovery", "chapAuthSession", "fsType", "iscsiInterface", "readOnly"],
+    ),
+    (
+        "ImageVolumeSource",
+        &["pullPolicy", "reference"],
+    ),
+    (
+        "IngressClassSpec",
+        &["controller"],
+    ),
+    (
+        "IngressLoadBalancerIngress",
+        &["hostname", "ip"],
+    ),
+    (
+        "IngressRule",
+        &["host"],
+    ),
+    (
+        "IngressTLS",
+        &["secretName"],
+    ),
+    (
+        "JSONSchemaProps",
+        &["$schema", "description", "exclusiveMaximum", "exclusiveMinimum", "format", "id", "nullable", "pattern", "title", "type", "uniqueItems", "x-kubernetes-embedded-resource", "x-kubernetes-int-or-string"],
+    ),
+    (
+        "JobCondition",
+        &["message", "reason"],
+    ),
+    (
+        "JobStatus",
+        &["active", "completedIndexes", "failed", "succeeded"],
+    ),
+    (
+        "LabelSelectorAttributes",
+        &["rawSelector"],
+    ),
+    (
+        "ListMeta",
+        &["continue", "resourceVersion", "selfLink"],
+    ),
+    (
+        "ListOptions",
+        &["allowWatchBookmarks", "continue", "fieldSelector", "labelSelector", "limit", "resourceVersion", "resourceVersionMatch", "watch"],
+    ),
+    (
+        "LoadBalancerIngress",
+        &["hostname", "ip"],
+    ),
+    (
+        "LocalObjectReference",
+        &["name"],
+    ),
+    (
+        "ManagedFieldsEntry",
+        &["apiVersion", "fieldsType", "manager", "operation", "subresource"],
+    ),
+    (
+        "ModifyVolumeStatus",
+        &["targetVolumeAttributesClassName"],
+    ),
+    (
+        "NFSVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "NamespaceCondition",
+        &["message", "reason"],
+    ),
+    (
+        "NamespaceStatus",
+        &["phase"],
+    ),
+    (
+        "NetworkDeviceData",
+        &["hardwareAddress", "interfaceName"],
+    ),
+    (
+        "NodeCondition",
+        &["message", "reason"],
+    ),
+    (
+        "NodeConfigStatus",
+        &["error"],
+    ),
+    (
+        "NodeProxyOptions",
+        &["path"],
+    ),
+    (
+        "NodeSpec",
+        &["externalID", "podCIDR", "providerID", "unschedulable"],
+    ),
+    (
+        "NodeStatus",
+        &["phase"],
+    ),
+    (
+        "NonResourceAttributes",
+        &["path", "verb"],
+    ),
+    (
+        "ObjectFieldSelector",
+        &["apiVersion"],
+    ),
+    (
+        "ObjectMeta",
+        &["generateName", "generation", "name", "namespace", "resourceVersion", "selfLink", "uid"],
+    ),
+    (
+        "ObjectReference",
+        &["apiVersion", "fieldPath", "kind", "name", "namespace", "resourceVersion", "uid"],
+    ),
+    (
+        "ParamKind",
+        &["apiVersion", "kind"],
+    ),
+    (
+        "ParamRef",
+        &["name", "namespace"],
+    ),
+    (
+        "ParentReference",
+        &["group", "name", "namespace", "resource"],
+    ),
+    (
+        "PatchOptions",
+        &["fieldManager", "fieldValidation"],
+    ),
+    (
+        "PersistentVolumeClaimCondition",
+        &["message", "reason"],
+    ),
+    (
+        "PersistentVolumeClaimSpec",
+        &["volumeName"],
+    ),
+    (
+        "PersistentVolumeClaimStatus",
+        &["phase"],
+    ),
+    (
+        "PersistentVolumeClaimVolumeSource",
+        &["readOnly"],
+    ),
+    (
+        "PersistentVolumeSpec",
+        &["persistentVolumeReclaimPolicy", "storageClassName"],
+    ),
+    (
+        "PersistentVolumeStatus",
+        &["message", "phase", "reason"],
+    ),
+    (
+        "PhotonPersistentDiskVolumeSource",
+        &["fsType"],
+    ),
+    (
+        "PodAttachOptions",
+        &["container", "stderr", "stdin", "stdout", "tty"],
+    ),
+    (
+        "PodCertificateProjection",
+        &["certificateChainPath", "credentialBundlePath", "keyPath", "keyType", "signerName"],
+    ),
+    (
+        "PodCondition",
+        &["message", "observedGeneration", "reason"],
+    ),
+    (
+        "PodDNSConfigOption",
+        &["name"],
+    ),
+    (
+        "PodDisruptionBudgetStatus",
+        &["observedGeneration"],
+    ),
+    (
+        "PodExecOptions",
+        &["container", "stderr", "stdin", "stdout", "tty"],
+    ),
+    (
+        "PodLogOptions",
+        &["container", "follow", "insecureSkipTLSVerifyBackend", "previous", "timestamps"],
+    ),
+    (
+        "PodProxyOptions",
+        &["path"],
+    ),
+    (
+        "PodSpec",
+        &["dnsPolicy", "hostIPC", "hostNetwork", "hostPID", "hostname", "nodeName", "priorityClassName", "restartPolicy", "schedulerName", "serviceAccount", "serviceAccountName", "subdomain"],
+    ),
+    (
+        "PodStatus",
+        &["hostIP", "message", "nominatedNodeName", "observedGeneration", "phase", "podIP", "qosClass", "reason", "resize"],
+    ),
+    (
+        "PortworxVolumeSource",
+        &["fsType", "readOnly"],
+    ),
+    (
+        "PreferAvoidPodsEntry",
+        &["message", "reason"],
+    ),
+    (
+        "PriorityClass",
+        &["description", "globalDefault"],
+    ),
+    (
+        "PriorityLevelConfigurationCondition",
+        &["message", "reason", "status", "type"],
+    ),
+    (
+        "Probe",
+        &["failureThreshold", "initialDelaySeconds", "periodSeconds", "successThreshold", "timeoutSeconds"],
+    ),
+    (
+        "QuobyteVolumeSource",
+        &["group", "readOnly", "tenant", "user"],
+    ),
+    (
+        "RBDPersistentVolumeSource",
+        &["fsType", "keyring", "pool", "readOnly", "user"],
+    ),
+    (
+        "RBDVolumeSource",
+        &["fsType", "keyring", "pool", "readOnly", "user"],
+    ),
+    (
+        "ReplicaSetCondition",
+        &["message", "reason"],
+    ),
+    (
+        "ReplicaSetSpec",
+        &["minReadySeconds"],
+    ),
+    (
+        "ReplicaSetStatus",
+        &["availableReplicas", "fullyLabeledReplicas", "observedGeneration", "readyReplicas"],
+    ),
+    (
+        "ReplicationControllerCondition",
+        &["message", "reason"],
+    ),
+    (
+        "ReplicationControllerSpec",
+        &["minReadySeconds"],
+    ),
+    (
+        "ReplicationControllerStatus",
+        &["availableReplicas", "fullyLabeledReplicas", "observedGeneration", "readyReplicas"],
+    ),
+    (
+        "ResourceAttributes",
+        &["group", "name", "namespace", "resource", "subresource", "verb", "version"],
+    ),
+    (
+        "ResourceClaim",
+        &["request"],
+    ),
+    (
+        "ResourceClaimConsumerReference",
+        &["apiGroup"],
+    ),
+    (
+        "ResourceFieldSelector",
+        &["containerName"],
+    ),
+    (
+        "ResourceHealth",
+        &["health"],
+    ),
+    (
+        "ResourcePolicyRule",
+        &["clusterScope"],
+    ),
+    (
+        "SELinuxOptions",
+        &["level", "role", "type", "user"],
+    ),
+    (
+        "ScaleIOPersistentVolumeSource",
+        &["fsType", "protectionDomain", "readOnly", "sslEnabled", "storageMode", "storagePool", "volumeName"],
+    ),
+    (
+        "ScaleIOVolumeSource",
+        &["fsType", "protectionDomain", "readOnly", "sslEnabled", "storageMode", "storagePool", "volumeName"],
+    ),
+    (
+        "ScaleSpec",
+        &["replicas"],
+    ),
+    (
+        "ScaleStatus",
+        &["selector"],
+    ),
+    (
+        "Secret",
+        &["type"],
+    ),
+    (
+        "SecretReference",
+        &["name", "namespace"],
+    ),
+    (
+        "SecretVolumeSource",
+        &["secretName"],
+    ),
+    (
+        "SelfSubjectRulesReviewSpec",
+        &["namespace"],
+    ),
+    (
+        "ServiceAccountTokenProjection",
+        &["audience"],
+    ),
+    (
+        "ServiceBackendPort",
+        &["name", "number"],
+    ),
+    (
+        "ServicePort",
+        &["name", "nodePort", "protocol"],
+    ),
+    (
+        "ServiceProxyOptions",
+        &["path"],
+    ),
+    (
+        "ServiceSpec",
+        &["clusterIP", "externalName", "externalTrafficPolicy", "healthCheckNodePort", "loadBalancerIP", "publishNotReadyAddresses", "sessionAffinity", "type"],
+    ),
+    (
+        "StatefulSetCondition",
+        &["message", "reason"],
+    ),
+    (
+        "StatefulSetPersistentVolumeClaimRetentionPolicy",
+        &["whenDeleted", "whenScaled"],
+    ),
+    (
+        "StatefulSetSpec",
+        &["minReadySeconds", "podManagementPolicy"],
+    ),
+    (
+        "StatefulSetStatus",
+        &["currentReplicas", "currentRevision", "observedGeneration", "readyReplicas", "updateRevision", "updatedReplicas"],
+    ),
+    (
+        "StatefulSetUpdateStrategy",
+        &["type"],
+    ),
+    (
+        "Status",
+        &["code", "message", "reason", "status"],
+    ),
+    (
+        "StatusCause",
+        &["field", "message", "reason"],
+    ),
+    (
+        "StatusDetails",
+        &["group", "kind", "name", "retryAfterSeconds", "uid"],
+    ),
+    (
+        "StorageOSPersistentVolumeSource",
+        &["fsType", "readOnly", "volumeName", "volumeNamespace"],
+    ),
+    (
+        "StorageOSVolumeSource",
+        &["fsType", "readOnly", "volumeName", "volumeNamespace"],
+    ),
+    (
+        "Subject",
+        &["apiGroup", "namespace"],
+    ),
+    (
+        "SubjectAccessReviewSpec",
+        &["uid", "user"],
+    ),
+    (
+        "SubjectAccessReviewStatus",
+        &["denied", "evaluationError", "reason"],
+    ),
+    (
+        "SubjectRulesReviewStatus",
+        &["evaluationError"],
+    ),
+    (
+        "TCPSocketAction",
+        &["host"],
+    ),
+    (
+        "TableOptions",
+        &["includeObject"],
+    ),
+    (
+        "TableRowCondition",
+        &["message", "reason"],
+    ),
+    (
+        "Taint",
+        &["value"],
+    ),
+    (
+        "TokenReviewSpec",
+        &["token"],
+    ),
+    (
+        "TokenReviewStatus",
+        &["authenticated", "error"],
+    ),
+    (
+        "Toleration",
+        &["effect", "key", "operator", "value"],
+    ),
+    (
+        "TypeMeta",
+        &["apiVersion", "kind"],
+    ),
+    (
+        "UpdateOptions",
+        &["fieldManager", "fieldValidation"],
+    ),
+    (
+        "UserInfo",
+        &["uid", "username"],
+    ),
+    (
+        "ValidatingAdmissionPolicyBindingSpec",
+        &["policyName"],
+    ),
+    (
+        "ValidatingAdmissionPolicyStatus",
+        &["observedGeneration"],
+    ),
+    (
+        "Validation",
+        &["message", "messageExpression"],
+    ),
+    (
+        "ValidationRule",
+        &["fieldPath", "message", "messageExpression"],
+    ),
+    (
+        "VolumeError",
+        &["message"],
+    ),
+    (
+        "VolumeMount",
+        &["readOnly", "subPath", "subPathExpr"],
+    ),
+    (
+        "VolumeMountStatus",
+        &["readOnly"],
+    ),
+    (
+        "VsphereVirtualDiskVolumeSource",
+        &["fsType", "storagePolicyID", "storagePolicyName"],
+    ),
+    (
+        "WorkloadReference",
+        &["podGroupReplicaKey"],
     ),
 ];

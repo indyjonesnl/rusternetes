@@ -65,6 +65,11 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
     let mut paths = serde_json::Map::new();
     let path_entry =
         |gv: &str| serde_json::json!({"serverRelativeURL": format!("/openapi/v3/{}", gv)});
+    // Group-level documents (`api`, `apis`, `apis/<group>`): the discovery
+    // endpoints' own definitions (kube-openapi handler3 publishes them).
+    for key in upstream_group_docs().keys() {
+        paths.insert(key.clone(), path_entry(key));
+    }
     paths.insert("api/v1".into(), path_entry("api/v1"));
     // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
     if rusternetes_common::feature_gates::enabled(
@@ -83,6 +88,9 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
         ("storage.k8s.io", "v1"),
         ("scheduling.k8s.io", "v1"),
         ("apiextensions.k8s.io", "v1"),
+        ("apiregistration.k8s.io", "v1"),
+        ("authentication.k8s.io", "v1"),
+        ("authorization.k8s.io", "v1"),
         ("admissionregistration.k8s.io", "v1"),
         ("coordination.k8s.io", "v1"),
         ("flowcontrol.apiserver.k8s.io", "v1"),
@@ -155,6 +163,11 @@ pub async fn get_openapi_spec_path(
     headers: HeaderMap,
     axum::extract::Path(gv_path): axum::extract::Path<String>,
 ) -> Response {
+    // The group-level discovery documents are upstream's verbatim.
+    if let Some(doc) = upstream_group_docs().get(gv_path.trim_matches('/')) {
+        return openapi_v3_response(&headers, doc);
+    }
+
     // Cache the static OpenAPI v3 spec — it doesn't change at runtime
     // (CRD definitions are in v2, not v3 for our implementation)
     use std::sync::OnceLock;
@@ -180,6 +193,7 @@ pub async fn get_openapi_spec_path(
                 schemas.insert(name.clone(), schema.clone());
             }
         }
+        drop_superseded_stub_schemas(&mut spec_json, upstream);
     }
 
     // Query storage for CRDs matching this group/version and inject their schemas.
@@ -346,9 +360,15 @@ pub async fn get_openapi_spec_path(
         rewrite_definition_refs_to_components(&mut spec_json);
     }
 
-    let json_bytes = serde_json::to_vec(&spec_json).unwrap_or_default();
+    openapi_v3_response(&headers, &spec_json)
+}
 
-    if wants_v3_protobuf(&headers) {
+/// Serialize a v3 document as JSON, or as gnostic `openapi.v3.Document`
+/// protobuf when the client asks for it.
+fn openapi_v3_response(headers: &HeaderMap, spec_json: &serde_json::Value) -> Response {
+    let json_bytes = serde_json::to_vec(spec_json).unwrap_or_default();
+
+    if wants_v3_protobuf(headers) {
         match gnostic::openapi_v3_json_to_protobuf(&json_bytes) {
             Ok(proto_bytes) => {
                 return Response::builder()
@@ -376,39 +396,189 @@ pub async fn get_openapi_spec_path(
 
 /// Upstream's generated `components.schemas` for a group-version, vendored
 /// from release-1.35 `api/openapi-spec/v3` by
-/// `scripts/sync-upstream-openapi.sh`. Only group-versions listed here are
-/// served from upstream definitions; the rest still use the stub schemas.
+/// `scripts/sync-upstream-openapi.sh`. Every group-version the `/openapi/v3`
+/// index publishes is served from upstream's definitions.
 pub(crate) fn upstream_v3_schemas(
     group: &str,
     version: &str,
 ) -> Option<&'static serde_json::Map<String, serde_json::Value>> {
-    use std::sync::OnceLock;
-    static APPS_V1: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
-    static BATCH_V1: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
-    let (cell, src) = match (group, version) {
-        ("apps", "v1") => (
-            &APPS_V1,
-            include_str!("../../openapi/upstream/v1.35/apps__v1.schemas.json"),
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    let src: &'static str = match (group, version) {
+        ("", "v1") => include_str!("../../openapi/upstream/v1.35/api__v1.schemas.json"),
+        ("admissionregistration.k8s.io", "v1") => include_str!(
+            "../../openapi/upstream/v1.35/admissionregistration.k8s.io__v1.schemas.json"
         ),
-        ("batch", "v1") => (
-            &BATCH_V1,
-            include_str!("../../openapi/upstream/v1.35/batch__v1.schemas.json"),
+        ("admissionregistration.k8s.io", "v1beta1") => include_str!(
+            "../../openapi/upstream/v1.35/admissionregistration.k8s.io__v1beta1.schemas.json"
         ),
+        ("apiextensions.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/apiextensions.k8s.io__v1.schemas.json")
+        }
+        ("apiregistration.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/apiregistration.k8s.io__v1.schemas.json")
+        }
+        ("apps", "v1") => include_str!("../../openapi/upstream/v1.35/apps__v1.schemas.json"),
+        ("authentication.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/authentication.k8s.io__v1.schemas.json")
+        }
+        ("authorization.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/authorization.k8s.io__v1.schemas.json")
+        }
+        ("autoscaling", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/autoscaling__v1.schemas.json")
+        }
+        ("autoscaling", "v2") => {
+            include_str!("../../openapi/upstream/v1.35/autoscaling__v2.schemas.json")
+        }
+        ("batch", "v1") => include_str!("../../openapi/upstream/v1.35/batch__v1.schemas.json"),
+        ("certificates.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/certificates.k8s.io__v1.schemas.json")
+        }
+        ("certificates.k8s.io", "v1alpha1") => {
+            include_str!("../../openapi/upstream/v1.35/certificates.k8s.io__v1alpha1.schemas.json")
+        }
+        ("certificates.k8s.io", "v1beta1") => {
+            include_str!("../../openapi/upstream/v1.35/certificates.k8s.io__v1beta1.schemas.json")
+        }
+        ("coordination.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/coordination.k8s.io__v1.schemas.json")
+        }
+        ("discovery.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/discovery.k8s.io__v1.schemas.json")
+        }
+        ("events.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/events.k8s.io__v1.schemas.json")
+        }
+        ("flowcontrol.apiserver.k8s.io", "v1") => include_str!(
+            "../../openapi/upstream/v1.35/flowcontrol.apiserver.k8s.io__v1.schemas.json"
+        ),
+        ("networking.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/networking.k8s.io__v1.schemas.json")
+        }
+        ("node.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/node.k8s.io__v1.schemas.json")
+        }
+        ("policy", "v1") => include_str!("../../openapi/upstream/v1.35/policy__v1.schemas.json"),
+        ("rbac.authorization.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/rbac.authorization.k8s.io__v1.schemas.json")
+        }
+        ("resource.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/resource.k8s.io__v1.schemas.json")
+        }
+        ("scheduling.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/scheduling.k8s.io__v1.schemas.json")
+        }
+        ("storage.k8s.io", "v1") => {
+            include_str!("../../openapi/upstream/v1.35/storage.k8s.io__v1.schemas.json")
+        }
         _ => return None,
     };
-    Some(cell.get_or_init(|| serde_json::from_str(src).unwrap_or_default()))
+    // One parsed copy per group-version, leaked so callers get `'static`.
+    type Schemas = serde_json::Map<String, serde_json::Value>;
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), &'static Schemas>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
+    let key = (group.to_string(), version.to_string());
+    if let Some(hit) = cache.get(&key) {
+        return Some(hit);
+    }
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(src).unwrap_or_default();
+    let leaked: &'static _ = Box::leak(Box::new(parsed));
+    cache.insert(key, leaked);
+    Some(leaked)
 }
 
-/// Upstream v2 (swagger) definitions served on top of the built-in stubs:
-/// `apps/v1 ControllerRevision` and the `autoscaling/v1 Scale` returned by
-/// the apps scale subresources, with their transitive `$ref` closure
-/// (release-1.35 `api/openapi-spec/swagger.json`).
-fn upstream_v2_extra_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
+/// Remove the hand-written stub schemas (`generate_openapi_spec`, keyed by the
+/// bare kind name) whose group-version-kind the vendored upstream document
+/// defines, and point every `$ref` to them at the upstream definition: the
+/// published document must hold one definition per GVK, as kube-openapi's
+/// builder produces.
+fn drop_superseded_stub_schemas(
+    spec: &mut serde_json::Value,
+    upstream: &serde_json::Map<String, serde_json::Value>,
+) {
+    fn gvk_keys(schema: &serde_json::Value) -> Vec<String> {
+        schema["x-kubernetes-group-version-kind"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|g| {
+                let f = |k: &str| g[k].as_str().unwrap_or_default();
+                format!("{}/{}/{}", f("group"), f("version"), f("kind"))
+            })
+            .collect()
+    }
+    let by_gvk: std::collections::HashMap<String, &str> = upstream
+        .iter()
+        .flat_map(|(name, schema)| {
+            gvk_keys(schema)
+                .into_iter()
+                .map(move |k| (k, name.as_str()))
+        })
+        .collect();
+    let Some(schemas) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    let mut renames: std::collections::HashMap<String, String> = Default::default();
+    for (name, schema) in schemas.iter() {
+        if upstream.contains_key(name) {
+            continue;
+        }
+        if let Some(target) = gvk_keys(schema).iter().find_map(|k| by_gvk.get(k)) {
+            renames.insert(
+                format!("#/components/schemas/{name}"),
+                format!("#/components/schemas/{target}"),
+            );
+        }
+    }
+    if renames.is_empty() {
+        return;
+    }
+    for old in renames.keys() {
+        schemas.remove(old.rsplit('/').next().unwrap_or(old));
+    }
+    fn walk(v: &mut serde_json::Value, renames: &std::collections::HashMap<String, String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(serde_json::Value::String(r)) = m.get_mut("$ref") {
+                    if let Some(n) = renames.get(r.as_str()) {
+                        *r = n.clone();
+                    }
+                }
+                m.values_mut().for_each(|c| walk(c, renames));
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|c| walk(c, renames)),
+            _ => {}
+        }
+    }
+    walk(spec, &renames);
+}
+
+/// Upstream's group-level v3 documents keyed by their index path (`api`,
+/// `apis`, `apis/<group>`), vendored by `scripts/sync-upstream-openapi.sh`.
+fn upstream_group_docs() -> &'static serde_json::Map<String, serde_json::Value> {
+    use std::sync::OnceLock;
+    static DOCS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
+    DOCS.get_or_init(|| {
+        serde_json::from_str(include_str!("../../openapi/upstream/v1.35/group_docs.json"))
+            .unwrap_or_default()
+    })
+}
+
+/// Upstream v2 (swagger) definitions for every group-version the server
+/// publishes, with their transitive `$ref` closure (release-1.35
+/// `api/openapi-spec/swagger.json`, vendored by
+/// `scripts/sync-upstream-openapi.sh`).
+fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
     use std::sync::OnceLock;
     static DEFS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
     DEFS.get_or_init(|| {
         serde_json::from_str(include_str!(
-            "../../openapi/upstream/v1.35/v2_extra.definitions.json"
+            "../../openapi/upstream/v1.35/v2.definitions.json"
         ))
         .unwrap_or_default()
     })
@@ -749,12 +919,11 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
     for (key, def) in core_v1_builtin_definitions() {
         definitions.insert(key, def);
     }
-    // Real upstream definitions for kinds the stubs do not cover; never
-    // replace an existing stub (`ObjectMeta` and friends).
-    for (key, def) in upstream_v2_extra_definitions() {
-        definitions
-            .entry(key.clone())
-            .or_insert_with(|| def.clone());
+    // Upstream's generated definitions replace the stubs above (kube-openapi
+    // `pkg/builder` output published as api/openapi-spec/swagger.json); the
+    // stubs only remain for kinds upstream has no definition for.
+    for (key, def) in upstream_v2_definitions() {
+        definitions.insert(key.clone(), def.clone());
     }
 
     serde_json::json!({
@@ -962,7 +1131,9 @@ fn rewrite_definition_refs_to_components(value: &mut serde_json::Value) {
             // CustomResourcePublishOpenAPI "with validation schema"). Move the
             // `$ref` under `allOf` so the siblings are honored while the ref
             // still expands the fields.
-            if map.contains_key("$ref") && map.len() > 1 {
+            // (Only a string `$ref` is a reference: JSONSchemaProps has a
+            // *property* named `$ref` whose value is a schema object.)
+            if map.get("$ref").is_some_and(serde_json::Value::is_string) && map.len() > 1 {
                 if let Some(r) = map.remove("$ref") {
                     map.insert("allOf".to_string(), serde_json::json!([{ "$ref": r }]));
                 }

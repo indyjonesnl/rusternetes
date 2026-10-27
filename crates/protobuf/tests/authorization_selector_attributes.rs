@@ -59,9 +59,19 @@ fn resource_attributes_decodes_field_and_label_selector() {
             "{sel}: {d}"
         );
     }
-    // And the roundtrip re-emits the upstream bytes.
+    // And the roundtrip re-emits the upstream bytes. Go's marshaller also
+    // writes the plain `verb`..`name` strings (fields 2-7, `omitempty` in JSON)
+    // when empty (authorization/v1 generated.pb.go
+    // `ResourceAttributes.MarshalToSizedBuffer`), which the hand-built input
+    // above leaves out.
     let re = reg
         .encode_message("ResourceAttributes", &d)
         .expect("encode");
-    assert_eq!(re, ra);
+    let mut want = ra[..4].to_vec(); // namespace
+    for tag in [0x12, 0x1a, 0x22, 0x2a, 0x32, 0x3a] {
+        want.extend_from_slice(&[tag, 0]);
+    }
+    want.extend_from_slice(&ra[4..]);
+    assert_eq!(re, want);
+    assert_eq!(reg.decode_message("ResourceAttributes", &re).unwrap(), d);
 }

@@ -1348,6 +1348,7 @@ mod tests {
                         .collect(),
                 ),
                 accepted_names: None,
+                observed_generation: None,
                 stored_versions: None,
             },
         );

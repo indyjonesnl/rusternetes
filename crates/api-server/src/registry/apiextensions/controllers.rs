@@ -93,6 +93,7 @@ pub fn condition(
         last_transition_time: None,
         reason: Some(reason.to_string()),
         message: Some(message.to_string()),
+        observed_generation: None,
     }
 }
 

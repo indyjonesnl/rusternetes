@@ -12,8 +12,10 @@ use serde_json::json;
 fn time_emits_explicit_zero_nanos() {
     let meta = json!({"creationTimestamp": "2007-01-01T01:01:01Z"});
     let bytes = PROTO_REGISTRY.encode_message("ObjectMeta", &meta).unwrap();
-    // field 8 (0x42), len 6: seconds(0x08 + 5-byte varint) -- then nanos 0x10 0x00
-    assert_eq!(&bytes[..2], &[0x42, 0x08], "{bytes:?}");
+    // field 8 (0x42), len 8: seconds(0x08 + 5-byte varint) -- then nanos 0x10 0x00
+    // (preceded by the plain `omitempty` strings/ints Go writes empty: name,
+    // generateName, namespace, selfLink, uid, resourceVersion, generation).
+    assert!(bytes.windows(2).any(|w| w == [0x42, 0x08]), "{bytes:?}");
     assert_eq!(&bytes[bytes.len() - 2..], &[0x10, 0x00], "{bytes:?}");
 }
 

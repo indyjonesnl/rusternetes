@@ -66,8 +66,16 @@ fn root() -> PathBuf {
 
 pub struct Fixture {
     pub stem: String,
+    /// `apiVersion`/`kind` of the object. For types that are not part of the
+    /// scheme and carry no TypeMeta (`core.v1.WatchEvent`: empty `kind` in the
+    /// JSON and an empty `Unknown.typeMeta` in the pb) these are derived from
+    /// the `<group>.<version>.<Kind>` stem, as upstream's `TestCompatibility`
+    /// takes the GVK from the testdata file name.
     pub api_version: String,
     pub kind: String,
+    /// The pb fixture's `Unknown.typeMeta` is empty, so the codec cannot
+    /// dispatch on it and decode goes straight to the schema for `kind`.
+    pub untyped: bool,
     pub json: Value,
     pub pb: Vec<u8>,
 }
@@ -85,10 +93,30 @@ fn load_fixtures() -> Vec<Fixture> {
         for p in pbs {
             let json: Value = serde_json::from_slice(&fs::read(p.with_extension("json")).unwrap())
                 .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+            let kind = json["kind"].as_str().unwrap_or_default().to_string();
+            let untyped = kind.is_empty();
+            let (api_version, kind) = if untyped {
+                let parts: Vec<&str> = stem.split('.').collect();
+                let (kind, version) = (parts[parts.len() - 1], parts[parts.len() - 2]);
+                let group = parts[..parts.len() - 2].join(".");
+                let api = if group == "core" {
+                    version.to_string()
+                } else {
+                    format!("{group}/{version}")
+                };
+                (api, kind.to_string())
+            } else {
+                (
+                    json["apiVersion"].as_str().unwrap_or_default().to_string(),
+                    kind,
+                )
+            };
             out.push(Fixture {
-                stem: p.file_stem().unwrap().to_string_lossy().into_owned(),
-                api_version: json["apiVersion"].as_str().unwrap_or_default().to_string(),
-                kind: json["kind"].as_str().unwrap_or_default().to_string(),
+                stem,
+                api_version,
+                kind,
+                untyped,
                 json,
                 pb: fs::read(&p).unwrap(),
             });
@@ -100,11 +128,10 @@ fn load_fixtures() -> Vec<Fixture> {
 /// In-tree volume plugins our `Volume` model intentionally does not implement
 /// (upstream marks them deprecated/removed). Same set as
 /// `completeness_skip("VolumeSource", ..)` in
-/// `crates/api-server/tests/it/protobuf_schema_parity_upstream.rs` and the
 /// `KNOWN_GAPS` of `k8s_openapi_parity`; stripped from `volumes[]` entries on
-/// both sides of every JSON comparison. (Byte comparison cannot strip them
-/// from the upstream pb, so fixtures that carry them are allowlisted under
-/// `encode-bytes`.)
+/// both sides of every JSON comparison (the typed model drops them). The
+/// protobuf codec itself carries them (`VolumeSource` fields 3-27), so the
+/// byte comparison needs no stripping.
 const LEGACY_VOLUME_SOURCES: &[&str] = &[
     "gcePersistentDisk",
     "awsElasticBlockStore",
@@ -317,6 +344,13 @@ fn wire_diff_into(got: &[u8], want: &[u8], path: &str, out: &mut Vec<String>) {
 }
 
 fn check_decode(f: &Fixture) -> Outcome {
+    if f.untyped {
+        let raw = envelope_raw(&f.pb)?;
+        let got = PROTO_REGISTRY
+            .decode_message(&f.kind, &raw)
+            .ok_or("no registry schema (decode_message returned None)")?;
+        return json_eq(&got, &f.json);
+    }
     let bytes = PROTO_REGISTRY
         .decode_k8s_resource(&f.pb)
         .ok_or("no registry schema (decode_k8s_resource returned None)")?;
@@ -342,7 +376,14 @@ fn check_encode_semantic(f: &Fixture) -> Outcome {
     let back = PROTO_REGISTRY
         .decode_k8s_resource(&framed)
         .ok_or("encoded bytes do not decode")?;
-    let got: Value = serde_json::from_slice(&back).map_err(|e| e.to_string())?;
+    let mut got: Value = serde_json::from_slice(&back).map_err(|e| e.to_string())?;
+    if f.untyped {
+        // The codec stamps the derived apiVersion/kind; the fixture has none.
+        got.as_object_mut().map(|m| {
+            m.remove("apiVersion");
+            m.remove("kind")
+        });
+    }
     json_eq(&got, &f.json)
 }
 
@@ -485,11 +526,11 @@ fn upstream_golden_fixtures() {
 
     // Every GA fixture is either dispatched to a typed model or explicitly listed.
     for f in &fixtures {
-        let ga = f
-            .api_version
-            .rsplit('/')
-            .next()
-            .is_some_and(|v| v == "v1" || v == "v2");
+        let ga = !f.untyped
+            && f.api_version
+                .rsplit('/')
+                .next()
+                .is_some_and(|v| v == "v1" || v == "v2");
         if ga {
             assert!(
                 DISPATCHED.contains(&f.stem.as_str())

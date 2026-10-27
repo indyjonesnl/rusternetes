@@ -77,16 +77,9 @@ fn crd_additional_properties_and_tuple_items_roundtrip() {
         .cloned()
         .unwrap()
     };
-    assert_eq!(
-        p("closed")["additionalProperties"],
-        json!({"allows": false})
-    );
-    assert_eq!(
-        p("map")["additionalProperties"]["schema"]["type"],
-        json!("string")
-    );
-    assert_eq!(
-        p("tuple")["items"]["jSONSchemas"][1]["type"],
-        json!("integer")
-    );
+    // Decoded to the Go JSON form (`apiextensions/v1/marshal.go` MarshalJSON):
+    // the bool, the bare schema, the array.
+    assert_eq!(p("closed")["additionalProperties"], json!(false));
+    assert_eq!(p("map")["additionalProperties"]["type"], json!("string"));
+    assert_eq!(p("tuple")["items"][1]["type"], json!("integer"));
 }

@@ -97,6 +97,16 @@ fn synth_message(
         "MicroTime" => return Some(Value::String("2020-01-02T03:04:05.000000Z".to_string())),
         _ => {}
     }
+    // The apiextensions unions are structs on the wire but a bare
+    // bool/array/schema in JSON (`unwrap_json_schema_union`), so a value with
+    // both members set cannot survive the collapse. Covered by the golden CRD
+    // fixtures (`upstream_golden`) and `crd_items_roundtrip`.
+    if matches!(
+        name.rsplit('.').next(),
+        Some("JSONSchemaPropsOrArray" | "JSONSchemaPropsOrBool" | "JSONSchemaPropsOrStringArray")
+    ) {
+        return None;
+    }
     if depth == 0 {
         return None;
     }
