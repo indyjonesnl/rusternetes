@@ -216,11 +216,12 @@ struct Args {
     #[arg(long, default_value = rusternetes_api_server::registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE)]
     service_cluster_ip_range: String,
 
-    /// ClusterIP CIDR — must match the apiserver's
-    /// `--service-cluster-ip-range`. Used by kube-proxy to scope its
-    /// POSTROUTING MASQUERADE rule.
-    #[arg(long, default_value = rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR)]
-    cluster_cidr: String,
+    /// ClusterIP CIDR kube-proxy scopes its POSTROUTING MASQUERADE rule to.
+    /// Defaults to the IPv4 range of `--service-cluster-ip-range` (kube-proxy
+    /// here is IPv4-only), so a non-default service range needs no second
+    /// flag (#2446).
+    #[arg(long)]
+    cluster_cidr: Option<String>,
 
     /// NodePort range in iptables `start:end` form — must match the
     /// apiserver's `--service-node-port-range`. Hyphen also accepted.
@@ -624,7 +625,10 @@ async fn async_main() -> Result<()> {
         let proxy_config = rusternetes_kube_proxy::KubeProxyConfig {
             node_name: args.node_name,
             sync_interval: args.proxy_sync_interval,
-            cluster_cidr: args.cluster_cidr,
+            cluster_cidr: args
+                .cluster_cidr
+                .clone()
+                .unwrap_or_else(|| kube_proxy_cluster_cidr(&service_ranges)),
             // Accept hyphen form as a convenience; iptables wants colon.
             nodeport_range: args.node_port_range.replace('-', ":"),
             // The all-in-one binary is a single node in a single network
@@ -695,6 +699,22 @@ async fn async_main() -> Result<()> {
 /// The recycler plugin config the `--pv-recycler-*` flags describe, built as
 /// `newPersistentVolumeBinderController` (`cmd/kube-controller-manager/app/core.go:322-325`)
 /// probes the volume plugins; failure aborts startup.
+/// kube-proxy's ClusterIP CIDR when `--cluster-cidr` is unset: the IPv4 entry
+/// of the service ranges (kube-proxy programs iptables only), else the primary.
+/// Rusternetes-only: upstream kube-proxy has no service-range flag (it learns
+/// ClusterIPs from the Services themselves), so there is no Go source to port.
+fn kube_proxy_cluster_cidr(
+    ranges: &rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges,
+) -> String {
+    let cidrs = ranges.cidrs();
+    cidrs
+        .iter()
+        .find(|c| !c.contains(':'))
+        .or_else(|| cidrs.first())
+        .cloned()
+        .unwrap_or_else(|| rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string())
+}
+
 fn recycler_config_from_args(
     args: &Args,
 ) -> anyhow::Result<rusternetes_controller_manager::controllers::pv_recycler::RecyclerConfig> {
@@ -887,5 +907,27 @@ mod controller_manager_metrics_tests {
         assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
         assert!(ok.contains("cm_marker 1"), "{ok}");
         assert!(get("/nope").await.starts_with("HTTP/1.1 404"));
+    }
+}
+
+#[cfg(test)]
+mod kube_proxy_cluster_cidr_tests {
+    use super::*;
+    use rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges;
+
+    #[test]
+    fn follows_service_range_when_flag_unset() {
+        for (flag, want) in [
+            ("", "10.96.0.0/12"),
+            ("10.0.0.0/24", "10.0.0.0/24"),
+            ("2000::/108", "2000::/108"),
+            ("2000::/108,10.0.0.0/24", "10.0.0.0/24"),
+            ("10.0.0.0/24,2000::/108", "10.0.0.0/24"),
+        ] {
+            let r = ServiceIpRanges::parse(flag).unwrap();
+            assert_eq!(kube_proxy_cluster_cidr(&r), want, "{flag}");
+        }
+        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        assert!(a.cluster_cidr.is_none());
     }
 }
