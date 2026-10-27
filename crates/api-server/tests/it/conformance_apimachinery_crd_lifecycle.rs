@@ -1296,22 +1296,16 @@ async fn cel_rule_cost_limit_exceeded_crd_rejected() {
 /// Mirror audit (#1749, 2026-08-27): re-cited; conformance claim dropped.
 /// Sonobuoy (Round 160, 2026-04-26): PASS
 ///
-/// Mirrored as: a CRD whose rule fits under the per-rule budget but with
-/// enough rules to blow the per-request budget at evaluation time. Each rule
-/// individually is cheap but the request total exceeds the runtime limit.
+/// Mirrored from the upstream spec (a CR whose rule's actual cost passes
+/// `celconfig.PerCallLimit`, so the create fails with "call cost exceeds
+/// limit"). #3589: the earlier mirror asserted the retired `estimate_cost`
+/// heuristic summed over 3000 cheap rules. Upstream's data (the nested `all`
+/// over 725 items) is rejected at CRD time by our heuristic estimator, which
+/// is not the schema-typed one (#3561/#3277), so the same limit is reached
+/// with one `all` over a larger array.
 #[tokio::test]
 async fn cel_rule_runtime_cost_limit_exceeded() {
     let router = spawn_router();
-    // Many comprehension-style rules → per-request total trips the runtime
-    // budget. Each rule's estimated cost is rule_len * 1024 (one `all(`) →
-    // ~50K. We need cumulative cost > 100M, so 3000+ rules suffice.
-    let mut rules: Vec<Value> = Vec::new();
-    for _ in 0..3000 {
-        rules.push(json!({
-            "rule": "[1,2,3].all(x, x > 0) && self.replicas == self.replicas",
-            "message": "noop",
-        }));
-    }
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
@@ -1335,10 +1329,15 @@ async fn cel_rule_runtime_cost_limit_exceeded() {
                         "properties": {
                             "spec": {
                                 "type": "object",
+                                "x-kubernetes-validations": [
+                                    {"rule": "self.largeArray.all(x, x == 20)"}
+                                ],
                                 "properties": {
-                                    "replicas": {"type": "integer"}
-                                },
-                                "x-kubernetes-validations": rules
+                                    "largeArray": {
+                                        "type": "array",
+                                        "items": {"type": "integer"}
+                                    }
+                                }
                             }
                         }
                     }
@@ -1346,23 +1345,19 @@ async fn cel_rule_runtime_cost_limit_exceeded() {
             }]
         }
     });
-    // The CRD itself passes admission (each rule cheap), but the CR rejects.
-    let (s, _) = post_json(
+    let (s, body) = post_json(
         &router,
         "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
         &crd,
     )
     .await;
-    assert_eq!(
-        s, 201,
-        "CRD with many cheap rules must be admitted (each rule under per-rule limit)"
-    );
+    assert_eq!(s, 201, "the CRD must be admitted, body={body}");
 
     let cr = json!({
         "apiVersion": "example.com/v1",
         "kind": "ManyRule",
         "metadata": {"name": "victim", "namespace": "default"},
-        "spec": {"replicas": 1},
+        "spec": {"largeArray": vec![20; 400_000]},
     });
     let (s, body) = post_json(
         &router,
@@ -1373,6 +1368,10 @@ async fn cel_rule_runtime_cost_limit_exceeded() {
     assert!(
         (400..500).contains(&s),
         "CR exceeding runtime cost limit must be rejected, got {s}, body={body}"
+    );
+    assert!(
+        body.to_string().contains("call cost exceeds limit"),
+        "expected \"call cost exceeds limit\", body={body}"
     );
 }
 
