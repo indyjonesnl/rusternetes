@@ -3,34 +3,6 @@
 # Checks: decode, encode-bytes, encode-semantic, zero-fixpoint, typed, typed-wire (see upstream_golden.rs).
 # Never add a line to hide a regression: every line must name its tracking issue.
 
-
-# --- nosch: no protobuf registry schema for this kind/version (decode_k8s_resource/encode_native return None)
-
-# --- legacyvol: fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1.DaemonSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1.Deployment | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1.ReplicaSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1.StatefulSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta1.Deployment | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta1.StatefulSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta2.DaemonSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta2.Deployment | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta2.ReplicaSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | apps.v1beta2.StatefulSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | batch.v1.CronJob | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | batch.v1.Job | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | batch.v1beta1.CronJob | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | core.v1.Pod | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | core.v1.PodTemplate | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | core.v1.ReplicationController | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | extensions.v1beta1.DaemonSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | extensions.v1beta1.Deployment | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-encode-bytes | extensions.v1beta1.ReplicaSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
-
-# --- prega: pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
-
-# --- apiext: apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
-
 # --- obsgen: typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
 typed,typed-wire | admissionregistration.k8s.io.v1.ValidatingAdmissionPolicy | #2958 | typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
 

@@ -712,21 +712,10 @@ fn registry_parity_with_upstream() {
 /// even though the upstream `.proto` declares them at that number. Keep this
 /// list tiny and well-justified — each entry is a place where protobuf
 /// round-trip is knowingly lossy.
-fn completeness_skip(msg: &str, field_number: u32) -> bool {
-    match (msg, field_number) {
-        // Legacy / removed in-tree volume plugins. Our Volume struct does not
-        // implement these provider-specific sources (same KNOWN_GAPS set the
-        // JSON parity test allowlists), so the registry has no field for them.
-        //   3 gcePersistentDisk, 4 awsElasticBlockStore, 5 gitRepo,
-        //   9 glusterfs, 11 rbd, 12 flexVolume, 13 cinder, 14 cephfs,
-        //   15 flocker, 17 fc, 18 azureFile, 20 vsphereVolume, 21 quobyte,
-        //   22 azureDisk, 23 photonPersistentDisk, 24 portworxVolume,
-        //   25 scaleIO, 27 storageos.
-        ("VolumeSource", 3 | 4 | 5 | 9 | 11 | 12 | 13 | 14 | 15 | 17 | 18) => true,
-        ("VolumeSource", 20 | 21 | 22 | 23 | 24 | 25 | 27) => true,
-
-        _ => false,
-    }
+fn completeness_skip(_msg: &str, _field_number: u32) -> bool {
+    // Empty: the registry now carries every upstream field, the legacy in-tree
+    // volume sources included. Add `(msg, field)` arms here only with a reason.
+    false
 }
 
 /// Field-level completeness gate (the inverse of [`registry_parity_with_upstream`]).

@@ -7683,12 +7683,13 @@ impl ProtoRegistry {
     fn volume_source_schema() -> MessageSchema {
         // Field numbers from
         // https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/api/core/v1/generated.proto
-        // (message VolumeSource). Source kinds we don't yet decode
-        // (gitRepo, nfs, iscsi, glusterfs, rbd, flex, cinder, cephfs,
-        // flocker, azure*, vsphere, photon, portworx, scaleIO,
-        // storageOS, csi, ephemeral) are intentionally omitted — the
-        // decoder ignores unknown field numbers so requests using them
-        // still round-trip with the supported subset.
+        // (message VolumeSource). The legacy in-tree provider sources (3 gce,
+        // 4 aws, 5 gitRepo, 9 glusterfs, 11 rbd, 12 flex, 13 cinder, 14 cephfs,
+        // 15 flocker, 17 fc, 18 azureFile, 20 vsphere, 21 quobyte, 22 azureDisk,
+        // 23 photon, 24 portworx, 25 scaleIO, 27 storageos) are carried on the
+        // wire so a Go-encoded Pod/Deployment round-trips byte for byte; the
+        // typed `Volume` model has no use for them and drops them as it does
+        // for JSON input.
         MessageSchema {
             fields: HashMap::from([
                 (
@@ -7696,6 +7697,126 @@ impl ProtoRegistry {
                     (
                         "hostPath".into(),
                         FieldType::Message("HostPathVolumeSource".into()),
+                    ),
+                ),
+                (
+                    3,
+                    (
+                        "gcePersistentDisk".into(),
+                        FieldType::Message("GCEPersistentDiskVolumeSource".into()),
+                    ),
+                ),
+                (
+                    4,
+                    (
+                        "awsElasticBlockStore".into(),
+                        FieldType::Message("AWSElasticBlockStoreVolumeSource".into()),
+                    ),
+                ),
+                (
+                    5,
+                    (
+                        "gitRepo".into(),
+                        FieldType::Message("GitRepoVolumeSource".into()),
+                    ),
+                ),
+                (
+                    9,
+                    (
+                        "glusterfs".into(),
+                        FieldType::Message("GlusterfsVolumeSource".into()),
+                    ),
+                ),
+                (
+                    11,
+                    ("rbd".into(), FieldType::Message("RBDVolumeSource".into())),
+                ),
+                (
+                    12,
+                    (
+                        "flexVolume".into(),
+                        FieldType::Message("FlexVolumeSource".into()),
+                    ),
+                ),
+                (
+                    13,
+                    (
+                        "cinder".into(),
+                        FieldType::Message("CinderVolumeSource".into()),
+                    ),
+                ),
+                (
+                    14,
+                    (
+                        "cephfs".into(),
+                        FieldType::Message("CephFSVolumeSource".into()),
+                    ),
+                ),
+                (
+                    15,
+                    (
+                        "flocker".into(),
+                        FieldType::Message("FlockerVolumeSource".into()),
+                    ),
+                ),
+                (
+                    17,
+                    ("fc".into(), FieldType::Message("FCVolumeSource".into())),
+                ),
+                (
+                    18,
+                    (
+                        "azureFile".into(),
+                        FieldType::Message("AzureFileVolumeSource".into()),
+                    ),
+                ),
+                (
+                    20,
+                    (
+                        "vsphereVolume".into(),
+                        FieldType::Message("VsphereVirtualDiskVolumeSource".into()),
+                    ),
+                ),
+                (
+                    21,
+                    (
+                        "quobyte".into(),
+                        FieldType::Message("QuobyteVolumeSource".into()),
+                    ),
+                ),
+                (
+                    22,
+                    (
+                        "azureDisk".into(),
+                        FieldType::Message("AzureDiskVolumeSource".into()),
+                    ),
+                ),
+                (
+                    23,
+                    (
+                        "photonPersistentDisk".into(),
+                        FieldType::Message("PhotonPersistentDiskVolumeSource".into()),
+                    ),
+                ),
+                (
+                    24,
+                    (
+                        "portworxVolume".into(),
+                        FieldType::Message("PortworxVolumeSource".into()),
+                    ),
+                ),
+                (
+                    25,
+                    (
+                        "scaleIO".into(),
+                        FieldType::Message("ScaleIOVolumeSource".into()),
+                    ),
+                ),
+                (
+                    27,
+                    (
+                        "storageos".into(),
+                        FieldType::Message("StorageOSVolumeSource".into()),
                     ),
                 ),
                 (

@@ -128,11 +128,10 @@ fn load_fixtures() -> Vec<Fixture> {
 /// In-tree volume plugins our `Volume` model intentionally does not implement
 /// (upstream marks them deprecated/removed). Same set as
 /// `completeness_skip("VolumeSource", ..)` in
-/// `crates/api-server/tests/it/protobuf_schema_parity_upstream.rs` and the
 /// `KNOWN_GAPS` of `k8s_openapi_parity`; stripped from `volumes[]` entries on
-/// both sides of every JSON comparison. (Byte comparison cannot strip them
-/// from the upstream pb, so fixtures that carry them are allowlisted under
-/// `encode-bytes`.)
+/// both sides of every JSON comparison (the typed model drops them). The
+/// protobuf codec itself carries them (`VolumeSource` fields 3-27), so the
+/// byte comparison needs no stripping.
 const LEGACY_VOLUME_SOURCES: &[&str] = &[
     "gcePersistentDisk",
     "awsElasticBlockStore",
