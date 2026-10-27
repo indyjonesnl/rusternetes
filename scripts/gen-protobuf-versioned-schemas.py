@@ -53,6 +53,23 @@ PACKAGES = [
     ("k8s.io/api/node/v1alpha1", "node.k8s.io/v1alpha1", ["RuntimeClass"]),
     ("k8s.io/api/rbac/v1alpha1", "rbac.authorization.k8s.io/v1alpha1",
      ["ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding"]),
+    ("k8s.io/api/resource/v1beta1", "resource.k8s.io/v1beta1",
+     ["ResourceClaim", "DeviceClass", "ResourceClaimTemplate", "ResourceSlice"]),
+    ("k8s.io/api/resource/v1beta2", "resource.k8s.io/v1beta2",
+     ["ResourceClaim", "DeviceClass", "ResourceClaimTemplate", "ResourceSlice"]),
+    ("k8s.io/api/resource/v1alpha3", "resource.k8s.io/v1alpha3", ["DeviceTaintRule"]),
+    ("k8s.io/api/admission/v1", "admission.k8s.io/v1", ["AdmissionReview"]),
+    ("k8s.io/api/admission/v1beta1", "admission.k8s.io/v1beta1", ["AdmissionReview"]),
+    ("k8s.io/api/apidiscovery/v2", "apidiscovery.k8s.io/v2", ["APIGroupDiscovery"]),
+    ("k8s.io/api/apidiscovery/v2beta1", "apidiscovery.k8s.io/v2beta1", ["APIGroupDiscovery"]),
+    ("k8s.io/api/coordination/v1alpha2", "coordination.k8s.io/v1alpha2", ["LeaseCandidate"]),
+    ("k8s.io/api/coordination/v1beta1", "coordination.k8s.io/v1beta1", ["LeaseCandidate"]),
+    ("k8s.io/api/imagepolicy/v1alpha1", "imagepolicy.k8s.io/v1alpha1", ["ImageReview"]),
+    ("k8s.io/api/apiserverinternal/v1alpha1", "internal.apiserver.k8s.io/v1alpha1",
+     ["StorageVersion"]),
+    ("k8s.io/api/scheduling/v1alpha1", "scheduling.k8s.io/v1alpha1", ["Workload"]),
+    ("k8s.io/api/storagemigration/v1beta1", "storagemigration.k8s.io/v1beta1",
+     ["StorageVersionMigration"]),
 ]
 
 PROTO_SCALARS = {
@@ -65,6 +82,7 @@ PROTO_SCALARS = {
 SPECIAL = {
     ".k8s.io.apimachinery.pkg.api.resource.Quantity": "Quantity",
     ".k8s.io.apimachinery.pkg.util.intstr.IntOrString": "IntOrString",
+    ".k8s.io.apimachinery.pkg.runtime.RawExtension": "JsonRaw",
 }
 
 

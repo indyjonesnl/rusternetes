@@ -14572,15 +14572,19 @@ mod tests {
         );
     }
 
-    /// Schemas registered with no fields. Only two messages are legitimately
+    /// Schemas registered with no fields. Only a few messages are legitimately
     /// empty in the upstream proto: `Patch` is an opaque body and
-    /// `CustomResourceSubresourceStatus` is an empty message. Every other type
+    /// `CustomResourceSubresourceStatus`, apiserverinternal/v1alpha1
+    /// `StorageVersionSpec` and scheduling/v1alpha1 `BasicSchedulingPolicy`
+    /// are empty messages (`message X {}` in generated.proto). Every other type
     /// MUST carry its fields, or they silently drop over vnd.kubernetes.protobuf
     /// (the EndpointSubset / NodeStatus bug class). NEVER add a new entry here to
     /// silence the guard below — populate the schema instead.
     const ALLOWED_EMPTY_SCHEMAS: &[&str] = &[
-        "Patch",                           // opaque patch body
-        "CustomResourceSubresourceStatus", // empty message in the proto
+        "Patch",                                                 // opaque patch body
+        "CustomResourceSubresourceStatus",                       // empty message in the proto
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersionSpec", // empty message in the proto
+        "scheduling.k8s.io/v1alpha1.BasicSchedulingPolicy",      // empty message in the proto
     ];
 
     #[test]

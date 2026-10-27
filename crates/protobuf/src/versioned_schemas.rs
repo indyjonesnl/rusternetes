@@ -23,17 +23,24 @@ fn m(fields: Vec<(u32, &str, T)>) -> MessageSchema {
 /// the `external_references_resolve` test).
 #[cfg(test)]
 pub(crate) const EXTERNAL_REFS: &[&str] = &[
+    "Condition",
     "EventSource",
     "FieldSelectorAttributes",
+    "GroupResource",
+    "GroupVersionKind",
+    "GroupVersionResource",
     "LabelSelector",
     "LabelSelectorAttributes",
     "MicroTime",
+    "NodeSelector",
     "ObjectMeta",
     "ObjectReference",
     "PodTemplateSpec",
+    "Status",
     "Time",
     "Toleration",
     "TypedLocalObjectReference",
+    "UserInfo",
 ];
 
 #[rustfmt::skip]
@@ -1017,6 +1024,1038 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (2, "apiVersion", T::String),
             (3, "name", T::String),
             (4, "namespace", T::String),
+        ]),
+    );
+    // ===== resource.k8s.io/v1beta1 (k8s.io/api/resource/v1beta1/generated.proto) =====
+    schemas.insert(
+        "resource.k8s.io/v1beta1.AllocatedDeviceStatus".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "pool", T::String),
+            (3, "device", T::String),
+            (7, "shareID", T::String),
+            (4, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
+            (5, "data", T::JsonRaw),
+            (6, "networkData", T::Message("resource.k8s.io/v1beta1.NetworkDeviceData".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.AllocationResult".into(),
+        m(vec![
+            (1, "devices", T::Message("resource.k8s.io/v1beta1.DeviceAllocationResult".into())),
+            (3, "nodeSelector", T::Message("NodeSelector".into())),
+            (5, "allocationTimestamp", T::Message("Time".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.BasicDevice".into(),
+        m(vec![
+            (1, "attributes", T::MessageMap("resource.k8s.io/v1beta1.DeviceAttribute".into())),
+            (2, "capacity", T::MessageMap("resource.k8s.io/v1beta1.DeviceCapacity".into())),
+            (3, "consumesCounters", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceCounterConsumption".into())))),
+            (4, "nodeName", T::String),
+            (5, "nodeSelector", T::Message("NodeSelector".into())),
+            (6, "allNodes", T::Bool),
+            (7, "taints", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceTaint".into())))),
+            (8, "bindsToNode", T::Bool),
+            (9, "bindingConditions", T::Repeated(Box::new(T::String))),
+            (10, "bindingFailureConditions", T::Repeated(Box::new(T::String))),
+            (11, "allowMultipleAllocations", T::Bool),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.CELDeviceSelector".into(),
+        m(vec![
+            (1, "expression", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.CapacityRequestPolicy".into(),
+        m(vec![
+            (1, "default", T::Quantity),
+            (3, "validValues", T::Repeated(Box::new(T::Quantity))),
+            (4, "validRange", T::Message("resource.k8s.io/v1beta1.CapacityRequestPolicyRange".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.CapacityRequestPolicyRange".into(),
+        m(vec![
+            (1, "min", T::Quantity),
+            (2, "max", T::Quantity),
+            (3, "step", T::Quantity),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.CapacityRequirements".into(),
+        m(vec![
+            (1, "requests", T::QuantityMap),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.Counter".into(),
+        m(vec![
+            (1, "value", T::Quantity),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.CounterSet".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "counters", T::MessageMap("resource.k8s.io/v1beta1.Counter".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.Device".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "basic", T::Message("resource.k8s.io/v1beta1.BasicDevice".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceAllocationConfiguration".into(),
+        m(vec![
+            (1, "source", T::String),
+            (2, "requests", T::Repeated(Box::new(T::String))),
+            (3, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta1.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceAllocationResult".into(),
+        m(vec![
+            (1, "results", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceRequestAllocationResult".into())))),
+            (2, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceAllocationConfiguration".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceAttribute".into(),
+        m(vec![
+            (2, "int", T::Int),
+            (3, "bool", T::Bool),
+            (4, "string", T::String),
+            (5, "version", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceCapacity".into(),
+        m(vec![
+            (1, "value", T::Quantity),
+            (2, "requestPolicy", T::Message("resource.k8s.io/v1beta1.CapacityRequestPolicy".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceClaim".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceRequest".into())))),
+            (2, "constraints", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceConstraint".into())))),
+            (3, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceClaimConfiguration".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceClaimConfiguration".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::String))),
+            (2, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta1.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceClass".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta1.DeviceClassSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceClassConfiguration".into(),
+        m(vec![
+            (1, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta1.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceClassSpec".into(),
+        m(vec![
+            (1, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceSelector".into())))),
+            (2, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceClassConfiguration".into())))),
+            (4, "extendedResourceName", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceConfiguration".into(),
+        m(vec![
+            (1, "opaque", T::Message("resource.k8s.io/v1beta1.OpaqueDeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceConstraint".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::String))),
+            (2, "matchAttribute", T::String),
+            (3, "distinctAttribute", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceCounterConsumption".into(),
+        m(vec![
+            (1, "counterSet", T::String),
+            (2, "counters", T::MessageMap("resource.k8s.io/v1beta1.Counter".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceRequest".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "deviceClassName", T::String),
+            (3, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceSelector".into())))),
+            (4, "allocationMode", T::String),
+            (5, "count", T::Int),
+            (6, "adminAccess", T::Bool),
+            (7, "firstAvailable", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceSubRequest".into())))),
+            (8, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceToleration".into())))),
+            (9, "capacity", T::Message("resource.k8s.io/v1beta1.CapacityRequirements".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceRequestAllocationResult".into(),
+        m(vec![
+            (1, "request", T::String),
+            (2, "driver", T::String),
+            (3, "pool", T::String),
+            (4, "device", T::String),
+            (5, "adminAccess", T::Bool),
+            (6, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceToleration".into())))),
+            (7, "bindingConditions", T::Repeated(Box::new(T::String))),
+            (8, "bindingFailureConditions", T::Repeated(Box::new(T::String))),
+            (9, "shareID", T::String),
+            (10, "consumedCapacity", T::QuantityMap),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceSelector".into(),
+        m(vec![
+            (1, "cel", T::Message("resource.k8s.io/v1beta1.CELDeviceSelector".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceSubRequest".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "deviceClassName", T::String),
+            (3, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceSelector".into())))),
+            (4, "allocationMode", T::String),
+            (5, "count", T::Int),
+            (7, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.DeviceToleration".into())))),
+            (8, "capacity", T::Message("resource.k8s.io/v1beta1.CapacityRequirements".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceTaint".into(),
+        m(vec![
+            (1, "key", T::String),
+            (2, "value", T::String),
+            (3, "effect", T::String),
+            (4, "timeAdded", T::Message("Time".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.DeviceToleration".into(),
+        m(vec![
+            (1, "key", T::String),
+            (2, "operator", T::String),
+            (3, "value", T::String),
+            (4, "effect", T::String),
+            (5, "tolerationSeconds", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.NetworkDeviceData".into(),
+        m(vec![
+            (1, "interfaceName", T::String),
+            (2, "ips", T::Repeated(Box::new(T::String))),
+            (3, "hardwareAddress", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.OpaqueDeviceConfiguration".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "parameters", T::JsonRaw),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaim".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta1.ResourceClaimSpec".into())),
+            (3, "status", T::Message("resource.k8s.io/v1beta1.ResourceClaimStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaimConsumerReference".into(),
+        m(vec![
+            (1, "apiGroup", T::String),
+            (3, "resource", T::String),
+            (4, "name", T::String),
+            (5, "uid", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaimSpec".into(),
+        m(vec![
+            (1, "devices", T::Message("resource.k8s.io/v1beta1.DeviceClaim".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaimStatus".into(),
+        m(vec![
+            (1, "allocation", T::Message("resource.k8s.io/v1beta1.AllocationResult".into())),
+            (2, "reservedFor", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.ResourceClaimConsumerReference".into())))),
+            (4, "devices", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.AllocatedDeviceStatus".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaimTemplate".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta1.ResourceClaimTemplateSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceClaimTemplateSpec".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta1.ResourceClaimSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourcePool".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "generation", T::Int),
+            (3, "resourceSliceCount", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceSlice".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta1.ResourceSliceSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta1.ResourceSliceSpec".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "pool", T::Message("resource.k8s.io/v1beta1.ResourcePool".into())),
+            (3, "nodeName", T::String),
+            (4, "nodeSelector", T::Message("NodeSelector".into())),
+            (5, "allNodes", T::Bool),
+            (6, "devices", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.Device".into())))),
+            (7, "perDeviceNodeSelection", T::Bool),
+            (8, "sharedCounters", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta1.CounterSet".into())))),
+        ]),
+    );
+    // ===== resource.k8s.io/v1beta2 (k8s.io/api/resource/v1beta2/generated.proto) =====
+    schemas.insert(
+        "resource.k8s.io/v1beta2.AllocatedDeviceStatus".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "pool", T::String),
+            (3, "device", T::String),
+            (7, "shareID", T::String),
+            (4, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
+            (5, "data", T::JsonRaw),
+            (6, "networkData", T::Message("resource.k8s.io/v1beta2.NetworkDeviceData".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.AllocationResult".into(),
+        m(vec![
+            (1, "devices", T::Message("resource.k8s.io/v1beta2.DeviceAllocationResult".into())),
+            (3, "nodeSelector", T::Message("NodeSelector".into())),
+            (5, "allocationTimestamp", T::Message("Time".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.CELDeviceSelector".into(),
+        m(vec![
+            (1, "expression", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.CapacityRequestPolicy".into(),
+        m(vec![
+            (1, "default", T::Quantity),
+            (3, "validValues", T::Repeated(Box::new(T::Quantity))),
+            (4, "validRange", T::Message("resource.k8s.io/v1beta2.CapacityRequestPolicyRange".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.CapacityRequestPolicyRange".into(),
+        m(vec![
+            (1, "min", T::Quantity),
+            (2, "max", T::Quantity),
+            (3, "step", T::Quantity),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.CapacityRequirements".into(),
+        m(vec![
+            (1, "requests", T::QuantityMap),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.Counter".into(),
+        m(vec![
+            (1, "value", T::Quantity),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.CounterSet".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "counters", T::MessageMap("resource.k8s.io/v1beta2.Counter".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.Device".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "attributes", T::MessageMap("resource.k8s.io/v1beta2.DeviceAttribute".into())),
+            (3, "capacity", T::MessageMap("resource.k8s.io/v1beta2.DeviceCapacity".into())),
+            (4, "consumesCounters", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceCounterConsumption".into())))),
+            (5, "nodeName", T::String),
+            (6, "nodeSelector", T::Message("NodeSelector".into())),
+            (7, "allNodes", T::Bool),
+            (8, "taints", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceTaint".into())))),
+            (9, "bindsToNode", T::Bool),
+            (10, "bindingConditions", T::Repeated(Box::new(T::String))),
+            (11, "bindingFailureConditions", T::Repeated(Box::new(T::String))),
+            (12, "allowMultipleAllocations", T::Bool),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceAllocationConfiguration".into(),
+        m(vec![
+            (1, "source", T::String),
+            (2, "requests", T::Repeated(Box::new(T::String))),
+            (3, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta2.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceAllocationResult".into(),
+        m(vec![
+            (1, "results", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceRequestAllocationResult".into())))),
+            (2, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceAllocationConfiguration".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceAttribute".into(),
+        m(vec![
+            (2, "int", T::Int),
+            (3, "bool", T::Bool),
+            (4, "string", T::String),
+            (5, "version", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceCapacity".into(),
+        m(vec![
+            (1, "value", T::Quantity),
+            (2, "requestPolicy", T::Message("resource.k8s.io/v1beta2.CapacityRequestPolicy".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceClaim".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceRequest".into())))),
+            (2, "constraints", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceConstraint".into())))),
+            (3, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceClaimConfiguration".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceClaimConfiguration".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::String))),
+            (2, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta2.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceClass".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta2.DeviceClassSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceClassConfiguration".into(),
+        m(vec![
+            (1, "deviceConfiguration", T::InlineMessage("resource.k8s.io/v1beta2.DeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceClassSpec".into(),
+        m(vec![
+            (1, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceSelector".into())))),
+            (2, "config", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceClassConfiguration".into())))),
+            (4, "extendedResourceName", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceConfiguration".into(),
+        m(vec![
+            (1, "opaque", T::Message("resource.k8s.io/v1beta2.OpaqueDeviceConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceConstraint".into(),
+        m(vec![
+            (1, "requests", T::Repeated(Box::new(T::String))),
+            (2, "matchAttribute", T::String),
+            (3, "distinctAttribute", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceCounterConsumption".into(),
+        m(vec![
+            (1, "counterSet", T::String),
+            (2, "counters", T::MessageMap("resource.k8s.io/v1beta2.Counter".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceRequest".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "exactly", T::Message("resource.k8s.io/v1beta2.ExactDeviceRequest".into())),
+            (3, "firstAvailable", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceSubRequest".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceRequestAllocationResult".into(),
+        m(vec![
+            (1, "request", T::String),
+            (2, "driver", T::String),
+            (3, "pool", T::String),
+            (4, "device", T::String),
+            (5, "adminAccess", T::Bool),
+            (6, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceToleration".into())))),
+            (7, "bindingConditions", T::Repeated(Box::new(T::String))),
+            (8, "bindingFailureConditions", T::Repeated(Box::new(T::String))),
+            (9, "shareID", T::String),
+            (10, "consumedCapacity", T::QuantityMap),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceSelector".into(),
+        m(vec![
+            (1, "cel", T::Message("resource.k8s.io/v1beta2.CELDeviceSelector".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceSubRequest".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "deviceClassName", T::String),
+            (3, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceSelector".into())))),
+            (4, "allocationMode", T::String),
+            (5, "count", T::Int),
+            (6, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceToleration".into())))),
+            (7, "capacity", T::Message("resource.k8s.io/v1beta2.CapacityRequirements".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceTaint".into(),
+        m(vec![
+            (1, "key", T::String),
+            (2, "value", T::String),
+            (3, "effect", T::String),
+            (4, "timeAdded", T::Message("Time".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.DeviceToleration".into(),
+        m(vec![
+            (1, "key", T::String),
+            (2, "operator", T::String),
+            (3, "value", T::String),
+            (4, "effect", T::String),
+            (5, "tolerationSeconds", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ExactDeviceRequest".into(),
+        m(vec![
+            (1, "deviceClassName", T::String),
+            (2, "selectors", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceSelector".into())))),
+            (3, "allocationMode", T::String),
+            (4, "count", T::Int),
+            (5, "adminAccess", T::Bool),
+            (6, "tolerations", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.DeviceToleration".into())))),
+            (7, "capacity", T::Message("resource.k8s.io/v1beta2.CapacityRequirements".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.NetworkDeviceData".into(),
+        m(vec![
+            (1, "interfaceName", T::String),
+            (2, "ips", T::Repeated(Box::new(T::String))),
+            (3, "hardwareAddress", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.OpaqueDeviceConfiguration".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "parameters", T::JsonRaw),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaim".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta2.ResourceClaimSpec".into())),
+            (3, "status", T::Message("resource.k8s.io/v1beta2.ResourceClaimStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaimConsumerReference".into(),
+        m(vec![
+            (1, "apiGroup", T::String),
+            (3, "resource", T::String),
+            (4, "name", T::String),
+            (5, "uid", T::String),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaimSpec".into(),
+        m(vec![
+            (1, "devices", T::Message("resource.k8s.io/v1beta2.DeviceClaim".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaimStatus".into(),
+        m(vec![
+            (1, "allocation", T::Message("resource.k8s.io/v1beta2.AllocationResult".into())),
+            (2, "reservedFor", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.ResourceClaimConsumerReference".into())))),
+            (4, "devices", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.AllocatedDeviceStatus".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaimTemplate".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta2.ResourceClaimTemplateSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceClaimTemplateSpec".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta2.ResourceClaimSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourcePool".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "generation", T::Int),
+            (3, "resourceSliceCount", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceSlice".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1beta2.ResourceSliceSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1beta2.ResourceSliceSpec".into(),
+        m(vec![
+            (1, "driver", T::String),
+            (2, "pool", T::Message("resource.k8s.io/v1beta2.ResourcePool".into())),
+            (3, "nodeName", T::String),
+            (4, "nodeSelector", T::Message("NodeSelector".into())),
+            (5, "allNodes", T::Bool),
+            (6, "devices", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.Device".into())))),
+            (7, "perDeviceNodeSelection", T::Bool),
+            (8, "sharedCounters", T::Repeated(Box::new(T::Message("resource.k8s.io/v1beta2.CounterSet".into())))),
+        ]),
+    );
+    // ===== resource.k8s.io/v1alpha3 (k8s.io/api/resource/v1alpha3/generated.proto) =====
+    schemas.insert(
+        "resource.k8s.io/v1alpha3.DeviceTaint".into(),
+        m(vec![
+            (1, "key", T::String),
+            (2, "value", T::String),
+            (3, "effect", T::String),
+            (4, "timeAdded", T::Message("Time".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1alpha3.DeviceTaintRule".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("resource.k8s.io/v1alpha3.DeviceTaintRuleSpec".into())),
+            (3, "status", T::Message("resource.k8s.io/v1alpha3.DeviceTaintRuleStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1alpha3.DeviceTaintRuleSpec".into(),
+        m(vec![
+            (1, "deviceSelector", T::Message("resource.k8s.io/v1alpha3.DeviceTaintSelector".into())),
+            (2, "taint", T::Message("resource.k8s.io/v1alpha3.DeviceTaint".into())),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1alpha3.DeviceTaintRuleStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "resource.k8s.io/v1alpha3.DeviceTaintSelector".into(),
+        m(vec![
+            (2, "driver", T::String),
+            (3, "pool", T::String),
+            (4, "device", T::String),
+        ]),
+    );
+    // ===== admission.k8s.io/v1 (k8s.io/api/admission/v1/generated.proto) =====
+    schemas.insert(
+        "admission.k8s.io/v1.AdmissionRequest".into(),
+        m(vec![
+            (1, "uid", T::String),
+            (2, "kind", T::Message("GroupVersionKind".into())),
+            (3, "resource", T::Message("GroupVersionResource".into())),
+            (4, "subResource", T::String),
+            (13, "requestKind", T::Message("GroupVersionKind".into())),
+            (14, "requestResource", T::Message("GroupVersionResource".into())),
+            (15, "requestSubResource", T::String),
+            (5, "name", T::String),
+            (6, "namespace", T::String),
+            (7, "operation", T::String),
+            (8, "userInfo", T::Message("UserInfo".into())),
+            (9, "object", T::JsonRaw),
+            (10, "oldObject", T::JsonRaw),
+            (11, "dryRun", T::Bool),
+            (12, "options", T::JsonRaw),
+        ]),
+    );
+    schemas.insert(
+        "admission.k8s.io/v1.AdmissionResponse".into(),
+        m(vec![
+            (1, "uid", T::String),
+            (2, "allowed", T::Bool),
+            (3, "status", T::Message("Status".into())),
+            (4, "patch", T::Bytes),
+            (5, "patchType", T::String),
+            (6, "auditAnnotations", T::StringMap),
+            (7, "warnings", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "admission.k8s.io/v1.AdmissionReview".into(),
+        m(vec![
+            (1, "request", T::Message("admission.k8s.io/v1.AdmissionRequest".into())),
+            (2, "response", T::Message("admission.k8s.io/v1.AdmissionResponse".into())),
+        ]),
+    );
+    // ===== admission.k8s.io/v1beta1 (k8s.io/api/admission/v1beta1/generated.proto) =====
+    schemas.insert(
+        "admission.k8s.io/v1beta1.AdmissionRequest".into(),
+        m(vec![
+            (1, "uid", T::String),
+            (2, "kind", T::Message("GroupVersionKind".into())),
+            (3, "resource", T::Message("GroupVersionResource".into())),
+            (4, "subResource", T::String),
+            (13, "requestKind", T::Message("GroupVersionKind".into())),
+            (14, "requestResource", T::Message("GroupVersionResource".into())),
+            (15, "requestSubResource", T::String),
+            (5, "name", T::String),
+            (6, "namespace", T::String),
+            (7, "operation", T::String),
+            (8, "userInfo", T::Message("UserInfo".into())),
+            (9, "object", T::JsonRaw),
+            (10, "oldObject", T::JsonRaw),
+            (11, "dryRun", T::Bool),
+            (12, "options", T::JsonRaw),
+        ]),
+    );
+    schemas.insert(
+        "admission.k8s.io/v1beta1.AdmissionResponse".into(),
+        m(vec![
+            (1, "uid", T::String),
+            (2, "allowed", T::Bool),
+            (3, "status", T::Message("Status".into())),
+            (4, "patch", T::Bytes),
+            (5, "patchType", T::String),
+            (6, "auditAnnotations", T::StringMap),
+            (7, "warnings", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "admission.k8s.io/v1beta1.AdmissionReview".into(),
+        m(vec![
+            (1, "request", T::Message("admission.k8s.io/v1beta1.AdmissionRequest".into())),
+            (2, "response", T::Message("admission.k8s.io/v1beta1.AdmissionResponse".into())),
+        ]),
+    );
+    // ===== apidiscovery.k8s.io/v2 (k8s.io/api/apidiscovery/v2/generated.proto) =====
+    schemas.insert(
+        "apidiscovery.k8s.io/v2.APIGroupDiscovery".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "versions", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2.APIVersionDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2.APIResourceDiscovery".into(),
+        m(vec![
+            (1, "resource", T::String),
+            (2, "responseKind", T::Message("GroupVersionKind".into())),
+            (3, "scope", T::String),
+            (4, "singularResource", T::String),
+            (5, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "shortNames", T::Repeated(Box::new(T::String))),
+            (7, "categories", T::Repeated(Box::new(T::String))),
+            (8, "subresources", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2.APISubresourceDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2.APISubresourceDiscovery".into(),
+        m(vec![
+            (1, "subresource", T::String),
+            (2, "responseKind", T::Message("GroupVersionKind".into())),
+            (3, "acceptedTypes", T::Repeated(Box::new(T::Message("GroupVersionKind".into())))),
+            (4, "verbs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2.APIVersionDiscovery".into(),
+        m(vec![
+            (1, "version", T::String),
+            (2, "resources", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2.APIResourceDiscovery".into())))),
+            (3, "freshness", T::String),
+        ]),
+    );
+    // ===== apidiscovery.k8s.io/v2beta1 (k8s.io/api/apidiscovery/v2beta1/generated.proto) =====
+    schemas.insert(
+        "apidiscovery.k8s.io/v2beta1.APIGroupDiscovery".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "versions", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2beta1.APIVersionDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2beta1.APIResourceDiscovery".into(),
+        m(vec![
+            (1, "resource", T::String),
+            (2, "responseKind", T::Message("GroupVersionKind".into())),
+            (3, "scope", T::String),
+            (4, "singularResource", T::String),
+            (5, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "shortNames", T::Repeated(Box::new(T::String))),
+            (7, "categories", T::Repeated(Box::new(T::String))),
+            (8, "subresources", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2beta1.APISubresourceDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2beta1.APISubresourceDiscovery".into(),
+        m(vec![
+            (1, "subresource", T::String),
+            (2, "responseKind", T::Message("GroupVersionKind".into())),
+            (3, "acceptedTypes", T::Repeated(Box::new(T::Message("GroupVersionKind".into())))),
+            (4, "verbs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2beta1.APIVersionDiscovery".into(),
+        m(vec![
+            (1, "version", T::String),
+            (2, "resources", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2beta1.APIResourceDiscovery".into())))),
+            (3, "freshness", T::String),
+        ]),
+    );
+    // ===== coordination.k8s.io/v1alpha2 (k8s.io/api/coordination/v1alpha2/generated.proto) =====
+    schemas.insert(
+        "coordination.k8s.io/v1alpha2.LeaseCandidate".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("coordination.k8s.io/v1alpha2.LeaseCandidateSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "coordination.k8s.io/v1alpha2.LeaseCandidateSpec".into(),
+        m(vec![
+            (1, "leaseName", T::String),
+            (2, "pingTime", T::Message("MicroTime".into())),
+            (3, "renewTime", T::Message("MicroTime".into())),
+            (4, "binaryVersion", T::String),
+            (5, "emulationVersion", T::String),
+            (6, "strategy", T::String),
+        ]),
+    );
+    // ===== coordination.k8s.io/v1beta1 (k8s.io/api/coordination/v1beta1/generated.proto) =====
+    schemas.insert(
+        "coordination.k8s.io/v1beta1.LeaseCandidate".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("coordination.k8s.io/v1beta1.LeaseCandidateSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "coordination.k8s.io/v1beta1.LeaseCandidateSpec".into(),
+        m(vec![
+            (1, "leaseName", T::String),
+            (2, "pingTime", T::Message("MicroTime".into())),
+            (3, "renewTime", T::Message("MicroTime".into())),
+            (4, "binaryVersion", T::String),
+            (5, "emulationVersion", T::String),
+            (6, "strategy", T::String),
+        ]),
+    );
+    // ===== imagepolicy.k8s.io/v1alpha1 (k8s.io/api/imagepolicy/v1alpha1/generated.proto) =====
+    schemas.insert(
+        "imagepolicy.k8s.io/v1alpha1.ImageReview".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("imagepolicy.k8s.io/v1alpha1.ImageReviewSpec".into())),
+            (3, "status", T::Message("imagepolicy.k8s.io/v1alpha1.ImageReviewStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "imagepolicy.k8s.io/v1alpha1.ImageReviewContainerSpec".into(),
+        m(vec![
+            (1, "image", T::String),
+        ]),
+    );
+    schemas.insert(
+        "imagepolicy.k8s.io/v1alpha1.ImageReviewSpec".into(),
+        m(vec![
+            (1, "containers", T::Repeated(Box::new(T::Message("imagepolicy.k8s.io/v1alpha1.ImageReviewContainerSpec".into())))),
+            (2, "annotations", T::StringMap),
+            (3, "namespace", T::String),
+        ]),
+    );
+    schemas.insert(
+        "imagepolicy.k8s.io/v1alpha1.ImageReviewStatus".into(),
+        m(vec![
+            (1, "allowed", T::Bool),
+            (2, "reason", T::String),
+            (3, "auditAnnotations", T::StringMap),
+        ]),
+    );
+    // ===== internal.apiserver.k8s.io/v1alpha1 (k8s.io/api/apiserverinternal/v1alpha1/generated.proto) =====
+    schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.ServerStorageVersion".into(),
+        m(vec![
+            (1, "apiServerID", T::String),
+            (2, "encodingVersion", T::String),
+            (3, "decodableVersions", T::Repeated(Box::new(T::String))),
+            (4, "servedVersions", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersion".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("internal.apiserver.k8s.io/v1alpha1.StorageVersionSpec".into())),
+            (3, "status", T::Message("internal.apiserver.k8s.io/v1alpha1.StorageVersionStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersionCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "observedGeneration", T::Int),
+            (4, "lastTransitionTime", T::Message("Time".into())),
+            (5, "reason", T::String),
+            (6, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersionSpec".into(),
+        m(vec![
+
+        ]),
+    );
+    schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersionStatus".into(),
+        m(vec![
+            (1, "storageVersions", T::Repeated(Box::new(T::Message("internal.apiserver.k8s.io/v1alpha1.ServerStorageVersion".into())))),
+            (2, "commonEncodingVersion", T::String),
+            (3, "conditions", T::Repeated(Box::new(T::Message("internal.apiserver.k8s.io/v1alpha1.StorageVersionCondition".into())))),
+        ]),
+    );
+    // ===== scheduling.k8s.io/v1alpha1 (k8s.io/api/scheduling/v1alpha1/generated.proto) =====
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.BasicSchedulingPolicy".into(),
+        m(vec![
+
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.GangSchedulingPolicy".into(),
+        m(vec![
+            (1, "minCount", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.PodGroup".into(),
+        m(vec![
+            (1, "name", T::String),
+            (3, "policy", T::Message("scheduling.k8s.io/v1alpha1.PodGroupPolicy".into())),
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.PodGroupPolicy".into(),
+        m(vec![
+            (2, "basic", T::Message("scheduling.k8s.io/v1alpha1.BasicSchedulingPolicy".into())),
+            (3, "gang", T::Message("scheduling.k8s.io/v1alpha1.GangSchedulingPolicy".into())),
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.TypedLocalObjectReference".into(),
+        m(vec![
+            (1, "apiGroup", T::String),
+            (2, "kind", T::String),
+            (3, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.Workload".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("scheduling.k8s.io/v1alpha1.WorkloadSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "scheduling.k8s.io/v1alpha1.WorkloadSpec".into(),
+        m(vec![
+            (1, "controllerRef", T::Message("scheduling.k8s.io/v1alpha1.TypedLocalObjectReference".into())),
+            (2, "podGroups", T::Repeated(Box::new(T::Message("scheduling.k8s.io/v1alpha1.PodGroup".into())))),
+        ]),
+    );
+    // ===== storagemigration.k8s.io/v1beta1 (k8s.io/api/storagemigration/v1beta1/generated.proto) =====
+    schemas.insert(
+        "storagemigration.k8s.io/v1beta1.StorageVersionMigration".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("storagemigration.k8s.io/v1beta1.StorageVersionMigrationSpec".into())),
+            (3, "status", T::Message("storagemigration.k8s.io/v1beta1.StorageVersionMigrationStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "storagemigration.k8s.io/v1beta1.StorageVersionMigrationSpec".into(),
+        m(vec![
+            (1, "resource", T::Message("GroupResource".into())),
+        ]),
+    );
+    schemas.insert(
+        "storagemigration.k8s.io/v1beta1.StorageVersionMigrationStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
+            (2, "resourceVersion", T::String),
         ]),
     );
 }
