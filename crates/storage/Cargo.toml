@@ -44,6 +44,9 @@ chrono.workspace = true
 testcontainers = "0.23"
 criterion = "0.5"
 tempfile = "3.27.0"
+# Holds a real SQLite write lock from a second connection in the
+# busy-contention test (#3877); same sqlx rhino links.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 [[bench]]
 name = "watch_latency"
