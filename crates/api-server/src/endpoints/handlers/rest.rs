@@ -141,6 +141,7 @@ impl<T: Object> RequestScope<T> {
             self.store.get_reset_fields(),
         )
         .with_schema(schema)
+        .with_converter(self.store.field_converter())
     }
 
     pub(super) fn namespace_scoped(&self) -> bool {

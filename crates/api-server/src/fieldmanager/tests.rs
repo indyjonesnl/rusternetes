@@ -189,7 +189,9 @@ fn update_with_a_schema_changes_one_keyed_item() {
     let new = json!({"spec": {"containers": [{"name": "c", "ports": [
         {"containerPort": 80, "protocol": "TCP"},
         {"containerPort": 80, "protocol": "UDP", "name": "dns"}]}]}});
-    let managed = fm.update_managed(&live, &new, Managed::default(), "m", true);
+    let managed = fm
+        .update_managed(&live, &new, Managed::default(), "m", true)
+        .unwrap();
     let entries = managed.encode().unwrap();
     let fields = entries[0].fields_v1.clone().unwrap();
     let ports = &fields["f:spec"]["f:containers"]["k:{\"name\":\"c\"}"]["f:ports"];

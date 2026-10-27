@@ -34,8 +34,9 @@
 //! DEVIATIONS, deliberate: (1) the field sets come from the kind's schema
 //! ([`schemas`]: the vendored OpenAPI for `apps/v1`, `batch/v1` and `Pod`, a
 //! custom resource's structural schema) and from [`fieldset`]'s name-driven
-//! table for every other built-in kind (#2734); (2) one version per kind is
-//! served here, so upstream's per-manager `versionConverter` is the identity.
+//! table for every other built-in kind (#2734); (2) a kind served at one
+//! version has no per-manager `versionConverter` (the identity); a custom
+//! resource with several versions gets one (#2736).
 
 pub mod schemas;
 
@@ -116,6 +117,17 @@ impl FieldManager {
         ))
     }
 
+    /// The kind's version `Converter` (#2736), see
+    /// [`rusternetes_common::fieldmanager::FieldManager::with_converter`].
+    pub fn with_converter(
+        self,
+        converter: Option<
+            std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>,
+        >,
+    ) -> Self {
+        Self(self.0.with_converter(converter))
+    }
+
     /// The kind's `typeConverter`, see
     /// [`rusternetes_common::fieldmanager::FieldManager::with_schema`].
     pub fn with_schema(
@@ -182,7 +194,7 @@ impl FieldManager {
         remove_managed_fields(&mut live_json);
         let live_is_new = live.is_none_or(|l| l.metadata().uid.is_empty());
 
-        let managed = self.update_managed(&live_json, &new_json, managed, manager, live_is_new);
+        let managed = self.update_managed(&live_json, &new_json, managed, manager, live_is_new)?;
         new.metadata_mut().managed_fields = managed.encode();
         Ok(new)
     }

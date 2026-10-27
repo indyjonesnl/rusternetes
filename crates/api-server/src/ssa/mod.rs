@@ -94,6 +94,10 @@ pub struct ApplyOptions {
     /// custom resource's structural schema); a built-in's comes from
     /// [`crate::fieldmanager::schemas::builtin`].
     pub schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+    /// The kind's version converter when it is served at several versions
+    /// (#2736).
+    pub converter:
+        Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>,
 }
 
 impl ApplyOptions {
@@ -104,7 +108,18 @@ impl ApplyOptions {
             reset_fields: ResetFields::new(),
             subresource: None,
             schema: None,
+            converter: None,
         }
+    }
+
+    pub fn with_converter(
+        mut self,
+        converter: Option<
+            std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>,
+        >,
+    ) -> Self {
+        self.converter = converter;
+        self
     }
 
     pub fn with_schema(
@@ -232,7 +247,8 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
         opts.subresource.as_deref(),
         opts.reset_fields.clone(),
     )
-    .with_schema(schema);
+    .with_schema(schema)
+    .with_converter(opts.converter.clone());
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
             rusternetes_common::fieldmanager::apply::retain_live_system_metadata(
@@ -245,7 +261,12 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
                 object: Box::new(object),
             })
         }
-        Err(conflicts) => Ok(ApplyOutcome::Conflicts(
+        Err(rusternetes_common::fieldmanager::versionconverter::UpdateFailure::Convert(e)) => {
+            Err(ApplyError::Internal(e))
+        }
+        Err(rusternetes_common::fieldmanager::versionconverter::UpdateFailure::Conflicts(
+            conflicts,
+        )) => Ok(ApplyOutcome::Conflicts(
             conflicts
                 .into_iter()
                 .map(|c| PathConflict {
