@@ -23,11 +23,19 @@
 //! - The APIService informer is a storage watch ([`spawn_apiservice_event_handlers`])
 //!   feeding the same Add/Update/Delete handlers; the lister reads storage
 //!   directly. The `Run` cache-sync wait is therefore "storage is readable".
-//! - There is no per-APIService `proxyHandler` to build or mux to mount it on:
-//!   the aggregator proxy (`handlers::aggregator`) resolves the APIService from
-//!   storage per request. [`AggregatorHandlerManager`] keeps upstream's
-//!   `proxyHandlers` / `handledGroupVersions` bookkeeping and forwards to the
-//!   discovery manager, which is what the hooks' ordering depends on.
+//! - There is no `NonGoRestfulMux` to mount handlers on: `/apis/<group>/...`
+//!   is dispatched by `router::custom_resource_fallback`.
+//!   [`AggregatorHandlerManager`] owns the per-APIService
+//!   [`ProxyHandler`]s (`proxyHandlers`) and the `handledGroupVersions`
+//!   bookkeeping that gates the per-group `apiGroupHandler`, and that
+//!   fallback consults it ([`crate::aggregator_mux::active_handler_manager`])
+//!   instead of reading the APIService from storage. "Mounting" is insertion,
+//!   `Unregister` is removal. The per-group handler's lister is the set of
+//!   APIServices the registration controller has processed (the informer
+//!   cache's equivalent here). Still open: the openapi / openapiv3
+//!   aggregation controllers' `AddAPIService`/`UpdateAPIService`/
+//!   `RemoveAPIService` calls, and the `/api` proxy path of the legacy `v1.`
+//!   APIService (the built-in `/api` routes serve it).
 //! - The `http.Handler` of an APIService is an [`AggregatorHandler`]
 //!   (production: [`crate::aggregated_discovery::ProxyDiscoveryHandler`]).
 //! - The merged document ([`MergedDiscovery`], process-global via
@@ -47,6 +55,9 @@ use crate::aggregated_discovery::{
     is_aggregated_discovery_content_type, legacy_path, parse_discovery_list,
     parse_legacy_resource_list, serve_with_timeout, AggregatorHandler, HandlerRequest,
     ProxyDiscoveryHandler, ACCEPT_V2, ACCEPT_V2_BETA1, AGGREGATOR_GROUP, AGGREGATOR_USER,
+};
+use crate::aggregator_mux::{
+    install_handler_manager, serve_api_group, ApiGroupResponse, ProxyHandler,
 };
 use crate::autoregister::{APIServiceClient, StorageAPIServiceClient};
 use crate::crdregistration::WorkQueue;
@@ -729,8 +740,10 @@ impl DiscoveryManager {
 
 #[derive(Default)]
 struct AggregatorState {
-    /// `proxyHandlers`: the APIServices that have a handler installed.
-    proxy_handlers: HashMap<String, APIService>,
+    /// `proxyHandlers`: the APIServices that have a handler installed, with
+    /// the latest object the handler was told about (the group handler's
+    /// lister view).
+    proxy_handlers: HashMap<String, (Arc<ProxyHandler>, APIService)>,
     /// `handledGroupVersions`.
     handled_group_versions: HashMap<String, BTreeSet<String>>,
 }
@@ -762,6 +775,29 @@ impl AggregatorHandlerManager {
             .collect()
     }
 
+    /// The `proxyHandler` mounted at `/apis/<group>/<version>` (the mux
+    /// lookup), or `None` when nothing is mounted there.
+    pub fn proxy_handler(&self, group: &str, version: &str) -> Option<Arc<ProxyHandler>> {
+        self.state
+            .lock()
+            .unwrap()
+            .proxy_handlers
+            .get(&format!("{version}.{group}"))
+            .map(|(h, _)| h.clone())
+    }
+
+    /// `apiGroupHandler.ServeHTTP` for `/apis/<group>`, or `None` when no
+    /// group handler is mounted for `group` (`handledGroupVersions`).
+    pub fn serve_api_group(&self, group: &str) -> Option<ApiGroupResponse> {
+        let st = self.state.lock().unwrap();
+        if !st.handled_group_versions.contains_key(group) {
+            return None;
+        }
+        let services: Vec<APIService> =
+            st.proxy_handlers.values().map(|(_, a)| a.clone()).collect();
+        Some(serve_api_group(group, &services))
+    }
+
     pub fn handled_group_versions(&self) -> BTreeMap<String, BTreeSet<String>> {
         self.state
             .lock()
@@ -776,16 +812,27 @@ impl AggregatorHandlerManager {
 impl APIHandlerManager for AggregatorHandlerManager {
     fn add_api_service(&self, api_service: &APIService) -> Result<(), String> {
         let mut st = self.state.lock().unwrap();
-        let exists = st.proxy_handlers.contains_key(&api_service.metadata.name);
-        // "Forward calls to discovery manager to update discovery document"
+        // "if the proxyHandler already exists, it needs to be updated. The
+        // aggregation bits do not since they are wired against listers"
+        if let Some((handler, stored)) = st.proxy_handlers.get_mut(&api_service.metadata.name) {
+            handler.update_api_service(api_service);
+            *stored = api_service.clone();
+            // "Forward calls to discovery manager to update discovery document"
+            if let Some(dm) = &self.discovery_aggregation_controller {
+                dm.add_api_service(api_service);
+            }
+            return Ok(());
+        }
+        // "register the proxy handler"
+        let handler = Arc::new(ProxyHandler::new());
+        handler.update_api_service(api_service);
         if let Some(dm) = &self.discovery_aggregation_controller {
             dm.add_api_service(api_service);
         }
-        st.proxy_handlers
-            .insert(api_service.metadata.name.clone(), api_service.clone());
-        if exists {
-            return Ok(());
-        }
+        st.proxy_handlers.insert(
+            api_service.metadata.name.clone(),
+            (handler, api_service.clone()),
+        );
         // "if we're dealing with the legacy group, we're done here"
         if api_service.metadata.name == LEGACY_API_SERVICE_NAME {
             return Ok(());
@@ -891,6 +938,9 @@ pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>
         Arc::new(ProxyDiscoveryHandler::new(storage.clone())),
     );
     let manager = Arc::new(AggregatorHandlerManager::new(Some(discovery.clone())));
+    // The request path's "mux": from here on aggregated requests are routed by
+    // the handlers this controller installs.
+    install_handler_manager(manager.clone());
     let controller = Arc::new(APIServiceRegistrationController::new(
         Arc::new(StorageAPIServiceClient(storage.clone())),
         manager,
@@ -1005,6 +1055,51 @@ mod tests {
         c.sync("v1.apps.example.com").await.unwrap();
         assert!(mgr.registered().is_empty());
         assert!(mgr.handled_group_versions().is_empty());
+    }
+
+    /// `AddAPIService` mounts a `proxyHandler` at `/apis/<group>/<version>`
+    /// and, for the first version of a group, the `apiGroupHandler`;
+    /// re-adding updates the existing handler in place; `RemoveAPIService`
+    /// unmounts the version, and the group handler with its last version.
+    #[tokio::test]
+    async fn add_and_remove_mount_and_unmount_handlers() {
+        use crate::aggregator_mux::{ApiGroupResponse, ProxyDecision};
+        let (_, mgr, _, _) = controller_over(lister_with(&[]));
+        assert!(mgr.proxy_handler("g.example.com", "v1").is_none());
+        assert!(mgr.serve_api_group("g.example.com").is_none());
+
+        let mut v1 = svc("v1.g.example.com", true);
+        mgr.add_api_service(&v1).unwrap();
+        let h = mgr.proxy_handler("g.example.com", "v1").unwrap();
+        // Not Available yet: handler_proxy.go answers 503.
+        assert_eq!(h.decide(), ProxyDecision::ServiceUnavailable);
+        mgr.add_api_service(&svc("v2.g.example.com", true)).unwrap();
+        let ApiGroupResponse::Group(g) = mgr.serve_api_group("g.example.com").unwrap() else {
+            panic!("expected group");
+        };
+        assert_eq!(g["versions"].as_array().unwrap().len(), 2);
+
+        // An update reaches the SAME handler (updateAPIService), not a new one.
+        v1.status.conditions.push(
+            rusternetes_common::resources::apiregistration::APIServiceCondition {
+                type_: "Available".into(),
+                status: "True".into(),
+                ..Default::default()
+            },
+        );
+        mgr.add_api_service(&v1).unwrap();
+        assert!(Arc::ptr_eq(
+            &h,
+            &mgr.proxy_handler("g.example.com", "v1").unwrap()
+        ));
+        assert!(matches!(h.decide(), ProxyDecision::Proxy(_)));
+
+        mgr.remove_api_service("v1.g.example.com");
+        assert!(mgr.proxy_handler("g.example.com", "v1").is_none());
+        assert!(mgr.serve_api_group("g.example.com").is_some());
+        mgr.remove_api_service("v2.g.example.com");
+        assert!(mgr.proxy_handler("g.example.com", "v2").is_none());
+        assert!(mgr.serve_api_group("g.example.com").is_none());
     }
 
     /// `Run`: nothing is signalled until the initial sync succeeds; it retries.
