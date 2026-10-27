@@ -1488,12 +1488,11 @@ async fn openapi_v2_baseline_has_no_crd_definitions() {
     let v2 = get_openapi_v2(&state).await;
     let defs = v2.pointer("/definitions").unwrap().as_object().unwrap();
     // No entry should look like a CRD key (reverse-domain group + version + kind).
-    // Both `io.k8s.apimachinery.*` (shared meta types) and `io.k8s.api.*`
-    // (built-in GVKs like Pod/Deployment/Job) are baseline and not CRD-derived.
-    let crd_like: Vec<&String> = defs
-        .keys()
-        .filter(|k| !k.starts_with("io.k8s.apimachinery.") && !k.starts_with("io.k8s.api."))
-        .collect();
+    // Every upstream built-in definition is `io.k8s.*` (shared meta types,
+    // `io.k8s.api.*` GVKs like Pod/Deployment/Job, and the
+    // `io.k8s.apiextensions-apiserver.*` / `io.k8s.kube-aggregator.*` kinds):
+    // baseline, not CRD-derived.
+    let crd_like: Vec<&String> = defs.keys().filter(|k| !k.starts_with("io.k8s.")).collect();
     assert!(
         crd_like.is_empty(),
         "no CRD-derived definitions in baseline /openapi/v2, found: {:?}",
