@@ -4,7 +4,7 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{Pod, Volume};
+use rusternetes_common::resources::Pod;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Arc;
@@ -64,12 +64,6 @@ struct GitRepoVolumeSource {
     repository: String,
     revision: String,
     directory: String,
-}
-
-/// `wrappedVolumeSpec` (`git_repo.go:46-50`): a plain `EmptyDir{}`.
-fn wrapped_volume(vol_name: &str) -> Volume {
-    serde_json::from_value(serde_json::json!({"name": vol_name, "emptyDir": {}}))
-        .expect("static emptyDir volume")
 }
 
 /// `getVolumeSource` (`git_repo.go:291-301`).
@@ -290,36 +284,13 @@ impl Mounter for GitRepoVolumeMounter {
             return Ok(());
         }
 
-        // Wrap EmptyDir, let it do the setup
-        // (`NewWrapperMounter`, `volume_host.go:190-199`: name
-        // `wrapped_<volName>`, then the plugin the manager finds for the spec
-        // — emptyDir).
-        let wrapped_name = format!("wrapped_{}", self.vol_name);
-        let wrapped_volume = wrapped_volume(&wrapped_name);
-        let wrapped = crate::volume_plugins::empty_dir::EmptyDirPlugin::new(self.host.clone())
-            .new_mounter(
-                &Spec {
-                    volume: &wrapped_volume,
-                    persistent_volume: None,
-                    read_only: false,
-                    migrated: false,
-                    inline_volume_spec_for_csi_migration: false,
-                },
-                &self.pod,
-            )
-            .await?;
+        // Wrap EmptyDir, let it do the setup (`NewWrapperMounter`,
+        // `volume_host.go:190-199`); its `SetUpAt` ends with
+        // `volumeutil.SetReady(ed.getMetaDir())` (`empty_dir.go:284`).
+        let wrapped =
+            crate::volume_plugins::util::new_wrapper_mounter(&self.host, &self.vol_name, &self.pod)
+                .await?;
         wrapped.set_up_at(dir, args).await?;
-        // The wrapped emptyDir's `SetUpAt` ends with
-        // `volumeutil.SetReady(ed.getMetaDir())` (`empty_dir.go:284`); our
-        // emptyDir mounter holds no host, so the caller records it, as the
-        // secret plugin does (`TestPlugin`, `git_repo_test.go:497-508`).
-        crate::volume_plugins::util::set_ready(
-            &crate::volume_plugins::util::wrapped_empty_dir_meta_dir(
-                &self.host,
-                &self.vol_name,
-                &self.pod_uid,
-            ),
-        );
 
         let mut clone_args = vec!["clone", "--", self.source.as_str()];
         if !self.target.is_empty() {
