@@ -83,6 +83,9 @@ async fn secure_port_authenticates_and_authorizes_like_the_upstream_chain() {
     // RemoteKubeConfigFileOptional: no kubeconfig and not in a cluster.
     let mut authn = DelegatingAuthenticationOptions::new();
     authn.remote_kubeconfig_file_optional = true;
+    // Hermetic under in-cluster runners (CI pods have a service account):
+    // upstream `--authentication-skip-lookup` / `SkipInClusterLookup`.
+    authn.skip_in_cluster_lookup = true;
     authn.client_ca = ca_file.to_str().unwrap().to_string();
     let authn = authn.apply_to(Some(&mut info)).await.unwrap();
     let mut authz = DelegatingAuthorizationOptions::new();
