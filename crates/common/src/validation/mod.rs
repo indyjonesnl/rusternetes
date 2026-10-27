@@ -66,6 +66,7 @@ pub mod service;
 pub mod servicecidr;
 pub mod storageclass;
 pub mod storageversion;
+pub mod storageversionmigration;
 pub mod structural;
 pub mod validating_admission_policy;
 pub mod volumeattachment;

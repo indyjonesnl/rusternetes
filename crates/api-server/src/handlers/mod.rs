@@ -75,6 +75,7 @@ pub mod servicecidr;
 pub mod statefulset;
 pub mod storageclass;
 pub mod storageversion;
+pub mod storageversionmigration;
 pub mod table;
 pub mod validating_admission_policy;
 pub mod validating_admission_policy_v1beta1;
