@@ -11614,10 +11614,7 @@ impl ProtoRegistry {
             MessageSchema {
                 fields: HashMap::from([
                     (1, ("type".into(), FieldType::String)),
-                    (
-                        2,
-                        ("object".into(), FieldType::Message("RawExtension".into())),
-                    ),
+                    (2, ("object".into(), FieldType::JsonRaw)),
                 ]),
             },
         );

@@ -5,7 +5,6 @@
 
 
 # --- nosch: no protobuf registry schema for this kind/version (decode_k8s_resource/encode_native return None)
-decode,encode-bytes,encode-semantic,zero-fixpoint | core.v1.WatchEvent | #3057 | no protobuf registry schema for this kind/version (decode_k8s_resource/encode_native return None)
 
 # --- legacyvol: fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
 encode-bytes | apps.v1.DaemonSet | #3057 | fixture carries the legacy in-tree volume sources our Volume model intentionally omits (completeness_skip VolumeSource); byte equality is unreachable until they are modelled
