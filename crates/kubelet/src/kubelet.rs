@@ -705,6 +705,31 @@ pub fn reconcile_existing_node(existing: &mut Node, desired: &Node) {
     }
 }
 
+/// The kubelet's service-account token signer for the storage-direct backends
+/// (all-in-one), where no api-server TokenRequest round trip is available and
+/// the kubelet falls back to signing in-process.
+///
+/// Upstream's kubelet never signs: `token.Manager.GetServiceAccountToken`
+/// (`pkg/kubelet/token/token_manager.go`) calls `CreateToken`, and the
+/// api-server signs with `--service-account-signing-key-file` under
+/// `--service-account-issuer` / `--api-audiences`
+/// (`pkg/kubeapiserver/options/authentication.go` `ToAuthenticationConfig`).
+/// Until the storage-direct kubelet can reach the TokenRequest handler, the
+/// closest faithful behaviour is to sign with the SAME key, issuer and
+/// audiences the co-located api-server was configured with, so tokens the
+/// kubelet mounts are accepted by it. `JWT_SECRET` matches the api-server's
+/// own default when no signing key file is given.
+pub fn service_account_token_manager(
+    opts: &rusternetes_common::auth::ServiceAccountOptions,
+) -> Result<rusternetes_common::auth::TokenManager> {
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
+    Ok(
+        rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes())
+            .with_service_account_options(opts)?,
+    )
+}
+
 impl Kubelet {
     /// Construct a Kubelet with upstream-default eviction config and
     /// `root_dir = /var/lib/kubelet`. Kept for library back-compat; the
@@ -736,6 +761,7 @@ impl Kubelet {
             Vec::new(),
             Vec::new(),
             false,
+            service_account_token_manager(&Default::default())?,
         )
         .await
     }
@@ -759,6 +785,7 @@ impl Kubelet {
         allowed_unsafe_sysctls: Vec<String>,
         node_ips: Vec<std::net::IpAddr>,
         external_cloud_provider: bool,
+        token_manager: rusternetes_common::auth::TokenManager,
     ) -> Result<Self> {
         let node_ip_validator: Arc<dyn Fn(std::net::IpAddr) -> Result<(), String> + Send + Sync> =
             Arc::new(crate::node_ip::validate_node_ip_on_host);
@@ -776,9 +803,6 @@ impl Kubelet {
 
         // VolumeManager shares the kubelet's storage + the api-server JWT secret
         // (for projected service-account tokens), mirroring the bollard runtime.
-        let jwt_secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "rusternetes-secret-change-in-production".to_string());
-        let token_manager = rusternetes_common::auth::TokenManager::new_auto(jwt_secret.as_bytes());
         // Pod certificate manager (`kubelet.go:955-972`), built before the
         // volume host so the projected `podCertificate` source can reach it.
         let pod_cache = crate::podcertificate::wiring::PodCache::new();
@@ -6800,6 +6824,44 @@ impl crate::eviction::NodeReclaimer for KubeletNodeReclaimer<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::service_account_token_manager;
+
+    /// The storage-direct kubelet signer carries the api-server's
+    /// `--service-account-issuer` / `--api-audiences` (issue #2713), so a token
+    /// it mints carries the configured issuer and is accepted by the
+    /// api-server's manager built from the same options.
+    #[test]
+    fn service_account_token_manager_honours_issuer_and_audiences() {
+        let key = format!(
+            "{}/../common/tests/fixtures/sa/rsa-pkcs1.key",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let opts = rusternetes_common::auth::ServiceAccountOptions {
+            key_files: vec![key.clone()],
+            signing_key_file: Some(key),
+            issuers: vec!["https://issuer.example".to_string()],
+            api_audiences: vec!["api-aud".to_string()],
+            ..Default::default()
+        };
+        let tm = service_account_token_manager(&opts).unwrap();
+        assert_eq!(tm.issuer(), Some("https://issuer.example"));
+        assert_eq!(tm.api_audiences(), ["api-aud".to_string()]);
+        let mut claims = rusternetes_common::auth::ServiceAccountClaims::new(
+            "sa".into(),
+            "ns".into(),
+            "uid".into(),
+            1,
+        );
+        claims.aud = tm.api_audiences().to_vec();
+        let tok = tm.generate_token(claims).unwrap();
+        let api_server_tm = service_account_token_manager(&opts).unwrap();
+        let got = api_server_tm.validate_token(&tok).unwrap();
+        assert_eq!(got.iss, "https://issuer.example");
+        // Unconfigured: no issuer override, no audiences.
+        let none = service_account_token_manager(&Default::default()).unwrap();
+        assert_eq!(none.issuer(), None);
+        assert!(none.api_audiences().is_empty());
+    }
     use super::Kubelet;
 
     /// Storage that behaves like the api-server Store on PUT: a non-empty
@@ -7250,6 +7312,7 @@ mod tests {
             Vec::new(),
             ips.iter().map(|s| s.parse().unwrap()).collect(),
             external,
+            service_account_token_manager(&Default::default()).unwrap(),
         )
         .await
         .unwrap()

@@ -660,6 +660,9 @@ async fn main() -> Result<()> {
             args.allowed_unsafe_sysctls.clone(),
             node_ips,
             external_cloud_provider,
+            // Standalone kubelet: tokens come from the api-server's
+            // TokenRequest; this signer is only the storage-direct fallback.
+            rusternetes_kubelet::kubelet::service_account_token_manager(&Default::default())?,
         )
         .await?
         .with_hostname(&hostname)

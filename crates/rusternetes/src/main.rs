@@ -604,6 +604,7 @@ async fn async_main() -> Result<()> {
         node_ip: args.node_ip.clone(),
         cloud_provider: args.cloud_provider.clone(),
         hostname_override: args.hostname_override.clone(),
+        service_account: args.service_account.to_options(),
         kubernetes_service_host: args
             .kubernetes_service_host
             .clone()
