@@ -4455,6 +4455,7 @@ dependencies = [
  "etcd-client",
  "flate2",
  "futures",
+ "ipnet",
  "jsonwebtoken",
  "k8s-openapi",
  "once_cell",
