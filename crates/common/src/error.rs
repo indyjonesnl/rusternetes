@@ -374,6 +374,17 @@ impl Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "axum-support")]
+/// Response extension carrying the `Status` an [`Error`] was rendered from.
+///
+/// Upstream writes every error through `responsewriters.ErrorNegotiated`
+/// (`apiserver/pkg/endpoints/handlers/responsewriters/writers.go:381-397`),
+/// which has the request in hand. `IntoResponse` has no request, so it renders
+/// JSON and leaves this marker for the api-server's
+/// `negotiated_error::negotiate_error_middleware` to re-encode per `Accept`.
+#[derive(Clone, Debug)]
+pub struct ErrorStatus(pub crate::types::Status);
+
+#[cfg(feature = "axum-support")]
 impl axum::response::IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
@@ -396,7 +407,9 @@ impl axum::response::IntoResponse for Error {
                 .and_then(|d| d.retry_after_seconds)
                 .filter(|s| *s > 0);
             let audit_obj = serde_json::to_value(&*status_obj).ok();
+            let negotiable = ErrorStatus((*status_obj).clone());
             let mut response = (code, Json(*status_obj)).into_response();
+            response.extensions_mut().insert(negotiable);
             if let Some(v) = audit_obj {
                 response
                     .extensions_mut()
@@ -530,7 +543,9 @@ impl axum::response::IntoResponse for Error {
         }
 
         let audit_obj = serde_json::to_value(&status_obj).ok();
+        let negotiable = ErrorStatus(status_obj.clone());
         let mut response = (status, Json(status_obj)).into_response();
+        response.extensions_mut().insert(negotiable);
         if let Some(v) = audit_obj {
             response
                 .extensions_mut()

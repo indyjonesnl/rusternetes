@@ -3139,6 +3139,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // outermost recovery; a panicking handler answers `http.Error(w,
     // "This request caused apiserver to panic. Look in the logs for
     // details.", 500)` instead of dropping the connection.
+    // `responsewriters.ErrorNegotiated` for every `Error::into_response`
+    // body (#3578): re-encode per the request's Accept.
+    .layer(axum::middleware::from_fn(
+        crate::negotiated_error::negotiate_error_middleware,
+    ))
     .layer(tower_http::catch_panic::CatchPanicLayer::custom(
         |_panic: Box<dyn std::any::Any + Send + 'static>| {
             tracing::error!("apiserver panic'd");
