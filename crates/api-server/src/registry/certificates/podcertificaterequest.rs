@@ -93,6 +93,12 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<PodCertificateRequest> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/certificates/podcertificaterequest/strategy.go:120-127):
+    /// `spec`. Only the status strategy defines it; `Strategy` does not.
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new().with("certificates.k8s.io/v1alpha1", &[&["spec"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -147,6 +153,19 @@ mod tests {
 
     /// strategy_test.go: create wipes status; update keeps the old status;
     /// the status strategy keeps the old spec.
+    #[test]
+    fn reset_fields_only_on_status_strategy() {
+        use crate::ssa::ResetFields;
+        assert_eq!(
+            RestUpdateStrategy::<PodCertificateRequest>::get_reset_fields(&StatusStrategy),
+            ResetFields::new().with("certificates.k8s.io/v1alpha1", &[&["spec"]])
+        );
+        assert_eq!(
+            RestUpdateStrategy::<PodCertificateRequest>::get_reset_fields(&Strategy),
+            ResetFields::new()
+        );
+    }
+
     #[test]
     fn prepare_for_create_and_update() {
         let ctx = RequestContext::new(Some("ns"));

@@ -81,6 +81,13 @@ impl RestCreateStrategy<CertificateSigningRequest> for Strategy {
 }
 
 impl RestUpdateStrategy<CertificateSigningRequest> for Strategy {
+    /// `GetResetFields` (pkg/registry/certificates/certificates/strategy.go:56-69).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with("certificates.k8s.io/v1", &[&["spec"], &["status"]])
+            .with("certificates.k8s.io/v1beta1", &[&["spec"], &["status"]])
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -211,6 +218,19 @@ impl NamespaceScopedStrategy for StatusStrategy {
 }
 
 impl RestUpdateStrategy<CertificateSigningRequest> for StatusStrategy {
+    /// `GetResetFields` (pkg/registry/certificates/certificates/strategy.go:158-171).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with(
+                "certificates.k8s.io/v1",
+                &[&["spec"], &["status", "conditions"]],
+            )
+            .with(
+                "certificates.k8s.io/v1beta1",
+                &[&["spec"], &["status", "conditions"]],
+            )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -254,6 +274,19 @@ impl NamespaceScopedStrategy for ApprovalStrategy {
 }
 
 impl RestUpdateStrategy<CertificateSigningRequest> for ApprovalStrategy {
+    /// `GetResetFields` (pkg/registry/certificates/certificates/strategy.go:269-282).
+    fn get_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+            .with(
+                "certificates.k8s.io/v1",
+                &[&["spec"], &["status", "certificate"]],
+            )
+            .with(
+                "certificates.k8s.io/v1beta1",
+                &[&["spec"], &["status", "certificate"]],
+            )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
