@@ -8735,7 +8735,10 @@ impl ProtoRegistry {
             return None;
         }
 
-        let raw = raw_bytes?;
+        // An all-zero object marshals to an empty payload and prost drops the
+        // empty `Unknown.raw`, so a missing `raw` is the empty message, not an
+        // error (Go's `Unknown.Raw` is nil for it and decodes to the zero value).
+        let raw = raw_bytes.unwrap_or(&[]);
 
         // Check if raw is already JSON
         if !raw.is_empty() && (raw[0] == b'{' || raw[0] == b'[') {

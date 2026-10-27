@@ -70,19 +70,12 @@ decode,encode-bytes | rbac.authorization.k8s.io.v1alpha1.ClusterRole | #3057 | p
 decode,encode-bytes,encode-semantic | rbac.authorization.k8s.io.v1alpha1.ClusterRoleBinding | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
 decode,encode-bytes | rbac.authorization.k8s.io.v1alpha1.Role | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
 decode,encode-bytes,encode-semantic | rbac.authorization.k8s.io.v1alpha1.RoleBinding | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
-decode,encode-bytes,encode-semantic,zero-fixpoint | resource.k8s.io.v1beta1.ResourceClaim | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
-decode,encode-bytes,encode-semantic,zero-fixpoint | resource.k8s.io.v1beta2.ResourceClaim | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
+decode,encode-bytes,encode-semantic | resource.k8s.io.v1beta1.ResourceClaim | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
+decode,encode-bytes,encode-semantic | resource.k8s.io.v1beta2.ResourceClaim | #3057 | pre-GA version: the registry keeps ONE schema per bare kind (the GA shape), so the older wire layout differs
 
 # --- apiext: apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
 decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1.ConversionReview | #3057 | apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
 decode,encode-bytes,encode-semantic | apiextensions.k8s.io.v1.CustomResourceDefinition | #3057 | apiextensions JSONSchemaProps/JSONSchemaPropsOrBool/RawExtension codec does not match the Go wire/JSON shape
-
-# --- zeroempty: an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
-zero-fixpoint | core.v1.GetOptions | #3057 | an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
-zero-fixpoint | core.v1.NodeProxyOptions | #3057 | an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
-zero-fixpoint | core.v1.PodAttachOptions | #3057 | an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
-zero-fixpoint | core.v1.PodProxyOptions | #3057 | an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
-zero-fixpoint | core.v1.ServiceProxyOptions | #3057 | an all-zero options object encodes to an empty Unknown.raw, which decode_k8s_resource rejects (returns None)
 
 # --- obsgen: typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
 typed,typed-wire | admissionregistration.k8s.io.v1.ValidatingAdmissionPolicy | #2958 | typed Condition lacks observedGeneration (status.conditions[].observedGeneration dropped)
