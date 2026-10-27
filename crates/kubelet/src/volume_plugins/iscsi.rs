@@ -77,6 +77,42 @@ impl IscsiPlugin {
         }
     }
 
+    /// The global mounts (`makeGlobalPDName` directories,
+    /// `<plugin dir>/iface-<iface>/<portal>-<iqn>-lun-<n>`,
+    /// `iscsi_util.go:184-186`) currently mounted on this node.
+    ///
+    /// Stands in for the `ActualStateOfWorld` entries upstream's reconstruction
+    /// would hold for them: the kubelet keeps no record of which devices it
+    /// `MountDevice`d, so the plugin directory is the source (the `volumeDevices`
+    /// block-map tree is not a filesystem global mount and is skipped).
+    pub(crate) fn list_global_mounts(&self) -> Vec<String> {
+        let plugin_dir = self.host.get_plugin_dir(ISCSI_PLUGIN_NAME);
+        let mounter = self.host.get_mounter();
+        let mut out = Vec::new();
+        let Ok(ifaces) = std::fs::read_dir(&plugin_dir) else {
+            return out;
+        };
+        for iface in ifaces.flatten() {
+            if !iface.file_name().to_string_lossy().starts_with("iface-") {
+                continue;
+            }
+            let Ok(devices) = std::fs::read_dir(iface.path()) else {
+                continue;
+            };
+            for dev in devices.flatten() {
+                if !dev.file_name().to_string_lossy().contains("-lun-") {
+                    continue;
+                }
+                let path = dev.path().to_string_lossy().into_owned();
+                if let Ok(false) = mounter.is_likely_not_mount_point(&path) {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// `GetAccessModes` (`iscsi.go:97-102`): `PersistentVolumePlugin`.
     pub fn get_access_modes(&self) -> Vec<PersistentVolumeAccessMode> {
         vec![
