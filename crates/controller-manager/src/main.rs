@@ -1852,6 +1852,30 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Start the PodCertificateRequest cleaner
+    // (`newPodCertificateRequestCleanerController`,
+    // cmd/kube-controller-manager/app/certificates.go:232-253), gated on the
+    // `PodCertificateRequest` feature gate.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    ) {
+        let pcr_cleaner = Arc::new(controllers::pcr_cleaner::PcrCleanerController::new(
+            storage.clone(),
+        ));
+        spawn_controller!(
+            "PodCertificateRequest cleaner controller",
+            leader_elector,
+            {
+                let controller = pcr_cleaner.clone();
+                async move {
+                    if let Err(e) = controller.run().await {
+                        tracing::error!("PodCertificateRequest cleaner controller error: {}", e);
+                    }
+                }
+            }
+        );
+    }
+
     // Start Namespace controller (watch-based). Hand it the CA cert so it can
     // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
     // same dir the metrics/cert paths use above).
