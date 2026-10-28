@@ -100,6 +100,12 @@ struct Args {
     #[arg(long = "attach-detach-controller", default_value_t = false)]
     attach_detach_controller: bool,
 
+    /// Run the bootstrap signer (`bootstrapsigner`). Upstream registers it
+    /// `isDisabledByDefault: true` (cmd/kube-controller-manager/app/bootstrap.go:60),
+    /// so it is opt-in here too; same flag as the standalone controller-manager.
+    #[arg(long = "bootstrap-signer-controller", default_value_t = false)]
+    bootstrap_signer_controller: bool,
+
     /// Node name for the embedded kubelet
     #[arg(long, default_value = "node-1")]
     node_name: String,
@@ -565,7 +571,7 @@ async fn async_main() -> Result<()> {
         node_ipam: None,
         csi_attachers,
         attach_detach_controller: args.attach_detach_controller,
-        bootstrap_signer_controller: false,
+        bootstrap_signer_controller: args.bootstrap_signer_controller,
         selinux_warning_controller: false,
         terminated_pod_gc_threshold:
             rusternetes_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
