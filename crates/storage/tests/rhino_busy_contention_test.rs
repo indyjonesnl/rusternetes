@@ -20,15 +20,29 @@ use sqlx::{ConnectOptions, SqliteConnection};
 use std::path::Path;
 use std::time::Duration;
 
+/// Opening a fresh database (WAL pragma, startup VACUUM connection still
+/// closing, schema setup) can itself see "database is locked" within the
+/// shortened 50ms `busy_timeout` on a loaded runner. That is open-time noise,
+/// not the contention under test, so retry the open a bounded number of times.
 async fn storage(path: &Path) -> RhinoStorage<rhino::SqliteBackend> {
-    RhinoStorage::with_config(SqliteConfig {
-        dsn: path.to_string_lossy().into_owned(),
-        compact_interval: Duration::ZERO,
-        busy_timeout: Duration::from_millis(50),
-        ..Default::default()
-    })
-    .await
-    .expect("storage")
+    let mut last = None;
+    for _ in 0..10 {
+        match RhinoStorage::with_config(SqliteConfig {
+            dsn: path.to_string_lossy().into_owned(),
+            compact_interval: Duration::ZERO,
+            busy_timeout: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(st) => return st,
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("storage: {:?}", last.unwrap());
 }
 
 async fn hold_write_lock(path: &Path) -> SqliteConnection {
