@@ -1,4 +1,3 @@
-pub mod apiservice;
 pub mod attach_detach;
 pub mod bootstrap_signer;
 pub mod bootstrap_token_cleaner;
@@ -6,7 +5,6 @@ pub mod cascade_tests;
 pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
-pub mod clusterrole_aggregation;
 pub mod clustertrustbundle_publisher;
 pub(crate) mod controller_utils;
 pub mod cronjob;
@@ -88,6 +86,8 @@ pub mod volume_data_source_validator;
 pub mod volume_expansion;
 pub mod volume_snapshot;
 pub mod vpa;
+// Shared with the api-server, which runs them in-process (as upstream does).
+pub use rusternetes_controller_core::{apiservice, clusterrole_aggregation};
 pub mod worker_pool;
 #[cfg(test)]
 mod worker_pool_tests;

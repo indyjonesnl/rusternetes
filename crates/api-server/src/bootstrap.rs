@@ -1101,7 +1101,7 @@ pub fn spawn_apiservice_availability_controller(
 }
 
 fn spawn_apiservice_availability_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
-    use rusternetes_controller_manager::controllers::apiservice::APIServiceAvailabilityController;
+    use rusternetes_controller_core::apiservice::APIServiceAvailabilityController;
     tokio::spawn(async move {
         let controller = Arc::new(APIServiceAvailabilityController::new(storage));
         if let Err(e) = controller.run().await {
@@ -2713,7 +2713,7 @@ mod tests {
         let admin: ClusterRole = storage.get("/registry/clusterroles/admin").await.unwrap();
         assert!(admin.aggregation_rule.is_some());
         assert!(admin.rules.is_empty(), "seeded without rules");
-        rusternetes_controller_manager::controllers::clusterrole_aggregation::ClusterRoleAggregationController::new(storage.clone())
+        rusternetes_controller_core::clusterrole_aggregation::ClusterRoleAggregationController::new(storage.clone())
             .sync_all()
             .await
             .unwrap();
