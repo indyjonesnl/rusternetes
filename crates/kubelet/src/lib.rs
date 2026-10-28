@@ -38,6 +38,7 @@ pub mod serving_tls;
 pub mod static_pod_url;
 pub mod static_pod_watch;
 pub mod static_pods;
+pub mod streaming_server;
 pub mod sync_locks;
 pub mod sysctl;
 pub mod volume_manager;
