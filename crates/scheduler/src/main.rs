@@ -5,39 +5,13 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod advanced;
-mod data_plane;
-mod diagnosis;
-#[allow(dead_code)]
-mod framework;
-#[allow(dead_code)] // library API surface (Framework accessors); partly unused by the binary
-mod framework_runtime;
-mod inter_pod_affinity_score;
-mod node_volume_limits;
-#[allow(dead_code)]
-mod plugins;
-mod pod_topology_spread_score;
-#[allow(dead_code)] // library API surface (Map accessors); partly unused by the binary
-mod profile;
-#[allow(dead_code)] // library API surface (queue introspection); partly unused by the binary
-mod queue;
-mod resource_events;
-mod scheduler;
-#[allow(dead_code)] // library API surface (single-profile loaders); partly unused by the binary
-mod scheduler_config;
-#[allow(dead_code)] // library API surface; test-only helpers unused by the binary
-mod score;
-#[allow(dead_code)] // library API surface (informer delete/new); partly unused by the binary
-mod volume_assume;
-mod volume_bind;
-mod volume_binding;
-
 use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
 use rusternetes_common::observability::MetricsRegistry;
+use rusternetes_scheduler::scheduler::Scheduler;
+use rusternetes_scheduler::{data_plane, profile, scheduler_config};
 use rusternetes_storage::{StorageBackend, StorageConfig};
-use scheduler::Scheduler;
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;

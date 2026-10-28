@@ -1,6 +1,5 @@
-// The router module is compiled into both this lib and the bin; it names the
-// shared process-global state through the extern crate path, which `self`
-// aliases here.
+// Modules name the shared process-global state through the extern crate path
+// (`rusternetes_api_server::...`), which `self` aliases here.
 extern crate self as rusternetes_api_server;
 
 pub mod abac;

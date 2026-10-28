@@ -680,7 +680,7 @@ impl<T: PodEventTarget + Send + Sync + 'static> PodObservationHandler for Regist
 /// saw the add, and the add is what lowers `ControllerExpectations`
 /// (replica_set.go:436). Here the cache is consulted exactly once per event,
 /// before any target is told.
-pub(crate) struct SharedPodInformer<S: Storage> {
+pub struct SharedPodInformer<S: Storage> {
     storage: Arc<S>,
     interval: Duration,
     cache: PodInformerCache,
@@ -692,7 +692,7 @@ pub(crate) struct SharedPodInformer<S: Storage> {
 }
 
 impl<S: Storage + 'static> SharedPodInformer<S> {
-    pub(crate) fn new(storage: Arc<S>, interval: Duration) -> Self {
+    pub fn new(storage: Arc<S>, interval: Duration) -> Self {
         Self {
             storage,
             interval,

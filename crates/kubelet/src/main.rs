@@ -5,84 +5,10 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[allow(dead_code, unused_imports)]
-mod config;
-#[allow(dead_code, unused_imports)]
-mod cri_runtime;
-// The standalone bin drives the CRI backend, so it no longer consumes the
-// kubelet's lifecycle-event / label / preStop / volume-manager / hostname free
-// helpers — those are only reached through the lib API now. They stay compiled
-// into the bin (shared modules) but read as dead here; the lib is their real
-// consumer.
-mod atomic_writer;
-mod clustertrustbundle;
-// The single home for downward-API `fieldRef`/`resourceFieldRef` resolution.
-// `volumes` and `cri_runtime::translate` both delegate here; until now this
-// module was declared only in `lib.rs`, so the *binary* compiled two divergent
-// hand-rolled copies instead and its unit tests guarded neither of them.
-mod downward_api;
-#[allow(dead_code)]
-mod events;
-#[allow(dead_code)]
-mod eviction;
-#[allow(dead_code)]
-#[cfg(target_os = "linux")]
-mod fsquota;
-#[allow(dead_code)]
-mod go_selinux;
-#[allow(dead_code)]
-mod go_selinux_label;
-mod host_port;
-#[allow(dead_code)]
-mod image_gc;
-mod image_gc_cri;
-#[allow(dead_code)]
-mod kubelet;
-#[allow(dead_code)]
-mod labels;
-#[allow(dead_code)]
-mod lifecycle;
-mod node_ip;
-mod node_status;
-// Wired in main below; the full surface is only reachable from lib users/tests.
-#[allow(dead_code)]
-mod pluginmanager;
-mod pod_dirs;
-mod pod_status;
-#[allow(dead_code)]
-mod podcertificate;
-mod poll;
-mod removeall;
-mod serving_tls;
-// The standalone bin no longer uses the bollard ContainerRuntime (the kubelet
-// runs on the CRI backend); runtime.rs is kept only for the still-shared free
-// helpers (volume setup, init-action decisions), which the bin does not all
-// call directly.
-#[allow(dead_code)]
-mod runtime;
-mod runtime_state;
-mod server;
-mod server_auth;
-mod server_debug;
-mod server_logs;
-mod server_metrics;
-mod server_metrics_endpoints;
-mod static_pod_url;
-mod static_pod_watch;
-mod static_pods;
-mod streaming_server;
-mod sync_locks;
-mod sysctl;
-// The binary does not use the volume-manager caches yet; population arrives
-// with the desired-state-of-world populator (#1970).
-#[allow(dead_code, unused_imports)]
-mod volume_manager;
-#[allow(dead_code)]
-mod volume_ownership;
-#[allow(dead_code, unused_imports)]
-mod volume_plugins;
-#[allow(dead_code)]
-mod volumes;
+use rusternetes_kubelet::{
+    config, eviction, image_gc, kubelet, node_ip, pluginmanager, server, server_auth, server_debug,
+    server_logs, server_metrics_endpoints, serving_tls, streaming_server, volume_plugins,
+};
 
 use anyhow::{Context, Result};
 use axum::{routing::get, Json, Router};

@@ -5,76 +5,14 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod admission;
-mod audit;
-mod authorization_filter;
-mod negotiated_error;
-pub use rusternetes_admission_webhook as admission_webhook;
-#[allow(dead_code)]
-mod bootstrap;
-#[allow(dead_code)]
-mod legacy_token_tracking;
-pub use rusternetes_admission_webhook::cel_evaluators as cel;
-mod apiserver_request_metrics;
-mod conversion;
-mod deprecation;
-mod dynamic_routes;
-mod endpoints;
-#[allow(dead_code)]
-mod flow_control;
-#[allow(dead_code)]
-mod flow_control_conc_alloc;
-mod flow_control_filter;
-#[allow(dead_code)]
-mod flow_control_integrator;
-#[allow(dead_code)]
-mod flow_control_metrics;
-#[allow(dead_code)]
-mod flow_control_object_count;
-#[allow(dead_code)]
-mod flow_control_queueset;
-#[allow(dead_code)]
-mod flow_control_stats_poller;
-mod flow_control_watch_tracker;
-#[allow(dead_code)]
-mod flow_control_work_estimator;
-mod gnostic;
-mod handlers;
-use rusternetes_middleware as middleware;
-mod openapi;
-mod patch;
-#[allow(dead_code)]
-mod post_start_hooks;
-mod prometheus_client;
-#[allow(dead_code)]
-mod registry;
-// The task-local is read by the lib's webhook authorizer, so the bin must
-// install it through the lib's module, not a second copy (#3159).
-use rusternetes_api_server::request_scope;
-// `s.Flagz` is read by the lib router, so set it through the lib module.
-use rusternetes_api_server::zpages;
-// The aggregator handler table is installed by the lib's registration hooks and
-// read by the bin's router, so both must share the lib's copy (#3925).
-use rusternetes_api_server::aggregator_mux;
-// The bin's own `bootstrap` copy names the lib's trust type (#3414).
-use rusternetes_api_server::request_header_authentication;
-// The bin's own `admission` copy shares the lib's webhook client (ImagePolicyWebhook).
-use rusternetes_api_server::authorization_webhook;
-#[allow(dead_code)]
-mod storage_readiness_hook;
-pub use rusternetes_protobuf as protobuf;
-#[allow(dead_code)]
-mod fieldmanager;
-mod request_timeout;
-#[allow(dead_code)]
-mod response;
-mod router;
-mod ssa;
-mod state;
-#[allow(dead_code)]
-mod streaming;
 mod upstream_flags;
-mod watch_cache;
+// The bin shares the lib's modules (and so its process-global state) rather
+// than recompiling them as a second copy of the crate.
+use rusternetes_api_server::{
+    admission, audit, bootstrap, flow_control, flow_control_filter, flow_control_object_count,
+    flow_control_stats_poller, post_start_hooks, prometheus_client, registry, request_timeout,
+    router, state, zpages,
+};
 
 use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;

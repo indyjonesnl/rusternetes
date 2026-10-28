@@ -52,7 +52,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     /// A controller whose pod event handlers hang off an informer shared with
     /// other controllers.
-    pub(crate) fn with_pod_informer(
+    pub fn with_pod_informer(
         storage: Arc<S>,
         interval_secs: u64,
         pod_informer: Arc<SharedPodInformer<S>>,
