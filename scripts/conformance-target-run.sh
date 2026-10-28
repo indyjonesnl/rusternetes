@@ -115,6 +115,24 @@ target_counts() {
     echo "1 $passed $failed $skipped $total"
 }
 
+# ginkgo_summary_counts <run.log>
+# Echoes "1 passed failed skipped total" from ginkgo's own suite summary line
+# ("SUCCESS! -- 105 Passed | 0 Failed | 0 Pending | 7243 Skipped" or "FAIL! -- ..."),
+# or "0 0 0 0 0" when the log carries none. The summary is what ginkgo prints once
+# the whole suite has run, so it stays authoritative when hydrophone dies copying
+# the results out afterwards (junit never arrives) — e.g. its `cat
+# /tmp/results/e2e.log` finding nothing the instant the log tail hits EOF.
+# `Pending` is folded into skipped; ANSI colour is tolerated.
+ginkgo_summary_counts() {
+    local log="${1:-}" line
+    [ -f "$log" ] || { echo "0 0 0 0 0"; return; }
+    line=$(sed 's/\x1b\[[0-9;]*m//g' "$log" \
+        | grep -E '^(SUCCESS|FAIL)! -- [0-9]+ Passed \| [0-9]+ Failed \| [0-9]+ Pending \| [0-9]+ Skipped' \
+        | tail -n 1)
+    [ -n "$line" ] || { echo "0 0 0 0 0"; return; }
+    echo "$line" | awk '{ printf "1 %d %d %d %d\n", $3, $6, $12 + $9, $3 + $6 + $9 + $12 }'
+}
+
 # Names of the ginkgo suite-level nodes that FAILED, one per line ("  - <name>").
 # These are excluded from the spec counts above, so without this a broken
 # BeforeSuite looks exactly like a focus that matched nothing.
@@ -310,6 +328,21 @@ done_marker_present() {
         >/dev/null 2>&1
 }
 
+# wait_for_done_marker <kubeconfig> [seconds]
+# Polls done_marker_present every 5s for up to SALVAGE_DONE_WAIT (default 120)
+# seconds; true once it shows up. Used before salvaging after a hydrophone that
+# died by itself: it may have read the log tail a moment before go-runner's
+# saveResults (test/conformance/image/go-runner/main.go:116) had finished.
+wait_for_done_marker() {
+    local kc="${1:-}" budget="${2:-${SALVAGE_DONE_WAIT:-120}}" waited=0
+    while :; do
+        done_marker_present "$kc" && return 0
+        [ "$waited" -lt "$budget" ] || return 1
+        sleep 5
+        waited=$((waited + 5))
+    done
+}
+
 # sleep_while_alive <pid> <seconds>: sleep up to <seconds>, one second at a
 # time; false as soon as <pid> is gone.
 sleep_while_alive() {
@@ -486,6 +519,14 @@ if [ -e "$OUTPUT_DIR/.hydrophone-stopped-at-done" ]; then
 elif [ "${#hydro_bound[@]}" -gt 0 ] && { [ "$hydro_exit" -eq 124 ] || [ "$hydro_exit" -eq 137 ]; }; then
     echo "[conformance-target-run] target=$TARGET hydrophone timed out after ${HYDROPHONE_TIMEOUT}s (exit $hydro_exit) — salvaging results" >&2
     salvage_junit_from_pod "$OUTPUT_DIR" "$KUBECONFIG_PATH"
+# Hydrophone died by itself (e.g. "failed to download results ... cat:
+# /tmp/results/e2e.log: No such file or directory" right after the suite ended).
+# That is a retrieval failure, not a suite verdict: the pod's output sidecar
+# still holds the results, so wait for the done marker and copy them out.
+elif [ "$hydro_exit" -ne 0 ] && ! ls "$OUTPUT_DIR"/junit_*.xml >/dev/null 2>&1; then
+    echo "[conformance-target-run] target=$TARGET hydrophone exited $hydro_exit without junit — salvaging results from the pod" >&2
+    wait_for_done_marker "$KUBECONFIG_PATH" || echo "[conformance-target-run] done marker not seen within ${SALVAGE_DONE_WAIT:-120}s; trying anyway" >&2
+    salvage_junit_from_pod "$OUTPUT_DIR" "$KUBECONFIG_PATH"
 fi
 
 # Ginkgo writes framework setup testcases to junit even when the focus selects
@@ -498,6 +539,18 @@ if grep -Eq 'Will run 0 of [0-9]+ specs' "$OUTPUT_DIR/run.log"; then
 fi
 
 IFS=' ' read -r HAD_JUNIT PASSED FAILED SKIPPED TOTAL <<<"$(target_counts "$OUTPUT_DIR")"
+
+# No junit could be retrieved, but ginkgo finished and printed its own summary:
+# the suite ran, only the results copy-out failed. Report ginkgo's counts rather
+# than an "infra failure" for a suite that passed.
+SUMMARY_ONLY=0
+if [ "$HAD_JUNIT" -eq 0 ]; then
+    IFS=' ' read -r S_HAD S_PASSED S_FAILED S_SKIPPED S_TOTAL <<<"$(ginkgo_summary_counts "$OUTPUT_DIR/run.log")"
+    if [ "$S_HAD" -eq 1 ]; then
+        echo "[conformance-target-run] target=$TARGET — no junit retrieved (hydrophone exit $hydro_exit); using ginkgo's suite summary from run.log: passed=$S_PASSED failed=$S_FAILED skipped=$S_SKIPPED" >&2
+        HAD_JUNIT=1; PASSED=$S_PASSED; FAILED=$S_FAILED; SKIPPED=$S_SKIPPED; TOTAL=$S_TOTAL; SUMMARY_ONLY=1
+    fi
+fi
 
 if [ "$HAD_JUNIT" -eq 0 ]; then
     echo "[conformance-target-run] target=$TARGET hydrophone_exit=$hydro_exit — NO junit produced (infra failure)"
@@ -524,7 +577,11 @@ fi
 echo "[conformance-target-run] target=$TARGET hydrophone_exit=$hydro_exit passed=$PASSED failed=$FAILED skipped=$SKIPPED total=$((PASSED + FAILED))"
 if [ "$FAILED" -gt 0 ]; then
     echo "[conformance-target-run] FAILED tests:"
-    spec_failures "$OUTPUT_DIR" || true
+    if [ "$SUMMARY_ONLY" -eq 1 ]; then
+        echo "[conformance-target-run] (no junit: see the ginkgo output in run.log for the failing specs)"
+    else
+        spec_failures "$OUTPUT_DIR" || true
+    fi
     capture_component_logs "$OUTPUT_DIR"
 fi
 

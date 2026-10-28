@@ -156,6 +156,18 @@ J
 J
   ;;
   nojunit) : ;;  # produce nothing
+  # Hydrophone's results copy-out failed right after the suite ended: ginkgo's
+  # summary is in the log, then `cat /tmp/results/e2e.log` finds nothing and
+  # hydrophone exits 1 with no junit. The suite itself passed / failed as printed.
+  dlfail) echo "SUCCESS! -- 105 Passed | 0 Failed | 0 Pending | 7243 Skipped"
+          echo "Test Suite Passed"
+          echo "06:48:35 ERR Error: failed to download results: download failed: command terminated with exit code 1 (stderr: cat: can't open '/tmp/results/e2e.log': No such file or directory)."
+          exit 1 ;;
+  dlfailfail) echo "FAIL! -- 100 Passed | 5 Failed | 2 Pending | 7241 Skipped"
+              echo "06:48:35 ERR Error: failed to download results: download failed: cat: can't open '/tmp/results/e2e.log'"
+              exit 1 ;;
+  dlfailnosummary) echo "06:48:35 ERR Error: failed to download results: download failed: cat: can't open '/tmp/results/e2e.log'"
+                   exit 1 ;;
   # A wedged hydrophone (#1635): never returns (40s stands in for forever; the
   # assertions below require the kill to land well inside that). hangjunit has
   # already written its junit (suite finished, the log follow never hit EOF).
@@ -250,6 +262,40 @@ set -e
 # no junit (infra fail) => exit 1
 if FAKE_MODE=nojunit run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/o4" >/dev/null 2>&1; then
   bad "no junit should exit 1"; else rc=$?; [ "$rc" -eq 1 ] && ok "no junit => exit 1" || bad "no junit exit=$rc"; fi
+
+# ---- hydrophone dies copying results out, after the suite finished ----
+# Observed in CI: "SUCCESS! -- 105 Passed | 0 Failed", "Test Suite Passed", then
+# "failed to download results ... cat: can't open '/tmp/results/e2e.log'" and a
+# non-zero exit with no junit. That is a retrieval failure, not a suite verdict,
+# so ginkgo's own summary must decide (counts from the log, no "infra failure").
+export SALVAGE_DONE_WAIT=0   # no cluster here: do not wait for a done marker
+
+IFS=' ' read -r sh_ sp sf ss st <<<"$(printf '\x1b[32mSUCCESS! -- 105 Passed | 0 Failed | 3 Pending | 7240 Skipped\x1b[0m\n' > "$TMP/gs.log"; ginkgo_summary_counts "$TMP/gs.log")"
+[ "$sh_" = "1" ] && [ "$sp" = "105" ] && [ "$sf" = "0" ] && [ "$ss" = "7243" ] && [ "$st" = "7348" ] \
+    && ok "ginkgo_summary_counts: parses the summary line (pending folded into skipped)" \
+    || bad "ginkgo_summary_counts got $sh_ $sp $sf $ss $st (want 1 105 0 7243 7348)"
+IFS=' ' read -r sh_ sp sf ss st <<<"$(ginkgo_summary_counts "$TMP/does-not-exist.log")"
+[ "$sh_" = "0" ] && ok "ginkgo_summary_counts: no log => 0 0 0 0 0" || bad "ginkgo_summary_counts missing log got hj=$sh_"
+
+out_dl=$(FAKE_MODE=dlfail run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/odl" 2>&1); rc_dl=$?
+[ "$rc_dl" -eq 0 ] && [ "$(gho passed)" = "105" ] && [ "$(gho failed)" = "0" ] \
+    && ok "suite passed but results download failed => verdict from ginkgo's summary (exit 0, passed=105)" \
+    || bad "dlfail rc=$rc_dl passed=$(gho passed) failed=$(gho failed): $(echo "$out_dl" | tail -4 | tr '\n' ' ')"
+echo "$out_dl" | grep -q "ginkgo's suite summary" && ! echo "$out_dl" | grep -q "NO junit produced" \
+    && ok "the summary fallback is named; no 'infra failure' is claimed" \
+    || bad "dlfail log wrong: $(echo "$out_dl" | tail -4 | tr '\n' ' ')"
+
+out_dlf=$(FAKE_MODE=dlfailfail run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/odlf" 2>&1); rc_dlf=$?
+[ "$rc_dlf" -eq 0 ] && [ "$(gho passed)" = "100" ] && [ "$(gho failed)" = "5" ] \
+    && ok "failing suite + failed download => ginkgo's failed count is reported (non-gating, exit 0)" \
+    || bad "dlfailfail rc=$rc_dlf passed=$(gho passed) failed=$(gho failed): $(echo "$out_dlf" | tail -4 | tr '\n' ' ')"
+
+set +e
+out_dln=$(FAKE_MODE=dlfailnosummary run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/odln" 2>&1); rc_dln=$?
+set -e
+[ "$rc_dln" -eq 1 ] && echo "$out_dln" | grep -q "NO junit produced" \
+    && ok "failed download and no ginkgo summary => still an infra failure (exit 1)" \
+    || bad "dlfailnosummary rc=$rc_dln: $(echo "$out_dln" | tail -3 | tr '\n' ' ')"
 
 # ---- the preflight gate itself (#1777) ----
 # With the gate ENABLED and no cluster reachable, the runner must refuse to run
@@ -430,6 +476,17 @@ EOF
   [ "$rc_ok" -eq 0 ] && ! echo "$out_ok" | grep -q "stopping hydrophone" \
     && ok "hydrophone that exits on its own is left alone" \
     || bad "clean run rc=$rc_ok was treated as wedged: $out_ok"
+
+  # Hydrophone dies by itself on the results download, the pod still has the
+  # results: wait for the done marker, then copy junit out of the sidecar.
+  set +e
+  out_sv=$(PATH="$KSHIM:$PATH" FAKE_DONE=1 FAKE_MODE=dlfail run_cli --target sig-node \
+      --kubeconfig "$KC" --hydrophone "$FAKE" --output-dir "$TMP/osv" 2>&1)
+  rc_sv=$?
+  set -e
+  [ "$rc_sv" -eq 0 ] && [ "$(gho passed)" = "1" ] && echo "$out_sv" | grep -q "salvaged junit from pod" \
+    && ok "hydrophone exits non-zero w/o junit => results salvaged from the pod sidecar" \
+    || bad "salvage-after-download-failure rc=$rc_sv passed=$(gho passed): $out_sv"
 
   # Default must fit inside the workflow's timeout-minutes with bring-up room.
   def="$(grep -oE 'HYDROPHONE_TIMEOUT:-[0-9]+' "$RUNNER" | head -1 | grep -oE '[0-9]+$')"
