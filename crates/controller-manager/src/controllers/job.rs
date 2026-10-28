@@ -5960,8 +5960,10 @@ mod tests {
         let p = failed_pod_with_count("p", 0, 0, 0);
         // absolute failure count 0 + 1 -> 10s window.
         let r = remaining_time_per_index(now, Some(&p));
+        // The finish time is stored at whole-second precision, so up to a
+        // second of the window is already gone; allow for a slow runner too.
         assert!(
-            r > Duration::from_secs(8) && r <= Duration::from_secs(10),
+            r > Duration::from_secs(7) && r <= Duration::from_secs(10),
             "{r:?}"
         );
         let p = failed_pod_with_count("p", 0, 2, 0);
@@ -6184,8 +6186,10 @@ mod tests {
         let d = controller
             .take_requeue_delay("default", "plain-job")
             .expect("the delayed creation must request a delayed requeue");
+        // The pod finished 1s ago and the finish time has whole-second
+        // precision, so 1-2s of the 10s window are already gone.
         assert!(
-            d > Duration::from_secs(8) && d <= Duration::from_secs(10),
+            d > Duration::from_secs(7) && d <= Duration::from_secs(10),
             "{d:?}"
         );
     }
