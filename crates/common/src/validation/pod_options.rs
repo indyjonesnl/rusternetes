@@ -849,7 +849,7 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
-}
+    }
 
     fn selinux_spec(policy: &str) -> PodSpec {
         spec(json!({"securityContext": {"seLinuxChangePolicy": policy}}))
