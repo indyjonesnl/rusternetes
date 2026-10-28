@@ -525,6 +525,21 @@ impl Admission<'_> {
             .await
         })
         .await?;
+        // OwnerReferencesPermissionEnforcement: `NewHandler(Create, Update)` and
+        // `var _ admission.ValidationInterface`
+        // (plugin/pkg/admission/gc/gc_admission.go:51, :71).
+        self.plugin(
+            "OwnerReferencesPermissionEnforcement",
+            op,
+            VALIDATE,
+            async {
+                if let Some(obj) = obj {
+                    self.validate_owner_references(op, obj, old).await?;
+                }
+                Ok(())
+            },
+        )
+        .await?;
         // `approval` is CertificateApproval's, `status` CertificateSigning's.
         let approval = self.subresource == Some("approval");
         self.plugin("CertificateApproval", op, VALIDATE, async {
@@ -759,6 +774,37 @@ impl Admission<'_> {
             dry_run: self.dry_run,
             object: event.as_ref(),
         })
+    }
+
+    /// `OwnerReferencesPermissionEnforcement.Validate`
+    /// ([`crate::admission::owner_references_permission_enforcement`]).
+    async fn validate_owner_references<T: Object>(
+        &self,
+        op: &Operation,
+        obj: &T,
+        old: Option<&T>,
+    ) -> Result<()> {
+        use crate::admission::owner_references_permission_enforcement::{
+            Attributes, OwnerReferencesPermissionEnforcement,
+        };
+        let plugin = OwnerReferencesPermissionEnforcement::new(
+            self.state.authorizer.clone(),
+            self.state.custom_metrics_mapper.clone(),
+        );
+        let attributes = Attributes {
+            user: self.user,
+            group: &self.resource.group,
+            version: &self.resource.version,
+            resource: &self.resource.resource,
+            subresource: self.subresource,
+            namespace: self.namespace,
+            name: &obj.metadata().name,
+            create: *op == Operation::Create,
+        };
+        plugin
+            .validate(&attributes, obj.metadata(), old.map(|o| o.metadata()))
+            .await
+            .map_err(|e| self.forbidden(&obj.metadata().name, e))
     }
 
     /// The `certificates/approval` and `certificates/signing` plugins, for an
