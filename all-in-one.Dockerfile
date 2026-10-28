@@ -100,6 +100,7 @@ COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud
 COPY rusternetes/crates/client/Cargo.toml             ./rusternetes/crates/client/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
+COPY rusternetes/crates/controller-core/Cargo.toml   ./rusternetes/crates/controller-core/Cargo.toml
 COPY rusternetes/crates/cri/Cargo.toml                ./rusternetes/crates/cri/Cargo.toml
 COPY rusternetes/crates/discovery/Cargo.toml          ./rusternetes/crates/discovery/Cargo.toml
 COPY rusternetes/crates/dns/Cargo.toml                ./rusternetes/crates/dns/Cargo.toml
@@ -133,14 +134,14 @@ COPY rusternetes/crates/kubelet/build.rs     ./rusternetes/crates/kubelet/build.
 COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
-#   - lib only:   common, storage, cloud-providers, protobuf,
+#   - lib only:   common, controller-core, storage, cloud-providers, protobuf,
 #                 middleware, admission-webhook, discovery, cri
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet,
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
+    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -210,6 +211,7 @@ COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
 COPY rusternetes/crates/client/src               ./crates/client/src
 COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
+COPY rusternetes/crates/controller-core/src      ./crates/controller-core/src
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src
 COPY rusternetes/crates/controller-manager/tests ./crates/controller-manager/tests
 COPY rusternetes/crates/cri/src                  ./crates/cri/src

@@ -177,6 +177,7 @@ COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/controller-core/Cargo.toml   crates/controller-core/Cargo.toml
 COPY crates/cri/Cargo.toml                crates/cri/Cargo.toml
 COPY crates/discovery/Cargo.toml          crates/discovery/Cargo.toml
 COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
@@ -212,13 +213,13 @@ COPY crates/kubelet/proto        crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, storage, cloud-providers, cri, test_support
+#   - lib only:   common, controller-core, storage, cloud-providers, cri, test_support
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
+    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -306,6 +307,7 @@ COPY crates/protobuf/src             crates/protobuf/src
 COPY crates/client/src               crates/client/src
 COPY crates/common/src               crates/common/src
 COPY crates/common/tests             crates/common/tests
+COPY crates/controller-core/src      crates/controller-core/src
 COPY crates/controller-manager/src   crates/controller-manager/src
 COPY crates/controller-manager/tests crates/controller-manager/tests
 COPY crates/cri/src                  crates/cri/src

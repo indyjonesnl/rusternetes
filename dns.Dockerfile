@@ -72,6 +72,7 @@ COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
+COPY crates/controller-core/Cargo.toml   crates/controller-core/Cargo.toml
 COPY crates/cri/Cargo.toml                crates/cri/Cargo.toml
 COPY crates/discovery/Cargo.toml          crates/discovery/Cargo.toml
 COPY crates/dns/Cargo.toml                crates/dns/Cargo.toml
@@ -102,7 +103,7 @@ COPY crates/common/build.rs     crates/common/build.rs
 # Dummy sources so `cargo build` can resolve the workspace before the
 # real source COPY further down.
 RUN set -eux; \
-    for c in client common storage cloud-providers streamproxy csi test_support; do \
+    for c in client common controller-core storage cloud-providers streamproxy csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
