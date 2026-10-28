@@ -64,7 +64,7 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
     /// A controller whose pod event handlers hang off an informer shared with
     /// other controllers (upstream builds one `PodInformer` from the shared
     /// informer factory and hands it to every controller).
-    pub(crate) fn with_pod_informer(
+    pub fn with_pod_informer(
         storage: Arc<S>,
         interval_secs: u64,
         pod_informer: Arc<SharedPodInformer<S>>,

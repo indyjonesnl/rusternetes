@@ -450,10 +450,7 @@ impl<S: Storage + 'static> JobController<S> {
     /// other controllers (upstream hands every controller the one `PodInformer`
     /// of the shared informer factory, `NewController(ctx, podInformer, ...)`,
     /// job_controller.go:172).
-    pub(crate) fn with_pod_informer(
-        storage: Arc<S>,
-        pod_informer: Arc<SharedPodInformer<S>>,
-    ) -> Self {
+    pub fn with_pod_informer(storage: Arc<S>, pod_informer: Arc<SharedPodInformer<S>>) -> Self {
         Self {
             storage,
             pod_informer,

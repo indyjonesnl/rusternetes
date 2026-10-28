@@ -48,10 +48,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
     /// A controller whose pod handlers hang off `pod_informer`, the one
     /// informer the binary shares between controllers.
-    pub(crate) fn with_pod_informer(
-        storage: Arc<S>,
-        pod_informer: Arc<SharedPodInformer<S>>,
-    ) -> Self {
+    pub fn with_pod_informer(storage: Arc<S>, pod_informer: Arc<SharedPodInformer<S>>) -> Self {
         Self {
             storage,
             pod_informer,

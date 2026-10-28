@@ -5,7 +5,7 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod controllers;
+use rusternetes_controller_manager::controllers;
 
 use anyhow::Result;
 use clap::Parser;
