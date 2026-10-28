@@ -13,6 +13,7 @@ fn main() {
     // rebuild as the routine price of `git commit`.
     println!("cargo:rerun-if-env-changed=RUSTERNETES_GIT_SHA");
     println!("cargo:rerun-if-env-changed=RUSTERNETES_STAMP_GIT");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     // Container builds inject the SHA as a build-arg because `.git` is excluded
     // from the Docker context (.dockerignore), and every shipped artifact is a
@@ -21,6 +22,14 @@ fn main() {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string());
+
+    // Whether this build asked to be identified at all (injected SHA or the
+    // local opt-in). Only such builds get a wall-clock timestamp: it differs
+    // on every run of this script, and since `common` is a dependency of every
+    // crate, a fresh timestamp in a plain dev/CI build changes `common`'s
+    // rustc input and defeats the compiler cache (sccache) for the whole
+    // dependent graph even when no source changed.
+    let stamped = injected.is_some() || stamp_from_git();
 
     let sha = match injected {
         Some(sha) => sha,
@@ -35,7 +44,10 @@ fn main() {
     };
     println!("cargo:rustc-env=RUSTERNETES_BUILD_SHA={sha}");
 
-    println!("cargo:rustc-env=RUSTERNETES_BUILD_TIME={}", build_time());
+    println!(
+        "cargo:rustc-env=RUSTERNETES_BUILD_TIME={}",
+        build_time(stamped)
+    );
 }
 
 /// Whether a local build asked to be stamped with its real commit.
@@ -102,12 +114,17 @@ fn git_sha() -> Option<String> {
     Some(sha)
 }
 
-fn build_time() -> String {
-    // Prefer a reproducible source date (set by some CI), else wall-clock UTC.
+fn build_time(stamped: bool) -> String {
+    // Prefer a reproducible source date (set by some CI), else wall-clock UTC
+    // for stamped builds only.
     if let Ok(epoch) = std::env::var("SOURCE_DATE_EPOCH") {
         if !epoch.trim().is_empty() {
             return format!("epoch:{}", epoch.trim());
         }
+    }
+    // Unstamped dev/CI builds stay reproducible: no wall clock.
+    if !stamped {
+        return "unknown".to_string();
     }
     Command::new("date")
         .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
