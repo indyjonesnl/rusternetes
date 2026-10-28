@@ -387,7 +387,12 @@ pub(crate) fn respond<B: Serialize>(
     // (responsewriters/writers.go:346): the object is recorded where it is
     // serialized, not read back from the body by the audit filter.
     crate::audit::log_response_object(body);
-    let mut response = (status, headers, Json(body)).into_response();
+    // `TrackSerializeResponseObjectLatency` (responsewriters/writers.go:354)
+    // times the serializer call.
+    let mut response =
+        rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+            (status, headers, Json(body)).into_response()
+        });
     if status.is_success() {
         // The serializer is chosen from the request's `Accept` for every
         // resource, not per kind (`transformResponseObject`,
@@ -458,7 +463,10 @@ pub async fn negotiate(headers: &HeaderMap, response: Response) -> Response {
     let type_meta: serde_json::Value = serde_json::from_slice(&json).unwrap_or_default();
     let api_version = type_meta["apiVersion"].as_str().unwrap_or_default();
     let kind = type_meta["kind"].as_str().unwrap_or_default();
-    let bytes = encode_native_or_wrapped(&json, api_version, kind);
+    let bytes =
+        rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+            encode_native_or_wrapped(&json, api_version, kind)
+        });
     parts.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(ContentType::Protobuf.mime_type()),

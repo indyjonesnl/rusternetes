@@ -259,8 +259,12 @@ impl<B: Backend> RhinoStorage<B> {
                 .update_key(&kv.key, kv.value.len(), kv.mod_revision);
             let json = String::from_utf8(kv.value)
                 .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
-            let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
-            match serde_json::from_str::<T>(&json_with_rv) {
+            // `DecodeListItem` (etcd3/decoder.go:78-84) times the item decode.
+            let decoded = crate::latency::tracked_decode(|| {
+                let json_with_rv = Self::inject_resource_version(&json, kv.mod_revision);
+                serde_json::from_str::<T>(&json_with_rv)
+            });
+            match decoded {
                 Ok(value) => results.push(value),
                 Err(e) => {
                     error!("Failed to deserialize value at {}: {}", kv.key, e);
@@ -631,7 +635,8 @@ impl<B: Backend + Send + Sync + 'static> Storage for RhinoStorage<B> {
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
         // Try to list at the given revision — if compacted, rhino returns Compacted error
-        match self.backend.list("/registry/", "", 1, revision, true).await {
+        match crate::latency::tracked(self.backend.list("/registry/", "", 1, revision, true)).await
+        {
             Ok(_) => Ok(false),
             Err(rhino::backend::BackendError::Compacted) => Ok(true),
             Err(_) => Ok(false),
