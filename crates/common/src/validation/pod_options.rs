@@ -877,7 +877,7 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
-}
+    }
 
     /// util.go:422/:427: both options follow their gate and ignore the old
     /// spec; a create and an update agree.
