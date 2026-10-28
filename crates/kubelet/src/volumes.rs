@@ -264,6 +264,40 @@ impl VolumeManager {
         token_manager: rusternetes_common::auth::TokenManager,
         pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     ) -> Self {
+        Self::new_inner(
+            volumes_base_path,
+            storage,
+            token_manager,
+            pod_certificate_manager,
+            None,
+        )
+    }
+
+    /// [`VolumeManager::new`] with the emptyDir mounter replaced by a recording
+    /// fake (upstream's `FakeVolumeHost` injects `mount.NewFakeMounter`), for
+    /// integration tests that run unprivileged and so cannot mount a tmpfs.
+    #[doc(hidden)]
+    pub fn new_with_recording_empty_dir_mounts(
+        volumes_base_path: String,
+        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
+        token_manager: rusternetes_common::auth::TokenManager,
+    ) -> Self {
+        Self::new_inner(
+            volumes_base_path,
+            storage,
+            token_manager,
+            None,
+            Some(crate::volume_plugins::empty_dir::fake_mount_deps().0),
+        )
+    }
+
+    fn new_inner(
+        volumes_base_path: String,
+        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
+        token_manager: rusternetes_common::auth::TokenManager,
+        pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+        empty_dir_mount_deps: Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps>,
+    ) -> Self {
         let node_allocatable = crate::kubelet::node_allocatable_map();
         let mut kubelet_host = crate::volume_plugins::KubeletVolumeHost::new(
             volumes_base_path.clone(),
@@ -273,6 +307,9 @@ impl VolumeManager {
         );
         if let Some(m) = pod_certificate_manager.clone() {
             kubelet_host = kubelet_host.with_pod_certificate_manager(m);
+        }
+        if let Some(deps) = empty_dir_mount_deps {
+            kubelet_host = kubelet_host.with_empty_dir_mount_deps(deps);
         }
         // The CSIDriver informer the CSI plugin's lister reads
         // (`pkg/kubelet/kubelet.go` builds it and hands it to the volume host).

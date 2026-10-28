@@ -84,6 +84,7 @@ impl VolumePlugin for ConfigMapPlugin {
                 .expect("checked by can_support"),
             storage: self.host.get_kube_client().cloned(),
             pod: pod.clone(),
+            host: self.host.clone(),
         }))
     }
 
@@ -135,6 +136,8 @@ struct ConfigMapMounter {
     /// `configMapVolumeMounter.pod` (`configmap.go:134`), read by
     /// `MakeNestedMountpoints`.
     pod: Pod,
+    /// `b.plugin.host`, for `NewWrapperMounter` / `NewWrapperUnmounter`.
+    host: Arc<dyn VolumeHost>,
 }
 
 #[async_trait]
@@ -171,10 +174,20 @@ impl Mounter for ConfigMapMounter {
         let key = build_key("configmaps", Some(&self.namespace), configmap_name);
         let configmap_result: Result<ConfigMap, _> = storage.get(&key).await;
 
-        // Create volume directory
+        // `wrapped.SetUpAt(dir, mounterArgs)` (`configmap.go:213`): configMap's
+        // `wrappedVolumeSpec()` is a plain (disk) emptyDir (`:165-172`), so
+        // this is `setupDir` + `SetReady(getMetaDir())`, no tmpfs.
         let volume_dir = dir;
-        std::fs::create_dir_all(volume_dir)
-            .context("Failed to create ConfigMap volume directory")?;
+        crate::volume_plugins::util::new_wrapper_mounter(
+            &self.host,
+            &self.volume_name,
+            None,
+            &self.pod,
+        )
+        .await?
+        .set_up_at(volume_dir, args)
+        .await
+        .context("Failed to create ConfigMap volume directory")?;
         // `volumeutil.MakeNestedMountpoints(b.volName, dir, b.pod)`
         // (`configmap.go:220-222`), after the wrapped emptyDir SetUpAt and
         // before the failure-teardown `defer` is armed.
@@ -234,7 +247,16 @@ impl Mounter for ConfigMapMounter {
             args.fs_group,
             true,
         ) {
-            if let Err(td) = std::fs::remove_dir_all(volume_dir) {
+            // `defer` teardown: `unmounter.TearDown()` -> `UnmountViaEmptyDir`
+            // (ready dir, umount of the tmpfs, volume dir).
+            if let Err(td) = crate::volume_plugins::util::unmount_via_empty_dir(
+                &self.host,
+                volume_dir,
+                &self.volume_name,
+                &self.pod.metadata.uid,
+            )
+            .await
+            {
                 tracing::error!("Error tearing down volume {}: {}", self.volume_name, td);
             }
             return Err(anyhow::Error::new(e)
@@ -255,6 +277,18 @@ mod tests {
     use super::*;
     use rusternetes_common::resources::Volume;
     use serde_json::json;
+
+    /// A host rooted beside `dir`, so the wrapped emptyDir's ready dir
+    /// (`<root>/pods/<uid>/plugins/...`) never lands in the volume itself.
+    fn test_host(dir: &std::path::Path) -> Arc<dyn VolumeHost> {
+        let root = format!("{}-kubelet-root", dir.to_string_lossy());
+        Arc::new(crate::volume_plugins::KubeletVolumeHost::new(
+            root,
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            std::collections::HashMap::new(),
+        ))
+    }
 
     fn plugin() -> ConfigMapPlugin {
         ConfigMapPlugin::new(std::sync::Arc::new(
@@ -364,6 +398,7 @@ mod tests {
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
                 rusternetes_storage::MemoryStorage::new(),
             )))),
+            host: test_host(dir),
             pod: serde_json::from_value(json!({
                 "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
                 "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": [
@@ -472,6 +507,7 @@ mod tests {
             config_map: serde_json::from_value(json!({"name": "cm", "defaultMode": 0o600}))
                 .unwrap(),
             storage: Some(storage),
+            host: test_host(&dir),
             pod: serde_json::from_value(
                 json!({"metadata": {"name": "p", "uid": "u"}, "spec": {"containers": []}}),
             )
