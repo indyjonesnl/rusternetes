@@ -22,13 +22,29 @@ use std::time::Duration;
 
 /// Opening a fresh database (WAL pragma, startup VACUUM connection still
 /// closing, schema setup) can itself see "database is locked" within the
-/// shortened 50ms `busy_timeout` on a loaded runner. That is open-time noise,
-/// not the contention under test, so retry the open a bounded number of times.
+/// shortened 50ms `busy_timeout` when the runner's disk stalls: nothing else is
+/// contending, rhino's own open sequence is. That is open-time noise, not the
+/// contention under test. So create and initialise the file once under the
+/// default busy timeout (which waits the stall out), let that handle close,
+/// then reopen with the short timeout; the reopen only has to attach to an
+/// initialised WAL database. The reopen is still retried a bounded number of
+/// times for the connection that is closing in the background.
 async fn storage(path: &Path) -> RhinoStorage<rhino::SqliteBackend> {
+    let dsn = path.to_string_lossy().into_owned();
+    drop(
+        RhinoStorage::with_config(SqliteConfig {
+            dsn: dsn.clone(),
+            compact_interval: Duration::ZERO,
+            ..Default::default()
+        })
+        .await
+        .expect("initialise the database under the default busy timeout"),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let mut last = None;
     for _ in 0..10 {
         match RhinoStorage::with_config(SqliteConfig {
-            dsn: path.to_string_lossy().into_owned(),
+            dsn: dsn.clone(),
             compact_interval: Duration::ZERO,
             busy_timeout: Duration::from_millis(50),
             ..Default::default()
