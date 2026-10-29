@@ -19,6 +19,7 @@ use crate::feature_gates::{enabled, Feature};
 use crate::quantity::Quantity;
 use crate::quota::{is_hugepage_resource_name, is_hugepage_resource_value_divisible};
 use crate::resources::pod::{EnvFromSource, EnvVar, PodSpec};
+use crate::resources::workloads::PodTemplateSpec;
 use crate::types::LabelSelector;
 use crate::validation::field::Path;
 use crate::validation::metav1::{
@@ -303,6 +304,20 @@ fn has_user_namespaces_with_volume_devices(spec: &PodSpec) -> bool {
             .iter()
             .flatten()
             .any(|c| c.volume_devices.as_deref().is_some_and(|d| !d.is_empty()))
+}
+
+/// `GetValidationOptionsFromPodTemplate` (util.go:659-673): the options for a
+/// pod template, derived from the OLD template's spec. Either template may be
+/// absent (a replication controller's `spec.template` is a pointer), in which
+/// case its spec is passed on as nil, exactly like upstream.
+pub fn get_validation_options_from_pod_template(
+    template: Option<&PodTemplateSpec>,
+    old_template: Option<&PodTemplateSpec>,
+) -> PodValidationOptions {
+    get_validation_options_from_pod_spec_and_meta(
+        template.map(|t| &t.spec),
+        old_template.map(|t| &t.spec),
+    )
 }
 
 /// `useRelaxedDNSSearchValidation` (util.go:520-532).
