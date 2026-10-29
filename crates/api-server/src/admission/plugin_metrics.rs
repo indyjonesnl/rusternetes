@@ -45,6 +45,14 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: true,
     },
+    // namespace/lifecycle/admission.go:77, :196 (Admit only). Run by the
+    // `namespace_lifecycle_gate` middleware, which observes it itself.
+    Spec {
+        name: "NamespaceLifecycle",
+        ops: C | U | D,
+        admit: true,
+        validate: false,
+    },
     // noderestriction/admission.go:72, :183 (Admit only)
     Spec {
         name: "NodeRestriction",

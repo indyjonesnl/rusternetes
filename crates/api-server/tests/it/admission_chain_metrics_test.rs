@@ -317,6 +317,45 @@ async fn delete_observes_priority_but_not_limit_ranger() {
     );
 }
 
+/// DELETE runs the admit phase before the validate phase
+/// (`AdmissionToValidateObjectDeleteFunc`, registry/rest/delete.go:177-218):
+/// the chain's `step` metric and Priority (C,U,D, Admit) are observed under
+/// `admit`; LimitRanger (C,U) is not called.
+#[tokio::test]
+async fn delete_runs_the_admit_phase() {
+    let state = state();
+    let (kind, resource, user, cm) = cm_kind();
+    let admission = cm_admission(&state, &kind, &resource, &user);
+    let st0 = hist_count(
+        "apiserver_admission_step_admission_duration_seconds",
+        &[
+            ("type", "admit"),
+            ("operation", "DELETE"),
+            ("rejected", "false"),
+        ],
+    );
+    let pr0 = plugin_series("Priority", "admit", "DELETE", "false");
+    let lr0 = plugin_series("LimitRanger", "admit", "DELETE", "false");
+
+    admission.admit_delete(&cm).await.unwrap();
+
+    assert!(
+        hist_count(
+            "apiserver_admission_step_admission_duration_seconds",
+            &[
+                ("type", "admit"),
+                ("operation", "DELETE"),
+                ("rejected", "false"),
+            ],
+        ) > st0
+    );
+    assert!(plugin_series("Priority", "admit", "DELETE", "false") > pr0);
+    assert_eq!(
+        plugin_series("LimitRanger", "admit", "DELETE", "false"),
+        lr0
+    );
+}
+
 /// `rejected` is `err != nil` (metrics.go:97-99): a Pod naming a missing
 /// PriorityClass is rejected by Priority's `Admit`.
 #[tokio::test]
