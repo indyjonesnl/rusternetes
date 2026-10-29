@@ -75,12 +75,12 @@ impl VolumePlugin for ProjectedPlugin {
         pod_uid: &str,
     ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
         Ok(Box::new(
-            crate::volume_plugins::util::WrappedEmptyDirUnmounter {
-                host: self.host.clone(),
-                plugin_name: self.name(),
-                vol_name: vol_name.to_string(),
-                pod_uid: pod_uid.to_string(),
-            },
+            crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
+                self.host.clone(),
+                self.name(),
+                vol_name,
+                pod_uid,
+            ),
         ))
     }
 
@@ -102,11 +102,13 @@ impl ProjectedPlugin {
     /// `NewMounter` (`projected.go:112-124`), concrete so tests can reach
     /// `collect_data`.
     fn build_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> ProjectedMounter {
+        let path = self
+            .host
+            .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name);
         ProjectedMounter {
             host: self.host.clone(),
-            path: self
-                .host
-                .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
+            metrics: crate::volume_plugins::metrics_cached::cached_du(&path),
+            path,
             // The whole Volume is cloned (not just its `projected` source)
             // because the final log line names `volume.name`, same reason as
             // Task 7's downwardAPI mounter.
@@ -146,6 +148,8 @@ struct ProjectedMounter {
     storage: Option<Arc<StorageBackend>>,
     token_manager: rusternetes_common::auth::TokenManager,
     node_allocatable: HashMap<String, String>,
+    /// Embedded `volume.MetricsProvider` (`projected.go:119`).
+    metrics: crate::volume_plugins::metrics_cached::CachedMetrics,
 }
 
 /// `utilerrors.NewAggregate(errlist).Error()`
@@ -658,6 +662,13 @@ impl ProjectedMounter {
           // and stays inert.
         std::fs::read_to_string(&token_path)
             .with_context(|| format!("reading cached token {token_path}"))
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for ProjectedMounter {
+    /// `volume.NewCachedMetrics(volume.NewMetricsDu(getPath(..)))` (`projected.go:119`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        self.metrics.get_metrics()
     }
 }
 

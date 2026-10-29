@@ -345,6 +345,16 @@ pub(crate) struct EmptyDirUnmounter {
     mount_detector: Arc<dyn MountDetector>,
 }
 
+impl crate::volume_plugins::plugin::MetricsProvider for EmptyDirUnmounter {
+    /// `emptyDir.MetricsProvider = volume.NewMetricsDu(getPath(..))`
+    /// (`empty_dir.go:163`, `:180`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::metrics_du::MetricsDu::new(&self.path),
+        )
+    }
+}
+
 #[async_trait]
 impl Unmounter for EmptyDirUnmounter {
     fn get_path(&self) -> String {
@@ -691,6 +701,16 @@ impl EmptyDirMounter {
             let _ = (dir, mounter_size, user_namespaces_enabled(&self.pod));
             Ok(())
         }
+    }
+}
+
+impl crate::volume_plugins::plugin::MetricsProvider for EmptyDirMounter {
+    /// `emptyDir.MetricsProvider = volume.NewMetricsDu(getPath(..))`
+    /// (`empty_dir.go:163`, `:180`).
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::metrics_du::MetricsDu::new(&self.path),
+        )
     }
 }
 

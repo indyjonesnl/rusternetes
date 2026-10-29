@@ -643,6 +643,15 @@ struct LocalUnmounter {
     volume: LocalVolume,
 }
 
+impl MetricsProvider for LocalUnmounter {
+    /// `NewUnmounter` (`local.go:148-157`) leaves `localVolume`'s embedded
+    /// `MetricsProvider` nil, so nothing can call it; `MetricsNil` is the safe
+    /// equivalent.
+    fn get_metrics(&self) -> Result<Metrics> {
+        MetricsNil.get_metrics()
+    }
+}
+
 #[async_trait]
 impl Unmounter for LocalUnmounter {
     fn get_path(&self) -> String {

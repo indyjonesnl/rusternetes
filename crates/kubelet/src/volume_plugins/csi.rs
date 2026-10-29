@@ -1835,6 +1835,17 @@ mod block;
 mod expander;
 mod metrics;
 
+impl crate::volume_plugins::plugin::MetricsProvider for CsiUnmounter {
+    /// Upstream's `NewUnmounter` (`csi_plugin.go`) leaves the embedded
+    /// `MetricsProvider` nil, so nothing can call it; `MetricsNil` is the safe
+    /// equivalent.
+    fn get_metrics(&self) -> anyhow::Result<crate::volume_plugins::plugin::Metrics> {
+        crate::volume_plugins::plugin::MetricsProvider::get_metrics(
+            &crate::volume_plugins::util::metrics::MetricsNil,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
