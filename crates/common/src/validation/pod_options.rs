@@ -937,7 +937,7 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
-}
+    }
 
     fn restart_container(policy: Option<&str>, rules: serde_json::Value) -> serde_json::Value {
         let mut c = json!({"name": "c", "image": "i", "restartPolicyRules": rules});
