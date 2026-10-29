@@ -20,6 +20,10 @@
 //! Go field names (`ScaleUp`, `StabilizationWindowSeconds`, ...) and are read
 //! back case-insensitively as `encoding/json` does.
 
+use super::autoscaling::CrossVersionObjectReference;
+use crate::types::ObjectMeta;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 /// `autoscaling.MetricSpecsAnnotation` (annotations.go:20).
@@ -801,6 +805,64 @@ pub fn hpa_v1_to_v2(v1: &Value) -> Value {
     // "drop round-tripping annotations after converting to internal"
     drop_round_trip_annotations(&mut out);
     out
+}
+
+/// The `autoscaling/v1` HorizontalPodAutoscaler wire shape
+/// (`staging/src/k8s.io/api/autoscaling/v1/types.go`), used only to
+/// strict-decode a v1 PATCH result in its own version (patch.go:331-363):
+/// unlike v2 it has no `metrics`/`behavior`/`conditions` fields, so those are
+/// unknown fields at v1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalPodAutoscalerV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default)]
+    pub spec: HorizontalPodAutoscalerSpecV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<HorizontalPodAutoscalerStatusV1>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalPodAutoscalerSpecV1 {
+    #[serde(default)]
+    pub scale_target_ref: CrossVersionObjectReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_replicas: Option<i32>,
+    #[serde(default)]
+    pub max_replicas: i32,
+    #[serde(
+        default,
+        rename = "targetCPUUtilizationPercentage",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_cpu_utilization_percentage: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HorizontalPodAutoscalerStatusV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::types::k8s_time::serialize",
+        deserialize_with = "crate::types::k8s_time::deserialize"
+    )]
+    pub last_scale_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub current_replicas: i32,
+    #[serde(default)]
+    pub desired_replicas: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "currentCPUUtilizationPercentage")]
+    pub current_cpu_utilization_percentage: Option<i32>,
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ use rusternetes_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::{
-        autoscaling_v1::{hpa_v1_to_v2, hpa_v2_to_v1},
+        autoscaling_v1::{hpa_v1_to_v2, hpa_v2_to_v1, HorizontalPodAutoscalerV1},
         HorizontalPodAutoscaler,
     },
     List, Result,
@@ -81,8 +81,17 @@ const V1_PATCH_CONVERSION: crate::endpoints::handlers::RequestVersionConversion 
     crate::endpoints::handlers::RequestVersionConversion {
         to_request_version: hpa_v2_to_v1,
         from_request_version: |_stored, patched| hpa_v1_to_v2(&patched),
-        strict_decode: None,
+        strict_decode: Some(strict_decode_hpa_v1),
     };
+
+/// Strict-decodes a patched `autoscaling/v1` document in that version
+/// (patch.go:331-363: the patched JSON is decoded into the versioned object),
+/// so v2-only fields such as `spec.metrics` warn/422 on a v1 endpoint.
+fn strict_decode_hpa_v1(params: &HashMap<String, String>, patched: &[u8]) -> Result<Vec<String>> {
+    let v1: HorizontalPodAutoscalerV1 = serde_json::from_slice(patched)
+        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+    crate::handlers::validation::validate_strict_fields(params, patched, &v1)
+}
 
 /// A request body in the shape the scope decodes. An `autoscaling/v1` body is
 /// converted onto the stored v2 object before decoding, as the codec does
