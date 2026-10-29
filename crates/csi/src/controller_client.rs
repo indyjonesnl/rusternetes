@@ -1279,11 +1279,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let r = rec.lock().unwrap();
-        assert_eq!(r.create_group, vec![req.clone()]);
-        assert_eq!(r.get_group.len(), 1);
-        assert_eq!(r.delete_group[0].snapshot_ids, vec!["snap-of-vol-1"]);
-        drop(r);
+        {
+            let r = rec.lock().unwrap();
+            assert_eq!(r.create_group, vec![req.clone()]);
+            assert_eq!(r.get_group.len(), 1);
+            assert_eq!(r.delete_group[0].snapshot_ids, vec!["snap-of-vol-1"]);
+        }
 
         // Identity does not advertise GROUP_CONTROLLER_SERVICE.
         let (_d2, client2, rec2) = start(Fake::full());
