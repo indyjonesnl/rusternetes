@@ -167,3 +167,65 @@ async fn update_and_delete_read_a_malformed_root_metadata_object() {
     let (status, out) = api.delete(&format!("{PATH}/w1")).await;
     assert_eq!(status, StatusCode::OK, "{out}");
 }
+
+/// #3950: a watch decodes its events through the same storage codec
+/// (customresource_handler.go:1280-1283), so an event whose root
+/// `metadata.labels` is `3` is delivered with the field dropped — both the
+/// synthetic initial ADDED and a live MODIFIED.
+#[tokio::test]
+async fn watch_drops_malformed_root_metadata_fields() {
+    use futures::StreamExt;
+    let api = setup_with_malformed_root_metadata().await;
+    let resp = api
+        .respond(
+            "GET",
+            &format!("{PATH}?watch=true&resourceVersion=0&timeoutSeconds=10"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.into_body().into_data_stream();
+
+    // A live write of another malformed object after the watch opened.
+    let key = build_key("stable_example_com_widgets", Some("default"), "w2");
+    let stored = json!({
+        "apiVersion": format!("{GROUP}/v1"), "kind": "Widget",
+        "metadata": {
+            "name": "w2", "namespace": "default", "uid": "u2", "generation": 1,
+            "creationTimestamp": "2020-01-01T00:00:00Z", "labels": 3
+        },
+        "spec": {}
+    });
+    api.storage.create(&key, &stored).await.unwrap();
+
+    let mut buf = String::new();
+    let mut seen: Vec<Value> = Vec::new();
+    let run = async {
+        while seen.len() < 2 {
+            let Some(Ok(bytes)) = stream.next().await else {
+                return;
+            };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(i) = buf.find('\n') {
+                let line = buf[..i].to_string();
+                buf.drain(..=i);
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if v["type"] != "BOOKMARK" {
+                        seen.push(v);
+                    }
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    let mut names: Vec<&str> = seen
+        .iter()
+        .filter_map(|e| e["object"]["metadata"]["name"].as_str())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["w1", "w2"], "{seen:?}");
+    for e in &seen {
+        assert!(e["object"]["metadata"].get("labels").is_none(), "{e}");
+    }
+}
