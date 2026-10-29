@@ -7,19 +7,25 @@
 //! `apiServicesToRegister`, `DefaultGenericAPIServicePriorities`). Tests are
 //! ported from `autoregister_controller_test.go` (`TestSync`).
 //!
-//! Deviation: upstream drives `checkAPIService` from an APIService informer's
-//! add/update/delete events through a rate-limited workqueue; [`run`] here
-//! re-syncs every known name on a short tick (the sync is idempotent and
-//! guarded by the same synced-once / present-at-start state).
+//! Like upstream, `checkAPIService` is driven from APIService add/update/delete
+//! events (a storage watch, [`spawn_api_service_event_handlers`]) and from
+//! `Add/RemoveAPIServiceToSync` through a de-duplicating workqueue with
+//! `AddRateLimited` retries on error ([`AutoRegisterController::run`]).
 //! Wired into `startup.rs` via [`spawn_autoregistration`], together with the
 //! `crdregistration` controller (`crate::crdregistration`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use rusternetes_common::resources::APIService;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent};
+
+use crate::crdregistration::WorkQueue;
+use crate::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
 
 /// `AutoRegisterManagedLabel`.
 pub const AUTO_REGISTER_MANAGED_LABEL: &str = "kube-aggregator.kubernetes.io/automanaged";
@@ -50,12 +56,26 @@ pub trait APIServiceClient: Send + Sync {
 }
 
 /// `autoRegisterController` state.
-#[derive(Default)]
 pub struct AutoRegisterController {
     api_services_to_sync: Mutex<HashMap<String, APIService>>,
     synced_successfully: Mutex<HashSet<String>>,
     api_services_at_start: Mutex<HashSet<String>>,
-    queue: Mutex<BTreeSet<String>>,
+    /// "where incoming work is placed to de-dup and to allow easy rate limited
+    /// requeues on errors"
+    queue: WorkQueue<String>,
+    rate_limiter: Mutex<ControllerRateLimiter>,
+}
+
+impl Default for AutoRegisterController {
+    fn default() -> Self {
+        Self {
+            api_services_to_sync: Mutex::default(),
+            synced_successfully: Mutex::default(),
+            api_services_at_start: Mutex::default(),
+            queue: WorkQueue::default(),
+            rate_limiter: Mutex::new(ControllerRateLimiter::new()),
+        }
+    }
 }
 
 fn automanaged_type(service: Option<&APIService>) -> &str {
@@ -106,13 +126,13 @@ impl AutoRegisterController {
             .lock()
             .unwrap()
             .insert(name.clone(), api_service);
-        self.queue.lock().unwrap().insert(name);
+        self.queue.add(name);
     }
 
     /// `RemoveAPIServiceToSync`.
     pub fn remove_api_service_to_sync(&self, name: &str) {
         self.api_services_to_sync.lock().unwrap().remove(name);
-        self.queue.lock().unwrap().insert(name.to_string());
+        self.queue.add(name.to_string());
     }
 
     /// `GetAPIServiceToSync`.
@@ -223,33 +243,145 @@ impl AutoRegisterController {
         }
     }
 
-    /// `Run` (minus the informer): record what exists at start, then sync
-    /// every known name until `stop` fires. See the module deviation note.
+    /// Informer `AddFunc`.
+    pub fn on_add(&self, api_service: &APIService) {
+        self.queue.add(api_service.metadata.name.clone());
+    }
+
+    /// Informer `UpdateFunc`.
+    pub fn on_update(&self, api_service: &APIService) {
+        self.queue.add(api_service.metadata.name.clone());
+    }
+
+    /// Informer `DeleteFunc` (the `DeletedFinalStateUnknown` tombstone is
+    /// unrepresentable: a storage watch delivers the previous object).
+    pub fn on_delete(&self, api_service: &APIService) {
+        self.queue.add(api_service.metadata.name.clone());
+    }
+
+    /// `Run`: wait for the APIService cache, record the APIServices that
+    /// existed when we started, then run `workers` workers until `stop` fires.
     pub async fn run(
-        &self,
-        client: &dyn APIServiceClient,
+        self: Arc<Self>,
+        client: Arc<dyn APIServiceClient>,
+        workers: usize,
         mut stop: tokio::sync::watch::Receiver<bool>,
     ) {
-        if let Ok(names) = client.list_names().await {
-            self.record_present_at_start(names);
-        }
-        loop {
-            let mut names: BTreeSet<String> = std::mem::take(&mut *self.queue.lock().unwrap());
-            names.extend(self.api_services_to_sync.lock().unwrap().keys().cloned());
-            if let Ok(listed) = client.list_names().await {
-                names.extend(listed);
-            }
-            for name in names {
-                if let Err(e) = self.check_api_service(client, &name).await {
-                    tracing::warn!("autoregister: {name} failed with : {e:?}");
-                }
+        tracing::info!("Starting autoregister controller");
+        // `WaitForCacheSync("autoregister", stopCh, c.apiServiceSynced)`
+        let names = loop {
+            match client.list_names().await {
+                Ok(names) => break names,
+                Err(e) => tracing::debug!("autoregister: waiting for cache sync: {e:?}"),
             }
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 _ = stop.changed() => return,
             }
+        };
+        // record APIService objects that existed when we started
+        self.record_present_at_start(names);
+
+        let mut tasks = Vec::new();
+        for _ in 0..workers {
+            let c = self.clone();
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                while c.process_next_work_item(&client).await {}
+            }));
         }
+        // wait until we're told to stop
+        while !*stop.borrow() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+        self.queue.shut_down();
+        for t in tasks {
+            let _ = t.await;
+        }
+        tracing::info!("Shutting down autoregister controller");
     }
+
+    /// `processNextWorkItem`: false when it's time to quit.
+    async fn process_next_work_item(self: &Arc<Self>, client: &Arc<dyn APIServiceClient>) -> bool {
+        let Some(key) = self.queue.get().await else {
+            return false;
+        };
+        let result = self.check_api_service(client.as_ref(), &key).await;
+        self.queue.done(&key);
+        match result {
+            // `Forget`: reset the per-item failure count
+            Ok(()) => self.rate_limiter.lock().unwrap().forget(&key),
+            Err(e) => {
+                tracing::error!("autoregister: {key} failed with : {e:?}");
+                // `AddRateLimited`
+                let delay = self
+                    .rate_limiter
+                    .lock()
+                    .unwrap()
+                    .when_at(&key, tokio::time::Instant::now());
+                let c = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    c.queue.add(key);
+                });
+            }
+        }
+        true
+    }
+}
+
+/// The APIService informer's event handlers, fed by a storage watch: the
+/// controller's `AddFunc`/`UpdateFunc`/`DeleteFunc` (aggregator.go
+/// `NewAutoRegisterController`) and, for Add/Update, the
+/// `autoregister-completion` check's `handleAPIServiceChange`
+/// (aggregator.go:~275-284). The informer's initial list is replayed as Adds
+/// after the watch starts, so no event falls between the two.
+pub async fn spawn_api_service_event_handlers<S: Storage + 'static>(
+    storage: Arc<S>,
+    controller: Arc<AutoRegisterController>,
+    check: Arc<APIServiceAvailableCheck>,
+) {
+    let mut stream = match storage.watch(&build_prefix("apiservices", None)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("autoregister: cannot watch APIServices: {e}");
+            return;
+        }
+    };
+    match storage
+        .list::<APIService>(&build_prefix("apiservices", None))
+        .await
+    {
+        Ok(all) => {
+            for a in &all {
+                controller.on_add(a);
+                check.handle_api_service_change(a);
+            }
+        }
+        Err(e) => tracing::error!("autoregister: cannot list APIServices: {e}"),
+    }
+    tokio::spawn(async move {
+        while let Some(ev) = stream.next().await {
+            let Ok(ev) = ev else { continue };
+            match ev {
+                WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                    let Ok(a) = serde_json::from_str::<APIService>(&v) else {
+                        continue;
+                    };
+                    controller.on_update(&a);
+                    check.handle_api_service_change(&a);
+                }
+                WatchEvent::Deleted(_, v) => {
+                    let Ok(a) = serde_json::from_str::<APIService>(&v) else {
+                        continue;
+                    };
+                    controller.on_delete(&a);
+                }
+            }
+        }
+    });
 }
 
 impl crate::crdregistration::AutoAPIServiceRegistration for AutoRegisterController {
@@ -510,9 +642,11 @@ pub const AUTOREGISTRATION_HOOK: &str = "kube-apiserver-autoregistration";
 /// autoregistration controller starts only after `WaitForInitialSync()`
 /// (:172-176) so its initial sync cannot delete APIServices of existing CRDs.
 ///
-/// Deviation (tracked in #2916): the controller is driven by
-/// [`AutoRegisterController::run`]'s tick rather than an informer, and the
-/// check observes Available by polling storage each second.
+/// Both are event-driven like upstream: [`spawn_api_service_event_handlers`]
+/// feeds the workqueue and the completion check from an APIService watch.
+///
+/// Deviation (tracked in #2916): the client is the API server's own storage
+/// rather than the loopback registry-store client.
 pub fn spawn_autoregistration<S: Storage + 'static>(
     storage: std::sync::Arc<S>,
     listed_paths: Vec<String>,
@@ -526,7 +660,8 @@ pub fn spawn_autoregistration<S: Storage + 'static>(
     });
     crate::post_start_hooks::spawn_starting_hook(AUTOREGISTRATION_HOOK, move || {
         let storage_for_crds = storage.clone();
-        let client = std::sync::Arc::new(StorageAPIServiceClient(storage));
+        let storage_for_events = storage.clone();
+        let client: Arc<dyn APIServiceClient> = Arc::new(StorageAPIServiceClient(storage));
         // `Run(5, context.Done())`: the stop channel never fires for the
         // process lifetime.
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -536,7 +671,6 @@ pub fn spawn_autoregistration<S: Storage + 'static>(
                 controller.clone(),
             ));
         let c = controller.clone();
-        let cl = client.clone();
         tokio::spawn(async move {
             let _keep = stop_tx;
             // Event handlers first, so no CRD event falls between the initial
@@ -546,6 +680,9 @@ pub fn spawn_autoregistration<S: Storage + 'static>(
                 crd_controller.clone(),
             )
             .await;
+            // The APIService informer's handlers (also drive the completion
+            // check's Available observation).
+            spawn_api_service_event_handlers(storage_for_events, c.clone(), check).await;
             // `go crdRegistrationController.Run(5, context.Done())`
             tokio::spawn(crd_controller.clone().run(5, stop_rx.clone()));
             // "let the CRD controller process the initial set of CRDs before
@@ -553,20 +690,7 @@ pub fn spawn_autoregistration<S: Storage + 'static>(
             tracing::info!("waiting for initial CRD sync...");
             crd_controller.wait_for_initial_sync().await;
             tracing::info!("initial CRD sync complete...");
-            c.run(cl.as_ref(), stop_rx).await;
-        });
-        // Observe Available (informer add/update handlers upstream).
-        tokio::spawn(async move {
-            loop {
-                if let Ok(names) = client.list_names().await {
-                    for n in names {
-                        if let Ok(Some(a)) = client.get(&n).await {
-                            check.handle_api_service_change(&a);
-                        }
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
+            c.run(client, 5, stop_rx).await;
         });
     })
 }
@@ -897,5 +1021,123 @@ mod tests {
                 (_, other) => panic!("{}: unexpected actions {other:?}", t.name),
             }
         }
+    }
+
+    async fn wait_for(cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    /// `Add/RemoveAPIServiceToSync` enqueue the name and a worker runs
+    /// `checkAPIService` for it: no polling tick involved.
+    #[tokio::test]
+    async fn worker_syncs_queued_name() {
+        let ctl = Arc::new(AutoRegisterController::new());
+        let fake = Arc::new(Fake::default());
+        ctl.add_api_service_to_sync(&plain("foo"));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let client: Arc<dyn APIServiceClient> = fake.clone();
+        let h = tokio::spawn(ctl.clone().run(client, 2, stop_rx));
+        wait_for(|| !fake.actions.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            fake.actions.lock().unwrap().clone(),
+            vec![Action::Create(managed("foo"))]
+        );
+        // an informer event for a queued name wakes a worker as well
+        ctl.add_api_service_to_sync(&plain("bar"));
+        wait_for(|| fake.actions.lock().unwrap().len() == 2).await;
+        stop_tx.send(true).unwrap();
+        h.await.unwrap();
+    }
+
+    /// A client whose first `create` fails.
+    struct FailFirstCreate {
+        inner: Fake,
+        failures: Mutex<u32>,
+        attempts: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl APIServiceClient for FailFirstCreate {
+        async fn get(&self, name: &str) -> Result<Option<APIService>, ClientError> {
+            self.inner.get(name).await
+        }
+        async fn list_names(&self) -> Result<Vec<String>, ClientError> {
+            self.inner.list_names().await
+        }
+        async fn create(&self, a: &APIService) -> Result<(), ClientError> {
+            *self.attempts.lock().unwrap() += 1;
+            let fail = {
+                let mut f = self.failures.lock().unwrap();
+                let fail = *f > 0;
+                if fail {
+                    *f -= 1;
+                }
+                fail
+            };
+            if fail {
+                return Err(ClientError::Other("boom".into()));
+            }
+            self.inner.create(a).await
+        }
+        async fn update(&self, a: &APIService) -> Result<(), ClientError> {
+            self.inner.update(a).await
+        }
+        async fn delete(&self, name: &str, uid: &str) -> Result<(), ClientError> {
+            self.inner.delete(name, uid).await
+        }
+    }
+
+    /// An error requeues the key rate-limited (`AddRateLimited`) until the
+    /// sync succeeds, then the failure count is forgotten.
+    #[tokio::test]
+    async fn failed_sync_is_requeued_rate_limited() {
+        let ctl = Arc::new(AutoRegisterController::new());
+        let client = Arc::new(FailFirstCreate {
+            inner: Fake::default(),
+            failures: Mutex::new(2),
+            attempts: Mutex::new(0),
+        });
+        ctl.add_api_service_to_sync(&plain("foo"));
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let dyn_client: Arc<dyn APIServiceClient> = client.clone();
+        let h = tokio::spawn(ctl.clone().run(dyn_client, 1, stop_rx));
+        wait_for(|| !client.inner.actions.lock().unwrap().is_empty()).await;
+        assert_eq!(*client.attempts.lock().unwrap(), 3);
+        wait_for(|| ctl.rate_limiter.lock().unwrap().num_requeues("foo") == 0).await;
+        stop_tx.send(true).unwrap();
+        h.await.unwrap();
+    }
+
+    /// The APIService watch feeds the workqueue and the completion check.
+    #[tokio::test]
+    async fn watch_events_drive_queue_and_check() {
+        use rusternetes_storage::MemoryStorage;
+        let storage = Arc::new(MemoryStorage::new());
+        let ctl = Arc::new(AutoRegisterController::new());
+        let mut pending = plain("v1.example.com");
+        pending.metadata.name = "v1.example.com".into();
+        let check = Arc::new(APIServiceAvailableCheck::new(&[pending.clone()]));
+        assert!(check.check().is_err());
+        spawn_api_service_event_handlers(storage.clone(), ctl.clone(), check.clone()).await;
+        let mut available = pending.clone();
+        available.status.conditions = vec![serde_json::from_value(serde_json::json!({
+            "type": "Available", "status": "True"
+        }))
+        .unwrap()];
+        storage
+            .create(
+                &build_key("apiservices", None, "v1.example.com"),
+                &available,
+            )
+            .await
+            .unwrap();
+        wait_for(|| check.check().is_ok()).await;
+        assert!(!ctl.queue.is_idle());
     }
 }
