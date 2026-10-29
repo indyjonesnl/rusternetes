@@ -85,6 +85,10 @@ pub struct PodValidationOptions {
     /// `InPlacePodLevelResourcesVerticalScaling`, util.go:427): a pod with
     /// pod-level resources may be resized.
     pub in_place_pod_level_resources_vertical_scaling_enabled: bool,
+    /// `AllowSidecarResizePolicy`: a restartable init container may carry a
+    /// `resizePolicy` (gate `InPlacePodVerticalScaling`, or the old spec
+    /// already has one on a sidecar).
+    pub allow_sidecar_resize_policy: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -109,6 +113,8 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         in_place_pod_level_resources_vertical_scaling_enabled: enabled(
             Feature::InPlacePodLevelResourcesVerticalScaling,
         ),
+        // util.go:424.
+        allow_sidecar_resize_policy: enabled(Feature::InPlacePodVerticalScaling),
         allow_match_label_keys_in_pod_topology_spread: enabled(
             Feature::MatchLabelKeysInPodTopologySpread,
         ),
@@ -167,6 +173,9 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         // doesn't work) may still be modified.
         opts.allow_user_namespaces_with_volume_devices =
             has_user_namespaces_with_volume_devices(old);
+        // util.go:479: an old resize policy on a restartable init container
+        // must stay updatable.
+        opts.allow_sidecar_resize_policy |= has_restartable_init_container_resize_policy(old);
         // util.go:464.
         opts.allow_non_local_projected_token_path = has_non_local_projected_token_path(old);
         // util.go:467-475: an old sysctl that `ValidateHostSysctl` rejects.
@@ -494,6 +503,15 @@ fn use_only_recursive_se_linux_change_policy(old_spec: Option<&PodSpec>) -> bool
         return false;
     }
     !se_linux_change_policy_in_use(old_spec)
+}
+
+/// `hasRestartableInitContainerResizePolicy` (util.go:1682-1693): any init
+/// container with `restartPolicy: Always` and a non-empty `resizePolicy`.
+fn has_restartable_init_container_resize_policy(spec: &PodSpec) -> bool {
+    spec.init_containers.iter().flatten().any(|c| {
+        c.restart_policy.as_deref() == Some("Always")
+            && c.resize_policy.as_ref().is_some_and(|p| !p.is_empty())
+    })
 }
 
 /// `hasNonLocalProjectedTokenPath` (util.go:393-408).
@@ -877,6 +895,79 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
+    }
+
+    fn init_spec(inits: serde_json::Value) -> PodSpec {
+        spec(json!({ "initContainers": inits }))
+    }
+
+    /// `TestValidateAllowSidecarResizePolicy` (util_test.go:4408): the option
+    /// is `want || gate`, and only a RESTARTABLE init container with a
+    /// resizePolicy relaxes it. Create (no old spec) is `gate`.
+    #[test]
+    #[serial_test::serial]
+    fn allow_sidecar_resize_policy_option() {
+        use crate::feature_gates::{with_feature, Feature};
+        let rp = json!([{"resourceName": "cpu", "restartPolicy": "NotRequired"}]);
+        let side = |rp: &serde_json::Value| json!({"name": "s", "image": "i", "restartPolicy": "Always", "resizePolicy": rp});
+        let plain = |rp: &serde_json::Value| json!({"name": "p", "image": "i", "resizePolicy": rp});
+        let cases = [
+            (None, false),
+            (
+                Some(init_spec(json!([side(&json!([])), plain(&json!([]))]))),
+                false,
+            ),
+            (
+                Some(init_spec(json!([side(&json!([])), plain(&rp)]))),
+                false,
+            ),
+            (Some(init_spec(json!([side(&rp), plain(&json!([]))]))), true),
+            (Some(init_spec(json!([side(&rp), plain(&rp)]))), true),
+            (Some(init_spec(json!([plain(&rp), plain(&rp)]))), false),
+            (
+                Some(spec(json!({"containers": [
+                    {"name": "c", "image": "i", "resizePolicy": rp}]}))),
+                false,
+            ),
+        ];
+        for gate in [true, false] {
+            let _g = with_feature(Feature::InPlacePodVerticalScaling, gate);
+            for (old, want) in &cases {
+                assert_eq!(
+                    opts(old.as_ref()).allow_sidecar_resize_policy,
+                    *want || gate,
+                    "old={old:?} gate={gate}"
+                );
+            }
+        }
+    }
+
+    /// validation.go:3866: with the option off, any init container with a
+    /// resizePolicy is `Invalid`; with it on, no error from this rule.
+    #[test]
+    fn sidecar_resize_policy_rule() {
+        use crate::validation::pod::validate_pod_spec_with_options;
+        let s = init_spec(
+            json!([{"name": "s", "image": "i", "restartPolicy": "Always",
+            "terminationMessagePolicy": "File", "imagePullPolicy": "Always",
+            "resizePolicy": [{"resourceName": "cpu", "restartPolicy": "NotRequired"}]}]),
+        );
+        let has = |o: &PodValidationOptions| {
+            validate_pod_spec_with_options(&s, &Path::new("spec"), o)
+                .iter()
+                .any(|e| {
+                    e.to_string()
+                        .contains("spec.initContainers[0].resizePolicy: Invalid value")
+                        && e.to_string()
+                            .contains("must not be set for init containers")
+                })
+        };
+        let on = PodValidationOptions {
+            allow_sidecar_resize_policy: true,
+            ..Default::default()
+        };
+        assert!(!has(&on));
+        assert!(has(&PodValidationOptions::default()));
     }
 
     /// util.go:422/:427: both options follow their gate and ignore the old
