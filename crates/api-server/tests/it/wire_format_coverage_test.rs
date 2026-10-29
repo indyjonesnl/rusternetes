@@ -286,6 +286,18 @@ fn all_bundled_protos() -> Vec<String> {
     out
 }
 
+/// Upstream proto packages whose messages kube-apiserver never serves over
+/// REST, so a registry layout would be dead weight.
+///
+/// * `audit.k8s.io/v1` (`k8s.io/apiserver/pkg/apis/audit/v1/generated.proto`):
+///   `Policy` is read from a file (`apiserver/pkg/audit/policy/reader.go`,
+///   `LoadPolicyFromBytes` via the universal decoder) and `Event`/`EventList`
+///   are only log/webhook payloads (`apiserver/pkg/server/options/audit.go`
+///   knows only `auditv1.SchemeGroupVersion`). No `/apis/audit.k8s.io` resource
+///   exists, and our audit sink (`crates/api-server/src/audit.rs`) does not use
+///   the protobuf registry.
+const NON_SERVED_PROTO_API_VERSIONS: &[&str] = &["audit.k8s.io/v1"];
+
 fn upstream_proto_findings(registry: &RegistryView, totals: &mut Totals) -> Vec<Finding> {
     let hard: BTreeSet<&str> = PROTO_FILES.iter().copied().collect();
     let mut parsed = Vec::new();
@@ -305,6 +317,9 @@ fn upstream_proto_findings(registry: &RegistryView, totals: &mut Totals) -> Vec<
         let Some(av) = api_version_for_proto_path(file.name()) else {
             continue;
         };
+        if NON_SERVED_PROTO_API_VERSIONS.contains(&av.as_str()) {
+            continue;
+        }
         totals.upstream_files += 1;
         out.extend(proto_parity_findings(
             file,
