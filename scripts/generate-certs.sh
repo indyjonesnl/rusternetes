@@ -30,6 +30,59 @@ if [ ! -f "$SA_KEY" ]; then
     echo "  SA public key:  $SA_PUB"
 fi
 
+# Front-proxy (aggregation layer) PKI, kubeadm parity: a dedicated CA plus the
+# client cert the api-server presents to extension API servers. Ported from
+# cmd/kubeadm/app/phases/certs/certlist.go KubeadmCertFrontProxyCA ("front-proxy-ca")
+# and KubeadmCertFrontProxyClient (CN=front-proxy-client, clientAuth, signed by
+# front-proxy-ca) and constants.FrontProxyClientCertCommonName. The CA MUST be
+# distinct from the cluster CA: --requestheader-client-ca-file may not overlap
+# --client-ca-file unless --requestheader-allowed-names is set (upstream
+# options/authentication.go Validate), and an extension apiserver trusts
+# X-Remote-* headers only from a client cert chaining to this CA. The api-server
+# publishes this CA in kube-system/extension-apiserver-authentication
+# (requestheader-client-ca-file) and the aggregator proxy presents
+# front-proxy-client.{crt,key} (handlers/aggregator.rs PROXY_CLIENT_CERT).
+# Runs whether or not the api-server TLS cert exists, and is idempotent (#3423).
+generate_front_proxy_certs() {
+    local fp_ca_crt="${CERT_DIR}/front-proxy-ca.crt"
+    local fp_ca_key="${CERT_DIR}/front-proxy-ca.key"
+    local fp_crt="${CERT_DIR}/front-proxy-client.crt"
+    local fp_key="${CERT_DIR}/front-proxy-client.key"
+
+    mkdir -p "$CERT_DIR"
+    if [ ! -f "$fp_ca_crt" ] || [ ! -f "$fp_ca_key" ]; then
+        echo "Generating front-proxy CA..."
+        openssl ecparam -name prime256v1 -genkey -noout -out "$fp_ca_key"
+        openssl req -new -x509 \
+            -key "$fp_ca_key" \
+            -out "$fp_ca_crt" \
+            -days 3650 \
+            -subj "/CN=front-proxy-ca" \
+            -addext "basicConstraints = critical, CA:TRUE" \
+            -addext "keyUsage = critical, digitalSignature, keyCertSign, cRLSign" \
+            -set_serial 01
+        # A new CA invalidates any client cert signed by the previous one.
+        rm -f "$fp_crt" "$fp_key"
+    fi
+
+    if [ ! -f "$fp_crt" ] || [ ! -f "$fp_key" ]; then
+        echo "Generating front-proxy client cert..."
+        # PKCS#8 so the reqwest identity loader (aggregator proxy) accepts it.
+        openssl ecparam -name prime256v1 -genkey -noout \
+            | openssl pkcs8 -topk8 -nocrypt -out "$fp_key"
+        openssl req -new -key "$fp_key" -out "${CERT_DIR}/front-proxy-client.csr" \
+            -subj "/CN=front-proxy-client"
+        openssl x509 -req -in "${CERT_DIR}/front-proxy-client.csr" \
+            -CA "$fp_ca_crt" -CAkey "$fp_ca_key" -CAcreateserial \
+            -out "$fp_crt" -days 3650 \
+            -extfile <(printf "extendedKeyUsage = clientAuth\n") 2>/dev/null
+        rm -f "${CERT_DIR}/front-proxy-client.csr"
+        echo "  Front-proxy CA:   $fp_ca_crt"
+        echo "  Front-proxy cert: $fp_crt (CN=front-proxy-client)"
+    fi
+}
+generate_front_proxy_certs
+
 # Generate the kube-scheduler client cert + kubeconfig for the in-cluster
 # static pod (Task 3 of the scheduler-in-cluster plan). Runs whether or not the
 # api-server TLS cert already exists, so it is idempotently produced on reruns.

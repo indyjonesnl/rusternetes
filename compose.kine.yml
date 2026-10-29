@@ -127,6 +127,21 @@ services:
       - "/etc/kubernetes/pki/api-server.crt"
       - "--tls-key-file"
       - "/etc/kubernetes/pki/api-server.key"
+      # Front-proxy authn (#3423): kubeadm flag set; CA/cert from generate-certs.sh.
+      # Client-cert authn CA, as kubeadm passes it next to the front-proxy CA: without it the
+      # listener trusts only the front-proxy CA and rejects cluster-CA client certs (#3423).
+      - "--client-ca-file"
+      - "/etc/kubernetes/pki/ca.crt"
+      - "--requestheader-client-ca-file"
+      - "/etc/kubernetes/pki/front-proxy-ca.crt"
+      - "--requestheader-allowed-names"
+      - "front-proxy-client"
+      - "--requestheader-username-headers"
+      - "X-Remote-User"
+      - "--requestheader-group-headers"
+      - "X-Remote-Group"
+      - "--requestheader-extra-headers-prefix"
+      - "X-Remote-Extra-"
       - "--skip-auth"
       - "--console-dir"
       - "/app/console"
