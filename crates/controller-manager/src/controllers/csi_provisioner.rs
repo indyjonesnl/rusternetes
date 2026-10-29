@@ -145,7 +145,8 @@ const ANN_ALLOW_VOLUME_MODE_CHANGE: &str =
 const DELETE_VOLUME_RETRY_COUNT: usize = 5;
 /// `--volume-name-prefix` default (csi-provisioner.go:81).
 const VOLUME_NAME_PREFIX: &str = "pvc";
-/// `--retry-interval-start` / `--retry-interval-max` (csi-provisioner.go:83-84).
+/// `--retry-interval-start` / `--retry-interval-max` defaults
+/// (csi-provisioner.go:83-84).
 const RETRY_INTERVAL_START: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL_MAX: Duration = Duration::from_secs(300);
 /// `DefaultTypedControllerRateLimiter`'s per-item exponential limiter
@@ -791,6 +792,9 @@ pub struct CsiProvisioner<S: Storage> {
     claims_in_progress: Mutex<HashMap<String, PersistentVolumeClaim>>,
     /// `queueStore.volumes`.
     unsaved: Mutex<HashMap<String, Unsaved>>,
+    /// `--retry-interval-start`: the queues' initial retry interval
+    /// (`genericRateLimiter`/`claimRateLimiter`, csi-provisioner.go:394-395).
+    retry_interval_start: Duration,
     /// `RetryIntervalMax` (`--retry-interval-max`): the queue's backoff cap
     /// and the `slowSet`'s retention (lib controller.go:682).
     retry_interval_max: Duration,
@@ -864,6 +868,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             prevent_volume_mode_conversion: true,
             claims_in_progress: Mutex::new(HashMap::new()),
             unsaved: Mutex::new(HashMap::new()),
+            retry_interval_start: RETRY_INTERVAL_START,
             retry_interval_max: RETRY_INTERVAL_MAX,
             slow_set: Mutex::new(HashMap::new()),
             strict_topology: false,
@@ -989,6 +994,12 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// `--controller-publish-readonly`.
     pub fn with_controller_publish_read_only(mut self, on: bool) -> Self {
         self.controller_publish_read_only = on;
+        self
+    }
+
+    /// `--retry-interval-start` (csi-provisioner.go:83).
+    pub fn with_retry_interval_start(mut self, start: Duration) -> Self {
+        self.retry_interval_start = start;
         self
     }
 
@@ -3206,7 +3217,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         use futures::StreamExt;
 
         let queue = WorkQueue::with_config(WorkQueueConfig {
-            base_delay: RETRY_INTERVAL_START,
+            base_delay: self.retry_interval_start,
             max_delay: self.retry_interval_max,
         });
         for _ in 0..WORKERS {
@@ -3276,7 +3287,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
 
         info!("Starting CSI provisioner for driver {}", self.driver_name);
         let queue = WorkQueue::with_config(WorkQueueConfig {
-            base_delay: RETRY_INTERVAL_START,
+            base_delay: self.retry_interval_start,
             max_delay: self.retry_interval_max,
         });
         for _ in 0..WORKERS {

@@ -197,6 +197,12 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     csi_prevent_volume_mode_conversion: bool,
 
+    /// `--retry-interval-start` of external-provisioner
+    /// (csi-provisioner.go:83, default 1s): the initial retry interval of
+    /// failed provisioning or deletion, doubling up to `--retry-interval-max`.
+    #[arg(long, default_value = "1s", value_parser = parse_clean_up_period)]
+    csi_retry_interval_start: std::time::Duration,
+
     /// `--retry-interval-max` of external-provisioner
     /// (csi-provisioner.go:84, default 5m): the retry backoff cap and how long
     /// an infeasible claim is delayed.
@@ -1407,6 +1413,7 @@ async fn main() -> Result<()> {
                 .with_extra_create_metadata(args.csi_extra_create_metadata)
                 .with_controller_publish_read_only(args.csi_controller_publish_readonly)
                 .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
+                .with_retry_interval_start(args.csi_retry_interval_start)
                 .with_retry_interval_max(args.csi_retry_interval_max)
                 .with_cross_namespace_volume_data_source(
                     rusternetes_common::feature_gates::enabled(
@@ -1460,10 +1467,10 @@ async fn main() -> Result<()> {
             let managed_by_id = controllers::csi_capacity::managed_by_id(node.as_deref());
             let immediate_binding = args.csi_capacity_for_immediate_binding;
             let poll = args.csi_capacity_poll_interval;
-            // `--retry-interval-start` (csi-provisioner.go, default 1s; no
-            // flag here) and `--retry-interval-max`: the capacity queue's
-            // `NewTypedItemExponentialFailureRateLimiter` (:528).
-            let retry_start = std::time::Duration::from_secs(1);
+            // `--retry-interval-start` and `--retry-interval-max`: the
+            // capacity queue's `NewTypedItemExponentialFailureRateLimiter`
+            // (:528).
+            let retry_start = args.csi_retry_interval_start;
             let retry_max = args.csi_retry_interval_max;
             let threads = args.csi_capacity_threads;
             // csi-provisioner.go:453-458: "Publishing storage capacity
@@ -2331,6 +2338,23 @@ mod pv_recycler_flag_tests {
         assert_eq!(args.pv_recycler_timeout_increment_hostpath, 4);
         assert_eq!(args.pv_recycler_pod_template_filepath_nfs, "/a");
         assert_eq!(args.pv_recycler_pod_template_filepath_hostpath, "/b");
+    }
+
+    /// `--retry-interval-start` (csi-provisioner.go:83): default 1s, and the
+    /// flag reaches the args the provisioner and capacity queues are built from.
+    #[test]
+    fn retry_interval_start_flag_defaults_to_one_second() {
+        let args = Args::try_parse_from(["controller-manager"]).unwrap();
+        assert_eq!(
+            args.csi_retry_interval_start,
+            std::time::Duration::from_secs(1)
+        );
+        let args = Args::try_parse_from(["controller-manager", "--csi-retry-interval-start=250ms"])
+            .unwrap();
+        assert_eq!(
+            args.csi_retry_interval_start,
+            std::time::Duration::from_millis(250)
+        );
     }
 
     /// A bad template file aborts startup with core.go:324's wrapper.
