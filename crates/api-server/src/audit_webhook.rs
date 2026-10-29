@@ -1059,8 +1059,15 @@ mod tests {
         assert!(got.lock().unwrap().is_empty());
         buffered.unwrap().shutdown().await;
         let got = got.lock().unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0]["items"].as_array().unwrap().len(), 3);
+        // Shutdown races the worker's collect loop (`select` over the buffer
+        // and the stop channel, buffered.go `collectEvents`), so the three
+        // events may leave as one batch or as a partial batch followed by the
+        // drain; either way all three arrive.
+        let delivered: usize = got
+            .iter()
+            .map(|b| b["items"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(delivered, 3);
     }
 
     #[test]
