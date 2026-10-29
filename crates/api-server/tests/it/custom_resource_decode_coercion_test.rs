@@ -17,33 +17,30 @@ use rusternetes_common::{
 };
 use rusternetes_storage::{build_key, Storage};
 use rusternetes_test_support::harness::TestApiServer;
+use rusternetes_test_support::mock_http::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use warp::Filter;
 
 const GROUP: &str = "stable.example.com";
 
 async fn start_webhook(seen: Arc<Mutex<Vec<Value>>>) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let req = r.request.expect("request");
-            seen.lock()
-                .unwrap()
-                .push(serde_json::to_value(&req).unwrap());
-            warp::reply::json(&AdmissionReview {
-                api_version: "admission.k8s.io/v1".into(),
-                kind: "AdmissionReview".into(),
-                request: None,
-                response: Some(AdmissionReviewResponse::allow(req.uid)),
-            })
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(move |r: AdmissionReview| {
+        let req = r.request.expect("request");
+        seen.lock()
+            .unwrap()
+            .push(serde_json::to_value(&req).unwrap());
+        reply_json(&AdmissionReview {
+            api_version: "admission.k8s.io/v1".into(),
+            kind: "AdmissionReview".into(),
+            request: None,
+            response: Some(AdmissionReviewResponse::allow(req.uid)),
+        })
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{addr}"), tx)
 }
 

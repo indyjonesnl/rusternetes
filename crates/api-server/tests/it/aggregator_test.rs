@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use warp::Filter;
 
 // ----- shared helpers --------------------------------------------------------
 
@@ -369,49 +368,44 @@ async fn forward_to_aggregator_forwards_body_and_impersonation() {
         Arc::new(tokio::sync::Mutex::new(None));
     let captured_route = captured.clone();
 
-    let route = warp::path::full()
-        .and(warp::header::headers_cloned())
-        .and(warp::body::bytes())
-        .and_then(
-            move |full: warp::path::FullPath,
-                  headers: warp::http::HeaderMap,
-                  body: bytes::Bytes| {
-                let captured = captured_route.clone();
-                async move {
-                    let mut user = String::new();
-                    let mut groups: Vec<String> = Vec::new();
-                    let mut extras: Vec<String> = Vec::new();
-                    for (k, v) in headers.iter() {
-                        let kl = k.as_str().to_ascii_lowercase();
-                        let vs = v.to_str().unwrap_or("").to_string();
-                        if kl == "x-remote-user" {
-                            user = vs;
-                        } else if kl == "x-remote-group" {
-                            groups.push(vs);
-                        } else if kl.starts_with("x-remote-extra-") {
-                            extras.push(format!("{}={}", kl, vs));
-                        }
+    let route = axum::Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let captured = captured_route.clone();
+            async move {
+                let mut user = String::new();
+                let mut groups: Vec<String> = Vec::new();
+                let mut extras: Vec<String> = Vec::new();
+                for (k, v) in headers.iter() {
+                    let kl = k.as_str().to_ascii_lowercase();
+                    let vs = v.to_str().unwrap_or("").to_string();
+                    if kl == "x-remote-user" {
+                        user = vs;
+                    } else if kl == "x-remote-group" {
+                        groups.push(vs);
+                    } else if kl.starts_with("x-remote-extra-") {
+                        extras.push(format!("{}={}", kl, vs));
                     }
-                    let path = full.as_str().to_string();
-                    let body_str = String::from_utf8_lossy(&body).to_string();
-                    *captured.lock().await = Some((user, groups, extras, body_str.clone()));
-                    // Echo back with custom content type to verify response wiring.
-                    Ok::<_, warp::Rejection>(
-                        warp::http::Response::builder()
-                            .status(201)
-                            .header("Content-Type", "application/json;charset=utf-8")
-                            .body(format!("{{\"path\":\"{}\",\"echo\":{}}}", path, body_str))
-                            .unwrap(),
-                    )
                 }
-            },
-        );
+                let path = uri.path().to_string();
+                let body_str = String::from_utf8_lossy(&body).to_string();
+                *captured.lock().await = Some((user, groups, extras, body_str.clone()));
+                // Echo back with custom content type to verify response wiring.
+                (axum::http::Response::builder()
+                    .status(201)
+                    .header("Content-Type", "application/json;charset=utf-8")
+                    .body(axum::body::Body::from(format!(
+                        "{{\"path\":\"{}\",\"echo\":{}}}",
+                        path, body_str
+                    )))
+                    .unwrap(),)
+            }
+        },
+    );
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let (addr, server_handle) =
+        rusternetes_test_support::mock_http::serve_graceful_handle(route, async {
             shutdown_rx.await.ok();
         });
-    let server_handle = tokio::spawn(server);
 
     let target = AggregatorTarget {
         host: addr.ip().to_string(),

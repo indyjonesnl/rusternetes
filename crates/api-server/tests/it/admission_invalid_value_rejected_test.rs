@@ -27,45 +27,42 @@ use rusternetes_common::{
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use rusternetes_test_support::harness::TestApiServer;
+use rusternetes_test_support::mock_http::*;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
-use warp::Filter;
 
 /// Mutating mock: adds `data["bad key"]`, an invalid ConfigMap key.
 async fn start_invalid_key_mutator() -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(|r: AdmissionReview| {
-            let uid = r.request.map(|q| q.uid).unwrap_or_else(|| "u".into());
-            let patch = vec![PatchOperation {
-                op: PatchOp::Add,
-                path: "/data/bad key".to_string(),
-                value: Some(json!("v")),
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(AdmissionReviewResponse {
-                    uid,
-                    allowed: true,
-                    status: None,
-                    patch: Some(b64),
-                    patch_type: Some("JSONPatch".to_string()),
-                    audit_annotations: None,
-                    warnings: None,
-                }),
-            })
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(|r: AdmissionReview| {
+        let uid = r.request.map(|q| q.uid).unwrap_or_else(|| "u".into());
+        let patch = vec![PatchOperation {
+            op: PatchOp::Add,
+            path: "/data/bad key".to_string(),
+            value: Some(json!("v")),
+            from: None,
+        }];
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&patch).unwrap());
+        reply_json(&AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(AdmissionReviewResponse {
+                uid,
+                allowed: true,
+                status: None,
+                patch: Some(b64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }),
+        })
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 

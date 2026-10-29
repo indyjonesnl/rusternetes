@@ -24,41 +24,36 @@ use rusternetes_common::{
     types::ObjectMeta,
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::mock_http::*;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use warp::Filter;
 
 /// Mock webhook server that sleeps `delay` before responding "allow".
 /// Used to deterministically trigger a timeout when `timeoutSeconds < delay`.
 async fn start_slow_validating_server(delay: Duration) -> (String, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let route =
-        warp::post()
-            .and(warp::body::json())
-            .and_then(move |review: AdmissionReview| async move {
-                tokio::time::sleep(delay).await;
-                let uid = review
-                    .request
-                    .as_ref()
-                    .map(|r| r.uid.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let response_review = AdmissionReview {
-                    api_version: "admission.k8s.io/v1".to_string(),
-                    kind: "AdmissionReview".to_string(),
-                    request: None,
-                    response: Some(AdmissionReviewResponse::allow(uid)),
-                };
-                Ok::<_, warp::Rejection>(warp::reply::json(&response_review))
-            });
+    let route = mock_post_async(move |review: AdmissionReview| async move {
+        tokio::time::sleep(delay).await;
+        let uid = review
+            .request
+            .as_ref()
+            .map(|r| r.uid.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(AdmissionReviewResponse::allow(uid)),
+        };
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
 }
