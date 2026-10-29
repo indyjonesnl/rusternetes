@@ -258,6 +258,9 @@ impl<T: Object> Patcher<'_, T> {
         // strategy.
         let kind = &self.scope.kind;
         let schema = PatchSchema::for_kind(&kind.group, &kind.version, &kind.kind);
+        // The patched document in the request's version, when it differs from
+        // the stored one: strictness is judged there (patch.go:331-363).
+        let mut versioned_patched: Option<Vec<u8>> = None;
         let patched = match self.scope.patch_conversion {
             None => {
                 apply_patch_with_schema(&current_json, &patch, patch_type.clone(), schema.as_ref())
@@ -272,6 +275,9 @@ impl<T: Object> Patcher<'_, T> {
                     schema.as_ref(),
                 )
                 .map_err(|e| patch_error(e, patch_type))?;
+                if conversion.strict_decode.is_some() {
+                    versioned_patched = serde_json::to_vec(&patched).ok();
+                }
                 (conversion.from_request_version)(&current_json, patched)
             }
         };
@@ -294,11 +300,18 @@ impl<T: Object> Patcher<'_, T> {
                 self.body,
             )
         };
-        match crate::handlers::validation::validate_strict_fields(
-            self.params,
-            patched_js.as_bytes(),
-            &obj,
+        let strict = match (
+            self.scope.patch_conversion.and_then(|c| c.strict_decode),
+            &versioned_patched,
         ) {
+            (Some(strict_decode), Some(versioned)) => strict_decode(self.params, versioned),
+            _ => crate::handlers::validation::validate_strict_fields(
+                self.params,
+                patched_js.as_bytes(),
+                &obj,
+            ),
+        };
+        match strict {
             Ok(warnings) => {
                 if matches!(directive, FieldValidationMode::Strict) && !applied.is_empty() {
                     return Err(invalid_patch(format!(
