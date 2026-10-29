@@ -174,6 +174,7 @@ mod hpa_status_validation_test;
 mod hpa_store_test;
 mod hpa_update_validation_test;
 mod hpa_v1_conversion_test;
+mod hpa_v1_patch_strict_decode_test;
 mod hpa_v1_watch_route_test;
 mod immutable_drop_field_test;
 mod ingress_event_decode_when_absent_test;
