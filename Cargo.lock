@@ -4373,6 +4373,7 @@ dependencies = [
  "rusternetes-admission-webhook",
  "rusternetes-client",
  "rusternetes-common",
+ "rusternetes-controller-core",
  "rusternetes-controller-manager",
  "rusternetes-cri",
  "rusternetes-discovery",
@@ -4507,6 +4508,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-controller-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "rusternetes-common",
+ "rusternetes-storage",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rusternetes-controller-manager"
 version = "0.1.0"
 dependencies = [
@@ -4532,6 +4547,7 @@ dependencies = [
  "rusternetes-client",
  "rusternetes-cloud-providers",
  "rusternetes-common",
+ "rusternetes-controller-core",
  "rusternetes-csi",
  "rusternetes-middleware",
  "rusternetes-storage",

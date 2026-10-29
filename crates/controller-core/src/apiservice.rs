@@ -1,4 +1,4 @@
-use crate::controllers::worker_pool::spawn_workers;
+use crate::worker_pool::spawn_workers;
 /// APIService Availability Controller
 ///
 /// Watches APIService resources and updates their Available condition

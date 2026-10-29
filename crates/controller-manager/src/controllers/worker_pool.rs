@@ -18,19 +18,9 @@
 //! The per-controller counts are the upstream `Concurrent*Syncs` defaults,
 //! cited at each constant.
 
-use rusternetes_storage::WorkQueue;
-use std::future::Future;
-
-/// Spawn `workers` tasks that each run `make_worker(queue.clone())`.
-pub fn spawn_workers<F, Fut>(workers: usize, queue: &WorkQueue, make_worker: F)
-where
-    F: Fn(WorkQueue) -> Fut,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    for _ in 0..workers {
-        tokio::spawn(make_worker(queue.clone()));
-    }
-}
+// `spawn_workers` lives in `rusternetes-controller-core` so the api-server can
+// use it without depending on this crate.
+pub use rusternetes_controller_core::worker_pool::spawn_workers;
 
 #[cfg(test)]
 pub mod test_support {

@@ -5,6 +5,7 @@ members = [
     "crates/middleware",
     "crates/discovery",
     "crates/scheduler",
+    "crates/controller-core",
     "crates/controller-manager",
     "crates/kubelet",
     "crates/cri",

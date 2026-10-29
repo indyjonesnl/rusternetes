@@ -88,12 +88,15 @@ prost.workspace = true
 prost-types = "0.13"
 # Aggregation-layer availability controller runs inside the apiserver (upstream
 # kube-aggregator placement), so this is a runtime dependency, not just dev.
-rusternetes-controller-manager = { path = "../controller-manager" }
+# Only the in-process controllers come from the small controller-core crate, so
+# editing an unrelated controller does not rebuild the api-server.
+rusternetes-controller-core = { path = "../controller-core" }
 
 [build-dependencies]
 prost-build = "0.13"
 
 [dev-dependencies]
+rusternetes-controller-manager = { path = "../controller-manager" }
 rusternetes-client = { path = "../client" }
 tokio-rustls = { workspace = true }
 tokio-test = "0.4"

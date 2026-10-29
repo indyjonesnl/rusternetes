@@ -22,6 +22,7 @@ rusternetes-client = { path = "../client" }
 # secure serving + delegated authn/authz for /metrics, /statusz, /flagz (#3437)
 rusternetes-middleware = { path = "../middleware" }
 rusternetes-csi = { path = "../csi" }
+rusternetes-controller-core = { path = "../controller-core" }
 # gRPC status codes for the CSI provisioner (`isInfeasibleError`).
 tonic.workspace = true
 rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
