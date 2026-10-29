@@ -1470,6 +1470,19 @@ pub(crate) fn validate_container(
         ));
     }
 
+    // `validateInitContainers` (validation.go:3866): resizePolicy on an init
+    // container needs `AllowSidecarResizePolicy`. Upstream checks this for every
+    // init container, restartable or not.
+    if is_init && !opts.allow_sidecar_resize_policy {
+        if let Some(policies) = c.resize_policy.as_ref().filter(|p| !p.is_empty()) {
+            errs.push(Error::invalid(
+                &fld_path.child("resizePolicy"),
+                serde_json::to_value(policies).unwrap_or_default(),
+                "must not be set for init containers",
+            ));
+        }
+    }
+
     // restartPolicyRules (upstream `validateContainerRestartPolicy`, called
     // from `validateContainers` at `:4060`).
     if let Some(ref rules) = c.restart_policy_rules {
