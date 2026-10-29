@@ -823,6 +823,10 @@ mod busy_read_tests {
             self.gate()?;
             Ok(7)
         }
+        async fn compact_revision(&self) -> BResult<i64> {
+            self.gate()?;
+            Ok(0)
+        }
         async fn wait_for_sync_to(&self, _: i64) {}
         async fn compact(&self, r: i64) -> BResult<i64> {
             Ok(r)
@@ -996,6 +1000,9 @@ mod stats_tests {
         }
         async fn current_revision(&self) -> BResult<i64> {
             Ok(9)
+        }
+        async fn compact_revision(&self) -> BResult<i64> {
+            Ok(0)
         }
         async fn wait_for_sync_to(&self, _: i64) {}
         async fn compact(&self, r: i64) -> BResult<i64> {
