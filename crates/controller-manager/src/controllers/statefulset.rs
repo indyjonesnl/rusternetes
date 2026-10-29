@@ -609,6 +609,8 @@ impl<S: Storage + 'static> StatefulSetController<S> {
             // If the most recently deleted pod's replacement is not yet Ready, wait before
             // deleting the next one.
             let mut deleted_one = false;
+            let min_ready_seconds_for_update =
+                statefulset.spec.min_ready_seconds.unwrap_or(0).max(0);
             for pod in statefulset_pods.iter().rev() {
                 let ordinal = pod
                     .metadata
@@ -673,6 +675,25 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                         deleted_one = true;
                         break; // Delete one at a time for OrderedReady rolling updates
                     }
+                }
+                // Upstream, still inside the same ordinal loop
+                // (pkg/controller/statefulset/stateful_set_control.go:743-749,
+                // `updateStatefulSet`): "wait for unavailable Pods on update".
+                // A pod already at the update revision that is terminating or
+                // not yet available (`isUnavailable`,
+                // stateful_set_utils.go:491) ends the sync, so the next lower
+                // ordinal is never replaced while this replacement is coming up.
+                // (MaxUnavailableStatefulSet is Beta default-off in 1.35, so
+                // maxUnavailable is always 1.)
+                if pod_revision == update_revision
+                    && (pod.metadata.deletion_timestamp.is_some()
+                        || !Self::is_pod_available(pod, min_ready_seconds_for_update))
+                {
+                    debug!(
+                        "StatefulSet {}/{}: waiting for pod {} to become available",
+                        namespace, name, pod.metadata.name
+                    );
+                    break;
                 }
             }
             let _ = deleted_one;
@@ -973,6 +994,34 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     /// Whether `processCondemned` (stateful_set_control.go:508-535) refuses to
     /// delete this condemned pod right now. A terminating pod blocks only under
     /// `monotonic`; the Ready/first-unhealthy gates are monotonic-only too.
+    /// `isRunningAndAvailable` (stateful_set_utils.go:461 ->
+    /// `podutil.IsPodAvailable`): Ready, and Ready for at least
+    /// `minReadySeconds`.
+    fn is_pod_available(pod: &Pod, min_ready_seconds: i32) -> bool {
+        let ready_since = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|conds| {
+                conds
+                    .iter()
+                    .find(|c| c.condition_type == "Ready" && c.status == "True")
+            });
+        let Some(cond) = ready_since else {
+            return false;
+        };
+        if min_ready_seconds == 0 {
+            return true;
+        }
+        match cond.last_transition_time {
+            Some(ts) => {
+                chrono::Utc::now().signed_duration_since(ts).num_seconds()
+                    >= min_ready_seconds as i64
+            }
+            None => false,
+        }
+    }
+
     fn condemned_blocked(
         pod: &Pod,
         monotonic: bool,
@@ -2424,6 +2473,58 @@ mod tests {
         assert!(
             !terminating(&p0) && !terminating(&p1),
             "lower-ordinal pods must not be replaced before web-ord-2"
+        );
+    }
+
+    /// Upstream `updateStatefulSet` (stateful_set_control.go:732-751): after a
+    /// pod matching the update revision is found, "wait for unavailable Pods on
+    /// update" (`isUnavailable`) ends the sync BEFORE the next lower ordinal is
+    /// considered. A replacement that is not yet Ready must hold the rollout.
+    #[tokio::test]
+    async fn test_rolling_update_waits_for_unavailable_replacement() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = StatefulSetController::new(storage.clone());
+        let ns = "default";
+        let key = format!("/registry/statefulsets/{}/web-wait", ns);
+        storage
+            .create(&key, &make_statefulset("web-wait", ns, 3, "nginx:1.19"))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+            controller.reconcile(&mut ss).await.unwrap();
+            for i in 0..3 {
+                make_pod_ready(&storage, ns, &format!("web-wait-{}", i)).await;
+            }
+        }
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        ss.spec.template.spec.containers[0].image = "nginx:1.20".to_string();
+        storage.update(&key, &ss).await.unwrap();
+
+        // Step 1: web-wait-2 is deleted.
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        simulate_kubelet_cleanup(&storage, ns).await;
+        // Step 2: web-wait-2 is recreated at the update revision, not Ready.
+        let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+        controller.reconcile(&mut ss).await.unwrap();
+        let p2: Pod = storage
+            .get(&format!("/registry/pods/{}/web-wait-2", ns))
+            .await
+            .unwrap();
+        assert!(p2.metadata.deletion_timestamp.is_none());
+        // Step 3..5: the replacement stays unavailable, nothing else may go.
+        for _ in 0..3 {
+            let mut ss: StatefulSet = storage.get(&key).await.unwrap();
+            controller.reconcile(&mut ss).await.unwrap();
+        }
+        let p1: Pod = storage
+            .get(&format!("/registry/pods/{}/web-wait-1", ns))
+            .await
+            .unwrap();
+        assert!(
+            p1.metadata.deletion_timestamp.is_none(),
+            "web-wait-1 must not be replaced while web-wait-2 is unavailable"
         );
     }
 
