@@ -327,6 +327,42 @@ fn registry_has(keys: &BTreeSet<String>, gv: &str, kind: &str) -> bool {
     keys.contains(&format!("{gv}.{kind}")) || keys.contains(kind)
 }
 
+/// Groups served here that upstream kube-apiserver does not serve natively, so
+/// the protobuf-registry and OpenAPI checks do not apply to them.
+///
+/// * `metrics.k8s.io`, `custom.metrics.k8s.io`, `external.metrics.k8s.io`: no
+///   storage or REST handler in `pkg/controlplane/instance.go`; they come from
+///   aggregated APIServices (metrics-server / adapters) built on the
+///   `k8s.io/metrics` client types, and their OpenAPI is published by the
+///   aggregated server, not by kube-apiserver's own spec.
+/// * `gateway.networking.k8s.io`, `snapshot.storage.k8s.io`: CRD-based add-ons.
+///   `apiextensions-apiserver` `customresource_handler.go` ("CRDs explicitly do
+///   not support protobuf") serves them without protobuf, and their OpenAPI is
+///   derived from the installed CRD schema.
+///
+/// The metrics protobuf messages themselves are reported by the upstream proto
+/// parity report (`proto-missing-message`), which is unaffected.
+fn addon_group(group: &str) -> bool {
+    matches!(
+        group,
+        "metrics.k8s.io"
+            | "custom.metrics.k8s.io"
+            | "external.metrics.k8s.io"
+            | "gateway.networking.k8s.io"
+            | "snapshot.storage.k8s.io"
+    )
+}
+
+/// Connect-option kinds: upstream's OpenAPI v2/v3 has no definition for them
+/// (only the operations carry the `x-kubernetes-group-version-kind`; verified
+/// against release-1.35 `api/openapi-spec/swagger.json` and `v3/api__v1_openapi.json`).
+fn openapi_has_no_definition_upstream(kind: &str) -> bool {
+    matches!(
+        kind,
+        "PodExecOptions" | "PodAttachOptions" | "PodPortForwardOptions"
+    )
+}
+
 /// Does an OpenAPI definitions/schemas map define `kind` at `group`/`version`?
 /// Matches the `x-kubernetes-group-version-kind` extension first, then the
 /// `io.k8s.*.<version>.<Kind>` name convention.
@@ -896,6 +932,12 @@ async fn proto_roundtrip(
     let mut expected = obj.clone();
     if let Some(m) = expected.as_object_mut() {
         m.remove("metadata");
+        // Write-only: the v1 -> internal conversion folds `stringData` into
+        // `data` and it is never returned (pkg/apis/core/v1/conversion.go
+        // `Convert_v1_Secret_To_core_Secret`).
+        if s.kind == "Secret" {
+            m.remove("stringData");
+        }
     }
     if let Some(p) = json_loss(&expected, &decoded, "") {
         return RoundTrip::Warn(format!("field lost through protobuf round trip: {p}"));
@@ -969,17 +1011,19 @@ async fn resource_findings(totals: &mut Totals) -> Vec<Finding> {
                 status: Status::Warn,
                 detail,
             };
-            if !registry_has(&keys, &s.gv, &s.kind) {
+            let addon = addon_group(&s.group);
+            if !addon && !registry_has(&keys, &s.gv, &s.kind) {
                 out.push(f(
                     "registry-kind",
                     format!("no registry entry for {}", s.kind),
                 ));
             }
             let list = format!("{}List", s.kind);
-            if s.has("list") && !s.is_sub() && !registry_has(&keys, &s.gv, &list) {
+            if !addon && s.has("list") && !s.is_sub() && !registry_has(&keys, &s.gv, &list) {
                 out.push(f("registry-list", format!("no registry entry for {list}")));
             }
-            if !openapi_defines(&v2, &s.group, &s.version, &s.kind) {
+            let skip_openapi = addon || openapi_has_no_definition_upstream(&s.kind);
+            if !skip_openapi && !openapi_defines(&v2, &s.group, &s.version, &s.kind) {
                 out.push(f(
                     "openapi-v2",
                     "no definition in /openapi/v2 (by x-kubernetes-group-version-kind or name)"
@@ -987,6 +1031,7 @@ async fn resource_findings(totals: &mut Totals) -> Vec<Finding> {
                 ));
             }
             match v3.get(&s.gv) {
+                _ if skip_openapi => {}
                 None => out.push(f(
                     "openapi-v3",
                     format!("no /openapi/v3 document for {}", s.gv),
