@@ -20,8 +20,15 @@ use crate::{normalize_endpoint, proto};
 use hyper_util::rt::TokioIo;
 use proto::controller_client::ControllerClient;
 use proto::controller_service_capability::rpc::Type as ControllerRpc;
+use proto::group_controller_client::GroupControllerClient;
+use proto::group_controller_service_capability::rpc::Type as GroupControllerRpc;
 use proto::identity_client::IdentityClient;
 use proto::plugin_capability::service::Type as PluginService;
+use proto::{
+    ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
+    CreateVolumeGroupSnapshotRequest, DeleteVolumeGroupSnapshotRequest,
+    GetVolumeGroupSnapshotRequest, GroupControllerGetCapabilitiesRequest, VolumeGroupSnapshot,
+};
 use proto::{
     ControllerGetCapabilitiesRequest, ControllerPublishVolumeRequest,
     ControllerUnpublishVolumeRequest, CreateSnapshotRequest, CreateVolumeRequest,
@@ -487,6 +494,128 @@ impl CsiControllerClient {
             .map(|_| ())
     }
 
+    /// `ControllerExpandVolume`, gated on the controller service and
+    /// `EXPAND_VOLUME` (external-resizer `csi_resizer.go` `Resize` checks
+    /// `supportsControllerResize` before calling `client.Expand`). Returns the
+    /// response so the caller can read `node_expansion_required`.
+    pub async fn controller_expand_volume(
+        &self,
+        req: ControllerExpandVolumeRequest,
+    ) -> Result<ControllerExpandVolumeResponse, ControllerError> {
+        if req.volume_id.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "ControllerExpandVolume: volume_id must be set".into(),
+            ));
+        }
+        if req.capacity_range.is_none() {
+            return Err(ControllerError::InvalidArgument(
+                "ControllerExpandVolume: capacity_range must be set".into(),
+            ));
+        }
+        let caps = self.get_driver_capabilities().await?;
+        if !caps.plugin.contains(&PluginService::ControllerService)
+            || !caps.controller.contains(&ControllerRpc::ExpandVolume)
+        {
+            return Err(ControllerError::UnsupportedCapability(
+                "CSI driver does not support volume expansion: controller EXPAND_VOLUME capability is not reported".into(),
+            ));
+        }
+        self.call(ControllerClient::new(self.channel()?).controller_expand_volume(req))
+            .await
+    }
+
+    /// `CreateVolumeGroupSnapshot` (external-snapshotter group snapshotter).
+    pub async fn create_volume_group_snapshot(
+        &self,
+        req: CreateVolumeGroupSnapshotRequest,
+    ) -> Result<VolumeGroupSnapshot, ControllerError> {
+        if req.name.is_empty() || req.source_volume_ids.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "CreateVolumeGroupSnapshot: name and source_volume_ids must be set".into(),
+            ));
+        }
+        self.require_group_snapshot().await?;
+        let resp = self
+            .call(GroupControllerClient::new(self.channel()?).create_volume_group_snapshot(req))
+            .await?;
+        match resp.group_snapshot {
+            Some(g) if !g.group_snapshot_id.is_empty() => Ok(g),
+            _ => Err(ControllerError::InvalidResponse(
+                "CreateVolumeGroupSnapshot returned no group_snapshot or an empty group_snapshot_id".into(),
+            )),
+        }
+    }
+
+    /// `DeleteVolumeGroupSnapshot`. Idempotent.
+    pub async fn delete_volume_group_snapshot(
+        &self,
+        req: DeleteVolumeGroupSnapshotRequest,
+    ) -> Result<(), ControllerError> {
+        if req.group_snapshot_id.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "DeleteVolumeGroupSnapshot: group_snapshot_id must be set".into(),
+            ));
+        }
+        self.require_group_snapshot().await?;
+        self.call(GroupControllerClient::new(self.channel()?).delete_volume_group_snapshot(req))
+            .await
+            .map(|_| ())
+    }
+
+    /// `GetVolumeGroupSnapshot`.
+    pub async fn get_volume_group_snapshot(
+        &self,
+        req: GetVolumeGroupSnapshotRequest,
+    ) -> Result<VolumeGroupSnapshot, ControllerError> {
+        if req.group_snapshot_id.is_empty() {
+            return Err(ControllerError::InvalidArgument(
+                "GetVolumeGroupSnapshot: group_snapshot_id must be set".into(),
+            ));
+        }
+        self.require_group_snapshot().await?;
+        let resp = self
+            .call(GroupControllerClient::new(self.channel()?).get_volume_group_snapshot(req))
+            .await?;
+        resp.group_snapshot.ok_or_else(|| {
+            ControllerError::InvalidResponse(
+                "GetVolumeGroupSnapshot returned no group_snapshot".into(),
+            )
+        })
+    }
+
+    /// The driver must advertise `GROUP_CONTROLLER_SERVICE` (Identity) and the
+    /// group controller `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT` capability.
+    async fn require_group_snapshot(&self) -> Result<(), ControllerError> {
+        let caps = self.get_driver_capabilities().await?;
+        let unsupported = || {
+            ControllerError::UnsupportedCapability(
+                "CSI driver does not support volume group snapshots: GROUP_CONTROLLER_SERVICE / CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT capability is not reported".into(),
+            )
+        };
+        if !caps.plugin.contains(&PluginService::GroupControllerService) {
+            return Err(unsupported());
+        }
+        let group = self
+            .call(
+                GroupControllerClient::new(self.channel()?)
+                    .group_controller_get_capabilities(GroupControllerGetCapabilitiesRequest {}),
+            )
+            .await?;
+        let ok = group.capabilities.iter().any(|c| {
+            matches!(
+                &c.r#type,
+                Some(proto::group_controller_service_capability::Type::Rpc(r))
+                    if GroupControllerRpc::try_from(r.r#type)
+                        == Ok(GroupControllerRpc::CreateDeleteGetVolumeGroupSnapshot)
+            )
+        });
+        if ok {
+            Ok(())
+        } else {
+            Err(unsupported())
+        }
+    }
+
     async fn require_snapshot(&self) -> Result<(), ControllerError> {
         let caps = self.get_driver_capabilities().await?;
         if !caps.plugin.contains(&PluginService::ControllerService)
@@ -505,6 +634,7 @@ impl CsiControllerClient {
 #[cfg(test)]
 mod tests {
     use super::proto::controller_server::{Controller, ControllerServer};
+    use super::proto::group_controller_server::{GroupController, GroupControllerServer};
     use super::proto::identity_server::{Identity, IdentityServer};
     use super::proto::volume_capability::access_mode::Mode;
     use super::proto::volume_capability::{AccessMode, AccessType, MountVolume};
@@ -521,6 +651,10 @@ mod tests {
         create_snapshot: Vec<CreateSnapshotRequest>,
         delete_snapshot: Vec<DeleteSnapshotRequest>,
         list_volumes: Vec<ListVolumesRequest>,
+        expand: Vec<ControllerExpandVolumeRequest>,
+        create_group: Vec<CreateVolumeGroupSnapshotRequest>,
+        delete_group: Vec<DeleteVolumeGroupSnapshotRequest>,
+        get_group: Vec<GetVolumeGroupSnapshotRequest>,
     }
 
     #[derive(Clone)]
@@ -535,6 +669,7 @@ mod tests {
         /// `starting_token` -> page served for it.
         list_pages: HashMap<String, ListVolumesResponse>,
         capacity: Option<GetCapacityResponse>,
+        group_caps: Vec<GroupControllerRpc>,
     }
 
     impl Fake {
@@ -547,6 +682,7 @@ mod tests {
                     ControllerRpc::CreateDeleteSnapshot,
                     ControllerRpc::CloneVolume,
                     ControllerRpc::ModifyVolume,
+                    ControllerRpc::ExpandVolume,
                 ],
                 create_code: None,
                 delay: Duration::ZERO,
@@ -554,6 +690,7 @@ mod tests {
                 delete_code: None,
                 list_pages: HashMap::new(),
                 capacity: None,
+                group_caps: vec![GroupControllerRpc::CreateDeleteGetVolumeGroupSnapshot],
             }
         }
     }
@@ -678,6 +815,17 @@ mod tests {
                 }),
             }))
         }
+        async fn controller_expand_volume(
+            &self,
+            r: Request<ControllerExpandVolumeRequest>,
+        ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
+            let req = r.into_inner();
+            self.rec.lock().unwrap().expand.push(req.clone());
+            Ok(Response::new(ControllerExpandVolumeResponse {
+                capacity_bytes: req.capacity_range.map_or(0, |c| c.required_bytes),
+                node_expansion_required: true,
+            }))
+        }
         async fn delete_snapshot(
             &self,
             r: Request<DeleteSnapshotRequest>,
@@ -691,6 +839,72 @@ mod tests {
         }
     }
 
+    #[tonic::async_trait]
+    impl GroupController for Fake {
+        async fn group_controller_get_capabilities(
+            &self,
+            _r: Request<GroupControllerGetCapabilitiesRequest>,
+        ) -> Result<Response<GroupControllerGetCapabilitiesResponse>, Status> {
+            Ok(Response::new(GroupControllerGetCapabilitiesResponse {
+                capabilities: self
+                    .group_caps
+                    .iter()
+                    .map(|t| GroupControllerServiceCapability {
+                        r#type: Some(group_controller_service_capability::Type::Rpc(
+                            group_controller_service_capability::Rpc { r#type: *t as i32 },
+                        )),
+                    })
+                    .collect(),
+            }))
+        }
+        async fn create_volume_group_snapshot(
+            &self,
+            r: Request<CreateVolumeGroupSnapshotRequest>,
+        ) -> Result<Response<CreateVolumeGroupSnapshotResponse>, Status> {
+            let req = r.into_inner();
+            self.rec.lock().unwrap().create_group.push(req.clone());
+            Ok(Response::new(CreateVolumeGroupSnapshotResponse {
+                group_snapshot: Some(VolumeGroupSnapshot {
+                    group_snapshot_id: "group-1".into(),
+                    snapshots: req
+                        .source_volume_ids
+                        .iter()
+                        .map(|v| Snapshot {
+                            snapshot_id: format!("snap-of-{v}"),
+                            source_volume_id: v.clone(),
+                            group_snapshot_id: "group-1".into(),
+                            ready_to_use: true,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    creation_time: None,
+                    ready_to_use: true,
+                }),
+            }))
+        }
+        async fn delete_volume_group_snapshot(
+            &self,
+            r: Request<DeleteVolumeGroupSnapshotRequest>,
+        ) -> Result<Response<DeleteVolumeGroupSnapshotResponse>, Status> {
+            self.rec.lock().unwrap().delete_group.push(r.into_inner());
+            Ok(Response::new(DeleteVolumeGroupSnapshotResponse {}))
+        }
+        async fn get_volume_group_snapshot(
+            &self,
+            r: Request<GetVolumeGroupSnapshotRequest>,
+        ) -> Result<Response<GetVolumeGroupSnapshotResponse>, Status> {
+            let req = r.into_inner();
+            self.rec.lock().unwrap().get_group.push(req.clone());
+            Ok(Response::new(GetVolumeGroupSnapshotResponse {
+                group_snapshot: Some(VolumeGroupSnapshot {
+                    group_snapshot_id: req.group_snapshot_id,
+                    ready_to_use: true,
+                    ..Default::default()
+                }),
+            }))
+        }
+    }
+
     fn start(fake: Fake) -> (tempfile::TempDir, CsiControllerClient, Arc<Mutex<Recorded>>) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("csi.sock");
@@ -700,7 +914,8 @@ mod tests {
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(IdentityServer::new(fake.clone()))
-                .add_service(ControllerServer::new(fake))
+                .add_service(ControllerServer::new(fake.clone()))
+                .add_service(GroupControllerServer::new(fake))
                 .serve_with_incoming(incoming)
                 .await
                 .unwrap();
@@ -994,6 +1209,99 @@ mod tests {
         let err = client2.create_snapshot(req).await.unwrap_err();
         assert!(matches!(err, ControllerError::UnsupportedCapability(_)));
         assert!(rec2.lock().unwrap().create_snapshot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn controller_expand_volume_round_trips_and_is_capability_gated() {
+        let (_d, client, rec) = start(Fake::full());
+        let req = ControllerExpandVolumeRequest {
+            volume_id: "vol-1".into(),
+            capacity_range: Some(CapacityRange {
+                required_bytes: 2 << 30,
+                limit_bytes: 0,
+            }),
+            secrets: [("k".to_string(), "v".to_string())].into(),
+            volume_capability: Some(cap()),
+        };
+        let resp = client.controller_expand_volume(req.clone()).await.unwrap();
+        assert_eq!(resp.capacity_bytes, 2 << 30);
+        assert!(resp.node_expansion_required);
+        assert_eq!(rec.lock().unwrap().expand, vec![req.clone()]);
+
+        let no_id = ControllerExpandVolumeRequest {
+            volume_id: String::new(),
+            ..req.clone()
+        };
+        assert!(matches!(
+            client.controller_expand_volume(no_id).await.unwrap_err(),
+            ControllerError::InvalidArgument(_)
+        ));
+
+        let mut f = Fake::full();
+        f.ctrl_caps = vec![ControllerRpc::CreateDeleteVolume];
+        let (_d2, client2, rec2) = start(f);
+        let err = client2.controller_expand_volume(req).await.unwrap_err();
+        assert!(matches!(err, ControllerError::UnsupportedCapability(_)));
+        assert!(rec2.lock().unwrap().expand.is_empty());
+    }
+
+    #[tokio::test]
+    async fn volume_group_snapshots_round_trip_and_are_capability_gated() {
+        let mut f = Fake::full();
+        f.plugin_caps.push(PluginService::GroupControllerService);
+        let (_d, client, rec) = start(f);
+        let req = CreateVolumeGroupSnapshotRequest {
+            name: "groupsnapshot-abc".into(),
+            source_volume_ids: vec!["vol-1".into(), "vol-2".into()],
+            ..Default::default()
+        };
+        let g = client
+            .create_volume_group_snapshot(req.clone())
+            .await
+            .unwrap();
+        assert_eq!(g.group_snapshot_id, "group-1");
+        assert_eq!(g.snapshots.len(), 2);
+        assert_eq!(g.snapshots[1].group_snapshot_id, "group-1");
+        let got = client
+            .get_volume_group_snapshot(GetVolumeGroupSnapshotRequest {
+                group_snapshot_id: "group-1".into(),
+                snapshot_ids: vec!["snap-of-vol-1".into()],
+                secrets: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(got.ready_to_use);
+        client
+            .delete_volume_group_snapshot(DeleteVolumeGroupSnapshotRequest {
+                group_snapshot_id: "group-1".into(),
+                snapshot_ids: vec!["snap-of-vol-1".into()],
+                secrets: Default::default(),
+            })
+            .await
+            .unwrap();
+        {
+            let r = rec.lock().unwrap();
+            assert_eq!(r.create_group, vec![req.clone()]);
+            assert_eq!(r.get_group.len(), 1);
+            assert_eq!(r.delete_group[0].snapshot_ids, vec!["snap-of-vol-1"]);
+        }
+
+        // Identity does not advertise GROUP_CONTROLLER_SERVICE.
+        let (_d2, client2, rec2) = start(Fake::full());
+        let err = client2
+            .create_volume_group_snapshot(req.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ControllerError::UnsupportedCapability(_)));
+        // Group controller lacks the group-snapshot capability.
+        let mut f = Fake::full();
+        f.plugin_caps.push(PluginService::GroupControllerService);
+        f.group_caps = vec![];
+        let (_d3, client3, rec3) = start(f);
+        let err = client3.create_volume_group_snapshot(req).await.unwrap_err();
+        assert!(matches!(err, ControllerError::UnsupportedCapability(_)));
+        assert!(rec2.lock().unwrap().create_group.is_empty());
+        assert!(rec3.lock().unwrap().create_group.is_empty());
     }
 
     #[tokio::test]
