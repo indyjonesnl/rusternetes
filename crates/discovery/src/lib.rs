@@ -790,6 +790,22 @@ pub async fn get_api_groups(
         },
     ];
 
+    // storagemigration.k8s.io is served (v1beta1 only) under the
+    // StorageVersionMigrator gate (storage_storagemigration.go:54-70).
+    if storagemigration_v1beta1_served() {
+        groups.push(APIGroup {
+            name: "storagemigration.k8s.io".to_string(),
+            versions: vec![GroupVersionForDiscovery {
+                group_version: "storagemigration.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            }],
+            preferred_version: GroupVersionForDiscovery {
+                group_version: "storagemigration.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            },
+        });
+    }
+
     // certificates.k8s.io/v1beta1 is served under the ClusterTrustBundle gate.
     if certificates_v1beta1_served() {
         if let Some(group) = groups.iter_mut().find(|g| g.name == "certificates.k8s.io") {
@@ -1003,6 +1019,17 @@ fn group_v1alpha3_served(group: &str) -> bool {
     }
 }
 
+/// Whether `storagemigration.k8s.io/v1beta1` is served: its only resource,
+/// `storageversionmigrations` (+ `/status`), is installed only while the
+/// `StorageVersionMigrator` gate is on (pkg/registry/storagemigration/rest/
+/// storage_storagemigration.go:54-70 `v1beta1Storage`), and upstream drops a
+/// group version that has no storage (`len(storageMap) > 0`, :41-43).
+fn storagemigration_v1beta1_served() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::StorageVersionMigrator,
+    )
+}
+
 /// Whether `group` also serves a `v1beta1` next to its preferred version.
 fn group_v1beta1_served(group: &str) -> bool {
     match group {
@@ -1014,7 +1041,7 @@ fn group_v1beta1_served(group: &str) -> bool {
 
 /// Helper to get all API group names and their preferred versions
 fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
-    vec![
+    let mut groups = vec![
         ("apps", "v1"),
         ("batch", "v1"),
         ("networking.k8s.io", "v1"),
@@ -1040,7 +1067,14 @@ fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
         ("resource.k8s.io", "v1"),
         ("events.k8s.io", "v1"),
         ("apiregistration.k8s.io", "v1"),
-    ]
+    ];
+    // storagemigration.k8s.io has only v1beta1, served under the
+    // StorageVersionMigrator gate: with the gate off its version has no
+    // storage and upstream drops the whole group.
+    if storagemigration_v1beta1_served() {
+        groups.push(("storagemigration.k8s.io", "v1beta1"));
+    }
+    groups
 }
 
 /// The delegate's `ListedPaths` for autoregistration (aggregator.go:354-387
@@ -1079,6 +1113,7 @@ pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Optio
         ("certificates.k8s.io", "v1alpha1") => certificates_v1alpha1_served(),
         ("admissionregistration.k8s.io", "v1beta1") => admissionregistration_v1beta1_served(),
         ("resource.k8s.io", "v1alpha3") => resource_v1alpha3_served(),
+        ("storagemigration.k8s.io", "v1beta1") => storagemigration_v1beta1_served(),
         _ => get_api_group_names()
             .iter()
             .any(|(g, v)| *g == group && *v == version),
@@ -1855,6 +1890,22 @@ fn get_aggregated_resources_for_group_uncategorized(
                 vec![sub("status", "PriorityLevelConfiguration", status_verbs)],
             ),
         ],
+        // pkg/registry/storagemigration/rest/storage_storagemigration.go:54-70
+        // (`v1beta1Storage`): storageversionmigrations + /status,
+        // cluster-scoped, only under the StorageVersionMigrator gate.
+        "storagemigration.k8s.io" => {
+            if !storagemigration_v1beta1_served() {
+                return Vec::new();
+            }
+            vec![res(
+                "storageversionmigrations",
+                "storageversionmigration",
+                "StorageVersionMigration",
+                false,
+                all_verbs,
+                vec![sub("status", "StorageVersionMigration", status_verbs)],
+            )]
+        }
         "events.k8s.io" => vec![res_with_short(
             "events",
             "event",
@@ -3769,6 +3820,70 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
         StatusCode::OK,
         Json(resource_list.with_storage_version_hashes()),
     )
+}
+
+/// GET /apis/storagemigration.k8s.io/v1beta1
+/// Returns `storageversionmigrations` and `storageversionmigrations/status`
+/// (404 while the `StorageVersionMigrator` gate is off, as for an API version
+/// with no storage: storage_storagemigration.go:41-43).
+pub async fn get_storagemigration_v1beta1_resources() -> Response {
+    if !storagemigration_v1beta1_served() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": "the server could not find the requested resource",
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response();
+    }
+    let verbs = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+    let resources = vec![
+        APIResource {
+            name: "storageversionmigrations".to_string(),
+            singular_name: "storageversionmigration".to_string(),
+            namespaced: false,
+            kind: "StorageVersionMigration".to_string(),
+            verbs: verbs(&[
+                "create",
+                "delete",
+                "deletecollection",
+                "get",
+                "list",
+                "patch",
+                "update",
+                "watch",
+            ]),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        },
+        APIResource {
+            name: "storageversionmigrations/status".to_string(),
+            singular_name: "".to_string(),
+            namespaced: false,
+            kind: "StorageVersionMigration".to_string(),
+            verbs: verbs(&["get", "patch", "update"]),
+            short_names: None,
+            categories: None,
+            storage_version_hash: None,
+        },
+    ];
+    let resource_list = APIResourceList {
+        kind: "APIResourceList".to_string(),
+        api_version: "v1".to_string(),
+        group_version: "storagemigration.k8s.io/v1beta1".to_string(),
+        resources,
+    };
+    (
+        StatusCode::OK,
+        Json(resource_list.with_storage_version_hashes()),
+    )
+        .into_response()
 }
 
 /// GET /apis/certificates.k8s.io/v1beta1
