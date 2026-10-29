@@ -895,7 +895,7 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
-}
+    }
 
     fn init_spec(inits: serde_json::Value) -> PodSpec {
         spec(json!({ "initContainers": inits }))
