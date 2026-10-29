@@ -2,6 +2,10 @@
 //! `metrics_nil.go` (`MetricsNil`) and the two `metrics_errors.go`
 //! constructors they use (`NewNoPathDefinedError`, `NewNotSupportedError`).
 //!
+//! Also `pkg/volume/util/metrics.go`: `StorageOperationMetric`,
+//! `OperationCompleteHook`, `GetFullQualifiedPluginNameForVolume` and
+//! `csiOperationsLatencyMetric`.
+//!
 //! `servermetrics.CollectVolumeStatCalDuration("block", ..)`
 //! (`metrics_block.go:55`) is ported in [`crate::server_metrics`].
 
@@ -117,6 +121,22 @@ static CSI_OPERATIONS_LATENCY_METRIC: LazyLock<HistogramVec> = LazyLock::new(|| 
     .expect("valid csi operations histogram definition")
 });
 
+/// `StorageOperationMetric` (`pkg/volume/util/metrics.go:48-56`):
+/// `storage_operation_duration_seconds`, `StabilityLevel: ALPHA`.
+static STORAGE_OPERATION_METRIC: LazyLock<HistogramVec> = LazyLock::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "storage_operation_duration_seconds",
+            "[ALPHA] Storage operation duration",
+        )
+        .buckets(vec![
+            0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 25.0, 50.0, 120.0, 300.0, 600.0,
+        ]),
+        &["volume_plugin", "operation_name", "status", "migrated"],
+    )
+    .expect("valid storage operation histogram definition")
+});
+
 static REGISTER_METRICS: Once = Once::new();
 
 /// `registerMetrics` (`metrics.go:81-87`), `registerMetrics.Do`; registered on
@@ -126,6 +146,9 @@ fn register_metrics() {
         prometheus::default_registry()
             .register(Box::new(CSI_OPERATIONS_LATENCY_METRIC.clone()))
             .expect("csi operations histogram registered once");
+        prometheus::default_registry()
+            .register(Box::new(STORAGE_OPERATION_METRIC.clone()))
+            .expect("storage operation histogram registered once");
     });
 }
 
@@ -154,6 +177,77 @@ pub fn get_error_code(err: Option<&tonic::Status>) -> &'static str {
         Some(Code::Unavailable) => "Unavailable",
         Some(Code::DataLoss) => "DataLoss",
         Some(Code::Unauthenticated) => "Unauthenticated",
+    }
+}
+
+/// `statusSuccess` / `statusFailUnknown` (`pkg/volume/util/metrics.go:35-38`).
+const STATUS_SUCCESS: &str = "success";
+const STATUS_FAIL_UNKNOWN: &str = "fail-unknown";
+
+/// `GetFullQualifiedPluginNameForVolume` (`pkg/volume/util/metrics.go:127-139`):
+/// a CSI volume's plugin name gets the driver appended
+/// (`kubernetes.io/csi:csi-hostpath`) so metrics of different CSI drivers stay
+/// apart.
+pub fn get_full_qualified_plugin_name_for_volume(
+    plugin_name: &str,
+    spec: Option<&crate::volume_plugins::plugin::Spec<'_>>,
+) -> String {
+    if let Some(spec) = spec {
+        if let Some(csi) = &spec.volume.csi {
+            return format!("{plugin_name}:{}", csi.driver);
+        }
+        if let Some(csi) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) {
+            return format!("{plugin_name}:{}", csi.driver);
+        }
+    }
+    plugin_name.to_string()
+}
+
+/// The hook `OperationCompleteHook` (`pkg/volume/util/metrics.go:90-108`)
+/// returns: created when the operation is generated (`requestTime :=
+/// time.Now()`), called when it completes.
+#[derive(Debug)]
+pub struct OperationCompleteHook {
+    plugin: String,
+    operation_name: &'static str,
+    request_time: Instant,
+}
+
+/// `OperationCompleteHook(plugin, operationName)`.
+pub fn operation_complete_hook(
+    plugin: &str,
+    operation_name: &'static str,
+) -> OperationCompleteHook {
+    OperationCompleteHook {
+        plugin: plugin.to_string(),
+        operation_name,
+        request_time: Instant::now(),
+    }
+}
+
+impl OperationCompleteHook {
+    /// `opComplete(CompleteFuncParam{Err, Migrated})`: observes the time since
+    /// the hook was created under `status=success` or, when the operation's
+    /// detailed error is set, `fail-unknown`. An unset `migrated` is false.
+    pub fn complete(&self, err: Option<&anyhow::Error>, migrated: Option<bool>) {
+        register_metrics();
+        let status = if err.is_some() {
+            STATUS_FAIL_UNKNOWN
+        } else {
+            STATUS_SUCCESS
+        };
+        STORAGE_OPERATION_METRIC
+            .with_label_values(&[
+                self.plugin.as_str(),
+                self.operation_name,
+                status,
+                if migrated.unwrap_or(false) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ])
+            .observe(self.request_time.elapsed().as_secs_f64());
     }
 }
 
@@ -255,5 +349,58 @@ mod tests {
         let body = rusternetes_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains("# HELP csi_operations_seconds [ALPHA] Container Storage Interface operation duration with gRPC error code status total"));
         assert!(body.contains("csi_operations_seconds_count{driver_name=\"util.metrics.test.driver\",grpc_status_code=\"OK\",method_name=\"/csi.v1.Node/NodeStageVolume\",migrated=\"true\"} 1"), "{body}");
+    }
+
+    /// `OperationCompleteHook` (`metrics.go:90-108`): `status` is `success` or
+    /// `fail-unknown`, `migrated` defaults to false.
+    #[test]
+    fn operation_complete_hook_observes_status_and_migrated() {
+        let h = operation_complete_hook("util.metrics.test/plugin", "unmount_device");
+        h.complete(None, None);
+        h.complete(Some(&anyhow::anyhow!("boom")), Some(true));
+        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        assert!(body.contains(
+            "# HELP storage_operation_duration_seconds [ALPHA] Storage operation duration"
+        ));
+        assert!(body.contains("storage_operation_duration_seconds_count{migrated=\"false\",operation_name=\"unmount_device\",status=\"success\",volume_plugin=\"util.metrics.test/plugin\"} 1"), "{body}");
+        assert!(body.contains("storage_operation_duration_seconds_count{migrated=\"true\",operation_name=\"unmount_device\",status=\"fail-unknown\",volume_plugin=\"util.metrics.test/plugin\"} 1"), "{body}");
+    }
+
+    /// `GetFullQualifiedPluginNameForVolume` (`metrics.go:127-139`).
+    #[test]
+    fn csi_plugin_name_carries_the_driver() {
+        use crate::volume_plugins::plugin::OwnedSpec;
+        let pv: rusternetes_common::resources::volume::PersistentVolume =
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "pv"},
+                "spec": {"csi": {"driver": "d.example.com", "volumeHandle": "h"}}
+            }))
+            .unwrap();
+        let spec = OwnedSpec {
+            volume: serde_json::from_value(serde_json::json!({"name": "v"})).unwrap(),
+            persistent_volume: Some(pv),
+            read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
+        };
+        assert_eq!(
+            get_full_qualified_plugin_name_for_volume("kubernetes.io/csi", Some(&spec.as_spec())),
+            "kubernetes.io/csi:d.example.com"
+        );
+        assert_eq!(
+            get_full_qualified_plugin_name_for_volume("kubernetes.io/csi", None),
+            "kubernetes.io/csi"
+        );
+        let plain = OwnedSpec {
+            persistent_volume: None,
+            ..spec
+        };
+        assert_eq!(
+            get_full_qualified_plugin_name_for_volume(
+                "kubernetes.io/host-path",
+                Some(&plain.as_spec())
+            ),
+            "kubernetes.io/host-path"
+        );
     }
 }
