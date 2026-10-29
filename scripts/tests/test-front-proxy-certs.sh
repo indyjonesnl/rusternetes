@@ -38,6 +38,15 @@ while IFS= read -r f; do
   else
     bad "$f starts the api-server without --requestheader-*"
   fi
+  # The listener builds its client-cert verifier from --client-ca-file plus
+  # --requestheader-client-ca-file. With only the latter it trusts the
+  # front-proxy CA alone and rejects every cluster-CA client cert (kubelet:
+  # "received fatal alert: UnknownCA"), so kubeadm's pair must travel together.
+  if grep -Eq -e '--client-ca-file' "$REPO_ROOT/$f"; then
+    ok "$f passes --client-ca-file"
+  else
+    bad "$f passes --requestheader-client-ca-file without --client-ca-file"
+  fi
 done < <(cd "$REPO_ROOT" && grep -l 'pki/api-server\.key' compose*.yml docker-compose*.yml scripts/podman-start-cluster.sh 2>/dev/null)
 
 exit "$fail"

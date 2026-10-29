@@ -73,6 +73,7 @@ podman run -d \
   --tls \
   --tls-cert-file /etc/kubernetes/pki/api-server.crt \
   --tls-key-file /etc/kubernetes/pki/api-server.key \
+  --client-ca-file /etc/kubernetes/pki/ca.crt \
   --requestheader-client-ca-file /etc/kubernetes/pki/front-proxy-ca.crt \
   --requestheader-allowed-names front-proxy-client \
   --requestheader-username-headers X-Remote-User \
