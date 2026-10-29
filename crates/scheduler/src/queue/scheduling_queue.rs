@@ -2684,7 +2684,15 @@ mod tests {
     /// capped at the max.
     #[tokio::test]
     async fn backoff_flow() {
-        let clock = Arc::new(FakeClock::new(SystemTime::now()));
+        // Fixed start with a half-second fraction. The backoff expiry and
+        // `now` are both aligned to the 1s ordering window, and each step
+        // below advances the clock by `wanted - 1ms + 1s`, so a start time
+        // taken from the wall clock lands the "window equality still
+        // backing off" boundary on a whole second about 1 run in 1000 and
+        // fails "pod should have left backoffQ".
+        let clock = Arc::new(FakeClock::new(
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_500),
+        ));
         let q = new_test_queue(HashMap::new(), clock.clone());
         let pod = mk_pod("test-pod", "test-ns", "test-uid");
         q.add(pod.clone());
