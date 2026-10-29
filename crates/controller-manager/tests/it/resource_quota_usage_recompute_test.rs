@@ -326,33 +326,17 @@ async fn test_watch_loop_decrements_used_on_pod_delete() {
         .await
         .unwrap();
 
-    // Poll until used.pods becomes "1" (controller saw the create).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw_one = false;
-    while tokio::time::Instant::now() < deadline {
-        let q: ResourceQuota = storage.get(&quota_key).await.unwrap();
-        if q.status
-            .as_ref()
-            .and_then(|s| s.used.as_ref())
-            .and_then(|u| u.get("pods"))
-            .map(|s| s.as_str())
-            == Some("1")
-        {
-            saw_one = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    if !saw_one {
-        run_handle.abort();
-        let q: ResourceQuota = storage.get(&quota_key).await.unwrap();
-        panic!(
-            "controller never reflected pod-create in status.used.pods (final: {:?})",
-            q.status
-                .and_then(|s| s.used)
-                .and_then(|u| u.get("pods").cloned())
-        );
-    }
+    // A create is charged by quota admission, not by the controller: upstream's
+    // QuotaMonitor registers no AddFunc (pkg/controller/resourcequota/
+    // resource_quota_monitor.go:146-172). Charge `status.used` the way admission
+    // does when it admits the pod, so the delete below has something to replenish.
+    let mut q: ResourceQuota = storage.get(&quota_key).await.unwrap();
+    q.status.get_or_insert_with(Default::default).used = Some(HashMap::from([
+        ("pods".to_string(), "1".to_string()),
+        ("requests.cpu".to_string(), "500m".to_string()),
+        ("requests.memory".to_string(), "256Mi".to_string()),
+    ]));
+    storage.update(&quota_key, &q).await.unwrap();
 
     // Delete the pod.
     storage.delete(&pod_key).await.unwrap();
