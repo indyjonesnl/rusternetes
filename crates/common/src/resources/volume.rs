@@ -63,11 +63,10 @@ pub struct PersistentVolumeSpec {
     pub mount_options: Option<Vec<String>>,
 
     /// Volume mode
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    // Upstream's field is a pointer enum: a present "" is not nil (it is
+    // not defaulted and validation answers NotSupported), so no
+    // `empty_string_as_none` (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Node affinity
@@ -444,11 +443,10 @@ pub struct PersistentVolumeClaimSpec {
     pub storage_class_name: Option<String>,
 
     /// Volume mode
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    // Upstream's field is a pointer enum: a present "" is not nil (it is
+    // not defaulted and validation answers NotSupported), so no
+    // `empty_string_as_none` (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_mode: Option<PersistentVolumeMode>,
 
     /// Selector for PV
@@ -659,19 +657,17 @@ pub struct StorageClass {
     pub parameters: Option<HashMap<String, String>>,
 
     /// Reclaim policy
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    // Upstream's field is a pointer enum: a present "" is not nil (it is
+    // not defaulted and validation answers NotSupported), so no
+    // `empty_string_as_none` (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reclaim_policy: Option<PersistentVolumeReclaimPolicy>,
 
     /// Volume binding mode
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "empty_string_as_none"
-    )]
+    // Upstream's field is a pointer enum: a present "" is not nil (it is
+    // not defaulted and validation answers NotSupported), so no
+    // `empty_string_as_none` (#2562).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_binding_mode: Option<VolumeBindingMode>,
 
     /// Allowed topologies
@@ -968,6 +964,62 @@ pub struct VolumeSnapshotContentStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #2562: upstream's volumeMode / reclaimPolicy / volumeBindingMode are
+    // pointers (core/v1/types.go:427,578; storage/v1/types.go:56,73), so a
+    // present "" is not nil: it is kept and validation answers NotSupported.
+    #[test]
+    fn pointer_enums_keep_an_empty_string() {
+        let pv: PersistentVolumeSpec =
+            serde_json::from_value(serde_json::json!({"volumeMode": ""})).unwrap();
+        assert_eq!(
+            pv.volume_mode,
+            Some(PersistentVolumeMode::Unknown(String::new()))
+        );
+        let pvc: PersistentVolumeClaimSpec =
+            serde_json::from_value(serde_json::json!({"volumeMode": ""})).unwrap();
+        assert_eq!(
+            pvc.volume_mode,
+            Some(PersistentVolumeMode::Unknown(String::new()))
+        );
+        let sc: StorageClass = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "sc"}, "provisioner": "example.com/p",
+            "reclaimPolicy": "", "volumeBindingMode": ""
+        }))
+        .unwrap();
+        assert_eq!(
+            sc.reclaim_policy,
+            Some(PersistentVolumeReclaimPolicy::Unknown(String::new()))
+        );
+        assert_eq!(
+            sc.volume_binding_mode,
+            Some(VolumeBindingMode::Unknown(String::new()))
+        );
+        // An absent field is still nil, and round-trips as absent.
+        let sc: StorageClass = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "sc"}, "provisioner": "example.com/p"
+        }))
+        .unwrap();
+        assert!(sc.reclaim_policy.is_none() && sc.volume_binding_mode.is_none());
+        let back = serde_json::to_value(&sc).unwrap();
+        assert!(back.get("reclaimPolicy").is_none());
+    }
+
+    #[test]
+    fn storage_class_empty_pointer_enums_are_not_supported() {
+        let sc: StorageClass = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "sc"}, "provisioner": "example.com/p",
+            "reclaimPolicy": "", "volumeBindingMode": ""
+        }))
+        .unwrap();
+        let errs = crate::validation::storageclass::validate_storage_class(&sc);
+        let fields: Vec<String> = errs.iter().map(|e| e.field.to_string()).collect();
+        assert!(
+            fields.contains(&"volumeBindingMode".to_string()),
+            "{fields:?}"
+        );
+        assert!(fields.contains(&"reclaimPolicy".to_string()), "{fields:?}");
+    }
 
     #[test]
     fn test_pv_serialization() {
