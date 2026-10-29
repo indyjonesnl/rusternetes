@@ -44,7 +44,7 @@ fn is_native_resource(name: &str) -> bool {
 
 /// Port of `apis/core/helper.IsOvercommitAllowed`: native and not a hugepage
 /// resource. For these, `default` must equal `defaultRequest` when both are set.
-fn is_overcommit_allowed(name: &str) -> bool {
+pub(crate) fn is_overcommit_allowed(name: &str) -> bool {
     is_native_resource(name) && !name.starts_with("hugepages-")
 }
 

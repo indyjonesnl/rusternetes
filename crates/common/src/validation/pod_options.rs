@@ -78,6 +78,13 @@ pub struct PodValidationOptions {
     pub allow_user_namespaces_with_volume_devices: bool,
     /// `AllowUserNamespacesHostNetworkSupport`.
     pub allow_user_namespaces_host_network_support: bool,
+    /// `PodLevelResourcesEnabled` (gate `PodLevelResources`, util.go:422):
+    /// `spec.resources` is validated.
+    pub pod_level_resources_enabled: bool,
+    /// `InPlacePodLevelResourcesVerticalScalingEnabled` (gate
+    /// `InPlacePodLevelResourcesVerticalScaling`, util.go:427): a pod with
+    /// pod-level resources may be resized.
+    pub in_place_pod_level_resources_vertical_scaling_enabled: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -95,6 +102,12 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         // util.go:421.
         allow_pod_lifecycle_sleep_action_zero_value: enabled(
             Feature::PodLifecycleSleepActionAllowZero,
+        ),
+        // util.go:422.
+        pod_level_resources_enabled: enabled(Feature::PodLevelResources),
+        // util.go:427.
+        in_place_pod_level_resources_vertical_scaling_enabled: enabled(
+            Feature::InPlacePodLevelResourcesVerticalScaling,
         ),
         allow_match_label_keys_in_pod_topology_spread: enabled(
             Feature::MatchLabelKeysInPodTopologySpread,
@@ -864,6 +877,50 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
+    }
+
+    /// util.go:422/:427: both options follow their gate and ignore the old
+    /// spec; a create and an update agree.
+    #[test]
+    #[serial_test::serial]
+    fn pod_level_resources_options_follow_gates() {
+        use crate::feature_gates::{with_feature, Feature};
+        for gate in [true, false] {
+            let _a = with_feature(Feature::PodLevelResources, gate);
+            let _b = with_feature(Feature::InPlacePodLevelResourcesVerticalScaling, gate);
+            for old in [None, Some(spec(json!({"containers": []})))] {
+                let o = opts(old.as_ref());
+                assert_eq!(o.pod_level_resources_enabled, gate);
+                assert_eq!(
+                    o.in_place_pod_level_resources_vertical_scaling_enabled,
+                    gate
+                );
+                assert!(!o.allow_indivisible_huge_pages_values);
+            }
+        }
+    }
+
+    /// validation.go:4645: the `spec.resources` rules run only with
+    /// `PodLevelResourcesEnabled`.
+    #[test]
+    fn pod_level_resources_rule_is_gated() {
+        use crate::validation::pod::validate_pod_spec_with_options;
+        let s = spec(json!({
+            "containers": [{"name": "c", "image": "i",
+                "terminationMessagePolicy": "File", "imagePullPolicy": "Always"}],
+            "os": {"name": "windows"},
+            "resources": {"limits": {"cpu": "1"}},
+        }));
+        let has = |o: &PodValidationOptions| {
+            validate_pod_spec_with_options(&s, &Path::new("spec"), o)
+                .iter()
+                .any(|e| e.to_string().contains("spec.resources: Forbidden"))
+        };
+        assert!(!has(&PodValidationOptions::default()));
+        assert!(has(&PodValidationOptions {
+            pod_level_resources_enabled: true,
+            ..Default::default()
+        }));
     }
 
     fn selinux_spec(policy: &str) -> PodSpec {
