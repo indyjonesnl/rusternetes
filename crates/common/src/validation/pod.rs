@@ -1483,10 +1483,29 @@ pub(crate) fn validate_container(
         }
     }
 
-    // restartPolicyRules (upstream `validateContainerRestartPolicy`, called
-    // from `validateContainers` at `:4060`).
-    if let Some(ref rules) = c.restart_policy_rules {
-        errs.extend(validate_container_restart_rules(rules, fld_path));
+    // restartPolicy / restartPolicyRules. Init containers go through
+    // `validateInitContainerRestartPolicy` (`validateInitContainers`, `:3825`);
+    // regular containers through `validateContainers` (`:4059-4063`).
+    let rules = c.restart_policy_rules.as_deref().unwrap_or(&[]);
+    if is_init {
+        errs.extend(validate_init_container_restart_policy(
+            c.restart_policy.as_deref(),
+            rules,
+            fld_path,
+            opts,
+        ));
+    } else if opts.allow_container_restart_policy_rules {
+        errs.extend(validate_container_restart_policy(
+            c.restart_policy.as_deref(),
+            rules,
+            fld_path,
+            opts,
+        ));
+    } else if c.restart_policy.is_some() {
+        errs.push(Error::forbidden(
+            &fld_path.child("restartPolicy"),
+            "may not be set for non-init containers",
+        ));
     }
 
     // securityContext (upstream `validateContainerCommon`, `:3915`).
@@ -1564,10 +1583,17 @@ const RESIZE_RESOURCES: &[&str] = &["cpu", "memory"];
 /// Upstream `supportedResizePolicies` (same function).
 const RESIZE_POLICIES: &[&str] = &["NotRequired", "RestartContainer"];
 /// Upstream `supportedContainerRestartRuleActions`
-/// (`pkg/apis/core/validation/validation.go:3661-3667`). `RestartAllContainers`
-/// is gated behind `AllowRestartAllContainers`, which is off here, and upstream
-/// lists only `Restart` in the error either way.
+/// (`pkg/apis/core/validation/validation.go:3674-3680`): the set without
+/// `AllowRestartAllContainers`; upstream lists only `Restart` in the error
+/// either way.
 const CONTAINER_RESTART_RULE_ACTIONS: &[&str] = &["Restart"];
+/// Upstream `supportedContainerRestartRuleActionsWithRestartAllContainers`
+/// (same block).
+const CONTAINER_RESTART_RULE_ACTIONS_WITH_RESTART_ALL_CONTAINERS: &[&str] =
+    &["Restart", "RestartAllContainers"];
+/// Upstream `supportedContainerRestartPolicies` (`:3661`), sorted as
+/// `sets.List` returns it.
+const CONTAINER_RESTART_POLICIES: &[&str] = &["Always", "Never", "OnFailure"];
 /// Upstream `supportedContainerRestartPolicyOperators` (same block).
 const CONTAINER_RESTART_RULE_OPERATORS: &[&str] = &["In", "NotIn"];
 /// Upstream `validateSeccompProfileType`
@@ -1746,14 +1772,94 @@ fn validate_resize_policy(
     errs
 }
 
-/// Port of the rules half of upstream `validateContainerRestartPolicy`
-/// (`pkg/apis/core/validation/validation.go:3683-3722`): at most 20 rules, a
-/// supported `action`, a required `exitCodes` with a supported `operator`, and
-/// at most 255 exit-code values.
-fn validate_container_restart_rules(rules: &[ContainerRestartRule], fld_path: &Path) -> ErrorList {
+/// Port of upstream `validateInitContainerRestartPolicy`
+/// (`pkg/apis/core/validation/validation.go:3317-3350`). Without
+/// `AllowContainerRestartPolicyRules` an init container may only set
+/// `restartPolicy: Always` (a sidecar); with it, sidecar rules additionally
+/// need `AllowRestartAllContainers`.
+fn validate_init_container_restart_policy(
+    policy: Option<&str>,
+    rules: &[ContainerRestartRule],
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
-    let rules_path = fld_path.child("restartPolicyRules");
+    let Some(policy) = policy else {
+        if !rules.is_empty() {
+            errs.push(Error::required(
+                &fld_path.child("restartPolicy"),
+                "must specify restartPolicy when restart rules are used",
+            ));
+        }
+        return errs;
+    };
+    if opts.allow_container_restart_policy_rules {
+        if policy == "Always" {
+            if opts.allow_restart_all_containers {
+                errs.extend(validate_container_restart_policy(
+                    Some(policy),
+                    rules,
+                    fld_path,
+                    opts,
+                ));
+            } else if !rules.is_empty() {
+                errs.push(Error::forbidden(
+                    &fld_path.child("restartPolicyRules"),
+                    "restartPolicyRules are not allowed for init containers with restart policy Always",
+                ));
+            }
+        } else {
+            errs.extend(validate_container_restart_policy(
+                Some(policy),
+                rules,
+                fld_path,
+                opts,
+            ));
+        }
+    } else if policy != "Always" {
+        errs.push(Error::not_supported(
+            &fld_path.child("restartPolicy"),
+            policy.to_string(),
+            &["Always"],
+        ));
+    }
+    errs
+}
 
+/// Port of upstream `validateContainerRestartPolicy`
+/// (`pkg/apis/core/validation/validation.go:3681-3722`): a supported
+/// container `restartPolicy` (required once rules are used), at most 20 rules,
+/// a supported `action`, a required `exitCodes` with a supported `operator`,
+/// and at most 255 exit-code values.
+fn validate_container_restart_policy(
+    policy: Option<&str>,
+    rules: &[ContainerRestartRule],
+    fld_path: &Path,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    let mut errs: ErrorList = Vec::new();
+    let policy_path = fld_path.child("restartPolicy");
+    match policy {
+        None => {
+            if rules.is_empty() {
+                return errs;
+            }
+            errs.push(Error::required(
+                &policy_path,
+                "must specify restartPolicy when restart rules are used",
+            ));
+        }
+        Some(p) if !CONTAINER_RESTART_POLICIES.contains(&p) => {
+            errs.push(Error::not_supported(
+                &policy_path,
+                p.to_string(),
+                CONTAINER_RESTART_POLICIES,
+            ));
+        }
+        Some(_) => {}
+    }
+
+    let rules_path = fld_path.child("restartPolicyRules");
     if rules.len() > 20 {
         errs.push(Error::too_long(&rules_path, 20));
     }
@@ -1761,7 +1867,14 @@ fn validate_container_restart_rules(rules: &[ContainerRestartRule], fld_path: &P
     for (i, rule) in rules.iter().enumerate() {
         let idx = rules_path.index(i);
 
-        if !CONTAINER_RESTART_RULE_ACTIONS.contains(&rule.action.as_str()) {
+        let allowed: &[&str] = if opts.allow_restart_all_containers {
+            CONTAINER_RESTART_RULE_ACTIONS_WITH_RESTART_ALL_CONTAINERS
+        } else {
+            CONTAINER_RESTART_RULE_ACTIONS
+        };
+        if !allowed.contains(&rule.action.as_str()) {
+            // Upstream lists only the base set in the message, even when the
+            // option widens the accepted set (`:3702-3705`).
             errs.push(Error::not_supported(
                 &idx.child("action"),
                 rule.action.clone(),
@@ -7352,10 +7465,15 @@ mod tests {
 
     #[test]
     fn a_restart_rule_requires_exit_codes() {
-        let e = cerrs(serde_json::json!({
-            "name": "c", "image": "i",
-            "restartPolicyRules": [{"action": "Restart"}]
-        }));
+        let e = restart_errs(
+            serde_json::json!({
+                "restartPolicy": "Never",
+                "restartPolicyRules": [{"action": "Restart"}]
+            }),
+            false,
+            true,
+            false,
+        );
         assert!(
             e.iter()
                 .any(|m| m.contains("restartPolicyRules[0].exitCodes")
@@ -7544,6 +7662,75 @@ mod tests {
         );
     }
 
+    /// Validate one container's restart fields under explicit options
+    /// (`TestValidateContainers` restart-policy cases, validation_test.go:29295
+    /// and `TestValidateInitContainers`, :29480).
+    fn restart_errs(
+        container: serde_json::Value,
+        is_init: bool,
+        rules_on: bool,
+        restart_all: bool,
+    ) -> Vec<String> {
+        let mut base = serde_json::json!({"name": "name", "image": "image",
+            "imagePullPolicy": "IfNotPresent", "terminationMessagePolicy": "File"});
+        for (k, v) in container.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        let c = container_from(base);
+        let opts = PodValidationOptions {
+            allow_container_restart_policy_rules: rules_on,
+            allow_restart_all_containers: restart_all,
+            ..PodValidationOptions::default()
+        };
+        let root = Path::new(if is_init {
+            "initContainers"
+        } else {
+            "containers"
+        })
+        .index(0);
+        validate_container(
+            &c,
+            is_init,
+            &HashSet::new(),
+            Some(30),
+            None,
+            Some("Always"),
+            true,
+            &root,
+            &opts,
+        )
+        .into_iter()
+        .map(|e| e.to_string())
+        .collect()
+    }
+
+    fn rule(action: &str, op: &str) -> serde_json::Value {
+        serde_json::json!({"action": action, "exitCodes": {"operator": op, "values": [42]}})
+    }
+
+    #[test]
+    fn container_restart_policy_accepts_valid_cases() {
+        for policy in [None, Some("Always"), Some("Never"), Some("OnFailure")] {
+            let c = match policy {
+                Some(p) => serde_json::json!({"restartPolicy": p}),
+                None => serde_json::json!({}),
+            };
+            assert_eq!(restart_errs(c, false, true, false), Vec::<String>::new());
+        }
+        let with_rule = serde_json::json!({"restartPolicy": "Never",
+            "restartPolicyRules": [rule("Restart", "In")]});
+        assert!(restart_errs(with_rule, false, true, false).is_empty());
+        let restart_all = serde_json::json!({"restartPolicy": "Never",
+            "restartPolicyRules": [rule("RestartAllContainers", "In")]});
+        assert!(restart_errs(restart_all.clone(), false, true, true).is_empty());
+        // Without AllowRestartAllContainers the action is not supported.
+        let e = restart_errs(restart_all, false, true, false);
+        assert!(
+            e.iter().any(|m| m.starts_with("containers[0].restartPolicyRules[0].action: Unsupported value: \"RestartAllContainers\"")),
+            "{e:?}"
+        );
+    }
+
     #[test]
     fn divisible_hugepages_accepted_on_create() {
         let pod = huge_pod(serde_json::json!({
@@ -7569,5 +7756,149 @@ mod tests {
             huge_errs(validate_pod_update(&pod, &old, false, false)).len(),
             2
         );
+    }
+
+    #[test]
+    fn container_restart_policy_rejects_invalid_cases() {
+        let one = |c: serde_json::Value| restart_errs(c, false, true, false);
+        let e = one(serde_json::json!({"restartPolicy": "invalid"}));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("containers[0].restartPolicy: Unsupported value: \"invalid\""),
+            "{e:?}"
+        );
+        let e = one(serde_json::json!({"restartPolicy": ""}));
+        assert!(
+            e[0].starts_with("containers[0].restartPolicy: Unsupported value: \"\""),
+            "{e:?}"
+        );
+        let e = one(serde_json::json!({"restartPolicyRules": [rule("Restart", "In")]}));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("containers[0].restartPolicy: Required value"),
+            "{e:?}"
+        );
+        for action in ["invalid", ""] {
+            let e = one(serde_json::json!({"restartPolicy": "Never",
+                "restartPolicyRules": [rule(action, "In")]}));
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert!(
+                e[0].starts_with(&format!(
+                    "containers[0].restartPolicyRules[0].action: Unsupported value: \"{action}\""
+                )),
+                "{e:?}"
+            );
+        }
+        let e = one(serde_json::json!({"restartPolicy": "Never",
+            "restartPolicyRules": [{"action": "Restart"}]}));
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("containers[0].restartPolicyRules[0].exitCodes: Required value"),
+            "{e:?}"
+        );
+        for op in ["invalid", ""] {
+            let e = one(serde_json::json!({"restartPolicy": "Never",
+                "restartPolicyRules": [rule("Restart", op)]}));
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert!(e[0].starts_with(&format!("containers[0].restartPolicyRules[0].exitCodes.operator: Unsupported value: \"{op}\"")), "{e:?}");
+        }
+        let many: Vec<_> = (0..21).map(|_| rule("Restart", "In")).collect();
+        let e = one(serde_json::json!({"restartPolicy": "Never", "restartPolicyRules": many}));
+        assert!(
+            e.iter()
+                .any(|m| m.starts_with("containers[0].restartPolicyRules: Too long")),
+            "{e:?}"
+        );
+        let values: Vec<i32> = (0..256).collect();
+        let e = one(
+            serde_json::json!({"restartPolicy": "Never", "restartPolicyRules": [
+            {"action": "Restart", "exitCodes": {"operator": "In", "values": values}}]}),
+        );
+        assert!(
+            e.iter()
+                .any(|m| m
+                    .starts_with("containers[0].restartPolicyRules[0].exitCodes.values: Too long")),
+            "{e:?}"
+        );
+    }
+
+    /// Without `AllowContainerRestartPolicyRules` a regular container may not
+    /// carry a restartPolicy (validation.go:4059-4063).
+    #[test]
+    fn container_restart_policy_forbidden_without_option() {
+        let e = restart_errs(
+            serde_json::json!({"restartPolicy": "Never"}),
+            false,
+            false,
+            false,
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with(
+                "containers[0].restartPolicy: Forbidden: may not be set for non-init containers"
+            ),
+            "{e:?}"
+        );
+        assert!(restart_errs(serde_json::json!({}), false, false, false).is_empty());
+    }
+
+    /// `TestValidateInitContainers` restart-policy cases (validation_test.go:29480+).
+    #[test]
+    fn init_container_restart_policy_rules() {
+        let sidecar_rules = serde_json::json!({"restartPolicy": "Always",
+            "restartPolicyRules": [rule("RestartAllContainers", "In")]});
+        assert!(restart_errs(
+            serde_json::json!({"restartPolicy": "Always"}),
+            true,
+            true,
+            false
+        )
+        .is_empty());
+        // Sidecar rules are allowed with AllowRestartAllContainers.
+        assert!(restart_errs(sidecar_rules.clone(), true, true, true).is_empty());
+        // ... and Forbidden without it.
+        let e = restart_errs(sidecar_rules, true, true, false);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("initContainers[0].restartPolicyRules: Forbidden"),
+            "{e:?}"
+        );
+        // Rules with no restartPolicy: Required.
+        let e = restart_errs(
+            serde_json::json!({"restartPolicyRules": [rule("RestartAllContainers", "In")]}),
+            true,
+            true,
+            true,
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].starts_with("initContainers[0].restartPolicy: Required value"),
+            "{e:?}"
+        );
+        // A non-sidecar init container may use a policy once the option is on.
+        assert!(restart_errs(
+            serde_json::json!({"restartPolicy": "Never",
+            "restartPolicyRules": [rule("Restart", "In")]}),
+            true,
+            true,
+            false
+        )
+        .is_empty());
+        // Option off: only `Always` is supported.
+        let e = restart_errs(
+            serde_json::json!({"restartPolicy": "Never"}),
+            true,
+            false,
+            false,
+        );
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].starts_with("initContainers[0].restartPolicy: Unsupported value: \"Never\": supported values: \"Always\""), "{e:?}");
+        assert!(restart_errs(
+            serde_json::json!({"restartPolicy": "Always"}),
+            true,
+            false,
+            false
+        )
+        .is_empty());
     }
 }

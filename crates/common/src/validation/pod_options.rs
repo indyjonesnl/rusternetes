@@ -89,6 +89,14 @@ pub struct PodValidationOptions {
     /// `resizePolicy` (gate `InPlacePodVerticalScaling`, or the old spec
     /// already has one on a sidecar).
     pub allow_sidecar_resize_policy: bool,
+    /// `AllowContainerRestartPolicyRules` (gate `ContainerRestartRules`, or the
+    /// old spec already uses container restart policy/rules): containers may
+    /// carry `restartPolicy` and `restartPolicyRules`.
+    pub allow_container_restart_policy_rules: bool,
+    /// `AllowRestartAllContainers` (gate `RestartAllContainersOnContainerExits`,
+    /// or the old spec already uses the action): the `RestartAllContainers`
+    /// rule action, and rules on sidecar containers.
+    pub allow_restart_all_containers: bool,
 }
 
 /// `GetValidationOptionsFromPodSpecAndMeta` (util.go:411-495) for the options
@@ -115,6 +123,10 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         ),
         // util.go:424.
         allow_sidecar_resize_policy: enabled(Feature::InPlacePodVerticalScaling),
+        // util.go:430.
+        allow_container_restart_policy_rules: enabled(Feature::ContainerRestartRules),
+        // util.go:433.
+        allow_restart_all_containers: enabled(Feature::RestartAllContainersOnContainerExits),
         allow_match_label_keys_in_pod_topology_spread: enabled(
             Feature::MatchLabelKeysInPodTopologySpread,
         ),
@@ -176,6 +188,9 @@ pub fn get_validation_options_from_pod_spec_and_meta(
         // util.go:479: an old resize policy on a restartable init container
         // must stay updatable.
         opts.allow_sidecar_resize_policy |= has_restartable_init_container_resize_policy(old);
+        // util.go:481-482.
+        opts.allow_container_restart_policy_rules |= container_restart_rules_in_use(old);
+        opts.allow_restart_all_containers |= restart_all_containers_action_in_use(old);
         // util.go:464.
         opts.allow_non_local_projected_token_path = has_non_local_projected_token_path(old);
         // util.go:467-475: an old sysctl that `ValidateHostSysctl` rejects.
@@ -512,6 +527,33 @@ fn has_restartable_init_container_resize_policy(spec: &PodSpec) -> bool {
         c.restart_policy.as_deref() == Some("Always")
             && c.resize_policy.as_ref().is_some_and(|p| !p.is_empty())
     })
+}
+
+/// `containerRestartRulesInUse` (util.go:1814-1832): an init container with a
+/// restart policy other than `Always` or with rules, or a regular container
+/// with any restart policy.
+fn container_restart_rules_in_use(spec: &PodSpec) -> bool {
+    spec.init_containers.iter().flatten().any(|c| {
+        c.restart_policy.as_deref().is_some_and(|p| p != "Always")
+            || !c.restart_policy_rules.as_deref().unwrap_or(&[]).is_empty()
+    }) || spec.containers.iter().any(|c| c.restart_policy.is_some())
+}
+
+/// `restartAllContainersActionInUse` (util.go:1850-1873): any
+/// `RestartAllContainers` rule action, or rules on a sidecar init container.
+fn restart_all_containers_action_in_use(spec: &PodSpec) -> bool {
+    let action = |c: &crate::resources::pod::Container| {
+        c.restart_policy_rules
+            .iter()
+            .flatten()
+            .any(|r| r.action == "RestartAllContainers")
+    };
+    spec.containers.iter().any(action)
+        || spec.init_containers.iter().flatten().any(|c| {
+            action(c)
+                || (c.restart_policy.as_deref() == Some("Always")
+                    && !c.restart_policy_rules.as_deref().unwrap_or(&[]).is_empty())
+        })
 }
 
 /// `hasNonLocalProjectedTokenPath` (util.go:393-408).
@@ -895,6 +937,72 @@ mod tests {
         let _g =
             crate::feature_gates::with_feature(Feature::UserNamespacesHostNetworkSupport, true);
         assert!(opts(None).allow_user_namespaces_host_network_support);
+}
+
+    fn restart_container(policy: Option<&str>, rules: serde_json::Value) -> serde_json::Value {
+        let mut c = json!({"name": "c", "image": "i", "restartPolicyRules": rules});
+        if let Some(p) = policy {
+            c["restartPolicy"] = json!(p);
+        }
+        c
+    }
+
+    fn restart_rule(action: &str) -> serde_json::Value {
+        json!([{"action": action, "exitCodes": {"operator": "In", "values": [1]}}])
+    }
+
+    /// `TestAllowContainerRestartPolicyRules` (util_test.go:5900-6003).
+    #[test]
+    fn allow_container_restart_policy_rules_option() {
+        // Gate on (the 1.35 default), create and plain update.
+        assert!(opts(None).allow_container_restart_policy_rules);
+        assert!(opts(Some(&spec(json!({})))).allow_container_restart_policy_rules);
+        // The in-use helper, which relaxes the option when the gate is off.
+        let regular = spec(json!({"containers": [restart_container(Some("Never"), json!([]))]}));
+        assert!(container_restart_rules_in_use(&regular));
+        let regular_rules = spec(
+            json!({"containers": [restart_container(Some("Never"), restart_rule("Restart"))]}),
+        );
+        assert!(container_restart_rules_in_use(&regular_rules));
+        let init = spec(json!({"initContainers": [restart_container(Some("Never"), json!([]))]}));
+        assert!(container_restart_rules_in_use(&init));
+        let init_rules = spec(json!({"initContainers": [
+            restart_container(Some("Never"), restart_rule("Restart"))]}));
+        assert!(container_restart_rules_in_use(&init_rules));
+        // A sidecar without rules is not "in use"; with rules it is.
+        let sidecar =
+            spec(json!({"initContainers": [restart_container(Some("Always"), json!([]))]}));
+        assert!(!container_restart_rules_in_use(&sidecar));
+        let sidecar_rules = spec(json!({"initContainers": [
+            restart_container(Some("Always"), restart_rule("Restart"))]}));
+        assert!(container_restart_rules_in_use(&sidecar_rules));
+        assert!(!container_restart_rules_in_use(&spec(json!({}))));
+    }
+
+    /// `TestAllowRestartAllContainers` (util_test.go:6500-6589).
+    #[test]
+    fn allow_restart_all_containers_option() {
+        let action = |a: &str| {
+            spec(json!({"containers": [restart_container(Some("Never"), restart_rule(a))]}))
+        };
+        assert!(restart_all_containers_action_in_use(&action(
+            "RestartAllContainers"
+        )));
+        assert!(!restart_all_containers_action_in_use(&action("Restart")));
+        let init_action = spec(json!({"initContainers": [
+            restart_container(Some("Never"), restart_rule("RestartAllContainers"))]}));
+        assert!(restart_all_containers_action_in_use(&init_action));
+        // Rules on a sidecar count regardless of the action.
+        let sidecar_rules = spec(json!({"initContainers": [
+            restart_container(Some("Always"), restart_rule("Restart"))]}));
+        assert!(restart_all_containers_action_in_use(&sidecar_rules));
+        let plain_init = spec(json!({"initContainers": [
+            restart_container(Some("Never"), restart_rule("Restart"))]}));
+        assert!(!restart_all_containers_action_in_use(&plain_init));
+        assert!(!restart_all_containers_action_in_use(&spec(json!({}))));
+        // Gate off by default; an old spec that uses the action relaxes it.
+        assert!(!opts(None).allow_restart_all_containers);
+        assert!(opts(Some(&action("RestartAllContainers"))).allow_restart_all_containers);
     }
 
     fn init_spec(inits: serde_json::Value) -> PodSpec {
