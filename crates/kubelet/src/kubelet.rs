@@ -9884,3 +9884,7 @@ mod tests {
         assert_eq!(ready.status, "False");
     }
 }
+
+#[cfg(test)]
+#[path = "kubelet_sync_pod_fake_cri_tests.rs"]
+mod sync_pod_fake_cri_tests;
