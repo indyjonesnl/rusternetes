@@ -182,12 +182,14 @@ impl ApiServerState {
         self
     }
 
-    /// Install the MutatingAdmissionPolicy plugin (#2910). The server binary
-    /// installs none until the `patch/` package exists (#2996); the library
-    /// and its tests do.
-    #[allow(dead_code)]
-    pub fn with_mutating_admission_policy(mut self, plugin: Arc<MutatingPolicyPlugin>) -> Self {
-        self.mutating_admission_policy = Some(plugin);
+    /// Install the MutatingAdmissionPolicy plugin (#2910); `None` (the gate
+    /// is off, see `admission::policy_install::new_mutating_policy_plugin`)
+    /// installs nothing.
+    pub fn with_mutating_admission_policy(
+        mut self,
+        plugin: impl Into<Option<Arc<MutatingPolicyPlugin>>>,
+    ) -> Self {
+        self.mutating_admission_policy = plugin.into();
         self
     }
 
