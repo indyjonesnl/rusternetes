@@ -446,11 +446,13 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
         a.resource = parts[0].to_string();
     }
     if a.name.is_empty() && a.verb == "get" {
+        // `req.URL.Query()["watch"][0]` (requestinfo.go:225-239): the decoded
+        // key, so `wat%63h=true` is `watch`; present with no value (`?watch`)
+        // is true (`Convert_Slice_string_To_bool`, runtime/conversion.go:83:
+        // only "0" and a case-insensitive "false" are false).
         let watch = query
-            .into_iter()
-            .flat_map(|q| q.split('&'))
-            .filter_map(|kv| kv.split_once('='))
-            .any(|(k, v)| k == "watch" && !matches!(v.to_lowercase().as_str(), "false" | "0"));
+            .and_then(|q| url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "watch"))
+            .is_some_and(|(_, v)| !(v == "0" || v.eq_ignore_ascii_case("false")));
         a.verb = if watch { "watch" } else { "list" }.to_string();
         // requestinfo.go:247-253: an exact `metadata.name` field selector names
         // the object.

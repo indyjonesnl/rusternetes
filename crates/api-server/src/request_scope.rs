@@ -41,6 +41,61 @@ pub async fn request_info_middleware(
     with_request_info(info, next.run(req)).await
 }
 
+/// The query parameters that decide what a request is authorized as: `watch`
+/// (list vs watch), `fieldSelector` (the name, and the selectors) and
+/// `labelSelector` (requestinfo.go:225-275).
+const AUTHZ_QUERY_KEYS: [&str; 3] = ["watch", "fieldSelector", "labelSelector"];
+
+/// `query` with a repeated authorization parameter reduced to its first
+/// occurrence, or `None` when nothing repeats. Upstream reads the first value
+/// of a key everywhere (`DecodeParameters` / `req.URL.Query()[k][0]`), so
+/// `RequestInfo` and the handler agree on which one counts. The handlers here
+/// decode into a `HashMap`, where the last value wins; left alone, a request
+/// authorized for `fieldSelector=metadata.name=a` could be served the
+/// `=b` that follows it. Keys are compared decoded, as the handlers decode
+/// them (`wat%63h` is `watch`); every other parameter (a repeatable one like
+/// `command`, `dryRun`) is left byte for byte.
+pub fn first_value_for_authz_keys(query: &str) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = false;
+    for segment in query.split('&') {
+        let key = url::form_urlencoded::parse(segment.as_bytes())
+            .next()
+            .map(|(k, _)| k.into_owned())
+            .unwrap_or_default();
+        if AUTHZ_QUERY_KEYS.contains(&key.as_str()) {
+            if seen.contains(&key) {
+                dropped = true;
+                continue;
+            }
+            seen.push(key);
+        }
+        kept.push(segment);
+    }
+    dropped.then(|| kept.join("&"))
+}
+
+/// Axum layer: [`first_value_for_authz_keys`] on every request's query,
+/// outside [`request_info_middleware`] so the filter and the handler read the
+/// same one.
+pub async fn first_value_query_middleware(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(query) = req.uri().query().and_then(first_value_for_authz_keys) {
+        let mut parts = req.uri().clone().into_parts();
+        let path_and_query = format!("{}?{}", req.uri().path(), query);
+        if let Ok(pq) = path_and_query.parse() {
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    next.run(req).await
+}
+
 /// `Attributes.GetAPIVersion` for `attr`: the version the caller set, else the
 /// current request's `RequestInfo.APIVersion` when `attr` is about that
 /// request's own resource. A check on another resource (an escalation or
