@@ -570,7 +570,6 @@ pub(crate) fn non_zero_request_amounts(pod: &Pod) -> (i64, i64) {
 
 /// System-critical priority threshold. Pods at or above this priority
 /// can only be preempted by pods with strictly higher priority.
-#[allow(dead_code)]
 const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
 
 /// Is this pod allowed to preempt *again*?
@@ -798,11 +797,6 @@ pub fn pick_one_node_for_preemption(candidates: &[PreemptionCandidate]) -> Optio
 /// honours only the pod's own `spec.preemptionPolicy` (no class fallback) — its
 /// callers don't load PriorityClasses. Use [`check_preemption_with_pdbs`] with a
 /// populated map when the class fallback is needed.
-///
-/// `dead_code`: invoked from integration tests under `crates/scheduler/tests/`
-/// and from the legacy direct-scheduling path in `scheduler.rs`. The bin's
-/// Framework-based path doesn't call it.
-#[allow(dead_code)]
 pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
     check_preemption_with_pdbs(node, pod, all_pods, &[], &HashMap::new())
 }
@@ -818,9 +812,6 @@ pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<
 /// which sorts candidates so that PDB-violating evictions are picked last.
 ///
 /// Returns (should_preempt, pods_to_evict).
-///
-/// `dead_code`: exercised by integration tests; bin uses Framework path.
-#[allow(dead_code)]
 pub fn check_preemption_with_pdbs(
     node: &Node,
     pod: &Pod,

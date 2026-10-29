@@ -544,8 +544,8 @@ impl IscsiDisk {
 pub(crate) struct IscsiDiskMounter {
     pub disk: IscsiDisk,
     pub read_only: bool,
-    #[allow(dead_code)]
     // `fsType` is only read by upstream's `iscsiDiskMounter` consumers we do not port
+    #[allow(dead_code)]
     pub fs_type: String,
     /// `volumeMode`: only `volumeSpecToMounter` sets it (`attacher.go:194-234`);
     /// `newMounterInternal` leaves Go's zero value, here `None`.

@@ -795,13 +795,11 @@ impl ClientCaContent {
     }
 
     /// `AddListener`.
-    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
     pub fn add_listener(&self, listener: Arc<dyn Listener>) {
         self.listeners.lock().unwrap().push(listener);
     }
 
     /// `CurrentCABundleContent`.
-    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
     pub fn current_ca_bundle_content(&self) -> Vec<u8> {
         self.current()
             .map(|b| b.ca_bundle.clone())
@@ -860,7 +858,6 @@ impl ClientCaContent {
     }
 
     /// `RunOnce`.
-    #[allow(dead_code)] // ported provider surface; the kubelet bin has no consumer yet
     pub fn run_once(&self) -> anyhow::Result<()> {
         self.load_ca_bundle()
     }

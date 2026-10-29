@@ -25,7 +25,6 @@ use std::sync::Arc;
 /// HTTP/1.1 only (no h2 ALPN): the api-server's kubelet transport uses
 /// HTTP/1.1, and `exec`/`attach` depend on HTTP/1.1 `Upgrade`
 /// (SPDY / WebSocket) which HTTP/2 would break.
-#[allow(dead_code)] // the kubelet binary serves via `..._with_client_ca`; the all-in-one lib uses this
 pub fn kubelet_serving_tls(node_name: &str) -> Result<axum_server::tls_rustls::RustlsConfig> {
     kubelet_serving_tls_with_client_ca(node_name, None)
 }

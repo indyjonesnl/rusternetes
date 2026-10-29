@@ -1,11 +1,9 @@
 pub mod atomic_writer;
 pub mod clustertrustbundle;
-#[allow(dead_code)]
 pub mod config;
 pub mod cri_runtime;
 pub mod downward_api;
 pub mod events;
-#[allow(dead_code)]
 pub mod eviction;
 #[cfg(target_os = "linux")]
 pub mod fsquota;

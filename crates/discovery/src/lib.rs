@@ -108,7 +108,7 @@ fn aggregated_discovery_version(headers: &HeaderMap) -> Option<&'static str> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn wants_aggregated_discovery(headers: &HeaderMap) -> bool {
     aggregated_discovery_version(headers).is_some()
 }

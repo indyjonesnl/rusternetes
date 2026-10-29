@@ -282,24 +282,15 @@ fn request_timeout_error() -> rusternetes_common::Error {
 }
 
 /// Admission webhook client for calling external webhooks
-pub struct AdmissionWebhookClient {
-    #[allow(dead_code)]
-    http_client: reqwest::Client,
-}
+pub struct AdmissionWebhookClient {}
 
 impl AdmissionWebhookClient {
     /// Create a new admission webhook client
     pub fn new() -> Self {
-        Self {
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
-        }
+        Self {}
     }
 
     /// Call a validating webhook
-    #[allow(dead_code)]
     pub async fn call_validating_webhook(
         &self,
         webhook: &ValidatingWebhook,
@@ -343,7 +334,6 @@ impl AdmissionWebhookClient {
     }
 
     /// Call a mutating webhook
-    #[allow(dead_code)]
     pub async fn call_mutating_webhook(
         &self,
         webhook: &MutatingWebhook,
@@ -387,7 +377,6 @@ impl AdmissionWebhookClient {
     }
 
     /// Internal method to call a webhook
-    #[allow(dead_code)]
     async fn call_webhook(
         &self,
         url: &str,
@@ -2403,7 +2392,6 @@ impl<S: Storage> AdmissionWebhookManager<S> {
     /// If provided, it is used for more accurate resource rule matching.
     /// `namespace` is the namespace of the object (for namespaced resources).
     /// `old_object` is the previous version (for UPDATE operations).
-    #[allow(dead_code)]
     pub async fn run_validating_admission_policies(
         &self,
         operation: &Operation,

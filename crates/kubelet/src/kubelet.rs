@@ -35,7 +35,6 @@ use tracing::{debug, error, info, warn};
 /// The kubelet retries in SyncPod state. Only deletion and eviction trigger it.
 /// K8s ref: pkg/kubelet/pod_workers.go:110-117, 260
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 #[allow(clippy::enum_variant_names)]
 pub enum PodWorkerState {
     /// Pod is expected to be started and running. Failures are retried.
@@ -735,7 +734,6 @@ impl Kubelet {
     /// `root_dir = /var/lib/kubelet`. Kept for library back-compat; the
     /// binary uses [`Kubelet::new_with_eviction`] to honor CLI flags.
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub async fn new(
         node_name: String,
         storage: Arc<StorageBackend>,
@@ -6075,7 +6073,6 @@ impl Kubelet {
     /// Build the standard pod conditions for a Running pod.
     /// Real Kubernetes sets Initialized, PodScheduled, ContainersReady, and Ready=True
     /// when all containers are running. The e2e conformance suite checks these conditions.
-    #[allow(dead_code)]
     fn running_pod_conditions() -> Vec<PodCondition> {
         let now = Some(chrono::Utc::now());
         vec![
@@ -6320,49 +6317,6 @@ impl Kubelet {
                 observed_generation: None,
             },
         ]
-    }
-
-    /// Build init container statuses for a running pod (static fallback).
-    /// Prefer `runtime.get_init_container_statuses()` which inspects actual Docker state.
-    #[allow(dead_code)]
-    fn build_init_container_statuses(pod: &Pod) -> Option<Vec<ContainerStatus>> {
-        let init_containers = pod.spec.as_ref()?.init_containers.as_ref()?;
-        if init_containers.is_empty() {
-            return None;
-        }
-        Some(
-            init_containers
-                .iter()
-                .map(|ic| ContainerStatus {
-                    name: ic.name.clone(),
-                    ready: true,
-                    restart_count: 0,
-                    state: Some(ContainerState {
-                        terminated: Some(ContainerStateTerminated {
-                            exit_code: 0,
-                            signal: None,
-                            reason: Some("Completed".to_string()),
-                            message: None,
-                            started_at: None,
-                            finished_at: None,
-                            container_id: None,
-                        }),
-                        ..Default::default()
-                    }),
-                    last_state: None,
-                    image: Some(ic.image.clone()),
-                    image_id: None,
-                    container_id: None,
-                    started: Some(false),
-                    allocated_resources: ic.resources.as_ref().and_then(|r| r.requests.clone()),
-                    allocated_resources_status: None,
-                    resources: ic.resources.clone(),
-                    user: None,
-                    volume_mounts: None,
-                    stop_signal: None,
-                })
-                .collect(),
-        )
     }
 
     /// The pod's `status.qosClass`, as upstream `generateAPIPodStatus` sets it

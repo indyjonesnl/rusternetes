@@ -2076,38 +2076,8 @@ fn extract_items(value: &serde_json::Value) -> (Vec<serde_json::Value>, serde_js
     }
 }
 
-/// Extract apiVersion and kind from JSON bytes without full parsing.
-///
-/// Now superseded by [`crate::response::NativeProtoOptIn`] — handlers carry
-/// the strongly-typed TypeMeta on the response extension so the middleware
-/// no longer has to re-parse the JSON body. Kept around for tests that
-/// validate the wire format and for a future "auto-discover TypeMeta"
-/// fallback path.
-#[allow(dead_code)]
-fn extract_api_version_kind(json: &[u8]) -> (Option<String>, Option<String>) {
-    // Quick parse just the top-level apiVersion and kind
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(json) {
-        let api_version = v
-            .get("apiVersion")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let kind = v
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        (api_version, kind)
-    } else {
-        (None, None)
-    }
-}
-
 /// Wrap JSON bytes in the K8s protobuf envelope with TypeMeta:
 /// "k8s\0" + Unknown{typeMeta: {apiVersion, kind}, raw: json, contentType: "application/json"}
-///
-/// Superseded by [`crate::response::wrap_json_in_protobuf_envelope`] / the
-/// [`crate::response::ProtoEncoder`] trait. Kept under `#[allow(dead_code)]`
-/// because the in-file roundtrip tests still cover the wire format here.
-#[allow(dead_code)]
 fn wrap_json_in_protobuf_with_type_meta(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
     // K8s runtime.Unknown protobuf message:
     //   field 1 (typeMeta, TypeMeta): nested message
@@ -2155,7 +2125,11 @@ fn wrap_json_in_protobuf_with_type_meta(json: &[u8], api_version: &str, kind: &s
 }
 
 /// Wrap JSON bytes in the K8s protobuf envelope: "k8s\0" + Unknown{raw: json}
-#[allow(dead_code)]
+///
+/// Superseded by [`crate::response::wrap_json_in_protobuf_envelope`] / the
+/// [`crate::response::ProtoEncoder`] trait; only the in-file roundtrip tests
+/// still cover this wire format.
+#[cfg(test)]
 fn wrap_json_in_protobuf(json: &[u8]) -> Vec<u8> {
     // K8s runtime.Unknown protobuf message (from k8s.io/apimachinery generated.proto):
     //   field 1 (typeMeta, TypeMeta): nested message (empty for responses)

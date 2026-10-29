@@ -287,7 +287,6 @@ impl KubeletConfiguration {
 }
 
 /// A zero `metav1.Duration` means "unset" and takes the upstream default.
-#[allow(dead_code)] // consumers land with the fields they configure (#2284)
 fn nonzero_or(v: Option<std::time::Duration>, default_secs: u64) -> std::time::Duration {
     v.filter(|d| !d.is_zero())
         .unwrap_or(std::time::Duration::from_secs(default_secs))
@@ -445,7 +444,6 @@ impl Default for KubeletConfiguration {
     }
 }
 
-#[allow(dead_code)] // upstream-defaulted accessors; no runtime consumer yet (#2284)
 impl KubeletConfiguration {
     /// `syncFrequency` with the upstream default applied (1m).
     ///
@@ -761,7 +759,6 @@ impl KubeletConfiguration {
     }
 
     /// Save configuration to a YAML file
-    #[allow(dead_code)]
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let contents = serde_yaml::to_string(self).context("Failed to serialize configuration")?;
 
