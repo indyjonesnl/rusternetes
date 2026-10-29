@@ -947,8 +947,6 @@ pub fn superuser_then(rest: Vec<Arc<dyn Authorizer>>) -> UnionAuthorizer {
 pub struct WebhookAuthorizer {
     webhook_url: String,
     http_client: reqwest::Client,
-    #[allow(dead_code)]
-    ca_cert: Option<String>,
 }
 
 impl WebhookAuthorizer {
@@ -972,7 +970,6 @@ impl WebhookAuthorizer {
         Ok(Self {
             webhook_url,
             http_client,
-            ca_cert,
         })
     }
 }

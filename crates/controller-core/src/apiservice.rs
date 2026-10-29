@@ -226,7 +226,6 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
     /// Reconcile a single APIService by name. Intended for integration tests
     /// and one-shot reconciliation; the production code path drives reconcile
     /// through the work-queue worker, which doesn't call this entry point.
-    #[allow(dead_code)]
     pub async fn reconcile(&self, name: &str) -> Result<()> {
         let key = rusternetes_storage::build_key("apiservices", None, name);
         let apiservice: serde_json::Value = self.storage.get(&key).await?;

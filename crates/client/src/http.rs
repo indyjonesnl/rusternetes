@@ -18,13 +18,10 @@ pub struct ListMeta {
 }
 
 /// Generic Kubernetes List wrapper
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KubernetesList<T> {
-    #[allow(dead_code)]
     pub api_version: String,
-    #[allow(dead_code)]
     pub kind: String,
     pub metadata: Option<ListMeta>,
     pub items: Vec<T>,
@@ -141,7 +138,6 @@ fn format_status_error(
 impl ApiClient {
     /// Ergonomic constructor without a CA (system trust store / insecure).
     /// Used widely by tests; production wiring uses [`Self::with_tls`].
-    #[allow(dead_code)]
     pub fn new(
         base_url: &str,
         insecure_skip_tls_verify: bool,
@@ -338,7 +334,6 @@ impl ApiClient {
     }
 
     /// Get a list of resources, automatically unwrapping the Kubernetes List wrapper
-    #[allow(dead_code)]
     pub async fn get_list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, GetError> {
         let list: KubernetesList<T> = self.get(path).await?;
         Ok(list.items)

@@ -13,8 +13,6 @@
 //! apiserver/pkg/endpoints/handlers/patch.go:446) only calls it. Moved
 //! verbatim from `rusternetes-api-server`; behaviour unchanged.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -865,14 +863,6 @@ fn validate_patch_with_set_order_list(
         )));
     }
     Ok(())
-}
-
-/// `removeDirectives` (patch.go:1282): drop objects carrying `$patch`.
-fn remove_directives(list: &[Value]) -> Vec<Value> {
-    list.iter()
-        .filter(|v| !v.as_object().is_some_and(|m| m.contains_key("$patch")))
-        .cloned()
-        .collect()
 }
 
 /// Port of `mergePatchIntoOriginal` (patch.go:1110-1230): merge `<field>`

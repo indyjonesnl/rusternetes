@@ -564,7 +564,6 @@ fn empty_list_resource_version_is_at_least_one() {
 /// Cheap compile-time guard that the imported types still implement what we
 /// rely on. Doesn't actually execute serde, just ensures these paths are not
 /// removed. Keeps the import block honest after refactors.
-#[allow(dead_code)]
 fn _typecheck_unused() {
     fn assert_serializable<T: Serialize + DeserializeOwned>() {}
     assert_serializable::<ListMeta>();

@@ -144,7 +144,6 @@ impl KubeConfig {
     }
 
     /// Get a specific context by name
-    #[allow(dead_code)]
     pub fn get_context(&self, name: &str) -> Result<&Context> {
         self.contexts
             .iter()

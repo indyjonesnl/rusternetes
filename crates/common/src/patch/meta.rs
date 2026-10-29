@@ -33,8 +33,9 @@ enum Ty {
     Struct(String),
     /// `[]T`.
     Slice(Box<Ty>),
-    /// `map[string]T`.
-    Map(Box<Ty>),
+    /// `map[string]T` (the element type is never consulted: upstream's
+    /// struct lookup rejects anything but a struct).
+    Map,
     /// Anything else; carries the `reflect.Kind` string.
     Prim(String),
 }
@@ -44,7 +45,7 @@ impl Ty {
         match s.split_once(':') {
             Some(("S", d)) => Ty::Struct(d.to_string()),
             Some(("L", e)) => Ty::Slice(Box::new(Ty::parse(e))),
-            Some(("M", e)) => Ty::Map(Box::new(Ty::parse(e))),
+            Some(("M", _)) => Ty::Map,
             Some((_, k)) => Ty::Prim(k.to_string()),
             None => Ty::Prim(s.to_string()),
         }
@@ -55,7 +56,7 @@ impl Ty {
         match self {
             Ty::Struct(_) => "struct".to_string(),
             Ty::Slice(_) => "slice".to_string(),
-            Ty::Map(_) => "map".to_string(),
+            Ty::Map => "map".to_string(),
             Ty::Prim(k) => k.clone(),
         }
     }

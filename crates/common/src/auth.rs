@@ -1281,6 +1281,9 @@ pub struct OIDCTokenValidator {
     client_id: String,
     jwks: std::sync::RwLock<Option<JsonWebKeySet>>,
     http_client: reqwest::Client,
+    // Accepted by `new` but not yet applied to `http_client` (the webhook
+    // authenticator below does build its client from it); kept until the
+    // OIDC client honours the CA bundle.
     #[allow(dead_code)]
     ca_cert: Option<String>,
 }
@@ -1467,8 +1470,6 @@ impl OIDCTokenValidator {
 pub struct WebhookTokenAuthenticator {
     webhook_url: String,
     http_client: reqwest::Client,
-    #[allow(dead_code)]
-    ca_cert: Option<String>,
 }
 
 impl WebhookTokenAuthenticator {
@@ -1489,7 +1490,6 @@ impl WebhookTokenAuthenticator {
         Ok(Self {
             webhook_url,
             http_client,
-            ca_cert,
         })
     }
 
