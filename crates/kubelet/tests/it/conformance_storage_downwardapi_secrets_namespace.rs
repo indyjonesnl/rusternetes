@@ -44,7 +44,11 @@ impl Node {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let api = Arc::new(StorageBackend::new_memory());
-        let vm = VolumeManager::new(
+        // The downwardAPI volume is a wrapped `Medium: Memory` emptyDir
+        // (downwardapi.go:54-58), i.e. a tmpfs mount, which an unprivileged
+        // test run cannot make: use the recording fake mounter, as upstream's
+        // FakeVolumeHost does (mount.NewFakeMounter).
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.path().to_string_lossy().to_string(),
             Some(api.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
