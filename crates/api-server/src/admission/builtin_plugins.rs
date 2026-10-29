@@ -838,7 +838,12 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
             .unwrap();
         assert_eq!(got.spec.unwrap().ingress_class_name, None);
         // One default.
-        put("default1", class("default1", Some("true"), None)).await;
+        // Both defaults carry an explicit, equal creation time: storage stamps
+        // `creationTimestamp` at whole-second precision, so leaving it to the
+        // clock lets the two creates straddle a second boundary and the later
+        // class wins on "newest first" instead of the name tie-break.
+        let same = Some("2000-01-01T00:00:00Z");
+        put("default1", class("default1", Some("true"), same)).await;
         let got: I = run(&state, id, None, ing(json!({}), None), None)
             .await
             .unwrap();
@@ -874,7 +879,7 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
         .unwrap();
         assert_eq!(got.spec.unwrap().ingress_class_name, None);
         // Two defaults, same creation time: the lower name.
-        put("default2", class("default2", Some("true"), None)).await;
+        put("default2", class("default2", Some("true"), same)).await;
         let got: I = run(&state, id, None, ing(json!({}), None), None)
             .await
             .unwrap();
