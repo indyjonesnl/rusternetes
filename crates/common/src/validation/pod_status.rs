@@ -12,14 +12,19 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::feature_gates::{enabled, Feature};
 use crate::resources::pod::{
-    ContainerState, ContainerStateTerminated, ContainerStatus, PodCondition, PodIP,
+    ContainerRestartRule, ContainerState, ContainerStateTerminated, ContainerStatus, PodCondition,
+    PodIP,
 };
 use crate::resources::{Binding, Container, Pod, PodSpec};
 use crate::validation::field::{Error, ErrorList, Path};
 use crate::validation::metav1::is_qualified_name;
 use crate::validation::objectmeta::{
     name_is_dns_subdomain, validate_immutable_field, validate_object_meta_update,
+};
+use crate::validation::pod_options::{
+    get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
 };
 use crate::validation::service::{is_valid_ip_for_legacy_field, parse_ip_sloppy};
 
@@ -58,8 +63,8 @@ pub fn validate_pod_binding(binding: &Binding) -> ErrorList {
 }
 
 /// `ValidatePodStatusUpdate` (validation.go:6003-6067). The validation
-/// options are the 1.35 defaults: `ContainerRestartRules` is beta and on,
-/// `RestartAllContainersOnContainerExits` alpha and off.
+/// options come from `GetValidationOptionsFromPodSpecAndMeta` over the new and
+/// old specs, as the pod status strategy does.
 pub fn validate_pod_status_update(new: &Pod, old: &Pod) -> ErrorList {
     let meta_path = Path::new("metadata");
     let mut errs = validate_object_meta_update(&new.metadata, &old.metadata, &meta_path);
@@ -135,19 +140,20 @@ pub fn validate_pod_status_update(new: &Pod, old: &Pod) -> ErrorList {
     let new_containers = statuses(&new_status.container_statuses);
     let new_init = statuses(&new_status.init_container_statuses);
     let new_ephemeral = statuses(&new_status.ephemeral_container_statuses);
+    let opts = get_validation_options_from_pod_spec_and_meta(new.spec.as_ref(), old.spec.as_ref());
     errs.extend(validate_container_state_transition(
         &new_containers,
         &statuses(&old_status.container_statuses),
         &status_path.child("containerStatuses"),
         &old_spec,
-        &old_spec.containers,
+        &opts,
     ));
-    errs.extend(validate_container_state_transition(
+    errs.extend(validate_init_container_state_transition(
         &new_init,
         &statuses(&old_status.init_container_statuses),
         &status_path.child("initContainerStatuses"),
         &old_spec,
-        old_spec.init_containers.as_deref().unwrap_or(&[]),
+        &opts,
     ));
     errs.extend(validate_ephemeral_container_state_transition(
         &new_ephemeral,
@@ -544,34 +550,51 @@ fn validate_pod_conditions(conditions: &[PodCondition], fld_path: &Path) -> Erro
     errs
 }
 
-/// `podutil.ContainerShouldRestart` (pkg/api/v1/pod/util.go:419-460) with
-/// `RestartAllContainersOnContainerExits` off: the first matching container
-/// rule, then the container's own policy, then the pod's.
+/// `podutil.FindMatchingContainerRestartRule` (pkg/api/v1/pod/util.go:465-489):
+/// the first rule whose `exitCodes` operator matches the exit code.
+fn find_matching_container_restart_rule(
+    container: &Container,
+    exit_code: i32,
+) -> Option<&ContainerRestartRule> {
+    container
+        .restart_policy_rules
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|rule| {
+            let Some(exit_codes) = rule.exit_codes.as_ref() else {
+                return false;
+            };
+            let hit = exit_codes
+                .values
+                .as_deref()
+                .unwrap_or(&[])
+                .contains(&exit_code);
+            match exit_codes.operator.as_str() {
+                "In" => hit,
+                "NotIn" => !hit,
+                _ => false,
+            }
+        })
+}
+
+/// `podutil.ContainerShouldRestart` (pkg/api/v1/pod/util.go:419-460): the
+/// first matching container rule, then the container's own policy, then the
+/// pod's. A `RestartAllContainers` action counts only while
+/// `RestartAllContainersOnContainerExits` is enabled.
 fn container_should_restart(container: &Container, spec: &PodSpec, exit_code: i32) -> bool {
     if let Some(container_policy) = container.restart_policy.as_deref() {
-        // FindMatchingContainerRestartRule (util.go:465-489).
-        let matched = container
-            .restart_policy_rules
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .find(|rule| {
-                let Some(exit_codes) = rule.exit_codes.as_ref() else {
-                    return false;
-                };
-                let hit = exit_codes
-                    .values
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .contains(&exit_code);
-                match exit_codes.operator.as_str() {
-                    "In" => hit,
-                    "NotIn" => !hit,
-                    _ => false,
+        if let Some(rule) = find_matching_container_restart_rule(container, exit_code) {
+            match rule.action.as_str() {
+                "Restart" => return true,
+                "RestartAllContainers"
+                    if enabled(Feature::RestartAllContainersOnContainerExits) =>
+                {
+                    return true
                 }
-            });
-        if matched.is_some_and(|rule| rule.action == "Restart") {
-            return true;
+                // Fall back to the container-level policy.
+                _ => {}
+            }
         }
         match container_policy {
             "Always" => return true,
@@ -588,6 +611,21 @@ fn container_should_restart(container: &Container, spec: &PodSpec, exit_code: i3
     }
 }
 
+/// `podutil.AllContainersCouldRestart` (pkg/api/v1/pod/util.go:494-513): any
+/// init or regular container has a `RestartAllContainers` rule.
+fn all_containers_could_restart(spec: &PodSpec) -> bool {
+    spec.init_containers
+        .iter()
+        .flatten()
+        .chain(spec.containers.iter())
+        .any(|c| {
+            c.restart_policy_rules
+                .iter()
+                .flatten()
+                .any(|r| r.action == "RestartAllContainers")
+        })
+}
+
 fn terminated_exit_code(status: &ContainerStatus) -> Option<i32> {
     match status.state {
         Some(ContainerState {
@@ -598,33 +636,139 @@ fn terminated_exit_code(status: &ContainerStatus) -> Option<i32> {
     }
 }
 
+/// The `AllowContainerRestartPolicyRules` branch shared by
 /// `ValidateContainerStateTransition` and `ValidateInitContainerStateTransition`
-/// (validation.go:5841-5990) with `ContainerRestartRules` on: a terminated
-/// container may become non-terminated only where `ContainerShouldRestart`
-/// says it would restart. `containers` are the spec's containers (or init
-/// containers) the statuses belong to; a status naming none is not allowed.
-fn validate_container_state_transition(
+/// (validation.go:5843-5880, :5908-5946): a terminated container may become
+/// non-terminated only where `ContainerShouldRestart` says it would restart,
+/// unless a `RestartAllContainers` rule lets every container restart.
+fn validate_state_transition_with_rules(
     new_statuses: &[ContainerStatus],
     old_statuses: &[ContainerStatus],
     fld_path: &Path,
     spec: &PodSpec,
     containers: &[Container],
+    opts: &PodValidationOptions,
 ) -> ErrorList {
     let mut errs = Vec::new();
+    if opts.allow_restart_all_containers && all_containers_could_restart(spec) {
+        return errs;
+    }
     for (i, old_status) in old_statuses.iter().enumerate() {
         // Skip any container that is not terminated.
         let Some(exit_code) = terminated_exit_code(old_status) else {
             continue;
         };
-        if let Some(_new_status) = new_statuses
+        if new_statuses
             .iter()
-            .find(|n| n.name == old_status.name && terminated_exit_code(n).is_none())
+            .any(|n| n.name == old_status.name && terminated_exit_code(n).is_none())
         {
             let allowed = containers
                 .iter()
                 .find(|c| c.name == old_status.name)
                 .is_some_and(|c| container_should_restart(c, spec, exit_code));
             if !allowed {
+                errs.push(Error::forbidden(
+                    &fld_path.index(i).child("state"),
+                    "may not be transitioned to non-terminated state",
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// `ValidateContainerStateTransition` (validation.go:5841-5904).
+fn validate_container_state_transition(
+    new_statuses: &[ContainerStatus],
+    old_statuses: &[ContainerStatus],
+    fld_path: &Path,
+    spec: &PodSpec,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    if opts.allow_container_restart_policy_rules {
+        return validate_state_transition_with_rules(
+            new_statuses,
+            old_statuses,
+            fld_path,
+            spec,
+            &spec.containers,
+            opts,
+        );
+    }
+    let mut errs = Vec::new();
+    let restart_policy = spec.restart_policy.as_deref();
+    // If we should always restart, containers are allowed to leave the
+    // terminated state.
+    if restart_policy == Some("Always") {
+        return errs;
+    }
+    for (i, old_status) in old_statuses.iter().enumerate() {
+        // Skip any container that is not terminated.
+        let Some(exit_code) = terminated_exit_code(old_status) else {
+            continue;
+        };
+        // Skip any container that failed but is allowed to restart.
+        if exit_code != 0 && restart_policy == Some("OnFailure") {
+            continue;
+        }
+        for new_status in new_statuses {
+            if old_status.name == new_status.name && terminated_exit_code(new_status).is_none() {
+                errs.push(Error::forbidden(
+                    &fld_path.index(i).child("state"),
+                    "may not be transitioned to non-terminated state",
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// `ValidateInitContainerStateTransition` (validation.go:5906-5990).
+fn validate_init_container_state_transition(
+    new_statuses: &[ContainerStatus],
+    old_statuses: &[ContainerStatus],
+    fld_path: &Path,
+    spec: &PodSpec,
+    opts: &PodValidationOptions,
+) -> ErrorList {
+    let inits = spec.init_containers.as_deref().unwrap_or(&[]);
+    if opts.allow_container_restart_policy_rules {
+        return validate_state_transition_with_rules(
+            new_statuses,
+            old_statuses,
+            fld_path,
+            spec,
+            inits,
+            opts,
+        );
+    }
+    let mut errs = Vec::new();
+    let restart_policy = spec.restart_policy.as_deref();
+    // If we should always restart, containers are allowed to leave the
+    // terminated state.
+    if restart_policy == Some("Always") {
+        return errs;
+    }
+    for (i, old_status) in old_statuses.iter().enumerate() {
+        // Skip any container that is not terminated.
+        let Some(exit_code) = terminated_exit_code(old_status) else {
+            continue;
+        };
+        // Skip any container that failed but is allowed to restart.
+        if exit_code != 0 && restart_policy == Some("OnFailure") {
+            continue;
+        }
+        // Skip any restartable init container that is allowed to restart
+        // (`isRestartableInitContainer`, validation.go:9546).
+        let restartable = inits
+            .iter()
+            .find(|c| c.name == old_status.name)
+            .is_some_and(|c| c.restart_policy.as_deref() == Some("Always"));
+        if restartable {
+            continue;
+        }
+        for new_status in new_statuses {
+            if old_status.name == new_status.name && terminated_exit_code(new_status).is_none() {
                 errs.push(Error::forbidden(
                     &fld_path.index(i).child("state"),
                     "may not be transitioned to non-terminated state",
@@ -1322,5 +1466,123 @@ mod tests {
         assert!(msg.contains("Duplicate value"));
         assert!(msg.contains("Unsupported value"));
         assert_eq!(errs.len(), 3, "{msg}");
+    }
+
+    fn statuses(v: serde_json::Value) -> Vec<ContainerStatus> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn terminated(code: i32) -> serde_json::Value {
+        serde_json::json!({"name": "c", "image": "i", "imageID": "", "ready": false,
+            "restartCount": 0, "state": {"terminated": {"exitCode": code}}})
+    }
+
+    fn running() -> serde_json::Value {
+        serde_json::json!({"name": "c", "image": "i", "imageID": "", "ready": true,
+            "restartCount": 1, "state": {"running": {}}})
+    }
+
+    fn spec_of(v: serde_json::Value) -> PodSpec {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn opts(rules: bool, restart_all: bool) -> PodValidationOptions {
+        PodValidationOptions {
+            allow_container_restart_policy_rules: rules,
+            allow_restart_all_containers: restart_all,
+            ..PodValidationOptions::default()
+        }
+    }
+
+    /// `ValidateContainerStateTransition` without `AllowContainerRestartPolicyRules`
+    /// (validation.go:5882-5904): the pod-level policy decides.
+    #[test]
+    fn container_state_transition_legacy_uses_pod_policy() {
+        let old = statuses(serde_json::json!([terminated(1)]));
+        let new = statuses(serde_json::json!([running()]));
+        let path = Path::new("status").child("containerStatuses");
+        let run = |policy: &str| {
+            let spec = spec_of(serde_json::json!({"restartPolicy": policy,
+                "containers": [{"name": "c", "image": "i"}]}));
+            validate_container_state_transition(&new, &old, &path, &spec, &opts(false, false))
+        };
+        assert!(run("Always").is_empty());
+        assert!(run("OnFailure").is_empty());
+        let e = run("Never");
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            e[0].to_string(),
+            "status.containerStatuses[0].state: Forbidden: may not be transitioned to non-terminated state"
+        );
+        // A clean exit under OnFailure may not restart.
+        let ok_old = statuses(serde_json::json!([terminated(0)]));
+        let spec = spec_of(serde_json::json!({"restartPolicy": "OnFailure",
+            "containers": [{"name": "c", "image": "i"}]}));
+        assert_eq!(
+            validate_container_state_transition(&new, &ok_old, &path, &spec, &opts(false, false))
+                .len(),
+            1
+        );
+    }
+
+    /// The legacy init-container path lets a sidecar leave `terminated`
+    /// (validation.go:5948-5973).
+    #[test]
+    fn init_container_state_transition_legacy_allows_sidecar() {
+        let old = statuses(serde_json::json!([terminated(0)]));
+        let new = statuses(serde_json::json!([running()]));
+        let path = Path::new("status").child("initContainerStatuses");
+        let run = |restart_policy: serde_json::Value| {
+            let mut init = serde_json::json!({"name": "c", "image": "i"});
+            if !restart_policy.is_null() {
+                init["restartPolicy"] = restart_policy;
+            }
+            let spec = spec_of(serde_json::json!({"restartPolicy": "Never",
+                "initContainers": [init], "containers": [{"name": "x", "image": "i"}]}));
+            validate_init_container_state_transition(&new, &old, &path, &spec, &opts(false, false))
+        };
+        assert!(run(serde_json::json!("Always")).is_empty());
+        assert_eq!(run(serde_json::Value::Null).len(), 1);
+    }
+
+    /// With the option on, a rule match (or the container's own policy)
+    /// decides, and `RestartAllContainers` lifts the fence for every
+    /// container (validation.go:5843-5880).
+    #[test]
+    fn container_state_transition_with_rules_and_restart_all() {
+        let old = statuses(serde_json::json!([terminated(42)]));
+        let new = statuses(serde_json::json!([running()]));
+        let path = Path::new("status").child("containerStatuses");
+        let rule = |action: &str| {
+            spec_of(
+                serde_json::json!({"restartPolicy": "Never", "containers": [{
+                "name": "c", "image": "i", "restartPolicy": "Never",
+                "restartPolicyRules": [{"action": action,
+                    "exitCodes": {"operator": "In", "values": [42]}}]}]}),
+            )
+        };
+        let check = |spec: &PodSpec, o: &PodValidationOptions| {
+            validate_container_state_transition(&new, &old, &path, spec, o).len()
+        };
+        assert_eq!(check(&rule("Restart"), &opts(true, false)), 0);
+        // RestartAllContainers: lifts the fence only with the option on.
+        assert_eq!(check(&rule("RestartAllContainers"), &opts(true, true)), 0);
+        assert_eq!(check(&rule("RestartAllContainers"), &opts(true, false)), 1);
+        // A non-matching exit code falls back to the container policy.
+        let other = statuses(serde_json::json!([terminated(1)]));
+        assert_eq!(
+            validate_container_state_transition(
+                &new,
+                &other,
+                &path,
+                &rule("Restart"),
+                &opts(true, false)
+            )
+            .len(),
+            1
+        );
+        // A status naming no spec container is not allowed to restart.
+        let stranger = spec_of(serde_json::json!({"containers": [{"name": "z", "image": "i"}]}));
+        assert_eq!(check(&stranger, &opts(true, false)), 1);
     }
 }
