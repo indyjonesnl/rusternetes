@@ -625,6 +625,197 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (3, "currentAverageValue", T::Quantity),
         ]),
     );
+    // ===== autoscaling/v2beta2 (k8s.io/api/autoscaling/v2beta2/generated.proto) =====
+    schemas.insert(
+        "autoscaling/v2beta2.ContainerResourceMetricSource".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "target", T::Message("autoscaling/v2beta2.MetricTarget".into())),
+            (3, "container", T::String),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ContainerResourceMetricStatus".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "current", T::Message("autoscaling/v2beta2.MetricValueStatus".into())),
+            (3, "container", T::String),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.CrossVersionObjectReference".into(),
+        m(vec![
+            (1, "kind", T::String),
+            (2, "name", T::String),
+            (3, "apiVersion", T::String),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ExternalMetricSource".into(),
+        m(vec![
+            (1, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+            (2, "target", T::Message("autoscaling/v2beta2.MetricTarget".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ExternalMetricStatus".into(),
+        m(vec![
+            (1, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+            (2, "current", T::Message("autoscaling/v2beta2.MetricValueStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HPAScalingPolicy".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "value", T::Int),
+            (3, "periodSeconds", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HPAScalingRules".into(),
+        m(vec![
+            (3, "stabilizationWindowSeconds", T::Int),
+            (1, "selectPolicy", T::String),
+            (2, "policies", T::Repeated(Box::new(T::Message("autoscaling/v2beta2.HPAScalingPolicy".into())))),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HorizontalPodAutoscaler".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("autoscaling/v2beta2.HorizontalPodAutoscalerSpec".into())),
+            (3, "status", T::Message("autoscaling/v2beta2.HorizontalPodAutoscalerStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HorizontalPodAutoscalerBehavior".into(),
+        m(vec![
+            (1, "scaleUp", T::Message("autoscaling/v2beta2.HPAScalingRules".into())),
+            (2, "scaleDown", T::Message("autoscaling/v2beta2.HPAScalingRules".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HorizontalPodAutoscalerCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HorizontalPodAutoscalerSpec".into(),
+        m(vec![
+            (1, "scaleTargetRef", T::Message("autoscaling/v2beta2.CrossVersionObjectReference".into())),
+            (2, "minReplicas", T::Int),
+            (3, "maxReplicas", T::Int),
+            (4, "metrics", T::Repeated(Box::new(T::Message("autoscaling/v2beta2.MetricSpec".into())))),
+            (5, "behavior", T::Message("autoscaling/v2beta2.HorizontalPodAutoscalerBehavior".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.HorizontalPodAutoscalerStatus".into(),
+        m(vec![
+            (1, "observedGeneration", T::Int),
+            (2, "lastScaleTime", T::Message("Time".into())),
+            (3, "currentReplicas", T::Int),
+            (4, "desiredReplicas", T::Int),
+            (5, "currentMetrics", T::Repeated(Box::new(T::Message("autoscaling/v2beta2.MetricStatus".into())))),
+            (6, "conditions", T::Repeated(Box::new(T::Message("autoscaling/v2beta2.HorizontalPodAutoscalerCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.MetricIdentifier".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "selector", T::Message("LabelSelector".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.MetricSpec".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "object", T::Message("autoscaling/v2beta2.ObjectMetricSource".into())),
+            (3, "pods", T::Message("autoscaling/v2beta2.PodsMetricSource".into())),
+            (4, "resource", T::Message("autoscaling/v2beta2.ResourceMetricSource".into())),
+            (7, "containerResource", T::Message("autoscaling/v2beta2.ContainerResourceMetricSource".into())),
+            (5, "external", T::Message("autoscaling/v2beta2.ExternalMetricSource".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.MetricStatus".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "object", T::Message("autoscaling/v2beta2.ObjectMetricStatus".into())),
+            (3, "pods", T::Message("autoscaling/v2beta2.PodsMetricStatus".into())),
+            (4, "resource", T::Message("autoscaling/v2beta2.ResourceMetricStatus".into())),
+            (7, "containerResource", T::Message("autoscaling/v2beta2.ContainerResourceMetricStatus".into())),
+            (5, "external", T::Message("autoscaling/v2beta2.ExternalMetricStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.MetricTarget".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "value", T::Quantity),
+            (3, "averageValue", T::Quantity),
+            (4, "averageUtilization", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.MetricValueStatus".into(),
+        m(vec![
+            (1, "value", T::Quantity),
+            (2, "averageValue", T::Quantity),
+            (3, "averageUtilization", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ObjectMetricSource".into(),
+        m(vec![
+            (1, "describedObject", T::Message("autoscaling/v2beta2.CrossVersionObjectReference".into())),
+            (2, "target", T::Message("autoscaling/v2beta2.MetricTarget".into())),
+            (3, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ObjectMetricStatus".into(),
+        m(vec![
+            (1, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+            (2, "current", T::Message("autoscaling/v2beta2.MetricValueStatus".into())),
+            (3, "describedObject", T::Message("autoscaling/v2beta2.CrossVersionObjectReference".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.PodsMetricSource".into(),
+        m(vec![
+            (1, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+            (2, "target", T::Message("autoscaling/v2beta2.MetricTarget".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.PodsMetricStatus".into(),
+        m(vec![
+            (1, "metric", T::Message("autoscaling/v2beta2.MetricIdentifier".into())),
+            (2, "current", T::Message("autoscaling/v2beta2.MetricValueStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ResourceMetricSource".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "target", T::Message("autoscaling/v2beta2.MetricTarget".into())),
+        ]),
+    );
+    schemas.insert(
+        "autoscaling/v2beta2.ResourceMetricStatus".into(),
+        m(vec![
+            (1, "name", T::String),
+            (2, "current", T::Message("autoscaling/v2beta2.MetricValueStatus".into())),
+        ]),
+    );
     // ===== discovery.k8s.io/v1beta1 (k8s.io/api/discovery/v1beta1/generated.proto) =====
     schemas.insert(
         "discovery.k8s.io/v1beta1.Endpoint".into(),
@@ -711,12 +902,219 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (2, "lastObservedTime", T::Message("MicroTime".into())),
         ]),
     );
+    // ===== flowcontrol.apiserver.k8s.io/v1 (k8s.io/api/flowcontrol/v1/generated.proto) =====
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.ExemptPriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "nominalConcurrencyShares", T::Int),
+            (2, "lendablePercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.FlowDistinguisherMethod".into(),
+        m(vec![
+            (1, "type", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.FlowSchema".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1.FlowSchemaSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1.FlowSchemaStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.FlowSchemaCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.FlowSchemaSpec".into(),
+        m(vec![
+            (1, "priorityLevelConfiguration", T::Message("flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationReference".into())),
+            (2, "matchingPrecedence", T::Int),
+            (3, "distinguisherMethod", T::Message("flowcontrol.apiserver.k8s.io/v1.FlowDistinguisherMethod".into())),
+            (4, "rules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.PolicyRulesWithSubjects".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.FlowSchemaStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.FlowSchemaCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.GroupSubject".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.LimitResponse".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "queuing", T::Message("flowcontrol.apiserver.k8s.io/v1.QueuingConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.LimitedPriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "nominalConcurrencyShares", T::Int),
+            (2, "limitResponse", T::Message("flowcontrol.apiserver.k8s.io/v1.LimitResponse".into())),
+            (3, "lendablePercent", T::Int),
+            (4, "borrowingLimitPercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.NonResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "nonResourceURLs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PolicyRulesWithSubjects".into(),
+        m(vec![
+            (1, "subjects", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.Subject".into())))),
+            (2, "resourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.ResourcePolicyRule".into())))),
+            (3, "nonResourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.NonResourcePolicyRule".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationReference".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationSpec".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "limited", T::Message("flowcontrol.apiserver.k8s.io/v1.LimitedPriorityLevelConfiguration".into())),
+            (3, "exempt", T::Message("flowcontrol.apiserver.k8s.io/v1.ExemptPriorityLevelConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1.PriorityLevelConfigurationCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.QueuingConfiguration".into(),
+        m(vec![
+            (1, "queues", T::Int),
+            (2, "handSize", T::Int),
+            (3, "queueLengthLimit", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.ResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (2, "apiGroups", T::Repeated(Box::new(T::String))),
+            (3, "resources", T::Repeated(Box::new(T::String))),
+            (4, "clusterScope", T::Bool),
+            (5, "namespaces", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.ServiceAccountSubject".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.Subject".into(),
+        m(vec![
+            (1, "kind", T::String),
+            (2, "user", T::Message("flowcontrol.apiserver.k8s.io/v1.UserSubject".into())),
+            (3, "group", T::Message("flowcontrol.apiserver.k8s.io/v1.GroupSubject".into())),
+            (4, "serviceAccount", T::Message("flowcontrol.apiserver.k8s.io/v1.ServiceAccountSubject".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1.UserSubject".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
     // ===== flowcontrol.apiserver.k8s.io/v1beta1 (k8s.io/api/flowcontrol/v1beta1/generated.proto) =====
     schemas.insert(
         "flowcontrol.apiserver.k8s.io/v1beta1.ExemptPriorityLevelConfiguration".into(),
         m(vec![
             (1, "nominalConcurrencyShares", T::Int),
             (2, "lendablePercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.FlowDistinguisherMethod".into(),
+        m(vec![
+            (1, "type", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.FlowSchema".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaSpec".into(),
+        m(vec![
+            (1, "priorityLevelConfiguration", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.PriorityLevelConfigurationReference".into())),
+            (2, "matchingPrecedence", T::Int),
+            (3, "distinguisherMethod", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.FlowDistinguisherMethod".into())),
+            (4, "rules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta1.PolicyRulesWithSubjects".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta1.FlowSchemaCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.GroupSubject".into(),
+        m(vec![
+            (1, "name", T::String),
         ]),
     );
     schemas.insert(
@@ -736,6 +1134,21 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.NonResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "nonResourceURLs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.PolicyRulesWithSubjects".into(),
+        m(vec![
+            (1, "subjects", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta1.Subject".into())))),
+            (2, "resourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta1.ResourcePolicyRule".into())))),
+            (3, "nonResourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta1.NonResourcePolicyRule".into())))),
+        ]),
+    );
+    schemas.insert(
         "flowcontrol.apiserver.k8s.io/v1beta1.PriorityLevelConfiguration".into(),
         m(vec![
             (1, "metadata", T::Message("ObjectMeta".into())),
@@ -751,6 +1164,12 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (3, "lastTransitionTime", T::Message("Time".into())),
             (4, "reason", T::String),
             (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.PriorityLevelConfigurationReference".into(),
+        m(vec![
+            (1, "name", T::String),
         ]),
     );
     schemas.insert(
@@ -775,12 +1194,89 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (3, "queueLengthLimit", T::Int),
         ]),
     );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.ResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (2, "apiGroups", T::Repeated(Box::new(T::String))),
+            (3, "resources", T::Repeated(Box::new(T::String))),
+            (4, "clusterScope", T::Bool),
+            (5, "namespaces", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.ServiceAccountSubject".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.Subject".into(),
+        m(vec![
+            (1, "kind", T::String),
+            (2, "user", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.UserSubject".into())),
+            (3, "group", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.GroupSubject".into())),
+            (4, "serviceAccount", T::Message("flowcontrol.apiserver.k8s.io/v1beta1.ServiceAccountSubject".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta1.UserSubject".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
     // ===== flowcontrol.apiserver.k8s.io/v1beta2 (k8s.io/api/flowcontrol/v1beta2/generated.proto) =====
     schemas.insert(
         "flowcontrol.apiserver.k8s.io/v1beta2.ExemptPriorityLevelConfiguration".into(),
         m(vec![
             (1, "nominalConcurrencyShares", T::Int),
             (2, "lendablePercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.FlowDistinguisherMethod".into(),
+        m(vec![
+            (1, "type", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.FlowSchema".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaSpec".into(),
+        m(vec![
+            (1, "priorityLevelConfiguration", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.PriorityLevelConfigurationReference".into())),
+            (2, "matchingPrecedence", T::Int),
+            (3, "distinguisherMethod", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.FlowDistinguisherMethod".into())),
+            (4, "rules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta2.PolicyRulesWithSubjects".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta2.FlowSchemaCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.GroupSubject".into(),
+        m(vec![
+            (1, "name", T::String),
         ]),
     );
     schemas.insert(
@@ -800,6 +1296,21 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.NonResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "nonResourceURLs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.PolicyRulesWithSubjects".into(),
+        m(vec![
+            (1, "subjects", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta2.Subject".into())))),
+            (2, "resourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta2.ResourcePolicyRule".into())))),
+            (3, "nonResourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta2.NonResourcePolicyRule".into())))),
+        ]),
+    );
+    schemas.insert(
         "flowcontrol.apiserver.k8s.io/v1beta2.PriorityLevelConfiguration".into(),
         m(vec![
             (1, "metadata", T::Message("ObjectMeta".into())),
@@ -815,6 +1326,12 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (3, "lastTransitionTime", T::Message("Time".into())),
             (4, "reason", T::String),
             (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.PriorityLevelConfigurationReference".into(),
+        m(vec![
+            (1, "name", T::String),
         ]),
     );
     schemas.insert(
@@ -837,6 +1354,200 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (1, "queues", T::Int),
             (2, "handSize", T::Int),
             (3, "queueLengthLimit", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.ResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (2, "apiGroups", T::Repeated(Box::new(T::String))),
+            (3, "resources", T::Repeated(Box::new(T::String))),
+            (4, "clusterScope", T::Bool),
+            (5, "namespaces", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.ServiceAccountSubject".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.Subject".into(),
+        m(vec![
+            (1, "kind", T::String),
+            (2, "user", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.UserSubject".into())),
+            (3, "group", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.GroupSubject".into())),
+            (4, "serviceAccount", T::Message("flowcontrol.apiserver.k8s.io/v1beta2.ServiceAccountSubject".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta2.UserSubject".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
+    // ===== flowcontrol.apiserver.k8s.io/v1beta3 (k8s.io/api/flowcontrol/v1beta3/generated.proto) =====
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.ExemptPriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "nominalConcurrencyShares", T::Int),
+            (2, "lendablePercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.FlowDistinguisherMethod".into(),
+        m(vec![
+            (1, "type", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.FlowSchema".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaSpec".into(),
+        m(vec![
+            (1, "priorityLevelConfiguration", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationReference".into())),
+            (2, "matchingPrecedence", T::Int),
+            (3, "distinguisherMethod", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.FlowDistinguisherMethod".into())),
+            (4, "rules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.PolicyRulesWithSubjects".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.FlowSchemaCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.GroupSubject".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.LimitResponse".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "queuing", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.QueuingConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.LimitedPriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "nominalConcurrencyShares", T::Int),
+            (2, "limitResponse", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.LimitResponse".into())),
+            (3, "lendablePercent", T::Int),
+            (4, "borrowingLimitPercent", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.NonResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (6, "nonResourceURLs", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PolicyRulesWithSubjects".into(),
+        m(vec![
+            (1, "subjects", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.Subject".into())))),
+            (2, "resourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.ResourcePolicyRule".into())))),
+            (3, "nonResourceRules", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.NonResourcePolicyRule".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfiguration".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationSpec".into())),
+            (3, "status", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationReference".into(),
+        m(vec![
+            (1, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationSpec".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "limited", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.LimitedPriorityLevelConfiguration".into())),
+            (3, "exempt", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.ExemptPriorityLevelConfiguration".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("flowcontrol.apiserver.k8s.io/v1beta3.PriorityLevelConfigurationCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.QueuingConfiguration".into(),
+        m(vec![
+            (1, "queues", T::Int),
+            (2, "handSize", T::Int),
+            (3, "queueLengthLimit", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.ResourcePolicyRule".into(),
+        m(vec![
+            (1, "verbs", T::Repeated(Box::new(T::String))),
+            (2, "apiGroups", T::Repeated(Box::new(T::String))),
+            (3, "resources", T::Repeated(Box::new(T::String))),
+            (4, "clusterScope", T::Bool),
+            (5, "namespaces", T::Repeated(Box::new(T::String))),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.ServiceAccountSubject".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.Subject".into(),
+        m(vec![
+            (1, "kind", T::String),
+            (2, "user", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.UserSubject".into())),
+            (3, "group", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.GroupSubject".into())),
+            (4, "serviceAccount", T::Message("flowcontrol.apiserver.k8s.io/v1beta3.ServiceAccountSubject".into())),
+        ]),
+    );
+    schemas.insert(
+        "flowcontrol.apiserver.k8s.io/v1beta3.UserSubject".into(),
+        m(vec![
+            (1, "name", T::String),
         ]),
     );
     // ===== networking.k8s.io/v1beta1 (k8s.io/api/networking/v1beta1/generated.proto) =====
@@ -2100,6 +2811,58 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         m(vec![
             (1, "conditions", T::Repeated(Box::new(T::Message("Condition".into())))),
             (2, "resourceVersion", T::String),
+        ]),
+    );
+    // ===== apiregistration.k8s.io/v1beta1 (k8s.io/kube-aggregator/pkg/apis/apiregistration/v1beta1/generated.proto) =====
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.APIService".into(),
+        m(vec![
+            (1, "metadata", T::Message("ObjectMeta".into())),
+            (2, "spec", T::Message("apiregistration.k8s.io/v1beta1.APIServiceSpec".into())),
+            (3, "status", T::Message("apiregistration.k8s.io/v1beta1.APIServiceStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.APIServiceCondition".into(),
+        m(vec![
+            (1, "type", T::String),
+            (2, "status", T::String),
+            (3, "lastTransitionTime", T::Message("Time".into())),
+            (4, "reason", T::String),
+            (5, "message", T::String),
+        ]),
+    );
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.APIServiceList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("apiregistration.k8s.io/v1beta1.APIService".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.APIServiceSpec".into(),
+        m(vec![
+            (1, "service", T::Message("apiregistration.k8s.io/v1beta1.ServiceReference".into())),
+            (2, "group", T::String),
+            (3, "version", T::String),
+            (4, "insecureSkipTLSVerify", T::Bool),
+            (5, "caBundle", T::Bytes),
+            (7, "groupPriorityMinimum", T::Int),
+            (8, "versionPriority", T::Int),
+        ]),
+    );
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.APIServiceStatus".into(),
+        m(vec![
+            (1, "conditions", T::Repeated(Box::new(T::Message("apiregistration.k8s.io/v1beta1.APIServiceCondition".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apiregistration.k8s.io/v1beta1.ServiceReference".into(),
+        m(vec![
+            (1, "namespace", T::String),
+            (2, "name", T::String),
+            (3, "port", T::Int),
         ]),
     );
     // ===== apiextensions.k8s.io/v1beta1 (k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1/generated.proto) =====

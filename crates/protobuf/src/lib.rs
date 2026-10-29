@@ -12833,8 +12833,9 @@ impl ProtoRegistry {
         //          taints=8 (repeated DeviceTaint), bindsToNode=9,
         //          bindingConditions=10 (repeated string),
         //          bindingFailureConditions=11 (repeated string),
-        //          allowMultipleAllocations=12,
-        //          nodeAllocatableResourceMappings=13 (map<string, ...>) }
+        //          allowMultipleAllocations=12 }
+        // Upstream: staging/src/k8s.io/api/resource/v1/generated.proto
+        // `message Device` (release-1.35 ends at #12).
         schemas.insert(
             "Device".into(),
             MessageSchema {
@@ -12895,19 +12896,13 @@ impl ProtoRegistry {
                         ),
                     ),
                     (12, ("allowMultipleAllocations".into(), FieldType::Bool)),
-                    (
-                        13,
-                        (
-                            "nodeAllocatableResourceMappings".into(),
-                            FieldType::MessageMap("NodeAllocatableResourceMapping".into()),
-                        ),
-                    ),
                 ]),
             },
         );
 
-        // DeviceAttribute (one-of) { int=2, bool=3, string=4, version=5,
-        //                            ints=6, bools=7, strings=8, versions=9 }
+        // DeviceAttribute (one-of) { int=2, bool=3, string=4, version=5 }
+        // Upstream: staging/src/k8s.io/api/resource/v1/generated.proto
+        // `message DeviceAttribute` (release-1.35 ends at #5).
         schemas.insert(
             "DeviceAttribute".into(),
             MessageSchema {
@@ -12916,31 +12911,6 @@ impl ProtoRegistry {
                     (3, ("bool".into(), FieldType::Bool)),
                     (4, ("string".into(), FieldType::String)),
                     (5, ("version".into(), FieldType::String)),
-                    (
-                        6,
-                        ("ints".into(), FieldType::Repeated(Box::new(FieldType::Int))),
-                    ),
-                    (
-                        7,
-                        (
-                            "bools".into(),
-                            FieldType::Repeated(Box::new(FieldType::Bool)),
-                        ),
-                    ),
-                    (
-                        8,
-                        (
-                            "strings".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
-                    (
-                        9,
-                        (
-                            "versions".into(),
-                            FieldType::Repeated(Box::new(FieldType::String)),
-                        ),
-                    ),
                 ]),
             },
         );
@@ -13140,18 +13110,6 @@ impl ProtoRegistry {
                     (2, ("driver".into(), FieldType::String)),
                     (3, ("pool".into(), FieldType::String)),
                     (4, ("device".into(), FieldType::String)),
-                ]),
-            },
-        );
-
-        // NodeAllocatableResourceMapping { capacityKey=1,
-        //                                  allocationMultiplier=2 (Quantity) }
-        schemas.insert(
-            "NodeAllocatableResourceMapping".into(),
-            MessageSchema {
-                fields: HashMap::from([
-                    (1, ("capacityKey".into(), FieldType::String)),
-                    (2, ("allocationMultiplier".into(), FieldType::Quantity)),
                 ]),
             },
         );

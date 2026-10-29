@@ -475,7 +475,17 @@ pub(crate) fn compare_types(ours: &FieldType, theirs: &LogicalType) -> Option<St
             )),
         },
         (FieldType::MessageMap(expected), LogicalType::Map(value)) => match value.as_ref() {
-            LogicalType::Message(name) if name == expected => None,
+            // A group-qualified value (`resource.k8s.io/v1beta1.Counter`)
+            // names the same upstream message as its simple name, exactly as
+            // the `Message` arm above treats a qualified reference.
+            LogicalType::Message(name)
+                if name == expected
+                    || expected
+                        .rsplit_once('.')
+                        .is_some_and(|(prefix, simple)| prefix.contains('/') && simple == name) =>
+            {
+                None
+            }
             other => Some(format!(
                 "expected map<string,{}>, upstream value={:?}",
                 expected, other
@@ -558,6 +568,13 @@ pub(crate) fn intentional_field_skip(msg: &str, field_number: u32) -> bool {
         // documents. protoc-gen-go strips the `$` and dash-camel-cases
         // to derive `schema`, `ref`, `xKubernetesPreserveUnknownFields`,
         // etc. Wire numbers match; only the Go-side string differs.
+        // protoc-gen-go derives the proto field name from the Go field name
+        // (`UID` -> `uID`, `APIGroup` -> `aPIGroup`); the registry keeps the
+        // JSON name. Wire numbers match (authentication/v1 types.go
+        // `BoundObjectReference.UID`, networking types.go
+        // `IngressClassParametersReference.APIGroup`).
+        ("BoundObjectReference", 4) => true,
+        ("IngressClassParametersReference", 1) => true,
         ("JSONSchemaProps", 2 | 3) => true,
         ("JSONSchemaProps", 38..=44) => true,
 
