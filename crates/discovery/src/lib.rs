@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 pub mod deferred_restmapper;
+pub mod deleted_kinds;
 pub mod kube_version;
 pub mod restmapper;
 
@@ -807,14 +808,14 @@ pub async fn get_api_groups(
     }
 
     // certificates.k8s.io/v1beta1 is served under the ClusterTrustBundle gate.
-    if certificates_v1beta1_served() {
+    if group_v1beta1_served("certificates.k8s.io") {
         if let Some(group) = groups.iter_mut().find(|g| g.name == "certificates.k8s.io") {
             group.versions.push(GroupVersionForDiscovery {
                 group_version: "certificates.k8s.io/v1beta1".to_string(),
                 version: "v1beta1".to_string(),
             });
             // v1alpha1 follows v1beta1 (priority order, aggregator.go:317-352).
-            if certificates_v1alpha1_served() {
+            if group_v1alpha1_served("certificates.k8s.io") {
                 group.versions.push(GroupVersionForDiscovery {
                     group_version: "certificates.k8s.io/v1alpha1".to_string(),
                     version: "v1alpha1".to_string(),
@@ -825,7 +826,7 @@ pub async fn get_api_groups(
 
     // admissionregistration.k8s.io/v1beta1 is served under the
     // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
-    if admissionregistration_v1beta1_served() {
+    if group_v1beta1_served("admissionregistration.k8s.io") {
         if let Some(group) = groups
             .iter_mut()
             .find(|g| g.name == "admissionregistration.k8s.io")
@@ -985,7 +986,9 @@ fn certificates_v1alpha1_served() -> bool {
 
 /// Whether `group` also serves a `v1alpha1` next to its v1beta1.
 fn group_v1alpha1_served(group: &str) -> bool {
-    group == "certificates.k8s.io" && certificates_v1alpha1_served()
+    group == "certificates.k8s.io"
+        && certificates_v1alpha1_served()
+        && served_at_emulation_version(group, "v1alpha1")
 }
 
 /// Whether `admissionregistration.k8s.io/v1beta1` is served: its resources,
@@ -1032,6 +1035,157 @@ fn storagemigration_v1beta1_served() -> bool {
 
 /// Whether `group` also serves a `v1beta1` next to its preferred version.
 fn group_v1beta1_served(group: &str) -> bool {
+    group_v1beta1_gate(group) && served_at_emulation_version(group, "v1beta1")
+}
+
+/// The built-in `(version -> resources)` of `group` that a server at the
+/// emulation version serves. Upstream runs `RemoveUnavailableKinds`
+/// (deleted_kinds.go) over each `APIGroupInfo` at install time with the
+/// evaluator built from `EffectiveVersion.EmulationVersion()` (see
+/// [`deleted_kinds`]); the lifecycle of each kind is `APILifecycleIntroduced`
+/// from the scheme table. `None` when nothing is filtered, which is always the
+/// case at the binary version, as no kind is introduced after it.
+fn emulation_served_resources(group: &str) -> Option<deleted_kinds::VersionedResources> {
+    emulation_served_resources_at(
+        group,
+        rusternetes_common::feature_gates::emulation_version(),
+    )
+}
+
+fn emulation_served_resources_at(
+    group: &str,
+    emulation: rusternetes_common::feature_gates::Version,
+) -> Option<deleted_kinds::VersionedResources> {
+    use rusternetes_common::resource_encoding::Scheme;
+    static SCHEME: std::sync::OnceLock<Scheme> = std::sync::OnceLock::new();
+
+    if emulation
+        >= rusternetes_common::compatibility::default_build_effective_version().emulation_version()
+    {
+        return None;
+    }
+    let scheme = SCHEME.get_or_init(Scheme::legacy);
+    let mut versions: Vec<String> = Vec::new();
+    for (g, preferred) in raw_api_group_names() {
+        if g == group {
+            versions.push(preferred.to_string());
+        }
+    }
+    if group_v1beta1_gate(group) {
+        versions.push("v1beta1".to_string());
+    }
+    if group == "certificates.k8s.io" && certificates_v1alpha1_served() {
+        versions.push("v1alpha1".to_string());
+    }
+    if group == "autoscaling" {
+        versions.push("v1".to_string());
+    }
+    let mut resources = deleted_kinds::VersionedResources::new();
+    for version in &versions {
+        let mut by_name = std::collections::BTreeMap::new();
+        for entry in get_aggregated_resources_for_group_unfiltered(group, version) {
+            let Some(name) = entry["resource"].as_str() else {
+                continue;
+            };
+            let lifecycle = |kind: &serde_json::Value| deleted_kinds::Lifecycle {
+                introduced: scheme.introduced(
+                    kind["group"].as_str().unwrap_or(group),
+                    kind["version"].as_str().unwrap_or(version),
+                    kind["kind"].as_str().unwrap_or(""),
+                ),
+                removed: None,
+            };
+            by_name.insert(name.to_string(), lifecycle(&entry["responseKind"]));
+            for sub in entry["subresources"].as_array().into_iter().flatten() {
+                if let Some(sub_name) = sub["subresource"].as_str() {
+                    by_name.insert(
+                        format!("{name}/{sub_name}"),
+                        lifecycle(&sub["responseKind"]),
+                    );
+                }
+            }
+        }
+        if !by_name.is_empty() {
+            resources.insert(version.clone(), by_name);
+        }
+    }
+    let evaluator =
+        deleted_kinds::ResourceExpirationEvaluator::from_options(deleted_kinds::Options {
+            current_version: Some(emulation),
+            ..Default::default()
+        })
+        .ok()?;
+    // No runtime-config and no --emulation-forward-compatible here, so the
+    // evaluator cannot fail (its errors name an explicitly enabled future API).
+    evaluator
+        .remove_unintroduced_kinds(group, &versions, &mut resources, None)
+        .ok()?;
+    Some(resources)
+}
+
+/// Whether `group/version` is still served at the emulation version. A version
+/// with nothing to filter (including one this crate does not list) is served.
+fn served_at_emulation_version(group: &str, version: &str) -> bool {
+    match emulation_served_resources(group) {
+        None => true,
+        Some(served) => {
+            served.contains_key(version)
+                || get_aggregated_resources_for_group_unfiltered(group, version).is_empty()
+        }
+    }
+}
+
+/// [`get_aggregated_resources_for_group_unfiltered`] without the resources
+/// (and subresources) introduced after the emulation version.
+fn get_aggregated_resources_for_group_uncategorized(
+    group: &str,
+    version: &str,
+) -> Vec<serde_json::Value> {
+    resources_at_emulation_version(
+        group,
+        version,
+        rusternetes_common::feature_gates::emulation_version(),
+    )
+}
+
+fn resources_at_emulation_version(
+    group: &str,
+    version: &str,
+    emulation: rusternetes_common::feature_gates::Version,
+) -> Vec<serde_json::Value> {
+    let mut entries = get_aggregated_resources_for_group_unfiltered(group, version);
+    let Some(served) = emulation_served_resources_at(group, emulation) else {
+        return entries;
+    };
+    let Some(names) = served.get(version) else {
+        return if entries.is_empty() {
+            entries
+        } else {
+            Vec::new()
+        };
+    };
+    entries.retain(|e| {
+        e["resource"]
+            .as_str()
+            .is_some_and(|n| names.contains_key(n))
+    });
+    for e in entries.iter_mut() {
+        let Some(name) = e["resource"].as_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(subs) = e["subresources"].as_array_mut() {
+            subs.retain(|s| {
+                s["subresource"]
+                    .as_str()
+                    .is_some_and(|sub| names.contains_key(&format!("{name}/{sub}")))
+            });
+        }
+    }
+    entries
+}
+
+/// The gate half of [`group_v1beta1_served`].
+fn group_v1beta1_gate(group: &str) -> bool {
     match group {
         "certificates.k8s.io" => certificates_v1beta1_served(),
         "admissionregistration.k8s.io" => admissionregistration_v1beta1_served(),
@@ -1041,6 +1195,14 @@ fn group_v1beta1_served(group: &str) -> bool {
 
 /// Helper to get all API group names and their preferred versions
 fn get_api_group_names() -> Vec<(&'static str, &'static str)> {
+    raw_api_group_names()
+        .into_iter()
+        .filter(|(group, version)| served_at_emulation_version(group, version))
+        .collect()
+}
+
+/// [`get_api_group_names`] before the emulation version filter.
+fn raw_api_group_names() -> Vec<(&'static str, &'static str)> {
     let mut groups = vec![
         ("apps", "v1"),
         ("batch", "v1"),
@@ -1109,9 +1271,10 @@ pub fn delegate_listed_paths() -> Vec<String> {
 pub fn resolve_kind_to_resource(group: &str, version: &str, kind: &str) -> Option<String> {
     let served = match (group, version) {
         ("", "v1") | ("autoscaling", "v1") => true,
-        ("certificates.k8s.io", "v1beta1") => certificates_v1beta1_served(),
-        ("certificates.k8s.io", "v1alpha1") => certificates_v1alpha1_served(),
-        ("admissionregistration.k8s.io", "v1beta1") => admissionregistration_v1beta1_served(),
+        ("certificates.k8s.io", "v1beta1") | ("admissionregistration.k8s.io", "v1beta1") => {
+            group_v1beta1_served(group)
+        }
+        ("certificates.k8s.io", "v1alpha1") => group_v1alpha1_served(group),
         ("resource.k8s.io", "v1alpha3") => resource_v1alpha3_served(),
         ("storagemigration.k8s.io", "v1beta1") => storagemigration_v1beta1_served(),
         _ => get_api_group_names()
@@ -1243,7 +1406,7 @@ fn resource_categories(group: &str, resource: &str) -> &'static [&'static str] {
     }
 }
 
-fn get_aggregated_resources_for_group_uncategorized(
+fn get_aggregated_resources_for_group_unfiltered(
     group: &str,
     version: &str,
 ) -> Vec<serde_json::Value> {
@@ -3891,7 +4054,7 @@ pub async fn get_storagemigration_v1beta1_resources() -> Response {
 /// and `podcertificaterequests` (+ `/status`), each present only while its
 /// gate is on (404 when neither is, as for an API version with no storage).
 pub async fn get_certificates_v1beta1_resources() -> Response {
-    if !certificates_v1beta1_served() {
+    if !group_v1beta1_served("certificates.k8s.io") {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -3977,7 +4140,7 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
 /// (`v1alpha1Storage`, storage_certificates.go:122-138), 404 while the
 /// `ClusterTrustBundle` gate is off, as for an API version with no storage.
 pub async fn get_certificates_v1alpha1_resources() -> Response {
-    if !certificates_v1alpha1_served() {
+    if !group_v1alpha1_served("certificates.k8s.io") {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -4094,7 +4257,7 @@ pub async fn get_resource_v1alpha3_resources() -> Response {
 /// (404 while the `MutatingAdmissionPolicy` gate is off, as for an API version
 /// with no storage: storage_apiserver.go:187-205).
 pub async fn get_admissionregistration_v1beta1_resources() -> Response {
-    if !admissionregistration_v1beta1_served() {
+    if !group_v1beta1_served("admissionregistration.k8s.io") {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -5967,5 +6130,74 @@ mod tests {
         // The two mutatingadmissionpolicy kinds are v1beta1 upstream and not
         // served here; HPA appears in both the v1 and v2 lists.
         assert!(seen >= 15, "only {seen} categorised typed resources");
+    }
+}
+
+/// Serving at an emulation version: kinds whose `APILifecycleIntroduced` is
+/// after it are not in discovery (`removeUnintroducedKinds`,
+/// deleted_kinds.go). These pass the version explicitly rather than setting
+/// the process-wide gate, so they do not race the other tests.
+#[cfg(test)]
+mod emulation_tests {
+    use super::*;
+    use rusternetes_common::feature_gates::Version;
+
+    fn names(group: &str, version: &str, emulation: Version) -> Vec<String> {
+        resources_at_emulation_version(group, version, emulation)
+            .iter()
+            .filter_map(|e| e["resource"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn nothing_is_filtered_at_the_binary_version() {
+        assert!(
+            emulation_served_resources_at("resource.k8s.io", Version::major_minor(1, 35)).is_none()
+        );
+        assert!(!names("resource.k8s.io", "v1", Version::major_minor(1, 35)).is_empty());
+    }
+
+    #[test]
+    fn only_kinds_introduced_after_the_emulation_version_are_dropped() {
+        // DeviceClass, ResourceClaim, ResourceClaimTemplate and ResourceSlice
+        // are introduced in resource.k8s.io/v1 at 1.34 (zz_generated
+        // .prerelease-lifecycle.go); a group whose kinds all predate 1.30 is
+        // untouched.
+        let emulation = Version::major_minor(1, 30);
+        assert!(names("resource.k8s.io", "v1", emulation).is_empty());
+        for (group, version) in [("apps", "v1"), ("storage.k8s.io", "v1")] {
+            assert_eq!(
+                names(group, version, emulation),
+                get_aggregated_resources_for_group_unfiltered(group, version)
+                    .iter()
+                    .filter_map(|e| e["resource"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>(),
+                "{group}/{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_with_no_resources_left_is_not_served() {
+        // Every resource.k8s.io/v1 kind is introduced in 1.34.
+        let at_33 = emulation_served_resources_at("resource.k8s.io", Version::major_minor(1, 33))
+            .expect("filtered below the binary version");
+        assert!(!at_33.contains_key("v1"));
+        assert!(names("resource.k8s.io", "v1", Version::major_minor(1, 33)).is_empty());
+        let at_34 = emulation_served_resources_at("resource.k8s.io", Version::major_minor(1, 34))
+            .expect("filtered below the binary version");
+        assert!(at_34.contains_key("v1"));
+    }
+
+    #[test]
+    fn subresources_of_a_served_resource_stay() {
+        let entries = resources_at_emulation_version("apps", "v1", Version::major_minor(1, 30));
+        let deployments = entries
+            .iter()
+            .find(|e| e["resource"] == "deployments")
+            .expect("deployments is served");
+        assert!(deployments["subresources"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|s| s["subresource"] == "scale")));
     }
 }

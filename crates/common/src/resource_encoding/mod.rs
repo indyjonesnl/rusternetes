@@ -184,6 +184,13 @@ impl Scheme {
         }
     }
 
+    /// `APILifecycleIntroduced()` of the versioned type registered for
+    /// `group/version` as `kind`: `None` when the kind is not registered or
+    /// has no such method (`versionedPtr.(introducedInterface)` fails).
+    pub fn introduced(&self, group: &str, version: &str, kind: &str) -> Option<(u32, u32)> {
+        self.new_introduced(group, version, kind).ok().flatten()
+    }
+
     /// `IsGroupRegistered`.
     pub fn is_group_registered(&self, group: &str) -> bool {
         self.groups.contains_key(group)
