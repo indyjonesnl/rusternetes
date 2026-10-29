@@ -11,7 +11,7 @@
 
 use crate::types::{k8s_time, Condition, ObjectMeta};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// `certificates.MaxPKIXPublicKeySize` (`pkg/apis/certificates/types.go:484`).
@@ -97,16 +97,16 @@ pub struct PodCertificateRequestSpec {
     #[serde(
         rename = "pkixPublicKey",
         default,
-        serialize_with = "serialize_bytes",
-        deserialize_with = "deserialize_bytes"
+        serialize_with = "crate::serde_helpers::bytes_b64::serialize",
+        deserialize_with = "crate::serde_helpers::bytes_b64::deserialize"
     )]
     pub pkix_public_key: Vec<u8>,
     /// Signature over `podUID` made with the private key (base64 on the wire).
     #[serde(
         rename = "proofOfPossession",
         default,
-        serialize_with = "serialize_bytes",
-        deserialize_with = "deserialize_bytes"
+        serialize_with = "crate::serde_helpers::bytes_b64::serialize",
+        deserialize_with = "crate::serde_helpers::bytes_b64::deserialize"
     )]
     pub proof_of_possession: Vec<u8>,
     #[serde(
@@ -146,20 +146,4 @@ pub struct PodCertificateRequestStatus {
         deserialize_with = "k8s_time::deserialize"
     )]
     pub not_after: Option<DateTime<Utc>>,
-}
-
-fn serialize_bytes<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        data,
-    ))
-}
-
-fn deserialize_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-    // Go marshals a nil `[]byte` as `null`.
-    let Some(encoded) = Option::<String>::deserialize(d)? else {
-        return Ok(Vec::new());
-    };
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(serde::de::Error::custom)
 }
