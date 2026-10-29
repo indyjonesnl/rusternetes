@@ -35,7 +35,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     /// Default-config constructor — builds an `HttpMetricsClient` from
     /// `HttpMetricsConfig::default()`. Binaries thread explicit config via
     /// `with_config`, so this is only used by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(storage: Arc<S>) -> Self {
         Self::with_config(storage, HttpMetricsConfig::default())
     }
@@ -57,7 +56,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     }
 
     /// Test/explicit constructor — inject any MetricsClient.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_metrics_client(storage: Arc<S>, metrics_client: Arc<dyn MetricsClient>) -> Self {
         Self {
             storage,
@@ -180,7 +178,6 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Reconciling all HorizontalPodAutoscalers");
 

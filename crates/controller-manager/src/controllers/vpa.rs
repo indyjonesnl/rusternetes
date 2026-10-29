@@ -30,8 +30,6 @@ pub struct VerticalPodAutoscalerController<S: Storage> {
 struct ResourceUsage {
     cpu_millicores: i64,
     memory_bytes: i64,
-    #[allow(dead_code)]
-    timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
@@ -155,7 +153,6 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Reconciling all VPAs");
 
@@ -309,8 +306,6 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
     /// Collect resource usage from pods (simulated from pod status)
     async fn collect_resource_usage(&self, pods: &[Pod]) -> Result<()> {
         let mut history = self.usage_history.write().await;
-        let now = chrono::Utc::now();
-
         for pod in pods {
             let pod_key = format!(
                 "{}/{}",
@@ -335,7 +330,6 @@ impl<S: Storage + 'static> VerticalPodAutoscalerController<S> {
                     samples.push(ResourceUsage {
                         cpu_millicores: cpu_usage,
                         memory_bytes: memory_usage,
-                        timestamp: now,
                     });
 
                     // Keep only last N samples

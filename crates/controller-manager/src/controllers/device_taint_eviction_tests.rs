@@ -337,6 +337,8 @@ struct Fx {
     rule_evict_instance1: Arc<DeviceTaintRule>,
     rule_evict_instance2_later: Arc<DeviceTaintRule>,
     rule_none: Arc<DeviceTaintRule>,
+    // Fixture mirrors upstream's `ruleEvictOther`; no ported test reads it yet.
+    #[allow(dead_code)]
     rule_evict_other: Arc<DeviceTaintRule>,
     claim: Arc<ResourceClaim>,
     in_use_claim: Arc<ResourceClaim>,

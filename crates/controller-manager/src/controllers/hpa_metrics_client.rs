@@ -3,11 +3,6 @@
 //! Mirrors k8s `pkg/controller/podautoscaler/metrics/interfaces.go`. The real
 //! impl (`HttpMetricsClient`) queries the api-server metrics endpoints over
 //! mTLS; tests inject `FakeMetricsClient`.
-//!
-//! Some surface (the `PodMetric::timestamp` field, the `pods_info` test helper)
-//! is only exercised in tests, so the module keeps `allow(dead_code)` to stay
-//! clean under `--all-targets` clippy on the binary crate.
-#![allow(dead_code)]
 
 use anyhow::Result;
 use async_trait::async_trait;

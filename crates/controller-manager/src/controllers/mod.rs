@@ -62,7 +62,6 @@ pub mod quota_admission_double;
 pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resource_quota;
-#[allow(dead_code)]
 pub mod resourceclaim;
 pub mod selinux_warning;
 pub mod service;
@@ -80,7 +79,6 @@ pub mod ttl_controller;
 pub mod typed_workqueue;
 #[cfg(test)]
 pub mod uid_precondition_double;
-#[allow(dead_code)]
 pub mod vac_protection;
 pub mod volume_data_source_validator;
 pub mod volume_expansion;

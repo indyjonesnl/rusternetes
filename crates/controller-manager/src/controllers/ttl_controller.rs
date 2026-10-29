@@ -19,7 +19,6 @@ use tracing::{debug, error, info, warn};
 const CONCURRENT_TTL_SYNCS: usize = 5;
 
 /// TTL Controller for automatic cleanup of finished Jobs
-#[allow(dead_code)]
 pub struct TTLController<S: Storage> {
     storage: Arc<S>,
     /// How often to check for expired Jobs
@@ -155,7 +154,6 @@ impl<S: Storage + 'static> TTLController<S> {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn check_and_cleanup(&self) -> rusternetes_common::Result<()> {
         debug!("Checking for expired Jobs");
 
@@ -318,7 +316,6 @@ impl<S: Storage + 'static> TTLController<S> {
 }
 
 /// Job spec extension for TTL
-#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobSpecWithTTL {

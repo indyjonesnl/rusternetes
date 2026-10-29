@@ -17,7 +17,6 @@
 // The controller-manager bin compiles its own copy of `controllers`; the ported
 // queue API (`Get`, `Clear`, `Always`, inspection helpers) is only exercised by
 // the lib and tests.
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;

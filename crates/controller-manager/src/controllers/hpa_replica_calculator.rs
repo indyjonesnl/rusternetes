@@ -4,7 +4,6 @@
 //! All functions are side-effect-free and unit-testable.
 //! `desired = ceil(current * usageRatio)` with the k8s tolerance band: if
 //! `|ratio - 1| <= TOLERANCE`, keep current replicas (avoid thrashing).
-#![allow(dead_code)]
 
 use crate::controllers::hpa_metrics_client::PodMetricsInfo;
 

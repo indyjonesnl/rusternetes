@@ -345,5 +345,4 @@ struct PortsAndEndpoints {
 
 // Sanity check that helper types are wired correctly (won't surface as a
 // false-negative on a missing import if the test file otherwise compiles).
-#[allow(dead_code)]
 fn _imports_alive(_: EndpointConditions, _: EndpointReference) {}

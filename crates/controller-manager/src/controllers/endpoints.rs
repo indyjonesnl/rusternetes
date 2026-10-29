@@ -418,7 +418,6 @@ impl<S: Storage + 'static> EndpointsController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting endpoints reconciliation");
 

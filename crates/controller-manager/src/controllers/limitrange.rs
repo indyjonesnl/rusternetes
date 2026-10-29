@@ -31,7 +31,6 @@ pub struct LimitRangeController<S: Storage> {
 // watch loop, worker, and `reconcile_all` are kept ready so wiring
 // the controller in is a single-line change in `lib.rs`. Tests in
 // `tests/limitrange_controller_test.rs` exercise the public API.
-#[allow(dead_code)]
 impl<S: Storage + 'static> LimitRangeController<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }

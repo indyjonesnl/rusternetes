@@ -37,7 +37,6 @@ pub const IS_DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.i
 /// accepted by the api-server admission layer; kept here so the
 /// controller's coverage can be extended once it learns to read
 /// it. Not yet referenced by the controller.
-#[allow(dead_code)]
 pub const IS_DEFAULT_STORAGE_CLASS_BETA_ANNOTATION: &str =
     "storageclass.beta.kubernetes.io/is-default-class";
 

@@ -45,8 +45,6 @@
 //! - Go's `evictPodHook` / `cancelEvictHook` (benchmark-only test seams) are
 //!   not ported.
 
-#![allow(dead_code)]
-
 use crate::controllers::device_taint_eviction_metrics::{self as metrics, Metrics};
 use crate::controllers::taint_eviction::update_pod_condition;
 use crate::controllers::typed_workqueue::{NopQueue, RateLimitingQueue, WorkItemQueue};

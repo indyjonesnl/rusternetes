@@ -737,7 +737,6 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 
     /// `CollectWithStability` (capacity.go:751-767), evaluated now.
-    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn stats(&self) -> CapacityStats {
         self.refresher.stats(&|c| self.is_managed(c))
     }
@@ -965,7 +964,6 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     }
 
     /// Process what is queued right now (and what is rescheduled by it).
-    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub async fn sync_queued(&self, start: std::time::Duration, max: std::time::Duration) {
         while self.process_next(start, max).await {}
     }

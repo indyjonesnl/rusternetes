@@ -173,7 +173,6 @@ async fn delete_orphan_verified<S: Storage>(
 }
 
 /// Garbage collector controller
-#[allow(dead_code)]
 pub struct GarbageCollector<S: Storage> {
     storage: Arc<S>,
     /// Base GC scan cadence. Used when the previous scan did work (found
@@ -221,7 +220,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// `scan_interval` is the base cadence used after a scan that did work;
     /// `max_scan_interval` is the ceiling the idle backoff walks up to. See
     /// [`next_scan_interval`].
-    #[allow(dead_code)]
     pub fn with_scan_intervals(
         storage: Arc<S>,
         scan_interval: Duration,
@@ -326,7 +324,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// [`scan_and_collect_inner`](Self::scan_and_collect_inner) carries the
     /// did-work signal the adaptive [`run`](Self::run) loop needs. Only the
     /// tests call this now (production `run` uses the inner method directly).
-    #[allow(dead_code)]
     pub async fn scan_and_collect(&self) -> rusternetes_common::Result<()> {
         self.scan_and_collect_inner().await.map(|_| ())
     }
@@ -595,7 +592,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                     key,
                     metadata,
                     resource_type: resource_type.to_string(),
-                    value,
                 });
             }
         }
@@ -1308,48 +1304,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         Ok(())
     }
 
-    /// Cascade delete all resources in a namespace
-    #[allow(dead_code)]
-    async fn cascade_delete_namespace(
-        &self,
-        namespace: &ResourceInfo,
-        all_resources: &[ResourceInfo],
-    ) -> rusternetes_common::Result<()> {
-        let namespace_name = &namespace.metadata.name;
-        info!("Cascading delete for namespace: {}", namespace_name);
-
-        // Find all resources in this namespace
-        let resources_in_namespace: Vec<_> = all_resources
-            .iter()
-            .filter(|r| {
-                r.metadata.namespace.as_deref() == Some(namespace_name)
-                    && r.resource_type != "namespaces"
-            })
-            .collect();
-
-        // Delete all resources in the namespace
-        for resource in resources_in_namespace {
-            info!(
-                "Deleting {} {} in namespace {}",
-                resource.resource_type, resource.metadata.name, namespace_name
-            );
-            if let Err(e) = self.storage.delete(&resource.key).await {
-                error!(
-                    "Failed to delete {} {}: {}",
-                    resource.resource_type, resource.metadata.name, e
-                );
-            }
-        }
-
-        // If no resources left in namespace and no finalizers, delete the namespace
-        if !namespace.metadata.has_finalizers() {
-            info!("Deleting namespace: {}", namespace_name);
-            self.storage.delete(&namespace.key).await?;
-        }
-
-        Ok(())
-    }
-
     /// Detect cycles in the dependency graph
     /// Returns Ok(()) if no cycles, Err with cycle info if found
     fn detect_cycles(
@@ -1442,7 +1396,6 @@ impl<S: Storage + 'static> GarbageCollector<S> {
 }
 
 /// Information about a resource for GC purposes
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ResourceInfo {
     /// Storage key for the resource
@@ -1451,12 +1404,9 @@ struct ResourceInfo {
     metadata: ObjectMeta,
     /// Resource type (e.g., "pods", "deployments")
     resource_type: String,
-    /// Full resource value
-    value: Value,
 }
 
 /// Cascade deletion options
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOptions {
@@ -1477,7 +1427,6 @@ pub struct DeleteOptions {
     pub orphan_dependents: Option<bool>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preconditions {
@@ -2046,7 +1995,6 @@ mod tests {
             key: rc_key.to_string(),
             metadata: rc_meta.clone(),
             resource_type: "replicationcontrollers".to_string(),
-            value: rc_val.clone(),
         };
         let empty_dep_map: HashMap<String, Vec<String>> = HashMap::new();
 

@@ -282,7 +282,6 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
     /// upstream's 10s so the allocators observe the deletion first. (`main.rs`
     /// compiles the controller modules into the binary too, where a test-only
     /// builder is legitimately unused.)
-    #[allow(dead_code)]
     pub fn with_deletion_grace_period(mut self, period: Duration) -> Self {
         self.deletion_grace_period = period;
         self
@@ -450,7 +449,6 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
 
     /// Sync every ServiceCIDR once, synchronously (tests; `run()` is queue
     /// driven).
-    #[allow(dead_code)] // main.rs compiles this module too; only tests call it
     pub async fn reconcile_all(&self) -> Result<()> {
         let cidrs: Vec<ServiceCIDR> = self
             .storage

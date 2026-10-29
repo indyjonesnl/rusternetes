@@ -258,7 +258,6 @@ impl<S: Storage + 'static> DeploymentController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         debug!("Reconciling all deployments");
 

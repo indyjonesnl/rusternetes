@@ -50,7 +50,6 @@ pub const TRACKING_CONFIG_MAP_DATA_KEY: &str = "since";
 pub const DEFAULT_CLEANER_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// `RecommendedDefaultLegacySATokenCleanerConfiguration`: `365 * 24 * time.Hour`
 /// (config/v1alpha1/defaults.go:44).
-#[allow(dead_code)] // the bin takes it from the flag default; the lib wires it
 pub const DEFAULT_CLEAN_UP_PERIOD: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// `time.Parse("2006-01-02", s)` succeeds: strict, zero-padded.

@@ -214,7 +214,6 @@ impl<S: Storage + 'static> ServiceController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting service reconciliation");
 
@@ -547,7 +546,6 @@ impl<S: Storage + 'static> ServiceController<S> {
     }
 
     /// Handle service deletion - release allocated resources
-    #[allow(dead_code)]
     pub async fn handle_service_deletion(&self, namespace: &str, service_name: &str) -> Result<()> {
         info!(
             "Handling deletion of service {}/{}",

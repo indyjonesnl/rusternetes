@@ -54,7 +54,6 @@ impl ControllerSELinuxTranslator {
     /// [`Self::selinux_options_to_file_label`] conflict. The first three
     /// components do not conflict when either side is empty (the node may
     /// default them); the level is always compared.
-    #[cfg_attr(not(test), allow(dead_code))] // the cache calls `conflicts_parsed`; only tests call this
     pub fn conflicts(&self, label_a: &str, label_b: &str) -> bool {
         self.conflicts_parsed(&parse_selinux_label(label_a), &parse_selinux_label(label_b))
     }
