@@ -31,6 +31,7 @@ pub(crate) const EXTERNAL_REFS: &[&str] = &[
     "GroupVersionResource",
     "LabelSelector",
     "LabelSelectorAttributes",
+    "ListMeta",
     "MicroTime",
     "NodeSelector",
     "ObjectMeta",
@@ -1802,6 +1803,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "apidiscovery.k8s.io/v2.APIGroupDiscoveryList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2.APIGroupDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
         "apidiscovery.k8s.io/v2.APIResourceDiscovery".into(),
         m(vec![
             (1, "resource", T::String),
@@ -1837,6 +1845,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         m(vec![
             (1, "metadata", T::Message("ObjectMeta".into())),
             (2, "versions", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2beta1.APIVersionDiscovery".into())))),
+        ]),
+    );
+    schemas.insert(
+        "apidiscovery.k8s.io/v2beta1.APIGroupDiscoveryList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("apidiscovery.k8s.io/v2beta1.APIGroupDiscovery".into())))),
         ]),
     );
     schemas.insert(
@@ -1878,6 +1893,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "coordination.k8s.io/v1alpha2.LeaseCandidateList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("coordination.k8s.io/v1alpha2.LeaseCandidate".into())))),
+        ]),
+    );
+    schemas.insert(
         "coordination.k8s.io/v1alpha2.LeaseCandidateSpec".into(),
         m(vec![
             (1, "leaseName", T::String),
@@ -1894,6 +1916,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         m(vec![
             (1, "metadata", T::Message("ObjectMeta".into())),
             (2, "spec", T::Message("coordination.k8s.io/v1beta1.LeaseCandidateSpec".into())),
+        ]),
+    );
+    schemas.insert(
+        "coordination.k8s.io/v1beta1.LeaseCandidateList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("coordination.k8s.io/v1beta1.LeaseCandidate".into())))),
         ]),
     );
     schemas.insert(
@@ -1968,6 +1997,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "internal.apiserver.k8s.io/v1alpha1.StorageVersionList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("internal.apiserver.k8s.io/v1alpha1.StorageVersion".into())))),
+        ]),
+    );
+    schemas.insert(
         "internal.apiserver.k8s.io/v1alpha1.StorageVersionSpec".into(),
         m(vec![
 
@@ -2024,6 +2060,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
         ]),
     );
     schemas.insert(
+        "scheduling.k8s.io/v1alpha1.WorkloadList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("scheduling.k8s.io/v1alpha1.Workload".into())))),
+        ]),
+    );
+    schemas.insert(
         "scheduling.k8s.io/v1alpha1.WorkloadSpec".into(),
         m(vec![
             (1, "controllerRef", T::Message("scheduling.k8s.io/v1alpha1.TypedLocalObjectReference".into())),
@@ -2037,6 +2080,13 @@ pub(crate) fn register(schemas: &mut HashMap<String, MessageSchema>) {
             (1, "metadata", T::Message("ObjectMeta".into())),
             (2, "spec", T::Message("storagemigration.k8s.io/v1beta1.StorageVersionMigrationSpec".into())),
             (3, "status", T::Message("storagemigration.k8s.io/v1beta1.StorageVersionMigrationStatus".into())),
+        ]),
+    );
+    schemas.insert(
+        "storagemigration.k8s.io/v1beta1.StorageVersionMigrationList".into(),
+        m(vec![
+            (1, "metadata", T::Message("ListMeta".into())),
+            (2, "items", T::Repeated(Box::new(T::Message("storagemigration.k8s.io/v1beta1.StorageVersionMigration".into())))),
         ]),
     );
     schemas.insert(
