@@ -15,7 +15,6 @@
 // Not called from the request path yet: the MutatingAdmissionPolicy plugin
 // that consumes it is the rest of #2731. The bin target compiles `admission`
 // separately and would flag every item.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 

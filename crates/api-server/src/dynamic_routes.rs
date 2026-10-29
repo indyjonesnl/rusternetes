@@ -3,8 +3,6 @@
 //! This module enables hot-reload of API routes when CRDs are created or deleted,
 //! allowing the API server to automatically serve new custom resource types without restart.
 
-#![allow(dead_code)]
-
 use crate::{handlers::custom_resource, state::ApiServerState};
 use axum::{routing::get, Router};
 use rusternetes_common::resources::{CustomResourceDefinition, ResourceScope};
@@ -14,6 +12,9 @@ use tracing::{debug, info};
 /// Manages dynamic route registration for custom resources
 pub struct DynamicRouteManager {
     /// API server state
+    // Held for the route handlers this manager is meant to build; nothing
+    // reads it yet (the module has no non-test callers).
+    #[allow(dead_code)]
     state: Arc<ApiServerState>,
 }
 

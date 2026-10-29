@@ -5,8 +5,6 @@
 //! `evaluatePatchExpression`) and its tests (`json_patch_test.go`
 //! `TestJSONPatch`).
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;

@@ -101,7 +101,6 @@ pub struct AggregateCheckResult {
 
 impl AggregateCheckResult {
     /// `ForbiddenReason` (checks.go:119-121).
-    #[allow(dead_code)]
     pub fn forbidden_reason(&self) -> String {
         self.forbidden_reasons.join(", ")
     }

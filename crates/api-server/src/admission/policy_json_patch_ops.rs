@@ -15,8 +15,6 @@
 //! Not modelled: `AccumulatedCopySizeLimit` (default 0 = unlimited,
 //! `patch.go:25`; the MAP patcher does not set it).
 
-#![allow(dead_code)]
-
 use serde_json::Value;
 
 /// `jsonpatch.Operation`: the fields `Apply` reads. `value: None` is an

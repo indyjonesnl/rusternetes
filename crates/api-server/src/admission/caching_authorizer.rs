@@ -9,8 +9,6 @@
 //! not `Clone`, so a cached error is replayed as `Error::Authorization` with
 //! the original error's message rather than as the same error value.
 
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 

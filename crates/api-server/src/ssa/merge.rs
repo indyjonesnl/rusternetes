@@ -83,7 +83,6 @@ impl OwnedPaths {
     }
 
     /// Number of owned paths.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -330,7 +329,6 @@ pub struct ResourceLeafSchema {
     /// `"secrets"`). Surfaced via the public field so downstream tooling
     /// (audit, conformance reporting) can correlate a schema with its
     /// REST path without re-deriving it.
-    #[allow(dead_code)]
     pub apply_resource: &'static str,
     /// String-map groups merged with granular ownership.
     pub string_map_groups: &'static [LeafGroup],
@@ -344,7 +342,6 @@ pub struct ResourceLeafSchema {
     /// strategies) rather than in the merge core; this flag is
     /// exposed so a future generic immutability fence can consult the
     /// schema instead of being hard-coded per resource.
-    #[allow(dead_code)]
     pub immutable_supported: bool,
 }
 

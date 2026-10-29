@@ -3,8 +3,6 @@
 //! This module implements Kubernetes-compatible conversion webhooks that allow
 //! automatic conversion between different versions of custom resources.
 
-#![allow(dead_code)]
-
 use rusternetes_common::resources::{
     CustomResource, CustomResourceDefinition, WebhookClientConfig,
 };
@@ -98,19 +96,12 @@ impl ConversionResult {
 }
 
 /// Conversion webhook client
-pub struct ConversionWebhookClient {
-    client: reqwest::Client,
-}
+pub struct ConversionWebhookClient {}
 
 impl ConversionWebhookClient {
     /// Create a new conversion webhook client
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
-        }
+        Self {}
     }
 
     /// Convert custom resources using a webhook

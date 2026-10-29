@@ -21,7 +21,6 @@
 
 // Not called from the request path yet; the bin target compiles `admission`
 // separately and would flag every item.
-#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::sync::Arc;

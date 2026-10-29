@@ -1501,6 +1501,7 @@ async fn a_uid_precondition_that_does_not_match_is_a_409() {
 }
 
 /// The router's eviction is the store-backed rest.
+// Compile-time pin of the constructor's return type; never called.
 #[allow(dead_code)]
 fn the_router_serves_the_store_backed_rest(storage: Arc<StorageBackend>) -> StoreEvictionRest {
     new_eviction_rest(storage)

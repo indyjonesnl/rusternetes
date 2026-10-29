@@ -1475,7 +1475,6 @@ const INITIAL_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 /// may not exist and no NodePort can be allocated
 /// (allocator/storage/storage.go:154-157).
 // Used by the test harness (test_support), not by the binary.
-#[allow(dead_code)]
 pub async fn repair_service_node_ports_once(
     state: &crate::state::ApiServerState,
 ) -> rusternetes_common::Result<()> {
@@ -1492,7 +1491,6 @@ pub async fn repair_service_node_ports_once(
 /// One ClusterIP repair pass (`RepairIPAddress.runOnce`), for the test
 /// harness: it creates the IPAddresses of Services stored without one.
 // Used by the test harness (test_support), not by the binary.
-#[allow(dead_code)]
 pub async fn repair_service_cluster_ips_once(
     state: &Arc<crate::state::ApiServerState>,
 ) -> rusternetes_common::Result<()> {

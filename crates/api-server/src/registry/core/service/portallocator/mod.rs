@@ -177,7 +177,6 @@ impl PortAllocator {
     }
 
     /// `PortAllocator.Free` (allocator.go:108-111).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn free(&self) -> usize {
         self.alloc.free().await
     }

@@ -745,7 +745,6 @@ pub fn json_response<B: serde::Serialize>(obj: B) -> axum::Json<B> {
 }
 
 /// `audit.AddAuditAnnotation(ctx, key, value)` (context.go:297).
-#[allow(dead_code)]
 pub fn add_audit_annotation(key: &str, value: &str) {
     add_audit_annotations(&[(key.to_string(), value.to_string())]);
 }

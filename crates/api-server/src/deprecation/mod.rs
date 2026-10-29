@@ -42,7 +42,6 @@ pub struct Lifecycle {
 /// characters after the first non-digit character". `Atoi` on the major
 /// accepts an optional sign and leading zeros; the minor goes through the
 /// `^(\d+)` match first, so "A" yields "" which `Atoi` rejects.
-#[allow(dead_code)] // bin target: only tests reach it until the version info is parsed
 pub fn major_minor(major: &str, minor: &str) -> Result<(i64, i64), String> {
     let major = major
         .parse::<i64>()
@@ -87,7 +86,6 @@ pub fn removed_release(obj: Option<&Lifecycle>) -> String {
 }
 
 /// `WarningMessage` (deprecation.go:93-123).
-#[allow(dead_code)] // bin target: awaits the per-request warning recorder
 pub fn warning_message(obj: Option<&Lifecycle>) -> String {
     let Some(obj) = obj else { return String::new() };
     let (dep_major, dep_minor) = obj.deprecated;
@@ -117,7 +115,6 @@ pub fn warning_message(obj: Option<&Lifecycle>) -> String {
 }
 
 /// `GroupVersion.String()`.
-#[allow(dead_code)]
 fn group_version_string(group: &str, version: &str) -> String {
     match (group.is_empty(), version.is_empty()) {
         (true, _) => version.to_string(),

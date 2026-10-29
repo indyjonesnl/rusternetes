@@ -586,7 +586,6 @@ pub async fn forward_to_aggregator(
 /// per the APIService (caBundle / insecure), and DNS of the service name pinned
 /// to the resolved pod IP (so the cert — issued for the service DNS name — still
 /// verifies while we connect to a reachable address).
-#[allow(dead_code)]
 pub(crate) fn build_aggregator_client(target: &AggregatorTarget) -> Option<reqwest::Client> {
     let mut b = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -697,7 +696,6 @@ fn decode_ca_bundle(s: &str) -> Option<Vec<u8>> {
 /// surface — kept here so integration tests can verify the base64/PEM logic
 /// without going through the resolver.
 #[doc(hidden)]
-#[allow(dead_code)]
 pub fn decode_ca_bundle_for_test(s: &str) -> Option<Vec<u8>> {
     decode_ca_bundle(s)
 }
@@ -721,7 +719,6 @@ fn service_unavailable_response(message: &str) -> Response {
 /// Discovery merge: produce APIGroup entries for APIServices whose backing
 /// `{group}/{version}` is not one of the built-in groups. Caller is
 /// responsible for filtering out built-in groups it already exposes.
-#[allow(dead_code)]
 pub async fn list_registered_apiservice_groups(state: &Arc<ApiServerState>) -> Vec<Value> {
     list_registered_apiservice_groups_with_storage(state.storage.as_ref()).await
 }

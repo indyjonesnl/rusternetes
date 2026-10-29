@@ -29,10 +29,8 @@ pub mod apiservice;
 pub mod endpoints;
 pub mod endpointslice;
 pub mod event;
-#[allow(dead_code)]
 pub mod filtering;
 pub mod flowcontrol;
-#[allow(dead_code)]
 pub mod health;
 pub mod horizontalpodautoscaler;
 pub mod ingress;

@@ -148,7 +148,6 @@ pub struct WatchCache {
     watchers: RwLock<HashMap<String, broadcast::Sender<CachedWatchEvent>>>,
     storage: Arc<dyn WatchSource>,
     /// Current revision counter (approximation based on timestamp)
-    #[allow(dead_code)]
     revision: RwLock<i64>,
     /// Ring buffer of recent events per prefix for history replay
     history: Arc<RwLock<HashMap<String, VecDeque<CachedWatchEvent>>>>,
@@ -578,7 +577,6 @@ impl WatchCache {
     }
 
     /// Get the current approximate revision
-    #[allow(dead_code)]
     pub async fn current_revision(&self) -> i64 {
         *self.revision.read().await
     }

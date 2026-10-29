@@ -14,7 +14,7 @@ use rusternetes_storage::{build_prefix, Storage};
 use std::sync::Arc;
 
 /// Encode a u64 as a protobuf varint
-#[allow(dead_code)]
+#[cfg(test)]
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -607,7 +607,7 @@ fn parse_gv_path(path: &str) -> (String, String) {
 ///   - field 2 (raw, bytes): the raw data (JSON spec) -- tag 0x12
 ///   - field 3 (contentEncoding, string): empty, omitted
 ///   - field 4 (contentType, string): "application/json" -- tag 0x22
-#[allow(dead_code)]
+#[cfg(test)]
 fn wrap_in_k8s_protobuf(_content_type: &str, data: &[u8]) -> Vec<u8> {
     let content_type_bytes = b"application/json";
     let mut msg = Vec::with_capacity(data.len() + 30);

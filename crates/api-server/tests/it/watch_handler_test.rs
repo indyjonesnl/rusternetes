@@ -9,30 +9,10 @@ use rusternetes_common::resources::{
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
-use serde::de::DeserializeOwned;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-
-// Helper to parse watch stream response
-#[allow(dead_code)]
-async fn parse_watch_events<T: DeserializeOwned>(body: &str) -> Vec<(String, T)> {
-    let mut events = Vec::new();
-    for line in body.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(line) {
-            let event_type = value["type"].as_str().unwrap_or("UNKNOWN").to_string();
-            if let Ok(object) = serde_json::from_value::<T>(value["object"].clone()) {
-                events.push((event_type, object));
-            }
-        }
-    }
-    events
-}
 
 // Helper to create minimal PodSpec (no Default impl)
 fn create_minimal_pod_spec() -> PodSpec {

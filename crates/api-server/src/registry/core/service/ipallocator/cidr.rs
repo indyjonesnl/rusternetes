@@ -209,7 +209,6 @@ impl<S: Storage> MetaAllocator<S> {
     }
 
     /// `Has` (cidrallocator.go:427-434).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn has(&self, ip: IpAddr) -> bool {
         match self.get_allocator(ip, true).await {
             Ok(a) => a.has(ip).await,
@@ -218,14 +217,12 @@ impl<S: Storage> MetaAllocator<S> {
     }
 
     /// `Used` (cidrallocator.go:446-456).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn used(&self) -> usize {
         list_managed(&*self.storage, self.ip_family).await.len()
     }
 
     /// `Free` (cidrallocator.go:459-484): the sizes of the prefixes no
     /// other prefix contains, less what is used.
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn free(&self) -> u64 {
         let _ = self.sync_allocators().await;
         let allocators = self.allocators.lock().await;

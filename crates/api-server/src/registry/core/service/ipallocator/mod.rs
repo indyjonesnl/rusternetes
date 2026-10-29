@@ -203,7 +203,6 @@ pub(crate) fn ip_address_key(name: &str) -> String {
 
 /// Every IPAddress this allocator family manages
 /// (`ForEach`/`Used`'s label selector, ipallocator.go:391-405).
-#[allow(dead_code)] // upstream API; exercised by the tests
 async fn list_managed<S: Storage>(storage: &S, family: &str) -> Vec<IPAddress> {
     storage
         .list::<IPAddress>(IP_ADDRESS_PREFIX)
@@ -418,7 +417,6 @@ impl<S: Storage> Allocator<S> {
     }
 
     /// `Has` (ipallocator.go:411-419).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn has(&self, ip: IpAddr) -> bool {
         self.storage
             .get::<IPAddress>(&ip_address_key(&ip.to_string()))
@@ -427,7 +425,6 @@ impl<S: Storage> Allocator<S> {
     }
 
     /// `Used` (ipallocator.go:425-448): the managed addresses in this CIDR.
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn used(&self) -> usize {
         list_managed(&*self.storage, self.family)
             .await
@@ -438,13 +435,11 @@ impl<S: Storage> Allocator<S> {
     }
 
     /// `Free` (ipallocator.go:451-474).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub async fn free(&self) -> u64 {
         let used = self.used().await as u64;
         self.size.saturating_sub(used)
     }
 
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
