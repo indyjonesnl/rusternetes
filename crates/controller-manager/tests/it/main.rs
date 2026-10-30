@@ -12,7 +12,6 @@
 mod apiservice_available_test;
 mod attach_detach_test;
 mod availability_status_test;
-mod cm_b_unit;
 mod conformance_apps_deployment_replicaset;
 mod conformance_apps_job_cronjob;
 mod conformance_apps_rc_daemonset_pdb;
@@ -88,3 +87,4 @@ mod volume_expansion_test;
 mod volume_snapshot_controller_test;
 mod volume_snapshot_default_class_test;
 mod vpa_controller_test;
+mod z_unit;

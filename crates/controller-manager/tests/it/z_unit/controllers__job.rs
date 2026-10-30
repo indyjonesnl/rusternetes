@@ -501,7 +501,7 @@ mod tests {
     /// redrawn, up to 8 attempts, rather than failing the create.
     #[tokio::test]
     async fn test_job_retries_pod_create_when_the_generated_name_collides() {
-        use crate::cm_b_unit::controllers__replicationcontroller::tests::NameCollisionStorage;
+        use crate::z_unit::controllers__replicationcontroller::tests::NameCollisionStorage;
         // Seven collisions: the eighth (last) attempt succeeds.
         let storage = Arc::new(NameCollisionStorage::new(
             Arc::new(MemoryStorage::new()),
@@ -522,7 +522,7 @@ mod tests {
     /// Eight collisions exhaust the budget (store.go:440): the create fails.
     #[tokio::test]
     async fn test_job_pod_create_gives_up_after_eight_name_collisions() {
-        use crate::cm_b_unit::controllers__replicationcontroller::tests::NameCollisionStorage;
+        use crate::z_unit::controllers__replicationcontroller::tests::NameCollisionStorage;
         let storage = Arc::new(NameCollisionStorage::new(
             Arc::new(MemoryStorage::new()),
             MAX_NAME_GENERATION_CREATE_ATTEMPTS,

@@ -598,7 +598,7 @@ mod tests {
     // replica_set_utils_test.go, TestCalculateStatusConditions.
     // ---------------------------------------------------------------------
 
-    use crate::cm_b_unit::controllers__replicationcontroller::tests::{
+    use crate::z_unit::controllers__replicationcontroller::tests::{
         ConcurrencyProbeStorage, TerminatingNamespaceStorage,
     };
     use rusternetes_controller_manager::controllers::quota_admission_double::QuotaAdmissionStorage;
