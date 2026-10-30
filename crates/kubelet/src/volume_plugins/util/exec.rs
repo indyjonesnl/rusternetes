@@ -84,8 +84,7 @@ impl Exec for RealExec {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
+pub mod testing {
     //! `FakeExec` with `ExactOrder`, scripted by `CommandScript`s.
     use super::*;
     use std::collections::VecDeque;
@@ -93,7 +92,7 @@ pub(crate) mod testing {
 
     /// `volumetest.CommandScript` (`testing.go:106-116`).
     #[derive(Clone, Debug, Default)]
-    pub(crate) struct CommandScript {
+    pub struct CommandScript {
         pub cmd: &'static str,
         pub args: Vec<String>,
         pub output: String,
@@ -102,7 +101,7 @@ pub(crate) mod testing {
         pub error: Option<&'static str>,
     }
 
-    pub(crate) fn script(cmd: &'static str, args: &[&str]) -> CommandScript {
+    pub fn script(cmd: &'static str, args: &[&str]) -> CommandScript {
         CommandScript {
             cmd,
             args: args.iter().map(|s| s.to_string()).collect(),
@@ -113,7 +112,7 @@ pub(crate) mod testing {
     /// `testingexec.FakeExec` after `ScriptCommands` with `ExactOrder = true`
     /// (`fake_exec.go:52-71`): each call consumes the next script and panics on a
     /// different command or arguments, or when the scripts run out.
-    pub(crate) struct FakeExec {
+    pub struct FakeExec {
         scripts: Mutex<VecDeque<CommandScript>>,
         pub(crate) calls: std::sync::atomic::AtomicUsize,
         /// Every `(cmd, args)` seen, for assertions beyond the scripts.
@@ -121,7 +120,7 @@ pub(crate) mod testing {
     }
 
     impl FakeExec {
-        pub(crate) fn new(scripts: Vec<CommandScript>) -> Self {
+        pub fn new(scripts: Vec<CommandScript>) -> Self {
             Self {
                 scripts: Mutex::new(scripts.into()),
                 calls: Default::default(),
@@ -130,7 +129,7 @@ pub(crate) mod testing {
         }
 
         /// `fakeExec.CommandCalls`.
-        pub(crate) fn command_calls(&self) -> usize {
+        pub fn command_calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
@@ -167,7 +166,7 @@ pub(crate) mod testing {
 
     /// A `FakeExec` whose every call panics: `&testingexec.FakeExec{}` with no
     /// scripts (`doTestPlugin`).
-    pub(crate) fn no_commands() -> FakeExec {
+    pub fn no_commands() -> FakeExec {
         FakeExec::new(vec![])
     }
 }

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 /// `metricsCsi` (`csi_metrics.go:37-44`).
-pub(super) struct MetricsCsi {
+pub struct MetricsCsi {
     /// `targetPath`: the directory path the volume is mounted to.
     target_path: String,
     /// `volumeID`: volume handle or id.
@@ -27,7 +27,7 @@ pub(super) struct MetricsCsi {
 }
 
 /// `NewMetricsCsi` (`csi_metrics.go:49-53`).
-pub(super) fn new_metrics_csi(volume_id: &str, target_path: &str, driver_name: &str) -> MetricsCsi {
+pub fn new_metrics_csi(volume_id: &str, target_path: &str, driver_name: &str) -> MetricsCsi {
     MetricsCsi {
         target_path: target_path.to_string(),
         volume_id: volume_id.to_string(),
@@ -103,6 +103,3 @@ impl MetricsProvider for CsiMounter {
         new_metrics_csi(&self.volume_id, &self.path, &self.driver_name).get_metrics()
     }
 }
-
-#[cfg(test)]
-mod tests;

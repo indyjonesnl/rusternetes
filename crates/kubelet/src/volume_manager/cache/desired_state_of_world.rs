@@ -751,7 +751,7 @@ const STORAGE: &str = "storage";
 /// plugin manager and translator passed in, so the kubelet's `create_volume`
 /// (which has no `DesiredStateOfWorld` yet) computes `SELinuxLabel` with the
 /// same code `AddPodToVolume` does.
-pub(crate) fn get_selinux_label(
+pub fn get_selinux_label(
     volume_plugin_mgr: &VolumePluginMgr,
     selinux_translator: &dyn SELinuxLabelTranslator,
     volume_spec: &Spec<'_>,
@@ -813,10 +813,7 @@ pub(crate) fn get_selinux_label(
 /// The `effectiveSELinuxMountFileLabel` `AddPodToVolume` stores
 /// (`desired_state_of_world.go:333-336`): the label, cleared for a volume
 /// whose access mode cannot carry `-o context=`.
-pub(crate) fn effective_selinux_mount_label(
-    volume_spec: &Spec<'_>,
-    selinux_file_label: &str,
-) -> String {
+pub fn effective_selinux_mount_label(volume_spec: &Spec<'_>, selinux_file_label: &str) -> String {
     if volume_supports_selinux_mount(volume_spec) {
         selinux_file_label.to_string()
     } else {
@@ -828,7 +825,7 @@ pub(crate) fn effective_selinux_mount_label(
 /// (`desired_state_of_world.go:297-322`): for a local ephemeral volume, the
 /// pod's ephemeral-storage limit, lowered to the emptyDir `sizeLimit` when
 /// that is smaller; `None` for any other volume.
-pub(crate) fn desired_size_limit(
+pub fn desired_size_limit(
     pod: &Pod,
     volume: &rusternetes_common::resources::Volume,
 ) -> Option<Quantity> {

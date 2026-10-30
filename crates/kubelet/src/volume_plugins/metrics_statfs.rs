@@ -47,7 +47,7 @@ impl MetricsStatFs {
 }
 
 /// `NewNoPathDefinedError` (`metrics_errors.go:56-61`).
-pub(crate) fn no_path_defined_error() -> MetricsError {
+pub fn no_path_defined_error() -> MetricsError {
     MetricsError {
         code: MetricsErrorCode::NoPathDefined,
         msg: "no path defined for disk usage metrics.".to_string(),
@@ -55,7 +55,7 @@ pub(crate) fn no_path_defined_error() -> MetricsError {
 }
 
 /// `NewFsInfoFailedError` (`metrics_errors.go:64-69`).
-pub(crate) fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
+pub fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
     MetricsError {
         code: MetricsErrorCode::FsInfoFailed,
         msg: format!("failed to get FsInfo due to error {err}"),
@@ -64,7 +64,7 @@ pub(crate) fn fs_info_failed_error(err: &std::io::Error) -> MetricsError {
 
 /// `fs.Info` (linux, `fs.go:39-60`): (available bytes, byte capacity, byte
 /// usage, total inodes, inodes free, inode usage).
-pub(crate) fn fs_info(path: &str) -> std::io::Result<(i64, i64, i64, i64, i64, i64)> {
+pub fn fs_info(path: &str) -> std::io::Result<(i64, i64, i64, i64, i64, i64)> {
     let c = std::ffi::CString::new(path)
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     // SAFETY: `c` is NUL-terminated; `st` is a valid out-pointer.
@@ -127,54 +127,5 @@ impl MetricsProvider for MetricsStatFs {
         })();
         collect_volume_stat_cal_duration("statfs", start_time);
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn code(e: &anyhow::Error) -> Option<MetricsErrorCode> {
-        e.downcast_ref::<MetricsError>().map(|m| m.code)
-    }
-
-    // TestGetMetricsStatFS (metrics_statfs_test.go:29)
-    #[test]
-    fn get_metrics_statfs() {
-        let err = MetricsStatFs::new("").get_metrics().unwrap_err();
-        assert_eq!(code(&err), Some(MetricsErrorCode::NoPathDefined));
-        assert_eq!(err.to_string(), "no path defined for disk usage metrics.");
-
-        let err = MetricsStatFs::new("/not/a/real/directory")
-            .get_metrics()
-            .unwrap_err();
-        assert_eq!(code(&err), Some(MetricsErrorCode::FsInfoFailed));
-        assert!(err
-            .to_string()
-            .starts_with("failed to get FsInfo due to error "));
-
-        let tmp = tempfile::tempdir().unwrap();
-        let m = MetricsStatFs::new(tmp.path().to_str().unwrap())
-            .get_metrics()
-            .unwrap();
-        assert!(m.time.is_some());
-        assert!(m.capacity.as_ref().unwrap().value() > 0);
-        assert!(m.available.as_ref().unwrap().value() > 0);
-        assert!(m.used.as_ref().unwrap().value() >= 0);
-        assert_eq!(
-            m.inodes_used.as_ref().unwrap().value(),
-            m.inodes.as_ref().unwrap().value() - m.inodes_free.as_ref().unwrap().value()
-        );
-    }
-
-    // metrics_statfs.go:47: GetMetrics defers CollectVolumeStatCalDuration
-    // ("statfs", ..), so every call (even the no-path error) is observed.
-    #[test]
-    fn get_metrics_statfs_observes_volume_stat_duration() {
-        let _ = MetricsStatFs::new("").get_metrics();
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
-        assert!(body.contains(
-            "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"statfs\"}"
-        ));
     }
 }

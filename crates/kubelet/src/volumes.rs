@@ -28,7 +28,7 @@ use crate::volume_plugins::VolumePlugin;
 /// truth for what a ConfigMap volume should contain, shared by the initial
 /// mount and every re-projection so they all feed the same bytes to the
 /// AtomicWriter (and therefore no-op identically when unchanged).
-pub(crate) fn build_configmap_payload(
+pub fn build_configmap_payload(
     configmap: &ConfigMap,
     items: Option<&Vec<KeyToPath>>,
     _configmap_name: &str,
@@ -287,6 +287,25 @@ impl VolumeManager {
             storage,
             token_manager,
             None,
+            Some(crate::volume_plugins::empty_dir::fake_mount_deps().0),
+        )
+    }
+
+    /// [`VolumeManager::new_with_pod_certificate_manager`] with the emptyDir
+    /// mounter replaced by a recording fake, as
+    /// [`VolumeManager::new_with_recording_empty_dir_mounts`] does.
+    #[doc(hidden)]
+    pub fn new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
+        volumes_base_path: String,
+        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
+        token_manager: rusternetes_common::auth::TokenManager,
+        pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+    ) -> Self {
+        Self::new_inner(
+            volumes_base_path,
+            storage,
+            token_manager,
+            pod_certificate_manager,
             Some(crate::volume_plugins::empty_dir::fake_mount_deps().0),
         )
     }
@@ -876,7 +895,7 @@ impl VolumeManager {
     /// flight is left alone. Not ported: `DetachVolume` (a CSI plugin that is
     /// attachable is detached by the attach/detach controller,
     /// `controllerAttachDetachEnabled`).
-    pub(crate) async fn unmount_csi_devices_not_in(
+    pub async fn unmount_csi_devices_not_in(
         &self,
         desired: &std::collections::HashSet<(String, String)>,
     ) {
@@ -1905,7 +1924,7 @@ impl VolumeManager {
     /// look the resulting `Spec` up in the registry exactly once. What used to
     /// be eight `if volume.<kind>.is_some()` blocks, each constructing its own
     /// plugin, is now the one dispatch the registry exists for.
-    pub(crate) async fn create_volume(
+    pub async fn create_volume(
         &self,
         pod: &Pod,
         volume: &rusternetes_common::resources::Volume,
@@ -2292,7 +2311,7 @@ mod projected_mode_tests {
         }))
         .unwrap();
 
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2347,7 +2366,7 @@ mod projected_mode_tests {
         let tmp = std::env::temp_dir().join(format!("rn-asw-node-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         stage_unregistered_csi_device(&tmp, "h1");
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2372,7 +2391,7 @@ mod projected_mode_tests {
         let tmp = std::env::temp_dir().join(format!("rn-asw-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         stage_unregistered_csi_device(&tmp, "h1");
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2417,7 +2436,7 @@ mod projected_mode_tests {
 
         let tmp = std::env::temp_dir().join(format!("rn-asw-detach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2496,7 +2515,7 @@ mod projected_mode_tests {
         }))
         .unwrap();
 
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2599,7 +2618,7 @@ mod projected_mode_tests {
             .await
             .unwrap();
         }
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2716,7 +2735,7 @@ mod projected_mode_tests {
         )
         .await
         .unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2818,7 +2837,7 @@ mod projected_mode_tests {
         )
         .await
         .unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2911,7 +2930,7 @@ mod projected_mode_tests {
         std::fs::create_dir_all(&volume_dir).unwrap();
         std::fs::write(volume_dir.join("data-1"), b"stale-root").unwrap();
 
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -2991,7 +3010,7 @@ mod projected_mode_tests {
         }))
         .unwrap();
 
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3019,7 +3038,7 @@ mod projected_mode_tests {
     async fn create_pod_volumes_maps_a_host_path_volume_to_the_host_path() {
         let tmp = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3052,7 +3071,7 @@ mod projected_mode_tests {
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3116,7 +3135,7 @@ mod projected_mode_tests {
         let storage = Arc::new(StorageBackend::new_memory());
 
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3236,7 +3255,7 @@ mod projected_mode_tests {
         .unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3367,7 +3386,7 @@ mod projected_mode_tests {
         let probe = tmp.path().join("probe");
         std::fs::write(&probe, b"").unwrap();
         let gid = std::fs::metadata(&probe).unwrap().gid();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3430,7 +3449,7 @@ mod projected_mode_tests {
         let probe = tmp.path().join("probe");
         std::fs::write(&probe, b"").unwrap();
         let gid = std::fs::metadata(&probe).unwrap().gid();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3478,7 +3497,7 @@ mod orphan_sweep_tests {
     }
 
     fn vm(root: &str) -> VolumeManager {
-        VolumeManager::new(
+        VolumeManager::new_with_recording_empty_dir_mounts(
             root.to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -3713,7 +3732,7 @@ mod pvc_resolution_tests {
     use serde_json::json;
 
     fn vm(storage: Option<Arc<StorageBackend>>) -> VolumeManager {
-        VolumeManager::new(
+        VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             storage,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4237,7 +4256,7 @@ mod dispatch_tests {
     use serde_json::json;
 
     fn vm() -> VolumeManager {
-        VolumeManager::new(
+        VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4309,7 +4328,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn create_volume_dispatches_storage_free_kinds_to_their_plugin_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4363,7 +4382,7 @@ mod dispatch_tests {
     #[test]
     fn an_nfs_volume_is_claimed_by_the_nfs_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4386,7 +4405,7 @@ mod dispatch_tests {
     #[test]
     fn a_git_repo_volume_is_claimed_by_the_git_repo_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4406,7 +4425,7 @@ mod dispatch_tests {
     #[test]
     fn an_iscsi_volume_is_claimed_by_the_iscsi_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4433,7 +4452,7 @@ mod dispatch_tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_string_lossy().to_string();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.clone(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4485,7 +4504,7 @@ mod dispatch_tests {
     #[test]
     fn an_fc_volume_is_claimed_by_the_fc_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4509,7 +4528,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn an_image_volume_is_claimed_by_the_image_plugin() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4534,7 +4553,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn an_unimplemented_kind_fails_with_no_volume_plugin_matched() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4562,7 +4581,7 @@ mod dispatch_tests {
     #[tokio::test]
     async fn an_unused_unimplemented_kind_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4651,7 +4670,7 @@ mod blocking_fs_offload_tests {
             .status()
             .unwrap()
             .success());
-        let vm = VolumeManager::new(
+        let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4765,7 +4784,7 @@ mod pod_certificate_resync_tests {
         ))));
         let tmp = tempfile::tempdir().unwrap();
         let storage = Arc::new(StorageBackend::new_memory());
-        let vm = VolumeManager::new_with_pod_certificate_manager(
+        let vm = VolumeManager::new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4862,7 +4881,7 @@ mod pod_certificate_resync_tests {
             b"c\n".to_vec(),
         ))));
         let mk = |m: Arc<dyn crate::podcertificate::Manager>| {
-            VolumeManager::new_with_pod_certificate_manager(
+            VolumeManager::new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
                 tmp.path().to_string_lossy().to_string(),
                 Some(storage.clone()),
                 rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),

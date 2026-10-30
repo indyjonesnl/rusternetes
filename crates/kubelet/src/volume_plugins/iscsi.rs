@@ -15,14 +15,12 @@
 //! - No kubelet caller invokes `UnmountDevice` yet (#3492), and a real
 //!   `iscsiadm` run is unproven (#3496).
 
-mod attacher;
-mod disk_manager;
-#[cfg(test)]
-mod tests;
-mod util;
+pub mod attacher;
+pub mod disk_manager;
+pub mod util;
 
 pub use attacher::IscsiAttacher;
-pub(crate) use disk_manager::DiskManager;
+pub use disk_manager::DiskManager;
 pub use util::IscsiUtil;
 
 use super::metrics_statfs::MetricsStatFs;
@@ -125,7 +123,7 @@ impl IscsiPlugin {
     }
 
     /// `newMounterInternal` (`iscsi.go:115-139`).
-    pub(crate) fn new_mounter_internal(
+    pub fn new_mounter_internal(
         &self,
         spec: &Spec<'_>,
         pod_uid: &str,
@@ -156,7 +154,7 @@ impl IscsiPlugin {
     }
 
     /// `newUnmounterInternal` (`iscsi.go:187-200`).
-    pub(crate) fn new_unmounter_internal(
+    pub fn new_unmounter_internal(
         &self,
         vol_name: &str,
         pod_uid: &str,
@@ -450,7 +448,7 @@ impl BlockVolumePlugin for IscsiPlugin {
 /// `iscsiDisk` (`iscsi.go:314-330`). The exported fields are the ones
 /// `persistISCSIFile` writes to `iscsi.json`.
 #[derive(Clone)]
-pub(crate) struct IscsiDisk {
+pub struct IscsiDisk {
     pub vol_name: String,
     pub pod_uid: String,
     pub portals: Vec<String>,
@@ -476,7 +474,7 @@ pub(crate) struct IscsiDisk {
 impl IscsiDisk {
     /// The `&iscsiDisk{podUID, VolName, manager, plugin}` literal of
     /// `newUnmounterInternal` / `newUnmapperInternal`.
-    pub(crate) fn blank(
+    pub fn blank(
         vol_name: &str,
         pod_uid: &str,
         manager: Arc<dyn DiskManager>,
@@ -541,7 +539,7 @@ impl IscsiDisk {
 
 /// `iscsiDiskMounter` (`iscsi.go:352-362`).
 #[derive(Clone)]
-pub(crate) struct IscsiDiskMounter {
+pub struct IscsiDiskMounter {
     pub disk: IscsiDisk,
     pub read_only: bool,
     #[allow(dead_code)]
@@ -619,7 +617,7 @@ impl MetricsProvider for IscsiDiskUnmounter {
 
 /// `iscsiDiskUnmounter` (`iscsi.go:393-398`).
 #[derive(Clone)]
-pub(crate) struct IscsiDiskUnmounter {
+pub struct IscsiDiskUnmounter {
     pub disk: IscsiDisk,
     pub mounter: Arc<dyn MountInterface>,
     pub exec: Arc<dyn Exec>,
@@ -678,7 +676,7 @@ impl BlockVolumeMapper for IscsiDiskMapper {
 
 /// `iscsiDiskUnmapper` (`iscsi.go:422-427`), the `BlockVolumeUnmapper`;
 /// `volume.MetricsNil` is its `MetricsProvider`.
-pub(crate) struct IscsiDiskUnmapper {
+pub struct IscsiDiskUnmapper {
     pub disk: IscsiDisk,
     pub exec: Arc<dyn Exec>,
     pub device_util: Arc<dyn DeviceUtil>,
@@ -771,7 +769,7 @@ fn get_reliable_mount_refs(
 }
 
 /// `portalMounter` (`iscsi.go:472-477`).
-pub(crate) fn portal_mounter(portal: &str) -> String {
+pub fn portal_mounter(portal: &str) -> String {
     if !portal.contains(':') {
         format!("{portal}:3260")
     } else {
@@ -825,7 +823,7 @@ pub(crate) fn get_iscsi_target_info(spec: &Spec<'_>) -> Result<(String, Vec<Stri
 /// (`staging/src/k8s.io/api/core/v1/types.go:1510`, `:1558`); the API server
 /// applies it (`SetObjectDefaults_Pod`/`_PersistentVolume`), so like upstream
 /// the kubelet reads the field as stored (#3491).
-pub(crate) fn get_iscsi_initiator_info(spec: &Spec<'_>) -> Result<(String, Option<String>)> {
+pub fn get_iscsi_initiator_info(spec: &Spec<'_>) -> Result<(String, Option<String>)> {
     let (s, _) = iscsi_source(spec).ok_or_else(|| anyhow!(NOT_ISCSI))?;
     Ok((
         s.iscsi_interface.clone().unwrap_or_default(),
@@ -834,13 +832,13 @@ pub(crate) fn get_iscsi_initiator_info(spec: &Spec<'_>) -> Result<(String, Optio
 }
 
 /// `getISCSIDiscoveryCHAPInfo` (`iscsi.go:518-527`).
-pub(crate) fn get_iscsi_discovery_chap_info(spec: &Spec<'_>) -> Result<bool> {
+pub fn get_iscsi_discovery_chap_info(spec: &Spec<'_>) -> Result<bool> {
     let (s, _) = iscsi_source(spec).ok_or_else(|| anyhow!(NOT_ISCSI))?;
     Ok(s.chap_auth_discovery.unwrap_or(false))
 }
 
 /// `getISCSISessionCHAPInfo` (`iscsi.go:530-539`).
-pub(crate) fn get_iscsi_session_chap_info(spec: &Spec<'_>) -> Result<bool> {
+pub fn get_iscsi_session_chap_info(spec: &Spec<'_>) -> Result<bool> {
     let (s, _) = iscsi_source(spec).ok_or_else(|| anyhow!(NOT_ISCSI))?;
     Ok(s.chap_auth_session.unwrap_or(false))
 }
@@ -848,7 +846,7 @@ pub(crate) fn get_iscsi_session_chap_info(spec: &Spec<'_>) -> Result<bool> {
 /// `getISCSISecretNameAndNamespace` (`iscsi.go:542-562`): secret name and
 /// namespace. An inline volume's `LocalObjectReference` has no namespace; a
 /// PV's `SecretReference` may name one, else the default applies.
-pub(crate) fn get_iscsi_secret_name_and_namespace(
+pub fn get_iscsi_secret_name_and_namespace(
     spec: &Spec<'_>,
     default_secret_namespace: &str,
 ) -> Result<(String, String)> {
@@ -991,7 +989,7 @@ fn create_persistent_volume_from_iscsi_pv_source(
 }
 
 /// `getVolumeSpecFromGlobalMapPath` (`iscsi.go:669-711`).
-pub(crate) fn get_volume_spec_from_global_map_path(
+pub fn get_volume_spec_from_global_map_path(
     volume_name: &str,
     global_map_path: &str,
 ) -> Result<OwnedSpec> {
@@ -1086,6 +1084,6 @@ pub(crate) fn get_volume_mode(spec: &Spec<'_>) -> Result<PersistentVolumeMode> {
 
 /// The "uncertain" error `AttachDisk` returns when it cannot persist
 /// `iscsi.json` (`iscsi_util.go:477-481`).
-pub(crate) fn uncertain_progress(msg: String) -> anyhow::Error {
+pub fn uncertain_progress(msg: String) -> anyhow::Error {
     VolumeOperationError::UncertainProgress(msg).into()
 }

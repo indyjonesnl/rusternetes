@@ -68,39 +68,3 @@ pub fn csi_drivers() -> &'static DriversStore {
     static STORE: OnceLock<DriversStore> = OnceLock::new();
     STORE.get_or_init(DriversStore::new)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn driver(endpoint: &str) -> Driver {
-        Driver {
-            endpoint: endpoint.to_string(),
-            highest_supported_version: "1.0.0".to_string(),
-        }
-    }
-
-    /// `TestDriversStore` (`csi_drivers_store_test.go`): set/get/delete/clear.
-    #[test]
-    fn set_get_delete_clear() {
-        let s = DriversStore::new();
-        assert!(s.get("a").is_none());
-        s.set("a", driver("/a.sock"));
-        s.set("b", driver("/b.sock"));
-        assert_eq!(s.get("a").unwrap().endpoint, "/a.sock");
-        s.delete("a");
-        assert!(s.get("a").is_none());
-        assert!(s.get("b").is_some());
-        s.clear();
-        assert!(s.get("b").is_none());
-    }
-
-    /// Set replaces an existing entry for the same name.
-    #[test]
-    fn set_overwrites() {
-        let s = DriversStore::new();
-        s.set("a", driver("/old.sock"));
-        s.set("a", driver("/new.sock"));
-        assert_eq!(s.get("a").unwrap().endpoint, "/new.sock");
-    }
-}

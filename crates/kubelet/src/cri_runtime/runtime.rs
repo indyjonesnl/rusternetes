@@ -4268,7 +4268,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let vm = crate::volumes::VolumeManager::new(
+        let vm = crate::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
             "/tmp/rusternetes-test-vols".to_string(),
             Some(storage),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
@@ -4319,7 +4319,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let vm = crate::volumes::VolumeManager::new(
+        let vm = crate::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
             "/tmp/rusternetes-test-vols".to_string(),
             Some(storage),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),

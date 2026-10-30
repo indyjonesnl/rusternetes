@@ -82,23 +82,3 @@ impl std::fmt::Display for ExponentialBackoffError {
 }
 
 impl std::error::Error for ExponentialBackoffError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn doubles_from_500ms_and_caps() {
-        let mut b = ExponentialBackoff::default();
-        assert!(b.safe_to_retry("x").is_ok());
-        b.update("e");
-        assert_eq!(b.duration_before_retry(), Duration::from_millis(500));
-        assert!(b.safe_to_retry("x").is_err());
-        b.update("e");
-        assert_eq!(b.duration_before_retry(), Duration::from_secs(1));
-        for _ in 0..20 {
-            b.update("e");
-        }
-        assert_eq!(b.duration_before_retry(), MAX_DURATION_BEFORE_RETRY);
-    }
-}
