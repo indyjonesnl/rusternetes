@@ -32,7 +32,7 @@ fn committed_table_matches_generator_output() {
         panic!("generator failed: {err}");
     }
     let generated = String::from_utf8(out.stdout).unwrap();
-    let committed = include_str!("../src/plain_zero_scalars.rs");
+    let committed = include_str!("../../src/plain_zero_scalars.rs");
     assert_eq!(
         committed, generated,
         "crates/protobuf/src/plain_zero_scalars.rs drifted; run \

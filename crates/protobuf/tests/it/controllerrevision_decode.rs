@@ -13,7 +13,7 @@ use rusternetes_protobuf::PROTO_REGISTRY;
 
 #[test]
 fn controllerrevision_post_decodes_with_data_wrapper() {
-    let body = include_bytes!("fixtures/controllerrevision_daemonset_post.bin");
+    let body = include_bytes!("../fixtures/controllerrevision_daemonset_post.bin");
     let json = PROTO_REGISTRY
         .decode_k8s_resource(body)
         .expect("ControllerRevision POST body must decode");
