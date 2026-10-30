@@ -23,10 +23,10 @@ use rusternetes_common::{
     types::ObjectMeta,
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use rusternetes_test_support::mock_http::*;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use warp::Filter;
 
 // ===== Mock Webhook Server Helpers =====
 
@@ -34,39 +34,34 @@ use warp::Filter;
 async fn start_mock_validating_allow_server() -> (String, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(|review: AdmissionReview| {
-            let response = if let Some(request) = review.request {
-                AdmissionReviewResponse::allow(request.uid)
-            } else {
-                AdmissionReviewResponse {
-                    uid: "unknown".to_string(),
-                    allowed: true,
-                    status: None,
-                    patch: None,
-                    patch_type: None,
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            };
+    let route = mock_post(|review: AdmissionReview| {
+        let response = if let Some(request) = review.request {
+            AdmissionReviewResponse::allow(request.uid)
+        } else {
+            AdmissionReviewResponse {
+                uid: "unknown".to_string(),
+                allowed: true,
+                status: None,
+                patch: None,
+                patch_type: None,
+                audit_annotations: None,
+                warnings: None,
+            }
+        };
 
-            let response_review = AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(response),
-            };
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        };
 
-            warp::reply::json(&response_review)
-        });
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
@@ -76,45 +71,40 @@ async fn start_mock_validating_allow_server() -> (String, oneshot::Sender<()>) {
 async fn start_mock_validating_deny_server(reason: String) -> (String, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |review: AdmissionReview| {
-            let response = if let Some(request) = review.request {
-                AdmissionReviewResponse::deny(request.uid, reason.clone())
-            } else {
-                AdmissionReviewResponse {
-                    uid: "unknown".to_string(),
-                    allowed: false,
-                    status: Some(rusternetes_common::admission::AdmissionStatus {
-                        status: "Failure".to_string(),
-                        code: Some(403),
-                        message: Some(reason.clone()),
-                        reason: Some("Forbidden".to_string()),
-                        metadata: None,
-                    }),
-                    patch: None,
-                    patch_type: None,
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            };
+    let route = mock_post(move |review: AdmissionReview| {
+        let response = if let Some(request) = review.request {
+            AdmissionReviewResponse::deny(request.uid, reason.clone())
+        } else {
+            AdmissionReviewResponse {
+                uid: "unknown".to_string(),
+                allowed: false,
+                status: Some(rusternetes_common::admission::AdmissionStatus {
+                    status: "Failure".to_string(),
+                    code: Some(403),
+                    message: Some(reason.clone()),
+                    reason: Some("Forbidden".to_string()),
+                    metadata: None,
+                }),
+                patch: None,
+                patch_type: None,
+                audit_annotations: None,
+                warnings: None,
+            }
+        };
 
-            let response_review = AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(response),
-            };
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        };
 
-            warp::reply::json(&response_review)
-        });
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
@@ -127,61 +117,56 @@ async fn start_mock_mutating_server(
 ) -> (String, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |review: AdmissionReview| {
-            let response = if let Some(request) = review.request {
-                // Create a JSON patch to add a label
-                let patch = vec![PatchOperation {
-                    op: PatchOp::Add,
-                    path: format!("/metadata/labels/{}", label_key),
-                    value: Some(json!(label_value.clone())),
-                    from: None,
-                }];
+    let route = mock_post(move |review: AdmissionReview| {
+        let response = if let Some(request) = review.request {
+            // Create a JSON patch to add a label
+            let patch = vec![PatchOperation {
+                op: PatchOp::Add,
+                path: format!("/metadata/labels/{}", label_key),
+                value: Some(json!(label_value.clone())),
+                from: None,
+            }];
 
-                // Encode patch as base64
-                use base64::Engine;
-                let patch_json = serde_json::to_string(&patch).unwrap();
-                let patch_base64 =
-                    base64::engine::general_purpose::STANDARD.encode(patch_json.as_bytes());
+            // Encode patch as base64
+            use base64::Engine;
+            let patch_json = serde_json::to_string(&patch).unwrap();
+            let patch_base64 =
+                base64::engine::general_purpose::STANDARD.encode(patch_json.as_bytes());
 
-                AdmissionReviewResponse {
-                    uid: request.uid,
-                    allowed: true,
-                    status: None,
-                    patch: Some(patch_base64),
-                    patch_type: Some("JSONPatch".to_string()),
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            } else {
-                AdmissionReviewResponse {
-                    uid: "unknown".to_string(),
-                    allowed: true,
-                    status: None,
-                    patch: None,
-                    patch_type: None,
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            };
+            AdmissionReviewResponse {
+                uid: request.uid,
+                allowed: true,
+                status: None,
+                patch: Some(patch_base64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }
+        } else {
+            AdmissionReviewResponse {
+                uid: "unknown".to_string(),
+                allowed: true,
+                status: None,
+                patch: None,
+                patch_type: None,
+                audit_annotations: None,
+                warnings: None,
+            }
+        };
 
-            let response_review = AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(response),
-            };
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        };
 
-            warp::reply::json(&response_review)
-        });
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
@@ -194,39 +179,33 @@ async fn start_mock_slow_validating_server(
 ) -> (String, oneshot::Sender<()>) {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let route =
-        warp::post()
-            .and(warp::body::json())
-            .and_then(move |review: AdmissionReview| async move {
-                tokio::time::sleep(delay).await;
-                let response = if let Some(request) = review.request {
-                    AdmissionReviewResponse::allow(request.uid)
-                } else {
-                    AdmissionReviewResponse {
-                        uid: "unknown".to_string(),
-                        allowed: true,
-                        status: None,
-                        patch: None,
-                        patch_type: None,
-                        audit_annotations: None,
-                        warnings: None,
-                    }
-                };
-                let response_review = AdmissionReview {
-                    api_version: "admission.k8s.io/v1".to_string(),
-                    kind: "AdmissionReview".to_string(),
-                    request: None,
-                    response: Some(response),
-                };
-                Ok::<_, warp::Rejection>(warp::reply::json(&response_review))
-            });
+    let route = mock_post_async(move |review: AdmissionReview| async move {
+        tokio::time::sleep(delay).await;
+        let response = if let Some(request) = review.request {
+            AdmissionReviewResponse::allow(request.uid)
+        } else {
+            AdmissionReviewResponse {
+                uid: "unknown".to_string(),
+                allowed: true,
+                status: None,
+                patch: None,
+                patch_type: None,
+                audit_annotations: None,
+                warnings: None,
+            }
+        };
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        };
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx)
@@ -246,57 +225,52 @@ async fn start_mock_counting_mutating_server(
     let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let counter_clone = counter.clone();
 
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |review: AdmissionReview| {
-            let call = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            let label_value = format!("call-{}", call);
-            let response = if let Some(request) = review.request {
-                let patch = vec![PatchOperation {
-                    op: PatchOp::Add,
-                    path: format!("/metadata/labels/{}", label_key),
-                    value: Some(json!(label_value)),
-                    from: None,
-                }];
-                use base64::Engine;
-                let patch_json = serde_json::to_string(&patch).unwrap();
-                let patch_base64 =
-                    base64::engine::general_purpose::STANDARD.encode(patch_json.as_bytes());
-                AdmissionReviewResponse {
-                    uid: request.uid,
-                    allowed: true,
-                    status: None,
-                    patch: Some(patch_base64),
-                    patch_type: Some("JSONPatch".to_string()),
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            } else {
-                AdmissionReviewResponse {
-                    uid: "unknown".to_string(),
-                    allowed: true,
-                    status: None,
-                    patch: None,
-                    patch_type: None,
-                    audit_annotations: None,
-                    warnings: None,
-                }
-            };
-            let response_review = AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(response),
-            };
-            warp::reply::json(&response_review)
-        });
+    let route = mock_post(move |review: AdmissionReview| {
+        let call = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let label_value = format!("call-{}", call);
+        let response = if let Some(request) = review.request {
+            let patch = vec![PatchOperation {
+                op: PatchOp::Add,
+                path: format!("/metadata/labels/{}", label_key),
+                value: Some(json!(label_value)),
+                from: None,
+            }];
+            use base64::Engine;
+            let patch_json = serde_json::to_string(&patch).unwrap();
+            let patch_base64 =
+                base64::engine::general_purpose::STANDARD.encode(patch_json.as_bytes());
+            AdmissionReviewResponse {
+                uid: request.uid,
+                allowed: true,
+                status: None,
+                patch: Some(patch_base64),
+                patch_type: Some("JSONPatch".to_string()),
+                audit_annotations: None,
+                warnings: None,
+            }
+        } else {
+            AdmissionReviewResponse {
+                uid: "unknown".to_string(),
+                allowed: true,
+                status: None,
+                patch: None,
+                patch_type: None,
+                audit_annotations: None,
+                warnings: None,
+            }
+        };
+        let response_review = AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        };
+        reply_json(&response_review)
+    });
 
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            shutdown_rx.await.ok();
-        });
-
-    tokio::spawn(server);
+    let addr = serve_graceful(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let url = format!("http://{}", addr);
     (url, shutdown_tx, counter)

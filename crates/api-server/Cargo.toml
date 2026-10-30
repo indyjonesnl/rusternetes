@@ -102,7 +102,6 @@ tokio-rustls = { workspace = true }
 tokio-test = "0.4"
 jsonwebtoken.workspace = true
 rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }
-warp.workspace = true
 async-trait.workspace = true
 protox-parse = "0.7"
 prost-types = "0.13"

@@ -21,6 +21,9 @@ pub mod builders;
 #[cfg(feature = "apiserver-harness")]
 pub mod harness;
 
+#[cfg(feature = "apiserver-harness")]
+pub mod mock_http;
+
 pub use builders::{
     endpoint_slice, node, node_with_resources, pod, service, PodBuilder, ResourceBuilder,
 };

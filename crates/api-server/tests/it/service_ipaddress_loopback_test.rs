@@ -13,10 +13,10 @@ use axum::http::StatusCode;
 use rusternetes_common::admission::{AdmissionReview, AdmissionReviewResponse};
 use rusternetes_storage::{build_key, Storage};
 use rusternetes_test_support::harness::TestApiServer;
+use rusternetes_test_support::mock_http::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
-use warp::Filter;
 
 const SVCS: &str = "/api/v1/namespaces/default/services";
 
@@ -24,35 +24,31 @@ const SVCS: &str = "/api/v1/namespaces/default/services";
 /// review and denies when `deny` is set.
 async fn start_webhook(deny: bool, seen: Arc<Mutex<Vec<String>>>) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |review: AdmissionReview| {
-            let request = review.request.expect("a request");
-            seen.lock().unwrap().push(format!(
-                "{} {}",
-                serde_json::to_value(&request.operation)
-                    .unwrap()
-                    .as_str()
-                    .unwrap(),
-                request.resource.resource
-            ));
-            let response = if deny {
-                AdmissionReviewResponse::deny(request.uid, "no new IPs".to_string())
-            } else {
-                AdmissionReviewResponse::allow(request.uid)
-            };
-            warp::reply::json(&AdmissionReview {
-                api_version: "admission.k8s.io/v1".to_string(),
-                kind: "AdmissionReview".to_string(),
-                request: None,
-                response: Some(response),
-            })
-        });
-    let (addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
-            rx.await.ok();
-        });
-    tokio::spawn(server);
+    let route = mock_post(move |review: AdmissionReview| {
+        let request = review.request.expect("a request");
+        seen.lock().unwrap().push(format!(
+            "{} {}",
+            serde_json::to_value(&request.operation)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            request.resource.resource
+        ));
+        let response = if deny {
+            AdmissionReviewResponse::deny(request.uid, "no new IPs".to_string())
+        } else {
+            AdmissionReviewResponse::allow(request.uid)
+        };
+        reply_json(&AdmissionReview {
+            api_version: "admission.k8s.io/v1".to_string(),
+            kind: "AdmissionReview".to_string(),
+            request: None,
+            response: Some(response),
+        })
+    });
+    let addr = serve_graceful(route, async {
+        rx.await.ok();
+    });
     (format!("http://{addr}"), tx)
 }
 

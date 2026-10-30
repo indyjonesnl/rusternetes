@@ -55,10 +55,10 @@ use rusternetes_common::{
 };
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use rusternetes_test_support::harness::TestApiServer;
+use rusternetes_test_support::mock_http::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use warp::Filter;
 
 // ---------------------------------------------------------------------------
 // HTTP harness
@@ -121,16 +121,13 @@ fn wrap(response: AdmissionReviewResponse) -> AdmissionReview {
 
 async fn start_deny_validator(reason: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let uid = r.request.map(|req| req.uid).unwrap_or_else(|| "u".into());
-            warp::reply::json(&wrap(AdmissionReviewResponse::deny(uid, reason.clone())))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(move |r: AdmissionReview| {
+        let uid = r.request.map(|req| req.uid).unwrap_or_else(|| "u".into());
+        reply_json(&wrap(AdmissionReviewResponse::deny(uid, reason.clone())))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -140,31 +137,26 @@ async fn start_deny_validator(reason: String) -> (String, oneshot::Sender<()>) {
 /// populated the review correctly. Any other shape is allowed.
 async fn start_delete_deny_validator(reason: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let request = match r.request {
-                Some(req) => req,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let is_delete = matches!(request.operation, Operation::Delete);
-            let has_old = request.old_object.is_some();
-            let no_new = request.object.is_none();
-            if is_delete && has_old && no_new {
-                warp::reply::json(&wrap(AdmissionReviewResponse::deny(
-                    request.uid,
-                    reason.clone(),
-                )))
-            } else {
-                warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid)))
-            }
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(move |r: AdmissionReview| {
+        let request = match r.request {
+            Some(req) => req,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let is_delete = matches!(request.operation, Operation::Delete);
+        let has_old = request.old_object.is_some();
+        let no_new = request.object.is_none();
+        if is_delete && has_old && no_new {
+            reply_json(&wrap(AdmissionReviewResponse::deny(
+                request.uid,
+                reason.clone(),
+            )))
+        } else {
+            reply_json(&wrap(AdmissionReviewResponse::allow(request.uid)))
+        }
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -187,46 +179,41 @@ async fn start_delete_deny_validator(reason: String) -> (String, oneshot::Sender
 /// successfully.
 async fn start_cr_data_validator() -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(|r: AdmissionReview| {
-            let request = match r.request {
-                Some(req) => req,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let subject = match request.operation {
-                Operation::Delete => request.old_object.as_ref(),
-                _ => request.object.as_ref(),
-            };
-            let marker = subject
-                .and_then(|o| o.pointer("/data/webhook-e2e-test"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+    let route = mock_post(|r: AdmissionReview| {
+        let request = match r.request {
+            Some(req) => req,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let subject = match request.operation {
+            Operation::Delete => request.old_object.as_ref(),
+            _ => request.object.as_ref(),
+        };
+        let marker = subject
+            .and_then(|o| o.pointer("/data/webhook-e2e-test"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
 
-            let denial = match (&request.operation, marker) {
-                (Operation::Create | Operation::Update, "webhook-disallow") => {
-                    Some("the custom resource contains unwanted data")
-                }
-                (Operation::Delete, "webhook-nondeletable") => Some(
-                    "the custom resource cannot be deleted because it contains unwanted key and value",
-                ),
-                _ => None,
-            };
-
-            match denial {
-                Some(reason) => warp::reply::json(&wrap(AdmissionReviewResponse::deny(
-                    request.uid,
-                    reason.to_string(),
-                ))),
-                None => warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid))),
+        let denial = match (&request.operation, marker) {
+            (Operation::Create | Operation::Update, "webhook-disallow") => {
+                Some("the custom resource contains unwanted data")
             }
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+            (Operation::Delete, "webhook-nondeletable") => Some(
+                "the custom resource cannot be deleted because it contains unwanted key and value",
+            ),
+            _ => None,
+        };
+
+        match denial {
+            Some(reason) => reply_json(&wrap(AdmissionReviewResponse::deny(
+                request.uid,
+                reason.to_string(),
+            ))),
+            None => reply_json(&wrap(AdmissionReviewResponse::allow(request.uid))),
+        }
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -238,72 +225,62 @@ async fn start_cr_data_validator() -> (String, oneshot::Sender<()>) {
 /// admitted.
 async fn start_label_deny_validator() -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(|r: AdmissionReview| {
-            let request = match r.request {
-                Some(req) => req,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let disallowed = request
-                .object
-                .as_ref()
-                .and_then(|o| o.pointer("/metadata/labels/webhook-e2e-test"))
-                .and_then(Value::as_str)
-                == Some("webhook-disallow");
-            if disallowed {
-                warp::reply::json(&wrap(AdmissionReviewResponse::deny(
-                    request.uid,
-                    "the crd contains unwanted label".to_string(),
-                )))
-            } else {
-                warp::reply::json(&wrap(AdmissionReviewResponse::allow(request.uid)))
-            }
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(|r: AdmissionReview| {
+        let request = match r.request {
+            Some(req) => req,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let disallowed = request
+            .object
+            .as_ref()
+            .and_then(|o| o.pointer("/metadata/labels/webhook-e2e-test"))
+            .and_then(Value::as_str)
+            == Some("webhook-disallow");
+        if disallowed {
+            reply_json(&wrap(AdmissionReviewResponse::deny(
+                request.uid,
+                "the crd contains unwanted label".to_string(),
+            )))
+        } else {
+            reply_json(&wrap(AdmissionReviewResponse::allow(request.uid)))
+        }
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
 /// Mutating mock that adds `/metadata/labels/{key}={value}`.
 async fn start_mutator_label(key: String, value: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let request = match r.request {
-                Some(r) => r,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let patch = vec![PatchOperation {
-                op: PatchOp::Add,
-                path: format!("/metadata/labels/{}", key),
-                value: Some(json!(value.clone())),
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&wrap(AdmissionReviewResponse {
-                uid: request.uid,
-                allowed: true,
-                status: None,
-                patch: Some(b64),
-                patch_type: Some("JSONPatch".to_string()),
-                audit_annotations: None,
-                warnings: None,
-            }))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(move |r: AdmissionReview| {
+        let request = match r.request {
+            Some(r) => r,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let patch = vec![PatchOperation {
+            op: PatchOp::Add,
+            path: format!("/metadata/labels/{}", key),
+            value: Some(json!(value.clone())),
+            from: None,
+        }];
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&patch).unwrap());
+        reply_json(&wrap(AdmissionReviewResponse {
+            uid: request.uid,
+            allowed: true,
+            status: None,
+            patch: Some(b64),
+            patch_type: Some("JSONPatch".to_string()),
+            audit_annotations: None,
+            warnings: None,
+        }))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -327,54 +304,49 @@ async fn start_mutator_data_stage(
     add_key: String,
 ) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let request = match r.request {
-                Some(r) => r,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let has_required = request
-                .object
-                .as_ref()
-                .and_then(|o| o.pointer(&format!("/data/{require_key}")))
-                .is_some();
-            if !has_required {
-                return warp::reply::json(&wrap(AdmissionReviewResponse {
-                    uid: request.uid,
-                    allowed: true,
-                    status: None,
-                    patch: None,
-                    patch_type: None,
-                    audit_annotations: None,
-                    warnings: None,
-                }));
-            }
-            let patch = vec![PatchOperation {
-                op: PatchOp::Add,
-                path: format!("/data/{add_key}"),
-                value: Some(json!("yes")),
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&wrap(AdmissionReviewResponse {
+    let route = mock_post(move |r: AdmissionReview| {
+        let request = match r.request {
+            Some(r) => r,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let has_required = request
+            .object
+            .as_ref()
+            .and_then(|o| o.pointer(&format!("/data/{require_key}")))
+            .is_some();
+        if !has_required {
+            return reply_json(&wrap(AdmissionReviewResponse {
                 uid: request.uid,
                 allowed: true,
                 status: None,
-                patch: Some(b64),
-                patch_type: Some("JSONPatch".to_string()),
+                patch: None,
+                patch_type: None,
                 audit_annotations: None,
                 warnings: None,
-            }))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+            }));
+        }
+        let patch = vec![PatchOperation {
+            op: PatchOp::Add,
+            path: format!("/data/{add_key}"),
+            value: Some(json!("yes")),
+            from: None,
+        }];
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&patch).unwrap());
+        reply_json(&wrap(AdmissionReviewResponse {
+            uid: request.uid,
+            allowed: true,
+            status: None,
+            patch: Some(b64),
+            patch_type: Some("JSONPatch".to_string()),
+            audit_annotations: None,
+            warnings: None,
+        }))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -383,60 +355,49 @@ async fn start_mutator_data_stage(
 /// "mutate pod and apply defaults after mutation" test relies on.
 async fn start_mutator_init_container() -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(|r: AdmissionReview| {
-            let request = match r.request {
-                Some(r) => r,
-                None => {
-                    return warp::reply::json(&wrap(AdmissionReviewResponse::allow("u".into())))
-                }
-            };
-            let patch = vec![PatchOperation {
-                op: PatchOp::Add,
-                path: "/spec/initContainers".to_string(),
-                value: Some(json!([{
-                    "name": "webhook-added-init-container",
-                    "image": "registry.k8s.io/pause:3.10",
-                }])),
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&wrap(AdmissionReviewResponse {
-                uid: request.uid,
-                allowed: true,
-                status: None,
-                patch: Some(b64),
-                patch_type: Some("JSONPatch".to_string()),
-                audit_annotations: None,
-                warnings: None,
-            }))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(|r: AdmissionReview| {
+        let request = match r.request {
+            Some(r) => r,
+            None => return reply_json(&wrap(AdmissionReviewResponse::allow("u".into()))),
+        };
+        let patch = vec![PatchOperation {
+            op: PatchOp::Add,
+            path: "/spec/initContainers".to_string(),
+            value: Some(json!([{
+                "name": "webhook-added-init-container",
+                "image": "registry.k8s.io/pause:3.10",
+            }])),
+            from: None,
+        }];
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&patch).unwrap());
+        reply_json(&wrap(AdmissionReviewResponse {
+            uid: request.uid,
+            allowed: true,
+            status: None,
+            patch: Some(b64),
+            patch_type: Some("JSONPatch".to_string()),
+            audit_annotations: None,
+            warnings: None,
+        }))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
 async fn start_slow_validator(delay: std::time::Duration) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route =
-        warp::post()
-            .and(warp::body::json())
-            .and_then(move |r: AdmissionReview| async move {
-                tokio::time::sleep(delay).await;
-                let uid = r.request.map(|q| q.uid).unwrap_or_else(|| "u".into());
-                Ok::<_, warp::Rejection>(warp::reply::json(&wrap(AdmissionReviewResponse::allow(
-                    uid,
-                ))))
-            });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post_async(move |r: AdmissionReview| async move {
+        tokio::time::sleep(delay).await;
+        let uid = r.request.map(|q| q.uid).unwrap_or_else(|| "u".into());
+        reply_json(&wrap(AdmissionReviewResponse::allow(uid)))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 
@@ -4296,33 +4257,30 @@ async fn object_selector_skips_webhook_for_nonmatching_configmap() {
 /// Mutating mock that removes `data[<key>]`.
 async fn start_mutator_remove_data(key: String) -> (String, oneshot::Sender<()>) {
     let (tx, rx) = oneshot::channel();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |r: AdmissionReview| {
-            let request = r.request.expect("request");
-            let patch = vec![PatchOperation {
-                op: PatchOp::Remove,
-                path: format!("/data/{key}"),
-                value: None,
-                from: None,
-            }];
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD
-                .encode(serde_json::to_vec(&patch).unwrap());
-            warp::reply::json(&wrap(AdmissionReviewResponse {
-                uid: request.uid,
-                allowed: true,
-                status: None,
-                patch: Some(b64),
-                patch_type: Some("JSONPatch".to_string()),
-                audit_annotations: None,
-                warnings: None,
-            }))
-        });
-    let (addr, srv) = warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let route = mock_post(move |r: AdmissionReview| {
+        let request = r.request.expect("request");
+        let patch = vec![PatchOperation {
+            op: PatchOp::Remove,
+            path: format!("/data/{key}"),
+            value: None,
+            from: None,
+        }];
+        use base64::Engine;
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&patch).unwrap());
+        reply_json(&wrap(AdmissionReviewResponse {
+            uid: request.uid,
+            allowed: true,
+            status: None,
+            patch: Some(b64),
+            patch_type: Some("JSONPatch".to_string()),
+            audit_annotations: None,
+            warnings: None,
+        }))
+    });
+    let addr = serve_graceful(route, async {
         rx.await.ok();
     });
-    tokio::spawn(srv);
     (format!("http://{}", addr), tx)
 }
 

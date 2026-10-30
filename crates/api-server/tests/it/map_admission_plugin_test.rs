@@ -345,26 +345,23 @@ async fn never_policy_is_not_reinvoked() {
 async fn mock_webhook() -> (String, Arc<AtomicUsize>) {
     use base64::Engine;
     use rusternetes_common::admission::AdmissionReview;
-    use warp::Filter;
+    use rusternetes_test_support::mock_http::*;
     let calls = Arc::new(AtomicUsize::new(0));
     let c = calls.clone();
-    let route = warp::post()
-        .and(warp::body::json())
-        .map(move |review: AdmissionReview| {
-            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
-            let uid = review.request.map(|r| r.uid).unwrap_or_default();
-            let patch =
-                json!([{"op": "add", "path": "/metadata/labels/w", "value": format!("call-{n}")}]);
-            warp::reply::json(&json!({
-                "apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
-                "response": {
-                    "uid": uid, "allowed": true, "patchType": "JSONPatch",
-                    "patch": base64::engine::general_purpose::STANDARD.encode(patch.to_string()),
-                }
-            }))
-        });
-    let (addr, server) = warp::serve(route).bind_ephemeral(([127, 0, 0, 1], 0));
-    tokio::spawn(server);
+    let route = mock_post(move |review: AdmissionReview| {
+        let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+        let uid = review.request.map(|r| r.uid).unwrap_or_default();
+        let patch =
+            json!([{"op": "add", "path": "/metadata/labels/w", "value": format!("call-{n}")}]);
+        reply_json(&json!({
+            "apiVersion": "admission.k8s.io/v1", "kind": "AdmissionReview",
+            "response": {
+                "uid": uid, "allowed": true, "patchType": "JSONPatch",
+                "patch": base64::engine::general_purpose::STANDARD.encode(patch.to_string()),
+            }
+        }))
+    });
+    let addr = serve_graceful(route, std::future::pending());
     (format!("http://{addr}"), calls)
 }
 

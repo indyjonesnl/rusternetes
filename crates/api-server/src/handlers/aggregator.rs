@@ -29,7 +29,7 @@ pub struct AggregatorTarget {
     pub insecure_skip_tls_verify: bool,
     pub ca_bundle: Option<Vec<u8>>,
     /// URL scheme used when forwarding. Always `"https"` in production; tests
-    /// may override to `"http"` to drive a plain warp mock backend.
+    /// may override to `"http"` to drive a plain mock backend.
     pub scheme: &'static str,
     /// TLS server name (and request `Host`) to present, e.g.
     /// `<service>.<namespace>.svc`. The aggregated apiserver's serving cert is

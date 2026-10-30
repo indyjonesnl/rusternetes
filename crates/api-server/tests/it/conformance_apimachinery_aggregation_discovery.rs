@@ -87,7 +87,6 @@ use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use warp::Filter;
 
 // ---------------------------------------------------------------------------
 // HTTP harness — thin shims over the shared `TestApiServer`.
@@ -677,36 +676,33 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     let cp = captured_path.clone();
     let cu = captured_user.clone();
 
-    let route = warp::path::full()
-        .and(warp::header::headers_cloned())
-        .and_then(
-            move |full: warp::path::FullPath, headers: warp::http::HeaderMap| {
-                let cp = cp.clone();
-                let cu = cu.clone();
-                async move {
-                    *cp.lock().await = Some(full.as_str().to_string());
-                    let user = headers
-                        .get("x-remote-user")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    *cu.lock().await = Some(user);
-                    Ok::<_, warp::Rejection>(
-                        warp::http::Response::builder()
-                            .status(200)
-                            .header("Content-Type", "application/json")
-                            .body(r#"{"kind":"FlunderList","apiVersion":"wardle.example.com/v1alpha1","items":[]}"#.to_string())
-                            .unwrap(),
-                    )
-                }
-            },
-        );
+    let route = axum::Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let cp = cp.clone();
+            let cu = cu.clone();
+            async move {
+                *cp.lock().await = Some(uri.path().to_string());
+                let user = headers
+                    .get("x-remote-user")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                *cu.lock().await = Some(user);
+                axum::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"kind":"FlunderList","apiVersion":"wardle.example.com/v1alpha1","items":[]}"#,
+                    ))
+                    .unwrap()
+            }
+        },
+    );
 
-    let (mock_addr, server) =
-        warp::serve(route).bind_with_graceful_shutdown(([127, 0, 0, 1], 0), async {
+    let (mock_addr, mock_handle) =
+        rusternetes_test_support::mock_http::serve_graceful_handle(route, async {
             shutdown_rx.await.ok();
         });
-    let mock_handle = tokio::spawn(server);
 
     let state = spawn_state();
 
