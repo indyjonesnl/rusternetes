@@ -33,7 +33,7 @@ pub const LABEL_IP_ADDRESS_FAMILY: &str = "ipaddress.kubernetes.io/ip-family";
 /// `networkingv1.LabelManagedBy` (well_known_labels.go:32).
 pub const LABEL_MANAGED_BY: &str = "ipaddress.kubernetes.io/managed-by";
 
-pub(crate) const IP_ADDRESS_PREFIX: &str = "/registry/ipaddresses/";
+pub const IP_ADDRESS_PREFIX: &str = "/registry/ipaddresses/";
 
 /// The errors of interfaces.go:43-58.
 #[derive(Debug)]
@@ -121,7 +121,7 @@ pub fn prefix_contains_ip(prefix: &IpNet, ip: &IpAddr) -> bool {
 }
 
 /// `hostsPerNetwork` (ipallocator.go:553-577), capped at `u64::MAX`.
-fn hosts_per_network(prefix: &IpNet) -> u64 {
+pub fn hosts_per_network(prefix: &IpNet) -> u64 {
     let host_bits = prefix.max_prefix_len() - prefix.prefix_len();
     if host_bits >= 64 {
         return u64::MAX;
@@ -197,7 +197,7 @@ pub fn new_ip_address(name: &str, svc: Option<&Service>) -> IPAddress {
     ip
 }
 
-pub(crate) fn ip_address_key(name: &str) -> String {
+pub fn ip_address_key(name: &str) -> String {
     build_key("ipaddresses", None, name)
 }
 
@@ -226,18 +226,18 @@ async fn list_managed<S: Storage>(storage: &S, family: &str) -> Vec<IPAddress> {
 
 /// `Allocator` (ipallocator.go:46-70): the addresses of one CIDR.
 pub struct Allocator<S: Storage> {
-    storage: Arc<S>,
-    prefix: IpNet,
-    first: u128,
-    offset_address: u128,
-    last: u128,
-    family: &'static str,
-    range_offset: u64,
-    size: u64,
-    loopback: LoopbackSlot,
+    pub storage: Arc<S>,
+    pub prefix: IpNet,
+    pub first: u128,
+    pub offset_address: u128,
+    pub last: u128,
+    pub family: &'static str,
+    pub range_offset: u64,
+    pub size: u64,
+    pub loopback: LoopbackSlot,
     /// Whether this allocator may hand out new addresses; it depends on
     /// its ServiceCIDR being ready.
-    pub(crate) ready: AtomicBool,
+    pub ready: AtomicBool,
 }
 
 impl<S: Storage> Allocator<S> {
@@ -445,10 +445,7 @@ impl<S: Storage> Allocator<S> {
     }
 
     #[allow(dead_code)] // upstream API; exercised by the tests
-    pub(crate) fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.size
     }
 }
-
-#[cfg(test)]
-mod tests;

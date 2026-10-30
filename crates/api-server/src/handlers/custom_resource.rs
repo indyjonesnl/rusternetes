@@ -492,7 +492,7 @@ pub async fn watch_custom_resources(
 /// `metadata.name` / `metadata.namespace` nor declared in the CRD version's
 /// `x-kubernetes-selectable-fields`. Mirrors the upstream apiextensions
 /// validator that gates which CR paths the apiserver indexes.
-pub(crate) fn validate_field_selector_paths(
+pub fn validate_field_selector_paths(
     crd: &CustomResourceDefinition,
     version: &str,
     field_selector: &str,
@@ -681,7 +681,7 @@ async fn get_crd_for_resource(
 /// Apply schema defaults from the CRD to a custom resource's spec.
 /// Walks the CRD's JSONSchemaProps and for each property with a `default`
 /// value, sets it on the CR if the field is missing.
-pub(crate) fn apply_schema_defaults(
+pub fn apply_schema_defaults(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &mut CustomResource,
@@ -769,7 +769,7 @@ pub(crate) fn validate_custom_resource_with_old(
 /// (`registry/customresource/strategy.go:216-224`), so the two halves must be
 /// callable apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CrPhase {
+pub enum CrPhase {
     /// The OpenAPI v3 schema checks (`validator.Validate`).
     Schema,
     /// The `x-kubernetes-validations` rules (`celValidator.Validate`).
@@ -777,7 +777,7 @@ pub(crate) enum CrPhase {
 }
 
 /// [`validate_custom_resource_with_old`] restricted to one [`CrPhase`].
-pub(crate) fn validate_custom_resource_phase(
+pub fn validate_custom_resource_phase(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &CustomResource,
@@ -798,7 +798,7 @@ pub(crate) fn validate_custom_resource_phase(
 /// Whether the version's schema carries any `x-kubernetes-validations` rule,
 /// i.e. upstream's `celValidator != nil` (`cel.NewValidator` returns nil when
 /// the schema has no rules).
-pub(crate) fn has_cel_rules(crd: &CustomResourceDefinition, version: &str) -> bool {
+pub fn has_cel_rules(crd: &CustomResourceDefinition, version: &str) -> bool {
     crd.spec
         .versions
         .iter()

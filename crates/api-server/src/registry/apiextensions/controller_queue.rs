@@ -42,7 +42,7 @@ enum ConditionKind {
 }
 
 #[derive(Default)]
-struct Queue {
+pub struct Queue {
     order: VecDeque<String>,
     queued: HashSet<String>,
 }
@@ -50,23 +50,23 @@ struct Queue {
 /// The controllers' shared state: the queue, the rate limiter that spaces
 /// retries, and the condition controllers' memos.
 pub struct CrdControllers {
-    queue: Mutex<Queue>,
-    notify: Arc<Notify>,
-    started: AtomicBool,
-    limiter: Mutex<ControllerRateLimiter>,
+    pub queue: Mutex<Queue>,
+    pub notify: Arc<Notify>,
+    pub started: AtomicBool,
+    pub limiter: Mutex<ControllerRateLimiter>,
     /// The CRD finalizer's own workqueue (crd_finalizer.go:73-76), drained by
     /// [`CRD_FINALIZER_WORKERS`] workers.
-    pub(super) finalizer: Arc<FinalizerQueue>,
+    pub finalizer: Arc<FinalizerQueue>,
     /// The nonstructuralschema controller's own workqueue
     /// (`non_structural_schema_condition_controller`), drained by
     /// [`CRD_FINALIZER_WORKERS`] workers (`go nonStructuralSchemaController.
     /// RunWithContext(5, ...)`, apiserver.go:247).
-    pub(super) non_structural: Arc<FinalizerQueue>,
+    pub non_structural: Arc<FinalizerQueue>,
     /// The apiapproval controller's own workqueue
     /// (`kubernetes_api_approval_conformant_condition_controller`), five
     /// workers (apiserver.go:248).
-    pub(super) api_approval: Arc<FinalizerQueue>,
-    pub(super) conditions: ConditionControllers,
+    pub api_approval: Arc<FinalizerQueue>,
+    pub conditions: ConditionControllers,
 }
 
 impl Default for CrdControllers {
@@ -140,7 +140,7 @@ impl CrdControllers {
             .forget(name);
     }
 
-    fn pop(&self) -> Option<String> {
+    pub fn pop(&self) -> Option<String> {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let name = q.order.pop_front()?;
         q.queued.remove(&name);
@@ -258,26 +258,5 @@ impl CrdControllers {
                 }
             }
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Each condition controller has a workqueue of its own
-    /// (nonstructuralschema_controller.go:66-69, apiapproval_controller.go:
-    /// 66-69): an `Add` reaches both, dedups per queue, and is independent of
-    /// the naming/establishing queue.
-    #[test]
-    fn condition_controllers_have_their_own_queues() {
-        let c = CrdControllers::default();
-        c.add_conditions("a.example.com");
-        c.add_conditions("a.example.com");
-        assert_eq!(c.non_structural.get().as_deref(), Some("a.example.com"));
-        assert_eq!(c.non_structural.get(), None);
-        assert_eq!(c.api_approval.get().as_deref(), Some("a.example.com"));
-        assert_eq!(c.api_approval.get(), None);
-        assert_eq!(c.pop(), None, "the naming queue was not fed");
     }
 }
