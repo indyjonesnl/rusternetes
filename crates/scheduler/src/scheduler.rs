@@ -147,14 +147,12 @@ impl Scheduler<StorageBackend> {
 }
 
 /// A map holding one defaulted profile named `scheduler_name`.
-#[allow(dead_code)] // test/library helper behind `new_with_name`
 fn single_profile(scheduler_name: &str) -> crate::profile::Map {
     crate::profile::Map::new_map(vec![crate::profile::Profile::named(scheduler_name)])
         .expect("a single named, defaulted profile is always valid")
 }
 
 impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
-    #[allow(dead_code)] // library/test API; the binary builds profiles from config
     pub fn new_with_name(storage: Arc<S>, interval_secs: u64, scheduler_name: String) -> Self {
         Self::new_with_profiles(storage, interval_secs, single_profile(&scheduler_name))
     }
@@ -1031,11 +1029,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// Run one scheduling cycle — schedules all pending pods.
     ///
     /// Public for testing. The production bin path uses `run()` →
-    /// `worker()` (watch + work-queue driven), not this direct method;
-    /// `dead_code` is allowed because the unit tests below DO call it
-    /// but the bin doesn't, and the test cfg is gated out of the bin
-    /// compilation unit.
-    #[allow(dead_code)]
+    /// `worker()` (watch + work-queue driven), not this direct method.
     pub async fn schedule_pending_pods(&self) -> rusternetes_common::Result<()> {
         debug!("Looking for pending pods to schedule");
 

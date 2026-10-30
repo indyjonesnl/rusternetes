@@ -152,7 +152,6 @@ pub enum ProbeResult {
     Failed,
     /// Not produced yet: `probe_container` is boolean, upstream's Unknown
     /// comes from `results.Unknown` probers.
-    #[allow(dead_code)]
     Unknown,
 }
 

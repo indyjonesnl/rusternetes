@@ -1,12 +1,10 @@
 pub mod advanced;
 pub mod data_plane;
 pub mod diagnosis;
-#[allow(dead_code)]
 pub mod framework;
 pub mod framework_runtime;
 pub mod inter_pod_affinity_score;
 pub mod node_volume_limits;
-#[allow(dead_code)]
 pub mod plugins;
 pub mod pod_topology_spread_score;
 pub mod profile;

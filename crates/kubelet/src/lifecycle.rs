@@ -176,7 +176,6 @@ pub fn build_prestop_lifecycle_map(pod: &Pod) -> HashMap<String, Lifecycle> {
 ///   - `restartPolicy=Never`     → never restart
 ///   - Unset → defaults to `Always` (K8s PodSpec default).
 #[inline]
-#[allow(dead_code)]
 pub fn should_restart_container(restart_policy: Option<&str>, exit_code: i32) -> bool {
     match restart_policy.unwrap_or("Always") {
         "Always" => true,
@@ -203,7 +202,6 @@ pub fn should_restart_container(restart_policy: Option<&str>, exit_code: i32) ->
 ///
 /// Returns the K8s phase string used in `Pod.status.phase`.
 #[inline]
-#[allow(dead_code)]
 pub fn terminal_pod_phase(restart_policy: Option<&str>, any_failed: bool) -> Option<&'static str> {
     match restart_policy.unwrap_or("Always") {
         "Always" => None,
@@ -419,7 +417,6 @@ pub fn container_reason_from_error_message(err_msg: &str) -> Option<&'static str
 ///   - tag is `:latest` or absent → `Always`
 ///   - any explicit non-`latest` tag → `IfNotPresent`
 ///   - digest reference → `IfNotPresent`
-#[allow(dead_code)]
 pub fn default_image_pull_policy(image: &str) -> &'static str {
     // Digest reference (`image@sha256:...`) → IfNotPresent.
     if image.contains('@') {
@@ -454,7 +451,6 @@ pub fn default_image_pull_policy(image: &str) -> &'static str {
 /// Negative values are clamped to 0 — the K8s API server normalises this
 /// at admission time, but the kubelet must defend against legacy objects.
 #[inline]
-#[allow(dead_code)]
 pub fn effective_termination_grace_period(spec_grace: Option<i64>) -> i64 {
     spec_grace.unwrap_or(30).max(0)
 }
@@ -475,7 +471,6 @@ pub fn effective_termination_grace_period(spec_grace: Option<i64>) -> i64 {
 /// truth for the mapping. The matching inline mapping in
 /// `runtime.rs::get_container_statuses` lives outside the lifecycle/preStop
 /// block — see CLAUDE.md scope rules.
-#[allow(dead_code)]
 pub fn terminated_state_from_exit(
     exit_code: i64,
     docker_error: Option<String>,

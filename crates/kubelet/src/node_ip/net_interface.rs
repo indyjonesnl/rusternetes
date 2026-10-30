@@ -9,7 +9,6 @@
 
 // The whole upstream helper surface is ported; the kubelet binary uses only
 // `resolve_bind_address`.
-#![allow(dead_code)]
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

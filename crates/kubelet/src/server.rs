@@ -162,7 +162,6 @@ async fn handle_stats_summary(State(state): State<ServerState>) -> impl IntoResp
 /// (`InstallAuthRequiredHandlers`, server.go:609-618); this fragment keeps it
 /// for callers that do not gate (tests). The kubelet servers use
 /// [`auth_not_required_router`] plus [`install_debugging_handlers`] instead.
-#[allow(dead_code)] // unused by the `kubelet` bin, which gates /runningpods/
 pub fn read_only_router(state: ServerState) -> Router {
     auth_not_required_router(state.clone()).merge(running_pods_router(state))
 }
@@ -507,11 +506,9 @@ pub fn server_bucket_options(enable_debugging_handlers: bool) -> ServerBucketOpt
 pub const READ_ONLY_PATHS: [&str; 3] = ["/pods", "/healthz", "/stats/summary"];
 
 /// `/runningpods/` as [`running_pods_router`] registers it.
-#[allow(dead_code)] // unused by the `kubelet` bin
 pub const RUNNING_PODS_ROUTE: &str = "/runningpods/";
 
 /// `authorizer.AttributesRecord` (as populated by `GetRequestAttributes`).
-#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestAttributes {
     pub user: String,
@@ -526,21 +523,14 @@ pub struct RequestAttributes {
     pub path: String,
 }
 
-#[allow(dead_code)]
 const STATS_PATH: &str = "/stats/";
-#[allow(dead_code)]
 const METRICS_PATH: &str = "/metrics";
-#[allow(dead_code)]
 const LOGS_PATH: &str = "/logs/";
-#[allow(dead_code)]
 const CHECKPOINT_PATH: &str = "/checkpoint/";
-#[allow(dead_code)]
 const PODS_PATH: &str = "/pods";
-#[allow(dead_code)]
 const RUNNING_PODS_PATH: &str = "/runningpods/";
 
 /// `isSubpath` (pkg/kubelet/server/auth.go:56-59).
-#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
 pub fn is_subpath(subpath: &str, path: &str) -> bool {
     let path = path.strip_suffix('/').unwrap_or(path);
     subpath == path || (subpath.starts_with(path) && subpath.as_bytes()[path.len()] == b'/')
@@ -550,7 +540,6 @@ pub fn is_subpath(subpath: &str, path: &str) -> bool {
 /// (pkg/kubelet/server/auth.go:77-148). `KubeletFineGrainedAuthz` is read by
 /// name (it has no typed `Feature` variant); the `/flagz` -> `configz` case is
 /// unconditional, as upstream.
-#[allow(dead_code)] // consumed by the kubelet authn/authz filter (not yet wired)
 pub fn get_request_attributes(
     node_name: &str,
     user: &str,
