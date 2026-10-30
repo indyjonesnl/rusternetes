@@ -41,6 +41,7 @@ use super::rest::{authorize, RequestScope};
 use crate::admission::caching_authorizer::new_caching_authorizer;
 use crate::admission::plugins::enabled as plugin_enabled;
 use crate::admission::{builtin_plugins, resourcequota, storage_object_in_use_protection};
+use crate::registry::metadata::HasMetadata;
 use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
@@ -68,15 +69,52 @@ fn denied(reason: &str) -> Error {
     Error::Forbidden(format!("admission webhook denied the request: {reason}"))
 }
 
-fn to_value<T: Object>(obj: &T) -> Result<serde_json::Value> {
-    serde_json::to_value(obj).map_err(|e| Error::Internal(e.to_string()))
+/// The object the admission chain works on, type-erased. The chain runs for
+/// every resource type, so keeping it generic over `T: Object` monomorphised
+/// ~5k lines of plugin code once per type; the plugins only ever look at the
+/// object's metadata or a JSON view of it, which is all this exposes. The
+/// public entry points stay generic and are thin wrappers over it.
+pub trait AdmissionObject: Send + Sync {
+    fn meta(&self) -> &rusternetes_common::types::ObjectMeta;
+    fn meta_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta;
+    fn to_json(&self) -> serde_json::Result<serde_json::Value>;
+    /// Replace the object with `value` decoded as its own type; on error the
+    /// object is left as it was.
+    fn replace_from_value(&mut self, value: serde_json::Value) -> serde_json::Result<()>;
+}
+
+impl<T: Object> AdmissionObject for T {
+    fn meta(&self) -> &rusternetes_common::types::ObjectMeta {
+        HasMetadata::metadata(self)
+    }
+    fn meta_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+        HasMetadata::metadata_mut(self)
+    }
+    fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        serde_json::to_value(self)
+    }
+    fn replace_from_value(&mut self, value: serde_json::Value) -> serde_json::Result<()> {
+        *self = serde_json::from_value(value)?;
+        Ok(())
+    }
+}
+
+fn to_value(obj: &dyn AdmissionObject) -> Result<serde_json::Value> {
+    obj.to_json().map_err(|e| Error::Internal(e.to_string()))
 }
 
 /// The object as another type — the typed view an in-tree plugin works on,
 /// as upstream's plugins type-assert `a.GetObject()`.
-fn recast<A: serde::Serialize, B: serde::de::DeserializeOwned>(obj: &A) -> Result<B> {
-    serde_json::to_value(obj)
+fn recast_obj<B: serde::de::DeserializeOwned>(obj: &dyn AdmissionObject) -> Result<B> {
+    obj.to_json()
         .and_then(serde_json::from_value)
+        .map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Write the typed view `a` back into `obj`.
+fn assign<A: serde::Serialize>(obj: &mut dyn AdmissionObject, a: &A) -> Result<()> {
+    serde_json::to_value(a)
+        .and_then(|v| obj.replace_from_value(v))
         .map_err(|e| Error::Internal(e.to_string()))
 }
 
@@ -185,11 +223,15 @@ impl Admission<'_> {
     /// PodCertificateRequest. NodeRestriction runs first, as it did before the
     /// pod handlers moved onto this chain: it only narrows a node's requests
     /// and reads the pod as sent.
-    async fn admit_in_tree<T: Object>(&self, op: &Operation, obj: T, old: Option<&T>) -> Result<T> {
+    async fn admit_in_tree(
+        &self,
+        op: &Operation,
+        obj: &mut dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
-        let mut obj = obj;
         let mut pod: Option<Pod> = if self.is_core("pods") {
-            Some(recast(&obj)?)
+            Some(recast_obj(&*obj)?)
         } else {
             None
         };
@@ -206,7 +248,7 @@ impl Admission<'_> {
                 self.kind,
                 &GroupResource::new(&self.resource.group, &self.resource.resource),
                 self.namespace,
-                &builtin_plugins::attr_name(obj.metadata()),
+                &builtin_plugins::attr_name(obj.meta()),
                 self.dry_run,
             )
             .await
@@ -232,7 +274,7 @@ impl Admission<'_> {
                 && self.resource.resource == "podcertificaterequests"
             {
                 let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
-                    recast(&obj)?;
+                    recast_obj(&*obj)?;
                 crate::handlers::node_restriction::admit_pod_certificate_request(
                     &**storage,
                     &rusternetes_middleware::AuthContext {
@@ -401,11 +443,11 @@ impl Admission<'_> {
 
         self.plugin("DefaultStorageClass", op, ADMIT, async {
             if self.is_core("persistentvolumeclaims") {
-                let mut pvc: PersistentVolumeClaim = recast(&obj)?;
+                let mut pvc: PersistentVolumeClaim = recast_obj(&*obj)?;
                 crate::admission::set_default_storage_class(storage, &mut pvc)
                     .await
                     .map_err(|e| self.forbidden(&pvc.metadata.name, e))?;
-                obj = recast(&pvc)?;
+                assign(&mut *obj, &pvc)?;
             }
             Ok(())
         })
@@ -423,7 +465,7 @@ impl Admission<'_> {
                         .unwrap_or(false),
                 ) {
                     storage_object_in_use_protection::add_protection_finalizer(
-                        obj.metadata_mut(),
+                        obj.meta_mut(),
                         finalizer,
                     );
                 }
@@ -469,7 +511,7 @@ impl Admission<'_> {
         // Create and Update, skipping `shouldIgnore` (:161-171).
         self.plugin("AlwaysPullImages", op, ADMIT, async {
             if let Some(pod) = pod.as_mut() {
-                let old: Option<Pod> = old.map(recast).transpose()?;
+                let old: Option<Pod> = old.map(recast_obj).transpose()?;
                 if !builtin_plugins::is_update_with_no_new_images(pod, old.as_ref()) {
                     builtin_plugins::always_pull_images_admit(pod);
                 }
@@ -485,30 +527,30 @@ impl Admission<'_> {
                 && self.resource.resource == "ingresses"
                 && self.subresource.is_none()
             {
-                let mut ingress: rusternetes_common::resources::Ingress = recast(&obj)?;
+                let mut ingress: rusternetes_common::resources::Ingress = recast_obj(&*obj)?;
                 builtin_plugins::default_ingress_class(storage, &mut ingress).await?;
-                obj = recast(&ingress)?;
+                assign(&mut *obj, &ingress)?;
             }
             Ok(())
         })
         .await?;
 
         if let Some(pod) = pod {
-            obj = recast(&pod)?;
+            assign(&mut *obj, &pod)?;
         }
-        Ok(obj)
+        Ok(())
     }
 
     /// The in-tree validating plugins, each run through [`Self::plugin`].
     /// `LimitRanger.Validate` (plugin/pkg/admission/limitranger/admission.go:
     /// 116-156) checks a PersistentVolumeClaim's requests on CREATE and
     /// UPDATE, except when the old object is being deleted.
-    async fn validate_in_tree<T: Object>(
+    async fn validate_in_tree(
         &self,
         ctx: &RequestContext,
         op: &Operation,
-        obj: Option<&T>,
-        old: Option<&T>,
+        obj: Option<&dyn AdmissionObject>,
+        old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
         use rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
         // NamespaceExists.Validate (exists/admission.go:55-86), registered for
@@ -582,7 +624,7 @@ impl Admission<'_> {
                 obj,
                 self.namespace,
             ) {
-                let pod: Pod = recast(obj)?;
+                let pod: Pod = recast_obj(obj)?;
                 self.validate_image_policy(&pod, namespace).await?;
             }
             Ok(())
@@ -605,8 +647,8 @@ impl Admission<'_> {
         // NodeDeclaredFeatureValidator plugin, off with its gate).
         self.plugin("NodeDeclaredFeatureValidator", op, VALIDATE, async {
             if self.subresource == Some("resize") && self.is_pod_resize() {
-                let pod: Option<Pod> = obj.map(recast).transpose()?;
-                let old: Option<Pod> = old.map(recast).transpose()?;
+                let pod: Option<Pod> = obj.map(recast_obj).transpose()?;
+                let old: Option<Pod> = old.map(recast_obj).transpose()?;
                 if let (Some(pod), Some(old), Some(_)) =
                     (pod.as_ref(), old.as_ref(), self.namespace)
                 {
@@ -625,7 +667,7 @@ impl Admission<'_> {
         // (Create, Update): pods proper, never a subresource.
         self.plugin("PodNodeSelector", op, VALIDATE, async {
             if let (Some(obj), true) = (obj, self.is_core("pods") && self.subresource.is_none()) {
-                let pod: Pod = recast(obj)?;
+                let pod: Pod = recast_obj(obj)?;
                 crate::admission::pod_plugins::pod_node_selector_validate(
                     &self.state.storage,
                     self.namespace.unwrap_or(""),
@@ -638,7 +680,7 @@ impl Admission<'_> {
         .await?;
         self.plugin("PodTolerationRestriction", op, VALIDATE, async {
             if let (Some(obj), true) = (obj, self.is_core("pods") && self.subresource.is_none()) {
-                let pod: Pod = recast(obj)?;
+                let pod: Pod = recast_obj(obj)?;
                 crate::admission::pod_plugins::toleration_restriction_validate(
                     &self.state.storage,
                     self.namespace.unwrap_or(""),
@@ -660,11 +702,11 @@ impl Admission<'_> {
                 return Ok(());
             };
             if !self.is_core("persistentvolumeclaims")
-                || old.is_some_and(|o| o.metadata().deletion_timestamp.is_some())
+                || old.is_some_and(|o| o.meta().deletion_timestamp.is_some())
             {
                 return Ok(());
             }
-            let pvc: PersistentVolumeClaim = recast(obj)?;
+            let pvc: PersistentVolumeClaim = recast_obj(obj)?;
             match crate::admission::limit_ranger_validate_pvc(&self.state.storage, namespace, &pvc)
                 .await
             {
@@ -682,11 +724,11 @@ impl Admission<'_> {
     /// AlwaysPullImages, PersistentVolumeClaimResize,
     /// DenyServiceExternalIPs. Each registers for Create and Update (the
     /// resize plugin for Update only) and ignores subresources.
-    async fn validate_builtin_plugins<T: Object>(
+    async fn validate_builtin_plugins(
         &self,
         op: &Operation,
-        obj: Option<&T>,
-        old: Option<&T>,
+        obj: Option<&dyn AdmissionObject>,
+        old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
         use rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
         let Some(obj) = obj else {
@@ -694,7 +736,7 @@ impl Admission<'_> {
         };
         self.plugin("LimitPodHardAntiAffinityTopology", op, VALIDATE, async {
             if self.is_core("pods") {
-                let pod: Pod = recast(obj)?;
+                let pod: Pod = recast_obj(obj)?;
                 builtin_plugins::limit_pod_hard_anti_affinity_topology(&pod)?;
             }
             Ok(())
@@ -702,8 +744,8 @@ impl Admission<'_> {
         .await?;
         self.plugin("AlwaysPullImages", op, VALIDATE, async {
             if self.is_core("pods") {
-                let pod: Pod = recast(obj)?;
-                let old: Option<Pod> = old.map(recast).transpose()?;
+                let pod: Pod = recast_obj(obj)?;
+                let old: Option<Pod> = old.map(recast_obj).transpose()?;
                 if !builtin_plugins::is_update_with_no_new_images(&pod, old.as_ref()) {
                     builtin_plugins::always_pull_images_validate("pods", &pod)?;
                 }
@@ -714,8 +756,8 @@ impl Admission<'_> {
         self.plugin("PersistentVolumeClaimResize", op, VALIDATE, async {
             if self.is_core("persistentvolumeclaims") {
                 if let Some(old) = old {
-                    let pvc: PersistentVolumeClaim = recast(obj)?;
-                    let old: PersistentVolumeClaim = recast(old)?;
+                    let pvc: PersistentVolumeClaim = recast_obj(obj)?;
+                    let old: PersistentVolumeClaim = recast_obj(old)?;
                     builtin_plugins::pvc_resize_validate(&self.state.storage, &pvc, &old).await?;
                 }
             }
@@ -724,9 +766,9 @@ impl Admission<'_> {
         .await?;
         self.plugin("DenyServiceExternalIPs", op, VALIDATE, async {
             if self.is_core("services") {
-                let svc: rusternetes_common::resources::Service = recast(obj)?;
+                let svc: rusternetes_common::resources::Service = recast_obj(obj)?;
                 let old: Option<rusternetes_common::resources::Service> =
-                    old.map(recast).transpose()?;
+                    old.map(recast_obj).transpose()?;
                 builtin_plugins::deny_service_external_ips(&svc, old.as_ref())?;
             }
             Ok(())
@@ -737,13 +779,17 @@ impl Admission<'_> {
     /// The `EventRateLimit` plugin (eventratelimit/admission.go:91-120): for
     /// CREATE and UPDATE of a core Event, when it is configured. The enabled
     /// and operation checks are made by [`Self::plugin`].
-    fn validate_event_rate_limit<T: Object>(&self, _op: &Operation, obj: Option<&T>) -> Result<()> {
+    fn validate_event_rate_limit(
+        &self,
+        _op: &Operation,
+        obj: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         use crate::admission::event_rate_limit as erl;
         let Some(plugin) = erl::installed() else {
             return Ok(());
         };
         let event: Option<rusternetes_common::resources::Event> = if self.is_core("events") {
-            obj.map(recast).transpose()?
+            obj.map(recast_obj).transpose()?
         } else {
             None
         };
@@ -759,11 +805,11 @@ impl Admission<'_> {
 
     /// `OwnerReferencesPermissionEnforcement.Validate`
     /// ([`crate::admission::owner_references_permission_enforcement`]).
-    async fn validate_owner_references<T: Object>(
+    async fn validate_owner_references(
         &self,
         op: &Operation,
-        obj: &T,
-        old: Option<&T>,
+        obj: &dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
         use crate::admission::owner_references_permission_enforcement::{
             Attributes, OwnerReferencesPermissionEnforcement,
@@ -779,26 +825,30 @@ impl Admission<'_> {
             resource: &self.resource.resource,
             subresource: self.subresource,
             namespace: self.namespace,
-            name: &obj.metadata().name,
+            name: &obj.meta().name,
             create: *op == Operation::Create,
         };
         plugin
-            .validate(&attributes, obj.metadata(), old.map(|o| o.metadata()))
+            .validate(&attributes, obj.meta(), old.map(|o| o.meta()))
             .await
-            .map_err(|e| self.forbidden(&obj.metadata().name, e))
+            .map_err(|e| self.forbidden(&obj.meta().name, e))
     }
 
     /// The `certificates/approval` and `certificates/signing` plugins, for an
     /// UPDATE of a CertificateSigningRequest's `approval` or `status`
     /// ([`crate::admission::certificates`]).
-    async fn validate_csr_signer<T: Object>(&self, obj: &T, old: &T) -> Result<()> {
+    async fn validate_csr_signer(
+        &self,
+        obj: &dyn AdmissionObject,
+        old: &dyn AdmissionObject,
+    ) -> Result<()> {
         if self.resource.group != "certificates.k8s.io"
             || self.resource.resource != "certificatesigningrequests"
         {
             return Ok(());
         }
-        let new: CertificateSigningRequest = recast(obj)?;
-        let old: CertificateSigningRequest = recast(old)?;
+        let new: CertificateSigningRequest = recast_obj(obj)?;
+        let old: CertificateSigningRequest = recast_obj(old)?;
         match crate::admission::certificates::validate_update(
             self.state,
             self.user,
@@ -816,15 +866,19 @@ impl Admission<'_> {
     /// The `certificates/ctbattest` plugin (`ClusterTrustBundleAttest`), for
     /// CREATE and UPDATE of a ClusterTrustBundle
     /// ([`crate::admission::certificates::validate_cluster_trust_bundle_attest`]).
-    async fn validate_ctb_attest<T: Object>(&self, obj: &T, old: Option<&T>) -> Result<()> {
+    async fn validate_ctb_attest(
+        &self,
+        obj: &dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         if self.resource.group != "certificates.k8s.io"
             || self.resource.resource != "clustertrustbundles"
             || self.subresource.is_some()
         {
             return Ok(());
         }
-        let new: ClusterTrustBundle = recast(obj)?;
-        let old: Option<ClusterTrustBundle> = old.map(recast).transpose()?;
+        let new: ClusterTrustBundle = recast_obj(obj)?;
+        let old: Option<ClusterTrustBundle> = old.map(recast_obj).transpose()?;
         match crate::admission::certificates::validate_cluster_trust_bundle_attest(
             self.state,
             self.user,
@@ -840,15 +894,19 @@ impl Admission<'_> {
 
     /// The `"sign"` authorization of a PodCertificateRequest `/status` update
     /// ([`crate::admission::certificates::validate_pod_certificate_request_sign`]).
-    async fn validate_pcr_signer<T: Object>(&self, obj: &T, old: &T) -> Result<()> {
+    async fn validate_pcr_signer(
+        &self,
+        obj: &dyn AdmissionObject,
+        old: &dyn AdmissionObject,
+    ) -> Result<()> {
         if self.resource.group != "certificates.k8s.io"
             || self.resource.resource != "podcertificaterequests"
             || self.subresource != Some("status")
         {
             return Ok(());
         }
-        let new: PodCertificateRequest = recast(obj)?;
-        let old: PodCertificateRequest = recast(old)?;
+        let new: PodCertificateRequest = recast_obj(obj)?;
+        let old: PodCertificateRequest = recast_obj(old)?;
         match crate::admission::certificates::validate_pod_certificate_request_sign(
             self.state, self.user, &new, &old,
         )
@@ -861,14 +919,14 @@ impl Admission<'_> {
 
     /// The `certificates/subjectrestriction` plugin, for CREATE of a
     /// CertificateSigningRequest (subjectrestriction/admission.go:64-93).
-    fn validate_csr_subject<T: Object>(&self, obj: &T) -> Result<()> {
+    fn validate_csr_subject(&self, obj: &dyn AdmissionObject) -> Result<()> {
         if self.resource.group != "certificates.k8s.io"
             || self.resource.resource != "certificatesigningrequests"
             || self.subresource.is_some()
         {
             return Ok(());
         }
-        let csr: CertificateSigningRequest = recast(obj)?;
+        let csr: CertificateSigningRequest = recast_obj(obj)?;
         match crate::admission::certificates::subject_restriction_error(&csr) {
             Some(err) => Err(self.forbidden(&csr.metadata.name, err)),
             None => Ok(()),
@@ -878,7 +936,11 @@ impl Admission<'_> {
     /// `Priority.Validate` (plugin/pkg/admission/priority/admission.go:116-133)
     /// for PriorityClasses:`validatePriorityClass` (:156-176) lets at most
     /// one class be `globalDefault`.
-    async fn validate_priority<T: Object>(&self, op: &Operation, obj: Option<&T>) -> Result<()> {
+    async fn validate_priority(
+        &self,
+        op: &Operation,
+        obj: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         let Some(obj) = obj else {
             return Ok(());
         };
@@ -889,7 +951,7 @@ impl Admission<'_> {
         {
             return Ok(());
         }
-        let pc: PriorityClass = recast(obj)?;
+        let pc: PriorityClass = recast_obj(obj)?;
         if pc.global_default != Some(true) {
             return Ok(());
         }
@@ -989,22 +1051,22 @@ impl Admission<'_> {
     /// admission.go:229-327), `ValidatePodController` (:393-453) and
     /// `ValidatePod` (:370-388). The pod ResourceQuota evaluator runs last, on
     /// the generic path (`validate_quota`).
-    async fn validate_pod_security<T: Object>(
+    async fn validate_pod_security(
         &self,
         ctx: &RequestContext,
         op: &Operation,
-        obj: Option<&T>,
-        old: Option<&T>,
+        obj: Option<&dyn AdmissionObject>,
+        old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
         // `ValidateNamespace`: label validation, and the existing pods
         // checked against a tightened enforce level.
         if let (Operation::Create | Operation::Update, Some(obj), true) =
             (op, obj, self.is_core("namespaces"))
         {
-            let ns: rusternetes_common::resources::Namespace = recast(obj)?;
+            let ns: rusternetes_common::resources::Namespace = recast_obj(obj)?;
             let old_ns: Option<rusternetes_common::resources::Namespace> =
                 if *op == Operation::Update {
-                    old.map(recast).transpose()?
+                    old.map(recast_obj).transpose()?
                 } else {
                     None
                 };
@@ -1025,7 +1087,8 @@ impl Admission<'_> {
             if !(r.group.is_empty() && r.resource == "pods")
                 && crate::admission::pod_security_controller::has_pod_spec(&r.group, &r.resource)
             {
-                let value = serde_json::to_value(obj)
+                let value = obj
+                    .to_json()
                     .map_err(|e| Error::Internal(format!("failed to encode object: {e}")))?;
                 for w in crate::admission::PodSecurityAdmission::new()
                     .validate_pod_controller(
@@ -1046,8 +1109,8 @@ impl Admission<'_> {
         }
         // `ValidatePod`, on CREATE and on UPDATE.
         if self.is_core("pods") || self.is_pod_resize() || self.is_pod_ephemeralcontainers() {
-            let pod: Option<Pod> = obj.map(recast).transpose()?;
-            let old: Option<Pod> = old.map(recast).transpose()?;
+            let pod: Option<Pod> = obj.map(recast_obj).transpose()?;
+            let old: Option<Pod> = old.map(recast_obj).transpose()?;
             let storage = &self.state.storage;
             let target = match (op, pod.as_ref(), old.as_ref(), self.namespace) {
                 (Operation::Create, Some(pod), _, Some(namespace)) => Some((pod, None, namespace)),
@@ -1084,31 +1147,31 @@ impl Admission<'_> {
     ///
     /// `reinvocation` is the request's `a.GetReinvocationContext()`, shared
     /// by both passes of [`Self::admit`].
-    async fn admit_mutating_policy<T: Object>(
+    async fn admit_mutating_policy(
         &self,
         op: &Operation,
-        obj: T,
-        old: Option<&T>,
+        obj: &mut dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
         reinvocation: &std::sync::Arc<crate::admission::policy_mutating::ReinvocationContext>,
-    ) -> Result<T> {
+    ) -> Result<()> {
         use crate::admission::policy_plugin::MutatingPolicyPlugin;
 
         if !plugin_enabled("MutatingAdmissionPolicy")
             || !MutatingPolicyPlugin::handles(op)
             || !MutatingPolicyPlugin::enabled()
         {
-            return Ok(obj);
+            return Ok(());
         }
         let Some(plugin) = self.state.mutating_admission_policy.as_ref() else {
-            return Ok(obj);
+            return Ok(());
         };
-        let before = to_value(&obj)?;
+        let before = to_value(&*obj)?;
         let mut attr = crate::admission::policy_matching::Attributes {
             kind: self.kind.clone(),
             resource: self.resource.clone(),
             subresource: self.subresource.unwrap_or("").to_string(),
             namespace: self.namespace.unwrap_or("").to_string(),
-            name: obj.metadata().name.clone(),
+            name: obj.meta().name.clone(),
             operation: op.clone(),
             object: Some(before.clone()),
             old_object: old.map(to_value).transpose()?,
@@ -1150,13 +1213,13 @@ impl Admission<'_> {
                         );
                     }
                 }
-                serde_json::from_value(after).map_err(|e| {
+                obj.replace_from_value(after).map_err(|e| {
                     Error::Internal(format!(
                         "failed to decode the object mutated by admission: {e}"
                     ))
                 })
             }
-            _ => Ok(obj),
+            _ => Ok(()),
         }
     }
 
@@ -1172,6 +1235,18 @@ impl Admission<'_> {
     /// `IfNeeded` webhook is rerun on the second pass when a policy or
     /// in-tree plugin changed the object after it (#3041).
     pub async fn admit<T: Object>(&self, op: Operation, obj: T, old: Option<&T>) -> Result<T> {
+        let mut obj = obj;
+        self.admit_dyn(op, &mut obj, old.map(|o| o as &dyn AdmissionObject))
+            .await?;
+        Ok(obj)
+    }
+
+    async fn admit_dyn(
+        &self,
+        op: Operation,
+        obj: &mut dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         // `c.AdmissionControl = admissionmetrics.WithStepMetrics(admissionChain)`
         // (apiserver/pkg/server/options/admission.go:179): the whole admit
         // phase, both reinvoker passes included, is one `step` observation.
@@ -1184,50 +1259,49 @@ impl Admission<'_> {
         .await
     }
 
-    async fn admit_reinvoking<T: Object>(
+    async fn admit_reinvoking(
         &self,
         op: Operation,
-        obj: T,
-        old: Option<&T>,
-    ) -> Result<T> {
+        obj: &mut dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         if self.forbid_create && op == Operation::Create {
-            return Err(self.forbid_create_error(&obj.metadata().name));
+            return Err(self.forbid_create_error(&obj.meta().name));
         }
         use crate::admission::policy_mutating::ReinvocationContext;
         let reinvocation = std::sync::Arc::new(ReinvocationContext::new(false));
-        let obj = self.admit_chain(&op, obj, old, &reinvocation).await?;
+        self.admit_chain(&op, &mut *obj, old, &reinvocation).await?;
         // AlwaysDeny is last in `AllOrderedPlugins` (plugins.go:69-111),
         // after the webhooks.
         if plugin_enabled("AlwaysDeny") {
-            return Err(self.always_deny(obj.metadata()));
+            return Err(self.always_deny(obj.meta()));
         }
         if !reinvocation.should_reinvoke() {
-            return Ok(obj);
+            return Ok(());
         }
         reinvocation.set_is_reinvoke();
         self.admit_chain(&op, obj, old, &reinvocation).await
     }
 
     /// One pass of the mutating chain (`mutator.Admit`).
-    async fn admit_chain<T: Object>(
+    async fn admit_chain(
         &self,
         op: &Operation,
-        obj: T,
-        old: Option<&T>,
+        obj: &mut dyn AdmissionObject,
+        old: Option<&dyn AdmissionObject>,
         reinvocation: &std::sync::Arc<crate::admission::policy_mutating::ReinvocationContext>,
-    ) -> Result<T> {
+    ) -> Result<()> {
         // MutatingAdmissionPolicy is first (plugins.go:106-110), ahead of
         // the webhooks; the in-tree plugins in `AllOrderedPlugins` precede
         // all four, and they are kept ahead of it here as before.
-        let obj = self.admit_in_tree(op, obj, old).await?;
-        let obj = self
-            .admit_mutating_policy(op, obj, old, reinvocation)
+        self.admit_in_tree(op, &mut *obj, old).await?;
+        self.admit_mutating_policy(op, &mut *obj, old, reinvocation)
             .await?;
         if !plugin_enabled("MutatingAdmissionWebhook") {
-            return Ok(obj);
+            return Ok(());
         }
-        let name = obj.metadata().name.clone();
-        let before_webhooks = to_value(&obj)?;
+        let name = obj.meta().name.clone();
+        let before_webhooks = to_value(&*obj)?;
         // dispatcher.go:106-113: this plugin's context lives in the shared
         // reinvocation context, so it survives into the second pass.
         let mut webhook_ctx = reinvocation.take_webhook_context();
@@ -1264,18 +1338,18 @@ impl Admission<'_> {
             return Err(denied(reason));
         }
         let decoded = match mutated {
-            Some(value) => serde_json::from_value(value).map_err(|e| {
+            Some(value) => obj.replace_from_value(value).map_err(|e| {
                 Error::Internal(format!(
                     "failed to decode the object mutated by admission: {e}"
                 ))
             }),
-            None => Ok(obj),
+            None => Ok(()),
         };
         // The next pass compares the typed object (what the plugins hand on),
         // not the raw webhook output, against the last webhook output: a
         // serde round trip that normalises a field is not a mutation.
-        if let Ok(typed) = &decoded {
-            webhook_ctx.set_last_webhook_invocation_output(Some(to_value(typed)?));
+        if decoded.is_ok() {
+            webhook_ctx.set_last_webhook_invocation_output(Some(to_value(&*obj)?));
         }
         reinvocation.restore_webhook_context(webhook_ctx);
         decoded
@@ -1293,18 +1367,22 @@ impl Admission<'_> {
     /// (webhook/mutating/dispatcher.go:346), and the mutating admission policy
     /// plugin does not handle DELETE (`policy_plugin.rs`).
     pub async fn admit_delete<T: Object>(&self, old: &T) -> Result<()> {
+        self.admit_delete_dyn(old).await
+    }
+
+    async fn admit_delete_dyn(&self, old: &dyn AdmissionObject) -> Result<()> {
         use rusternetes_admission_webhook::admission_metrics::{with_step_metrics, STEP_ADMIT};
         with_step_metrics(&Operation::Delete, STEP_ADMIT, self.admit_delete_chain(old)).await
     }
 
-    async fn admit_delete_chain<T: Object>(&self, old: &T) -> Result<()> {
+    async fn admit_delete_chain(&self, old: &dyn AdmissionObject) -> Result<()> {
         use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
         let op = Operation::Delete;
         // NodeRestriction.Admit on a pod DELETE (admission.go:257-270); it
         // is an Admit-only plugin.
         self.plugin("NodeRestriction", &op, ADMIT, async {
             if self.is_core("pods") {
-                let pod: Pod = recast(old)?;
+                let pod: Pod = recast_obj(old)?;
                 crate::handlers::node_restriction::admit_pod_delete(
                     &rusternetes_middleware::AuthContext {
                         user: self.user.clone(),
@@ -1320,9 +1398,9 @@ impl Admission<'_> {
         self.plugin("Priority", &op, ADMIT, async { Ok(()) })
             .await?;
         if !plugin_enabled("MutatingAdmissionWebhook") {
-            return self.admit_delete_deny(old.metadata());
+            return self.admit_delete_deny(old.meta());
         }
-        let name = old.metadata().name.clone();
+        let name = old.meta().name.clone();
         let mut webhook_ctx = rusternetes_admission_webhook::WebhookReinvokeContext::default();
         let (response, _, _) = self
             .state
@@ -1344,7 +1422,7 @@ impl Admission<'_> {
         if let AdmissionResponse::Deny(reason) = &response {
             return Err(denied(reason));
         }
-        self.admit_delete_deny(old.metadata())
+        self.admit_delete_deny(old.meta())
     }
 
     /// AlwaysDeny is last in `AllOrderedPlugins`, after the webhooks.
@@ -1364,6 +1442,22 @@ impl Admission<'_> {
         obj: Option<&T>,
         old: Option<&T>,
     ) -> Result<()> {
+        self.validate_dyn(
+            ctx,
+            op,
+            obj.map(|o| o as &dyn AdmissionObject),
+            old.map(|o| o as &dyn AdmissionObject),
+        )
+        .await
+    }
+
+    async fn validate_dyn(
+        &self,
+        ctx: &RequestContext,
+        op: Operation,
+        obj: Option<&dyn AdmissionObject>,
+        old: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
         // `WithStepMetrics` (admission.go:179), the validate phase.
         let step_op = op.clone();
         rusternetes_admission_webhook::admission_metrics::with_step_metrics(
@@ -1374,25 +1468,25 @@ impl Admission<'_> {
         .await
     }
 
-    async fn validate_chain<T: Object>(
+    async fn validate_chain(
         &self,
         ctx: &RequestContext,
         op: Operation,
-        obj: Option<&T>,
-        old: Option<&T>,
+        obj: Option<&dyn AdmissionObject>,
+        old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
         if self.forbid_create && op == Operation::Create {
-            let name = obj.map(|o| o.metadata().name.as_str()).unwrap_or_default();
+            let name = obj.map(|o| o.meta().name.as_str()).unwrap_or_default();
             return Err(self.forbid_create_error(name));
         }
         self.validate_in_tree(ctx, &op, obj, old).await?;
         let name = obj
             .or(old)
-            .map(|o| o.metadata().name.clone())
+            .map(|o| o.meta().name.clone())
             .unwrap_or_default();
         let deny = plugin_enabled("AlwaysDeny").then(|| {
             let default = rusternetes_common::types::ObjectMeta::default();
-            self.always_deny(obj.or(old).map(|o| o.metadata()).unwrap_or(&default))
+            self.always_deny(obj.or(old).map(|o| o.meta()).unwrap_or(&default))
         });
         let obj = obj.map(to_value).transpose()?;
         let old = old.map(to_value).transpose()?;
