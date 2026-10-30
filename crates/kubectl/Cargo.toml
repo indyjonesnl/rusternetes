@@ -8,6 +8,9 @@ license.workspace = true
 [lib]
 name = "rusternetes_kubectl"
 path = "src/lib.rs"
+# Unit tests live in tests/it: a second compilation of the lib as a test
+# target costs as much as the lib itself.
+test = false
 
 [[bin]]
 name = "kubectl"
