@@ -80,15 +80,13 @@ impl LocalPlugin {
 
     /// Replace the `mount.Interface` (upstream's tests inject
     /// `mount.NewFakeMounter` through the `FakeKubeletVolumeHost`).
-    #[cfg(test)]
-    pub(crate) fn with_mounter(mut self, mounter: Arc<dyn MountInterface>) -> Self {
+    pub fn with_mounter(mut self, mounter: Arc<dyn MountInterface>) -> Self {
         self.mounter = mounter;
         self
     }
 
     /// Replace `GetFileType` (upstream's `pathToFSType` fake).
-    #[cfg(test)]
-    pub(crate) fn with_file_type(mut self, f: FileTypeFn) -> Self {
+    pub fn with_file_type(mut self, f: FileTypeFn) -> Self {
         self.file_type = f;
         self
     }
@@ -103,7 +101,7 @@ impl LocalPlugin {
 
     /// `getGlobalLocalPath` (`local.go:270-292`): the source directory of a
     /// directory PV, or the device's global mount path for a block device.
-    fn get_global_local_path(&self, spec: &Spec<'_>) -> Result<String> {
+    pub fn get_global_local_path(&self, spec: &Spec<'_>) -> Result<String> {
         let path = match spec.persistent_volume.and_then(|pv| pv.spec.local.as_ref()) {
             Some(l) if !l.path.is_empty() => l.path.as_str(),
             _ => bail!("local volume source is nil or local path is not set"),
@@ -123,7 +121,7 @@ impl LocalPlugin {
     /// of `localVolume` (`local.go:500`) is `volume.NewMetricsStatFS` of the
     /// pod volume dir on the mounter (`local.go:140`) and nil on the
     /// unmounter (`local.go:148-157`).
-    fn new_local_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<LocalMounter> {
+    pub fn new_local_mounter(&self, spec: &Spec<'_>, pod: &Pod) -> Result<LocalMounter> {
         let (_, read_only) = get_volume_source(spec)?;
         let global_local_path = self.get_global_local_path(spec)?;
         let mut volume = self.new_local_volume(&pod.metadata.uid, spec.name(), &global_local_path);
@@ -139,7 +137,12 @@ impl LocalPlugin {
         })
     }
 
-    fn new_local_volume(&self, pod_uid: &str, vol_name: &str, global_path: &str) -> LocalVolume {
+    pub fn new_local_volume(
+        &self,
+        pod_uid: &str,
+        vol_name: &str,
+        global_path: &str,
+    ) -> LocalVolume {
         LocalVolume {
             pod: None,
             pod_uid: pod_uid.to_string(),
@@ -151,7 +154,7 @@ impl LocalPlugin {
 
     /// `newDeviceMounterInternal` / `newDeviceUnmounterInternal`: the same
     /// `deviceMounter` struct serves both roles.
-    pub(crate) fn new_device_mounter_internal(&self, exec: Arc<dyn Exec>) -> LocalDeviceMounter {
+    pub fn new_device_mounter_internal(&self, exec: Arc<dyn Exec>) -> LocalDeviceMounter {
         LocalDeviceMounter {
             plugin: self.clone(),
             mounter: SafeFormatAndMount {
@@ -359,7 +362,7 @@ impl BlockVolumePlugin for LocalPlugin {
 /// directory on a node. The directory at the globalPath will be bind-mounted
 /// to the pod's directory".
 #[derive(Clone)]
-struct LocalVolume {
+pub struct LocalVolume {
     vol_name: String,
     pod: Option<Pod>,
     pod_uid: String,
@@ -402,12 +405,12 @@ impl LocalVolume {
 }
 
 /// `localVolumeMounter` (`local.go:509-513`).
-struct LocalMounter {
-    volume: LocalVolume,
-    read_only: bool,
-    mount_options: Vec<String>,
+pub struct LocalMounter {
+    pub volume: LocalVolume,
+    pub read_only: bool,
+    pub mount_options: Vec<String>,
     /// Embedded `volume.MetricsProvider` (`local.go:500`, set at `:140`).
-    metrics: MetricsStatFs,
+    pub metrics: MetricsStatFs,
 }
 
 impl MetricsProvider for LocalMounter {
@@ -435,7 +438,7 @@ impl LocalMounter {
 
     /// `filterPodMounts` (`local.go:631-639`): only mount paths inside the
     /// kubelet pod directory.
-    fn filter_pod_mounts(&self, refs: Vec<String>) -> Vec<String> {
+    pub fn filter_pod_mounts(&self, refs: Vec<String>) -> Vec<String> {
         let prefix = format!(
             "{}{}",
             self.volume.plugin.host.get_pods_dir(),
@@ -760,7 +763,7 @@ impl BlockVolumeUnmapper for LocalUnmapper {
 
 /// `deviceMounter` (`local.go:307-311`): the `DeviceMounter` and
 /// `DeviceUnmounter` of a local block device.
-pub(crate) struct LocalDeviceMounter {
+pub struct LocalDeviceMounter {
     plugin: LocalPlugin,
     mounter: SafeFormatAndMount,
 }
@@ -887,6 +890,3 @@ impl DeviceUnmounter for LocalDeviceMounter {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

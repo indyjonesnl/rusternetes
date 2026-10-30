@@ -21,7 +21,7 @@ use tracing::{debug, error, info};
 /// Port of `getCredentialsFromSecret` (`csi_util.go:45-57`), shared by the
 /// mounter and the expander; `storage` is the kube client (`None` when the
 /// host has none).
-pub(super) async fn get_credentials_from_secret(
+pub async fn get_credentials_from_secret(
     storage: Option<&Arc<StorageBackend>>,
     namespace: &str,
     name: &str,
@@ -48,7 +48,7 @@ pub(super) async fn get_credentials_from_secret(
 const VOL_DATA_FILE_NAME: &str = "vol_data.json";
 
 /// Port of `volDataKey` (`csi_mounter.go:42-53`).
-mod vol_data_key {
+pub mod vol_data_key {
     pub const SPEC_VOL_ID: &str = "specVolID";
     pub const VOL_HANDLE: &str = "volumeHandle";
     pub const DRIVER_NAME: &str = "driverName";
@@ -89,13 +89,13 @@ impl LifecycleMode {
 /// An unregistered driver is a transient failure for both arms
 /// (`csi_mounter.go:106-109`); no placeholder directory is created (#3262).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolumeLifecycleMode {
+pub enum VolumeLifecycleMode {
     Persistent,
     Ephemeral,
 }
 
 pub struct CsiPlugin {
-    host: Arc<dyn VolumeHost>,
+    pub host: Arc<dyn VolumeHost>,
 }
 
 impl CsiPlugin {
@@ -114,7 +114,7 @@ impl CsiPlugin {
     /// after `WaitForCacheSync` (`volume_host.go:175-188`), which blocks until
     /// the CSIDriver informer has synced (`wait.NeverStop`: it never fails
     /// while a lister exists). `Ok(None)` is `apierrors.IsNotFound`.
-    fn get_csi_driver(&self, driver: &str) -> Result<Option<CSIDriver>> {
+    pub fn get_csi_driver(&self, driver: &str) -> Result<Option<CSIDriver>> {
         let Some(lister) = self.host.csi_driver_lister() else {
             return Err(anyhow!("CSIDriver lister does not exist"));
         };
@@ -555,7 +555,7 @@ impl CsiPlugin {
 /// `GetPluginDir(CSIPluginName)` (`pkg/kubelet/volume_host.go`):
 /// `<root>/plugins/kubernetes.io/csi`. The plugin name's `/` stays a path
 /// separator here, unlike the pod-volume directory where it is escaped to `~`.
-fn plugin_dir(volumes_base_path: &str) -> PathBuf {
+pub fn plugin_dir(volumes_base_path: &str) -> PathBuf {
     Path::new(volumes_base_path)
         .join("plugins")
         .join(crate::pod_dirs::plugin::CSI)
@@ -595,7 +595,7 @@ struct CsiMounter {
     need_selinux_relabel: std::sync::atomic::AtomicBool,
 }
 
-fn transient(msg: String) -> anyhow::Error {
+pub fn transient(msg: String) -> anyhow::Error {
     CsiError::Transient(msg).into()
 }
 
@@ -784,7 +784,7 @@ async fn get_publish_context(
 
 /// Port of `makeDeviceMountPath` (`csi_attacher.go:598-622`):
 /// `<pluginDir>/<driver>/<sha256(volumeHandle)>/globalmount`.
-fn make_device_mount_path(
+pub fn make_device_mount_path(
     plugin_dir: &Path,
     driver_name: &str,
     pv_handle: &str,
@@ -851,7 +851,7 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
 }
 
 /// `getPVSourceFromSpec` (`csi_util.go:165-174`).
-fn pv_source_from_spec<'a>(
+pub fn pv_source_from_spec<'a>(
     spec: &'a Spec<'_>,
 ) -> Result<&'a rusternetes_common::resources::volume::CSIVolumeSource> {
     if spec.volume.csi.is_some() {
@@ -1631,7 +1631,7 @@ const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
 
 /// `isResourceExhaustError` (`csi_plugin.go:234-240`): the attachment's
 /// `status.attachError.errorCode` is gRPC `ResourceExhausted` (8).
-pub(crate) fn is_resource_exhaust_error(attachment: Option<&VolumeAttachment>) -> bool {
+pub fn is_resource_exhaust_error(attachment: Option<&VolumeAttachment>) -> bool {
     attachment
         .and_then(|a| a.status.as_ref())
         .and_then(|s| s.attach_error.as_ref())
@@ -1731,7 +1731,7 @@ impl CsiPlugin {
 }
 
 /// `getAttachmentName` (`csi_attacher.go:593-596`).
-pub(crate) fn get_attachment_name(vol_name: &str, driver: &str, node: &str) -> String {
+pub fn get_attachment_name(vol_name: &str, driver: &str, node: &str) -> String {
     format!(
         "csi-{:x}",
         Sha256::digest(format!("{vol_name}{driver}{node}"))
@@ -1747,7 +1747,7 @@ fn make_volume_handle(pod_uid: &str, vol_source_spec_name: &str) -> String {
 }
 
 /// `os.MkdirAll(dir, 0750)`.
-fn make_dir_0750(dir: &Path) -> std::io::Result<()> {
+pub fn make_dir_0750(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1756,7 +1756,7 @@ fn make_dir_0750(dir: &Path) -> std::io::Result<()> {
 }
 
 /// `saveVolumeData` (`csi_util.go:59-73`).
-fn save_volume_data(dir: &Path, data: &HashMap<String, String>) -> Result<()> {
+pub fn save_volume_data(dir: &Path, data: &HashMap<String, String>) -> Result<()> {
     let file = dir.join(VOL_DATA_FILE_NAME);
     let json = serde_json::to_string(data).map_err(|e| {
         anyhow!(
@@ -1773,7 +1773,7 @@ fn save_volume_data(dir: &Path, data: &HashMap<String, String>) -> Result<()> {
 }
 
 /// `loadVolumeData` (`csi_util.go:75-91`).
-fn load_volume_data(dir: &Path) -> Result<HashMap<String, String>> {
+pub fn load_volume_data(dir: &Path) -> Result<HashMap<String, String>> {
     let file = dir.join(VOL_DATA_FILE_NAME);
     let text = std::fs::read_to_string(&file).map_err(|e| {
         anyhow!(
@@ -1792,7 +1792,7 @@ fn load_volume_data(dir: &Path) -> Result<HashMap<String, String>> {
 /// Port of `removeMountDir` + `isDirMounted` (`csi_mounter.go:572-610`): when
 /// `mount_path` is not a mount point, remove it, the volume info file and the
 /// volume dir. A still-mounted path is left alone — never delete through a mount.
-fn remove_mount_dir(mount_path: &Path) -> Result<()> {
+pub fn remove_mount_dir(mount_path: &Path) -> Result<()> {
     debug!(
         "kubernetes.io/csi: removing mount path [{}]",
         mount_path.display()
@@ -1831,9 +1831,9 @@ fn remove_mount_dir(mount_path: &Path) -> Result<()> {
     Ok(())
 }
 
-mod block;
-mod expander;
-mod metrics;
+pub mod block;
+pub mod expander;
+pub mod metrics;
 
 impl crate::volume_plugins::plugin::MetricsProvider for CsiUnmounter {
     /// Upstream's `NewUnmounter` (`csi_plugin.go`) leaves the embedded
@@ -1845,9 +1845,6 @@ impl crate::volume_plugins::plugin::MetricsProvider for CsiUnmounter {
         )
     }
 }
-
-#[cfg(test)]
-mod tests;
 
 /// Port of `csi.GetCSIDriverName` (`pkg/volume/csi/csi_util.go:182-196`):
 /// the inline source's driver if present, else the PV source's, else an error.

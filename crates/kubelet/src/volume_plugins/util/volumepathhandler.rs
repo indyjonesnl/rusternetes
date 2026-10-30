@@ -359,7 +359,7 @@ fn map_bind_mount_device(
 }
 
 /// Port of `AttachFileDevice` over an injectable `losetup` runner / sysfs.
-fn attach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<String> {
+pub fn attach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<String> {
     let mut block_device_path = match get_loop_device_with(sys_block, path) {
         Ok(p) => p,
         Err(e) if e.to_string() == ERR_DEVICE_NOT_FOUND => String::new(),
@@ -375,7 +375,7 @@ fn attach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Res
 }
 
 /// Port of `DetachFileDevice` over an injectable `losetup` runner / sysfs.
-fn detach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<()> {
+pub fn detach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Result<()> {
     match get_loop_device_with(sys_block, path) {
         Err(e) if e.to_string() == ERR_DEVICE_NOT_FOUND => {
             tracing::warn!(
@@ -395,7 +395,7 @@ fn detach_file_device_with(exec: &dyn Exec, sys_block: &Path, path: &str) -> Res
 }
 
 /// Port of `GetLoopDevice` (`volume_path_handler_linux.go:77-87`).
-fn get_loop_device_with(sys_block: &Path, path: &str) -> Result<String> {
+pub fn get_loop_device_with(sys_block: &Path, path: &str) -> Result<String> {
     match fs::metadata(path) {
         Ok(_) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => bail!("{ERR_DEVICE_NOT_FOUND}"),
@@ -465,7 +465,7 @@ fn get_loop_device_from_sysfs(sys_block: &Path, path: &str) -> Result<String> {
 }
 
 /// Port of `cleanBackingFilePath` (`volume_path_handler_linux.go:151-156`).
-fn clean_backing_file_path(path: &str) -> String {
+pub fn clean_backing_file_path(path: &str) -> String {
     // If the block device was deleted, the path will contain a "(deleted)" suffix
     let path = path.trim();
     let path = path.strip_suffix("(deleted)").unwrap_or(path);
@@ -488,147 +488,3 @@ fn remove_ignoring_not_found(path: &Path) -> Result<()> {
         Err(e) => bail!("failed to remove file {}: {e}", path.display()),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    //! Ported from `volume_path_handler_test.go` (`TestMapDevice`,
-    //! `TestUnmapDevice`, `TestRemoveMapPath`, `TestIsSymlinkExist`).
-    use super::*;
-    use tempfile::tempdir;
-
-    fn err_of(r: Result<()>) -> String {
-        r.unwrap_err().to_string()
-    }
-
-    #[test]
-    fn map_device_valid_symlink() {
-        let tmp = tempdir().unwrap();
-        let map = tmp.path().join("test-map-valid");
-        fs::create_dir_all(&map).unwrap();
-        VolumePathHandler
-            .map_device("/dev/fakeDevice", map.to_str().unwrap(), "validLink", false)
-            .unwrap();
-        let link = map.join("validLink");
-        assert_eq!(fs::read_link(&link).unwrap(), Path::new("/dev/fakeDevice"));
-    }
-
-    #[test]
-    fn map_device_replaces_existing_link() {
-        let tmp = tempdir().unwrap();
-        let map = tmp.path().to_str().unwrap();
-        VolumePathHandler
-            .map_device("/dev/a", map, "l", false)
-            .unwrap();
-        VolumePathHandler
-            .map_device("/dev/b", map, "l", false)
-            .unwrap();
-        assert_eq!(
-            fs::read_link(tmp.path().join("l")).unwrap(),
-            Path::new("/dev/b")
-        );
-    }
-
-    #[test]
-    fn map_device_empty_device_path() {
-        let tmp = tempdir().unwrap();
-        let e = err_of(VolumePathHandler.map_device("", tmp.path().to_str().unwrap(), "l", false));
-        assert_eq!(e, "failed to map device to map path. devicePath is empty");
-    }
-
-    #[test]
-    fn map_device_empty_map_path() {
-        let e = err_of(VolumePathHandler.map_device("/dev/fakeDevice", "", "l", false));
-        assert_eq!(e, "failed to map device to map path. mapPath is empty");
-    }
-
-    #[test]
-    fn map_device_relative_map_path() {
-        let e = err_of(VolumePathHandler.map_device("/dev/x", "rel/path", "l", false));
-        assert_eq!(e, "the map path should be absolute: map path: rel/path");
-    }
-
-    #[test]
-    fn unmap_device_valid_symlink() {
-        let tmp = tempdir().unwrap();
-        symlink("/dev/fakeDevice", tmp.path().join("validLink")).unwrap();
-        VolumePathHandler
-            .unmap_device(tmp.path().to_str().unwrap(), "validLink", false)
-            .unwrap();
-        assert!(fs::symlink_metadata(tmp.path().join("validLink")).is_err());
-    }
-
-    #[test]
-    fn unmap_device_symlink_does_not_exist() {
-        let tmp = tempdir().unwrap();
-        VolumePathHandler
-            .unmap_device(tmp.path().to_str().unwrap(), "nonexistentLink", false)
-            .unwrap();
-    }
-
-    #[test]
-    fn unmap_device_bind_mount_file_exists_but_not_mounted() {
-        let tmp = tempdir().unwrap();
-        fs::write(tmp.path().join("bindFile"), b"").unwrap();
-        VolumePathHandler
-            .unmap_device(tmp.path().to_str().unwrap(), "bindFile", true)
-            .unwrap();
-        assert!(fs::symlink_metadata(tmp.path().join("bindFile")).is_err());
-    }
-
-    #[test]
-    fn unmap_device_bind_mount_file_does_not_exist() {
-        let tmp = tempdir().unwrap();
-        VolumePathHandler
-            .unmap_device(tmp.path().to_str().unwrap(), "bindFileNotExist", true)
-            .unwrap();
-    }
-
-    #[test]
-    fn unmap_device_empty_map_path() {
-        for bind in [false, true] {
-            let e = err_of(VolumePathHandler.unmap_device("", "someLink", bind));
-            assert_eq!(e, "failed to unmap device from map path. mapPath is empty");
-        }
-    }
-
-    #[test]
-    fn remove_map_path_existing_and_missing() {
-        let tmp = tempdir().unwrap();
-        let p = tmp.path().join("test-remove-map-path");
-        fs::create_dir_all(&p).unwrap();
-        VolumePathHandler
-            .remove_map_path(p.to_str().unwrap())
-            .unwrap();
-        assert!(!p.exists());
-        VolumePathHandler
-            .remove_map_path(tmp.path().join("non-existing-path").to_str().unwrap())
-            .unwrap();
-        assert_eq!(
-            err_of(VolumePathHandler.remove_map_path("")),
-            "failed to remove map path. mapPath is empty"
-        );
-    }
-
-    #[test]
-    fn is_symlink_exist_cases() {
-        let tmp = tempdir().unwrap();
-        let link = tmp.path().join("test-symlink-link");
-        symlink("/dev/fakeDevice", &link).unwrap();
-        assert!(VolumePathHandler
-            .is_symlink_exist(link.to_str().unwrap())
-            .unwrap());
-        assert!(!VolumePathHandler
-            .is_symlink_exist(tmp.path().join("non-existing-symlink").to_str().unwrap())
-            .unwrap());
-        // A regular file is not a symlink.
-        let f = tmp.path().join("file");
-        fs::write(&f, b"").unwrap();
-        assert!(!VolumePathHandler
-            .is_symlink_exist(f.to_str().unwrap())
-            .unwrap());
-    }
-}
-
-#[cfg(test)]
-#[path = "volumepathhandler_bind_loop_tests.rs"]
-mod bind_mount_and_loop_tests;

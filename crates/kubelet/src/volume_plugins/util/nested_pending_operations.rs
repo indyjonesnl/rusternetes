@@ -72,25 +72,25 @@ impl std::fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 #[derive(Clone, Debug)]
-struct Operation {
-    key: OperationKey,
-    operation_name: String,
-    operation_pending: bool,
-    exp_backoff: ExponentialBackoff,
+pub struct Operation {
+    pub key: OperationKey,
+    pub operation_name: String,
+    pub operation_pending: bool,
+    pub exp_backoff: ExponentialBackoff,
 }
 
 #[derive(Default)]
-struct Inner {
-    operations: Vec<Operation>,
-    exponential_back_off_on_error: bool,
+pub struct Inner {
+    pub operations: Vec<Operation>,
+    pub exponential_back_off_on_error: bool,
 }
 
 /// `nestedPendingOperations`.
 #[derive(Clone)]
 pub struct NestedPendingOperations {
-    inner: Arc<Mutex<Inner>>,
+    pub inner: Arc<Mutex<Inner>>,
     /// `grm.cond`, for [`Self::wait`].
-    changed: Arc<Notify>,
+    pub changed: Arc<Notify>,
 }
 
 impl NestedPendingOperations {
@@ -334,6 +334,3 @@ impl Inner {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -14,6 +14,3 @@ pub mod status;
 pub mod translate;
 
 pub use runtime::{CriContainerRuntime, CriRuntimeError};
-
-#[cfg(test)]
-mod fake_cri_tests;

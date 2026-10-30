@@ -65,9 +65,9 @@ pub const ASSUME_DELETED_THRESHOLD: Duration = Duration::from_secs(10 * 60);
 /// `BeginRefreshAt` is overdue for refresh.
 pub const REFRESH_OVERDUE_DURATION: Duration = Duration::from_secs(10 * 60);
 
-const PCR_RESOURCE: &str = "podcertificaterequests";
+pub const PCR_RESOURCE: &str = "podcertificaterequests";
 
-fn chrono_dur(d: Duration) -> ChronoDuration {
+pub fn chrono_dur(d: Duration) -> ChronoDuration {
     ChronoDuration::from_std(d).unwrap_or_else(|_| ChronoDuration::zero())
 }
 
@@ -229,7 +229,7 @@ impl CredState {
 }
 
 /// `projectionRecord` (`:140-155`): the lock covers the whole state.
-struct ProjectionRecord {
+pub struct ProjectionRecord {
     cur_state: Mutex<CredState>,
 }
 
@@ -240,7 +240,7 @@ struct ProjectionRecord {
 /// `workqueue.DefaultTypedControllerRateLimiter`'s per-item half:
 /// `NewTypedItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second)`
 /// (`client-go/util/workqueue/default_rate_limiters.go`).
-fn item_backoff(failures: u32) -> Duration {
+pub fn item_backoff(failures: u32) -> Duration {
     let base = Duration::from_millis(5);
     let max = Duration::from_secs(1000);
     let exp = failures.min(40);
@@ -261,7 +261,7 @@ struct QueueState {
 
 /// The `workqueue.TypedRateLimitingInterface[projectionKey]` surface used by
 /// the manager: `Add`, `AddRateLimited`, `Get`, `Done`, `Forget`, `ShutDown`.
-struct ProjectionQueue {
+pub struct ProjectionQueue {
     state: StdMutex<QueueState>,
     notify: Notify,
 }
@@ -342,9 +342,12 @@ impl ProjectionQueue {
         self.notify.notify_one();
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.state.lock().unwrap().queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -357,14 +360,14 @@ impl ProjectionQueue {
 /// State is not preserved across restarts — if Kubelet or the node restarts,
 /// all PodCertificateProjections are queued for immediate refresh (`:104-105`).
 pub struct IssuingManager<S: Storage + ?Sized + 'static> {
-    storage: Arc<S>,
-    pod_manager: Arc<dyn PodManager>,
-    recorder: Option<EventRecorder<S>>,
-    projection_queue: Arc<ProjectionQueue>,
-    node_name: String,
-    clock: Arc<dyn Clock>,
+    pub storage: Arc<S>,
+    pub pod_manager: Arc<dyn PodManager>,
+    pub recorder: Option<EventRecorder<S>>,
+    pub projection_queue: Arc<ProjectionQueue>,
+    pub node_name: String,
+    pub clock: Arc<dyn Clock>,
     /// `lock` covers credStore.
-    cred_store: StdMutex<HashMap<ProjectionKey, Arc<ProjectionRecord>>>,
+    pub cred_store: StdMutex<HashMap<ProjectionKey, Arc<ProjectionRecord>>>,
 }
 
 impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
@@ -878,8 +881,7 @@ impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
         });
     }
 
-    #[cfg(test)]
-    fn queued(&self) -> usize {
+    pub fn queued(&self) -> usize {
         self.projection_queue.len()
     }
 }
@@ -1194,6 +1196,3 @@ pub mod tokio_util_cancel {
 }
 
 pub mod wiring;
-
-#[cfg(test)]
-mod tests;

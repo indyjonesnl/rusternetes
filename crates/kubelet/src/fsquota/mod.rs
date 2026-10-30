@@ -48,50 +48,50 @@ type Applier = Arc<dyn LinuxVolumeQuotaApplier>;
 
 /// The maps guarded by `quotaLock`.
 #[derive(Default)]
-struct QuotaMaps {
+pub struct QuotaMaps {
     /// Pod -> External Pod UID
-    pod_uid_map: HashMap<String, String>,
+    pub pod_uid_map: HashMap<String, String>,
     /// Pod -> ID
-    pod_quota_map: HashMap<String, QuotaID>,
+    pub pod_quota_map: HashMap<String, QuotaID>,
     /// Dir -> ID (for convenience)
-    dir_quota_map: HashMap<String, QuotaID>,
+    pub dir_quota_map: HashMap<String, QuotaID>,
     /// ID -> pod
-    quota_pod_map: HashMap<QuotaID, String>,
+    pub quota_pod_map: HashMap<QuotaID, String>,
     /// Directory -> pod
-    dir_pod_map: HashMap<String, String>,
+    pub dir_pod_map: HashMap<String, String>,
     /// Pod -> refcount
-    pod_dir_count_map: HashMap<String, i32>,
+    pub pod_dir_count_map: HashMap<String, i32>,
     /// ID -> size
-    quota_size_map: HashMap<QuotaID, i64>,
+    pub quota_size_map: HashMap<QuotaID, i64>,
 }
 
 /// The maps guarded by `dirApplierLock`, `supportsQuotasLock`,
 /// `backingDevLock` and `mountpointLock`.
 #[derive(Default)]
-struct FsMaps {
+pub struct FsMaps {
     /// Backing device -> applier. This is *not* cleaned up; its size will be
     /// bounded.
-    dev_applier_map: HashMap<String, Applier>,
+    pub dev_applier_map: HashMap<String, Applier>,
     /// Directory -> applier
-    dir_applier_map: HashMap<String, Applier>,
-    supports_quotas_map: HashMap<String, bool>,
+    pub dir_applier_map: HashMap<String, Applier>,
+    pub supports_quotas_map: HashMap<String, bool>,
     /// Directory -> backingDev
-    backing_dev_map: HashMap<String, String>,
-    mountpoint_map: HashMap<String, String>,
+    pub backing_dev_map: HashMap<String, String>,
+    pub mountpoint_map: HashMap<String, String>,
 }
 
 /// The state of the `fsquota` package.
 pub struct FsQuota {
-    providers: Vec<Box<dyn LinuxVolumeQuotaProvider>>,
-    projects_file: PathBuf,
-    projid_file: PathBuf,
+    pub providers: Vec<Box<dyn LinuxVolumeQuotaProvider>>,
+    pub projects_file: PathBuf,
+    pub projid_file: PathBuf,
     /// `quotaIDLock`.
-    quota_id_lock: Mutex<()>,
+    pub quota_id_lock: Mutex<()>,
     /// `quotaLock`.
-    quota: Mutex<QuotaMaps>,
-    fs: Mutex<FsMaps>,
+    pub quota: Mutex<QuotaMaps>,
+    pub fs: Mutex<FsMaps>,
     /// `enabledQuotasForMonitoring`.
-    enabled: Box<dyn Fn() -> bool + Send + Sync>,
+    pub enabled: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// `enabledQuotasForMonitoring` (`quota.go:53-55`).
@@ -146,7 +146,7 @@ pub fn clear_quota(path: &str, user_namespaces_enabled: bool) -> Result<()> {
 }
 
 /// `detectBackingDevInternal`: separate the innards for ease of testing.
-fn detect_backing_dev_internal(mountpoint: &str, mounts: &str) -> Result<String> {
+pub fn detect_backing_dev_internal(mountpoint: &str, mounts: &str) -> Result<String> {
     let data = std::fs::read_to_string(mounts)?;
     for line in data.lines() {
         let (device, mount) = mount_parse(line);
@@ -159,7 +159,7 @@ fn detect_backing_dev_internal(mountpoint: &str, mounts: &str) -> Result<String>
 
 /// `detectMountpointInternal`: assumes that the path has been fully
 /// canonicalized. Breaking this up helps with testing.
-fn detect_mountpoint_internal(m: &dyn MountInterface, path: &str) -> Result<String> {
+pub fn detect_mountpoint_internal(m: &dyn MountInterface, path: &str) -> Result<String> {
     let mut path = path.to_string();
     while !path.is_empty() && path != "/" {
         // per k8s.io/mount-utils/mount_linux this detects all but a bind
@@ -564,6 +564,3 @@ impl FsQuota {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;
