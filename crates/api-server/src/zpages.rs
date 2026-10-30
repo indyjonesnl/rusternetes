@@ -36,7 +36,7 @@ pub fn set_flagz_reader(reader: NamedFlagSetsReader) {
 /// serves, sorted (`APIServerHandler.ListedPaths`, handler.go:103-113).
 /// `statusz` aggregates `/api*`, `/apis*` etc. itself. `/flagz` is installed
 /// earlier (in `New`) than `/statusz` (in `PrepareRun`), so it is listed.
-fn listed_paths(flagz_installed: bool) -> Vec<String> {
+pub fn listed_paths(flagz_installed: bool) -> Vec<String> {
     let mut paths: Vec<String> = [
         "/.well-known/openid-configuration",
         "/api",
@@ -69,7 +69,10 @@ where
     install_with(router, FLAGZ.get().cloned())
 }
 
-fn install_with<S>(router: axum::Router<S>, reader: Option<NamedFlagSetsReader>) -> axum::Router<S>
+pub fn install_with<S>(
+    router: axum::Router<S>,
+    reader: Option<NamedFlagSetsReader>,
+) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -87,74 +90,4 @@ where
         ))
         .with_listed_paths(listed_paths(flagz_installed))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use rusternetes_common::feature_gates::with_feature;
-    use serial_test::serial;
-    use tower::ServiceExt;
-
-    fn reader() -> NamedFlagSetsReader {
-        NamedFlagSetsReader {
-            flags: vec![flagz::Flag {
-                name: "v".into(),
-                value: "2".into(),
-                classified: false,
-            }],
-        }
-    }
-
-    async fn status(app: axum::Router, path: &str) -> u16 {
-        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-            .status()
-            .as_u16()
-    }
-
-    // genericapiserver.go:466 / server.go:157: gates off => not registered.
-    #[tokio::test]
-    #[serial]
-    async fn nothing_installed_when_gates_off() {
-        let _a = with_feature(Feature::ComponentStatusz, false);
-        let _b = with_feature(Feature::ComponentFlagz, false);
-        let app = install_with(axum::Router::new(), Some(reader()));
-        assert_eq!(status(app.clone(), "/statusz").await, 404);
-        assert_eq!(status(app, "/flagz").await, 404);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn both_installed_when_gates_on() {
-        let _a = with_feature(Feature::ComponentStatusz, true);
-        let _b = with_feature(Feature::ComponentFlagz, true);
-        let app = install_with(axum::Router::new(), Some(reader()));
-        assert_eq!(status(app.clone(), "/statusz").await, 200);
-        assert_eq!(status(app, "/flagz").await, 200);
-    }
-
-    // server.go:158: `c.Generic.Flagz != nil` guards /flagz only.
-    #[tokio::test]
-    #[serial]
-    async fn flagz_needs_a_reader() {
-        let _a = with_feature(Feature::ComponentStatusz, true);
-        let _b = with_feature(Feature::ComponentFlagz, true);
-        let app = install_with(axum::Router::new(), None);
-        assert_eq!(status(app.clone(), "/statusz").await, 200);
-        assert_eq!(status(app, "/flagz").await, 404);
-    }
-
-    #[test]
-    fn listed_paths_are_sorted() {
-        let p = listed_paths(true);
-        let mut s = p.clone();
-        s.sort();
-        assert_eq!(p, s);
-        assert!(p.contains(&"/flagz".to_string()));
-        assert!(!listed_paths(false).contains(&"/flagz".to_string()));
-    }
 }

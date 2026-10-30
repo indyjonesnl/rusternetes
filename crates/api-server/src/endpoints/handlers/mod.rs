@@ -28,6 +28,3 @@ pub use patch::patch_resource;
 pub(crate) use rest::{authorize, is_dry_run, respond};
 pub use rest::{negotiate, RequestScope, RequestVersionConversion};
 pub use update::update_resource;
-
-#[cfg(test)]
-mod tests;

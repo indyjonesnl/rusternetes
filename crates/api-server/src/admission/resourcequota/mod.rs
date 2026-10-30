@@ -348,7 +348,7 @@ async fn update_quota_status<S: Storage>(storage: &S, q: &ResourceQuota) -> Resu
 /// `checkQuotas` (controller.go:228-363) for one request: check it, write
 /// the quotas whose usage changed, and on a conflict re-read those quotas
 /// and check again, `remaining_retries` times.
-async fn check_quotas<S: Storage>(
+pub async fn check_quotas<S: Storage>(
     storage: &S,
     mut quotas: Vec<ResourceQuota>,
     a: &Attributes<'_>,
@@ -452,6 +452,3 @@ pub fn to_api_error(err: QuotaError, gr: &GroupResource, name: &str) -> Error {
         QuotaError::Other(msg) => Error::Internal(msg),
     }
 }
-
-#[cfg(test)]
-mod tests;

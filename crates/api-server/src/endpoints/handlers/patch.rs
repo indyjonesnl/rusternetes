@@ -459,7 +459,7 @@ impl<T: Object> TransformFunc<T> for Patcher<'_, T> {
 
 /// patch.go:116-128: decode the query into `PatchOptions`, then
 /// `ValidatePatchOptions`.
-pub(super) fn checked_patch_options(
+pub fn checked_patch_options(
     params: &HashMap<String, String>,
     content_type: &str,
 ) -> Result<PatchOptions> {
@@ -481,7 +481,7 @@ pub(super) fn checked_patch_options(
 /// `errors.NewInvalid(schema.GroupKind{}, "", field.ErrorList{
 /// field.Invalid(field.NewPath("patch"), patchedObjJS, msg)})`
 /// (patch.go:345-347, 352-354, 361-363).
-pub(super) fn patch_invalid(patched_js: String, msg: String) -> Error {
+pub fn patch_invalid(patched_js: String, msg: String) -> Error {
     Error::new_invalid(
         "",
         "",

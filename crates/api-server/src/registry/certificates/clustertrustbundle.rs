@@ -85,21 +85,3 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<ClusterTrustBundle, Stor
         Arc::new(Strategy),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// strategy_test.go:26-48.
-    #[test]
-    fn strategy_flags_and_warnings() {
-        let s = Strategy;
-        let obj = ClusterTrustBundle::default();
-        let ctx = RequestContext::new(None);
-        assert!(RestCreateStrategy::warnings_on_create(&s, &ctx, &obj).is_empty());
-        assert!(!RestUpdateStrategy::<ClusterTrustBundle>::allow_create_on_update(&s));
-        assert!(RestUpdateStrategy::warnings_on_update(&s, &ctx, &obj, &obj).is_empty());
-        assert!(!RestUpdateStrategy::<ClusterTrustBundle>::allow_unconditional_update(&s));
-        assert!(!NamespaceScopedStrategy::namespace_scoped(&s));
-    }
-}

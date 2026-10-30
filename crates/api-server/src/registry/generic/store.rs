@@ -1323,7 +1323,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// `shouldOrphanDependents` (store.go:883-929) and
     /// `shouldDeleteDependents` (store.go:935-969). Returns whether the
     /// finalizer list changed, and the list to store.
-    fn deletion_finalizers_for_garbage_collection(
+    pub fn deletion_finalizers_for_garbage_collection(
         &self,
         ctx: &RequestContext,
         meta: &ObjectMeta,
@@ -1681,7 +1681,7 @@ pub fn should_delete_during_update<T: Object>(obj: &T, existing: &T) -> bool {
 }
 
 /// `markAsDeleting` (store.go:1009-1029).
-fn mark_as_deleting(meta: &mut ObjectMeta, now: chrono::DateTime<chrono::Utc>) {
+pub fn mark_as_deleting(meta: &mut ObjectMeta, now: chrono::DateTime<chrono::Utc>) {
     use chrono::SubsecRound;
     let now = now.trunc_subsecs(0);
     // The generation bump for resources without graceful deletion; graceful
@@ -1965,7 +1965,3 @@ pub(crate) fn page_for_delete_collection<T: Object>(
     }
     Ok(page)
 }
-
-#[cfg(test)]
-#[path = "store_tests.rs"]
-mod tests;
