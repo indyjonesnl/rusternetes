@@ -14,7 +14,7 @@ pub mod net_interface;
 
 /// `netutils.ParseIPSloppy`: like `ParseIP` but tolerates leading zeros in
 /// IPv4 octets ("01.2.3.004").
-pub(crate) fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
+pub fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Some(ip);
     }
@@ -421,7 +421,6 @@ pub fn apply_host_ips(
 
 /// The setter without an external cloud provider, on a scratch node named
 /// `hostname`; returns `(type, address)` pairs.
-#[cfg(test)]
 pub fn node_addresses(
     node_ips: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
