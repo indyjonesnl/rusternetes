@@ -7,7 +7,7 @@ use rusternetes_middleware::decode_k8s_protobuf_request_body;
 
 #[test]
 fn controllerrevision_request_decodes_with_data() {
-    let body = include_bytes!("fixtures/controllerrevision_daemonset_post.bin");
+    let body = include_bytes!("../fixtures/controllerrevision_daemonset_post.bin");
     let json = decode_k8s_protobuf_request_body(body);
     let v: serde_json::Value = serde_json::from_slice(&json).expect("decoded JSON");
     assert_eq!(
