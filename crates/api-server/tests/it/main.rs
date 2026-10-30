@@ -12,6 +12,7 @@
 mod admission_chain_metrics_test;
 mod admission_invalid_value_rejected_test;
 mod admission_test;
+mod admission_unit;
 mod admission_webhook_e2e_test;
 mod admissionregistration_store_test;
 mod aggregator_test;

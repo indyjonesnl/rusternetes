@@ -1,0 +1,32 @@
+//! Unit tests moved out of `src/` so the lib is not compiled a second time as a test target.
+#![allow(non_snake_case)]
+mod admission;
+mod admission__builtin_plugins;
+mod admission__caching_authorizer;
+mod admission__certificates;
+mod admission__config;
+mod admission__event_rate_limit;
+mod admission__image_policy;
+mod admission__namespace_plugins;
+mod admission__owner_references_permission_enforcement;
+mod admission__plugin_metrics;
+mod admission__plugins;
+mod admission__pod_plugins;
+mod admission__pod_security_api;
+mod admission__pod_security_controller;
+mod admission__pod_security_namespace;
+mod admission__pod_security_policy;
+mod admission__policy_apply_config;
+mod admission__policy_dispatch;
+mod admission__policy_install;
+mod admission__policy_json_patch;
+mod admission__policy_json_patch_ops;
+mod admission__policy_match_conditions;
+mod admission__policy_matching;
+mod admission__policy_mutating;
+mod admission__policy_mutating_metrics;
+mod admission__policy_plugin;
+mod admission__policy_registry;
+mod admission__policy_source;
+mod admission__resourcequota;
+mod admission__storage_object_in_use_protection;
