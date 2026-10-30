@@ -1,3 +1,6 @@
+//! SEPARATE-TEST-BINARY: the storage-contract workflow runs this target by
+//! name (`cargo test --test storage_contract -- --test-threads=1`).
+
 //! Every `Storage` backend must satisfy the same contract. See
 //! `contract/mod.rs` for the provenance of these tests.
 
