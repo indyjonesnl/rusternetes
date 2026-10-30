@@ -9,12 +9,8 @@ license.workspace = true
 rusternetes-common = { path = "../common" }
 
 tokio = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 
 # AWS SDK (optional, enabled with 'aws' feature)
 aws-config = { workspace = true, optional = true }
