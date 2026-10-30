@@ -993,7 +993,6 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting endpointslice reconciliation");
 
@@ -1726,7 +1725,6 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// Clean up orphaned EndpointSlices whose owning Service or Endpoints no
     /// longer exists. Used by external callers and tests; the regular
     /// reconcile loop also runs this cleanup.
-    #[allow(dead_code)]
     pub async fn cleanup_orphans(&self) -> Result<()> {
         let all_slices: Vec<EndpointSlice> = self
             .storage

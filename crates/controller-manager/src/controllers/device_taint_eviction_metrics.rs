@@ -8,8 +8,6 @@
 //! plus `Register()` publish one instance in `legacyregistry`; here
 //! [`Metrics::new`] is `New` and [`global`] is `Global`.
 
-#![allow(dead_code)]
-
 use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, Opts, Registry, TextEncoder};
 use std::sync::{Arc, LazyLock};
 

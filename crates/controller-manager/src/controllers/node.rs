@@ -10,8 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
 use rusternetes_common::quantity::Quantity;
 use rusternetes_common::resources::node::Taint;
-use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
-use rusternetes_common::types::Phase;
+use rusternetes_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -210,7 +209,6 @@ fn apply_status_unknown(
 }
 
 impl<S: Storage + 'static> NodeController<S> {
-    #[allow(dead_code)]
     pub fn new(storage: Arc<S>) -> Self {
         Self::with_eviction_config(storage, EvictionConfig::default())
     }
@@ -235,7 +233,6 @@ impl<S: Storage + 'static> NodeController<S> {
 
     /// Test helper: move the controller's clock forward, the way upstream's
     /// tests advance `fakeNow`.
-    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn advance_clock_for_test(&self, by: Duration) {
         *self.clock_offset.lock().unwrap() += by;
@@ -244,11 +241,6 @@ impl<S: Storage + 'static> NodeController<S> {
     /// Test helper: mark `node_name` as observed long enough ago that the
     /// nodeHealthMap startup grace period is over, so tests observe the
     /// Ready-flip behavior deterministically without sleeping.
-    ///
-    /// `dead_code` allowed because the bin compilation unit never calls this
-    /// (cfg(test) blocks aren't compiled for the bin), but integration tests
-    /// under `crates/controller-manager/tests/` do.
-    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn seed_first_seen_for_test(&self, node_name: &str) {
         // The controller has been watching this node all along: its first
@@ -549,7 +541,6 @@ impl<S: Storage + 'static> NodeController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting node reconciliation");
 
@@ -1909,52 +1900,6 @@ impl<S: Storage + 'static> NodeController<S> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    /// Mark a pod as failed due to node failure
-    #[allow(dead_code)]
-    async fn mark_pod_failed(&self, namespace: &str, pod_name: &str, reason: &str) -> Result<()> {
-        let pod_key = build_key("pods", Some(namespace), pod_name);
-
-        let mut pod: Pod = match self.storage.get(&pod_key).await {
-            Ok(p) => p,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Initialize status if needed
-        if pod.status.is_none() {
-            pod.status = Some(PodStatus {
-                phase: Some(Phase::Pending),
-                message: None,
-                reason: None,
-                host_ip: None,
-                host_i_ps: None,
-                pod_ip: None,
-                pod_i_ps: None,
-                nominated_node_name: None,
-                qos_class: None,
-                start_time: None,
-                conditions: None,
-                container_statuses: None,
-                init_container_statuses: None,
-                ephemeral_container_statuses: None,
-                resize: None,
-                resource_claim_statuses: None,
-                observed_generation: None,
-                ..Default::default()
-            });
-        }
-
-        let status = pod.status.as_mut().unwrap();
-        status.phase = Some(Phase::Failed);
-        status.reason = Some(reason.to_string());
-        status.message = Some(format!("Node {} is not ready", reason));
-
-        // Update pod
-        self.storage.update(&pod_key, &pod).await?;
 
         Ok(())
     }

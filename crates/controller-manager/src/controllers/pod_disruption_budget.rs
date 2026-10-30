@@ -900,7 +900,6 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     }
 
     /// Reconcile every PDB once (tests and one-shot callers).
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
         let pdbs: Vec<PodDisruptionBudget> = self
             .storage
@@ -1278,7 +1277,6 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
 
     /// Test helper: install a custom timeout so the controller can be driven
     /// deterministically without 120s of wall-clock waiting.
-    #[allow(dead_code)]
     #[doc(hidden)]
     pub fn with_timeout(storage: Arc<S>, timeout: StdDuration) -> Self {
         Self { storage, timeout }
@@ -1370,7 +1368,6 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
     }
 
     /// Walk every pod, fix the stale ones (tests call this directly).
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> anyhow::Result<()> {
         let queue = WorkQueue::new();
         let pods: Vec<Pod> = self.storage.list("/registry/pods/").await?;

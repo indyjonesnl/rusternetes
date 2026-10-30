@@ -134,7 +134,6 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     }
 
     /// Main reconciliation loop - processes all NetworkPolicies
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting NetworkPolicy reconciliation");
 

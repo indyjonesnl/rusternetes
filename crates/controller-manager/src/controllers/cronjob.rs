@@ -396,7 +396,6 @@ impl<S: Storage + 'static> CronJobController<S> {
 
     /// Replace the clock, as upstream tests set `jm.now`. Used by the `it`
     /// integration tests; the bin target compiles this module without them.
-    #[allow(dead_code)]
     pub fn with_now(
         mut self,
         now: impl Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static,
@@ -769,7 +768,6 @@ impl<S: Storage + 'static> CronJobController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         let cronjobs: Vec<CronJob> = self.storage.list("/registry/cronjobs/").await?;
 

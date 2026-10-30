@@ -162,7 +162,6 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
     }
 
     /// Main reconciliation loop - processes all CSR resources
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting CertificateSigningRequest reconciliation");
 

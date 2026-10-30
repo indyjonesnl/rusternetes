@@ -142,7 +142,6 @@ impl CapacityRefresher {
 
     /// Seed `capacities` with entries that have no object yet (what
     /// `addWorkItem` does, capacity.go:469-484, minus the enqueue).
-    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn set_capacities(&self, items: HashSet<ItemKey>) {
         self.lock().capacities = items.into_iter().map(|i| (i, None)).collect();
     }
@@ -245,7 +244,6 @@ impl CapacityRefresher {
     }
 
     /// The queued work items, oldest first.
-    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn queued(&self) -> Vec<ItemKey> {
         self.lock()
             .queue
@@ -257,7 +255,6 @@ impl CapacityRefresher {
             .collect()
     }
 
-    #[allow(dead_code)] // used by tests; the bin target re-includes this module
     pub fn clear_queue(&self) {
         let mut st = self.lock();
         st.queue.clear();

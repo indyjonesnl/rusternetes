@@ -54,7 +54,6 @@ pub struct ReplicaSetController<S: Storage> {
 }
 
 impl<S: Storage + 'static> ReplicaSetController<S> {
-    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>, interval_secs: u64) -> Self {
         let interval = Duration::from_secs(interval_secs);
         let pod_informer = Arc::new(SharedPodInformer::new(storage.clone(), interval));
@@ -281,7 +280,6 @@ impl<S: Storage + 'static> ReplicaSetController<S> {
         }
     }
 
-    #[allow(dead_code)]
     /// One synchronous pass, for callers that do not run the watch loop: let the
     /// pod informer catch up (the reflector's list, [`Self::relist_pods`]) and
     /// then sync every object once. The informer step is what lowers the

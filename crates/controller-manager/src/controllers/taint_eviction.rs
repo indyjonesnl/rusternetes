@@ -306,7 +306,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     }
 
     /// `PodUpdated` (taint_eviction.go:389).
-    #[allow(dead_code)] // upstream API; the bin's watch path goes through observe_*
     pub async fn pod_updated(&self, old_pod: Option<&Pod>, new_pod: Option<&Pod>) {
         self.snapshot_updated(
             old_pod.map(PodSnapshot::of).as_ref(),
@@ -332,7 +331,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     }
 
     /// `NodeUpdated` (taint_eviction.go:421).
-    #[allow(dead_code)] // upstream API; the bin's watch path goes through observe_*
     pub async fn node_updated(&self, old_node: Option<&Node>, new_node: Option<&Node>) {
         let old = old_node.map(|n| taint_keys(&node_no_execute_taints(n)));
         self.taints_updated(
@@ -650,7 +648,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     }
 
     /// The deferred shutdown of `Run` (taint_eviction.go:292-298).
-    #[allow(dead_code)] // upstream API; the bin's watch path goes through observe_*
     pub async fn shutdown(&self) {
         self.node_update_queue.shutdown().await;
         self.pod_update_queue.shutdown().await;
@@ -815,7 +812,6 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
     /// Single synchronous pass over every node, for callers (and tests) that
     /// have no running worker pool: handles each node directly and waits for
     /// the evictions that fire immediately.
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting taint eviction reconciliation");
         let nodes: Vec<Node> = self.storage.list(&build_prefix("nodes", None)).await?;

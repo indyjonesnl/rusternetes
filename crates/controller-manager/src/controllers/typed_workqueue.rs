@@ -22,8 +22,6 @@
 //! upstream `Mock`, `mockqueue_test.go`) and the eviction simulation a no-op
 //! queue (`nopqueue.go`).
 
-#![allow(dead_code)]
-
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;

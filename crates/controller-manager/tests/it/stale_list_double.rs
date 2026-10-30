@@ -26,8 +26,6 @@
 //! Two knobs, one per shape of lag. Both are opt-in so each test states exactly
 //! what it models; everything else passes through to `MemoryStorage`.
 
-#![allow(dead_code)]
-
 use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
 use std::collections::HashSet;
 use std::sync::Mutex;

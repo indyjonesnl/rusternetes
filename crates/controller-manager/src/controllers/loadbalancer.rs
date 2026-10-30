@@ -195,7 +195,6 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Reconciling LoadBalancer services");
 
@@ -676,7 +675,6 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
     }
 
     /// Delete load balancer for a service (called when service is deleted)
-    #[allow(dead_code)]
     pub async fn cleanup_service(&self, namespace: &str, name: &str) -> Result<()> {
         let cloud_provider = match &self.cloud_provider {
             Some(p) => p,

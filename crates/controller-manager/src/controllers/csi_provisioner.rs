@@ -923,7 +923,6 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     /// deployment.
     /// Library entry point: no controller-manager flag selects node
     /// deployment (that needs a per-node CSI driver `NodeGetInfo`).
-    #[allow(dead_code)]
     pub fn with_node_deployment(mut self, nd: NodeDeployment) -> Self {
         self.owner_limiter = Some(OwnerRateLimiter::new(nd.base_delay, nd.max_delay));
         self.node_deployment = Some(nd);

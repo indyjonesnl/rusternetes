@@ -437,7 +437,6 @@ impl<S: Storage + 'static> PodEventTarget for JobController<S> {
 }
 
 impl<S: Storage + 'static> JobController<S> {
-    #[allow(dead_code)] // the binary shares one informer via `with_pod_informer`
     pub fn new(storage: Arc<S>) -> Self {
         let pod_informer = Arc::new(SharedPodInformer::new(
             storage.clone(),
@@ -1119,7 +1118,6 @@ impl<S: Storage + 'static> JobController<S> {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         let jobs: Vec<Job> = self.storage.list("/registry/jobs/").await?;
 

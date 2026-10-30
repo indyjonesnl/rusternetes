@@ -316,7 +316,6 @@ impl<S: Storage + 'static> NamespaceController<S> {
     }
 
     /// Main reconciliation loop - processes all namespaces
-    #[allow(dead_code)]
     pub async fn reconcile_all(&self) -> Result<()> {
         debug!("Starting namespace reconciliation");
 
@@ -1188,27 +1187,6 @@ impl<S: Storage + 'static> NamespaceController<S> {
         }
 
         Ok(total)
-    }
-
-    /// Remove lifecycle finalizers from a namespace through `/finalize`.
-    #[allow(dead_code)]
-    async fn remove_namespace_finalizers(&self, name: &str) -> Result<()> {
-        let key = build_key("namespaces", None, name);
-
-        // Get current namespace
-        let mut namespace: Namespace = self.storage.get(&key).await?;
-
-        // Remove all finalizers
-        namespace
-            .spec
-            .get_or_insert_with(Default::default)
-            .finalizers = None;
-
-        self.storage
-            .update_subresource(&key, "finalize", &namespace)
-            .await?;
-
-        Ok(())
     }
 }
 
