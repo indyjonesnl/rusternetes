@@ -152,7 +152,7 @@ const RETRY_INTERVAL_MAX: Duration = Duration::from_secs(300);
 /// `DefaultTypedControllerRateLimiter`'s per-item exponential limiter
 /// (`5ms` base, `1000s` cap), used by the background PV store.
 const PV_SAVE_BASE: Duration = Duration::from_millis(5);
-const PV_SAVE_MAX: Duration = Duration::from_secs(1000);
+pub const PV_SAVE_MAX: Duration = Duration::from_secs(1000);
 /// Concurrent claim workers (`--worker-threads`, csi-provisioner.go:85,
 /// default 100; this process runs fewer, the claims are cheap).
 const WORKERS: usize = 8;
@@ -330,7 +330,7 @@ pub fn remove_prefixed_parameters(
 /// `secretParamsMap` (controller.go:140-158): the parameter keys naming one
 /// kind of secret. `deprecated_*` are the pre-prefix keys, NOT stripped from
 /// the parameters passed to CreateVolume.
-struct SecretParams {
+pub struct SecretParams {
     name: &'static str,
     deprecated_name_key: Option<&'static str>,
     deprecated_namespace_key: Option<&'static str>,
@@ -346,7 +346,7 @@ const DEFAULT_SECRET_PARAMS: SecretParams = SecretParams {
     name_key: "csi.storage.k8s.io/secret-name",
     namespace_key: "csi.storage.k8s.io/secret-namespace",
 };
-const PROVISIONER_SECRET_PARAMS: SecretParams = SecretParams {
+pub const PROVISIONER_SECRET_PARAMS: SecretParams = SecretParams {
     name: "Provisioner",
     deprecated_name_key: Some("csiProvisionerSecretName"),
     deprecated_namespace_key: Some("csiProvisionerSecretNamespace"),
@@ -486,7 +486,7 @@ fn shell_name(s: &str) -> (&str, usize) {
 }
 
 /// `resolveTemplate` (controller.go:1989-2002) over Go's `os.Expand`.
-fn resolve_template(
+pub fn resolve_template(
     template: &str,
     params: &HashMap<String, String>,
 ) -> std::result::Result<String, String> {
@@ -526,7 +526,7 @@ fn resolve_template(
 /// `getSecretReference` (controller.go:1922-1987): the secret named by the
 /// class parameters, its name and namespace templates resolved against the PV
 /// and claim. No lookup of the secret itself is performed.
-fn get_secret_reference(
+pub fn get_secret_reference(
     secret_params: &SecretParams,
     sc_params: &HashMap<String, String>,
     pv_name: &str,
@@ -703,7 +703,7 @@ fn storage_bytes(q: Option<&String>) -> i64 {
 /// a random share of `BaseDelay`. Keyed by claim UID; the value also keeps the
 /// queue key so a deleted claim can be forgotten (the informer `DeleteFunc`
 /// at controller.go:429-441).
-struct OwnerRateLimiter {
+pub struct OwnerRateLimiter {
     base: Duration,
     max: Duration,
     /// claim UID -> (queue key, failures).
@@ -711,7 +711,7 @@ struct OwnerRateLimiter {
 }
 
 impl OwnerRateLimiter {
-    fn new(base: Duration, max: Duration) -> Self {
+    pub fn new(base: Duration, max: Duration) -> Self {
         Self {
             base,
             max,
@@ -720,12 +720,12 @@ impl OwnerRateLimiter {
     }
 
     /// `NumRequeues`.
-    fn num_requeues(&self, uid: &str) -> u32 {
+    pub fn num_requeues(&self, uid: &str) -> u32 {
         self.failures.lock().unwrap().get(uid).map_or(0, |e| e.1)
     }
 
     /// `rateLimiterWithJitter.When` over `ItemExponentialFailureRateLimiter.When`.
-    fn when(&self, uid: &str, key: &str) -> Duration {
+    pub fn when(&self, uid: &str, key: &str) -> Duration {
         let exp = {
             let mut f = self.failures.lock().unwrap();
             let e = f.entry(uid.to_string()).or_insert((key.to_string(), 0));
@@ -754,7 +754,7 @@ impl OwnerRateLimiter {
     }
 
     /// Informer `DeleteFunc`: the claim behind `key` is gone.
-    fn forget_key(&self, key: &str) {
+    pub fn forget_key(&self, key: &str) {
         self.failures.lock().unwrap().retain(|_, e| e.0 != key);
     }
 }
@@ -3357,235 +3357,8 @@ async fn cancelled(ctx: &mut tokio::sync::watch::Receiver<bool>) {
 }
 
 /// `NewItemExponentialFailureRateLimiter(5ms, 1000s)`: `base * 2^(n-1)`.
-fn backoff(attempts: u32) -> Duration {
+pub fn backoff(attempts: u32) -> Duration {
     PV_SAVE_BASE
         .checked_mul(2u32.saturating_pow(attempts.saturating_sub(1)))
         .map_or(PV_SAVE_MAX, |d| d.min(PV_SAVE_MAX))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use PersistentVolumeAccessMode::*;
-
-    /// `access_modes_test.go`'s table, both mappings.
-    #[test]
-    fn access_modes_map_like_csi_lib_utils() {
-        assert_eq!(
-            to_csi_access_mode(&[ReadWriteOnce], false),
-            Ok(AccessModeKind::SingleNodeWriter)
-        );
-        assert_eq!(
-            to_csi_access_mode(&[ReadWriteOnce], true),
-            Ok(AccessModeKind::SingleNodeMultiWriter)
-        );
-        assert_eq!(
-            to_csi_access_mode(&[ReadWriteOncePod], false),
-            Ok(AccessModeKind::SingleNodeWriter)
-        );
-        assert_eq!(
-            to_csi_access_mode(&[ReadWriteOncePod], true),
-            Ok(AccessModeKind::SingleNodeSingleWriter)
-        );
-        assert_eq!(
-            to_csi_access_mode(&[ReadWriteMany, ReadOnlyMany], true),
-            Ok(AccessModeKind::MultiNodeMultiWriter)
-        );
-        assert_eq!(
-            to_csi_access_mode(&[ReadOnlyMany], false),
-            Ok(AccessModeKind::MultiNodeReaderOnly)
-        );
-        assert!(to_csi_access_mode(&[ReadOnlyMany, ReadWriteOnce], false).is_err());
-        assert!(to_csi_access_mode(&[ReadWriteOncePod, ReadWriteOnce], false).is_err());
-        assert!(to_csi_access_mode(&[], false).is_err());
-    }
-
-    #[test]
-    fn prefixed_parameters_are_stripped_and_unknown_ones_rejected() {
-        let p: HashMap<String, String> = [
-            ("type", "ssd"),
-            ("csi.storage.k8s.io/fstype", "xfs"),
-            ("csi.storage.k8s.io/provisioner-secret-name", "s"),
-            ("csiFoo", "kept: not under the reserved prefix"),
-        ]
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .into();
-        let out = remove_prefixed_parameters(&p).unwrap();
-        assert_eq!(out.len(), 2);
-        assert!(out.contains_key("type") && out.contains_key("csiFoo"));
-        let bad: HashMap<String, String> =
-            [("csi.storage.k8s.io/bogus".to_string(), "x".to_string())].into();
-        assert!(remove_prefixed_parameters(&bad)
-            .unwrap_err()
-            .contains("found unknown parameter key"));
-    }
-
-    fn pvc(name: &str, ns: &str, ann: &[(&str, &str)]) -> PersistentVolumeClaim {
-        let mut meta = ObjectMeta::new(name).with_namespace(ns);
-        meta.annotations = Some(
-            ann.iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        );
-        PersistentVolumeClaim {
-            type_meta: TypeMeta::default(),
-            metadata: meta,
-            spec: Default::default(),
-            status: None,
-        }
-    }
-
-    fn params(p: &[(&str, &str)]) -> HashMap<String, String> {
-        p.iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    /// `TestGetSecretReference` (controller_test.go) cases: tokens, the
-    /// deprecated keys, the default keys and every refusal.
-    #[test]
-    fn secret_references_resolve_like_get_secret_reference() {
-        let sp = &PROVISIONER_SECRET_PARAMS;
-        let c = pvc("pvc1", "ns1", &[("example.com/k", "from-ann")]);
-        let r = |p: &[(&str, &str)]| get_secret_reference(sp, &params(p), "pv1", &c);
-        let named = |n: &str, ns: &str| {
-            Ok(Some(SecretReference {
-                name: Some(n.into()),
-                namespace: Some(ns.into()),
-            }))
-        };
-
-        assert_eq!(r(&[]), Ok(None));
-        assert_eq!(
-            r(&[
-                (
-                    "csi.storage.k8s.io/provisioner-secret-name",
-                    "${pv.name}-${pvc.name}"
-                ),
-                (
-                    "csi.storage.k8s.io/provisioner-secret-namespace",
-                    "${pvc.namespace}"
-                ),
-            ]),
-            named("pv1-pvc1", "ns1")
-        );
-        // Deprecated keys and `$name` shorthand.
-        assert_eq!(
-            r(&[
-                ("csiProvisionerSecretName", "${pv.name}"),
-                ("csiProvisionerSecretNamespace", "ns"),
-            ]),
-            named("pv1", "ns")
-        );
-        // `$pv` is the variable (`.name` stays literal) and `pv` is unknown.
-        assert!(r(&[
-            ("csiProvisionerSecretName", "$pv.name"),
-            ("csiProvisionerSecretNamespace", "ns"),
-        ])
-        .unwrap_err()
-        .contains("invalid tokens: [\"pv\"]"));
-        assert_eq!(
-            r(&[
-                (
-                    "csi.storage.k8s.io/provisioner-secret-name",
-                    "${pvc.annotations['example.com/k']}"
-                ),
-                ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
-            ]),
-            named("from-ann", "ns")
-        );
-        // Falls back to the default keys.
-        assert_eq!(
-            r(&[
-                ("csi.storage.k8s.io/secret-name", "dflt"),
-                ("csi.storage.k8s.io/secret-namespace", "ns"),
-            ]),
-            named("dflt", "ns")
-        );
-        // Refusals.
-        let both = r(&[
-            ("csiProvisionerSecretName", "a"),
-            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
-        ])
-        .unwrap_err();
-        assert!(both.contains("with both \"csi\" and \"csi.storage.k8s.io/\" keys"));
-        let half = r(&[("csi.storage.k8s.io/provisioner-secret-name", "a")]).unwrap_err();
-        assert!(half.contains("Both must be specified"));
-        let empty = r(&[
-            ("csi.storage.k8s.io/provisioner-secret-name", ""),
-            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
-        ])
-        .unwrap_err();
-        assert!(empty.contains("value of either namespace or name is empty"));
-        let bad_ns = r(&[
-            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
-            (
-                "csi.storage.k8s.io/provisioner-secret-namespace",
-                "${pv.name}.X",
-            ),
-        ])
-        .unwrap_err();
-        assert!(bad_ns.contains("resolved to \"pv1.X\" which is not a valid namespace name"));
-        let bad_name = r(&[
-            ("csi.storage.k8s.io/provisioner-secret-name", "Bad_Name"),
-            ("csi.storage.k8s.io/provisioner-secret-namespace", "ns"),
-        ])
-        .unwrap_err();
-        assert!(bad_name.contains("\"Bad_Name\" is not a valid secret name"));
-        // The namespace template cannot read the PVC name.
-        let ns_tok = r(&[
-            ("csi.storage.k8s.io/provisioner-secret-name", "a"),
-            (
-                "csi.storage.k8s.io/provisioner-secret-namespace",
-                "${pvc.name}",
-            ),
-        ])
-        .unwrap_err();
-        assert!(ns_tok.contains("invalid tokens: [\"pvc.name\"]"));
-    }
-
-    /// Go `os.Expand` edge cases `resolveTemplate` inherits.
-    #[test]
-    fn resolve_template_follows_os_expand() {
-        let p = params(&[("a", "1"), ("b.c", "2")]);
-        assert_eq!(resolve_template("x${a}y${b.c}", &p).unwrap(), "x1y2");
-        assert_eq!(resolve_template("$a-z", &p).unwrap(), "1-z");
-        assert_eq!(resolve_template("cost$", &p).unwrap(), "cost$");
-        assert_eq!(resolve_template("a${}b", &p).unwrap(), "ab");
-        assert_eq!(
-            resolve_template("${z}${y}", &p).unwrap_err(),
-            "invalid tokens: [\"y\" \"z\"]"
-        );
-    }
-
-    #[test]
-    fn volume_names_follow_make_volume_name() {
-        assert_eq!(make_volume_name("pvc", "abc-1").unwrap(), "pvc-abc-1");
-        assert!(make_volume_name("", "abc").is_err());
-        assert!(make_volume_name("pvc", "").is_err());
-    }
-
-    /// `TestRateLimiter` (ratelimiter_test.go:25-35), plus the exponential
-    /// growth and `Forget`.
-    #[test]
-    fn owner_rate_limiter_stays_within_max_and_forgets() {
-        let max = Duration::from_secs(10);
-        let l = OwnerRateLimiter::new(Duration::from_secs(1), max);
-        for _ in 0..100 {
-            assert!(l.when("uid", "k") <= max);
-        }
-        assert_eq!(l.num_requeues("uid"), 100);
-        l.forget_key("k");
-        assert_eq!(l.num_requeues("uid"), 0);
-        // Zero base delay (the tests): no wait at all.
-        let z = OwnerRateLimiter::new(Duration::ZERO, Duration::ZERO);
-        assert_eq!(z.when("u", "k"), Duration::ZERO);
-    }
-
-    #[test]
-    fn pv_save_backoff_doubles_from_5ms_to_1000s() {
-        assert_eq!(backoff(1), Duration::from_millis(5));
-        assert_eq!(backoff(3), Duration::from_millis(20));
-        assert_eq!(backoff(60), PV_SAVE_MAX);
-    }
 }

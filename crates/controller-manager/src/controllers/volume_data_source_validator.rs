@@ -245,38 +245,3 @@ impl<S: Storage + 'static> VolumeDataSourceValidator<S> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn populator(group: &str, kind: &str) -> Value {
-        json!({"sourceKind": {"group": group, "kind": kind}})
-    }
-
-    #[test]
-    fn pvc_and_snapshot_are_special_cases() {
-        assert_eq!(
-            validate_group_kind("", "PersistentVolumeClaim", &[]),
-            Validation::Pvc
-        );
-        assert_eq!(
-            validate_group_kind("snapshot.storage.k8s.io", "VolumeSnapshot", &[]),
-            Validation::VolumeSnapshot
-        );
-    }
-
-    #[test]
-    fn registered_populator_matches_group_and_kind() {
-        let pops = [populator("hello.example.com", "Hello")];
-        assert_eq!(
-            validate_group_kind("hello.example.com", "Hello", &pops),
-            Validation::Populator
-        );
-        assert!(!validate_group_kind("other.example.com", "Hello", &pops).is_valid());
-        assert!(!validate_group_kind("hello.example.com", "Other", &pops).is_valid());
-        // A core-group kind is not a PVC just because a populator exists.
-        assert!(!validate_group_kind("", "Hello", &pops).is_valid());
-    }
-}

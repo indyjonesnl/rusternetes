@@ -6,7 +6,7 @@ pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clustertrustbundle_publisher;
-pub(crate) mod controller_utils;
+pub mod controller_utils;
 pub mod cronjob;
 pub mod csi_attacher;
 pub mod csi_capacity;
@@ -57,7 +57,6 @@ pub mod pv_binder;
 pub mod pv_protection;
 pub mod pv_recycler;
 pub mod pvc_protection;
-#[cfg(test)]
 pub mod quota_admission_double;
 pub mod replicaset;
 pub mod replicationcontroller;
@@ -68,7 +67,6 @@ pub mod service;
 pub mod serviceaccount;
 pub mod servicecidr;
 pub mod statefulset;
-#[cfg(test)]
 pub mod status_subresource_double;
 pub mod storage_class;
 pub mod storageversiongc;
@@ -77,7 +75,6 @@ pub mod taint_eviction_timed_workers;
 pub mod trigger_time_tracker;
 pub mod ttl_controller;
 pub mod typed_workqueue;
-#[cfg(test)]
 pub mod uid_precondition_double;
 pub mod vac_protection;
 pub mod volume_data_source_validator;
@@ -87,8 +84,6 @@ pub mod vpa;
 // Shared with the api-server, which runs them in-process (as upstream does).
 pub use rusternetes_controller_core::{apiservice, clusterrole_aggregation};
 pub mod worker_pool;
-#[cfg(test)]
-mod worker_pool_tests;
 
 /// Propagate the pod's ServiceAccount `imagePullSecrets` onto a
 /// controller-created pod spec (#1084). Controllers write pods straight to
@@ -138,77 +133,20 @@ pub fn gather_metrics() -> String {
     out
 }
 
-#[cfg(test)]
-mod gather_metrics_tests {
-    #[test]
-    fn serves_version_info_from_default_registry() {
-        rusternetes_common::compat_version_metrics::record_compat_version_info(
-            "kube", "1.35", "1.35", "1.34",
-        );
-        assert!(super::gather_metrics().contains(
-            "version_info{binary=\"1.35\",component=\"kube\",emulation=\"1.35\",min_compat=\"1.34\"} 1"
-        ));
-    }
-}
-
 /// `apierrors.IsAlreadyExists(err)` for a storage create error
 /// (staging/src/k8s.io/apimachinery/pkg/api/errors/errors.go:542-544,
 /// `ReasonForError(err) == metav1.StatusReasonAlreadyExists`): the decision
 /// is the typed reason, never the message text. Storage backends map their
 /// create-conflict to `Error::AlreadyExists` (memory.rs, etcd.rs, rhino.rs
 /// `KeyExists`, api_storage.rs `map_write_err`).
-pub(crate) fn is_already_exists(e: &rusternetes_common::Error) -> bool {
+pub fn is_already_exists(e: &rusternetes_common::Error) -> bool {
     matches!(e, rusternetes_common::Error::AlreadyExists(_))
 }
 
 /// [`is_already_exists`] for an `anyhow::Error` carrying a storage error
 /// (`create_pod` helpers return `anyhow::Result`).
 /// Like `errors.As`, `downcast_ref` sees through `.context(..)` wrappers.
-pub(crate) fn is_already_exists_anyhow(e: &anyhow::Error) -> bool {
+pub fn is_already_exists_anyhow(e: &anyhow::Error) -> bool {
     e.downcast_ref::<rusternetes_common::Error>()
         .is_some_and(is_already_exists)
-}
-
-#[cfg(test)]
-mod error_predicate_tests {
-    use super::{is_already_exists, is_already_exists_anyhow};
-    use rusternetes_common::Error;
-
-    #[test]
-    fn typed_already_exists_is_matched() {
-        assert!(is_already_exists(&Error::AlreadyExists("k".into())));
-    }
-
-    /// A non-AlreadyExists variant whose message merely mentions the token
-    /// must not be classified benign (upstream branches on the Status reason,
-    /// never on message text).
-    #[test]
-    fn other_variants_with_the_token_are_not_matched() {
-        assert!(!is_already_exists(&Error::Storage(
-            "backend: lease already exists in cache".into()
-        )));
-        assert!(!is_already_exists(&Error::BadRequest(
-            "label AlreadyExists is reserved".into()
-        )));
-        assert!(!is_already_exists(&Error::Conflict(
-            "resourceVersion mismatch; object already exists elsewhere".into()
-        )));
-    }
-
-    #[test]
-    fn anyhow_wrapped_variants_are_classified_by_variant() {
-        let typed: anyhow::Error = Error::AlreadyExists("k".into()).into();
-        assert!(is_already_exists_anyhow(&typed));
-        let wrapped = anyhow::Error::from(Error::AlreadyExists("k".into())).context("creating pod");
-        assert!(is_already_exists_anyhow(&wrapped));
-        let other: anyhow::Error = Error::Storage("lease already exists in cache".into()).into();
-        assert!(!is_already_exists_anyhow(&other));
-        let plain = anyhow::anyhow!("pod already exists");
-        assert!(!is_already_exists_anyhow(&plain));
-    }
-
-    #[test]
-    fn untokened_non_matching_variants_are_not_matched() {
-        assert!(!is_already_exists(&Error::NotFound("k".into())));
-    }
 }

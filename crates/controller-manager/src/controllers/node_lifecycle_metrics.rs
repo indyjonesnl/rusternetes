@@ -126,12 +126,10 @@ pub fn observe_update_all_nodes_health(seconds: f64) {
     SERIES.update_all_nodes_health.observe(seconds);
 }
 
-#[cfg(test)]
 pub fn update_node_health_count() -> u64 {
     SERIES.update_node_health.get_sample_count()
 }
 
-#[cfg(test)]
 pub fn update_all_nodes_health_count() -> u64 {
     SERIES.update_all_nodes_health.get_sample_count()
 }
@@ -168,7 +166,6 @@ pub fn init_evictions(zone: &str) {
     SERIES.evictions_total.with_label_values(&[zone]).inc_by(0);
 }
 
-#[cfg(test)]
 pub fn zone_size(zone: &str) -> Option<f64> {
     SERIES
         .zone_size
@@ -177,7 +174,6 @@ pub fn zone_size(zone: &str) -> Option<f64> {
         .map(|g| g.get())
 }
 
-#[cfg(test)]
 pub fn zone_health(zone: &str) -> Option<f64> {
     SERIES
         .zone_health
@@ -186,7 +182,6 @@ pub fn zone_health(zone: &str) -> Option<f64> {
         .map(|g| g.get())
 }
 
-#[cfg(test)]
 pub fn unhealthy_nodes(zone: &str) -> Option<f64> {
     SERIES
         .unhealthy_nodes
@@ -195,7 +190,6 @@ pub fn unhealthy_nodes(zone: &str) -> Option<f64> {
         .map(|g| g.get())
 }
 
-#[cfg(test)]
 pub fn evictions_total(zone: &str) -> u64 {
     SERIES.evictions_total.with_label_values(&[zone]).get()
 }

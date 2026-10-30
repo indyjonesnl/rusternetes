@@ -41,7 +41,7 @@ pub fn gather() -> String {
 }
 
 /// One gauge series per conflict returned by `cache.get_conflicts()`.
-pub(crate) fn render(cache: &dyn VolumeCache) -> String {
+pub fn render(cache: &dyn VolumeCache) -> String {
     let registry = Registry::new();
     let gauge =
         GaugeVec::new(Opts::new(NAME, HELP).subsystem(SUBSYSTEM), &LABELS).expect("valid opts");
@@ -66,29 +66,4 @@ pub(crate) fn render(cache: &dyn VolumeCache) -> String {
         .encode(&registry.gather(), &mut buf)
         .expect("text encode");
     String::from_utf8(buf).expect("utf8")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::cache::{
-        ObjectName, VolumeLabelCache, SELINUX_CHANGE_POLICY_MOUNT_OPTION as MOUNT,
-    };
-    use super::super::translator::ControllerSELinuxTranslator;
-    use super::*;
-
-    #[test]
-    fn conflicts_are_exposed_as_gauges() {
-        let cache = VolumeLabelCache::new(ControllerSELinuxTranslator);
-        assert_eq!(render(&cache), "");
-        cache.add_volume("v", &ObjectName::new("ns", "p1"), ":::s0:c1", MOUNT, "d");
-        cache.add_volume("v", &ObjectName::new("ns", "p2"), ":::s0:c2", MOUNT, "d");
-        let out = render(&cache);
-        assert!(out.contains("# TYPE selinux_warning_controller_selinux_volume_conflict gauge"));
-        assert!(out.contains(
-            "selinux_warning_controller_selinux_volume_conflict{pod1_name=\"p1\",pod1_namespace=\"ns\",pod1_value=\":::s0:c1\",pod2_name=\"p2\",pod2_namespace=\"ns\",pod2_value=\":::s0:c2\",property=\"SELinuxLabel\"} 1"
-        ));
-        assert!(out.contains("pod1_name=\"p2\""), "both directions: {out}");
-        cache.delete_pod(&ObjectName::new("ns", "p1"));
-        assert_eq!(render(&cache), "");
-    }
 }

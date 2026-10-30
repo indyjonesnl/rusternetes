@@ -159,7 +159,7 @@ impl<S: Storage + 'static> IngressController<S> {
     }
 
     /// Reconcile a single Ingress resource
-    async fn reconcile_ingress(&self, ingress: &Ingress) -> Result<()> {
+    pub async fn reconcile_ingress(&self, ingress: &Ingress) -> Result<()> {
         let namespace = ingress
             .metadata
             .namespace
@@ -240,7 +240,7 @@ impl<S: Storage + 'static> IngressController<S> {
     }
 
     /// Validate an ingress backend
-    async fn validate_backend(&self, backend: &IngressBackend, namespace: &str) -> Result<()> {
+    pub async fn validate_backend(&self, backend: &IngressBackend, namespace: &str) -> Result<()> {
         // Check service backend
         if let Some(service_backend) = &backend.service {
             let service_name = &service_backend.name;
@@ -308,7 +308,7 @@ impl<S: Storage + 'static> IngressController<S> {
     }
 
     /// Validate ingress rule
-    async fn validate_ingress_rule(&self, rule: &IngressRule, namespace: &str) -> Result<()> {
+    pub async fn validate_ingress_rule(&self, rule: &IngressRule, namespace: &str) -> Result<()> {
         // Validate HTTP rules
         if let Some(http) = &rule.http {
             for path in &http.paths {
@@ -320,7 +320,7 @@ impl<S: Storage + 'static> IngressController<S> {
     }
 
     /// Validate HTTP path
-    async fn validate_http_path(&self, path: &HTTPIngressPath, namespace: &str) -> Result<()> {
+    pub async fn validate_http_path(&self, path: &HTTPIngressPath, namespace: &str) -> Result<()> {
         // Validate path type
         match path.path_type.as_deref().unwrap_or("") {
             "Exact" | "Prefix" | "ImplementationSpecific" => {}
@@ -473,240 +473,5 @@ impl<S: Storage + 'static> IngressController<S> {
         let octet4 = (hash & 0xFF) as u8;
 
         format!("10.{}.{}.{}", octet2, octet3, octet4)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_common::resources::ingress::{
-        HTTPIngressRuleValue, IngressServiceBackend, ServiceBackendPort,
-    };
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_storage::memory::MemoryStorage;
-
-    #[tokio::test]
-    async fn test_validate_path_type_valid() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: Some(80),
-                }),
-            }),
-            resource: None,
-        };
-
-        let path = HTTPIngressPath {
-            path: Some("/".to_string()),
-            path_type: Some("Prefix".to_string()),
-            backend,
-        };
-
-        assert!(controller
-            .validate_http_path(&path, "default")
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_validate_path_type_invalid() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: Some(80),
-                }),
-            }),
-            resource: None,
-        };
-
-        let path = HTTPIngressPath {
-            path: Some("/".to_string()),
-            path_type: Some("Invalid".to_string()),
-            backend,
-        };
-
-        assert!(controller
-            .validate_http_path(&path, "default")
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn test_validate_backend_with_port_number() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: Some(80),
-                }),
-            }),
-            resource: None,
-        };
-
-        assert!(controller
-            .validate_backend(&backend, "default")
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_validate_backend_with_port_name() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: Some("http".to_string()),
-                    number: None,
-                }),
-            }),
-            resource: None,
-        };
-
-        assert!(controller
-            .validate_backend(&backend, "default")
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_validate_backend_missing_port_spec() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: None,
-                }),
-            }),
-            resource: None,
-        };
-
-        assert!(controller
-            .validate_backend(&backend, "default")
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn test_validate_ingress_rule() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage);
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: Some(80),
-                }),
-            }),
-            resource: None,
-        };
-
-        let path = HTTPIngressPath {
-            path: Some("/api".to_string()),
-            path_type: Some("Prefix".to_string()),
-            backend,
-        };
-
-        let rule = IngressRule {
-            host: Some("example.com".to_string()),
-            http: Some(HTTPIngressRuleValue { paths: vec![path] }),
-        };
-
-        assert!(controller
-            .validate_ingress_rule(&rule, "default")
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_valid_ingress() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = IngressController::new(storage.clone());
-
-        let backend = IngressBackend {
-            service: Some(IngressServiceBackend {
-                name: "test-service".to_string(),
-                port: Some(ServiceBackendPort {
-                    name: None,
-                    number: Some(80),
-                }),
-            }),
-            resource: None,
-        };
-
-        let path = HTTPIngressPath {
-            path: Some("/".to_string()),
-            path_type: Some("Prefix".to_string()),
-            backend,
-        };
-
-        let rule = IngressRule {
-            host: Some("example.com".to_string()),
-            http: Some(HTTPIngressRuleValue { paths: vec![path] }),
-        };
-
-        let spec = IngressSpec {
-            ingress_class_name: Some("nginx".to_string()),
-            default_backend: None,
-            tls: None,
-            rules: Some(vec![rule]),
-        };
-
-        let ingress = Ingress {
-            type_meta: rusternetes_common::types::TypeMeta {
-                kind: "Ingress".to_string(),
-                api_version: "networking.k8s.io/v1".to_string(),
-            },
-            metadata: {
-                let mut meta = ObjectMeta::new("test-ingress").with_namespace("default");
-                meta.uid = uuid::Uuid::new_v4().to_string();
-                meta
-            },
-            spec: Some(spec),
-            status: None,
-        };
-
-        // Create the IngressClass "nginx" so validation passes
-        use rusternetes_common::resources::IngressClass;
-        let class_key = build_key("ingressclasses", None, "nginx");
-        storage
-            .create(&class_key, &IngressClass::new("nginx"))
-            .await
-            .unwrap();
-
-        // Create ingress in storage first (like API server would)
-        let ingress_key = build_key("ingresses", Some("default"), "test-ingress");
-        storage.create(&ingress_key, &ingress).await.unwrap();
-
-        // Reconcile should validate and update status
-        assert!(controller.reconcile_ingress(&ingress).await.is_ok());
-
-        // Verify ingress was updated with load balancer status
-        let updated_ingress: Ingress = storage.get(&ingress_key).await.unwrap();
-        assert!(updated_ingress.status.is_some());
-        let status = updated_ingress.status.unwrap();
-        assert!(status.load_balancer.is_some());
     }
 }

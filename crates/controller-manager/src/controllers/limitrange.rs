@@ -135,17 +135,3 @@ impl<S: Storage + 'static> LimitRangeController<S> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_storage::memory::MemoryStorage;
-
-    #[tokio::test]
-    async fn test_reconcile_all_is_noop_on_empty_storage() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = LimitRangeController::new(storage);
-        // Stub MUST return Ok even with nothing in storage.
-        controller.reconcile_all().await.unwrap();
-    }
-}

@@ -116,7 +116,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
     /// `pkg/common-controller/snapshot_controller_base.go:377`): a key whose
     /// snapshot is gone is the `deleteSnapshot` path (`:585`), scoped to THAT
     /// snapshot's content only, not a sweep of every content.
-    async fn process_key(&self, key: &str) -> Result<()> {
+    pub async fn process_key(&self, key: &str) -> Result<()> {
         let parts: Vec<&str> = key.splitn(3, '/').collect();
         let (ns, name) = match parts.len() {
             3 => (parts[1], parts[2]),
@@ -493,7 +493,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         }
     }
 
-    fn is_driver_supported(&self, driver: &str) -> bool {
+    pub fn is_driver_supported(&self, driver: &str) -> bool {
         // For now, we only support our own hostpath snapshotter
         matches!(
             driver,
@@ -501,7 +501,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         )
     }
 
-    fn create_snapshot_content(
+    pub fn create_snapshot_content(
         &self,
         vsc: &VolumeSnapshotClass,
         vs: &VolumeSnapshot,
@@ -661,7 +661,3 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "volume_snapshot_tests.rs"]
-mod tests;

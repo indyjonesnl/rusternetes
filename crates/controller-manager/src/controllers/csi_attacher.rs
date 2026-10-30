@@ -59,8 +59,8 @@ use tracing::{debug, error, info, warn};
 const VA_NODE_ID_ANNOTATION: &str = "csi.alpha.kubernetes.io/node-id";
 /// `--retry-interval-start` / `--retry-interval-max` (`main.go:69-70`), the
 /// per-item exponential limiter of the VA and PV queues (`main.go:275-276`).
-const RETRY_INTERVAL_START: Duration = Duration::from_secs(1);
-const RETRY_INTERVAL_MAX: Duration = Duration::from_secs(300);
+pub const RETRY_INTERVAL_START: Duration = Duration::from_secs(1);
+pub const RETRY_INTERVAL_MAX: Duration = Duration::from_secs(300);
 /// `--timeout` (`main.go:68`): the budget of one attach or detach call.
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 /// `--worker-threads` (`main.go:71`).
@@ -114,7 +114,7 @@ fn describe(err: &anyhow::Error) -> (String, Option<i32>) {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Caps {
+pub struct Caps {
     /// `supportsAttach`: the driver implements `ControllerPublishVolume`.
     attach: bool,
     read_only: bool,
@@ -143,25 +143,25 @@ impl Caps {
 }
 
 pub struct CsiAttacher<S: Storage> {
-    storage: Arc<S>,
-    driver_name: String,
-    client: CsiControllerClient,
+    pub storage: Arc<S>,
+    pub driver_name: String,
+    pub client: CsiControllerClient,
     /// `--default-fstype`.
-    default_fs_type: String,
-    capabilities: tokio::sync::OnceCell<Caps>,
+    pub default_fs_type: String,
+    pub capabilities: tokio::sync::OnceCell<Caps>,
     /// The VA queue's `ItemExponentialFailureRateLimiter`: failures and the
     /// earliest next attempt per VolumeAttachment name.
-    retries: Mutex<HashMap<String, (u32, Instant)>>,
-    retry_start: Duration,
-    retry_max: Duration,
+    pub retries: Mutex<HashMap<String, (u32, Instant)>>,
+    pub retry_start: Duration,
+    pub retry_max: Duration,
     /// `forceSync` (`csi_handler.go:73`): VolumeAttachments whose next
     /// processing must attach or detach even when `status.attached` /
     /// the finalizer already show the desired state.
-    force_sync: Mutex<HashSet<String>>,
+    pub force_sync: Mutex<HashSet<String>>,
     /// `--reconcile-sync` (`main.go:76`).
-    reconcile_sync: Duration,
+    pub reconcile_sync: Duration,
     /// `--max-entries` (`main.go:72`).
-    max_entries: i32,
+    pub max_entries: i32,
 }
 
 impl<S: Storage + 'static> CsiAttacher<S> {
@@ -253,7 +253,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         }
     }
 
-    async fn reconcile_va_if_due(&self, next: &mut Instant) {
+    pub async fn reconcile_va_if_due(&self, next: &mut Instant) {
         if Instant::now() < *next {
             return;
         }
@@ -998,51 +998,4 @@ fn csi_source(spec: &PersistentVolumeSpec) -> Result<&CSIVolumeSource> {
     spec.csi
         .as_ref()
         .ok_or_else(|| anyhow!("pv spec contained non-csi source that was not migrated"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `TestSanitizeDriverName` (`util_test.go`).
-    #[test]
-    fn driver_names_sanitize_like_upstream() {
-        assert_eq!(sanitize_driver_name("csi/example.com"), "csi-example-com");
-        assert_eq!(sanitize_driver_name("a."), "a-X");
-        assert_eq!(
-            finalizer_name("test.csi.example.com"),
-            "external-attacher/test-csi-example-com"
-        );
-    }
-
-    /// `--reconcile-sync` (`main.go:76`) sets the ReconcileVA period.
-    #[tokio::test]
-    async fn reconcile_sync_flag_sets_next_reconcile() {
-        let a = CsiAttacher::new(
-            Arc::new(rusternetes_storage::memory::MemoryStorage::new()),
-            "d.example.com",
-            CsiControllerClient::with_endpoint("/nonexistent.sock"),
-        )
-        .with_reconcile_sync(Duration::from_secs(7))
-        .with_max_entries(5);
-        let mut next = Instant::now();
-        let before = Instant::now();
-        a.reconcile_va_if_due(&mut next).await;
-        assert!(next >= before + Duration::from_secs(7));
-        assert!(next < before + Duration::from_secs(30));
-        assert_eq!(a.max_entries, 5);
-    }
-
-    #[test]
-    fn backoff_is_exponential_and_capped() {
-        // 1s, 2s, 4s ... capped at 5m (`ItemExponentialFailureRateLimiter`).
-        let d = |n: u32| {
-            RETRY_INTERVAL_START
-                .saturating_mul(2u32.saturating_pow(n))
-                .min(RETRY_INTERVAL_MAX)
-        };
-        assert_eq!(d(0), Duration::from_secs(1));
-        assert_eq!(d(3), Duration::from_secs(8));
-        assert_eq!(d(20), RETRY_INTERVAL_MAX);
-    }
 }
