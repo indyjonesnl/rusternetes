@@ -563,12 +563,12 @@ mod tests {
     #[tokio::test]
     async fn union_joins_non_empty_reasons_with_newlines() {
         let attr = non_resource(user("u", &[]), "get", "/x");
-        let u = UnionAuthz::new(vec![no_opinion("", None), no_opinion("", None)]);
+        let u = UnionAuthorizer::new(vec![no_opinion("", None), no_opinion("", None)]);
         assert_eq!(
             u.authorize(&attr).await.unwrap(),
             Decision::Deny(String::new())
         );
-        let u = UnionAuthz::new(vec![
+        let u = UnionAuthorizer::new(vec![
             no_opinion("a", None),
             no_opinion("", None),
             no_opinion("b", None),
@@ -583,13 +583,13 @@ mod tests {
     #[tokio::test]
     async fn union_stops_at_the_first_decision() {
         let attr = non_resource(user("u", &[]), "get", "/x");
-        let u = UnionAuthz::new(vec![
+        let u = UnionAuthorizer::new(vec![
             no_opinion("", Some("boom")),
             Arc::new(Fixed(Opinion::Allow(String::new()))),
             no_opinion("never", None),
         ]);
         assert_eq!(u.authorize(&attr).await.unwrap(), Decision::Allow);
-        let u = UnionAuthz::new(vec![
+        let u = UnionAuthorizer::new(vec![
             Arc::new(Fixed(Opinion::Deny("no".into()))),
             Arc::new(Fixed(Opinion::Allow(String::new()))),
         ]);
@@ -603,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn union_aggregates_errors_when_nobody_decides() {
         let attr = non_resource(user("u", &[]), "get", "/x");
-        let u = UnionAuthz::new(vec![no_opinion("", Some("e1")), no_opinion("", Some("e2"))]);
+        let u = UnionAuthorizer::new(vec![no_opinion("", Some("e1")), no_opinion("", Some("e2"))]);
         assert_eq!(
             u.authorize(&attr).await.unwrap_err().to_string(),
             Error::Authorization("[e1, e2]".into()).to_string()

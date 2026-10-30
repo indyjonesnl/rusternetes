@@ -8,7 +8,7 @@
 //!   and `delegating.go:46-60` (`DelegatingAuthorizerConfig.New`)
 //! * `plugin/pkg/authorizer/webhook/webhook.go:171-319,426-436,535-547`
 //!   (`WebhookAuthorizer.Authorize`, `shouldCache`)
-//! * `pkg/authorization/union/union.go` (reused: [`UnionAuthorizer`])
+//! * `pkg/authorization/union/union.go` (reused: `rusternetes_common::authz::UnionAuthorizer`)
 //!
 //! Not ported (unreachable from the delegating authorizer): `matchConditions`
 //! (`NewFromInterface` passes none), the authorizer metrics, and the
@@ -25,59 +25,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
-
-/// `unionAuthzHandler` (`pkg/authorization/union/union.go:44-69`): the first
-/// `Allow` or `Deny` wins; no-opinion reasons that are not empty are joined
-/// with `\n`, and the errors that came with them are aggregated.
-///
-/// Used instead of `rusternetes_common::authz::UnionAuthorizer`, which joins
-/// every reason (empty ones too) with `"; "` and so renders the
-/// always-empty reasons of the path and privileged-group authorizers as
-/// `": ; "` in the 403 message.
-pub struct UnionAuthz {
-    authorizers: Vec<Arc<dyn Authorizer>>,
-}
-
-impl UnionAuthz {
-    pub fn new(authorizers: Vec<Arc<dyn Authorizer>>) -> Self {
-        Self { authorizers }
-    }
-}
-
-#[async_trait]
-impl Authorizer for UnionAuthz {
-    async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        let mut errlist: Vec<String> = vec![];
-        let mut reasons: Vec<String> = vec![];
-        for a in &self.authorizers {
-            match a.authorize_opinion(attrs).await? {
-                Opinion::Allow(_) => return Ok(Decision::Allow),
-                Opinion::Deny(r) => return Ok(Decision::Deny(r)),
-                Opinion::NoOpinion { reason, error } => {
-                    errlist.extend(error);
-                    if !reason.is_empty() {
-                        reasons.push(reason);
-                    }
-                }
-            }
-        }
-        match super::authn::aggregate(&errlist) {
-            Some(e) => Err(Error::Authorization(e)),
-            None => Ok(Decision::Deny(reasons.join("\n"))),
-        }
-    }
-
-    async fn get_user_rules(
-        &self,
-        _user: &UserInfo,
-        _namespace: &str,
-    ) -> Result<(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
-    )> {
-        Ok((vec![], vec![]))
-    }
-}
 
 /// `maxControlledAttrCacheSize` (webhook.go:56).
 pub const MAX_CONTROLLED_ATTR_CACHE_SIZE: usize = 10000;
