@@ -12,6 +12,9 @@ path = "src/main.rs"
 [lib]
 name = "rusternetes_kubelet"
 path = "src/lib.rs"
+# Unit tests live in tests/it: a second compilation of the lib as a test
+# target costs as much as the lib itself.
+test = false
 
 [features]
 mimalloc = ["dep:mimalloc"]
