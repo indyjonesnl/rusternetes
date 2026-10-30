@@ -28,8 +28,6 @@
 //! - `CompositionEnv.CreateContext` (:131-133) belongs to the CEL compiler and
 //!   is the evaluator's business, not the dispatcher's.
 
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

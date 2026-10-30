@@ -30,7 +30,6 @@ pub mod crdregistration;
 pub mod legacy_token_tracking;
 pub use rusternetes_admission_webhook::cel_evaluators as cel;
 pub use rusternetes_middleware::cbor;
-#[allow(dead_code)]
 pub mod apiserver_request_metrics;
 pub mod conversion;
 pub mod deprecation;
@@ -61,15 +60,12 @@ pub mod registry;
 pub mod request_header_authentication;
 pub mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
-#[allow(dead_code)]
 pub mod fieldmanager;
-#[allow(dead_code)]
 pub mod response;
 pub mod router;
 pub mod ssa;
 pub mod startup;
 pub mod state;
-#[allow(dead_code)]
 pub mod streaming;
 pub mod watch_cache;
 pub mod zpages;

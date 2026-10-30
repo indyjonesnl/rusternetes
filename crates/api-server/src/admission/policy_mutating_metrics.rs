@@ -6,8 +6,6 @@
 //! (:106-110), and its test `metrics_test.go` `TestNoUtils`. Registered in the
 //! process-global registry like upstream's `legacyregistry`.
 
-#![allow(dead_code)]
-
 use std::sync::LazyLock;
 use std::time::Duration;
 

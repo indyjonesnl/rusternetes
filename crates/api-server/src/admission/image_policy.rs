@@ -50,7 +50,6 @@ pub const AUDIT_KEY_PREFIX: &str = "imagepolicywebhook.image-policy.k8s.io/";
 pub const FAILED_OPEN_KEY_SUFFIX: &str = "failed-open";
 
 /// `api.ImagePolicyFailedOpenKey` (pkg/apis/core/annotation_key_constants.go).
-#[allow(dead_code)] // the pod-side half; see the module's deviation note
 pub const IMAGE_POLICY_FAILED_OPEN_KEY: &str = "alpha.image-policy.k8s.io/failed-open";
 
 const EPHEMERAL_CONTAINERS: &str = "ephemeralcontainers";
@@ -213,7 +212,6 @@ pub struct Decision {
     pub audit_annotations: Vec<(String, String)>,
     /// The backend failed and `defaultAllow` admitted the pod
     /// (`webhookError`, admission.go:107-123).
-    #[allow(dead_code)] // read by `mark_failed_open` callers and the tests
     pub failed_open: bool,
     /// The refusal, if any (`NewForbidden`). `admitPod` adds the backend's
     /// audit annotations before it checks `Allowed` (admission.go:204-215), so
@@ -233,7 +231,6 @@ impl Decision {
 }
 
 /// Stamp the legacy fail-open pod annotation (admission.go:112-119).
-#[allow(dead_code)] // see the module's deviation note
 pub fn mark_failed_open(pod: &mut Pod) {
     pod.metadata
         .annotations

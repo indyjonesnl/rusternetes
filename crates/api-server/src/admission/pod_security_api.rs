@@ -6,7 +6,6 @@
 
 // A faithful port of the `api` package: `Older`, `Equivalent` and friends are
 // ported ahead of their callers (versioned checks, namespace validation).
-#![allow(dead_code)]
 
 use rusternetes_common::validation::field::{self, Path};
 use std::collections::HashMap;

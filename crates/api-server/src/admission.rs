@@ -73,7 +73,6 @@ pub async fn lock_namespace_quota(namespace: &str) -> tokio::sync::OwnedMutexGua
 }
 
 /// Apply LimitRange defaults and validate constraints
-#[allow(dead_code)]
 pub async fn apply_limit_range<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
@@ -787,7 +786,6 @@ impl PodSecurityAdmission {
     }
 
     /// A plugin instance with explicit exemptions.
-    #[allow(dead_code)]
     pub fn with_exemptions(exemptions: PodSecurityExemptions) -> Self {
         Self { exemptions }
     }
@@ -820,7 +818,6 @@ impl PodSecurityAdmission {
     /// Upstream parity:
     /// `staging/src/k8s.io/pod-security-admission/policy/` (release-1.35).
     /// `username` is the requester, so a user exemption can apply.
-    #[allow(dead_code)]
     pub async fn admit_as<S: Storage>(
         &self,
         storage: &Arc<S>,

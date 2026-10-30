@@ -9,8 +9,6 @@
 //! `pkg/apiserver/customresource_handler.go`. Lists, watches and `/scale` are
 //! still served here directly.
 
-#![allow(dead_code)]
-
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::registry::apiextensions::controllers::{
     find_crd_condition, ESTABLISHED, NAMES_ACCEPTED, TERMINATING,
@@ -735,6 +733,7 @@ pub(crate) fn apply_schema_defaults(
 ///
 /// On UPDATE/PATCH callers should use [`validate_custom_resource_with_old`]
 /// so transition rules (`oldSelf`) are evaluated against the prior version.
+#[cfg(test)]
 fn validate_custom_resource(
     crd: &CustomResourceDefinition,
     version: &str,
@@ -753,6 +752,7 @@ fn validate_custom_resource(
 /// Transition rules (those that reference `oldSelf`) are never ratcheted.
 ///
 /// Upstream: `apiextensions-apiserver/pkg/apiserver/validation/ratcheting.go`.
+#[cfg(test)]
 pub(crate) fn validate_custom_resource_with_old(
     crd: &CustomResourceDefinition,
     version: &str,

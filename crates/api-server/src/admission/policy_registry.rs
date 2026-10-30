@@ -11,7 +11,6 @@
 
 // Not called from the request path yet (the MutatingAdmissionPolicy plugin is
 // the rest of #2731); the bin target compiles `admission` separately.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};

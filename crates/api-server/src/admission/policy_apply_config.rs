@@ -5,8 +5,6 @@
 //! `applyConfigPatcher.Patch`, `ApplyStructuredMergeDiff`, `validatePatch`,
 //! `findAtomics`) and its tests (`smd_test.go` `TestApplyConfiguration`).
 
-#![allow(dead_code)]
-
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;

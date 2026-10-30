@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::registry::rest::HasMetadata;
 use crate::{middleware::AuthContext, state::ApiServerState};
 use axum::{
@@ -1657,16 +1655,6 @@ fn matches_label_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
                         return false;
                     }
                 }
-                SetRequirement::Exists(key) => {
-                    if !labels.contains_key(key) {
-                        return false;
-                    }
-                }
-                SetRequirement::NotExists(key) => {
-                    if labels.contains_key(key) {
-                        return false;
-                    }
-                }
             }
             continue;
         }
@@ -1703,8 +1691,6 @@ fn matches_label_selector(metadata: &ObjectMeta, selector: &Option<String>) -> b
 enum SetRequirement<'a> {
     In(&'a str, Vec<&'a str>),
     NotIn(&'a str, Vec<&'a str>),
-    Exists(&'a str),
-    NotExists(&'a str),
 }
 
 fn parse_set_requirement(s: &str) -> Option<SetRequirement<'_>> {

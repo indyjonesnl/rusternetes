@@ -825,7 +825,6 @@ impl ProxyServerConnector for UdsHttpConnectConnector {
 /// a GRPC egress selection connects and then fails every dial. Deliberate gap,
 /// tracked in #3463.
 struct UdsGrpcConnector {
-    #[allow(dead_code)]
     uds_name: String,
 }
 

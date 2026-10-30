@@ -24,7 +24,6 @@ pub trait Interface: Send + Sync {
     async fn allocated(&self) -> Vec<usize>;
     async fn has(&self, offset: usize) -> bool;
     /// The number of free items.
-    #[allow(dead_code)] // upstream API; exercised by the tests
     async fn free(&self) -> usize;
     /// `Snapshottable.Snapshot` (interfaces.go:35-40), for the allocators
     /// that are snapshottable.
@@ -88,7 +87,6 @@ pub struct AllocationBitmap {
 
 impl AllocationBitmap {
     /// `NewAllocationMap` (bitmap.go:55-58): the random-scan strategy.
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub fn new(max: usize, range_spec: impl Into<String>) -> Self {
         Self::with_offset(max, range_spec, 0)
     }
@@ -212,7 +210,6 @@ impl AllocationBitmap {
     }
 
     /// `AllocationBitmap.Free` (bitmap.go:166-171).
-    #[allow(dead_code)] // upstream API; exercised by the tests
     pub fn free(&self) -> usize {
         self.max - self.count
     }

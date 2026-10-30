@@ -11,8 +11,6 @@
 //! - `mutating/dispatcher.go` `dispatchOne` (:229-279, the nil type converter check at :244-245): a kind with no type
 //!   converter is a 503 `Resource kind ... not found`.
 
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

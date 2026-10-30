@@ -35,7 +35,6 @@ use tracing::debug;
 /// - `SetDefaults_ConfigMapVolumeSource`
 /// - `SetDefaults_DownwardAPIVolumeSource`
 /// - `SetDefaults_ProjectedVolumeSource`
-#[allow(dead_code)]
 pub const DEFAULT_VOLUME_FILE_MODE: i32 = 0o644;
 
 /// Apply K8s defaulting for volume `defaultMode` bits to every Secret,
@@ -48,7 +47,6 @@ pub const DEFAULT_VOLUME_FILE_MODE: i32 = 0o644;
 /// Explicit caller-supplied values (including `0`) are never overwritten:
 /// only `None` is defaulted. This matches the upstream Go defaulting which
 /// only fills in nil pointers.
-#[allow(dead_code)]
 pub fn apply_volume_mode_defaults(spec: &mut PodSpec) {
     let Some(volumes) = spec.volumes.as_mut() else {
         return;

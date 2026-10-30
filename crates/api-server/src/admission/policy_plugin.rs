@@ -12,8 +12,6 @@
 //! (`pkg/kubeapiserver/options/plugins.go:106-110`), see
 //! `endpoints/handlers/admission.rs`.
 
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use rusternetes_common::admission::Operation;

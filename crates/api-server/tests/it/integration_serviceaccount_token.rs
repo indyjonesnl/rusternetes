@@ -682,5 +682,4 @@ async fn test_service_account_token_authentication() {
 
 // Belt-and-braces: keep the helpers in the file even if a future refactor
 // removes one of the bearer-token tests, so the test surface still compiles.
-#[allow(dead_code)]
 fn _bind_helpers(_a: &dyn Fn() -> StatusCode) {}
