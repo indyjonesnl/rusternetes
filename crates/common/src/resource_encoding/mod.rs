@@ -584,6 +584,3 @@ pub struct GroupTable {
     pub group: &'static str,
     pub versions: &'static [VersionTable],
 }
-
-#[cfg(test)]
-mod tests;

@@ -41,7 +41,7 @@ def main() -> None:
     w("")
     w("use super::{spec, PreRelease, UpstreamGate};")
     w("")
-    w("pub(super) const UPSTREAM_GATES: &[UpstreamGate] = &[")
+    w("pub const UPSTREAM_GATES: &[UpstreamGate] = &[")
     for g in gates:
         assert re.fullmatch(r"[A-Za-z0-9]+", g["name"]), g["name"]
         rows = []

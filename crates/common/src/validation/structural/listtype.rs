@@ -193,6 +193,3 @@ fn validate_list_map(fld_path: &Path, s: &Structural, obj: &[Value]) -> Vec<Erro
         .map(|i| Error::duplicate(&fld_path.index(i), keys[i].clone()))
         .collect()
 }
-
-#[cfg(test)]
-mod tests;

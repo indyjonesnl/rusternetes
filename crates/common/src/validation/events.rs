@@ -34,7 +34,7 @@ use chrono::{DateTime, Utc};
 const REPORTING_INSTANCE_LENGTH_LIMIT: usize = 128;
 const ACTION_LENGTH_LIMIT: usize = 128;
 const REASON_LENGTH_LIMIT: usize = 128;
-const NOTE_LENGTH_LIMIT: usize = 1024;
+pub const NOTE_LENGTH_LIMIT: usize = 1024;
 
 /// The API group/version a request arrived on. Mirrors upstream
 /// `schema.GroupVersion`, but only the cases the validator branches on.
@@ -453,7 +453,3 @@ pub fn validate_event_update(
 
     errs
 }
-
-#[cfg(test)]
-#[path = "events_tests.rs"]
-mod tests;

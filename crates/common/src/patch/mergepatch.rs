@@ -28,11 +28,11 @@ pub(crate) fn go_type_name(v: &Value) -> Option<&'static str> {
 
 /// The Go type name `[]interface {}` — what `ErrBadArgType` prints for the
 /// typed-nil `[]interface{}` "expected" argument at every slice assertion.
-pub(crate) const GO_SLICE: &str = "[]interface {}";
+pub const GO_SLICE: &str = "[]interface {}";
 
 /// `mergepatch.ErrNoMergeKey` (errors.go:35-37):
 /// `map: %v does not contain declared merge key: %s`.
-pub(crate) fn err_no_merge_key(m: &Value, k: &str) -> String {
+pub fn err_no_merge_key(m: &Value, k: &str) -> String {
     format!(
         "map: {} does not contain declared merge key: {k}",
         go_fmt_v(m)
@@ -42,7 +42,7 @@ pub(crate) fn err_no_merge_key(m: &Value, k: &str) -> String {
 /// `mergepatch.ErrBadArgType` (errors.go:39-43):
 /// `expected a %s, but received a %s` over `reflect.TypeOf` of both. A nil
 /// `reflect.Type` under `%s` prints `%!s(<nil>)`.
-pub(crate) fn err_bad_arg_type(expected: &str, actual: &Value) -> String {
+pub fn err_bad_arg_type(expected: &str, actual: &Value) -> String {
     format!(
         "expected a {expected}, but received a {}",
         go_type_name(actual).unwrap_or("%!s(<nil>)")
@@ -51,7 +51,7 @@ pub(crate) fn err_bad_arg_type(expected: &str, actual: &Value) -> String {
 
 /// `mergepatch.ErrBadPatchType` (errors.go:60-62):
 /// `unknown patch type: %s in map: %v`.
-pub(crate) fn err_bad_patch_type(t: &Value, m: &Value) -> String {
+pub fn err_bad_patch_type(t: &Value, m: &Value) -> String {
     format!(
         "unknown patch type: {} in map: {}",
         go_fmt(t, Verb::S, true),
@@ -60,7 +60,7 @@ pub(crate) fn err_bad_patch_type(t: &Value, m: &Value) -> String {
 }
 
 /// `fmt.Sprintf("%v", v)`.
-pub(crate) fn go_fmt_v(v: &Value) -> String {
+pub fn go_fmt_v(v: &Value) -> String {
     go_fmt(v, Verb::V, true)
 }
 
@@ -137,80 +137,5 @@ fn go_number_v(n: &serde_json::Number) -> String {
         format!("{mantissa}e{sign}{:02}", exp.abs())
     } else {
         format!("{f}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn go_fmt_v_matches_fmt_for_decoded_json() {
-        assert_eq!(go_fmt_v(&json!({"b": 1, "a": "x"})), "map[a:x b:1]");
-        assert_eq!(
-            go_fmt_v(&json!([{"name": "c"}, [1, 2], null, true])),
-            "[map[name:c] [1 2] <nil> true]"
-        );
-        assert_eq!(go_fmt_v(&json!({})), "map[]");
-        assert_eq!(go_fmt_v(&json!([])), "[]");
-        assert_eq!(go_fmt_v(&json!(null)), "<nil>");
-        assert_eq!(go_fmt_v(&json!(1.5)), "1.5");
-        assert_eq!(go_fmt_v(&json!(1.0)), "1");
-        assert_eq!(go_fmt_v(&json!(123456.0)), "123456");
-        assert_eq!(go_fmt_v(&json!(1000000.0)), "1e+06");
-        assert_eq!(go_fmt_v(&json!(1234567.5)), "1.2345675e+06");
-        assert_eq!(go_fmt_v(&json!(0.0001)), "0.0001");
-        assert_eq!(go_fmt_v(&json!(0.00001)), "1e-05");
-        assert_eq!(go_fmt_v(&json!(-2.5e-300)), "-2.5e-300");
-        assert_eq!(go_fmt_v(&json!(1000000)), "1000000");
-    }
-
-    #[test]
-    fn err_bad_patch_type_formats_directive_with_percent_s() {
-        assert_eq!(
-            err_bad_patch_type(&json!("foo"), &json!({"$patch": "foo", "x": "y"})),
-            "unknown patch type: foo in map: map[$patch:foo x:y]"
-        );
-        assert_eq!(
-            err_bad_patch_type(&json!(5), &json!({"$patch": 5})),
-            "unknown patch type: %!s(int64=5) in map: map[$patch:5]"
-        );
-        assert_eq!(
-            err_bad_patch_type(&json!(true), &json!({"$patch": true})),
-            "unknown patch type: %!s(bool=true) in map: map[$patch:true]"
-        );
-        assert_eq!(
-            err_bad_patch_type(&json!(null), &json!({"$patch": null})),
-            "unknown patch type: %!s(<nil>) in map: map[$patch:<nil>]"
-        );
-        assert_eq!(
-            err_bad_patch_type(&json!(["a", 1]), &json!({})),
-            "unknown patch type: [a %!s(int64=1)] in map: map[]"
-        );
-    }
-
-    #[test]
-    fn err_bad_arg_type_and_no_merge_key() {
-        assert_eq!(
-            err_bad_arg_type(GO_SLICE, &json!("x")),
-            "expected a []interface {}, but received a string"
-        );
-        assert_eq!(
-            err_bad_arg_type(GO_SLICE, &json!({"a": 1})),
-            "expected a []interface {}, but received a map[string]interface {}"
-        );
-        assert_eq!(
-            err_bad_arg_type(GO_SLICE, &json!(null)),
-            "expected a []interface {}, but received a %!s(<nil>)"
-        );
-        assert_eq!(
-            err_bad_arg_type(GO_SLICE, &json!(2.5)),
-            "expected a []interface {}, but received a float64"
-        );
-        assert_eq!(
-            err_no_merge_key(&json!({"image": "x"}), "name"),
-            "map: map[image:x] does not contain declared merge key: name"
-        );
     }
 }

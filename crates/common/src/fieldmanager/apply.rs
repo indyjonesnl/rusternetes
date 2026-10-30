@@ -380,7 +380,7 @@ pub fn merge_values(live: &Value, config: &Value, name: &str) -> Value {
 
 /// `RemoveItems` for one path element chain: drop the field, list item or
 /// set value the path names.
-pub(super) fn remove_path(value: &mut Value, path: &[String]) {
+pub fn remove_path(value: &mut Value, path: &[String]) {
     let Some((first, rest)) = path.split_first() else {
         return;
     };
@@ -434,32 +434,4 @@ pub(super) fn path_string(path: &[String]) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    /// Ported from the removed top-level-key engine's
-    /// `test_metadata_merge_preserves_system_fields`: an applied configuration
-    /// never overrides the live object's system-owned metadata, while its user
-    /// fields (labels) survive.
-    #[test]
-    fn retain_live_system_metadata_keeps_live_system_fields_and_applied_labels() {
-        let live = json!({"metadata": {
-            "name": "p", "uid": "abc-123", "resourceVersion": "100",
-            "creationTimestamp": "2024-01-01T00:00:00Z"}});
-        let mut applied = json!({"metadata": {
-            "name": "p", "uid": "forged", "generation": 9, "labels": {"app": "test"}}});
-        retain_live_system_metadata(&mut applied, Some(&live));
-        assert_eq!(applied["metadata"]["uid"], "abc-123");
-        assert_eq!(applied["metadata"]["resourceVersion"], "100");
-        assert_eq!(
-            applied["metadata"]["creationTimestamp"],
-            "2024-01-01T00:00:00Z"
-        );
-        assert!(applied["metadata"].get("generation").is_none());
-        assert_eq!(applied["metadata"]["labels"]["app"], "test");
-    }
 }

@@ -33,20 +33,3 @@ pub fn semantic_equal<A: Serialize>(a: &A, b: &A) -> bool {
     };
     normalized(a) == normalized(b)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::semantic_equal;
-    use std::collections::HashMap;
-
-    #[test]
-    fn nil_and_empty_are_equal() {
-        let none: Option<HashMap<String, String>> = None;
-        assert!(semantic_equal(&none, &Some(HashMap::new())));
-        assert!(!semantic_equal(
-            &none,
-            &Some(HashMap::from([("a".to_string(), "1".to_string())]))
-        ));
-        assert!(semantic_equal(&Vec::<i32>::new(), &Vec::new()));
-    }
-}

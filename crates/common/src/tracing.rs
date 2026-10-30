@@ -73,18 +73,3 @@ pub fn set_verbosity(v: u32) -> Result<()> {
     control.handle.reload(filter)?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verbosity_maps_to_levels() {
-        assert_eq!(verbosity_directive(0, "warn,foo=debug"), "warn,foo=debug");
-        assert_eq!(verbosity_directive(2, "warn"), "info");
-        assert_eq!(verbosity_directive(4, "warn"), "debug");
-        assert_eq!(verbosity_directive(5, "warn"), "debug");
-        assert_eq!(verbosity_directive(6, "warn"), "trace");
-        assert_eq!(verbosity_directive(10, "warn"), "trace");
-    }
-}

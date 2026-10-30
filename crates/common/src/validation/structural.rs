@@ -985,6 +985,3 @@ pub mod listtype;
 pub mod objectmeta;
 pub mod prune;
 pub mod prunenulls;
-
-#[cfg(test)]
-mod tests;

@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 /// `types.Type`: the kinds the declarations and the selector type pass use.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum DType {
+pub enum DType {
     Bool,
     Int,
     Uint,
@@ -111,7 +111,7 @@ impl DType {
 
 /// One `decls.OverloadDecl`.
 #[derive(Debug)]
-pub(crate) struct Overload {
+pub struct Overload {
     pub member: bool,
     /// Argument types; for a member overload the first is the receiver.
     pub args: Vec<DType>,
@@ -552,13 +552,13 @@ fn build() -> Table {
     t
 }
 
-fn table() -> &'static Table {
+pub fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
     TABLE.get_or_init(build)
 }
 
 /// `Env.LookupFunction`.
-pub(crate) fn lookup(name: &str) -> Option<&'static [Overload]> {
+pub fn lookup(name: &str) -> Option<&'static [Overload]> {
     table().get(name).map(Vec::as_slice)
 }
 
@@ -817,7 +817,7 @@ pub(crate) fn is_assignable(t1: &DType, t2: &DType) -> bool {
 }
 
 /// The outcome of `resolveOverload`.
-pub(crate) enum Resolution {
+pub enum Resolution {
     /// The result type of the first matching overload.
     #[allow(dead_code)] // the pass keeps its own call result types, see `cel_dra`
     Resolved(DType),
@@ -828,7 +828,7 @@ pub(crate) enum Resolution {
 
 /// `checker.resolveOverload` for the ordinary (non-logical) functions.
 /// `arg_types` holds the receiver first when `member`.
-pub(crate) fn resolve(decls: &[Overload], member: bool, arg_types: &[DType]) -> Resolution {
+pub fn resolve(decls: &[Overload], member: bool, arg_types: &[DType]) -> Resolution {
     let mut result: Option<DType> = None;
     let mut mapping = Mapping::new();
     for o in decls {
@@ -862,7 +862,7 @@ pub(crate) fn resolve(decls: &[Overload], member: bool, arg_types: &[DType]) -> 
 }
 
 /// `checker/format.go` `formatFunctionDeclType(nil, args, isInstance)`.
-pub(crate) fn format_signature(args: &[DType], is_instance: bool) -> String {
+pub fn format_signature(args: &[DType], is_instance: bool) -> String {
     let (target, rest) = if is_instance {
         (Some(&args[0]), &args[1..])
     } else {
@@ -877,107 +877,4 @@ pub(crate) fn format_signature(args: &[DType], is_instance: bool) -> String {
     out.push_str(&rest.iter().map(DType::name).collect::<Vec<_>>().join(", "));
     out.push(')');
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn call(name: &str, member: bool, args: &[DType]) -> Option<DType> {
-        match resolve(lookup(name)?, member, args) {
-            Resolution::Resolved(t) => Some(t),
-            Resolution::NoMatch(_) => None,
-        }
-    }
-
-    #[test]
-    fn table_parses_and_every_overload_has_its_call_style() {
-        for (name, ovs) in table() {
-            assert!(!ovs.is_empty(), "{name}");
-            for o in ovs {
-                if o.member {
-                    assert!(!o.args.is_empty(), "{name} member overload has no receiver");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn arithmetic_needs_matching_types() {
-        assert_eq!(
-            call("_+_", false, &[DType::Int, DType::Int]),
-            Some(DType::Int)
-        );
-        assert_eq!(call("_+_", false, &[DType::Int, DType::Str]), None);
-        // dyn is assignable to everything
-        assert_eq!(
-            call("_+_", false, &[DType::Int, DType::Dyn]),
-            Some(DType::Int)
-        );
-    }
-
-    #[test]
-    fn equality_binds_one_type_parameter() {
-        assert_eq!(
-            call("_==_", false, &[DType::Str, DType::Str]),
-            Some(DType::Bool)
-        );
-        assert_eq!(call("_==_", false, &[DType::Int, DType::Double]), None);
-        assert_eq!(
-            call("_==_", false, &[DType::Any, DType::Double]),
-            Some(DType::Bool)
-        );
-    }
-
-    #[test]
-    fn member_and_global_overloads_are_separate() {
-        assert_eq!(
-            call("startsWith", true, &[DType::Str, DType::Str]),
-            Some(DType::Bool)
-        );
-        assert_eq!(call("startsWith", false, &[DType::Str, DType::Str]), None);
-        assert_eq!(
-            call("size", false, &[DType::List(Box::new(DType::Int))]),
-            Some(DType::Int)
-        );
-    }
-
-    #[test]
-    fn list_overloads_unify_element_types() {
-        let li = DType::List(Box::new(DType::Int));
-        assert_eq!(
-            call("_+_", false, &[li.clone(), li.clone()]),
-            Some(li.clone())
-        );
-        assert_eq!(
-            call(
-                "_+_",
-                false,
-                &[li.clone(), DType::List(Box::new(DType::Str))]
-            ),
-            None
-        );
-        assert_eq!(call("indexOf", true, &[li, DType::Int]), Some(DType::Int));
-    }
-
-    #[test]
-    fn namespaced_functions_and_undeclared_ones() {
-        assert!(lookup("sets.contains").is_some());
-        assert!(lookup("strings.quote").is_some());
-        assert!(lookup("format.named").is_some());
-        assert!(lookup("math.greatest").is_none());
-        assert!(lookup("base64.encode").is_none());
-    }
-
-    #[test]
-    fn signature_formatting() {
-        assert_eq!(
-            format_signature(&[DType::Int, DType::Str], false),
-            "(int, string)"
-        );
-        assert_eq!(
-            format_signature(&[DType::Str, DType::Int], true),
-            "string.(int)"
-        );
-    }
 }

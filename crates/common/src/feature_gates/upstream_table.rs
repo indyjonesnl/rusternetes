@@ -14,7 +14,7 @@
 
 use super::{spec, PreRelease, UpstreamGate};
 
-pub(super) const UPSTREAM_GATES: &[UpstreamGate] = &[
+pub const UPSTREAM_GATES: &[UpstreamGate] = &[
     UpstreamGate {
         name: "APIResponseCompression",
         specs: &[

@@ -86,14 +86,14 @@ pub const DEFAULT_MAX_UPDATE_MANAGERS: usize = 10;
 /// `capManagersManager.oldUpdatesManagerName` (capmanagers.go).
 const ANCIENT_CHANGES: &str = "ancient-changes";
 
-const OPERATION_APPLY: &str = "Apply";
-const OPERATION_UPDATE: &str = "Update";
+pub const OPERATION_APPLY: &str = "Apply";
+pub const OPERATION_UPDATE: &str = "Update";
 
 /// The identity of a manager entry, `BuildManagerIdentifier`
 /// (managedfields.go:134-159): the entry without its time and fields, as JSON.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct ManagerIdentity {
+pub struct ManagerIdentity {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     manager: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -104,7 +104,7 @@ struct ManagerIdentity {
     subresource: String,
 }
 
-fn build_manager_identifier(
+pub fn build_manager_identifier(
     manager: &str,
     operation: &str,
     api_version: &str,
@@ -127,16 +127,16 @@ fn build_manager_identifier(
 /// `fieldpath.VersionedSet`.
 #[derive(Debug, Clone)]
 pub struct VersionedSet {
-    set: Set,
-    api_version: String,
-    applied: bool,
+    pub set: Set,
+    pub api_version: String,
+    pub applied: bool,
 }
 
 /// `internal.Managed`: the sets by manager identifier, and their times.
 #[derive(Debug, Default, Clone)]
 pub struct Managed {
     pub fields: BTreeMap<String, VersionedSet>,
-    times: BTreeMap<String, Option<DateTime<Utc>>>,
+    pub times: BTreeMap<String, Option<DateTime<Utc>>>,
 }
 
 impl Managed {
@@ -393,7 +393,7 @@ impl FieldManager {
 }
 
 /// `stripMetaManager.stripSet` (stripmeta.go:36-52).
-fn strip_set() -> Set {
+pub fn strip_set() -> Set {
     let mut set = Set::new();
     for path in [
         &["apiVersion"][..],
@@ -485,41 +485,5 @@ pub fn cap_update_managers(managed: &mut Managed, max: usize) {
                 version_to_first.insert(version, manager.clone());
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `capManagersManager` merges per API version into one bucket, oldest first
-    /// (capmanagers_test.go `TestCapUpdateManagers`).
-    #[test]
-    fn the_cap_merges_the_oldest_entries_into_a_versioned_bucket() {
-        let mut managed = Managed::default();
-        for i in 0..12 {
-            let id = build_manager_identifier(&format!("m{i:02}"), OPERATION_UPDATE, "v1", "");
-            let mut set = Set::new();
-            set.insert(&field_path(&["data", &format!("k{i}")]));
-            managed.fields.insert(
-                id.clone(),
-                VersionedSet {
-                    set,
-                    api_version: "v1".into(),
-                    applied: false,
-                },
-            );
-            managed
-                .times
-                .insert(id, Some(Utc::now() + chrono::Duration::seconds(i)));
-        }
-        cap_update_managers(&mut managed, DEFAULT_MAX_UPDATE_MANAGERS);
-        assert_eq!(managed.fields.len(), 10);
-        let bucket = build_manager_identifier("ancient-changes", OPERATION_UPDATE, "v1", "");
-        let b = &managed.fields[&bucket];
-        // m00, m01 and m02 were merged: the first seen became the bucket.
-        assert!(b.set.has(&field_path(&["data", "k0"])));
-        assert!(b.set.has(&field_path(&["data", "k1"])));
-        assert!(b.set.has(&field_path(&["data", "k2"])));
     }
 }

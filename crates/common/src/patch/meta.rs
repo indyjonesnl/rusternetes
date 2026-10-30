@@ -141,8 +141,7 @@ impl PatchSchema {
         PatchSchema::for_kind(group, version, kind)
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(json: &str, root: &str) -> PatchSchema {
+    pub fn for_test(json: &str, root: &str) -> PatchSchema {
         PatchSchema {
             defs: Arc::new(Defs::from_json(json)),
             ty: Ty::Struct(root.to_string()),

@@ -74,29 +74,29 @@ fn observe(operation: &str, start: Instant) {
 
 /// `intSet` (intset.go): a map of id to refcounts.
 #[derive(Debug, Default)]
-pub(crate) struct IntSet {
-    pub(crate) members: HashMap<usize, usize>,
+pub struct IntSet {
+    pub members: HashMap<usize, usize>,
 }
 
 impl IntSet {
     /// `has`: true if the id has a positive refcount.
-    pub(crate) fn has(&self, i: usize) -> bool {
+    pub fn has(&self, i: usize) -> bool {
         self.members.get(&i).copied().unwrap_or(0) > 0
     }
 
     /// `reset`: removes all ids.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.members.clear();
     }
 
     /// `increment`: adds one to the refcount of the id.
-    pub(crate) fn increment(&mut self, i: usize) {
+    pub fn increment(&mut self, i: usize) {
         *self.members.entry(i).or_insert(0) += 1;
     }
 
     /// `decrement`: removes one from the refcount, removing the id when the
     /// result is <= 0. Refcounts below zero are not tracked.
-    pub(crate) fn decrement(&mut self, i: usize) {
+    pub fn decrement(&mut self, i: usize) {
         match self.members.get(&i).copied().unwrap_or(0) {
             0 | 1 => {
                 self.members.remove(&i);
@@ -167,7 +167,7 @@ impl VertexType {
 
 /// `namedVertex`: remembers the type, namespace, and name of its API object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NamedVertex {
+pub struct NamedVertex {
     pub(crate) vertex_type: VertexType,
     pub(crate) namespace: String,
     pub(crate) name: String,
@@ -176,8 +176,7 @@ pub(crate) struct NamedVertex {
 
 impl NamedVertex {
     /// `namedVertex.String`.
-    #[cfg(test)]
-    pub(crate) fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         if self.namespace.is_empty() {
             format!("{}:{}", self.vertex_type.name(), self.name)
         } else {
@@ -196,31 +195,31 @@ impl NamedVertex {
 /// vertex. This should only be used when there is a single leaf vertex
 /// reachable from T." (graph.go `destinationEdge`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Edge {
-    pub(crate) from: usize,
-    pub(crate) to: usize,
-    pub(crate) destination: Option<usize>,
+pub struct Edge {
+    pub from: usize,
+    pub to: usize,
+    pub destination: Option<usize>,
 }
 
 /// The graph state behind [`NodeGraph`]'s lock. The `*_locked` methods are
 /// upstream's "must be called under (write) lock" methods.
 #[derive(Debug)]
-pub(crate) struct GraphInner {
+pub struct GraphInner {
     // simple.UndirectedGraph storage.
-    nodes: HashMap<usize, NamedVertex>,
+    pub nodes: HashMap<usize, NamedVertex>,
     /// node id -> neighbor id -> the single edge between them (stored under
     /// both endpoints, as `UndirectedGraph.edges` does).
-    edges: HashMap<usize, HashMap<usize, Edge>>,
-    free_ids: BTreeSet<usize>,
-    used_ids: BTreeSet<usize>,
+    pub edges: HashMap<usize, HashMap<usize, Edge>>,
+    pub free_ids: BTreeSet<usize>,
+    pub used_ids: BTreeSet<usize>,
 
     /// `vertices`: type -> namespace -> name -> vertex id.
-    vertices: HashMap<VertexType, HashMap<String, HashMap<String, usize>>>,
+    pub vertices: HashMap<VertexType, HashMap<String, HashMap<String, usize>>>,
     /// `destinationEdgeIndex`: vertex -> set of destination IDs.
-    destination_edge_index: HashMap<usize, IntSet>,
+    pub destination_edge_index: HashMap<usize, IntSet>,
     /// `destinationEdgeThreshold`: the minimum number of distinct destination
     /// IDs at which to maintain an index.
-    destination_edge_threshold: usize,
+    pub destination_edge_threshold: usize,
 }
 
 impl GraphInner {
@@ -289,8 +288,7 @@ impl GraphInner {
     }
 
     /// `UndirectedGraph.RemoveEdge`.
-    #[cfg(test)]
-    fn remove_edge(&mut self, e: Edge) {
+    pub fn remove_edge(&mut self, e: Edge) {
         if !self.nodes.contains_key(&e.from) || !self.nodes.contains_key(&e.to) {
             return;
         }
@@ -314,7 +312,7 @@ impl GraphInner {
 
     /// `DirectedAcyclicGraph.VisitFrom`: neighbors reachable by an edge
     /// directed away from `id`.
-    fn neighbors_from(&self, id: usize) -> Vec<usize> {
+    pub fn neighbors_from(&self, id: usize) -> Vec<usize> {
         self.edges.get(&id).map_or_else(Vec::new, |m| {
             m.values().filter(|e| e.from == id).map(|e| e.to).collect()
         })
@@ -345,7 +343,7 @@ impl GraphInner {
     }
 
     /// `getOrCreateVertexLocked`.
-    fn get_or_create_vertex(
+    pub fn get_or_create_vertex(
         &mut self,
         vertex_type: VertexType,
         namespace: &str,
@@ -417,8 +415,7 @@ impl GraphInner {
     /// `deleteEdgesLocked`: deletes edges from a given vertex type to a
     /// specific vertex; deletes each orphaned "from" vertex, but never the
     /// "to" vertex.
-    #[cfg(test)]
-    fn delete_edges(
+    pub fn delete_edges(
         &mut self,
         from_type: VertexType,
         to_type: VertexType,
@@ -536,7 +533,7 @@ impl GraphInner {
     /// `addEdgeLocked`: all edge adds must be handled by this method rather
     /// than by calling `set_edge` directly. If `from` belongs to
     /// `vertexTypeWithAuthoritativeIndex`, `destination` must be non-nil.
-    fn add_edge(&mut self, from: usize, to: usize, destination: Option<usize>) {
+    pub fn add_edge(&mut self, from: usize, to: usize, destination: Option<usize>) {
         if destination.is_some() {
             let e = Edge {
                 from,
@@ -565,7 +562,7 @@ impl GraphInner {
     }
 
     /// `hasPathFrom`'s body, under the read lock.
-    pub(crate) fn has_path_from(
+    pub fn has_path_from(
         &self,
         node_name: &str,
         starting_type: VertexType,
@@ -682,16 +679,15 @@ impl NodeGraph {
     }
 
     /// Test hook for `g.destinationEdgeThreshold = n`.
-    #[cfg(test)]
-    pub(crate) fn set_destination_edge_threshold(&self, threshold: usize) {
+    pub fn set_destination_edge_threshold(&self, threshold: usize) {
         self.write().destination_edge_threshold = threshold;
     }
 
-    pub(crate) fn read(&self) -> std::sync::RwLockReadGuard<'_, GraphInner> {
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, GraphInner> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, GraphInner> {
+    pub fn write(&self) -> std::sync::RwLockWriteGuard<'_, GraphInner> {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1022,7 +1018,7 @@ fn json_present<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 /// `podutil.VisitPodSecretNames` (pkg/api/v1/pod/util.go:113-176): the name
 /// of every secret referenced by the pod spec; empty names skipped.
 /// Transitive references (pod -> pvc -> pv -> secret) are not visited.
-pub(crate) fn visit_pod_secret_names(pod: &Pod) -> Vec<String> {
+pub fn visit_pod_secret_names(pod: &Pod) -> Vec<String> {
     let mut names = Vec::new();
     let mut push = |n: &str| {
         if !n.is_empty() {
@@ -1111,7 +1107,7 @@ pub(crate) fn visit_pod_secret_names(pod: &Pod) -> Vec<String> {
 }
 
 /// `podutil.VisitPodConfigmapNames` (pkg/api/v1/pod/util.go:196-214).
-pub(crate) fn visit_pod_configmap_names(pod: &Pod) -> Vec<String> {
+pub fn visit_pod_configmap_names(pod: &Pod) -> Vec<String> {
     let mut names = Vec::new();
     let mut push = |n: &str| {
         if !n.is_empty() {
@@ -1154,7 +1150,7 @@ pub(crate) fn visit_pod_configmap_names(pod: &Pod) -> Vec<String> {
 /// `pvutil.VisitPVSecretNames` (pkg/api/v1/persistentvolume/util.go:47-157):
 /// `(namespace, name, kubeletVisible)` for every secret referenced by the PV
 /// source; empty names skipped.
-pub(crate) fn visit_pv_secret_names(pv: &PersistentVolume) -> Vec<(String, String, bool)> {
+pub fn visit_pv_secret_names(pv: &PersistentVolume) -> Vec<(String, String, bool)> {
     let mut out: Vec<(String, String, bool)> = Vec::new();
     let mut push = |ns: &str, name: &str, kubelet_visible: bool| {
         if !name.is_empty() {
@@ -1471,7 +1467,3 @@ impl GraphPopulator {
         self.graph.delete_pod_certificate_request(pcr);
     }
 }
-
-#[cfg(test)]
-#[path = "node_graph_tests.rs"]
-pub(crate) mod tests;
