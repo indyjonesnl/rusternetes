@@ -17,7 +17,7 @@
 //! The endpoint-level `Warning:` header (`installer.go:814`
 //! `utilwarning.AddWarningsHandler`) is in [`warnings`].
 
-mod table;
+pub mod table;
 pub mod warnings;
 
 /// The kubernetes version this server reports (`versioninfo.Get()` is
@@ -312,6 +312,3 @@ pub fn deprecation_for(
         (false, String::new())
     }
 }
-
-#[cfg(test)]
-mod tests;

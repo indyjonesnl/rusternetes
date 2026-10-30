@@ -386,11 +386,7 @@ pub(super) fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>
 
 /// `transformResponseObject` for a JSON client, with the request's warnings
 /// as `Warning: 299` headers (endpoints/filters/warning.go).
-pub(crate) fn respond<B: Serialize>(
-    status: StatusCode,
-    body: &B,
-    ctx: &RequestContext,
-) -> Response {
+pub fn respond<B: Serialize>(status: StatusCode, body: &B, ctx: &RequestContext) -> Response {
     let mut headers = HeaderMap::new();
     for warning in ctx.warnings() {
         let value = crate::handlers::validation::format_warning_header(&warning);
