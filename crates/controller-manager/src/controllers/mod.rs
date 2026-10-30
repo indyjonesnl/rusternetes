@@ -6,7 +6,7 @@ pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
 pub mod clustertrustbundle_publisher;
-pub(crate) mod controller_utils;
+pub mod controller_utils;
 pub mod cronjob;
 pub mod csi_attacher;
 pub mod csi_capacity;
@@ -78,7 +78,6 @@ pub mod taint_eviction_timed_workers;
 pub mod trigger_time_tracker;
 pub mod ttl_controller;
 pub mod typed_workqueue;
-#[cfg(test)]
 pub mod uid_precondition_double;
 #[allow(dead_code)]
 pub mod vac_protection;

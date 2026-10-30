@@ -1107,7 +1107,7 @@ pub(crate) fn slow_start_batches(count: usize, initial_batch_size: usize) -> Vec
 /// as the StatefulSet controller's `slowStartBatch` does
 /// (pkg/controller/statefulset/stateful_set_control.go:334,
 /// `MaxBatchSize = 500` at :42).
-pub(crate) fn slow_start_batches_capped(
+pub fn slow_start_batches_capped(
     count: usize,
     initial_batch_size: usize,
     max_batch_size: usize,
@@ -1146,7 +1146,7 @@ pub(crate) fn slow_start_batches_capped(
 /// api-server emits (crates/middleware/src/lib.rs, added in #1849). Both
 /// spellings are accepted so this keeps working if the cause is ever surfaced
 /// structurally.
-pub(crate) fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
+pub fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
     let rusternetes_common::Error::Forbidden(message) = err else {
         return false;
     };

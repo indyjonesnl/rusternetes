@@ -151,7 +151,7 @@ pub fn get_matching_tolerations(
 
 /// `v1helper.UpdatePodCondition` (pkg/api/v1/pod/util.go): returns whether the
 /// conditions changed.
-pub(crate) fn update_pod_condition(conditions: &mut Vec<PodCondition>, new: PodCondition) -> bool {
+pub fn update_pod_condition(conditions: &mut Vec<PodCondition>, new: PodCondition) -> bool {
     match conditions
         .iter_mut()
         .find(|c| c.condition_type == new.condition_type)

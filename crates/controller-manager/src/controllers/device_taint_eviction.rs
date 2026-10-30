@@ -112,7 +112,7 @@ pub enum WorkItem {
 }
 
 /// `workItemForRule`.
-fn work_item_for_rule(rule: &DeviceTaintRule) -> WorkItem {
+pub fn work_item_for_rule(rule: &DeviceTaintRule) -> WorkItem {
     WorkItem::Rule(NamespacedObject {
         namespace: String::new(),
         name: rule.metadata.name.clone(),
@@ -121,7 +121,7 @@ fn work_item_for_rule(rule: &DeviceTaintRule) -> WorkItem {
 }
 
 /// `newObject(pod)`.
-fn pod_object(pod: &Pod) -> NamespacedObject {
+pub fn pod_object(pod: &Pod) -> NamespacedObject {
     NamespacedObject {
         namespace: pod.metadata.namespace.clone().unwrap_or_default(),
         name: pod.metadata.name.clone(),
@@ -130,9 +130,9 @@ fn pod_object(pod: &Pod) -> NamespacedObject {
 }
 
 /// `(namespace, name)` of a namespaced object, the `types.NamespacedName` key.
-type ClaimKey = (String, String);
+pub type ClaimKey = (String, String);
 
-fn claim_key(claim: &ResourceClaim) -> ClaimKey {
+pub fn claim_key(claim: &ResourceClaim) -> ClaimKey {
     (
         claim.metadata.namespace.clone().unwrap_or_default(),
         claim.metadata.name.clone(),
@@ -167,7 +167,7 @@ pub fn tolerates_taint(toleration: &DeviceToleration, taint: &DeviceTaint) -> bo
 /// Why `resourceclaim.Name` found no usable claim name (a returned error
 /// upstream, which the caller treats as "not created yet or unsupported").
 #[derive(Debug, PartialEq, Eq)]
-enum ClaimNameError {
+pub enum ClaimNameError {
     /// `ErrClaimNotFound`.
     NotCreatedYet,
     /// `ErrAPIUnsupported`.
@@ -177,7 +177,7 @@ enum ClaimNameError {
 /// `resourceclaim.Name`: the name of the ResourceClaim referenced by or
 /// created for the PodResourceClaim, whether the owner must be checked with
 /// `IsForPod`, or `Ok(None)` when the claim intentionally was not created.
-fn resource_claim_name(
+pub fn resource_claim_name(
     pod: &Pod,
     pod_claim: &PodResourceClaim,
 ) -> std::result::Result<Option<(String, bool)>, ClaimNameError> {
@@ -328,7 +328,7 @@ impl Pool {
     }
 
     /// `pool.getDevice`: one device by name; out-dated slices are ignored.
-    fn device(&self, device_name: &str) -> Option<(Arc<ResourceSlice>, usize)> {
+    pub fn device(&self, device_name: &str) -> Option<(Arc<ResourceSlice>, usize)> {
         for slice in self.slices.values() {
             if slice.spec.pool.generation != self.max_generation {
                 continue;
@@ -518,7 +518,7 @@ impl<T> Store<T> {
     }
 }
 
-fn pod_store_key(pod: &Pod) -> String {
+pub fn pod_store_key(pod: &Pod) -> String {
     format!(
         "{}/{}",
         pod.metadata.namespace.as_deref().unwrap_or(""),
@@ -2035,7 +2035,3 @@ pub fn feature_enabled() -> bool {
     use rusternetes_common::feature_gates::{enabled, Feature};
     enabled(Feature::DynamicResourceAllocation) && enabled(Feature::DRADeviceTaints)
 }
-
-#[cfg(test)]
-#[path = "device_taint_eviction_tests.rs"]
-mod tests;

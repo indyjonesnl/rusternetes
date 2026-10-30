@@ -45,7 +45,7 @@ use tracing::{error, warn};
 /// (replica_set.go:305-321): the kind, the name to look the controller up by,
 /// and the UID that must still match.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ControllerRef {
+pub struct ControllerRef {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) uid: String,
@@ -100,7 +100,7 @@ pub(crate) enum PodEffect {
 /// What a pod event means for the controllers' expectations and queue: the
 /// effects, in the order the handler performs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PodObservation {
+pub struct PodObservation {
     pub(crate) pod_key: String,
     pub(crate) effects: Vec<PodEffect>,
 }
@@ -128,7 +128,7 @@ struct KnownPod {
 
 /// Pod key ("namespace/name") to what the handlers read of it.
 #[derive(Debug, Default)]
-pub(crate) struct PodInformerCache {
+pub struct PodInformerCache {
     known: Mutex<HashMap<String, KnownPod>>,
 }
 
@@ -337,7 +337,7 @@ impl PodInformerCache {
 
     /// Classify one watch event, updating the cache the way the informer's
     /// indexer would. `None` when the event cannot be attributed to a pod.
-    pub(crate) fn on_event(&self, event: &WatchEvent) -> Option<PodObservation> {
+    pub fn on_event(&self, event: &WatchEvent) -> Option<PodObservation> {
         let (storage_key, value, deleted) = match event {
             WatchEvent::Added(k, v) | WatchEvent::Modified(k, v) => (k, v, false),
             WatchEvent::Deleted(k, v) => (k, v, true),
@@ -445,14 +445,14 @@ impl PodInformerCache {
 /// What `resolveControllerRef` returns: upstream hands back the controller
 /// object, and the handlers read its name and `Spec.MinReadySeconds`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedController {
+pub struct ResolvedController {
     pub(crate) name: String,
     /// `rs.Spec.MinReadySeconds` (0 when unset).
     pub(crate) min_ready_seconds: i32,
 }
 
 /// The controller-specific half of the pod event handlers.
-pub(crate) trait PodEventTarget: Sync {
+pub trait PodEventTarget: Sync {
     /// The work-queue key prefix: `replicasets` or `replicationcontrollers`.
     fn queue_prefix(&self) -> &'static str;
 
@@ -524,7 +524,7 @@ pub(crate) trait PodEventTarget: Sync {
 }
 
 /// Run the effects of one observation against `target`.
-pub(crate) async fn apply_pod_observation<T: PodEventTarget>(
+pub async fn apply_pod_observation<T: PodEventTarget>(
     target: &T,
     queue: &WorkQueue,
     observation: &PodObservation,
@@ -704,7 +704,7 @@ impl<S: Storage + 'static> SharedPodInformer<S> {
     }
 
     /// The informer's indexer, for a target driving its own pass.
-    pub(crate) fn cache(&self) -> &PodInformerCache {
+    pub fn cache(&self) -> &PodInformerCache {
         &self.cache
     }
 

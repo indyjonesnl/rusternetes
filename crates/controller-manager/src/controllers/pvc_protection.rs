@@ -39,7 +39,7 @@ pub(crate) fn need_to_add_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool 
 /// finalizer is gone is deleted here: upstream PATCHes/Updates and the
 /// apiserver reaps it, but this controller writes to storage directly (the
 /// same shortcut `servicecidr::remove_finalizer_if_needed` takes).
-pub(crate) async fn update_or_reap<S: Storage, T>(storage: &S, key: &str, obj: &T) -> Result<()>
+pub async fn update_or_reap<S: Storage, T>(storage: &S, key: &str, obj: &T) -> Result<()>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
 {
