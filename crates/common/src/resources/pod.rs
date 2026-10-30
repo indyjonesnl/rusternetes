@@ -23,22 +23,6 @@ where
     }
 }
 
-/// Macro to create a skip_serializing_if function for Option<T> where T has all optional fields.
-/// This prevents serializing empty structs as {} when all fields are None.
-macro_rules! skip_if_empty {
-    ($fn_name:ident, $type:ty, $($field:ident),+) => {
-        #[allow(dead_code)]
-        fn $fn_name(value: &Option<$type>) -> bool {
-            match value {
-                None => true,
-                Some(v) => {
-                    $(v.$field.is_none())&&+
-                }
-            }
-        }
-    };
-}
-
 /// Pod is the smallest deployable unit in Kubernetes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -843,50 +827,6 @@ pub struct ContainerPort {
     #[serde(skip_serializing_if = "Option::is_none", rename = "hostIP")]
     pub host_ip: Option<String>,
 }
-
-// Generate skip functions for structs with all-optional fields
-// NOTE: Do NOT use skip_if_empty for structs with mutually exclusive fields:
-// - EnvVarSource: only one of (config_map_key_ref, secret_key_ref, field_ref, resource_field_ref) should be set
-// - ClaimSource: only one of (resource_claim_name, resource_claim_template_name) should be set
-// Using skip_if_empty would incorrectly skip serialization when only one field is set.
-skip_if_empty!(
-    skip_empty_security_context,
-    SecurityContext,
-    privileged,
-    run_as_user,
-    run_as_non_root,
-    allow_privilege_escalation,
-    capabilities,
-    seccomp_profile
-);
-skip_if_empty!(skip_empty_capabilities, Capabilities, add, drop);
-skip_if_empty!(
-    skip_empty_empty_dir_volume_source,
-    EmptyDirVolumeSource,
-    medium
-);
-skip_if_empty!(
-    skip_empty_config_map_volume_source,
-    ConfigMapVolumeSource,
-    name,
-    items,
-    default_mode,
-    optional
-);
-skip_if_empty!(
-    skip_empty_secret_volume_source,
-    SecretVolumeSource,
-    secret_name,
-    items,
-    default_mode,
-    optional
-);
-skip_if_empty!(
-    skip_empty_downward_api_volume_source,
-    DownwardAPIVolumeSource,
-    items,
-    default_mode
-);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

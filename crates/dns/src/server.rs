@@ -343,7 +343,6 @@ pub fn respond_bytes(zone: &Zone, query: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 // Silence the unused-import warning when ip_to_arpa isn't referenced
 // here — re-exported for the watcher / future PTR-zone work.
-#[allow(dead_code)]
 fn _ip_to_arpa_used(ip: IpAddr) -> String {
     ip_to_arpa(ip)
 }

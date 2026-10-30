@@ -365,6 +365,8 @@ struct EventLog {
 /// Faithful port of upstream `eventLogger`.
 pub struct EventLogger<C: PassiveClock> {
     cache: HashMap<String, EventLog>,
+    // Stored but never read, exactly like upstream `eventLogger.clock`
+    // (events_cache.go:314).
     #[allow(dead_code)]
     clock: C,
 }
