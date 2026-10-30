@@ -1,3 +1,6 @@
+//! SEPARATE-TEST-BINARY: the storage-contract workflow runs this target by
+//! name (`cargo test --test etcd_rpc_subset -- --test-threads=1`).
+
 //! The etcd backend must speak only the etcd v3 RPC subset that upstream's
 //! `etcd3` store emits.
 //!
