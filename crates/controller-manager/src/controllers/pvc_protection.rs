@@ -26,12 +26,12 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 /// `protectionutil.IsDeletionCandidate`.
-pub(crate) fn is_deletion_candidate(meta: &ObjectMeta, finalizer: &str) -> bool {
+pub fn is_deletion_candidate(meta: &ObjectMeta, finalizer: &str) -> bool {
     meta.deletion_timestamp.is_some() && has_finalizer(meta, finalizer)
 }
 
 /// `protectionutil.NeedToAddFinalizer`.
-pub(crate) fn need_to_add_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool {
+pub fn need_to_add_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool {
     meta.deletion_timestamp.is_none() && !has_finalizer(meta, finalizer)
 }
 
@@ -39,7 +39,7 @@ pub(crate) fn need_to_add_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool 
 /// finalizer is gone is deleted here: upstream PATCHes/Updates and the
 /// apiserver reaps it, but this controller writes to storage directly (the
 /// same shortcut `servicecidr::remove_finalizer_if_needed` takes).
-pub(crate) async fn update_or_reap<S: Storage, T>(storage: &S, key: &str, obj: &T) -> Result<()>
+pub async fn update_or_reap<S: Storage, T>(storage: &S, key: &str, obj: &T) -> Result<()>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
 {
@@ -65,13 +65,13 @@ fn has_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool {
 }
 
 /// `podIsShutDown`: kubelet is done with the pod or it was force-deleted.
-pub(crate) fn pod_is_shut_down(pod: &Pod) -> bool {
+pub fn pod_is_shut_down(pod: &Pod) -> bool {
     pod.metadata.deletion_timestamp.is_some()
         && pod.metadata.deletion_grace_period_seconds == Some(0)
 }
 
 /// `podUsesPVC`.
-pub(crate) fn pod_uses_pvc(pod: &Pod, pvc: &PersistentVolumeClaim) -> bool {
+pub fn pod_uses_pvc(pod: &Pod, pvc: &PersistentVolumeClaim) -> bool {
     let Some(spec) = pod.spec.as_ref() else {
         return false;
     };
@@ -244,161 +244,5 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_storage::memory::MemoryStorage;
-    use serde_json::json;
-
-    const FIN: &str = "kubernetes.io/pvc-protection";
-
-    fn pvc(name: &str, finalizer: bool, deleting: bool) -> PersistentVolumeClaim {
-        let mut meta = json!({"name": name, "namespace": "ns", "uid": format!("uid-{name}")});
-        if finalizer {
-            meta["finalizers"] = json!([FIN]);
-        }
-        if deleting {
-            meta["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-        }
-        serde_json::from_value(json!({
-            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": meta, "spec": {}
-        }))
-        .unwrap()
-    }
-
-    fn pod(name: &str, node: &str, claim: &str) -> Pod {
-        let mut spec = json!({"containers": [],
-            "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}]});
-        if !node.is_empty() {
-            spec["nodeName"] = json!(node);
-        }
-        serde_json::from_value(json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": name, "namespace": "ns", "uid": format!("uid-{name}")},
-            "spec": spec
-        }))
-        .unwrap()
-    }
-
-    async fn setup(
-        pvcs: &[PersistentVolumeClaim],
-        pods: &[Pod],
-    ) -> (Arc<MemoryStorage>, PvcProtectionController<MemoryStorage>) {
-        let storage = Arc::new(MemoryStorage::new());
-        for c in pvcs {
-            let key = build_key("persistentvolumeclaims", Some("ns"), &c.metadata.name);
-            storage.create(&key, c).await.unwrap();
-        }
-        for p in pods {
-            let key = build_key("pods", Some("ns"), &p.metadata.name);
-            storage.create(&key, p).await.unwrap();
-        }
-        let c = PvcProtectionController::new(storage.clone());
-        (storage, c)
-    }
-
-    async fn finalizers(s: &MemoryStorage, name: &str) -> Option<Vec<String>> {
-        let key = build_key("persistentvolumeclaims", Some("ns"), name);
-        s.get::<PersistentVolumeClaim>(&key)
-            .await
-            .ok()
-            .map(|c| c.metadata.finalizers.unwrap_or_default())
-    }
-
-    #[tokio::test]
-    async fn pvc_without_finalizer_gets_it() {
-        let (s, c) = setup(&[pvc("a", false, false)], &[]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert_eq!(finalizers(&s, "a").await.unwrap(), vec![FIN.to_string()]);
-    }
-
-    #[tokio::test]
-    async fn pvc_with_finalizer_is_left_alone() {
-        let (s, c) = setup(&[pvc("a", true, false)], &[]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert_eq!(finalizers(&s, "a").await.unwrap(), vec![FIN.to_string()]);
-    }
-
-    #[tokio::test]
-    async fn missing_pvc_is_ignored() {
-        let (_s, c) = setup(&[], &[]).await;
-        c.process_pvc("ns", "gone").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn deleted_unused_pvc_is_reaped() {
-        let (s, c) = setup(&[pvc("a", true, true)], &[]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert!(finalizers(&s, "a").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn deleted_pvc_with_scheduled_pod_is_kept() {
-        let (s, c) = setup(&[pvc("a", true, true)], &[pod("p", "node-1", "a")]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert_eq!(finalizers(&s, "a").await.unwrap(), vec![FIN.to_string()]);
-    }
-
-    #[tokio::test]
-    async fn deleted_pvc_with_unscheduled_pod_is_reaped() {
-        let (s, c) = setup(&[pvc("a", true, true)], &[pod("p", "", "a")]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert!(finalizers(&s, "a").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn deleted_pvc_with_unrelated_pod_is_reaped() {
-        let (s, c) = setup(&[pvc("a", true, true)], &[pod("p", "node-1", "other")]).await;
-        c.process_pvc("ns", "a").await.unwrap();
-        assert!(finalizers(&s, "a").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn mixed_pvcs_only_unused_reaped() {
-        let (s, c) = setup(
-            &[pvc("used", true, true), pvc("free", true, true)],
-            &[pod("p", "node-1", "used")],
-        )
-        .await;
-        c.process_pvc("ns", "used").await.unwrap();
-        c.process_pvc("ns", "free").await.unwrap();
-        assert!(finalizers(&s, "used").await.is_some());
-        assert!(finalizers(&s, "free").await.is_none());
-    }
-
-    #[test]
-    fn finished_but_not_deleted_pod_still_uses_pvc() {
-        let mut p = pod("p", "node-1", "a");
-        p.status = serde_json::from_value(json!({"phase": "Succeeded"})).ok();
-        assert!(pod_uses_pvc(&p, &pvc("a", true, true)));
-    }
-
-    #[test]
-    fn force_deleted_pod_is_shut_down_and_ephemeral_unused() {
-        let mut p: Pod = serde_json::from_value(json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "ns", "uid": "u",
-                "deletionTimestamp": "2026-01-01T00:00:00Z",
-                "deletionGracePeriodSeconds": 0},
-            "spec": {"containers": [], "nodeName": "n",
-                "volumes": [{"name": "v", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}]}
-        }))
-        .unwrap();
-        assert!(pod_is_shut_down(&p));
-        let mut claim = pvc("p-v", true, true);
-        claim.metadata.owner_references = serde_json::from_value(json!([{
-            "apiVersion": "v1", "kind": "Pod", "name": "p", "uid": "u", "controller": true}]))
-        .unwrap();
-        assert!(!pod_uses_pvc(&p, &claim));
-        // Not shut down: the generic ephemeral claim owned by the pod counts.
-        p.metadata.deletion_grace_period_seconds = Some(30);
-        assert!(pod_uses_pvc(&p, &claim));
-        // Same name but not controlled by this pod: does not count.
-        claim.metadata.owner_references = None;
-        assert!(!pod_uses_pvc(&p, &claim));
     }
 }

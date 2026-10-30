@@ -299,17 +299,3 @@ impl<S: Storage + 'static> PriorityClassController<S> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_storage::memory::MemoryStorage;
-
-    #[tokio::test]
-    async fn test_reconcile_all_is_noop_when_empty() {
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = PriorityClassController::new(storage);
-        // Must succeed without doing anything when there is no data.
-        controller.reconcile_all().await.unwrap();
-    }
-}

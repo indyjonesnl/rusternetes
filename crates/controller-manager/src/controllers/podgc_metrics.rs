@@ -77,7 +77,6 @@ pub fn inc_deleting_pod_errors(namespace: &str, reason: &str) {
 }
 
 /// `testutil.GetCounterMetricValue(DeletingPodsTotal.WithLabelValues(..))`.
-#[cfg(test)]
 pub fn deleting_pods(namespace: &str, reason: &str) -> u64 {
     SERIES
         .deleting
@@ -86,7 +85,6 @@ pub fn deleting_pods(namespace: &str, reason: &str) -> u64 {
 }
 
 /// `testutil.GetCounterMetricValue(DeletingPodsErrorTotal.WithLabelValues(..))`.
-#[cfg(test)]
 pub fn deleting_pod_errors(namespace: &str, reason: &str) -> u64 {
     SERIES
         .deleting_errors

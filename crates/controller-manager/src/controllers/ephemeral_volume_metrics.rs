@@ -51,13 +51,11 @@ pub fn inc_create_failures() {
 }
 
 /// `testutil.GetCounterMetricValue(EphemeralVolumeCreateAttempts)`.
-#[cfg(test)]
 pub fn create_attempts() -> u64 {
     SERIES.create_attempts.get()
 }
 
 /// `testutil.GetCounterMetricValue(EphemeralVolumeCreateFailures)`.
-#[cfg(test)]
 pub fn create_failures() -> u64 {
     SERIES.create_failures.get()
 }

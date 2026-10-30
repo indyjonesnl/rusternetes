@@ -22,7 +22,6 @@
 // use it without depending on this crate.
 pub use rusternetes_controller_core::worker_pool::spawn_workers;
 
-#[cfg(test)]
 pub mod test_support {
     //! Storage wrapper that makes overlap between workers observable, so a
     //! test can drive a controller's real `run()` and assert the pool is wider

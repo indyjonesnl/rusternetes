@@ -143,7 +143,7 @@ fn go_slice(items: &[String]) -> String {
 
 /// `hostPathPlugin` (`pkg/volume/hostpath/host_path.go`): name = path, no
 /// SELinux mount.
-struct HostPathPlugin;
+pub struct HostPathPlugin;
 
 #[async_trait]
 impl VolumePlugin for HostPathPlugin {
@@ -175,7 +175,7 @@ impl VolumePlugin for HostPathPlugin {
 }
 
 /// `nfsPlugin` (`pkg/volume/nfs/nfs.go`): name = `server/path`.
-struct NfsPlugin;
+pub struct NfsPlugin;
 
 #[async_trait]
 impl VolumePlugin for NfsPlugin {
@@ -207,7 +207,7 @@ impl VolumePlugin for NfsPlugin {
 }
 
 /// `fcPlugin` (`pkg/volume/fc/fc.go`): supports SELinux mount.
-struct FcPlugin;
+pub struct FcPlugin;
 
 impl FcPlugin {
     /// `getVolumeSource`.
@@ -262,7 +262,7 @@ impl VolumePlugin for FcPlugin {
 }
 
 /// `iscsiPlugin` (`pkg/volume/iscsi/iscsi.go`): supports SELinux mount.
-struct IscsiPlugin;
+pub struct IscsiPlugin;
 
 #[async_trait]
 impl VolumePlugin for IscsiPlugin {
@@ -296,7 +296,7 @@ impl VolumePlugin for IscsiPlugin {
 }
 
 /// `localVolumePlugin` (`pkg/volume/local/local.go`): PV only, name = PV name.
-struct LocalPlugin;
+pub struct LocalPlugin;
 
 #[async_trait]
 impl VolumePlugin for LocalPlugin {
@@ -319,8 +319,8 @@ impl VolumePlugin for LocalPlugin {
 }
 
 /// `csiPlugin` (`pkg/volume/csi/csi_plugin.go`).
-struct CsiPlugin<S: Storage> {
-    storage: Arc<S>,
+pub struct CsiPlugin<S: Storage> {
+    pub storage: Arc<S>,
 }
 
 #[async_trait]
@@ -610,14 +610,12 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
         }
     }
 
-    #[cfg(test)]
-    fn with_plugins(mut self, plugins: Vec<Arc<dyn VolumePlugin>>) -> Self {
+    pub fn with_plugins(mut self, plugins: Vec<Arc<dyn VolumePlugin>>) -> Self {
         self.plugins = plugins;
         self
     }
 
-    #[cfg(test)]
-    fn with_label_cache(mut self, cache: Arc<dyn VolumeCache>) -> Self {
+    pub fn with_label_cache(mut self, cache: Arc<dyn VolumeCache>) -> Self {
         self.label_cache = cache;
         self
     }
@@ -1182,6 +1180,3 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests;

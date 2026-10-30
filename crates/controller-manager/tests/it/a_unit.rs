@@ -1,0 +1,34 @@
+//! Unit tests moved out of `src/` so the lib is not compiled a second time as a test target.
+#![allow(non_snake_case)]
+mod controllers__attach_detach;
+mod controllers__bootstrap_signer;
+mod controllers__bootstrap_token_cleaner;
+mod controllers__cascade_tests;
+mod controllers__cert_authority;
+mod controllers__certificate_signing_request;
+mod controllers__cidrset_metrics;
+mod controllers__clustertrustbundle_publisher;
+mod controllers__controller_utils;
+mod controllers__cronjob;
+mod controllers__csi_attacher;
+mod controllers__csi_capacity;
+mod controllers__csi_provisioner;
+mod controllers__csi_topology;
+mod controllers__csr_cleaner;
+mod controllers__daemonset;
+mod controllers__deployment;
+mod controllers__device_taint_eviction;
+mod controllers__dynamic_provisioner;
+mod controllers__endpoints;
+mod controllers__endpoints_tracker;
+mod controllers__endpointslice;
+mod controllers__endpointslice_tracker;
+mod controllers__ephemeral_volume;
+mod controllers__events;
+mod controllers__expectations;
+mod controllers__garbage_collector;
+mod controllers__hpa;
+mod controllers__hpa_behavior;
+mod controllers__hpa_metrics_client;
+mod controllers__hpa_pod_grouping;
+mod controllers__hpa_replica_calculator;

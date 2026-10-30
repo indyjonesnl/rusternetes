@@ -52,37 +52,10 @@ impl StaleEndpointsTracker {
             .remove(&(namespace.to_string(), name.to_string()));
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.stale_resource_version_by_endpoints
             .read()
             .unwrap()
             .is_empty()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Port of `TestStaleEndpointsTracker` (`endpoints_tracker_test.go:30-60`).
-    #[test]
-    fn stale_endpoints_tracker() {
-        let tracker = StaleEndpointsTracker::new();
-        assert!(
-            !tracker.is_stale("default", "foo", "1"),
-            "is_stale should return false before the endpoint is staled"
-        );
-        tracker.stale("default", "foo", "1");
-        assert!(
-            tracker.is_stale("default", "foo", "1"),
-            "is_stale should return true after the endpoint is staled"
-        );
-        assert!(
-            !tracker.is_stale("default", "foo", "2"),
-            "is_stale should return false after the endpoint is updated"
-        );
-        tracker.delete("default", "foo");
-        assert!(tracker.is_empty());
     }
 }
