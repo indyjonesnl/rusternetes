@@ -24,7 +24,7 @@ use crate::state::ApiServerState;
 
 /// update.go:84-96: decode the query into `UpdateOptions`, then
 /// `ValidateUpdateOptions`.
-pub(super) fn checked_update_options(params: &HashMap<String, String>) -> Result<UpdateOptions> {
+pub fn checked_update_options(params: &HashMap<String, String>) -> Result<UpdateOptions> {
     let options = UpdateOptions {
         field_manager: params.get("fieldManager").cloned(),
         dry_run: dry_run_param(params),

@@ -78,18 +78,3 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<ControllerRevision, Stor
         Arc::new(Strategy),
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strategy_flags_match_upstream() {
-        assert!(Strategy.namespace_scoped());
-        assert!(!Strategy.allow_create_on_update());
-        assert!(Strategy.allow_unconditional_update());
-        let ctx = RequestContext::new(Some("default"));
-        assert!(Strategy.default_garbage_collection_policy(&ctx).is_none());
-        assert!(Strategy.graceful().is_none());
-    }
-}

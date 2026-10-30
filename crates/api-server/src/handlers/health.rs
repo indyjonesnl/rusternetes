@@ -118,7 +118,7 @@ pub async fn post_start_hook_check(
     post_start_hook_response(crate::post_start_hooks::global(), &name)
 }
 
-fn post_start_hook_response(
+pub fn post_start_hook_response(
     reg: &crate::post_start_hooks::PostStartHooks,
     name: &str,
 ) -> (StatusCode, String) {
@@ -484,31 +484,5 @@ fn skip_length(der: &[u8], pos: usize) -> Option<usize> {
     } else {
         let num_bytes = (der[pos] & 0x7f) as usize;
         Some(pos + 1 + num_bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::post_start_hooks::PostStartHooks;
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn poststarthook_check_fails_until_finished() {
-        let reg = PostStartHooks::new();
-        let n = "scheduling/bootstrap-system-priority-classes";
-        let done = reg.register(n);
-        let (code, body) = post_start_hook_response(&reg, n);
-        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body.contains("not finished"));
-        done.store(true, Ordering::SeqCst);
-        assert_eq!(
-            post_start_hook_response(&reg, n),
-            (StatusCode::OK, "ok".into())
-        );
-        assert_eq!(
-            post_start_hook_response(&reg, "missing").0,
-            StatusCode::NOT_FOUND
-        );
     }
 }

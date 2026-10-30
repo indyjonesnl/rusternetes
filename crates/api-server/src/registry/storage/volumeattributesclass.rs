@@ -78,32 +78,3 @@ pub fn new_store(storage: Arc<StorageBackend>) -> Store<VolumeAttributesClass, S
     store.return_deleted_object = true;
     store
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vac(driver: &str, param: &str) -> VolumeAttributesClass {
-        serde_json::from_value(serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1", "kind": "VolumeAttributesClass",
-            "metadata": {"name": "gold"}, "driverName": driver,
-            "parameters": {"iops": param}
-        }))
-        .unwrap()
-    }
-
-    fn ctx() -> RequestContext {
-        RequestContext::new(None)
-    }
-
-    #[test]
-    fn flags_and_update_immutability_match_upstream() {
-        assert!(!Strategy.namespace_scoped());
-        assert!(!Strategy.allow_create_on_update());
-        assert!(Strategy.allow_unconditional_update());
-        let old = vac("csi.example.com", "100");
-        assert!(Strategy.validate(&ctx(), &old).is_empty());
-        let errs = Strategy.validate_update(&ctx(), &vac("csi.example.com", "200"), &old);
-        assert!(errs.iter().any(|e| e.field == "parameters"), "{errs:?}");
-    }
-}

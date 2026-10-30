@@ -166,7 +166,7 @@ impl<T: Object> RequestScope<T> {
 
 /// The `WithAuthorization` filter's check for a resource request
 /// (endpoints/filters/authorization.go).
-pub(crate) async fn authorize(
+pub async fn authorize(
     state: &ApiServerState,
     user: &UserInfo,
     verb: &str,
@@ -207,7 +207,7 @@ pub(crate) fn dry_run_param(params: &HashMap<String, String>) -> Option<Vec<Stri
 
 /// `dryrun.IsDryRun` (apiserver/pkg/util/dryrun/dryrun.go): any value is a
 /// dry run. The options validation that runs first admits only `All`.
-pub(crate) fn is_dry_run(dry_run: Option<&[String]>) -> bool {
+pub fn is_dry_run(dry_run: Option<&[String]>) -> bool {
     dry_run.is_some_and(|d| !d.is_empty())
 }
 
@@ -292,9 +292,7 @@ const DUPLICATE_OWNER_REFERENCES_AFTER_ADMISSION_WARNING: &str = ".metadata.owne
 /// `dedupOwnerReferences` (rest.go:293-313): drops an entry only when it is
 /// wholly equal to one already kept (the UID set is a short-circuit, as
 /// upstream), and reports the UID of each dropped entry.
-pub(super) fn dedup_owner_references(
-    refs: &[OwnerReference],
-) -> (Vec<OwnerReference>, Vec<String>) {
+pub fn dedup_owner_references(refs: &[OwnerReference]) -> (Vec<OwnerReference>, Vec<String>) {
     let mut result: Vec<OwnerReference> = Vec::new();
     let mut duplicates = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -312,7 +310,7 @@ pub(super) fn dedup_owner_references(
 
 /// `dedupOwnerReferencesAndAddWarning` (rest.go:334-353). Called before and
 /// after mutating admission on create and update, and only after it on patch.
-pub(super) fn dedup_owner_references_and_add_warning<T: Object>(
+pub fn dedup_owner_references_and_add_warning<T: Object>(
     obj: &mut T,
     ctx: &RequestContext,
     after_mutating_admission: bool,
@@ -346,7 +344,7 @@ pub(super) fn dedup_owner_references_and_add_warning<T: Object>(
 ///
 /// `request(strip_managed_fields)` runs one attempt; the second attempt is
 /// made at most once, and only for a too-large error.
-pub(super) async fn retry_without_managed_fields_if_too_large<R, Fut>(
+pub async fn retry_without_managed_fields_if_too_large<R, Fut>(
     mut request: impl FnMut(bool) -> Fut,
 ) -> Result<R>
 where
@@ -358,7 +356,7 @@ where
     }
 }
 
-pub(super) fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>) -> Result<()> {
+pub fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>) -> Result<()> {
     let meta = obj.metadata();
     if meta.name.is_empty() {
         // `ObjectName` refuses an empty name with `errEmptyName`
@@ -386,11 +384,7 @@ pub(super) fn check_name<T: Object>(obj: &T, name: &str, namespace: Option<&str>
 
 /// `transformResponseObject` for a JSON client, with the request's warnings
 /// as `Warning: 299` headers (endpoints/filters/warning.go).
-pub(crate) fn respond<B: Serialize>(
-    status: StatusCode,
-    body: &B,
-    ctx: &RequestContext,
-) -> Response {
+pub fn respond<B: Serialize>(status: StatusCode, body: &B, ctx: &RequestContext) -> Response {
     let mut headers = HeaderMap::new();
     for warning in ctx.warnings() {
         let value = crate::handlers::validation::format_warning_header(&warning);

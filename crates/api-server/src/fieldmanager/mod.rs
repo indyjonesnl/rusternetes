@@ -199,6 +199,3 @@ impl FieldManager {
         Ok(new)
     }
 }
-
-#[cfg(test)]
-mod tests;

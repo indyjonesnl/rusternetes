@@ -62,37 +62,3 @@ pub fn drop_disabled_fields(new: &mut ResourceClaimSpec, old: Option<&ResourceCl
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn spec() -> ResourceClaimSpec {
-        serde_json::from_value(serde_json::json!({"devices": {
-            "constraints": [{"distinctAttribute": "a.example.com/b"}],
-            "requests": [{"name": "r", "firstAvailable": [
-                {"name": "s", "deviceClassName": "c", "capacity": {"requests": {"m": "1"}}}]}]
-        }}))
-        .unwrap()
-    }
-
-    /// util.go:132-149: with `DRAConsumableCapacity` off, `distinctAttribute`
-    /// and sub-request capacity are dropped unless the old spec used them.
-    #[test]
-    #[serial_test::serial]
-    fn distinct_attribute_and_subrequest_capacity_are_dropped() {
-        let mut new = spec();
-        drop_disabled_fields(&mut new, None);
-        assert!(new.devices.constraints[0].distinct_attribute.is_none());
-        assert!(new.devices.requests[0].first_available[0]
-            .capacity
-            .is_none());
-
-        let mut kept = spec();
-        drop_disabled_fields(&mut kept, Some(&spec()));
-        assert!(kept.devices.constraints[0].distinct_attribute.is_some());
-        assert!(kept.devices.requests[0].first_available[0]
-            .capacity
-            .is_some());
-    }
-}

@@ -43,7 +43,7 @@ out = [
     "",
     "use super::Lifecycle;",
     "",
-    "pub(super) const TABLE: &[Lifecycle] = &[",
+    "pub const TABLE: &[Lifecycle] = &[",
 ]
 for g, v, k, d in entries:
     dep = d["Deprecated"]

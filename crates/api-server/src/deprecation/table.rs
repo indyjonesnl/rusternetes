@@ -5,7 +5,7 @@
 
 use super::Lifecycle;
 
-pub(super) const TABLE: &[Lifecycle] = &[
+pub const TABLE: &[Lifecycle] = &[
     Lifecycle {
         group: "admission.k8s.io",
         version: "v1beta1",

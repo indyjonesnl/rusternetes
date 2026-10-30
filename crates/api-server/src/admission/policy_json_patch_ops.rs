@@ -372,6 +372,3 @@ fn test(doc: &mut Value, op: &Operation) -> Result<(), ApplyError> {
         _ => Err(ApplyError::TestFailed),
     }
 }
-
-#[cfg(test)]
-mod tests;
