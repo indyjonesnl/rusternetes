@@ -145,18 +145,26 @@ impl KubeletVolumeHost {
                 true,
                 crate::volume_plugins::util::mount_ops::detect_safe_not_mounted_behavior(),
             ),
-            // Unit tests run unprivileged on temp dirs: record tmpfs mounts
-            // instead of performing them.
-            #[cfg(test)]
-            empty_dir_mount_deps: Some(crate::volume_plugins::empty_dir::fake_mount_deps().0),
-            #[cfg(not(test))]
             empty_dir_mount_deps: None,
         }
     }
 
+    /// [`Self::new`] for unit tests, which run unprivileged on temp dirs:
+    /// tmpfs mounts are recorded instead of performed.
+    #[doc(hidden)]
+    pub fn new_for_tests(
+        volumes_base_path: String,
+        storage: Option<Arc<StorageBackend>>,
+        token_manager: TokenManager,
+        node_allocatable: HashMap<String, String>,
+    ) -> Self {
+        Self::new(volumes_base_path, storage, token_manager, node_allocatable)
+            .with_empty_dir_mount_deps(crate::volume_plugins::empty_dir::fake_mount_deps().0)
+    }
+
     /// Inject the emptyDir mounter and mount detector (see
     /// [`VolumeHost::empty_dir_mount_deps`]).
-    pub(crate) fn with_empty_dir_mount_deps(
+    pub fn with_empty_dir_mount_deps(
         mut self,
         deps: crate::volume_plugins::empty_dir::EmptyDirMountDeps,
     ) -> Self {
@@ -279,47 +287,5 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn pod_certificate_manager(&self) -> Option<&Arc<dyn crate::podcertificate::Manager>> {
         self.pod_certificate_manager.as_ref()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn host() -> KubeletVolumeHost {
-        KubeletVolumeHost::new(
-            "/var/lib/rusternetes".to_string(),
-            None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
-            std::collections::HashMap::new(),
-        )
-    }
-
-    #[test]
-    fn pods_dir_and_host_util() {
-        let h = host();
-        assert_eq!(h.get_pods_dir(), "/var/lib/rusternetes/pods");
-        assert!(h.get_host_util().get_file_type("/tmp").is_ok());
-    }
-
-    /// The host is the only way a plugin learns where its directory goes, so
-    /// it must agree with `pod_dirs` exactly — the layout bug #1967 was two
-    /// path builders disagreeing.
-    #[test]
-    fn pod_volume_dir_matches_pod_dirs() {
-        let got = host().get_pod_volume_dir("uid-1", "kubernetes.io/empty-dir", "data");
-        assert_eq!(
-            got,
-            "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~empty-dir/data"
-        );
-    }
-
-    /// The accessor must return exactly the root the host was constructed
-    /// with — no re-derivation from `crate::pod_dirs::get_pods_dir()` or any
-    /// other getter. This is the invariant a `.parent()`-based derivation
-    /// would silently assume instead of stating.
-    #[test]
-    fn volumes_base_path_matches_constructor_argument() {
-        assert_eq!(host().get_volumes_base_path(), "/var/lib/rusternetes");
     }
 }

@@ -20,11 +20,9 @@
 //! - A real FibreChannel run (`/dev/disk/by-path`, `multipath`, sysfs) is
 //!   unproven in this repository's CI (no FC HBA).
 
-mod attacher;
-mod disk_manager;
-#[cfg(test)]
-mod tests;
-mod util;
+pub mod attacher;
+pub mod disk_manager;
+pub mod util;
 
 pub use attacher::{FcAttacher, FcDetacher};
 pub(crate) use disk_manager::DiskManager;
@@ -64,7 +62,7 @@ pub const FC_PLUGIN_NAME: &str = "kubernetes.io/fc";
 /// [`FcDisk`] holds its plugin.
 #[derive(Clone)]
 pub struct FcPlugin {
-    pub(crate) host: Arc<dyn VolumeHost>,
+    pub host: Arc<dyn VolumeHost>,
 }
 
 impl FcPlugin {
@@ -87,7 +85,7 @@ impl FcPlugin {
     }
 
     /// `newMounterInternal` (`fc.go:116-154`).
-    pub(crate) fn new_mounter_internal(
+    pub fn new_mounter_internal(
         &self,
         spec: &Spec<'_>,
         pod_uid: &str,
@@ -175,7 +173,7 @@ impl FcPlugin {
     }
 
     /// `newUnmounterInternal` (`fc.go:206-219`).
-    pub(crate) fn new_unmounter_internal(
+    pub fn new_unmounter_internal(
         &self,
         vol_name: &str,
         pod_uid: &str,
@@ -192,7 +190,7 @@ impl FcPlugin {
     }
 
     /// `newUnmapperInternal` (`fc.go:225-237`).
-    pub(crate) fn new_unmapper_internal(
+    pub fn new_unmapper_internal(
         &self,
         vol_name: &str,
         pod_uid: &str,
@@ -479,7 +477,7 @@ fn fc_source_json(wwns: &[String], lun: i32, wwids: &[String]) -> serde_json::Va
 
 /// `fcDisk` (`fc.go:342-354`); `volume.MetricsNil` is its `MetricsProvider`.
 #[derive(Clone)]
-pub(crate) struct FcDisk {
+pub struct FcDisk {
     pub vol_name: String,
     pub pod_uid: String,
     pub wwns: Vec<String>,
@@ -495,7 +493,7 @@ pub(crate) struct FcDisk {
 impl FcDisk {
     /// The `&fcDisk{podUID, volName, manager, plugin, io}` literal of
     /// `newUnmounterInternal` / `newUnmapperInternal`.
-    pub(crate) fn blank(
+    pub fn blank(
         vol_name: &str,
         pod_uid: &str,
         manager: Arc<dyn DiskManager>,
@@ -554,7 +552,7 @@ impl FcDisk {
 
 /// `fcDiskMounter` (`fc.go:374-383`).
 #[derive(Clone)]
-pub(crate) struct FcDiskMounter {
+pub struct FcDiskMounter {
     pub disk: FcDisk,
     pub read_only: bool,
     #[allow(dead_code)] // read by upstream's `fsType` consumers we do not port
@@ -634,7 +632,7 @@ impl super::Mounter for FcDiskMounter {
 
 /// `fcDiskUnmounter` (`fc.go:413-418`).
 #[derive(Clone)]
-pub(crate) struct FcDiskUnmounter {
+pub struct FcDiskUnmounter {
     pub disk: FcDisk,
     pub mounter: Arc<dyn MountInterface>,
     pub device_util: Arc<dyn DeviceUtil>,
@@ -691,7 +689,7 @@ impl BlockVolumeMapper for FcDiskMapper {
 
 /// `fcDiskUnmapper` (`fc.go:443-447`), the `BlockVolumeUnmapper`;
 /// `volume.MetricsNil` is its `MetricsProvider`.
-pub(crate) struct FcDiskUnmapper {
+pub struct FcDiskUnmapper {
     pub disk: FcDisk,
     pub exec: Arc<dyn Exec>,
     pub device_util: Arc<dyn DeviceUtil>,
@@ -757,7 +755,7 @@ impl CustomBlockVolumeUnmapper for FcDiskUnmapper {
 /// FC volumes used directly in a pod have a ReadOnly flag set by the pod
 /// author; used as a PersistentVolume they get the ReadOnly flag indirectly
 /// through the persistent-claim volume used to mount the PV.
-pub(crate) fn get_volume_source(spec: &Spec<'_>) -> Result<(FCVolumeSource, bool)> {
+pub fn get_volume_source(spec: &Spec<'_>) -> Result<(FCVolumeSource, bool)> {
     if let Some(fc) = spec.volume.legacy_sources.fc.as_ref() {
         let read_only = fc.read_only.unwrap_or(false);
         return Ok((fc.clone(), read_only));
@@ -771,7 +769,7 @@ pub(crate) fn get_volume_source(spec: &Spec<'_>) -> Result<(FCVolumeSource, bool
 /// `createPersistentVolumeFromFCVolumeSource` (`fc.go:495-508`), wrapped as
 /// `volume.NewSpecFromPersistentVolume(fcPV, false)` (`fc.go:339`): our `Spec`
 /// needs a `Volume`, named after the PV (see `Spec::name`).
-fn create_persistent_volume_from_fc_volume_source(
+pub fn create_persistent_volume_from_fc_volume_source(
     volume_name: &str,
     fc: FCVolumeSource,
 ) -> Result<OwnedSpec> {
@@ -792,9 +790,7 @@ fn create_persistent_volume_from_fc_volume_source(
 }
 
 /// `getWwnsLunWwids` (`fc.go:510-524`): `(wwns, lun, wwids)`.
-pub(crate) fn get_wwns_lun_wwids(
-    fc: &FCVolumeSource,
-) -> Result<(Vec<String>, String, Vec<String>)> {
+pub fn get_wwns_lun_wwids(fc: &FCVolumeSource) -> Result<(Vec<String>, String, Vec<String>)> {
     let target_wwns = fc.target_wwns.clone().unwrap_or_default();
     if let (Some(lun), false) = (fc.lun, target_wwns.is_empty()) {
         return Ok((target_wwns, lun.to_string(), Vec::new()));

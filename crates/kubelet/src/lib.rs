@@ -22,7 +22,7 @@ pub mod pluginmanager;
 pub mod pod_dirs;
 pub mod pod_status;
 pub mod podcertificate;
-mod poll;
+pub mod poll;
 pub mod removeall;
 pub mod runtime;
 pub mod runtime_state;

@@ -897,6 +897,3 @@ impl CustomBlockVolumeUnmapper for CsiBlockMapper {
             .await
     }
 }
-
-#[cfg(test)]
-mod tests;

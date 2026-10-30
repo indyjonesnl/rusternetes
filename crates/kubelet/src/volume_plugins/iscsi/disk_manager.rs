@@ -11,7 +11,7 @@ use std::os::unix::fs::DirBuilderExt;
 use tracing::error;
 
 /// Abstract interface to disk operations (`disk_manager.go:29-39`).
-pub(crate) trait DiskManager: Send + Sync {
+pub trait DiskManager: Send + Sync {
     fn make_global_pd_name(&self, disk: &IscsiDisk) -> String;
     fn make_global_vdpd_name(&self, disk: &IscsiDisk) -> String;
     /// Attaches the disk to the kubelet's host machine.

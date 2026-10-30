@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 /// alone), sorted by filename as `ioutil.ReadDir` does. Upstream's `Lstat` is
 /// not declared: only `util.DeviceHandler` calls it, through
 /// [`IoUtil`], which carries its own `lstat`.
-pub(crate) trait IoHandler: Send + Sync {
+pub trait IoHandler: Send + Sync {
     fn read_dir(&self, dirname: &str) -> io::Result<Vec<String>>;
     fn eval_symlinks(&self, path: &str) -> io::Result<String>;
     fn write_file(&self, filename: &str, data: &[u8], perm: u32) -> io::Result<()>;
@@ -28,7 +28,7 @@ pub(crate) trait IoHandler: Send + Sync {
 
 /// `osIOHandler` (`fc_util.go:43`, `:50-61`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct OsIoHandler;
+pub struct OsIoHandler;
 
 impl IoHandler for OsIoHandler {
     fn read_dir(&self, dirname: &str) -> io::Result<Vec<String>> {
@@ -217,7 +217,7 @@ fn atoi(s: &str) -> std::result::Result<i64, String> {
 
 /// `parsePDName` (`fc_util.go:163-186`): parse a directory name created by
 /// `makePDNameInternal` or `makeVDPDNameInternal` into `(wwns, lun, wwids)`.
-pub(crate) fn parse_pd_name(path: &str) -> Result<(Vec<String>, i32, Vec<String>)> {
+pub fn parse_pd_name(path: &str) -> Result<(Vec<String>, i32, Vec<String>)> {
     let dirname = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -245,7 +245,7 @@ pub(crate) fn parse_pd_name(path: &str) -> Result<(Vec<String>, i32, Vec<String>
 pub struct FcUtil;
 
 /// `searchDisk` (`fc_util.go:199-249`).
-pub(crate) fn search_disk(b: &FcDiskMounter) -> Result<String> {
+pub fn search_disk(b: &FcDiskMounter) -> Result<String> {
     let io = b.disk.io.as_ref();
     let wwids = &b.disk.wwids;
     let wwns = &b.disk.wwns;

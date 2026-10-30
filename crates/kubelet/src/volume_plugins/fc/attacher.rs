@@ -39,7 +39,7 @@ pub struct FcAttacher {
 
 impl FcPlugin {
     /// `NewAttacher` (`attacher.go:49-54`).
-    pub(crate) fn new_attacher_internal(&self) -> FcAttacher {
+    pub fn new_attacher_internal(&self) -> FcAttacher {
         FcAttacher {
             host: self.host.clone(),
             manager: Arc::new(FcUtil),
@@ -144,9 +144,9 @@ impl DeviceMounter for FcAttacher {
 
 /// `fcDetacher` (`attacher.go:140-144`).
 pub struct FcDetacher {
-    pub(crate) mounter: Arc<dyn MountInterface>,
-    pub(crate) manager: Arc<dyn DiskManager>,
-    pub(crate) host: Arc<dyn VolumeHost>,
+    pub mounter: Arc<dyn MountInterface>,
+    pub manager: Arc<dyn DiskManager>,
+    pub host: Arc<dyn VolumeHost>,
 }
 
 /// `wait.PollImmediate` interval and timeout of `UnmountDevice`
@@ -157,7 +157,7 @@ const DETACH_POLL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 impl FcDetacher {
     /// `UnmountDevice` (`attacher.go:166-206`) with the poll cadence as
     /// parameters, so tests need not wait two minutes.
-    pub(crate) async fn unmount_device_with(
+    pub async fn unmount_device_with(
         &self,
         device_mount_path: &str,
         poll_interval: Duration,

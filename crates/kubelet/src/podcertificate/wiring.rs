@@ -176,6 +176,3 @@ pub fn new_pod_certificate_manager<S: Storage + ?Sized + 'static>(
         (Arc::new(NoOpManager), None)
     }
 }
-
-#[cfg(test)]
-mod tests;

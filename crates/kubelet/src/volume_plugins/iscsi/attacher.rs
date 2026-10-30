@@ -39,7 +39,7 @@ pub struct IscsiAttacher {
 
 impl IscsiPlugin {
     /// `NewAttacher` (`attacher.go:49-55`).
-    pub(crate) fn new_attacher_internal(&self) -> IscsiAttacher {
+    pub fn new_attacher_internal(&self) -> IscsiAttacher {
         IscsiAttacher {
             plugin: self.clone(),
             manager: Arc::new(IscsiUtil),
