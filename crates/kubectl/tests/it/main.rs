@@ -13,6 +13,7 @@ mod command_tests;
 mod describe_tests;
 mod exec_attach_portforward_tests;
 mod info_commands_tests;
+mod kc_unit;
 mod mock_client_example;
 mod scale_patch_label_tests;
 mod top_tests;

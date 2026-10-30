@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lib]
+name = "rusternetes_kubectl"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kubectl"
 path = "src/main.rs"
