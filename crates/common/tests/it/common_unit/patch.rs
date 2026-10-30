@@ -1095,3 +1095,39 @@ pub mod smp_schema_tests {
         }
     }
 }
+
+mod deep_merge_tests {
+    use rusternetes_common::patch::deep_merge_objects;
+
+    #[test]
+    fn test_deep_merge_preserves_existing_map_entries() {
+        let mut target = serde_json::json!({
+            "capacity": {
+                "cpu": "4",
+                "memory": "8Gi",
+                "pods": "110"
+            },
+            "conditions": [{"type": "Ready"}]
+        });
+        let patch = serde_json::json!({
+            "capacity": {
+                "scheduling.k8s.io/foo": "5"
+            }
+        });
+        deep_merge_objects(&mut target, &patch);
+
+        let cap = target.get("capacity").unwrap().as_object().unwrap();
+        assert_eq!(cap.get("cpu").unwrap(), "4", "existing cpu preserved");
+        assert_eq!(
+            cap.get("memory").unwrap(),
+            "8Gi",
+            "existing memory preserved"
+        );
+        assert_eq!(
+            cap.get("scheduling.k8s.io/foo").unwrap(),
+            "5",
+            "new extended resource added"
+        );
+        assert!(target.get("conditions").is_some(), "conditions preserved");
+    }
+}

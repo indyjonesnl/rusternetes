@@ -63,6 +63,11 @@ ed25519-dalek = { version = "2", features = ["pkcs8"] }
 # Validity window of generated self-signed serving certs (rcgen takes `time` types).
 time = "0.3"
 
+[lib]
+# Unit tests live in tests/it: a second compilation of the lib as a test
+# target costs as much as the lib itself.
+test = false
+
 [features]
 default = []
 axum-support = ["axum"]
