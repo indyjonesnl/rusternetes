@@ -1,0 +1,28 @@
+//! Unit tests moved out of `src/` so the lib is not compiled a second time as a test target.
+#![allow(non_snake_case)]
+mod advanced;
+mod data_plane;
+mod diagnosis;
+mod framework_runtime;
+mod inter_pod_affinity_score;
+mod node_volume_limits;
+mod pod_topology_spread_score;
+mod profile;
+mod queue__csi_hints;
+mod queue__dra_hints;
+mod queue__events;
+mod queue__heap;
+mod queue__hints;
+mod queue__preemption_hints;
+mod queue__scheduling_gates;
+mod queue__scheduling_queue;
+mod queue__topology_spread_hints;
+mod queue__volume_binding_hints;
+mod queue__volume_hints;
+mod resource_events;
+mod scheduler;
+mod scheduler_config;
+mod score;
+mod volume_assume;
+mod volume_bind;
+mod volume_binding;

@@ -79,12 +79,12 @@ pub type PodLister = Arc<dyn Fn(&str, &str) -> Option<Pod> + Send + Sync>;
 pub struct Nominator {
     /// Used to verify the given pod is alive (`WithPodLister`); `None` skips
     /// the check, as upstream does for a nil lister.
-    pod_lister: Option<PodLister>,
+    pub pod_lister: Option<PodLister>,
     /// Node name -> pods nominated to run on it (in activeQ, backoffQ or
     /// unschedulablePods).
-    pub(crate) nominated_pods: HashMap<String, Vec<PodRef>>,
+    pub nominated_pods: HashMap<String, Vec<PodRef>>,
     /// Pod UID -> node name where it is nominated.
-    pub(crate) nominated_pod_to_node: HashMap<String, String>,
+    pub nominated_pod_to_node: HashMap<String, String>,
 }
 
 fn nominated_node_name(pod: &Pod) -> &str {
