@@ -36,7 +36,7 @@ impl CriImageGcRuntime {
 
 /// `toKubeContainer` (`kuberuntime/helpers.go:101-123`): a container with no id
 /// or no image is not convertible and is skipped by `GetPods`.
-fn to_gc_container(c: &v1::Container) -> Option<GcContainer> {
+pub fn to_gc_container(c: &v1::Container) -> Option<GcContainer> {
     let image = c.image.as_ref()?;
     if c.id.is_empty() {
         return None;
@@ -236,47 +236,5 @@ impl NodeEventSink for NodeEvents {
                 .event(&involved, &source, EventType::Warning, &reason, &message)
                 .await;
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `toKubeContainer` (`kuberuntime/helpers.go:101-123`): `ImageID` is
-    /// `c.ImageId`, falling back to `c.ImageRef` for pre-1.30 runtimes; a
-    /// container without an id or image is skipped.
-    #[test]
-    fn to_gc_container_follows_to_kube_container() {
-        let base = v1::Container {
-            id: "c1".into(),
-            image: Some(v1::ImageSpec {
-                image: "busybox".into(),
-                runtime_handler: "h".into(),
-                ..Default::default()
-            }),
-            image_ref: "sha256:ref".into(),
-            ..Default::default()
-        };
-        let c = to_gc_container(&base).unwrap();
-        assert_eq!("sha256:ref", c.image_id);
-        assert_eq!("h", c.image_runtime_handler);
-
-        let with_id = v1::Container {
-            image_id: "sha256:id".into(),
-            ..base.clone()
-        };
-        assert_eq!("sha256:id", to_gc_container(&with_id).unwrap().image_id);
-
-        assert!(to_gc_container(&v1::Container {
-            id: String::new(),
-            ..base.clone()
-        })
-        .is_none());
-        assert!(to_gc_container(&v1::Container {
-            image: None,
-            ..base
-        })
-        .is_none());
     }
 }

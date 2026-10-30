@@ -81,7 +81,7 @@ impl IscsiPlugin {
     /// would hold for them: the kubelet keeps no record of which devices it
     /// `MountDevice`d, so the plugin directory is the source (the `volumeDevices`
     /// block-map tree is not a filesystem global mount and is skipped).
-    pub(crate) fn list_global_mounts(&self) -> Vec<String> {
+    pub fn list_global_mounts(&self) -> Vec<String> {
         let plugin_dir = self.host.get_plugin_dir(ISCSI_PLUGIN_NAME);
         let mounter = self.host.get_mounter();
         let mut out = Vec::new();
