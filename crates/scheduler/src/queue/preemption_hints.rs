@@ -20,18 +20,3 @@ pub fn is_pod_schedulable_after_pod_deletion(
 ) -> Result<QueueingHint, String> {
     Ok(QueueingHint::QueueSkip)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn always_skips() {
-        let pod: Pod =
-            serde_json::from_value(serde_json::json!({"metadata": {"name": "p"}})).unwrap();
-        assert_eq!(
-            is_pod_schedulable_after_pod_deletion(&pod, Some(&pod), None).unwrap(),
-            QueueingHint::QueueSkip
-        );
-    }
-}

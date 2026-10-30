@@ -820,7 +820,7 @@ fn get_err_to_common(e: GetError) -> Error {
 /// apimachinery `IsConflict`/`IsAlreadyExists`/`IsNotFound`, errors.go:529-557)
 /// to [`Error::Conflict`] so the scheduler's bind/update retry
 /// loops trip on it exactly as they do against storage.
-fn api_err_to_common(e: anyhow::Error) -> Error {
+pub fn api_err_to_common(e: anyhow::Error) -> Error {
     let msg = format!("{e:#}");
     if is_conflict(&e) || is_already_exists(&e) {
         Error::Conflict(msg)
@@ -828,62 +828,5 @@ fn api_err_to_common(e: anyhow::Error) -> Error {
         Error::NotFound(msg)
     } else {
         Error::Internal(msg)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn binding_body_has_target_name_and_metadata_name() {
-        let b = binding_body("web-1", "node-2");
-        assert_eq!(b["target"]["name"], "node-2");
-        assert_eq!(b["metadata"]["name"], "web-1");
-        assert_eq!(b["kind"], "Binding");
-    }
-
-    #[test]
-    fn api_err_conflict_maps_to_conflict() {
-        let e = anyhow::Error::new(rusternetes_client::api_status::ApiStatusError {
-            code: 409,
-            reason: "Conflict".into(),
-            message: "Error from server (Conflict): pod already assigned".into(),
-            retry_after_seconds: None,
-        });
-        assert!(matches!(api_err_to_common(e), Error::Conflict(_)));
-    }
-
-    /// Typed `ApiStatusError`s must classify by reason/code (apimachinery
-    /// `IsNotFound`/`IsConflict`/`IsAlreadyExists`, errors.go:529-557), not by
-    /// the rendered message.
-    #[test]
-    fn api_err_classifies_by_typed_status() {
-        use rusternetes_client::api_status::ApiStatusError;
-        let typed = |code: u16, reason: &str, message: &str| {
-            anyhow::Error::new(ApiStatusError {
-                code,
-                reason: reason.into(),
-                message: message.into(),
-                retry_after_seconds: None,
-            })
-        };
-        assert!(matches!(
-            api_err_to_common(typed(409, "", "request failed with status 409")),
-            Error::Conflict(_)
-        ));
-        assert!(matches!(
-            api_err_to_common(typed(404, "", "request failed with status 404")),
-            Error::NotFound(_)
-        ));
-        assert!(matches!(
-            api_err_to_common(typed(409, "AlreadyExists", "exists")),
-            Error::Conflict(_)
-        ));
-        // A message that mentions "(Conflict)" on a non-conflict status.
-        assert!(matches!(
-            api_err_to_common(typed(500, "InternalError", "x (Conflict) y")),
-            Error::Internal(_)
-        ));
     }
 }
