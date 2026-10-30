@@ -9,10 +9,10 @@
 //! Add a new test file as `tests/it/<name>.rs` plus a `mod <name>;` line
 //! below. A stray `tests/<name>.rs` still compiles -- it just silently
 //! reintroduces a separate binary, which is what this layout avoids.
+mod a_unit;
 mod apiservice_available_test;
 mod attach_detach_test;
 mod availability_status_test;
-mod cm_a_unit;
 mod conformance_apps_deployment_replicaset;
 mod conformance_apps_job_cronjob;
 mod conformance_apps_rc_daemonset_pdb;
