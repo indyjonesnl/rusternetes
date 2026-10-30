@@ -36,40 +36,30 @@ env:
   # `line-tables-only`, or reproduce locally where the profile still applies.
   CARGO_PROFILE_DEV_DEBUG: "0"
 
-# ONE job on the self-hosted ARC `arc-runner-set` scale set (large tier,
-# ~8 GiB), which ships the Rust toolchain (clippy + rustfmt), cargo-nextest,
-# and the system build deps (protoc + libprotobuf-dev, mold + clang,
-# pkg-config + libssl-dev).
+
+# Three jobs. `clippy` and `nextest` are independent and run in PARALLEL, so
+# the wall clock of a PR is max(clippy, nextest) instead of their sum (they
+# used to be one serial job: clippy first, then the test build + run). Each
+# keeps its own `target/` cache: clippy only produces check metadata, the
+# nextest build only produces codegen artifacts, so there was no artifact
+# reuse between the two steps to lose; only the cheap build scripts and proc
+# macros are compiled twice.
 #
-# clippy and nextest were previously two separate jobs on two pods. Each
-# did a full cold workspace compile, and their combined schedule-time
-# reservation (8 GiB nextest + 6 GiB clippy) could not co-fit on a single
-# ~14 GiB node, so they serialized anyway. Merging them into one job:
-#   - Collapses the two reservations into one 8 GiB pod (the steps run
-#     sequentially, so peak = max(clippy, nextest) ≈ 8 GiB, not the sum) —
-#     one node runs the whole PR check with no cross-pod contention.
-#   - Shares the common dependency graph on warm `target/`: clippy compiles
-#     it first, nextest reuses the dep rlibs instead of a second cold build
-#     + sccache pull.
+# `checks` is the single REQUIRED status check for Rust and keeps its old
+# name and id, so branch protection is unchanged. It is a pure aggregate gate
+# over the two jobs above. When a PR touches no Rust, both jobs still start,
+# skip their cache + build steps via the change-detection step and report
+# green in seconds. Pushes to main always run the full jobs.
 #
 # Both feature configs are still compiled exactly once, preserving the
 # original dual-config coverage:
-#   - clippy runs with DEFAULT features — the no-sqlite build guard + lint.
+#   - clippy runs with DEFAULT features, the no-sqlite build guard + lint.
 #   - nextest runs WITH the `sqlite` feature. Features are additive and
 #     there are no `cfg(not(feature="sqlite"))` tests, so this is a superset
 #     of the default run (regular tests PLUS the rhino/SQLite-gated ones).
-# clippy runs first as the cheap fail-fast gate (lint + no-sqlite build)
-# before the longer test run.
-#
-# This job is the single REQUIRED status check for Rust. To keep it
-# mergeable without burning a full compile on PRs that touch no Rust
-# (docs / scripts / compose only), it stays always-triggered but gates its
-# cache + build steps on a change-detection step — so the required check
-# still reports green in seconds when there's no Rust to build. Pushes to
-# main always run the full job.
 jobs:
-  checks:
-    name: cargo clippy + nextest
+  clippy:
+    name: cargo clippy
     runs-on: arc-runner-set
     steps:
       - name: Checkout repository
@@ -92,66 +82,86 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Rust-relevant changes — skipping clippy + nextest (required check reports green)."
+            echo "::notice::No Rust-relevant changes — skipping clippy (the required check reports green)."
           fi
 
       - name: Cache cargo registry + target
-        # ARC runner pods are ephemeral; rust-cache restores ~/.cargo
-        # and target/ from the GitHub Actions cache scoped to
-        # Cargo.lock + rustc version.
-        #
-        # `save-if: main only` is deliberate: PRs restore from the
-        # cache main wrote on the most recent merge, then SKIP the
-        # multi-GB upload at job end. Cache uploads from the ARC
-        # cluster to the GHA cache service (Azure blob) were eating
-        # 1-3 min per PR job; main pays that cost once per Cargo.lock
-        # change. PRs that touch Cargo.lock will recompile new deps
-        # but still benefit from the warm cache for everything else.
-        #
-        # One cache namespace for the merged job: a single `target/` now
-        # holds both the default-feature (clippy) and sqlite (nextest)
-        # artifacts, saved and restored together.
+        # rust-cache restores ~/.cargo and target/ from the GitHub Actions
+        # cache scoped to Cargo.lock + rustc version. `save-if: main only`:
+        # PRs restore the cache main wrote on the most recent merge and skip
+        # the upload at job end. Own shared-key: this job's target/ holds
+        # check metadata only.
         if: steps.rust.outputs.changed == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
-          shared-key: "checks"
+          shared-key: "checks-clippy"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo clippy (hard gate, all targets)
-        # Runs FIRST as the cheap fail-fast gate — a lint or no-sqlite build
-        # break stops the job before the longer test run.
-        #
         # `-- -D warnings` converts every clippy lint into a build error
         # so warnings cannot accrete unnoticed. Future PRs must keep clippy
         # green or `#[allow(<lint>)]` the specific case with a comment.
         #
         # Default features only: this is the no-sqlite build guard (the
-        # nextest step below compiles the sqlite config), and the optional
+        # nextest job compiles the sqlite config), and the optional
         # `jaeger` feature pulls in opentelemetry-jaeger which is itself
         # deprecated upstream. clippy lints are therefore not run on the
-        # `cfg(feature = "sqlite")` code paths — those are still compiled
-        # (and type-checked) by the sqlite-enabled nextest step, just not
+        # `cfg(feature = "sqlite")` code paths; those are still compiled
+        # (and type-checked) by the sqlite-enabled nextest job, just not
         # linted.
         #
-        # `--all-targets` also acts as the bin-target build check the old
-        # explicit `cargo build` step provided — clippy compiles every
-        # target before lint, so any compile error in a bin fails this step.
+        # `--all-targets` also acts as the bin-target build check: clippy
+        # compiles every target before lint, so any compile error in a bin
+        # fails this step.
         if: steps.rust.outputs.changed == 'true'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  nextest:
+    name: cargo nextest
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout repository
+        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
+        # `../../rhino` path dep. submodules: recursive checks it out pinned.
+        # fetch-depth: 0 gives the change-detection diff the PR base commit.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Detect Rust-relevant changes
+        id: rust
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD" \
+              | grep -qE '(\.rs|\.proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)build\.rs$|^rhino($|/)|(^|/)rust-toolchain|^\.github/workflows/(test|fmt)\.yml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Rust-relevant changes — skipping nextest (the required check reports green)."
+          fi
+
+      - name: Cache cargo registry + target
+        # Same cache policy as the clippy job, own shared-key: this job's
+        # target/ holds the sqlite-feature test build.
+        if: steps.rust.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          shared-key: "checks-nextest"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: cargo nextest run
-        # Reuses the common dependency artifacts clippy just built in
-        # target/. Runs the whole workspace with the `sqlite` feature ON.
-        # Features are additive and there are no `cfg(not(feature = "sqlite"))`
-        # tests, so a single sqlite-enabled run is a SUPERSET of the default
-        # run: it executes every default test PLUS the rhino/SQLite-gated ones
-        # (e.g. watch_delivery_rhino_test.rs).
+        # Runs the whole workspace with the `sqlite` feature ON (a superset of
+        # the default run, see the header comment).
         #
         # `--status-level fail` suppresses per-test PASS lines; the final
         # summary still reports totals. `--no-fail-fast` surfaces every failure
         # in one run instead of stopping at the first. Doctests are not run
-        # (nextest limitation) — none of the workspace depends on doctest
+        # (nextest limitation); none of the workspace depends on doctest
         # coverage; add a separate `cargo test --doc` step if that changes.
         if: steps.rust.outputs.changed == 'true'
         run: cargo nextest run --workspace --features rusternetes-api-server/sqlite --locked --no-fail-fast --status-level fail
@@ -169,11 +179,21 @@ jobs:
         run: bash scripts/wire-format-coverage.sh
 
       - name: sccache stats
-        # Compilation cache hit-rate, for visibility. sccache itself is
-        # configured cluster-side via the runner pod env (RUSTC_WRAPPER +
-        # SCCACHE_* → the in-cluster MinIO; see indy/arc-runner/sccache-minio
-        # + values-*.yaml). It shares rustc artifacts across successive
-        # pushes to a PR. `|| true` keeps a missing/unconfigured sccache
-        # from failing the job.
+        # Compilation cache hit-rate, for visibility. `|| true` keeps a
+        # missing/unconfigured sccache from failing the job.
         if: always() && steps.rust.outputs.changed == 'true'
         run: sccache --show-stats || true
+
+  checks:
+    # Aggregate required check. Keep this name and job id: branch protection
+    # matches on it.
+    name: cargo clippy + nextest
+    needs: [clippy, nextest]
+    if: always()
+    runs-on: arc-runner-set-small
+    steps:
+      - name: Require clippy and nextest
+        run: |
+          echo "clippy:  ${{ needs.clippy.result }}"
+          echo "nextest: ${{ needs.nextest.result }}"
+          [ "${{ needs.clippy.result }}" = "success" ] && [ "${{ needs.nextest.result }}" = "success" ]
