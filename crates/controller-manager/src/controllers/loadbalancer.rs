@@ -16,10 +16,10 @@ use tracing::{debug, error, info, warn};
 
 /// LoadBalancerController reconciles LoadBalancer-type Services with cloud provider load balancers
 pub struct LoadBalancerController<S: Storage> {
-    storage: Arc<S>,
-    cloud_provider: Option<Arc<dyn CloudProvider>>,
-    cluster_name: String,
-    sync_interval: Duration,
+    pub storage: Arc<S>,
+    pub cloud_provider: Option<Arc<dyn CloudProvider>>,
+    pub cluster_name: String,
+    pub sync_interval: Duration,
 }
 
 impl<S: Storage + 'static> LoadBalancerController<S> {
@@ -782,21 +782,5 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             max,
             max - min + 1
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rusternetes_storage::memory::MemoryStorage;
-
-    #[test]
-    fn test_controller_creation() {
-        // Test that we can create a controller without cloud provider
-        let storage = Arc::new(MemoryStorage::new());
-        let controller = LoadBalancerController::new(storage, None, "test-cluster".to_string(), 30);
-
-        assert_eq!(controller.cluster_name, "test-cluster");
-        assert!(controller.cloud_provider.is_none());
     }
 }

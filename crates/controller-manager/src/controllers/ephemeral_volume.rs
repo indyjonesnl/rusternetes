@@ -38,14 +38,14 @@ use tracing::{debug, error, info, warn};
 const FAILED_BINDING: &str = "FailedBinding";
 
 /// `ephemeral.VolumeClaimName`.
-pub(crate) fn volume_claim_name(pod: &Pod, volume: &Volume) -> String {
+pub fn volume_claim_name(pod: &Pod, volume: &Volume) -> String {
     format!("{}-{}", pod.metadata.name, volume.name)
 }
 
 /// `ephemeral.VolumeIsForPod`: the claim must be in the pod's namespace and
 /// controlled by the pod (`metav1.IsControlledBy`: controller ref with the
 /// pod's UID).
-pub(crate) fn volume_is_for_pod(pod: &Pod, pvc: &PersistentVolumeClaim) -> Result<()> {
+pub fn volume_is_for_pod(pod: &Pod, pvc: &PersistentVolumeClaim) -> Result<()> {
     let controlled = pvc
         .metadata
         .owner_references

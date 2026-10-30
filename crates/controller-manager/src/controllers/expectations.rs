@@ -265,7 +265,6 @@ impl ControllerExpectations {
     /// Upstream `GetExpectations` (`controller_utils.go:172-179`), which is part
     /// of its public interface; here only the tests inspect the counts, so it
     /// is test-only rather than shipped dead.
-    #[cfg(test)]
     pub fn get_expectations(&self, key: &str) -> Option<(i64, i64)> {
         self.entries
             .lock()

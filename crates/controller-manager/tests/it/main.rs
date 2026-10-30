@@ -12,6 +12,7 @@
 mod apiservice_available_test;
 mod attach_detach_test;
 mod availability_status_test;
+mod cm_b_unit;
 mod conformance_apps_deployment_replicaset;
 mod conformance_apps_job_cronjob;
 mod conformance_apps_rc_daemonset_pdb;

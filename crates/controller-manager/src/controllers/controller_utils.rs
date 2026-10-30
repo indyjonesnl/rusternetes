@@ -21,7 +21,7 @@ use std::time::Duration;
 pub(crate) const POD_DELETION_COST: &str = "controller.kubernetes.io/pod-deletion-cost";
 
 /// `podutil.IsPodReady`: the Ready condition is True.
-pub(crate) fn is_pod_ready(pod: &Pod) -> bool {
+pub fn is_pod_ready(pod: &Pod) -> bool {
     pod_ready_condition(pod).is_some()
 }
 
@@ -45,14 +45,14 @@ fn phase_of(pod: &Pod) -> Option<&Phase> {
 
 /// `controller.IsPodActive` (`controller_utils.go:1085`): not Succeeded or
 /// Failed, and no deletionTimestamp.
-pub(crate) fn is_pod_active(pod: &Pod) -> bool {
+pub fn is_pod_active(pod: &Pod) -> bool {
     !matches!(phase_of(pod), Some(Phase::Succeeded) | Some(Phase::Failed))
         && pod.metadata.deletion_timestamp.is_none()
 }
 
 /// `controller.IsPodTerminating` (`controller_utils.go:1092`): not terminal,
 /// with a deletionTimestamp.
-pub(crate) fn is_pod_terminating(pod: &Pod) -> bool {
+pub fn is_pod_terminating(pod: &Pod) -> bool {
     !matches!(phase_of(pod), Some(Phase::Succeeded) | Some(Phase::Failed))
         && pod.metadata.deletion_timestamp.is_some()
 }
@@ -61,7 +61,7 @@ pub(crate) fn is_pod_terminating(pod: &Pod) -> bool {
 /// Ready for at least `min_ready_seconds` since the Ready condition's
 /// lastTransitionTime (a zero transition time is never available once
 /// `minReadySeconds` is set).
-pub(crate) fn is_pod_available(pod: &Pod, min_ready_seconds: i32, now: DateTime<Utc>) -> bool {
+pub fn is_pod_available(pod: &Pod, min_ready_seconds: i32, now: DateTime<Utc>) -> bool {
     let Some(cond) = pod_ready_condition(pod) else {
         return false;
     };
@@ -113,7 +113,7 @@ pub(crate) fn find_min_next_pod_availability_simple_check<'a>(
 /// `last_owner_status_evaluation` is the instant status was computed at;
 /// `clock_now` is the clock now (upstream's `clock.Now()`), so the wait is
 /// measured from when the caller actually acts, not from the evaluation.
-pub(crate) fn find_min_next_pod_availability_check(
+pub fn find_min_next_pod_availability_check(
     pods: &[&Pod],
     min_ready_seconds: i32,
     last_owner_status_evaluation: DateTime<Utc>,
@@ -134,7 +134,7 @@ pub(crate) fn find_min_next_pod_availability_check(
 }
 
 /// `controller.PodKey` (`controller_utils.go`): "namespace/name".
-pub(crate) fn pod_key(pod: &Pod) -> String {
+pub fn pod_key(pod: &Pod) -> String {
     format!(
         "{}/{}",
         pod.metadata.namespace.as_deref().unwrap_or(""),
@@ -248,7 +248,7 @@ pub(crate) fn active_pods_less(a: &Pod, b: &Pod) -> bool {
     false
 }
 
-pub(crate) fn sort_active_pods(pods: &mut [&Pod]) {
+pub fn sort_active_pods(pods: &mut [&Pod]) {
     pods.sort_by(|a, b| {
         if active_pods_less(a, b) {
             std::cmp::Ordering::Less
@@ -306,7 +306,7 @@ fn logarithmic_rank_diff(t1: DateTime<Utc>, t2: DateTime<Utc>, now: DateTime<Utc
 /// Which feature gates `ActivePodsWithRanks.Less` consults. Resolved once per
 /// sort by the caller: they are process-wide and `Less` runs O(n log n) times.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RankGates {
+pub struct RankGates {
     /// `PodDeletionCost` (1.22 Beta, on in v1.35).
     pub pod_deletion_cost: bool,
     /// `LogarithmicScaleDown` (GA since 1.31, locked on).
@@ -422,7 +422,7 @@ fn scaled_after_or_zero(
 /// logarithmic buckets mixed with the zero-time rule can be intransitive),
 /// whereas Rust's `sort_by` may panic on one. A merge sort over `Less`
 /// reproduces "returns some permutation" without that hazard.
-pub(crate) fn sort_active_pods_with_ranks<'a>(
+pub fn sort_active_pods_with_ranks<'a>(
     pods: &[&'a Pod],
     ranks: &[usize],
     now: Option<DateTime<Utc>>,
@@ -462,7 +462,7 @@ fn merge_sort<T: Clone>(mut items: Vec<T>, less: &dyn Fn(&T, &T) -> bool) -> Vec
 
 /// Number of active pods per node among `related`, used as the rank
 /// (`getPodsRankedByRelatedPodsOnSameNode`, `replica_set.go:942-957`).
-pub(crate) fn pods_on_node_counts(related: &[&Pod]) -> HashMap<String, usize> {
+pub fn pods_on_node_counts(related: &[&Pod]) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for pod in related {
         if is_pod_active(pod) {
@@ -472,7 +472,7 @@ pub(crate) fn pods_on_node_counts(related: &[&Pod]) -> HashMap<String, usize> {
     counts
 }
 
-pub(crate) fn node_of(pod: &Pod) -> &str {
+pub fn node_of(pod: &Pod) -> &str {
     node_name(pod)
 }
 
