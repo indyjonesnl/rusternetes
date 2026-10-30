@@ -11,6 +11,7 @@
 //! reintroduces a separate binary, which is what this layout avoids.
 mod authz_rbac_node;
 mod cel_struct_literals_test;
+mod common_unit;
 mod crd_jsonschemaprops_roundtrip_test;
 mod decode_parity;
 mod fuzz_roundtrip_jsonproto_test;

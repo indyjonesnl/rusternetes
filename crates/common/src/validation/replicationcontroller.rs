@@ -222,35 +222,3 @@ fn validate_replication_controller_status(
     }
     errs
 }
-
-#[cfg(test)]
-mod old_template_options_tests {
-    use super::*;
-
-    fn rc(search: &str) -> ReplicationController {
-        serde_json::from_value(serde_json::json!({
-            "metadata": {"name": "r", "namespace": "d", "resourceVersion": "1"},
-            "spec": {"replicas": 1, "selector": {"a": "b"},
-                "template": {"metadata": {"labels": {"a": "b"}}, "spec": {
-                    "containers": [{"name": "c", "image": "x"}],
-                    "dnsConfig": {"searches": [search]}}}}
-        }))
-        .unwrap()
-    }
-
-    /// strategy.go:127 vs :160 (`GetValidationOptionsFromPodTemplate`).
-    #[test]
-    #[serial_test::serial]
-    fn update_derives_pod_options_from_the_old_template() {
-        let _g = crate::feature_gates::with_feature(
-            crate::feature_gates::Feature::RelaxedDNSSearchValidation,
-            false,
-        );
-        let relaxed = "my_search.example.com";
-        assert!(!validate_replication_controller(&rc(relaxed)).is_empty());
-        assert!(validate_replication_controller_update(&rc(relaxed), &rc(relaxed)).is_empty());
-        assert!(
-            !validate_replication_controller_update(&rc(relaxed), &rc("a.example.com")).is_empty()
-        );
-    }
-}

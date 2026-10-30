@@ -168,7 +168,7 @@ fn validate_exempt(eplc: &ExemptPriorityLevelConfiguration, fld_path: &Path) -> 
 /// Validate a `PriorityLevelConfiguration`'s `status`. Mirrors upstream
 /// `ValidatePriorityLevelConfigurationStatus`: each condition's `type` must be
 /// unique within the list and non-empty.
-fn validate_status(status: &PriorityLevelConfigurationStatus, fld_path: &Path) -> ErrorList {
+pub fn validate_status(status: &PriorityLevelConfigurationStatus, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
     let conditions = status.conditions.as_deref().unwrap_or(&[]);
     let cp = fld_path.child("conditions");
@@ -332,50 +332,4 @@ fn validate_if_mandatory_priority_level_configuration_object(
         )];
     }
     Vec::new()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::validation::field::ErrorType;
-
-    fn cond(type_: &str) -> PriorityLevelConfigurationCondition {
-        PriorityLevelConfigurationCondition {
-            type_: type_.to_string(),
-            status: "True".to_string(),
-            last_transition_time: None,
-            reason: None,
-            message: None,
-        }
-    }
-
-    #[test]
-    fn status_condition_type_required() {
-        let status = PriorityLevelConfigurationStatus {
-            conditions: Some(vec![cond("")]),
-        };
-        let errs = validate_status(&status, &Path::new("status"));
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].error_type, ErrorType::Required);
-        assert_eq!(errs[0].field, "status.conditions[0].type");
-    }
-
-    #[test]
-    fn status_condition_duplicate_type() {
-        let status = PriorityLevelConfigurationStatus {
-            conditions: Some(vec![cond("ConcurrencyShared"), cond("ConcurrencyShared")]),
-        };
-        let errs = validate_status(&status, &Path::new("status"));
-        assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].error_type, ErrorType::Duplicate);
-        assert_eq!(errs[0].field, "status.conditions[1].type");
-    }
-
-    #[test]
-    fn status_conditions_unique_ok() {
-        let status = PriorityLevelConfigurationStatus {
-            conditions: Some(vec![cond("ConcurrencyShared"), cond("Ready")]),
-        };
-        assert!(validate_status(&status, &Path::new("status")).is_empty());
-    }
 }

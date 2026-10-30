@@ -628,7 +628,7 @@ fn validate_custom_resource_definition_spec_opts(
 ///
 /// An absent `openAPIV3Schema` is `None` and the caller skips it, as upstream
 /// skips a nil pointer (`:914-916`); an explicit `{}` is validated.
-fn validate_custom_resource_definition_validation(
+pub fn validate_custom_resource_definition_validation(
     schema: &JSONSchemaProps,
     status_subresource_enabled: bool,
     require_structural_schema: bool,
@@ -1201,8 +1201,7 @@ pub fn is_invalid_ca_bundle(bundle: &str) -> bool {
 
 /// `webhook.ValidateCABundle` (`apiserver/pkg/util/webhook/validation.go:29-36`).
 /// The bad value is the `[]byte`, which upstream marshals to JSON as base64.
-#[cfg(test)]
-fn validate_ca_bundle(path: &Path, ca_bundle: &[u8]) -> ErrorList {
+pub fn validate_ca_bundle(path: &Path, ca_bundle: &[u8]) -> ErrorList {
     use base64::Engine;
     let shown = base64::engine::general_purpose::STANDARD.encode(ca_bundle);
     validate_ca_bundle_with_value(path, ca_bundle, &shown)
@@ -1360,7 +1359,7 @@ pub fn api_approval_state(
 }
 
 /// `validateAPIApproval` (`validation.go:1857-1890`).
-fn validate_api_approval(
+pub fn validate_api_approval(
     new_crd: &CustomResourceDefinition,
     old_crd: Option<&CustomResourceDefinition>,
 ) -> ErrorList {
@@ -1395,7 +1394,7 @@ fn validate_api_approval(
 }
 
 /// `validatePreserveUnknownFields` (`validation.go:1892-1904`).
-fn validate_preserve_unknown_fields(
+pub fn validate_preserve_unknown_fields(
     crd: &CustomResourceDefinition,
     old_crd: Option<&CustomResourceDefinition>,
 ) -> ErrorList {
@@ -1470,7 +1469,7 @@ pub fn validate_custom_resource_definition_stored_versions(
 /// the name is `<plural>.<group>`. Upstream appends the message for the name
 /// and for a `generateName` prefix alike, because the prefix never equals the
 /// required name.
-fn required_name_errors(crd: &CustomResourceDefinition) -> ErrorList {
+pub fn required_name_errors(crd: &CustomResourceDefinition) -> ErrorList {
     let required = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     let message = "must be spec.names.plural+\".\"+spec.group";
     let mut errs: ErrorList = Vec::new();
@@ -1596,311 +1595,3 @@ pub fn validate_update_custom_resource_definition_status(
     ));
     errs
 }
-
-#[cfg(test)]
-mod whole_object_tests {
-    use super::*;
-
-    fn crd(group: &str) -> CustomResourceDefinition {
-        let mut crd = CustomResourceDefinition::new("widget", group, "Widget", "widgets");
-        crd.spec.versions = vec![serde_json::from_value(serde_json::json!({
-            "name": "v1", "served": true, "storage": true
-        }))
-        .unwrap()];
-        set_defaults_custom_resource_definition(&mut crd);
-        crd
-    }
-
-    /// `validateEnumStrings` (validation.go:502-515): an unknown `spec.scope`
-    /// is a Go string, so it decodes and is `NotSupported` with the accepted
-    /// list in declaration order (`Cluster`, `Namespaced`, :364).
-    #[test]
-    fn unknown_scope_is_not_supported() {
-        let spec: crate::resources::CustomResourceDefinitionSpec =
-            serde_json::from_value(serde_json::json!({
-                "group": "example.com",
-                "names": {"kind": "Widget", "plural": "widgets"},
-                "scope": "Galactic",
-                "versions": [{"name": "v1", "served": true, "storage": true}]
-            }))
-            .expect("an unknown scope must decode");
-        let errs = validate_custom_resource_definition_spec(&spec, &Path::new("spec"));
-        let e = errs
-            .iter()
-            .find(|e| e.field == "spec.scope")
-            .unwrap_or_else(|| panic!("{errs:?}"));
-        assert_eq!(
-            e.error_type,
-            crate::validation::field::ErrorType::NotSupported,
-            "{errs:?}"
-        );
-        assert!(
-            e.to_string()
-                .contains("supported values: \"Cluster\", \"Namespaced\""),
-            "{e}"
-        );
-    }
-
-    /// validation.go:617 + 618-640: an unknown strategy is `NotSupported`
-    /// (`None`, `Webhook`) and, not being Webhook, takes the else branch that
-    /// forbids `webhook` config.
-    #[test]
-    fn unknown_conversion_strategy_is_not_supported() {
-        let mut c = crd("example.com");
-        c.spec.conversion = Some(
-            serde_json::from_value(serde_json::json!({"strategy": "Carrier"}))
-                .expect("an unknown strategy must decode"),
-        );
-        let errs = validate_custom_resource_definition_spec(&c.spec, &Path::new("spec"));
-        let e = errs
-            .iter()
-            .find(|e| e.field == "spec.conversion.strategy")
-            .unwrap_or_else(|| panic!("{errs:?}"));
-        assert_eq!(
-            e.error_type,
-            crate::validation::field::ErrorType::NotSupported,
-            "{errs:?}"
-        );
-        assert!(
-            e.to_string()
-                .contains("supported values: \"None\", \"Webhook\""),
-            "{e}"
-        );
-    }
-
-    /// `TestValidateCustomResourceDefinitionStoredVersions`
-    /// (validation_test.go): the storage version must be stored, and a stored
-    /// version must stay in `spec.versions`.
-    #[test]
-    fn stored_versions_rules() {
-        let c = crd("example.com");
-        let path = Path::new("status").child("storedVersions");
-        assert!(validate_custom_resource_definition_stored_versions(
-            &["v1".into()],
-            &c.spec.versions,
-            &path
-        )
-        .is_empty());
-        let errs =
-            validate_custom_resource_definition_stored_versions(&[], &c.spec.versions, &path);
-        assert_eq!(errs.len(), 1);
-        let errs = validate_custom_resource_definition_stored_versions(
-            &["v0".into()],
-            &c.spec.versions,
-            &path,
-        );
-        assert_eq!(errs.len(), 2, "{errs:?}");
-    }
-
-    #[test]
-    fn protected_groups() {
-        for g in ["k8s.io", "a.k8s.io", "kubernetes.io", "a.kubernetes.io"] {
-            assert!(is_protected_community_group(g), "{g}");
-        }
-        assert!(!is_protected_community_group("example.com"));
-        assert!(!is_protected_community_group("notk8s.io.example.com"));
-    }
-
-    #[test]
-    fn approval_annotation_states() {
-        let mut c = crd("a.k8s.io");
-        let errs = validate_api_approval(&c, None);
-        assert!(
-            errs.iter()
-                .any(|e| e.error_body().contains("Required value")),
-            "{errs:?}"
-        );
-        for (value, ok) in [
-            ("https://github.com/kubernetes/kubernetes/pull/1", true),
-            ("unapproved, experimental-only", true),
-            ("not a url", false),
-        ] {
-            c.metadata.annotations =
-                Some([(KUBE_API_APPROVED_ANNOTATION.to_string(), value.to_string())].into());
-            let errs = validate_api_approval(&c, None);
-            assert_eq!(errs.is_empty(), ok, "{value}: {errs:?}");
-        }
-    }
-
-    /// An unchanged approval state is never rejected on update
-    /// (`validation.go:1873-1877`).
-    #[test]
-    fn unchanged_approval_state_passes_update() {
-        let c = crd("a.k8s.io");
-        assert!(validate_api_approval(&c, Some(&c)).is_empty());
-    }
-
-    #[test]
-    fn preserve_unknown_fields_true_is_rejected_unless_already_set() {
-        let mut c = crd("example.com");
-        c.spec.preserve_unknown_fields = Some(true);
-        assert_eq!(validate_preserve_unknown_fields(&c, None).len(), 1);
-        assert!(validate_preserve_unknown_fields(&c, Some(&c)).is_empty());
-    }
-
-    #[test]
-    fn defaults_seed_stored_versions_once() {
-        let mut c = crd("example.com");
-        assert_eq!(
-            c.status.as_ref().unwrap().stored_versions,
-            Some(vec!["v1".to_string()])
-        );
-        c.status.as_mut().unwrap().stored_versions = Some(vec!["v0".to_string()]);
-        set_defaults_custom_resource_definition(&mut c);
-        assert_eq!(
-            c.status.as_ref().unwrap().stored_versions,
-            Some(vec!["v0".to_string()])
-        );
-    }
-
-    #[test]
-    fn name_must_be_plural_dot_group() {
-        let mut c = crd("example.com");
-        assert!(required_name_errors(&c).is_empty());
-        c.metadata.name = "other.example.com".into();
-        assert_eq!(required_name_errors(&c).len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod ca_bundle_tests {
-    use super::*;
-    use base64::Engine;
-
-    const CERT: &str = r#"-----BEGIN CERTIFICATE-----
-MIIBbzCCARWgAwIBAgIUNlw6NuSK77Vukti6ud7ET7GhqoEwCgYIKoZIzj0EAwIw
-DDEKMAgGA1UEAwwBdDAgFw0yNjEwMDYxMDAwMjZaGA8yMTI2MDkxMjEwMDAyNlow
-DDEKMAgGA1UEAwwBdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAyxwlFXhKv2
-VrRugTxQF05QRdxMCwi9imsVkTzmSbFhY08oQcY7rE0p32un+8/2/RlclBghXdsk
-JoOVsn1LB16jUzBRMB0GA1UdDgQWBBT0iCEcLVCXeTKArrq89VZNNHkTqjAfBgNV
-HSMEGDAWgBT0iCEcLVCXeTKArrq89VZNNHkTqjAPBgNVHRMBAf8EBTADAQH/MAoG
-CCqGSM49BAMCA0gAMEUCIGaiWFbeacTzpGuCBN2CeZq9GsKKNp4ii/lsWwWDxF7s
-AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
------END CERTIFICATE-----"#;
-
-    fn b64(b: &[u8]) -> String {
-        base64::engine::general_purpose::STANDARD.encode(b)
-    }
-
-    fn crd_with_bundle(bundle: Option<String>, established: bool) -> CustomResourceDefinition {
-        let mut c = CustomResourceDefinition::new("widget", "example.com", "Widget", "widgets");
-        c.spec.versions = vec![serde_json::from_value(serde_json::json!({
-            "name": "v1", "served": true, "storage": true,
-            "schema": {"openAPIV3Schema": {"type": "object"}}
-        }))
-        .unwrap()];
-        c.spec.conversion = Some(crate::resources::CustomResourceConversion {
-            strategy: Some(ConversionStrategyType::Webhook),
-            webhook: Some(crate::resources::WebhookConversion {
-                client_config: crate::resources::WebhookClientConfig {
-                    url: Some("https://example.com/convert".into()),
-                    service: None,
-                    ca_bundle: bundle,
-                },
-                conversion_review_versions: vec!["v1".into()],
-            }),
-        });
-        set_defaults_custom_resource_definition(&mut c);
-        c.metadata.resource_version = Some("42".into());
-        if established {
-            let status = c.status.get_or_insert_with(Default::default);
-            status.conditions = Some(vec![serde_json::from_value(serde_json::json!({
-                "type": "Established", "status": "True"
-            }))
-            .unwrap()]);
-        }
-        c
-    }
-
-    /// `TestValidateCABundle` (apiserver/pkg/util/webhook/validation_test.go).
-    #[test]
-    fn validate_ca_bundle_cases() {
-        let p = Path::new("caBundle");
-        assert!(validate_ca_bundle(&p, b"").is_empty());
-        assert!(validate_ca_bundle(&p, CERT.as_bytes()).is_empty());
-        let errs = validate_ca_bundle(&p, b"bogus");
-        assert_eq!(errs.len(), 1);
-        assert!(
-            errs[0]
-                .error_body()
-                .contains("unable to load root certificates: unable to parse bytes as PEM block"),
-            "{errs:?}"
-        );
-        assert_eq!(validate_ca_bundle(&p, b"Cg==").len(), 1);
-    }
-
-    /// "invalid CABundle should be allowed on Create" (validation_test.go:260).
-    #[test]
-    fn invalid_ca_bundle_allowed_on_create() {
-        let c = crd_with_bundle(Some(b64(b"Cg==")), false);
-        assert!(validate_custom_resource_definition(&c).is_empty());
-    }
-
-    /// "update to invalid CABundle should fail if existing is valid"
-    /// (validation_test.go:5958) -- error at
-    /// `spec.conversion.webhookClientConfig.caBundle`.
-    #[test]
-    fn update_to_invalid_ca_bundle_fails_if_existing_valid_and_established() {
-        let old = crd_with_bundle(Some(b64(CERT.as_bytes())), true);
-        let mut new = old.clone();
-        new.spec
-            .conversion
-            .as_mut()
-            .unwrap()
-            .webhook
-            .as_mut()
-            .unwrap()
-            .client_config
-            .ca_bundle = Some(b64(b"Cg=="));
-        let errs = validate_custom_resource_definition_update(&new, &old);
-        assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(
-            errs[0]
-                .to_string()
-                .starts_with("spec.conversion.webhookClientConfig.caBundle: Invalid value"),
-            "{errs:?}"
-        );
-    }
-
-    /// "existing valid CABundle should be able to transition to invalid
-    /// pre-serving" (validation_test.go:5844): not Established.
-    #[test]
-    fn invalid_ca_bundle_allowed_before_established() {
-        let old = crd_with_bundle(Some(b64(CERT.as_bytes())), false);
-        let mut new = old.clone();
-        new.spec
-            .conversion
-            .as_mut()
-            .unwrap()
-            .webhook
-            .as_mut()
-            .unwrap()
-            .client_config
-            .ca_bundle = Some(b64(b"Cg=="));
-        assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
-    }
-
-    /// "existing invalid CABundle update should pass" (validation_test.go:5724).
-    #[test]
-    fn existing_invalid_ca_bundle_update_passes() {
-        let old = crd_with_bundle(Some(b64(b"Cg==")), true);
-        let new = old.clone();
-        assert!(validate_custom_resource_definition_update(&new, &old).is_empty());
-    }
-}
-
-#[cfg(test)]
-#[path = "crd_structural_tests.rs"]
-mod structural_schema_tests;
-
-#[cfg(test)]
-#[path = "crd_selectable_tests.rs"]
-mod selectable_fields_tests;
-
-#[cfg(test)]
-#[path = "crd_defaults_tests.rs"]
-mod defaults_tests;
-
-#[cfg(test)]
-#[path = "crd_openapi_schema_tests.rs"]
-mod openapi_schema_tests;

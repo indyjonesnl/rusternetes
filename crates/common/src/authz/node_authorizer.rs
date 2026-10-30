@@ -633,7 +633,3 @@ impl Authorizer for NodeAuthorizer {
         ))
     }
 }
-
-#[cfg(test)]
-#[path = "node_authorizer_tests.rs"]
-mod tests;

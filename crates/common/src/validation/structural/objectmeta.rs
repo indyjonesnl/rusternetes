@@ -1095,6 +1095,3 @@ fn validate_embedded_resource(pth: Option<&Path>, x: &Map<String, Value>) -> Err
     }
     errs
 }
-
-#[cfg(test)]
-mod tests;

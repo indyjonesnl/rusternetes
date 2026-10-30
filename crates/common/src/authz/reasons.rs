@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 /// fmt's %q uses strconv.Quote: Go src/strconv/quote.go:68-130,519-522.
 /// Rust debug quoting has different control/Unicode escape syntax.
-pub(super) fn quoted(value: &str) -> String {
+pub fn quoted(value: &str) -> String {
     static PRINTABLE: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r"^[\p{L}\p{M}\p{N}\p{P}\p{S} ]$")
             .expect("Go printable character classes")
@@ -45,7 +45,7 @@ pub(super) fn quoted(value: &str) -> String {
 
 /// appliesToUser (rule.go:281-303) uses the binding namespace as the default
 /// for an unqualified service account; unsupported subject kinds never match.
-pub(super) fn applicable_subject<'a>(
+pub fn applicable_subject<'a>(
     subjects: &'a [Subject],
     user: &UserInfo,
     namespace: &str,
@@ -66,7 +66,7 @@ pub(super) fn applicable_subject<'a>(
     })
 }
 
-pub(super) fn describe_subject(subject: &Subject, binding_namespace: &str) -> String {
+pub fn describe_subject(subject: &Subject, binding_namespace: &str) -> String {
     // Keep upstream's NAME/NAMESPACE ordering, even though service-account
     // usernames put namespace before name (rule.go:139-148).
     let name = if subject.kind == "ServiceAccount" {
@@ -87,7 +87,7 @@ pub(super) fn describe_subject(subject: &Subject, binding_namespace: &str) -> St
 
 /// apimachinery/pkg/util/errors/errors.go:70-97: stable, unique messages;
 /// only a multiple-message aggregate has square brackets.
-pub(super) fn aggregate_errors(errors: &[String]) -> Option<String> {
+pub fn aggregate_errors(errors: &[String]) -> Option<String> {
     let mut unique = Vec::new();
     for error in errors {
         if !unique.contains(error) {

@@ -25,7 +25,7 @@ const MAX_PORT: i64 = 65535;
 /// Upstream pkg/apis/networking/validation/validation.go:59. The strict CIDR
 /// feature gate defaults false in release-1.35 (pkg/features/kube_features.go:1844).
 #[derive(Default)]
-struct NetworkPolicyValidationOptions<'a> {
+pub struct NetworkPolicyValidationOptions<'a> {
     allow_invalid_label_value_in_selector: bool,
     allow_cidrs_even_if_invalid: Vec<&'a str>,
 }
@@ -209,7 +209,7 @@ fn validate_port(port: &NetworkPolicyPort, fld_path: &Path) -> ErrorList {
 }
 
 /// Upstream pkg/apis/networking/validation/validation.go:246, `ValidateIPBlock`.
-fn validate_ip_block(
+pub fn validate_ip_block(
     ipb: &IPBlock,
     fld_path: &Path,
     opts: &NetworkPolicyValidationOptions<'_>,
@@ -444,68 +444,4 @@ pub fn validate_network_policy_update(new: &NetworkPolicy, old: &NetworkPolicy) 
         &opts,
     ));
     errs
-}
-
-#[cfg(test)]
-mod ip_block_tests {
-    use super::*;
-
-    fn ipb_errs(json: serde_json::Value) -> Vec<String> {
-        let ipb: IPBlock = serde_json::from_value(json).unwrap();
-        validate_ip_block(
-            &ipb,
-            &Path::new("ipBlock"),
-            &NetworkPolicyValidationOptions::default(),
-        )
-        .into_iter()
-        .map(|e| e.to_string())
-        .collect()
-    }
-
-    #[test]
-    fn valid_strict_subset_passes() {
-        assert!(ipb_errs(serde_json::json!({
-            "cidr": "10.0.0.0/8", "except": ["10.1.0.0/16", "10.2.3.0/24"]
-        }))
-        .is_empty());
-    }
-
-    #[test]
-    fn except_not_contained_rejected() {
-        let e = ipb_errs(serde_json::json!({
-            "cidr": "10.0.0.0/8", "except": ["192.168.0.0/16"]
-        }));
-        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
-    }
-
-    #[test]
-    fn except_equal_or_shorter_prefix_rejected() {
-        // same prefix as cidr -> not strict (prefix must be longer)
-        let e = ipb_errs(serde_json::json!({
-            "cidr": "10.0.0.0/8", "except": ["10.0.0.0/8"]
-        }));
-        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
-    }
-
-    #[test]
-    fn ipv6_strict_subset_passes() {
-        assert!(ipb_errs(serde_json::json!({
-            "cidr": "2001:db8::/32", "except": ["2001:db8:1::/48"]
-        }))
-        .is_empty());
-    }
-
-    #[test]
-    fn mixed_family_except_rejected() {
-        let e = ipb_errs(serde_json::json!({
-            "cidr": "10.0.0.0/8", "except": ["2001:db8::/64"]
-        }));
-        assert!(e.iter().any(|m| m.contains("strict subset")), "{e:?}");
-    }
-
-    #[test]
-    fn invalid_cidr_still_rejected() {
-        let e = ipb_errs(serde_json::json!({"cidr": "10.0.0.0/8", "except": ["notacidr"]}));
-        assert!(e.iter().any(|m| m.contains("valid CIDR")), "{e:?}");
-    }
 }
