@@ -5,12 +5,7 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod commands;
-mod discovery;
-mod manifest;
-mod ops;
-mod types;
-mod websocket;
+use rusternetes_kubectl::{commands, types};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

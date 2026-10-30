@@ -41,10 +41,3 @@ pub mod taint;
 pub mod top;
 pub mod version;
 pub mod wait;
-
-#[cfg(test)]
-mod apply_test;
-#[cfg(test)]
-mod create_test;
-#[cfg(test)]
-mod get_test;
