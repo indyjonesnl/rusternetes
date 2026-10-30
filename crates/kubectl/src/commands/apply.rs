@@ -46,27 +46,6 @@ impl Default for ApplyOptions {
     }
 }
 
-/// Legacy entry point — kept for backward compat.
-#[allow(dead_code)]
-pub async fn execute_enhanced(
-    client: &ApiClient,
-    file: &str,
-    namespace: Option<&str>,
-    dry_run: Option<&str>,
-    server_side: bool,
-    force: bool,
-) -> Result<()> {
-    let options = ApplyOptions {
-        files: vec![file.to_string()],
-        namespace: namespace.map(|s| s.to_string()),
-        dry_run: dry_run.map(|s| s.to_string()),
-        server_side,
-        force,
-        ..Default::default()
-    };
-    execute_with_options(client, &options).await
-}
-
 /// Main entry point that honours all ApplyOptions.
 pub async fn execute_with_options(client: &ApiClient, options: &ApplyOptions) -> Result<()> {
     // Build the list of file paths to process.
@@ -96,12 +75,6 @@ pub async fn execute_with_options(client: &ApiClient, options: &ApplyOptions) ->
     }
 
     Ok(())
-}
-
-/// Legacy entry point.
-#[allow(dead_code)]
-pub async fn execute(client: &ApiClient, file: &str) -> Result<()> {
-    execute_enhanced(client, file, None, None, false, false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +185,6 @@ struct ApplyResult {
     kind: String,
     api_group: String,
     name: String,
-    #[allow(dead_code)]
-    namespace: Option<String>,
     action: ApplyAction,
     response: Value,
 }
@@ -354,11 +325,6 @@ async fn apply_resource(
         kind,
         api_group: mapping.group.clone(),
         name,
-        namespace: if mapping.namespaced {
-            ns.or_else(|| crate::ops::value_namespace(&json))
-        } else {
-            None
-        },
         action,
         response,
     })
@@ -742,7 +708,6 @@ mod tests {
             kind: "Pod".to_string(),
             api_group: "".to_string(),
             name: "nginx".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -755,7 +720,6 @@ mod tests {
             kind: "Deployment".to_string(),
             api_group: "apps".to_string(),
             name: "web".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Configured,
             response: json!({}),
         };
@@ -1080,7 +1044,6 @@ mod tests {
             kind: "Pod".to_string(),
             api_group: "".to_string(),
             name: "nginx".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1094,7 +1057,6 @@ mod tests {
             kind: "Deployment".to_string(),
             api_group: "apps".to_string(),
             name: "web".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Configured,
             response: json!({}),
         };
@@ -1108,7 +1070,6 @@ mod tests {
             kind: "Pod".to_string(),
             api_group: "".to_string(),
             name: "test".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({"kind": "Pod", "metadata": {"name": "test"}}),
         };
@@ -1125,7 +1086,6 @@ mod tests {
             kind: "Pod".to_string(),
             api_group: "".to_string(),
             name: "test".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({"kind": "Pod"}),
         };
@@ -1142,7 +1102,6 @@ mod tests {
             kind: "Service".to_string(),
             api_group: "".to_string(),
             name: "frontend".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1166,7 +1125,6 @@ mod tests {
             kind: "ClusterRole".to_string(),
             api_group: "rbac.authorization.k8s.io".to_string(),
             name: "admin".to_string(),
-            namespace: None,
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1182,7 +1140,6 @@ mod tests {
             kind: "Namespace".to_string(),
             api_group: "".to_string(),
             name: "test-ns".to_string(),
-            namespace: None,
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1423,7 +1380,6 @@ mod tests {
             kind: "ConfigMap".to_string(),
             api_group: "".to_string(),
             name: "my-cm".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Configured,
             response: json!({}),
         };
@@ -1438,7 +1394,6 @@ mod tests {
             kind: "Deployment".to_string(),
             api_group: "apps".to_string(),
             name: "web".to_string(),
-            namespace: Some("prod".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1455,7 +1410,6 @@ mod tests {
             kind: "Job".to_string(),
             api_group: "batch".to_string(),
             name: "my-job".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };
@@ -1468,7 +1422,6 @@ mod tests {
             kind: "Service".to_string(),
             api_group: "".to_string(),
             name: "frontend".to_string(),
-            namespace: Some("default".to_string()),
             action: ApplyAction::Created,
             response: json!({}),
         };

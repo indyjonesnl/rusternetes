@@ -11,8 +11,6 @@ struct ApiGroupList {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApiGroup {
-    #[allow(dead_code)]
-    name: String,
     versions: Vec<GroupVersionForDiscovery>,
 }
 
@@ -77,7 +75,6 @@ mod tests {
         }"#;
         let group_list: ApiGroupList = serde_json::from_str(json).unwrap();
         assert_eq!(group_list.groups.len(), 2);
-        assert_eq!(group_list.groups[0].name, "apps");
         assert_eq!(group_list.groups[1].versions.len(), 2);
         assert_eq!(group_list.groups[1].versions[0].group_version, "batch/v1");
     }

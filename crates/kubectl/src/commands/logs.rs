@@ -29,21 +29,6 @@ pub async fn execute_enhanced(
     .await
 }
 
-#[allow(dead_code)]
-pub async fn execute(
-    client: &ApiClient,
-    pod_name: &str,
-    namespace: Option<&str>,
-    container: Option<&str>,
-    follow: bool,
-    tail: Option<i64>,
-) -> Result<()> {
-    execute_full(
-        client, pod_name, namespace, container, follow, tail, false, None, None, false,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_full(
     client: &ApiClient,

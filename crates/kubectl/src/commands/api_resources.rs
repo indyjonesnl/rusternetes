@@ -13,8 +13,6 @@ struct ApiGroupList {
 #[serde(rename_all = "camelCase")]
 struct ApiGroup {
     name: String,
-    #[allow(dead_code)]
-    versions: Vec<GroupVersionForDiscovery>,
     preferred_version: GroupVersionForDiscovery,
 }
 
@@ -22,8 +20,6 @@ struct ApiGroup {
 #[serde(rename_all = "camelCase")]
 struct GroupVersionForDiscovery {
     group_version: String,
-    #[allow(dead_code)]
-    version: String,
 }
 
 #[derive(Deserialize)]
@@ -37,16 +33,10 @@ struct ApiResourceList {
 #[serde(rename_all = "camelCase")]
 struct ApiResource {
     name: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    singular_name: String,
     namespaced: bool,
     kind: String,
     #[serde(default)]
     short_names: Vec<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    verbs: Vec<String>,
 }
 
 #[derive(Tabled, Serialize)]

@@ -8,15 +8,6 @@ use rusternetes_common::resources::{
 };
 use serde::Serialize;
 
-// Helper to convert GetError to anyhow::Error (used in tests)
-#[allow(dead_code)]
-fn map_get_error(err: GetError) -> anyhow::Error {
-    match err {
-        GetError::NotFound => anyhow::anyhow!("Resource not found"),
-        GetError::Other(e) => e,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum OutputFormat {
     Table,
@@ -646,34 +637,6 @@ async fn execute_with_mapping(
     }
 
     Ok(true)
-}
-
-/// Kept for callers that invoke `execute` directly (e.g., describe-fallback).
-#[allow(dead_code)]
-pub async fn execute(
-    client: &ApiClient,
-    resource_type: &str,
-    name: Option<&str>,
-    namespace: Option<&str>,
-    output: Option<&str>,
-    no_headers: bool,
-) -> Result<()> {
-    // Route everything through the mapper-based path.
-    execute_enhanced(
-        client,
-        resource_type,
-        name,
-        namespace,
-        false,
-        output,
-        no_headers,
-        None,
-        None,
-        false,
-        false,
-        None,
-    )
-    .await
 }
 
 fn print_pods(pods: &[Pod], no_headers: bool, show_labels: bool) {
@@ -1372,18 +1335,6 @@ mod tests {
         let pods: Vec<Pod> = vec![];
         print_pods(&pods, false, true);
         print_pods(&pods, true, true);
-    }
-
-    #[test]
-    fn test_map_get_error_not_found() {
-        let err = map_get_error(GetError::NotFound);
-        assert_eq!(err.to_string(), "Resource not found");
-    }
-
-    #[test]
-    fn test_map_get_error_other() {
-        let err = map_get_error(GetError::Other(anyhow::anyhow!("connection refused")));
-        assert_eq!(err.to_string(), "connection refused");
     }
 
     #[test]
