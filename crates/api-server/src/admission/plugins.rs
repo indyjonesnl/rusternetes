@@ -294,7 +294,6 @@ pub fn install(options: &AdmissionOptions) {
 
 /// Whether `name` is in the chain this server runs.
 pub fn enabled(name: &str) -> bool {
-    #[cfg(test)]
     if let Some(r) = TEST_ENABLED.with(|t| t.borrow().as_ref().map(|s| s.contains(name))) {
         return r;
     }
@@ -304,17 +303,14 @@ pub fn enabled(name: &str) -> bool {
     !default_off_plugins().contains(name)
 }
 
-#[cfg(test)]
 thread_local! {
     static TEST_ENABLED: std::cell::RefCell<Option<HashSet<String>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Run the current thread with exactly `names` enabled (tests only).
-#[cfg(test)]
 pub struct EnabledForTest;
 
-#[cfg(test)]
 impl EnabledForTest {
     pub fn new(names: &[&str]) -> Self {
         TEST_ENABLED.with(|t| {
@@ -324,7 +320,6 @@ impl EnabledForTest {
     }
 }
 
-#[cfg(test)]
 impl Drop for EnabledForTest {
     fn drop(&mut self) {
         TEST_ENABLED.with(|t| *t.borrow_mut() = None);

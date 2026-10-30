@@ -351,7 +351,10 @@ const PROXY_CLIENT_KEY: &str = "/etc/kubernetes/pki/front-proxy-client.key";
 /// Load a reqwest client identity from a PEM cert + key file pair. Returns
 /// `None` when the files are absent (rusternetes' own cluster, whose backends
 /// don't require front-proxy client auth) or unparsable.
-fn load_proxy_client_identity_from(cert_path: &str, key_path: &str) -> Option<reqwest::Identity> {
+pub fn load_proxy_client_identity_from(
+    cert_path: &str,
+    key_path: &str,
+) -> Option<reqwest::Identity> {
     let mut pem = std::fs::read(cert_path).ok()?;
     pem.extend_from_slice(&std::fs::read(key_path).ok()?);
     match reqwest::Identity::from_pem(&pem) {
@@ -386,7 +389,7 @@ fn proxy_client_identity() -> Option<reqwest::Identity> {
 /// /round_trippers.go headerKeyEscape`: every byte outside the legal
 /// header-key set (and `%` itself) is emitted as `%XX`. The receiving apiserver
 /// percent-decodes it back (`requestheader` authenticator).
-fn header_key_escape(key: &str) -> String {
+pub fn header_key_escape(key: &str) -> String {
     fn legal_header_byte(b: u8) -> bool {
         matches!(b,
             b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
@@ -773,76 +776,4 @@ pub async fn list_registered_apiservice_groups_with_storage<S: Storage + Send + 
         }));
     }
     out
-}
-
-#[cfg(test)]
-mod proxy_header_tests {
-    use super::header_key_escape;
-
-    // Regression: SA identities carry extra keys with `/`, which is illegal in
-    // an HTTP header name. Without escaping, the aggregator proxy fails to build
-    // every request ("builder error" -> 503) and the Aggregator conformance test
-    // can never reach the sample-apiserver.
-    #[test]
-    fn escapes_slash_in_extra_key() {
-        assert_eq!(
-            header_key_escape("authentication.kubernetes.io/pod-name"),
-            "authentication.kubernetes.io%2Fpod-name"
-        );
-    }
-
-    #[test]
-    fn leaves_legal_token_chars_untouched() {
-        // tchar set minus `%` (which is force-escaped).
-        assert_eq!(header_key_escape("Ab9-._~|"), "Ab9-._~|");
-    }
-
-    #[test]
-    fn force_escapes_percent() {
-        assert_eq!(header_key_escape("a%b"), "a%25b");
-    }
-
-    #[test]
-    fn escapes_other_illegal_bytes() {
-        assert_eq!(header_key_escape("a/b c"), "a%2Fb%20c");
-    }
-}
-
-#[cfg(test)]
-mod proxy_client_identity_tests {
-    use super::load_proxy_client_identity_from;
-
-    // Regression: the aggregation proxy MUST be able to load the kubeadm
-    // front-proxy client credential (upstream --proxy-client-cert-file).
-    // Without presenting it, the extension apiserver's requestheader
-    // authenticator treats every proxied request as system:anonymous → 403 →
-    // the Aggregator conformance test polls to timeout.
-    #[test]
-    fn loads_identity_from_pem_pair() {
-        let cert = rcgen::generate_simple_self_signed(vec!["front-proxy-client".to_string()])
-            .expect("generate test cert");
-        let dir = std::env::temp_dir().join(format!("rn-fpc-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cert_path = dir.join("front-proxy-client.crt");
-        let key_path = dir.join("front-proxy-client.key");
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-
-        let id = load_proxy_client_identity_from(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        );
-        assert!(id.is_some(), "cert+key PEM pair must load as an identity");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Absent files (rusternetes' own cluster) → None, proxy stays client-auth-less.
-    #[test]
-    fn absent_files_yield_none() {
-        assert!(load_proxy_client_identity_from(
-            "/nonexistent/front-proxy-client.crt",
-            "/nonexistent/front-proxy-client.key"
-        )
-        .is_none());
-    }
 }

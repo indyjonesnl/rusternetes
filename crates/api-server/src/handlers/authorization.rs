@@ -355,26 +355,3 @@ pub async fn create_self_subject_rules_review(
 
     Ok((StatusCode::CREATED, crate::audit::json_response(ssrr)))
 }
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn test_subject_access_review_allowed() {
-        // This test would verify that a user with permissions gets allowed=true
-    }
-
-    #[tokio::test]
-    async fn test_subject_access_review_denied() {
-        // This test would verify that a user without permissions gets allowed=false
-    }
-
-    #[tokio::test]
-    async fn test_self_subject_access_review() {
-        // This test would verify that the current user can check their own permissions
-    }
-
-    #[tokio::test]
-    async fn test_self_subject_rules_review() {
-        // This test would verify that the current user can enumerate their permissions
-    }
-}
