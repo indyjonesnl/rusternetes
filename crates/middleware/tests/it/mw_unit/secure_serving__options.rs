@@ -9,7 +9,7 @@ mod __parent {
         RequestHeaderConfig, RequestHeaderSettings,
     };
     pub use rusternetes_middleware::secure_serving::authz::{
-        new_path_authorizer, DelegatingAuthorizerConfig, UnionAuthz,
+        new_path_authorizer, DelegatingAuthorizerConfig,
     };
     pub use rusternetes_middleware::secure_serving::serve::{
         tls_cipher_suites, tls_version, SecureServingInfo, ServingCert,

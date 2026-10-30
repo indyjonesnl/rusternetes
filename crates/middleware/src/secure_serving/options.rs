@@ -26,11 +26,11 @@ use super::authn::{
     AnonymousAuthConfig, CaContent, DelegatingAuthenticatorConfig, RequestAuthenticator,
     RequestHeaderConfig, RequestHeaderSettings,
 };
-use super::authz::{new_path_authorizer, DelegatingAuthorizerConfig, UnionAuthz};
+use super::authz::{new_path_authorizer, DelegatingAuthorizerConfig};
 use super::serve::{tls_cipher_suites, tls_version, SecureServingInfo, ServingCert};
 use super::webhook::{ApiClientReviewClient, Backoff, ReviewClient, ReviewError};
 use async_trait::async_trait;
-use rusternetes_common::authz::{Authorizer, PrivilegedGroupAuthorizer};
+use rusternetes_common::authz::{Authorizer, PrivilegedGroupAuthorizer, UnionAuthorizer};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1041,7 +1041,7 @@ impl DelegatingAuthorizationOptions {
                 .new()?,
             ),
         }
-        Ok(Arc::new(UnionAuthz::new(authorizers)))
+        Ok(Arc::new(UnionAuthorizer::new(authorizers)))
     }
 }
 
