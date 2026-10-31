@@ -41,18 +41,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-/// `bootstrapapi.SecretTypeBootstrapToken` (token/api/types.go).
-pub const SECRET_TYPE_BOOTSTRAP_TOKEN: &str = "bootstrap.kubernetes.io/token";
-/// `bootstrapapi.BootstrapTokenSecretPrefix`.
-pub const BOOTSTRAP_TOKEN_SECRET_PREFIX: &str = "bootstrap-token-";
-/// `bootstrapapi.BootstrapTokenIDKey`.
-pub const BOOTSTRAP_TOKEN_ID_KEY: &str = "token-id";
-/// `bootstrapapi.BootstrapTokenSecretKey`.
-pub const BOOTSTRAP_TOKEN_SECRET_KEY: &str = "token-secret";
-/// `bootstrapapi.BootstrapTokenExpirationKey`.
-pub const BOOTSTRAP_TOKEN_EXPIRATION_KEY: &str = "expiration";
-/// `bootstrapapi.BootstrapTokenUsageSigningKey`.
-pub const BOOTSTRAP_TOKEN_USAGE_SIGNING_KEY: &str = "usage-bootstrap-signing";
+use super::bootstrap_secret_util::{get_data, has_expired, parse_name};
+pub use super::bootstrap_secret_util::{
+    BOOTSTRAP_TOKEN_EXPIRATION_KEY, BOOTSTRAP_TOKEN_ID_KEY, BOOTSTRAP_TOKEN_SECRET_KEY,
+    BOOTSTRAP_TOKEN_SECRET_PREFIX, BOOTSTRAP_TOKEN_USAGE_SIGNING_KEY, SECRET_TYPE_BOOTSTRAP_TOKEN,
+};
 /// `bootstrapapi.ConfigMapClusterInfo`.
 pub const CONFIG_MAP_CLUSTER_INFO: &str = "cluster-info";
 /// `bootstrapapi.KubeConfigKey`.
@@ -104,39 +97,6 @@ pub fn compute_detached_signature(
     mac.update(format!("{protected}.{payload}").as_bytes());
     let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
     Ok(format!("{protected}..{sig}"))
-}
-
-/// `bootstrapsecretutil.ParseName`: `^bootstrap-token-([a-z0-9]{6})$`.
-fn parse_name(name: &str) -> Option<&str> {
-    let id = name.strip_prefix(BOOTSTRAP_TOKEN_SECRET_PREFIX)?;
-    (id.len() == 6
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
-    .then_some(id)
-}
-
-/// `bootstrapsecretutil.GetData`: empty string when absent.
-fn get_data(secret: &Secret, key: &str) -> String {
-    secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get(key))
-        .map(|v| String::from_utf8_lossy(v).into_owned())
-        .unwrap_or_default()
-}
-
-/// `bootstrapsecretutil.HasExpired` (`GetExpiration`'s `isExpired`): no
-/// expiration is not expired, an unparseable one is expired.
-fn has_expired(secret: &Secret, now: DateTime<Utc>) -> bool {
-    let expiration = get_data(secret, BOOTSTRAP_TOKEN_EXPIRATION_KEY);
-    if expiration.is_empty() {
-        return false;
-    }
-    match DateTime::parse_from_rfc3339(&expiration) {
-        Err(_) => true,
-        Ok(t) => t.with_timezone(&Utc) - now <= chrono::Duration::zero(),
-    }
 }
 
 /// `validateSecretForSigning` (util.go): `(tokenID, tokenSecret)` when the

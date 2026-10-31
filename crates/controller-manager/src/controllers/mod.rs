@@ -1,4 +1,5 @@
 pub mod attach_detach;
+pub mod bootstrap_secret_util;
 pub mod bootstrap_signer;
 pub mod bootstrap_token_cleaner;
 pub mod cascade_tests;

@@ -31,11 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
-/// `bootstrapapi.SecretTypeBootstrapToken`
-/// (`staging/src/k8s.io/cluster-bootstrap/token/api/types.go:33`).
-pub const SECRET_TYPE_BOOTSTRAP_TOKEN: &str = "bootstrap.kubernetes.io/token";
-/// `bootstrapapi.BootstrapTokenExpirationKey` (types.go:48).
-pub const BOOTSTRAP_TOKEN_EXPIRATION_KEY: &str = "expiration";
+use super::bootstrap_secret_util::get_expiration;
+pub use super::bootstrap_secret_util::{
+    BOOTSTRAP_TOKEN_EXPIRATION_KEY, SECRET_TYPE_BOOTSTRAP_TOKEN,
+};
 /// `api.NamespaceSystem`, `DefaultTokenCleanerOptions().TokenSecretNamespace`.
 pub const DEFAULT_TOKEN_SECRET_NAMESPACE: &str = "kube-system";
 /// The worker period of `Run` (`wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`).
@@ -55,26 +54,6 @@ pub enum EvalOutcome {
 pub struct TokenCleaner<S: Storage> {
     storage: Arc<S>,
     token_secret_namespace: String,
-}
-
-/// `GetExpiration` (secrets.go:59-78): `(timeRemaining, isExpired)`.
-fn get_expiration(secret: &Secret, now: DateTime<Utc>) -> (Duration, bool) {
-    let expiration = secret
-        .data
-        .as_ref()
-        .and_then(|d| d.get(BOOTSTRAP_TOKEN_EXPIRATION_KEY))
-        .map(|v| String::from_utf8_lossy(v).into_owned())
-        .unwrap_or_default();
-    if expiration.is_empty() {
-        return (Duration::ZERO, false);
-    }
-    let Ok(exp) = DateTime::parse_from_rfc3339(&expiration) else {
-        return (Duration::ZERO, true);
-    };
-    match (exp.with_timezone(&Utc) - now).to_std() {
-        Ok(d) if !d.is_zero() => (d, false),
-        _ => (Duration::ZERO, true),
-    }
 }
 
 impl<S: Storage + 'static> TokenCleaner<S> {
