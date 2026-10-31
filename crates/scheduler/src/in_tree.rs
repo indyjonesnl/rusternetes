@@ -22,6 +22,7 @@ pub struct FilterPluginArgs<'a> {
 /// that are not (yet) plugin objects.
 pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<dyn FilterPlugin>> {
     match name {
+        names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
         names::NODE_NAME => Some(Arc::new(NodeName)),
@@ -234,5 +235,35 @@ impl FilterPlugin for NodeAffinityPlugin {
             }
         }
         Status::success()
+    }
+}
+
+/// `nodeports.ErrReason`.
+pub const ERR_REASON_NODE_PORTS: &str =
+    "node(s) didn't have free ports for the requested pod ports";
+
+/// `nodeports.NodePorts` Filter (`plugins/nodeports/node_ports.go`): checks
+/// that the pod's hostPorts are free on the node.
+///
+/// Deviation: PreFilter (caching the wanted ports in CycleState, and Skip for
+/// pods without any so Filter is not run) is not ported; Filter computes the
+/// wanted ports itself, which has the same outcome (a pod without hostPorts
+/// fits every node). Upstream's Filter returns an Error status if PreFilter
+/// state is missing; that case cannot arise here.
+pub struct NodePorts;
+
+impl Plugin for NodePorts {
+    fn name(&self) -> &'static str {
+        names::NODE_PORTS
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for NodePorts {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        if crate::advanced::host_ports_fit(&node_info.node().metadata.name, pod, node_info.pods()) {
+            return Status::success();
+        }
+        Status::new(Code::Unschedulable, vec![ERR_REASON_NODE_PORTS.to_string()])
     }
 }

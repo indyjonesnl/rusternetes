@@ -151,27 +151,32 @@ pub fn check_pod_affinity(
 /// A hostIP of "0.0.0.0", "::", or "" (empty/unset) means "all interfaces" and overlaps with
 /// any other hostIP.
 pub fn check_host_port_conflicts(node: &Node, pod: &Pod, all_pods: &[Pod]) -> bool {
+    let on_node = all_pods.iter().filter(|p| {
+        p.spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_ref())
+            .map(|n| n == &node.metadata.name)
+            .unwrap_or(false)
+    });
+    host_ports_fit(&node.metadata.name, pod, on_node)
+}
+
+/// `fitsPorts` over the pods bound to a node (`nodeports/node_ports.go`):
+/// does the incoming pod's hostPorts not conflict with any in use by
+/// `pods_on_node`?
+pub fn host_ports_fit<'a>(
+    node_name: &str,
+    pod: &Pod,
+    pods_on_node: impl Iterator<Item = &'a Pod>,
+) -> bool {
     // Collect hostPorts requested by the incoming pod
     let incoming_ports = collect_host_ports(pod);
     if incoming_ports.is_empty() {
         return true; // No hostPort requirements, no conflict possible
     }
 
-    let node_name = &node.metadata.name;
-
     // Collect hostPorts already in use on this node
-    for existing_pod in all_pods {
-        // Only consider pods scheduled on this node
-        let on_this_node = existing_pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.node_name.as_ref())
-            .map(|n| n == node_name)
-            .unwrap_or(false);
-        if !on_this_node {
-            continue;
-        }
-
+    for existing_pod in pods_on_node {
         // K8s tracks UsedPorts for ALL pods assigned to a node (including
         // Pending). Only skip terminal pods (Succeeded/Failed) and terminating.
         let phase = existing_pod.status.as_ref().and_then(|s| s.phase.as_ref());

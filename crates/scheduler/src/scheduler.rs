@@ -10,8 +10,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::advanced::{
-    check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
-    check_taints_tolerations, check_topology_spread_constraints, parse_resource_quantity,
+    check_node_affinity, check_pod_affinity, check_pod_anti_affinity, check_taints_tolerations,
+    check_topology_spread_constraints, parse_resource_quantity,
 };
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
@@ -1571,7 +1571,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let cycle_state = CycleState::new();
 
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
-        let ports_on = filter_on(names::NODE_PORTS);
         let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
         let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
         let fit_filter_on = filter_on(names::NODE_RESOURCES_FIT);
@@ -1628,7 +1627,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 processed_nodes += 1;
                 let eval = async {
                     // The Filter plugins that are objects (`RunFilterPlugins`,
-                    // framework.go:1033): NodeUnschedulable, NodeName, TaintToleration, NodeAffinity. They run first,
+                    // framework.go:1033): NodeUnschedulable, NodeName, TaintToleration, NodeAffinity, NodePorts. They run first,
                     // as in the default plugin order, ahead of the filters
                     // still inline below.
                     let status = fw
@@ -1652,15 +1651,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             node.metadata.name, pod.metadata.name
                         );
                         diag.add_plugin_status(names::DYNAMIC_RESOURCES);
-                        return None;
-                    }
-                    // NodePorts
-                    if ports_on && !check_host_port_conflicts(node, pod, all_pods) {
-                        debug!(
-                            "Node {} rejected for pod {}: hostPort conflict",
-                            node.metadata.name, pod.metadata.name
-                        );
-                        diag.add_plugin_status(names::NODE_PORTS);
                         return None;
                     }
                     // NodeVolumeLimits (csi.go:236-345); `nodeInfo.GetPods()` is
