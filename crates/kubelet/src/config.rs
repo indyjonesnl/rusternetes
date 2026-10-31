@@ -243,6 +243,12 @@ pub struct KubeletConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_system_log_handler: Option<bool>,
 
+    /// `enableSystemLogQuery` (zero value false). Makes `/logs/` query-aware
+    /// (`?query=`, `sinceTime`, ...); requires the `NodeLogQuery` gate and
+    /// `enableSystemLogHandler` (validation.go:355-361).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_system_log_query: Option<bool>,
+
     /// `enableProfilingHandler` (nil defaults to true, defaults.go:283-285).
     /// Serves `/debug/pprof/`; only honoured when `enableDebuggingHandlers` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -259,6 +265,11 @@ pub struct KubeletConfiguration {
     pub enable_debug_flags_handler: Option<bool>,
 }
 
+/// `utilfeature.DefaultFeatureGate.Enabled(features.NodeLogQuery)`.
+pub fn node_log_query_gate_enabled() -> bool {
+    rusternetes_common::feature_gates::gate_enabled("NodeLogQuery").unwrap_or(false)
+}
+
 impl KubeletConfiguration {
     /// `*obj.EnableDebuggingHandlers` after `SetDefaults_KubeletConfiguration`.
     pub fn debugging_handlers_enabled(&self) -> bool {
@@ -268,6 +279,11 @@ impl KubeletConfiguration {
     /// `*obj.EnableSystemLogHandler` after `SetDefaults_KubeletConfiguration`.
     pub fn system_log_handler_enabled(&self) -> bool {
         self.enable_system_log_handler.unwrap_or(true)
+    }
+
+    /// `obj.EnableSystemLogQuery` (zero value false).
+    pub fn system_log_query_enabled(&self) -> bool {
+        self.enable_system_log_query.unwrap_or(false)
     }
 
     /// `*obj.EnableProfilingHandler` after `SetDefaults_KubeletConfiguration`.
@@ -440,6 +456,7 @@ impl Default for KubeletConfiguration {
             enable_contention_profiling: None,
             enable_debug_flags_handler: None,
             enable_system_log_handler: None,
+            enable_system_log_query: None,
         }
     }
 }
@@ -648,6 +665,20 @@ impl KubeletConfiguration {
                 "Invalid kind: {}. Expected: KubeletConfiguration",
                 self.kind
             );
+        }
+
+        // ValidateKubeletConfiguration (validation.go:355-361).
+        if self.system_log_query_enabled() {
+            if !node_log_query_gate_enabled() {
+                anyhow::bail!(
+                    "invalid configuration: NodeLogQuery feature gate is required for enableSystemLogQuery"
+                );
+            }
+            if !self.system_log_handler_enabled() {
+                anyhow::bail!(
+                    "invalid configuration: enableSystemLogHandler is required for enableSystemLogQuery"
+                );
+            }
         }
 
         // Validate paths exist if specified

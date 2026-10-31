@@ -4,11 +4,15 @@
 //! `(*Server).InstallDebuggingDisabledHandlers`
 //! (pkg/kubelet/server/server.go) and `(*Kubelet).ServeLogs` /
 //! the `kl.logServer` built in `(*Kubelet).Run` (pkg/kubelet/kubelet.go):
-//! `http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))`.
+//! `http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/")))`, and,
+//! when the `NodeLogQuery` gate and `enableSystemLogQuery` are on, the
+//! query-aware variant of that handler plus `journalServer.ServeHTTP`
+//! (pkg/kubelet/kubelet_server_journal.go:62-89), whose engine lives in
+//! [`crate::node_log_query`].
 
 use axum::{
     body::Body,
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get, MethodRouter},
     Router,
@@ -16,6 +20,8 @@ use axum::{
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
+
+use crate::node_log_query::{aggregate_message, new_node_log_query};
 
 /// `logsPath` (server.go).
 pub const LOGS_PATH: &str = "/logs/";
@@ -38,12 +44,15 @@ fn disabled(msg: &'static str) -> Response {
 /// every method on `/logs/` with 405 "Debug endpoints are disabled."; on =>
 /// `InstallSystemLogHandler`, which serves `GET` only when
 /// `EnableSystemLogHandler` is on and otherwise answers every method with 405
-/// "logs endpoint is disabled.". (`EnableSystemLogQuery` / the journal
-/// handler are not ported.)
+/// "logs endpoint is disabled.". `enable_system_log_query` is
+/// `NodeLogQuery && EnableSystemLogQuery` (kubelet.go:1783): it swaps the
+/// plain file server for the query-aware handler built in `Kubelet.Run`
+/// (kubelet.go:1784-1812).
 pub fn install_logs_handlers(
     router: Router,
     enable_debugging_handlers: bool,
     enable_system_log_handler: bool,
+    enable_system_log_query: bool,
     root: PathBuf,
 ) -> Router {
     let routes =
@@ -62,11 +71,110 @@ pub fn install_logs_handlers(
     }
     routes(
         router,
-        get(move |uri: Uri| {
+        get(move |uri: Uri, headers: HeaderMap| {
             let root = root.clone();
-            async move { serve_logs(&root, &uri).await }
+            async move {
+                if enable_system_log_query {
+                    serve_logs_query(&root, &uri, &headers).await
+                } else {
+                    serve_logs(&root, &uri).await
+                }
+            }
         }),
     )
+}
+
+/// `http.Error(w, msg, code)`.
+fn http_error(code: StatusCode, msg: &str) -> Response {
+    (
+        code,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("{msg}\n"),
+    )
+        .into_response()
+}
+
+/// `req.URL.Query()` as `(key, value)` pairs in request order.
+fn query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
+        .into_owned()
+        .collect()
+}
+
+/// The `kl.logServer` handler of `Kubelet.Run` (kubelet.go:1784-1812) when
+/// `NodeLogQuery` and `enableSystemLogQuery` are on.
+async fn serve_logs_query(root: &Path, uri: &Uri, headers: &HeaderMap) -> Response {
+    let path = unescape(uri.path());
+    let upath = path.strip_prefix(LOGS_PATH).unwrap_or("");
+    match new_node_log_query(&query_pairs(uri)) {
+        Err(errs) => http_error(StatusCode::BAD_REQUEST, &aggregate_message(&errs)),
+        Ok(Some(nlq)) => {
+            if !upath.is_empty() && upath != "/" {
+                return http_error(StatusCode::NOT_ACCEPTABLE, "path not allowed in query mode");
+            }
+            let errs = nlq.validate_in(&root.to_string_lossy());
+            if !errs.is_empty() {
+                return http_error(StatusCode::NOT_ACCEPTABLE, &aggregate_message(&errs));
+            }
+            // Validation ensures that the request does not query services and
+            // files at the same time.
+            if !nlq.services.is_empty() {
+                return serve_journal(nlq, headers);
+            }
+            // Validation ensures that the request does not explicitly query
+            // multiple files at the same time.
+            if nlq.files.len() == 1 {
+                return serve_logs_path(root, &nlq.files[0].replace('\\', "/")).await;
+            }
+            serve_logs_path(root, upath).await
+        }
+        // Fall back in case the caller is directly trying to query a file.
+        Ok(None) => serve_logs_path(root, upath).await,
+    }
+}
+
+/// `io.Writer` over a response body channel; `Err` once the client is gone.
+struct ChannelWriter(tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>);
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .blocking_send(Ok(axum::body::Bytes::copy_from_slice(buf)))
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `journalServer.ServeHTTP` (kubelet_server_journal.go:65-89): stream the
+/// logging command's output, gzip-encoded when the request's
+/// `Accept-Encoding` is exactly `gzip`.
+fn serve_journal(nlq: crate::node_log_query::NodeLogQuery, headers: &HeaderMap) -> Response {
+    let gzip = headers
+        .get(header::ACCEPT_ENCODING)
+        .is_some_and(|v| v.as_bytes() == b"gzip");
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::task::spawn_blocking(move || {
+        let w = ChannelWriter(tx);
+        if gzip {
+            let mut gz = flate2::write::GzEncoder::new(w, flate2::Compression::fast());
+            nlq.copy(&mut gz);
+            let _ = gz.finish();
+        } else {
+            let mut w = w;
+            nlq.copy(&mut w);
+        }
+    });
+    let mut b = Response::builder().header(header::CONTENT_TYPE, "text/plain;charset=UTF-8");
+    if gzip {
+        b = b.header(header::CONTENT_ENCODING, "gzip");
+    }
+    b.body(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ))
+    .unwrap()
 }
 
 /// Minimal `url.PathUnescape` for the request path.
@@ -124,6 +232,11 @@ fn forbidden() -> Response {
 async fn serve_logs(root: &Path, uri: &Uri) -> Response {
     let path = unescape(uri.path());
     let upath = path.strip_prefix(LOGS_PATH).unwrap_or("");
+    serve_logs_path(root, upath).await
+}
+
+/// The `http.FileServer` half of [`serve_logs`] for an already-stripped path.
+async fn serve_logs_path(root: &Path, upath: &str) -> Response {
     let parts = clean(upath);
     let mut fs_path = root.to_path_buf();
     fs_path.extend(&parts);

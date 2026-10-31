@@ -4587,6 +4587,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "futures-util",
  "hmac 0.12.1",

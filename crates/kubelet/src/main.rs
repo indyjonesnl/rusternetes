@@ -411,6 +411,12 @@ async fn main() -> Result<()> {
     let enable_system_log_handler = config_file
         .as_ref()
         .is_none_or(|c| c.system_log_handler_enabled());
+    // kubelet.go:1783: the query-aware /logs/ handler needs both the gate and
+    // enableSystemLogQuery.
+    let enable_system_log_query = config::node_log_query_gate_enabled()
+        && config_file
+            .as_ref()
+            .is_some_and(|c| c.system_log_query_enabled());
     // enableProfilingHandler / enableContentionProfiling / enableDebugFlagsHandler
     // (v1beta1 defaults.go:283-288): only honoured under enableDebuggingHandlers.
     let enable_profiling_handler = config_file
@@ -799,6 +805,7 @@ async fn main() -> Result<()> {
             app,
             enable_debugging_handlers,
             enable_system_log_handler,
+            enable_system_log_query,
             std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
         );
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.

@@ -85,6 +85,10 @@ rsa = { version = "0.9", features = ["sha2"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rand = "0.9"
+# Node log query (`/logs/?query=`): query parsing, gzip, streamed body.
+url = "2.5"
+flate2 = "1"
+tokio-stream = "0.1"
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -94,7 +98,6 @@ tonic-build = "0.12"
 rusternetes-cri = { path = "../cri", features = ["fake-server"] }
 tempfile = "3"
 serial_test = { workspace = true }
-url = "2.5"
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 # Fake CSI driver gRPC server over a unix socket (volume_plugins::csi_client).

@@ -235,6 +235,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             app,
             true,
             true,
+            false,
             std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
         );
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
