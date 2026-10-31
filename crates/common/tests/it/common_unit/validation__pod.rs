@@ -1419,9 +1419,12 @@ mod tests {
 
     #[test]
     fn resourcefieldref_divisor_must_be_quantity() {
-        assert!(env_errs(serde_json::json!([
+        // Go's `resource.Quantity.UnmarshalJSON` rejects it at decode, before
+        // validation can see it (#3146).
+        assert!(serde_json::from_value::<Vec<EnvVar>>(serde_json::json!([
             {"name": "A", "valueFrom": {"resourceFieldRef": {"resource": "limits.cpu", "divisor": "notaqty"}}}
-        ])).iter().any(|m| m.contains("divisor")));
+        ]))
+        .is_err());
     }
 
     // ---- container ports -------------------------------------------------

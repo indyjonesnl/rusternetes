@@ -26,7 +26,11 @@ pub struct NodeMetrics {
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub window: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "crate::quantity::wire::serialize_btree_map",
+        deserialize_with = "crate::quantity::wire::deserialize_btree_map"
+    )]
     pub usage: BTreeMap<String, String>,
 }
 
@@ -60,6 +64,10 @@ pub struct ContainerMetrics {
     /// validation, so an absent name decodes rather than failing.
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "crate::quantity::wire::serialize_btree_map",
+        deserialize_with = "crate::quantity::wire::deserialize_btree_map"
+    )]
     pub usage: BTreeMap<String, String>,
 }
