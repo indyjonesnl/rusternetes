@@ -44,8 +44,18 @@ pub trait VolumeHost: Send + Sync {
     /// the storage backend the kubelet already reads objects through.
     fn get_kube_client(&self) -> Option<&Arc<StorageBackend>>;
 
-    /// `GetServiceAccountTokenFunc` (`plugins.go:405`).
+    /// The JWT signer, for the storage-direct self-mint paths (CSI
+    /// `tokenRequests`). Not upstream: it has no equivalent of a kubelet that
+    /// can sign tokens itself.
     fn get_service_account_token_func(&self) -> &TokenManager;
+
+    /// The kubelet's token manager (`pkg/kubelet/token`), which backs both
+    /// `GetServiceAccountTokenFunc` (`plugins.go:405`, `volume_host.go:256`:
+    /// `tokenManager.GetServiceAccountToken`) and
+    /// `DeleteServiceAccountTokenFunc` (`plugins.go:407`:
+    /// `tokenManager.DeleteServiceAccountToken`). Expression difference: one
+    /// accessor in place of two closures over the same manager.
+    fn service_account_token_manager(&self) -> &Arc<crate::token_manager::Manager>;
 
     /// `GetNodeAllocatable` (`plugins.go:397`). The kubelet implementation
     /// (`pkg/kubelet/volume_host.go:226-232`) looks the node up through a
@@ -114,6 +124,8 @@ pub struct KubeletVolumeHost {
     volumes_base_path: String,
     storage: Option<Arc<StorageBackend>>,
     token_manager: TokenManager,
+    /// `kubeletVolumeHost.tokenManager` (`volume_host.go`).
+    sa_token_manager: Arc<crate::token_manager::Manager>,
     node_allocatable: HashMap<String, String>,
     pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     csi_driver_lister: Option<CsiDriverLister>,
@@ -131,6 +143,9 @@ impl KubeletVolumeHost {
     ) -> Self {
         Self {
             volumes_base_path,
+            sa_token_manager: crate::token_manager::Manager::new(
+                crate::token_manager::storage_token_source(storage.clone(), token_manager.clone()),
+            ),
             storage,
             token_manager,
             node_allocatable,
@@ -257,6 +272,10 @@ impl VolumeHost for KubeletVolumeHost {
 
     fn get_service_account_token_func(&self) -> &TokenManager {
         &self.token_manager
+    }
+
+    fn service_account_token_manager(&self) -> &Arc<crate::token_manager::Manager> {
+        &self.sa_token_manager
     }
 
     fn get_node_allocatable(&self) -> &HashMap<String, String> {

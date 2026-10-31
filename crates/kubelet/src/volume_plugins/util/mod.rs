@@ -344,6 +344,9 @@ pub(crate) struct WrappedEmptyDirUnmounter {
     pub(crate) plugin_name: &'static str,
     pub(crate) vol_name: String,
     pub(crate) pod_uid: String,
+    /// `c.plugin.deleteServiceAccountToken(c.podUID)` after a successful
+    /// `TearDownAt` (`projected.go:454`); projected only.
+    pub(crate) delete_service_account_token: bool,
     /// Embedded `volume.MetricsProvider`: `NewCachedMetrics(NewMetricsDu(..))`
     /// for the four plugins above (`configmap.go:115`, `secret.go:119`,
     /// `downwardapi.go:116`, `projected.go:132`); `MetricsNil` for gitRepo
@@ -365,6 +368,7 @@ impl WrappedEmptyDirUnmounter {
             plugin_name,
             vol_name: vol_name.to_string(),
             pod_uid: pod_uid.to_string(),
+            delete_service_account_token: false,
             metrics: Box::new(crate::volume_plugins::metrics_cached::cached_du(&path)),
         }
     }
@@ -385,7 +389,13 @@ impl crate::volume_plugins::Unmounter for WrappedEmptyDirUnmounter {
     }
 
     async fn tear_down_at(&self, dir: &str) -> anyhow::Result<()> {
-        unmount_via_empty_dir(&self.host, dir, &self.vol_name, &self.pod_uid).await
+        unmount_via_empty_dir(&self.host, dir, &self.vol_name, &self.pod_uid).await?;
+        if self.delete_service_account_token {
+            self.host
+                .service_account_token_manager()
+                .delete_service_account_token(&self.pod_uid);
+        }
+        Ok(())
     }
 }
 

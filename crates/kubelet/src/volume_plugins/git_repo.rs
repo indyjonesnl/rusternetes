@@ -196,6 +196,7 @@ impl VolumePlugin for GitRepoPlugin {
                 plugin_name: self.name(),
                 vol_name: vol_name.to_string(),
                 pod_uid: pod_uid.to_string(),
+                delete_service_account_token: false,
                 metrics: Box::new(crate::volume_plugins::util::metrics::MetricsNil),
             },
         ))

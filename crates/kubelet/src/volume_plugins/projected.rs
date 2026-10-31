@@ -74,14 +74,15 @@ impl VolumePlugin for ProjectedPlugin {
         vol_name: &str,
         pod_uid: &str,
     ) -> Result<Box<dyn crate::volume_plugins::Unmounter>> {
-        Ok(Box::new(
-            crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
-                self.host.clone(),
-                self.name(),
-                vol_name,
-                pod_uid,
-            ),
-        ))
+        let mut unmounter = crate::volume_plugins::util::WrappedEmptyDirUnmounter::new(
+            self.host.clone(),
+            self.name(),
+            vol_name,
+            pod_uid,
+        );
+        // `c.plugin.deleteServiceAccountToken(c.podUID)` (`projected.go:454`).
+        unmounter.delete_service_account_token = true;
+        Ok(Box::new(unmounter))
     }
 
     /// `ConstructVolumeSpec` (`projected.go:126-148`): a bare `ProjectedVolumeSource{}`
@@ -128,7 +129,6 @@ impl ProjectedPlugin {
             // (serviceAccountName, nodeName) and metadata (uid) directly.
             pod: pod.clone(),
             storage: self.host.get_kube_client().cloned(),
-            token_manager: self.host.get_service_account_token_func().clone(),
             // `GetNodeAllocatable` (`pkg/volume/plugins.go:397`) — needed
             // only when a downwardAPI source item has a `resourceFieldRef`,
             // same as Task 7's downwardAPI plugin.
@@ -146,7 +146,6 @@ pub struct ProjectedMounter {
     pod_name: String,
     pod: Pod,
     storage: Option<Arc<StorageBackend>>,
-    token_manager: rusternetes_common::auth::TokenManager,
     node_allocatable: HashMap<String, String>,
     /// Embedded `volume.MetricsProvider` (`projected.go:119`).
     metrics: crate::volume_plugins::metrics_cached::CachedMetrics,
@@ -424,7 +423,7 @@ impl ProjectedMounter {
                     Err(e) => errlist.push(e),
                 }
             } else if let Some(tp) = &source.service_account_token {
-                match self.service_account_token(storage, tp).await {
+                match self.service_account_token(tp).await {
                     Ok(token) => {
                         payload.insert(
                             tp.path.clone(),
@@ -497,171 +496,48 @@ impl ProjectedMounter {
     /// (`projected.go:289-318`): a token bound to this pod.
     async fn service_account_token(
         &self,
-        storage: &Arc<StorageBackend>,
         sa_token: &rusternetes_common::resources::ServiceAccountTokenProjection,
     ) -> Result<String> {
-        let storage = Some(storage);
-        let token_path = format!("{}/{}", self.path, sa_token.path);
-        // Generate a real JWT token bound to this pod
         let sa_name = self
             .pod
             .spec
             .as_ref()
             .and_then(|s| s.service_account_name.as_deref())
             .unwrap_or("default");
-        let sa_uid = if let Some(storage) = storage {
-            let sa_key = build_key("serviceaccounts", Some(&self.namespace), sa_name);
-            match storage
-                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                .await
-            {
-                Ok(sa) => sa.metadata.uid.clone(),
-                Err(_) => String::new(),
-            }
-        } else {
-            String::new()
-        };
+        // `auds = []string{tp.Audience}` when set: exactly what the projection
+        // asked for. Empty means the api-server's own default audience, which
+        // it then accepts - do NOT force "rusternetes", or a vanilla
+        // api-server issues a token whose audience it rejects on use.
+        let audiences: Vec<String> = sa_token.audience.iter().cloned().collect();
         // TokenRequest requires expirationSeconds >= 600 (10m).
         let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600).max(600);
-        let now = chrono::Utc::now();
-        let exp = now.timestamp() + expiration_seconds;
-        // Audience to REQUEST from the api-server: exactly what the
-        // projection asked for (empty => the api-server's own
-        // default api-audience, which it will then accept — do NOT
-        // force "rusternetes", or a vanilla api-server issues a
-        // token whose audience it rejects on use).
-        let requested_audiences: Vec<String> = sa_token.audience.iter().cloned().collect();
-        // Audience baked into the self-mint FALLBACK claims (storage-direct
-        // backends only). TokenRequest defaults an empty audience list to the
-        // api-server's `--api-audiences`
-        // (`pkg/registry/core/serviceaccount/storage/token.go`
-        // `TokenREST.Create`), so use those, else "rusternetes".
-        let mut audiences = if self.token_manager.api_audiences().is_empty() {
-            vec!["rusternetes".to_string()]
-        } else {
-            self.token_manager.api_audiences().to_vec()
-        };
-        if let Some(ref aud) = sa_token.audience {
-            audiences = vec![aud.clone()];
-        }
-        let node_name = self.pod.spec.as_ref().and_then(|s| s.node_name.clone());
-        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
-            let node_key = build_key("nodes", None::<&str>, nn);
-            st.get::<serde_json::Value>(&node_key)
-                .await
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/metadata/uid")
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.to_string())
-                })
-        } else {
-            None
-        };
-        let claims = rusternetes_common::auth::ServiceAccountClaims {
-            sub: format!("system:serviceaccount:{}:{}", self.namespace, sa_name),
-            namespace: self.namespace.to_string(),
-            uid: sa_uid.clone(),
-            iat: now.timestamp(),
-            exp,
-            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-            aud: audiences.clone(),
-            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                namespace: self.namespace.to_string(),
-                svcacct: rusternetes_common::auth::KubeRef {
-                    name: sa_name.to_string(),
-                    uid: sa_uid,
+        // `s.plugin.getServiceAccountToken(ns, saName, &TokenRequest{..})`
+        // (`projected.go:334-346`): the kubelet token manager caches the token
+        // and refreshes it at 80% of its lifetime, so a periodic re-SetUp feeds
+        // the AtomicWriter the same bytes and stays inert.
+        let tr = self
+            .host
+            .service_account_token_manager()
+            .get_service_account_token(
+                &self.namespace,
+                sa_name,
+                crate::token_manager::TokenRequest {
+                    uid: String::new(),
+                    spec: crate::token_manager::TokenRequestSpec {
+                        audiences,
+                        expiration_seconds: Some(expiration_seconds),
+                        bound_object_ref: Some(crate::token_manager::BoundObjectReference {
+                            api_version: "v1".to_string(),
+                            kind: "Pod".to_string(),
+                            name: self.pod_name.clone(),
+                            uid: self.pod.metadata.uid.clone(),
+                        }),
+                    },
+                    status: Default::default(),
                 },
-                pod: Some(rusternetes_common::auth::KubeRef {
-                    name: self.pod_name.clone(),
-                    uid: self.pod.metadata.uid.clone(),
-                }),
-                node: node_name
-                    .as_ref()
-                    .map(|nn| rusternetes_common::auth::KubeRef {
-                        name: nn.clone(),
-                        uid: node_uid.clone().unwrap_or_default(),
-                    }),
-                secret: None,
-                warnafter: None,
-            }),
-            pod_name: Some(self.pod_name.clone()),
-            pod_uid: Some(self.pod.metadata.uid.clone()),
-            node_name,
-            node_uid,
-        };
-        // Reuse a still-fresh token: re-mint only when the file is
-        // missing or past ~80% of its lifetime. The per-sync volume
-        // re-creation would otherwise hit the api-server TokenRequest
-        // endpoint every few seconds per pod and churn the token file.
-        let refresh_after = token_refresh_after_secs(expiration_seconds, token_jitter_secs());
-        let token_fresh = std::fs::metadata(&token_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|mt| mt.elapsed().ok())
-            .map(|age| (age.as_secs() as i64) < refresh_after)
-            .unwrap_or(false);
-        if !token_fresh {
-            // Prefer an api-server-issued bound token (TokenRequest),
-            // matching the upstream kubelet (pkg/kubelet/token) — it
-            // never self-signs. A vanilla api-server only trusts
-            // tokens IT signed, so a self-minted token is 401-rejected
-            // for in-cluster clients (kindnet et al.). Self-mint only
-            // as a fallback for the storage-direct backends
-            // (all-in-one), whose co-located api-server trusts our key.
-            let mut issued: Option<String> = None;
-            if let Some(st) = storage {
-                // Bind the token to this pod, as upstream's
-                // projected volume plugin does
-                // (pkg/volume/projected/projected.go). The
-                // api-server derives the pod/node claims from
-                // the ref, and a TokenReview on the mounted
-                // token then reports the
-                // authentication.kubernetes.io/pod-name,
-                // pod-uid and node-name extras (#1684).
-                match st
-                    .create_sa_token(
-                        &self.namespace,
-                        sa_name,
-                        &requested_audiences,
-                        expiration_seconds,
-                        Some((self.pod_name.as_str(), self.pod.metadata.uid.as_str())),
-                    )
-                    .await
-                {
-                    Ok(Some(t)) => issued = Some(t),
-                    Ok(None) => {}
-                    Err(e) => warn!(
-                        "TokenRequest for {}/{} failed: {}; self-minting",
-                        &self.namespace, sa_name, e
-                    ),
-                }
-            }
-            let token = match issued {
-                Some(t) => t,
-                None => match self.token_manager.generate_token(claims) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(
-                            "Failed to generate SA token for pod {}: {}, using placeholder",
-                            self.pod_name, e
-                        );
-                        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                    }
-                },
-            };
-            // A failed mint is an error, as upstream's
-            // `errlist = append(errlist, err)` (`projected.go:
-            // 306-309`); no placeholder token is written.
-            return Ok(token);
-        } // end if !token_fresh
-          // Still fresh: re-use the on-disk token. The upstream
-          // kubelet's token manager caches and refreshes at 80% of
-          // the lifetime (pkg/kubelet/token/token_manager.go), so a
-          // periodic re-SetUp feeds the AtomicWriter the SAME bytes
-          // and stays inert.
-        std::fs::read_to_string(&token_path)
-            .with_context(|| format!("reading cached token {token_path}"))
+            )
+            .await?;
+        Ok(tr.status.token)
     }
 }
 
@@ -967,22 +843,4 @@ pub(crate) fn resync_payload<'a>(
     } else {
         Err(aggregate_message(&errlist))
     }
-}
-
-/// Seconds after minting at which a projected token is refreshed. Ports
-/// `requiresRefresh` (pkg/kubelet/token/token_manager.go:174-195): refresh at
-/// 80% of the lifetime (`exp - ExpirationSeconds*20/100 - jitter`) AND never
-/// later than `maxTTL (24h) - jitter` (`:40`, `:187`). `maxJitter = 10s` (`:42`).
-pub fn token_refresh_after_secs(expiration_seconds: i64, jitter_secs: i64) -> i64 {
-    const MAX_TTL_SECS: i64 = 24 * 3600;
-    let pct = expiration_seconds - (expiration_seconds * 20) / 100 - jitter_secs;
-    pct.min(MAX_TTL_SECS - jitter_secs).max(60)
-}
-
-/// Jitter in [0, 10) seconds (upstream `rand.Float64()*maxJitter`, :186).
-fn token_jitter_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 10) as i64)
-        .unwrap_or(0)
 }
