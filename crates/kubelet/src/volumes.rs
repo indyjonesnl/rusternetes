@@ -141,10 +141,13 @@ pub struct VolumeManager {
     /// leave one alone while a pod is mounting it (`IsOperationPending`,
     /// `reconciler_common.go:275-277`).
     ///
-    /// Not upstream: there `MountVolume` is itself an operation on
-    /// `pendingOperations`, which backs failures off exponentially. The kubelet
-    /// retries a failed mount from its own sync loop, so this one never backs
-    /// off.
+    /// Not upstream's `pendingOperations` itself (that one also carries unmount
+    /// and device operations), but the same mechanism: `MountVolume` is an
+    /// operation on it, which backs failures off exponentially
+    /// (`NewNestedPendingOperations(true)`). It does so once a volume manager is
+    /// attached ([`Self::set_volume_manager`]), so the reconciler's 100ms loop
+    /// does not hammer a mount that keeps failing; the inline mount, retried
+    /// by the kubelet's own sync loop, never backs off.
     pub mount_operations:
         crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations,
     /// An iscsi plugin over the same host, for the global-mount enumeration
@@ -177,6 +180,11 @@ pub struct VolumeManager {
     /// `pkg/kubelet/volume_host.go:86`). Resync re-asks it for the bundle of
     /// each `podCertificate` source so a rotated credential reaches the mount.
     pub pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
+    /// The volume manager whose reconciler mounts the pod's volumes
+    /// (`kubelet.volumeManager`). Set once by [`Self::set_volume_manager`];
+    /// `Weak` because the volume manager holds this manager (the spec factory
+    /// and mounter its populator and reconciler use). Shared by every clone.
+    volume_manager: Arc<std::sync::OnceLock<std::sync::Weak<crate::volume_manager::VolumeManager>>>,
 }
 
 /// `(driver, volumeHandle)` of an attached volume's CSI persistent volume.
@@ -413,7 +421,21 @@ impl VolumeManager {
             node_name: String::new(),
             mounted: Arc::default(),
             pod_certificate_manager,
+            volume_manager: Arc::default(),
         }
+    }
+
+    /// Hand over the volume manager whose reconciler mounts pod volumes.
+    /// From then on [`Self::create_pod_volumes`] is `WaitForAttachAndMount`
+    /// (`kubelet.go:2204`): it waits for the reconciler instead of mounting
+    /// inline.
+    pub fn set_volume_manager(&self, volume_manager: &Arc<crate::volume_manager::VolumeManager>) {
+        let _ = self.volume_manager.set(Arc::downgrade(volume_manager));
+        self.mount_operations
+            .inner
+            .lock()
+            .unwrap()
+            .exponential_back_off_on_error = true;
     }
 
     /// Give the manager the kubelet's node name, the `nodeName` argument of
@@ -1530,6 +1552,14 @@ impl VolumeManager {
 
     /// Create volumes for a pod and return volume bindings for containers
     pub async fn create_pod_volumes(&self, pod: &Pod) -> Result<HashMap<String, String>> {
+        // With a volume manager running, the pod's volumes are mounted by its
+        // reconciler: wait for them and read the paths from the actual state
+        // (`WaitForAttachAndMount` + `GetMountedVolumesForPod`).
+        if let Some(volume_manager) = self.volume_manager.get().and_then(|w| w.upgrade()) {
+            volume_manager.wait_for_attach_and_mount(pod).await?;
+            return Ok(volume_manager.get_mounted_volume_paths(pod));
+        }
+
         let mut volume_paths = HashMap::new();
 
         if let Some(volumes) = &pod.spec.as_ref().unwrap().volumes {
@@ -2050,28 +2080,10 @@ impl VolumeManager {
                 // `GenerateVerifyControllerAttachedVolumeFunc` does for a
                 // volume that needs no attach), so the mount can report to it.
                 let volume_to_mount = self.volume_to_mount(plugin, owned.clone(), pod, volume)?;
-                if !self.asw.volume_exists(&volume_to_mount.volume_name) {
-                    self.asw
-                        .mark_volume_as_attached(
-                            Some(&volume_to_mount.volume_name),
-                            volume_to_mount.volume_spec.clone(),
-                            &self.node_name,
-                            "",
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("MountVolume.MarkVolumeAsAttached failed: {e}")
-                        })?;
-                }
-                let (path, attributes) = self
+                self.mark_volume_attached(&volume_to_mount)?;
+                let (path, _) = self
                     .run_mount_operation(&spec, pod, &volume_to_mount, &volume.name)
                     .await?;
-                // Keep an existing `SELinuxLabeled` across a re-mount of the
-                // same pod volume (upstream keeps it on the pod's VolumeInfo).
-                let mut mounted = self.mounted.lock().unwrap();
-                let rec = mounted
-                    .entry((pod.metadata.uid.clone(), volume.name.clone()))
-                    .or_default();
-                rec.attributes = attributes;
                 Ok(path)
             }
             // Upstream: the populator's `AddPodToVolume` fails the volume and
@@ -2161,7 +2173,36 @@ impl VolumeManager {
                 anyhow::bail!("MountVolume for volume {} did not run", volume_name)
             }
         };
+        // Keep an existing `SELinuxLabeled` across a re-mount of the same pod
+        // volume (upstream keeps it on the pod's VolumeInfo).
+        self.mounted
+            .lock()
+            .unwrap()
+            .entry((pod.metadata.uid.clone(), volume_name.to_string()))
+            .or_default()
+            .attributes = attributes;
         Ok((path, attributes))
+    }
+
+    /// `MarkVolumeAsAttached` for a volume the kubelet need not attach: what
+    /// `GenerateVerifyControllerAttachedVolumeFunc` does for a non-attachable
+    /// plugin (`operation_generator.go:1431-1446`). The volume enters the
+    /// actual state so the mount can report to it.
+    pub fn mark_volume_attached(
+        &self,
+        volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+    ) -> Result<()> {
+        if self.asw.volume_exists(&volume_to_mount.volume_name) {
+            return Ok(());
+        }
+        self.asw
+            .mark_volume_as_attached(
+                Some(&volume_to_mount.volume_name),
+                volume_to_mount.volume_spec.clone(),
+                &self.node_name,
+                "",
+            )
+            .map_err(|e| anyhow::anyhow!("MountVolume.MarkVolumeAsAttached failed: {e}"))
     }
 
     /// Port of `operationExecutor.ExpandInUseVolume`
