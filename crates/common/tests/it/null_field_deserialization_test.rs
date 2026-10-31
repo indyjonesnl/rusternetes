@@ -25,7 +25,7 @@ use serde_json::json;
 #[test]
 fn test_object_meta_tolerates_null_name() {
     // kubectl strategic-merge-patch can produce {"name": null} when the patch
-    // body omits name. Without deserialize_null_string this returns Err.
+    // body omits name. Without null_default this returns Err.
     let v = json!({"name": null, "namespace": "default"});
     let m: ObjectMeta = serde_json::from_value(v)
         .expect("ObjectMeta with name=null must deserialize without error");
@@ -40,7 +40,7 @@ fn test_object_meta_tolerates_null_name() {
 #[test]
 fn test_endpoint_address_tolerates_null_ip() {
     // Endpoints stored in etcd may have ip: null from protobuf decode or
-    // initial creation. Without deserialize_null_string this returns Err.
+    // initial creation. Without null_default this returns Err.
     let v = json!({"ip": null});
     let a: EndpointAddress = serde_json::from_value(v)
         .expect("EndpointAddress with ip=null must deserialize without error");

@@ -3,8 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 pub use crate::serde_helpers::{
-    deserialize_null_string, k8s_float, k8s_micro_time, k8s_micro_time_required, k8s_time,
-    k8s_time_map, k8s_time_required, k8s_time_str, sorted_opt_map,
+    k8s_float, k8s_micro_time, k8s_micro_time_required, k8s_time, k8s_time_map, k8s_time_required,
+    k8s_time_str, sorted_opt_map,
 };
 
 /// ObjectMeta is metadata that all persisted resources must have
@@ -15,7 +15,7 @@ pub struct ObjectMeta {
     /// Name must be unique within a namespace
     #[serde(
         default,
-        deserialize_with = "deserialize_null_string",
+        deserialize_with = "crate::serde_helpers::null_default",
         skip_serializing_if = "String::is_empty"
     )]
     pub name: String,

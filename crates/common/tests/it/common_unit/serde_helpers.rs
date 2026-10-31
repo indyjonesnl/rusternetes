@@ -58,7 +58,7 @@ mod tests {
             v: Vec<u8>,
             #[serde(default, deserialize_with = "null_default")]
             n: i32,
-            #[serde(default, deserialize_with = "deserialize_null_string")]
+            #[serde(default, deserialize_with = "null_default")]
             s: String,
         }
         let w: W = serde_json::from_str(r#"{"v":null,"n":null,"s":null}"#).unwrap();
