@@ -1,7 +1,8 @@
 //! Tests for the remount arm of `pkg/kubelet/volumemanager/reconciler`
 //! (`reconciler_common.go:132-232`): a volume the desired state wants and the
 //! actual state has mounted for the pod, whose plugin asks for a remount, is
-//! mounted again through the plugin's `SetUp`.
+//! mounted again through the plugin's `SetUp`, and an unknown one is attached
+//! and mounted.
 
 use rusternetes_common::resources::{ConfigMap, Pod};
 use rusternetes_kubelet::podcertificate::PodManager;
@@ -173,19 +174,109 @@ async fn volume_without_remount_request_is_left_alone() {
     assert_eq!(read(&f), "two");
 }
 
-/// A volume the actual state does not know (kubelet restarted, or not mounted
-/// yet) is the inline mount's: the reconciler does not mount it.
+/// A volume the actual state does not know is attached first
+/// (`waitForVolumeAttach`), then mounted on the next pass, as upstream's
+/// reconciler does across loop iterations.
 #[tokio::test]
-async fn volume_unknown_to_the_actual_state_is_not_mounted() {
+async fn volume_unknown_to_the_actual_state_is_attached_then_mounted() {
     let f = fx_inner().await;
     f.shell
         .desired_state_of_world_populator
         .find_and_add_new_pods()
         .await;
+
     f.shell.reconciler.reconcile().await;
+    assert_eq!(
+        f.shell.actual_state_of_world.get_attached_volumes().len(),
+        1
+    );
     assert!(f
         .shell
         .actual_state_of_world
         .get_mounted_volumes()
+        .is_empty());
+
+    f.shell.reconciler.reconcile().await;
+    assert_eq!(f.shell.actual_state_of_world.get_mounted_volumes().len(), 1);
+}
+
+// ---- `WaitForAttachAndMount` (`volume_manager.go:395-472`) ----
+
+fn started(f: &Fx) -> Arc<VolumeManagerShell> {
+    // Same shell as `f.shell`, which owns plain fields: build the one the
+    // mounter hands its `create_pod_volumes` to.
+    let shell = Arc::new(VolumeManagerShell::new(
+        "node-rc",
+        f.storage.clone(),
+        Arc::new(Pods(Mutex::new(vec![f.pod.clone()]))),
+        Arc::new(Running),
+        f.mounter.clone(),
+        f.mounter.plugin_mgr.clone(),
+    ));
+    f.mounter.set_volume_manager(&shell);
+    shell.run(|| true);
+    shell
+}
+
+/// With a volume manager attached, `create_pod_volumes` mounts nothing itself:
+/// it waits for the reconciler and reads the path from the actual state.
+#[tokio::test]
+async fn create_pod_volumes_waits_for_the_reconciler() {
+    let f = fx_inner().await;
+    let shell = started(&f);
+
+    let paths = f.mounter.create_pod_volumes(&f.pod).await.unwrap();
+    let dir = paths.get("cfg").expect("the volume's path");
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(dir).join("app.conf")).unwrap(),
+        "one"
+    );
+    assert_eq!(shell.actual_state_of_world.get_mounted_volumes().len(), 1);
+    // Mounted: a second call returns at once with the same path.
+    assert_eq!(f.mounter.create_pod_volumes(&f.pod).await.unwrap(), paths);
+}
+
+/// A volume that cannot be set up (a required ConfigMap that does not exist)
+/// leaves the wait to time out: the pod is waiting, not failing, and the
+/// message names what is unmounted (`volume_manager.go:462-468`).
+#[tokio::test]
+async fn wait_for_attach_and_mount_times_out_naming_the_unmounted_volume() {
+    let f = fx_inner().await;
+    Storage::delete(
+        f.storage.as_ref(),
+        &build_key("configmaps", Some("ns"), "cfg"),
+    )
+    .await
+    .unwrap();
+    let shell = started(&f);
+
+    let err = shell
+        .wait_for_attach_and_mount_within(&f.pod, std::time::Duration::from_millis(800))
+        .await
+        .unwrap_err();
+    assert!(
+        rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string().starts_with("unmounted volumes=[\"cfg\"]"),
+        "{err}"
+    );
+}
+
+/// A volume no container uses is never mounted nor waited for
+/// (`desired_state_of_world_populator.go:293-298`).
+#[tokio::test]
+async fn unused_volume_is_not_waited_for() {
+    let mut f = fx_inner().await;
+    f.pod.spec.as_mut().unwrap().containers[0].volume_mounts = None;
+    let shell = started(&f);
+
+    shell.wait_for_attach_and_mount(&f.pod).await.unwrap();
+    assert!(f
+        .mounter
+        .create_pod_volumes(&f.pod)
+        .await
+        .unwrap()
         .is_empty());
 }

@@ -888,6 +888,9 @@ impl Kubelet {
             Arc::new(volumes.clone()),
             volumes.plugin_mgr.clone(),
         ));
+        // From here `create_pod_volumes` is `WaitForAttachAndMount`: the
+        // reconciler mounts, the runtime waits for it.
+        volumes.set_volume_manager(&volume_manager);
 
         // The kubernetes Service host:port injected into pods as
         // KUBERNETES_SERVICE_* so in-cluster clients reach the api-server.
