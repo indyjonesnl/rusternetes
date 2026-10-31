@@ -394,6 +394,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=cargo-builder /out/api-server /app/api-server
+# Upstream's server images install the binary at /usr/local/bin/<name>
+# (build/server-image/kube-apiserver/Dockerfile); kubeadm/Talos manifests exec
+# it by that name (#3908).
+RUN ln -s /app/api-server /usr/local/bin/kube-apiserver
 COPY --from=console-builder /console/dist /app/console
 COPY deploy/api-server/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
@@ -448,6 +452,7 @@ RUN mkdir -p /etc/cni/net.d
 COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
 COPY --from=cargo-builder /out/kubelet /app/kubelet
+RUN ln -s /app/kubelet /usr/local/bin/kubelet
 
 # Entrypoint installs a route to the pod CIDR via the containerd container so
 # the kubelet can dial pod IPs for probes + HTTP lifecycle hooks (mirrors the
@@ -482,6 +487,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=cargo-builder /out/scheduler /app/scheduler
+RUN ln -s /app/scheduler /usr/local/bin/kube-scheduler
 
 ENTRYPOINT ["/app/scheduler"]
 CMD ["--etcd-servers", "http://etcd:2379"]
@@ -499,6 +505,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=cargo-builder /out/controller-manager /app/controller-manager
+RUN ln -s /app/controller-manager /usr/local/bin/kube-controller-manager
 
 ENTRYPOINT ["/app/controller-manager"]
 CMD ["--etcd-servers", "http://etcd:2379"]
@@ -522,6 +529,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=cargo-builder /out/kube-proxy /app/kube-proxy
+RUN ln -s /app/kube-proxy /usr/local/bin/kube-proxy
 
 ENTRYPOINT ["/app/kube-proxy"]
 CMD ["--node-name", "node-1"]

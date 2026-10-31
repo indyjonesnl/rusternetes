@@ -28,6 +28,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY target/release/api-server /app/api-server
+# Upstream's server images install the binary at /usr/local/bin/<name>
+# (build/server-image/kube-apiserver/Dockerfile); kubeadm/Talos manifests exec
+# it by that name (#3908).
+RUN ln -s /app/api-server /usr/local/bin/kube-apiserver
 
 EXPOSE 6443
 
@@ -64,6 +68,7 @@ RUN mkdir -p /etc/cni/net.d
 COPY cni-config/10-rusternetes.conflist /etc/cni/net.d/
 
 COPY target/release/kubelet /app/kubelet
+RUN ln -s /app/kubelet /usr/local/bin/kubelet
 
 # Do NOT declare `VOLUME ["/var/run"]` — the runtime socket comes from the
 # compose bind mount, not a volume. A /var/run VOLUME creates a fresh anonymous
@@ -86,6 +91,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY target/release/scheduler /app/scheduler
+RUN ln -s /app/scheduler /usr/local/bin/kube-scheduler
 
 ENTRYPOINT ["/app/scheduler"]
 CMD ["--etcd-servers", "http://etcd:2379"]
@@ -103,6 +109,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY target/release/controller-manager /app/controller-manager
+RUN ln -s /app/controller-manager /usr/local/bin/kube-controller-manager
 
 ENTRYPOINT ["/app/controller-manager"]
 CMD ["--etcd-servers", "http://etcd:2379"]
@@ -122,6 +129,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY target/release/kube-proxy /app/kube-proxy
+RUN ln -s /app/kube-proxy /usr/local/bin/kube-proxy
 
 ENTRYPOINT ["/app/kube-proxy"]
 CMD ["--node-name", "node-1"]
