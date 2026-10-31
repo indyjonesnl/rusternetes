@@ -25,6 +25,7 @@ use crate::resources::workloads::{
     RollingUpdateStatefulSetStrategy, StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy,
     StatefulSetSpec, StatefulSetStatus,
 };
+use crate::resources::PodTemplateSpec;
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -34,7 +35,7 @@ use crate::validation::objectmeta::{
     name_is_dns_label, name_is_dns_subdomain, validate_annotations, validate_immutable_field,
     validate_nonnegative_field, validate_object_meta, validate_object_meta_update,
 };
-use crate::validation::podtemplate::validate_pod_template_spec;
+use crate::validation::podtemplate::validate_pod_template_spec_with_old;
 use crate::validation::pvc::validate_persistent_volume_claim_spec;
 
 // ---------------------------------------------------------------------------
@@ -403,8 +404,12 @@ fn validate_rolling_update_deployment(
 // ---------------------------------------------------------------------------
 
 /// Validate `spec`. Mirrors upstream `ValidateDeploymentSpec`.
+// `old_template`: pod options come from the stored template on update
+// (`GetValidationOptionsFromPodTemplate(new, old)`, pkg/registry/apps/
+// {deployment,replicaset,daemonset,statefulset}/strategy.go), `None` on create.
 fn validate_deployment_spec(
     spec: &crate::resources::deployment::DeploymentSpec,
+    old_template: Option<&PodTemplateSpec>,
     fld_path: &Path,
 ) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
@@ -515,8 +520,9 @@ fn validate_deployment_spec(
     // (`pkg/apis/apps/validation/validation.go:656 via ValidatePodTemplateSpecForReplicaSet`), which is what makes
     // `spec.template.spec.containers: Required value` — not a decoder error —
     // the answer to a workload with no containers (#1939).
-    errs.extend(validate_pod_template_spec(
+    errs.extend(validate_pod_template_spec_with_old(
         &spec.template,
+        old_template,
         &fld_path.child("template"),
         false,
     ));
@@ -540,7 +546,7 @@ pub fn validate_deployment(d: &Deployment) -> ErrorList {
         name_is_dns_subdomain,
         &Path::new("metadata"),
     );
-    errs.extend(validate_deployment_spec(&d.spec, &Path::new("spec")));
+    errs.extend(validate_deployment_spec(&d.spec, None, &Path::new("spec")));
     errs
 }
 
@@ -648,7 +654,11 @@ pub fn validate_deployment_status_update(new: &Deployment, old: &Deployment) -> 
 /// (`pkg/apis/apps/validation/validation.go`): non-negative `replicas` and
 /// `minReadySeconds`, a required + structurally-valid `selector`, and template
 /// labels that satisfy the selector.
-fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList {
+fn validate_replicaset_spec(
+    spec: &ReplicaSetSpec,
+    old_template: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // replicas must be non-negative
@@ -719,8 +729,9 @@ fn validate_replicaset_spec(spec: &ReplicaSetSpec, fld_path: &Path) -> ErrorList
     // (`pkg/apis/apps/validation/validation.go:847 via ValidatePodTemplateSpecForReplicaSet`), which is what makes
     // `spec.template.spec.containers: Required value` — not a decoder error —
     // the answer to a workload with no containers (#1939).
-    errs.extend(validate_pod_template_spec(
+    errs.extend(validate_pod_template_spec_with_old(
         &spec.template,
+        old_template,
         &fld_path.child("template"),
         false,
     ));
@@ -737,7 +748,7 @@ pub fn validate_replicaset(rs: &ReplicaSet) -> ErrorList {
         name_is_dns_subdomain,
         &Path::new("metadata"),
     );
-    errs.extend(validate_replicaset_spec(&rs.spec, &Path::new("spec")));
+    errs.extend(validate_replicaset_spec(&rs.spec, None, &Path::new("spec")));
     errs
 }
 
@@ -746,7 +757,11 @@ pub fn validate_replicaset(rs: &ReplicaSet) -> ErrorList {
 pub fn validate_replicaset_update(new: &ReplicaSet, old: &ReplicaSet) -> ErrorList {
     let mut errs =
         validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
-    errs.extend(validate_replicaset_spec(&new.spec, &Path::new("spec")));
+    errs.extend(validate_replicaset_spec(
+        &new.spec,
+        Some(&old.spec.template),
+        &Path::new("spec"),
+    ));
     errs.extend(validate_immutable_field(
         &new.spec.selector,
         &old.spec.selector,
@@ -843,6 +858,7 @@ pub struct StatefulSetValidationOptions {
 
 fn validate_statefulset_spec(
     spec: &StatefulSetSpec,
+    old_template: Option<&PodTemplateSpec>,
     fld_path: &Path,
     set_opts: StatefulSetValidationOptions,
 ) -> ErrorList {
@@ -1010,8 +1026,9 @@ fn validate_statefulset_spec(
     let template_to_validate = template_for_validation(spec);
     let template_path = fld_path.child("template");
     if !set_opts.skip_validate_pod_template_spec {
-        errs.extend(validate_pod_template_spec(
+        errs.extend(validate_pod_template_spec_with_old(
             &template_to_validate,
+            old_template,
             &template_path,
             false,
         ));
@@ -1141,6 +1158,7 @@ pub fn validate_statefulset(ss: &StatefulSet) -> ErrorList {
     );
     errs.extend(validate_statefulset_spec(
         &ss.spec,
+        None,
         &Path::new("spec"),
         StatefulSetValidationOptions::default(),
     ));
@@ -1227,7 +1245,11 @@ pub fn validate_statefulset_status_update(new: &StatefulSet, old: &StatefulSet) 
 /// `revisionHistoryLimit`, and an `updateStrategy` of `RollingUpdate`
 /// (`rollingUpdate` required, with in-range `maxUnavailable`/`maxSurge`) or
 /// `OnDelete`. Run after defaulting (the api-server defaults `updateStrategy`).
-fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
+fn validate_daemonset_spec(
+    spec: &DaemonSetSpec,
+    old_template: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     // selector required + valid + non-empty; template labels must match.
@@ -1367,8 +1389,9 @@ fn validate_daemonset_spec(spec: &DaemonSetSpec, fld_path: &Path) -> ErrorList {
     // (`pkg/apis/apps/validation/validation.go:454`), which is what makes
     // `spec.template.spec.containers: Required value` — not a decoder error —
     // the answer to a workload with no containers (#1939).
-    errs.extend(validate_pod_template_spec(
+    errs.extend(validate_pod_template_spec_with_old(
         &spec.template,
+        old_template,
         &fld_path.child("template"),
         false,
     ));
@@ -1386,16 +1409,19 @@ pub fn validate_daemonset(ds: &DaemonSet) -> ErrorList {
         name_is_dns_subdomain,
         &Path::new("metadata"),
     );
-    errs.extend(validate_daemonset_spec_with_generation(ds));
+    errs.extend(validate_daemonset_spec_with_generation(ds, None));
     errs
 }
 
 /// `ValidateDaemonSetSpec` including its `templateGeneration` check
 /// (validation.go:463). The internal field is the v1 annotation, see
 /// [`DaemonSet::template_generation`].
-fn validate_daemonset_spec_with_generation(ds: &DaemonSet) -> ErrorList {
+fn validate_daemonset_spec_with_generation(
+    ds: &DaemonSet,
+    old_template: Option<&PodTemplateSpec>,
+) -> ErrorList {
     let spec_path = Path::new("spec");
-    let mut errs = validate_daemonset_spec(&ds.spec, &spec_path);
+    let mut errs = validate_daemonset_spec(&ds.spec, old_template, &spec_path);
     errs.extend(validate_nonnegative_field(
         ds.template_generation(),
         &spec_path.child("templateGeneration"),
@@ -1409,7 +1435,10 @@ pub fn validate_daemonset_update(new: &DaemonSet, old: &DaemonSet) -> ErrorList 
     let mut errs =
         validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
     errs.extend(validate_daemonset_spec_update(new, old, &Path::new("spec")));
-    errs.extend(validate_daemonset_spec_with_generation(new));
+    errs.extend(validate_daemonset_spec_with_generation(
+        new,
+        Some(&old.spec.template),
+    ));
     errs
 }
 
@@ -1515,7 +1544,11 @@ pub fn validate_daemonset_status_update(new: &DaemonSet, old: &DaemonSet) -> Err
 pub fn validate_deployment_update(new: &Deployment, old: &Deployment) -> ErrorList {
     let mut errs =
         validate_object_meta_update(&new.metadata, &old.metadata, &Path::new("metadata"));
-    errs.extend(validate_deployment_spec(&new.spec, &Path::new("spec")));
+    errs.extend(validate_deployment_spec(
+        &new.spec,
+        Some(&old.spec.template),
+        &Path::new("spec"),
+    ));
     errs.extend(validate_immutable_field(
         &new.spec.selector,
         &old.spec.selector,
@@ -1537,11 +1570,12 @@ pub fn validate_statefulset_update(new: &StatefulSet, old: &StatefulSet) -> Erro
         skip_validate_volume_claim_templates: true,
         ..StatefulSetValidationOptions::default()
     };
-    if !validate_statefulset_spec(&old.spec, &Path::new("spec"), set_opts).is_empty() {
+    if !validate_statefulset_spec(&old.spec, None, &Path::new("spec"), set_opts).is_empty() {
         set_opts.skip_validate_pod_template_spec = true;
     }
     errs.extend(validate_statefulset_spec(
         &new.spec,
+        Some(&old.spec.template),
         &Path::new("spec"),
         set_opts,
     ));
