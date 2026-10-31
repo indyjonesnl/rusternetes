@@ -14,6 +14,8 @@ use std::sync::Arc;
 pub fn new_filter_plugin(name: &str) -> Option<Arc<dyn FilterPlugin>> {
     match name {
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
+        names::NODE_NAME => Some(Arc::new(NodeName)),
+        names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         _ => None,
     }
 }
@@ -70,5 +72,74 @@ impl FilterPlugin for NodeUnschedulable {
             );
         }
         Status::success()
+    }
+}
+
+/// `nodename.ErrReason`.
+pub const ERR_REASON_NODE_NAME: &str = "node(s) didn't match the requested node name";
+
+/// `nodename.NodeName` (`plugins/nodename/node_name.go`): filters nodes that
+/// do not match the name in `pod.Spec.NodeName`.
+pub struct NodeName;
+
+impl Plugin for NodeName {
+    fn name(&self) -> &'static str {
+        names::NODE_NAME
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for NodeName {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        // `nodeInfo.Node() == nil` is an Error upstream; a Node here always exists.
+        let wanted = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("");
+        if !wanted.is_empty() && wanted != node_info.node().metadata.name {
+            return Status::new(
+                Code::UnschedulableAndUnresolvable,
+                vec![ERR_REASON_NODE_NAME.to_string()],
+            );
+        }
+        Status::success()
+    }
+}
+
+/// `tainttoleration.TaintToleration` Filter
+/// (`plugins/tainttoleration/taint_toleration.go:119-132`): a node with a
+/// NoSchedule/NoExecute taint the pod does not tolerate is rejected
+/// (`FindMatchingUntoleratedTaint` with `DoNotScheduleTaintsFilterFunc`).
+pub struct TaintToleration;
+
+impl Plugin for TaintToleration {
+    fn name(&self) -> &'static str {
+        names::TAINT_TOLERATION
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for TaintToleration {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let taints = node_info
+            .node()
+            .spec
+            .as_ref()
+            .and_then(|s| s.taints.as_deref())
+            .unwrap_or(&[]);
+        let tolerations = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.tolerations.as_deref())
+            .unwrap_or(&[]);
+        if !crate::queue::hints::taints::has_untolerated_do_not_schedule_taint(taints, tolerations)
+        {
+            return Status::success();
+        }
+        Status::new(
+            Code::UnschedulableAndUnresolvable,
+            vec!["node(s) had untolerated taint(s)".to_string()],
+        )
     }
 }
