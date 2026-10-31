@@ -234,3 +234,23 @@ async fn discovery_serves_the_group_when_the_gate_is_on() {
     assert_eq!(res[0]["namespaced"], false);
     assert_eq!(res[1]["verbs"], json!(["get", "patch", "update"]));
 }
+
+/// The deprecated `/watch/` path prefix is served like `?watch=true` on the
+/// list route, and stays gated (404 while StorageVersionMigrator is off).
+#[tokio::test]
+#[serial_test::serial]
+async fn legacy_watch_route_is_served_and_gated() {
+    const WATCH: &str = "/apis/storagemigration.k8s.io/v1beta1/watch/storageversionmigrations";
+    {
+        let _g = with_feature(Feature::StorageVersionMigrator, false);
+        let api = TestApiServer::new();
+        let (code, _) = api.get(WATCH).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+    let _g = with_feature(Feature::StorageVersionMigrator, true);
+    let api = TestApiServer::new();
+    let resp = api
+        .respond("GET", &format!("{WATCH}?resourceVersion=0"), None, None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}

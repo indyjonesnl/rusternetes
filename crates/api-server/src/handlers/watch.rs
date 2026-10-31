@@ -2962,6 +2962,27 @@ pub async fn watch_mutatingadmissionpolicybindings(
     .await
 }
 
+/// Legacy `GET /apis/storagemigration.k8s.io/v1beta1/watch/storageversionmigrations`
+/// (the deprecated `/watch/` path prefix upstream still serves for every
+/// resource; same stream as `?watch=true` on the list route).
+pub async fn watch_storageversionmigrations(
+    State(state): State<Arc<ApiServerState>>,
+    Extension(auth_ctx): Extension<AuthContext>,
+    Query(params): Query<WatchParams>,
+) -> Result<Response> {
+    crate::handlers::storageversionmigration::gate()?;
+    watch_cluster_scoped::<
+        rusternetes_common::resources::storageversionmigration::StorageVersionMigration,
+    >(
+        state,
+        auth_ctx,
+        "storageversionmigrations",
+        "storagemigration.k8s.io",
+        params,
+    )
+    .await
+}
+
 /// Watch clustertrustbundles (cluster-scoped, certificates.k8s.io/v1beta1)
 pub async fn watch_clustertrustbundles(
     State(state): State<Arc<ApiServerState>>,
