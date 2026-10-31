@@ -6,8 +6,9 @@
 //! Implemented: the `ImageService` (`ListImages`, `ImageStatus`, `PullImage`,
 //! `RemoveImage`, `ImageFsInfo`), the list RPCs plus the sandbox/container lifecycle RPCs
 //! (`RunPodSandbox`, `StopPodSandbox`, `RemovePodSandbox`, `CreateContainer`,
-//! `StartContainer`, `StopContainer`, `RemoveContainer`). Every other RPC
-//! answers `UNIMPLEMENTED`, like a runtime that lacks the feature.
+//! `StartContainer`, `StopContainer`, `RemoveContainer`) and `ContainerStatus`.
+//! Every other RPC answers `UNIMPLEMENTED`, like a runtime that lacks the
+//! feature.
 //!
 //! Ported from upstream's `FakeRuntimeService`
 //! (`staging/src/k8s.io/cri-api/pkg/apis/testing/fake_runtime_service.go`:
@@ -43,6 +44,10 @@ struct FakeState {
     called: Vec<String>,
     /// Image store (upstream `FakeImageService.Images`), keyed by image name.
     images: HashMap<String, v1::Image>,
+    /// `ContainerStatus.StartedAt` / `FinishedAt` (unix nanos) by container id:
+    /// the part of upstream's embedded `ContainerStatus` that `v1::Container`
+    /// (the list item) does not carry.
+    container_times: HashMap<String, (i64, i64)>,
 }
 
 impl FakeState {
@@ -61,6 +66,13 @@ impl FakeState {
 #[derive(Clone, Default)]
 pub struct FakeCri {
     state: Arc<Mutex<FakeState>>,
+}
+
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn labels_match(have: &HashMap<String, String>, want: &HashMap<String, String>) -> bool {
@@ -298,6 +310,7 @@ fake_runtime_service! {
             pod_sandbox_id: req.pod_sandbox_id,
             metadata: Some(meta),
             image: config.image,
+            created_at: now_nanos(),
             state: v1::ContainerState::ContainerCreated as i32,
             labels: config.labels,
             annotations: config.annotations,
@@ -317,6 +330,8 @@ fake_runtime_service! {
             return Err(Status::not_found(format!("container {id} not found")));
         };
         c.state = v1::ContainerState::ContainerRunning as i32;
+        // Upstream: `c.StartedAt = time.Now().UnixNano()`.
+        st.container_times.entry(id).or_default().0 = now_nanos();
         Ok(Response::new(v1::StartContainerResponse {}))
     }
 
@@ -331,6 +346,8 @@ fake_runtime_service! {
             return Err(Status::not_found(format!("container {id} not found")));
         };
         c.state = v1::ContainerState::ContainerExited as i32;
+        // Upstream: `c.FinishedAt = time.Now().UnixNano()`.
+        st.container_times.entry(id).or_default().1 = now_nanos();
         Ok(Response::new(v1::StopContainerResponse {}))
     }
 
@@ -342,7 +359,52 @@ fake_runtime_service! {
         let mut st = self.state.lock().unwrap();
         st.record("RemoveContainer");
         st.containers.retain(|c| c.id != id);
+        st.container_times.remove(&id);
         Ok(Response::new(v1::RemoveContainerResponse {}))
+    }
+
+    /// `ContainerStatus` (upstream `FakeRuntimeService.ContainerStatus`,
+    /// `fake_runtime_service.go:501-517`): a copy of the stored container's
+    /// status, `not found` for an unknown id. The fake keeps no exit code or
+    /// reason, as upstream's (`StopContainer` only sets `State` and
+    /// `FinishedAt`).
+    async fn container_status(
+        &self,
+        request: Request<v1::ContainerStatusRequest>,
+    ) -> Result<Response<v1::ContainerStatusResponse>, Status> {
+        let id = request.into_inner().container_id;
+        let mut st = self.state.lock().unwrap();
+        st.record("ContainerStatus");
+        let Some(c) = st.containers.iter().find(|c| c.id == id) else {
+            return Err(Status::not_found(format!("container {id:?} not found")));
+        };
+        let (started_at, finished_at) = st.container_times.get(&id).copied().unwrap_or_default();
+        let image_ref = c
+            .image
+            .as_ref()
+            .map(|i| i.image.clone())
+            .unwrap_or_default();
+        let status = v1::ContainerStatus {
+            id: c.id.clone(),
+            metadata: c.metadata.clone(),
+            state: c.state,
+            created_at: c.created_at,
+            started_at,
+            finished_at,
+            image: c.image.clone(),
+            image_ref: if c.image_ref.is_empty() {
+                image_ref
+            } else {
+                c.image_ref.clone()
+            },
+            labels: c.labels.clone(),
+            annotations: c.annotations.clone(),
+            ..Default::default()
+        };
+        Ok(Response::new(v1::ContainerStatusResponse {
+            status: Some(status),
+            info: HashMap::new(),
+        }))
     }
 
     /// `PodSandboxStatus` (upstream `FakeRuntimeService.PodSandboxStatus`,
@@ -389,7 +451,6 @@ fake_runtime_service! {
     }
     stubs {
         version: VersionRequest => VersionResponse,
-        container_status: ContainerStatusRequest => ContainerStatusResponse,
         update_container_resources: UpdateContainerResourcesRequest => UpdateContainerResourcesResponse,
         reopen_container_log: ReopenContainerLogRequest => ReopenContainerLogResponse,
         exec_sync: ExecSyncRequest => ExecSyncResponse,
