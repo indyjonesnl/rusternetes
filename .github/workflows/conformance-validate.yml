@@ -64,6 +64,7 @@ on:
       - 'scripts/tests/test-ghcr-overlays.sh'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
       - 'scripts/tests/test-dockerfile-multiarch.sh'
+      - 'scripts/tests/test-dockerfile-kube-symlinks.sh'
       - 'scripts/tests/test-kubelet-image-mount-deps.sh'
       - 'scripts/tests/test-all-in-one-csi-socket-mount.sh'
       - 'compose.all-in-one.yml'
@@ -133,6 +134,9 @@ jobs:
       # test existed but was wired into no workflow at all.
       - name: Dockerfile multi-arch test
         run: bash scripts/tests/test-dockerfile-multiarch.sh
+      # #3908: upstream binary names (kube-apiserver, ...) exist in the images.
+      - name: Dockerfile upstream binary-name symlink test
+        run: bash scripts/tests/test-dockerfile-kube-symlinks.sh
       # #3333: kubelet images must ship /sbin/mount.nfs (nfs-common).
       - name: Kubelet image mount-deps test
         run: bash scripts/tests/test-kubelet-image-mount-deps.sh
