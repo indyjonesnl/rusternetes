@@ -168,15 +168,27 @@ impl CycleState {
 }
 
 /// `fwk.NodeInfo` for the Filter extension point: the node and the pods bound
-/// to it.
+/// to it, plus any pods "added" to it for a what-if pass (`nodeInfo.AddPod`,
+/// used for nominated pods by `addGENominatedPods`, framework.go).
 pub struct NodeInfo<'a> {
     node: &'a Node,
     all_pods: &'a [Pod],
+    added: Vec<&'a Pod>,
 }
 
 impl<'a> NodeInfo<'a> {
     pub fn new(node: &'a Node, all_pods: &'a [Pod]) -> Self {
-        Self { node, all_pods }
+        Self {
+            node,
+            all_pods,
+            added: Vec::new(),
+        }
+    }
+
+    /// A node info with `pods` added, as `nodeInfo.AddPod` for each.
+    pub fn with_added_pods(mut self, pods: Vec<&'a Pod>) -> Self {
+        self.added = pods;
+        self
     }
 
     /// `Node()`.
@@ -184,12 +196,13 @@ impl<'a> NodeInfo<'a> {
         self.node
     }
 
-    /// `GetPods()`: the pods bound to this node.
+    /// `GetPods()`: the pods bound to this node, then the added ones.
     pub fn pods(&self) -> impl Iterator<Item = &'a Pod> + '_ {
         let name = self.node.metadata.name.as_str();
         self.all_pods
             .iter()
             .filter(move |p| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(name))
+            .chain(self.added.iter().copied())
     }
 }
 

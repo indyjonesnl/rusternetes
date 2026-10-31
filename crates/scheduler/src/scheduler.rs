@@ -16,7 +16,7 @@ use crate::advanced::{
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
-use crate::fwk::{CycleState, NodeInfo};
+use crate::fwk::CycleState;
 use crate::profile::DEFAULT_SCHEDULER_NAME;
 use crate::queue::{
     hints, node_scheduling_properties_change, pod_scheduling_properties_change, priority_sort_less,
@@ -1569,11 +1569,34 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
         let start_index = self.next_start_node_index.load(Ordering::Relaxed);
         let cycle_state = CycleState::new();
+        // `addGENominatedPods` (framework.go): the pods nominated to a node by
+        // preemption, of greater or equal priority than this pod, that are
+        // not yet bound there. The Filter plugins run with them added.
+        let candidate_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
+        let nominated_pods_for_node = |node_name: &str| -> Vec<&Pod> {
+            all_pods
+                .iter()
+                .filter(|p| {
+                    !(p.metadata.name == pod.metadata.name
+                        && p.metadata.namespace == pod.metadata.namespace)
+                        && p.status
+                            .as_ref()
+                            .and_then(|s| s.nominated_node_name.as_deref())
+                            == Some(node_name)
+                        && p.spec
+                            .as_ref()
+                            .and_then(|s| s.node_name.as_deref())
+                            .is_none_or(str::is_empty)
+                        && p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0)
+                            >= candidate_priority
+                        && p.metadata.deletion_timestamp.is_none()
+                })
+                .collect()
+        };
 
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
         let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
-        let fit_filter_on = filter_on(names::NODE_RESOURCES_FIT);
         // VolumeBinding Filter (FindPodVolumes) — bound PV node affinity,
         // matching/provisionable unbound WaitForFirstConsumer claims.
         let volume_filter = match &volume_ctx {
@@ -1631,7 +1654,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // as in the default plugin order, ahead of the filters
                     // still inline below.
                     let status = fw
-                        .run_filter_plugins(&cycle_state, pod, &NodeInfo::new(node, all_pods))
+                        .run_filter_plugins_with_nominated_pods(
+                            &cycle_state,
+                            pod,
+                            node,
+                            all_pods,
+                            nominated_pods_for_node(&node.metadata.name),
+                        )
                         .await;
                     if !status.is_success() {
                         if status.is_rejected() {
@@ -1751,17 +1780,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         check_topology_spread_constraints(node, pod, all_pods, nodes);
                     if spread_filter_on && !topology_ok {
                         diag.add_plugin_status(names::POD_TOPOLOGY_SPREAD);
-                        return None;
-                    }
-                    // Resource fit (accounting for pod overhead and existing pod usage)
-                    let resource_score =
-                        self.calculate_resource_score_with_overhead(node, pod, all_pods);
-                    if fit_filter_on && resource_score == 0 {
-                        debug!(
-                        "Node {} rejected for pod {}: resource_score=0 (insufficient resources)",
-                        node.metadata.name, pod.metadata.name,
-                    );
-                        diag.add_plugin_status(names::NODE_RESOURCES_FIT);
                         return None;
                     }
                     Some(NodeEval {

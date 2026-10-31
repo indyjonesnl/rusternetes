@@ -22,6 +22,7 @@ pub struct FilterPluginArgs<'a> {
 /// that are not (yet) plugin objects.
 pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<dyn FilterPlugin>> {
     match name {
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
@@ -265,5 +266,131 @@ impl FilterPlugin for NodePorts {
             return Status::success();
         }
         Status::new(Code::Unschedulable, vec![ERR_REASON_NODE_PORTS.to_string()])
+    }
+}
+
+/// `noderesources.Fit` Filter (`plugins/noderesources/fit.go:586-619`,
+/// `fitsRequest` :649-736): the node must have room for the pod's requests
+/// (cpu, memory, ephemeral-storage, scalar/extended resources) and for one
+/// more pod.
+///
+/// Deviations:
+/// - PreFilter (computing the request once into CycleState) is not ported;
+///   Filter computes it per node.
+/// - A node that reports no `status.allocatable` at all is not filtered
+///   (upstream would reject every pod there); the kubelet always reports it.
+/// - `NodeResourcesFitArgs.IgnoredResources`/`IgnoredResourceGroups` and the
+///   DRA extended-resource delegation (`shouldDelegateResourceToDRA`) are not
+///   honoured yet.
+/// - Terminating pods do not count against the node, as in the scheduler's
+///   other accounting here.
+pub struct NodeResourcesFit;
+
+impl Plugin for NodeResourcesFit {
+    fn name(&self) -> &'static str {
+        names::NODE_RESOURCES_FIT
+    }
+}
+
+fn counts_against_node(pod: &Pod) -> bool {
+    !matches!(
+        pod.status.as_ref().and_then(|s| s.phase.as_ref()),
+        Some(rusternetes_common::types::Phase::Succeeded)
+            | Some(rusternetes_common::types::Phase::Failed)
+    ) && pod.metadata.deletion_timestamp.is_none()
+}
+
+#[async_trait]
+impl FilterPlugin for NodeResourcesFit {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        use crate::advanced::{parse_resource_quantity, pod_request_amounts};
+        use crate::score::is_scalar_resource_name;
+        use std::collections::HashMap;
+
+        let Some(allocatable) = node_info
+            .node()
+            .status
+            .as_ref()
+            .and_then(|s| s.allocatable.as_ref())
+        else {
+            return Status::success();
+        };
+        let alloc = |name: &str| -> i64 {
+            allocatable
+                .get(name)
+                .map(|q| parse_resource_quantity(q, name))
+                .unwrap_or(0)
+        };
+
+        // `NodeInfo.Requested` and `len(GetPods())` over the node's pods.
+        let mut requested: HashMap<String, i64> = HashMap::new();
+        let mut pod_count = 0i64;
+        for p in node_info.pods().filter(|p| counts_against_node(p)) {
+            pod_count += 1;
+            for (k, v) in pod_request_amounts(p) {
+                *requested.entry(k).or_insert(0) += v;
+            }
+        }
+        let used = |name: &str| requested.get(name).copied().unwrap_or(0);
+
+        // (reason, unresolvable)
+        let mut insufficient: Vec<(String, bool)> = Vec::new();
+
+        let allowed_pod_number = alloc("pods");
+        if pod_count + 1 > allowed_pod_number {
+            insufficient.push(("Too many pods".to_string(), false));
+        }
+
+        let request = pod_request_amounts(pod);
+        let want = |name: &str| request.get(name).copied().unwrap_or(0);
+        let scalars: Vec<(&String, &i64)> = {
+            let mut v: Vec<_> = request
+                .iter()
+                .filter(|(k, v)| is_scalar_resource_name(k) && **v != 0)
+                .collect();
+            v.sort();
+            v
+        };
+        if want("cpu") == 0
+            && want("memory") == 0
+            && want("ephemeral-storage") == 0
+            && scalars.is_empty()
+        {
+            return Self::status(insufficient);
+        }
+
+        for (name, reason) in [
+            ("cpu", "Insufficient cpu"),
+            ("memory", "Insufficient memory"),
+            ("ephemeral-storage", "Insufficient ephemeral-storage"),
+        ] {
+            let w = want(name);
+            if w > 0 && w > alloc(name) - used(name) {
+                insufficient.push((reason.to_string(), w > alloc(name)));
+            }
+        }
+        for (name, w) in scalars {
+            if *w > alloc(name) - used(name) {
+                insufficient.push((format!("Insufficient {name}"), *w > alloc(name)));
+            }
+        }
+        Self::status(insufficient)
+    }
+}
+
+impl NodeResourcesFit {
+    /// The status `Filter` builds from the insufficient resources
+    /// (fit.go:604-617): all reasons are kept, and any unresolvable one makes
+    /// the status UnschedulableAndUnresolvable.
+    fn status(insufficient: Vec<(String, bool)>) -> Status {
+        if insufficient.is_empty() {
+            return Status::success();
+        }
+        let code = if insufficient.iter().any(|(_, unresolvable)| *unresolvable) {
+            Code::UnschedulableAndUnresolvable
+        } else {
+            Code::Unschedulable
+        };
+        Status::new(code, insufficient.into_iter().map(|(r, _)| r).collect())
     }
 }
