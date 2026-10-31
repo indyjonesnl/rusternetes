@@ -1,5 +1,6 @@
 pub mod atomic_writer;
 pub mod clustertrustbundle;
+pub mod cm_helpers;
 pub mod config;
 pub mod cri_runtime;
 pub mod downward_api;
@@ -37,6 +38,7 @@ pub mod static_pod_url;
 pub mod static_pod_watch;
 pub mod static_pods;
 pub mod streaming_server;
+pub mod swap_util;
 pub mod sync_locks;
 pub mod sysctl;
 pub mod volume_manager;

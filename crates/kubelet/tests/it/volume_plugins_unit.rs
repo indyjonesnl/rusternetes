@@ -11,6 +11,7 @@ mod volume_plugins__csi_drivers_store;
 mod volume_plugins__csi_node_updater;
 mod volume_plugins__downward_api;
 mod volume_plugins__empty_dir;
+mod volume_plugins__empty_dir_memory;
 mod volume_plugins__fc;
 mod volume_plugins__git_repo;
 mod volume_plugins__host;
