@@ -70,6 +70,7 @@ pub mod servicecidr;
 pub mod statefulset;
 pub mod status_subresource_double;
 pub mod storage_class;
+pub mod storage_version_migrator;
 pub mod storageversiongc;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
