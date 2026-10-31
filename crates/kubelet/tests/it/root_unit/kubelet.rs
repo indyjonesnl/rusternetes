@@ -3325,6 +3325,35 @@ mod sync_pod_fake_cri_tests {
 
     #[test]
     #[serial_test::serial]
+    fn sync_pod_reports_container_statuses_from_the_fake_cri() {
+        // The fake CRI answers ContainerStatus (upstream
+        // `FakeRuntimeService.ContainerStatus`), so the container status the
+        // kubelet builds is asserted rather than silently empty.
+        run(|| async {
+            let t = new_test_kubelet().await;
+            let p = pod("default", "web-0", "uid-1");
+            store(&t, &p).await;
+            t.kubelet.sync_pod(&p).await.unwrap();
+            let got: Pod = t.storage.get("/registry/pods/default/web-0").await.unwrap();
+            let statuses = got
+                .status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_ref())
+                .expect("containerStatuses");
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].name, "app");
+            assert!(statuses[0].ready);
+            assert!(statuses[0].container_id.is_some());
+            assert!(
+                count(&t.fake, "ContainerStatus") >= 1,
+                "{:?}",
+                t.fake.called()
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn concurrent_same_name_sync_pod_skips_the_loser() {
         // Two syncs of the same pod race: the lock holder drives the CRI, the
         // other is skipped (Ok, no CRI traffic) instead of issuing a duplicate
