@@ -4720,13 +4720,11 @@ impl Kubelet {
                 // Use fresh_pod for all subsequent checks (spec may have been updated by resize PATCH)
                 let pod = &fresh_pod;
 
-                // Refresh Secret/ConfigMap volumes so updates are reflected in running pods
-                if let Err(e) = self.runtime.refresh_volumes(pod).await {
-                    debug!(
-                        "Failed to refresh volumes for pod {}/{}: {}",
-                        namespace, pod_name, e
-                    );
-                }
+                // Refresh Secret/ConfigMap volumes so updates are reflected in running
+                // pods: `ReprocessPod`, then the reconciler remounts (see below).
+                self.volume_manager
+                    .desired_state_of_world_populator
+                    .reprocess_pod(&crate::volume_plugins::util::get_unique_pod_name(pod));
 
                 // K8s computePodActions: check if any spec containers are MISSING from the
                 // runtime and need to be (re)created. This happens when a container was never
@@ -5105,28 +5103,12 @@ impl Kubelet {
                     } else {
                         // Resync projected/secret/configmap volumes (data may have changed).
                         // Upstream's SyncPod calls `volumeManager.ReprocessPod`
-                        // (`kubelet.go`, `WaitForAttachAndMount`), the populator marks the
-                        // pod's volumes `RemountRequired` and the reconciler mounts them
-                        // again. A pod the actual state does not know yet (kubelet restarted:
-                        // reconstruction is not ported) keeps the inline resync.
-                        let unique_pod_name = crate::volume_plugins::util::get_unique_pod_name(pod);
-                        if self
-                            .volume_manager
-                            .actual_state_of_world
-                            .get_possibly_mounted_volumes_for_pod(&unique_pod_name)
-                            .is_empty()
-                        {
-                            if let Err(e) = self.runtime.resync_volumes(pod, &*self.storage).await {
-                                debug!(
-                                    "Volume resync error for pod {}/{}: {}",
-                                    namespace, pod_name, e
-                                );
-                            }
-                        } else {
-                            self.volume_manager
-                                .desired_state_of_world_populator
-                                .reprocess_pod(&unique_pod_name);
-                        }
+                        // (`volume_manager.go` `WaitForAttachAndMount`): the populator marks
+                        // the pod's volumes `RemountRequired` and the reconciler sets them up
+                        // again through the plugin.
+                        self.volume_manager
+                            .desired_state_of_world_populator
+                            .reprocess_pod(&crate::volume_plugins::util::get_unique_pod_name(pod));
 
                         // Update container statuses with readiness info.
                         // IMPORTANT: Read the fresh pod from storage so that
