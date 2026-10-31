@@ -4,10 +4,13 @@
 
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
-use crate::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Plugin, Status};
+use crate::fwk::{
+    Code, CycleState, FilterPlugin, NodeInfo, Plugin, PreFilterPlugin, PreFilterResult, Status,
+};
 use async_trait::async_trait;
 use rusternetes_common::resources::pod::{NodeAffinity, NodeSelector};
-use rusternetes_common::resources::{Pod, Taint};
+use rusternetes_common::resources::{Node, Pod, Taint};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The per-profile plugin arguments the Filter plugin factories read
@@ -30,6 +33,26 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         _ => None,
     }
+}
+
+/// The factory for an in-tree PreFilter plugin by name, `None` for names
+/// that are not (yet) plugin objects.
+pub fn new_pre_filter_plugin(
+    name: &str,
+    args: &FilterPluginArgs<'_>,
+) -> Option<Arc<dyn PreFilterPlugin>> {
+    match name {
+        names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
+        names::NODE_PORTS => Some(Arc::new(NodePorts)),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        _ => None,
+    }
+}
+
+/// `framework.ErrNotFound`-style failure reading PreFilter state: PreFilter
+/// was not invoked for the plugin (`getPreFilterState`).
+fn missing_state(key: &str) -> Status {
+    Status::from_error(format!("reading {key:?} from cycleState: not found"))
 }
 
 /// `nodeunschedulable.ErrReasonUnschedulable`.
@@ -161,15 +184,63 @@ pub const ERR_REASON_ENFORCED: &str = "node(s) didn't match scheduler-enforced n
 /// `ErrReasonPod` (node_affinity.go:63-64).
 pub const ERR_REASON_POD: &str = "node(s) didn't match Pod's node affinity/selector";
 
-/// `nodeaffinity.NodeAffinity` Filter (`plugins/nodeaffinity/node_affinity.go:217-238`):
-/// the scheduler-enforced `addedAffinity` first, then the pod's
-/// `spec.nodeSelector` and required node affinity
-/// (`GetRequiredNodeAffinity(pod).Match(node)`).
+/// `errReasonConflict` (node_affinity.go:69-70).
+pub const ERR_REASON_CONFLICT: &str = "pod affinity terms conflict";
+
+/// `preFilterStateKey` of the NodeAffinity plugin (`"PreFilter" + Name`).
+const NODE_AFFINITY_STATE_KEY: &str = "PreFilterNodeAffinity";
+
+/// `nodeaffinity.RequiredNodeAffinity` (`component-helpers/scheduling/corev1/nodeaffinity`):
+/// the pod's `spec.nodeSelector` and required node affinity, which a node
+/// must both match. Also the NodeAffinity plugin's `preFilterState`.
+struct RequiredNodeAffinity {
+    node_selector: Option<HashMap<String, String>>,
+    required_affinity: Option<NodeSelector>,
+}
+
+impl RequiredNodeAffinity {
+    /// `GetRequiredNodeAffinity(pod)`.
+    fn from_pod(pod: &Pod) -> Self {
+        let spec = pod.spec.as_ref();
+        Self {
+            node_selector: spec.and_then(|s| s.node_selector.clone()),
+            required_affinity: spec
+                .and_then(|s| s.affinity.as_ref())
+                .and_then(|a| a.node_affinity.as_ref())
+                .and_then(|na| {
+                    na.required_during_scheduling_ignored_during_execution
+                        .clone()
+                }),
+        }
+    }
+
+    /// `RequiredNodeAffinity.Match`.
+    fn matches(&self, node: &Node) -> bool {
+        if let Some(selector) = &self.node_selector {
+            let ok = match node.metadata.labels.as_ref() {
+                None => selector.is_empty(),
+                Some(l) => selector.iter().all(|(k, v)| l.get(k) == Some(v)),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        match &self.required_affinity {
+            Some(required) => rusternetes_common::affinity::matches_node_selector(node, required),
+            None => true,
+        }
+    }
+}
+
+/// `nodeaffinity.NodeAffinity` (`plugins/nodeaffinity/node_affinity.go`).
 ///
-/// Deviation: upstream's PreFilter (narrowing candidate nodes by
-/// `matchFields` on `metadata.name`, :146-215) is not ported; Filter alone is
-/// complete, as upstream's own fallback when no PreFilter state exists
-/// (:225-231).
+/// PreFilter (:159-209) skips pods the plugin has nothing to do with,
+/// caches `GetRequiredNodeAffinity(pod)` in CycleState, and narrows the
+/// candidate nodes when every required term pins `metadata.name` through a
+/// `matchFields` `In` requirement. Filter (:217-238) checks the
+/// scheduler-enforced `addedAffinity` first, then the cached pod
+/// selector/affinity (recomputed from the pod when PreFilter did not run, as
+/// upstream does at :225-231).
 pub struct NodeAffinityPlugin {
     /// `addedNodeSelector`.
     added_node_selector: Option<NodeSelector>,
@@ -193,8 +264,82 @@ impl Plugin for NodeAffinityPlugin {
 }
 
 #[async_trait]
+impl PreFilterPlugin for NodeAffinityPlugin {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+    ) -> (Option<PreFilterResult>, Status) {
+        let spec = pod.spec.as_ref();
+        let required = spec
+            .and_then(|s| s.affinity.as_ref())
+            .and_then(|a| a.node_affinity.as_ref())
+            .and_then(|na| {
+                na.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            });
+        if required.is_none()
+            && self.added_node_selector.is_none()
+            && spec.is_none_or(|s| s.node_selector.is_none())
+        {
+            // NodeAffinity Filter has nothing to do with the Pod.
+            return (None, Status::new(Code::Skip, Vec::new()));
+        }
+
+        state.write(NODE_AFFINITY_STATE_KEY, RequiredNodeAffinity::from_pod(pod));
+
+        let Some(required) = required.filter(|r| !r.node_selector_terms.is_empty()) else {
+            return (None, Status::success());
+        };
+
+        // Check if there is affinity to a specific node and return it.
+        let mut node_names: Option<HashSet<String>> = None;
+        for term in &required.node_selector_terms {
+            let mut term_node_names: Option<HashSet<String>> = None;
+            for r in term.match_fields.iter().flatten() {
+                if r.key == "metadata.name" && r.operator == "In" {
+                    // The requirements are ANDed, so intersect the nodes.
+                    let s: HashSet<String> = r.values.iter().flatten().cloned().collect();
+                    term_node_names = Some(match term_node_names {
+                        None => s,
+                        Some(t) => t.intersection(&s).cloned().collect(),
+                    });
+                }
+            }
+            let Some(term_node_names) = term_node_names else {
+                // This term has no node.Name field affinity, so all nodes
+                // are eligible because the terms are ORed.
+                return (None, Status::success());
+            };
+            node_names
+                .get_or_insert_with(HashSet::new)
+                .extend(term_node_names);
+        }
+        match node_names {
+            // Every term has conflicting affinity to node.Name: the pod will
+            // not match any node.
+            Some(n) if n.is_empty() => (
+                None,
+                Status::new(
+                    Code::UnschedulableAndUnresolvable,
+                    vec![ERR_REASON_CONFLICT.to_string()],
+                ),
+            ),
+            Some(n) => (
+                Some(PreFilterResult {
+                    node_names: Some(n),
+                }),
+                Status::success(),
+            ),
+            None => (None, Status::success()),
+        }
+    }
+}
+
+#[async_trait]
 impl FilterPlugin for NodeAffinityPlugin {
-    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+    async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
         let node = node_info.node();
         if let Some(added) = &self.added_node_selector {
             if !rusternetes_common::affinity::matches_node_selector(node, added) {
@@ -204,36 +349,17 @@ impl FilterPlugin for NodeAffinityPlugin {
                 );
             }
         }
-        let spec = pod.spec.as_ref();
-        // `RequiredNodeAffinity.Match`: the nodeSelector labels ...
-        if let Some(selector) = spec.and_then(|s| s.node_selector.as_ref()) {
-            let labels = node.metadata.labels.as_ref();
-            let ok = match labels {
-                None => selector.is_empty(),
-                Some(l) => selector.iter().all(|(k, v)| l.get(k) == Some(v)),
-            };
-            if !ok {
-                return Status::new(
-                    Code::UnschedulableAndUnresolvable,
-                    vec![ERR_REASON_POD.to_string()],
-                );
-            }
-        }
-        // ... and the required node affinity terms.
-        if let Some(required) = spec
-            .and_then(|s| s.affinity.as_ref())
-            .and_then(|a| a.node_affinity.as_ref())
-            .and_then(|na| {
-                na.required_during_scheduling_ignored_during_execution
-                    .as_ref()
-            })
-        {
-            if !rusternetes_common::affinity::matches_node_selector(node, required) {
-                return Status::new(
-                    Code::UnschedulableAndUnresolvable,
-                    vec![ERR_REASON_POD.to_string()],
-                );
-            }
+        // Fall back to computing the required selector here when PreFilter
+        // is disabled.
+        let matched = match state.read::<RequiredNodeAffinity>(NODE_AFFINITY_STATE_KEY) {
+            Some(s) => s.matches(node),
+            None => RequiredNodeAffinity::from_pod(pod).matches(node),
+        };
+        if !matched {
+            return Status::new(
+                Code::UnschedulableAndUnresolvable,
+                vec![ERR_REASON_POD.to_string()],
+            );
         }
         Status::success()
     }
@@ -243,14 +369,16 @@ impl FilterPlugin for NodeAffinityPlugin {
 pub const ERR_REASON_NODE_PORTS: &str =
     "node(s) didn't have free ports for the requested pod ports";
 
-/// `nodeports.NodePorts` Filter (`plugins/nodeports/node_ports.go`): checks
-/// that the pod's hostPorts are free on the node.
-///
-/// Deviation: PreFilter (caching the wanted ports in CycleState, and Skip for
-/// pods without any so Filter is not run) is not ported; Filter computes the
-/// wanted ports itself, which has the same outcome (a pod without hostPorts
-/// fits every node). Upstream's Filter returns an Error status if PreFilter
-/// state is missing; that case cannot arise here.
+/// `preFilterStateKey` of the NodePorts plugin.
+const NODE_PORTS_STATE_KEY: &str = "PreFilterNodePorts";
+
+/// `nodeports.preFilterState`: the pod's wanted (hostPort, protocol, hostIP).
+struct NodePortsState(Vec<(u16, String, String)>);
+
+/// `nodeports.NodePorts` (`plugins/nodeports/node_ports.go`): PreFilter
+/// (:75-83) caches the pod's host ports in CycleState, and returns Skip when
+/// it has none so Filter does not run; Filter (:162-174) checks that they
+/// are free on the node, and is an Error if PreFilter state is missing.
 pub struct NodePorts;
 
 impl Plugin for NodePorts {
@@ -260,9 +388,34 @@ impl Plugin for NodePorts {
 }
 
 #[async_trait]
+impl PreFilterPlugin for NodePorts {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+    ) -> (Option<PreFilterResult>, Status) {
+        let wanted = crate::advanced::collect_host_ports(pod);
+        // Skip if a pod has no ports.
+        if wanted.is_empty() {
+            return (None, Status::new(Code::Skip, Vec::new()));
+        }
+        state.write(NODE_PORTS_STATE_KEY, NodePortsState(wanted));
+        (None, Status::success())
+    }
+}
+
+#[async_trait]
 impl FilterPlugin for NodePorts {
-    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
-        if crate::advanced::host_ports_fit(&node_info.node().metadata.name, pod, node_info.pods()) {
+    async fn filter(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let Some(NodePortsState(wanted)) = state.read(NODE_PORTS_STATE_KEY) else {
+            return missing_state(NODE_PORTS_STATE_KEY);
+        };
+        if crate::advanced::fits_host_ports(
+            &node_info.node().metadata.name,
+            wanted,
+            node_info.pods(),
+        ) {
             return Status::success();
         }
         Status::new(Code::Unschedulable, vec![ERR_REASON_NODE_PORTS.to_string()])
@@ -274,9 +427,13 @@ impl FilterPlugin for NodePorts {
 /// (cpu, memory, ephemeral-storage, scalar/extended resources) and for one
 /// more pod.
 ///
+/// PreFilter (:304-318) computes the pod's request once into CycleState;
+/// Filter (:586-619) reads it, and is an Error if it is missing.
+///
 /// Deviations:
-/// - PreFilter (computing the request once into CycleState) is not ported;
-///   Filter computes it per node.
+/// - PreFilter's SidecarContainers-disabled rejection and pod-level
+///   resources are not ported (restartable init containers are always
+///   supported here).
 /// - A node that reports no `status.allocatable` at all is not filtered
 ///   (upstream would reject every pod there); the kubelet always reports it.
 /// - `NodeResourcesFitArgs.IgnoredResources`/`IgnoredResourceGroups` and the
@@ -300,13 +457,37 @@ fn counts_against_node(pod: &Pod) -> bool {
     ) && pod.metadata.deletion_timestamp.is_none()
 }
 
+/// `preFilterStateKey` of the NodeResourcesFit plugin.
+const NODE_RESOURCES_FIT_STATE_KEY: &str = "PreFilterNodeResourcesFit";
+
+/// `noderesources.preFilterState`: the pod's computed resource request.
+struct FitState(HashMap<String, i64>);
+
+#[async_trait]
+impl PreFilterPlugin for NodeResourcesFit {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+    ) -> (Option<PreFilterResult>, Status) {
+        state.write(
+            NODE_RESOURCES_FIT_STATE_KEY,
+            FitState(crate::advanced::pod_request_amounts(pod)),
+        );
+        (None, Status::success())
+    }
+}
+
 #[async_trait]
 impl FilterPlugin for NodeResourcesFit {
-    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+    async fn filter(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
         use crate::advanced::{parse_resource_quantity, pod_request_amounts};
         use crate::score::is_scalar_resource_name;
-        use std::collections::HashMap;
 
+        let Some(FitState(request)) = state.read(NODE_RESOURCES_FIT_STATE_KEY) else {
+            return missing_state(NODE_RESOURCES_FIT_STATE_KEY);
+        };
         let Some(allocatable) = node_info
             .node()
             .status
@@ -341,7 +522,6 @@ impl FilterPlugin for NodeResourcesFit {
             insufficient.push(("Too many pods".to_string(), false));
         }
 
-        let request = pod_request_amounts(pod);
         let want = |name: &str| request.get(name).copied().unwrap_or(0);
         let scalars: Vec<(&String, &i64)> = {
             let mut v: Vec<_> = request

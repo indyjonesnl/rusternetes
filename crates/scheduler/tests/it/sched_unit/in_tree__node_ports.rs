@@ -1,6 +1,6 @@
 //! `TestNodePorts` (`plugins/nodeports/node_ports_test.go`).
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo};
+use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo, PreFilterPlugin};
 use rusternetes_scheduler::in_tree::{NodePorts, ERR_REASON_NODE_PORTS};
 use serde_json::json;
 
@@ -23,8 +23,15 @@ fn new_pod(host: &str, ports: &[&str]) -> Pod {
 
 async fn run(pod: Pod, existing: Vec<Pod>) -> rusternetes_scheduler::fwk::Status {
     let node: Node = serde_json::from_value(json!({"metadata": {"name": "m1"}})).unwrap();
+    let mut state = CycleState::new();
+    let (result, status) = NodePorts.pre_filter(&mut state, &pod, &[]).await;
+    assert!(result.is_none(), "NodePorts never narrows the nodes");
+    if status.is_skip() {
+        return rusternetes_scheduler::fwk::Status::success();
+    }
+    assert!(status.is_success());
     NodePorts
-        .filter(&CycleState::new(), &pod, &NodeInfo::new(&node, &existing))
+        .filter(&state, &pod, &NodeInfo::new(&node, &existing))
         .await
 }
 
@@ -36,6 +43,28 @@ fn conflict(s: rusternetes_scheduler::fwk::Status) {
 #[tokio::test]
 async fn skip_filter_no_ports() {
     assert!(run(new_pod("m1", &[]), vec![]).await.is_success());
+    // PreFilter says Skip, so the framework does not run Filter.
+    let (result, status) = NodePorts
+        .pre_filter(&mut CycleState::new(), &new_pod("m1", &[]), &[])
+        .await;
+    assert!(result.is_none());
+    assert!(status.is_skip());
+}
+
+#[tokio::test]
+async fn filter_without_pre_filter_state_is_an_error() {
+    // `getPreFilterState`: PreFilter was not invoked.
+    let node: Node = serde_json::from_value(json!({"metadata": {"name": "m1"}})).unwrap();
+    let pods: Vec<Pod> = vec![];
+    let s = NodePorts
+        .filter(
+            &CycleState::new(),
+            &new_pod("m1", &["TCP/127.0.0.1/80"]),
+            &NodeInfo::new(&node, &pods),
+        )
+        .await;
+    assert_eq!(s.code(), Code::Error);
+    assert!(s.message().contains("PreFilterNodePorts"));
 }
 
 #[tokio::test]

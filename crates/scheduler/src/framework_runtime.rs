@@ -17,7 +17,7 @@
 //! set of extension points it implements; the resolved [`Framework`] is what
 //! the pipeline consults to decide which stages run for a profile.
 
-use crate::fwk::{CycleState, FilterPlugin, NodeInfo, Status};
+use crate::fwk::{CycleState, FilterPlugin, NodeInfo, PreFilterPlugin, PreFilterResult, Status};
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
 use rusternetes_common::resources::{Node, Pod};
@@ -502,6 +502,9 @@ pub struct Framework {
     /// [`crate::in_tree::new_filter_plugin`]) appear here; the others still
     /// run inline in the scheduling cycle while they migrate (#3455).
     filter_plugin_objects: FilterPluginObjects,
+    /// `f.preFilterPlugins` (framework.go:66): the PreFilter plugin objects,
+    /// in execution order; the rest still run inline (#3455).
+    pre_filter_plugin_objects: PreFilterPluginObjects,
     pub profile_name: String,
     /// `f.percentageOfNodesToScore` (framework.go:354); set even when the
     /// profile has no plugins.
@@ -527,7 +530,114 @@ impl std::fmt::Debug for FilterPluginObjects {
     }
 }
 
+/// The PreFilter plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PreFilterPluginObjects(Vec<Arc<dyn PreFilterPlugin>>);
+
+impl std::fmt::Debug for PreFilterPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
 impl Framework {
+    /// `RunPreFilterPlugins` (framework.go:862-923) over the PreFilter plugin
+    /// objects. Returns the merged [`PreFilterResult`] (`None` is all nodes),
+    /// the status, and the names of the plugins that restricted the nodes
+    /// (`pluginsWithNodes`).
+    ///
+    /// A plugin returning Skip has its Filter skipped for the cycle
+    /// (`SetSkipFilterPlugins`). UnschedulableAndUnresolvable ends the run;
+    /// Unschedulable lets the remaining plugins run (kubernetes#119770) and is
+    /// returned at the end; any other non-success is wrapped as
+    /// `running PreFilter plugin "<name>": <err>`. A result that leaves no
+    /// node is UnschedulableAndUnresolvable.
+    pub async fn run_pre_filter_plugins(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+    ) -> (Option<PreFilterResult>, Status, HashSet<String>) {
+        let mut skip_plugins: HashSet<String> = HashSet::new();
+        let out = self
+            .pre_filter_plugins_inner(state, pod, nodes, &mut skip_plugins)
+            .await;
+        // Upstream sets this in a defer, so it applies on every return path.
+        state.set_skip_filter_plugins(skip_plugins);
+        out
+    }
+
+    async fn pre_filter_plugins_inner(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+        skip_plugins: &mut HashSet<String>,
+    ) -> (Option<PreFilterResult>, Status, HashSet<String>) {
+        let mut result: Option<PreFilterResult> = None;
+        let mut plugins_with_nodes: HashSet<String> = HashSet::new();
+        let mut return_status = Status::success();
+        for pl in &self.pre_filter_plugin_objects.0 {
+            let (r, mut s) = pl.pre_filter(state, pod, nodes).await;
+            if s.is_skip() {
+                skip_plugins.insert(pl.name().to_string());
+                continue;
+            }
+            if !s.is_success() {
+                s.set_plugin(pl.name());
+                if s.code() == crate::fwk::Code::UnschedulableAndUnresolvable {
+                    // Preemption shouldn't happen in this cycle, so no need
+                    // to execute all PreFilter.
+                    return (None, s, HashSet::new());
+                }
+                if s.code() == crate::fwk::Code::Unschedulable {
+                    // Preemption happens later in this cycle, so all
+                    // PreFilter plugins must run (kubernetes#119770).
+                    return_status = s;
+                    continue;
+                }
+                let mut wrapped = Status::from_error(format!(
+                    "running PreFilter plugin {:?}: {}",
+                    pl.name(),
+                    s.as_error().unwrap_or_default()
+                ));
+                wrapped.set_plugin(pl.name());
+                return (None, wrapped, HashSet::new());
+            }
+            if !PreFilterResult::all_nodes(&r) {
+                plugins_with_nodes.insert(pl.name().to_string());
+            }
+            result = PreFilterResult::merge(&result, &r);
+            if !PreFilterResult::all_nodes(&result)
+                && result
+                    .as_ref()
+                    .and_then(|r| r.node_names.as_ref())
+                    .is_some_and(HashSet::is_empty)
+            {
+                let mut names: Vec<&str> = plugins_with_nodes.iter().map(String::as_str).collect();
+                names.sort();
+                let msg = if names.len() == 1 {
+                    format!("node(s) didn't satisfy plugin {}", names[0])
+                } else {
+                    format!(
+                        "node(s) didn't satisfy plugin(s) [{}] simultaneously",
+                        names.join(" ")
+                    )
+                };
+                // Nodes filtered out by a PreFilterResult are considered
+                // UnschedulableAndUnresolvable.
+                return (
+                    result,
+                    Status::new(crate::fwk::Code::UnschedulableAndUnresolvable, vec![msg]),
+                    plugins_with_nodes,
+                );
+            }
+        }
+        (result, return_status, plugins_with_nodes)
+    }
+
     /// `RunFilterPlugins` (framework.go:1033-1066) over the Filter plugin
     /// objects: the first plugin that does not succeed ends the run. A status
     /// other than Success/Unschedulable is wrapped as
@@ -540,6 +650,9 @@ impl Framework {
         node_info: &NodeInfo<'_>,
     ) -> Status {
         for pl in &self.filter_plugin_objects.0 {
+            if state.skip_filter_plugins().contains(pl.name()) {
+                continue;
+            }
             let mut status = pl.filter(state, pod, node_info).await;
             if !status.is_success() {
                 if !status.is_rejected() {
@@ -766,6 +879,20 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
             .iter()
             .filter_map(|name| {
                 crate::in_tree::new_filter_plugin(
+                    name,
+                    &crate::in_tree::FilterPluginArgs {
+                        added_affinity: profile.added_affinity,
+                    },
+                )
+            })
+            .collect(),
+    );
+    // The PreFilter plugins that are objects, in list order.
+    f.pre_filter_plugin_objects = PreFilterPluginObjects(
+        f.plugins_at(ExtensionPoint::PreFilter)
+            .iter()
+            .filter_map(|name| {
+                crate::in_tree::new_pre_filter_plugin(
                     name,
                     &crate::in_tree::FilterPluginArgs {
                         added_affinity: profile.added_affinity,

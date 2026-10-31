@@ -169,8 +169,16 @@ pub fn host_ports_fit<'a>(
     pod: &Pod,
     pods_on_node: impl Iterator<Item = &'a Pod>,
 ) -> bool {
-    // Collect hostPorts requested by the incoming pod
-    let incoming_ports = collect_host_ports(pod);
+    fits_host_ports(node_name, &collect_host_ports(pod), pods_on_node)
+}
+
+/// `fitsPorts` for already-collected wanted ports (`nodeports` PreFilter
+/// state, see [`collect_host_ports`]).
+pub fn fits_host_ports<'a>(
+    node_name: &str,
+    incoming_ports: &[(u16, String, String)],
+    pods_on_node: impl Iterator<Item = &'a Pod>,
+) -> bool {
     if incoming_ports.is_empty() {
         return true; // No hostPort requirements, no conflict possible
     }
@@ -192,7 +200,7 @@ pub fn host_ports_fit<'a>(
         }
 
         let existing_ports = collect_host_ports(existing_pod);
-        for (inc_port, inc_protocol, inc_ip) in &incoming_ports {
+        for (inc_port, inc_protocol, inc_ip) in incoming_ports {
             for (ex_port, ex_protocol, ex_ip) in &existing_ports {
                 if inc_port == ex_port
                     && inc_protocol == ex_protocol
@@ -212,7 +220,7 @@ pub fn host_ports_fit<'a>(
 }
 
 /// Collect all (hostPort, protocol, hostIP) tuples from a pod's containers.
-fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
+pub fn collect_host_ports(pod: &Pod) -> Vec<(u16, String, String)> {
     let mut result = Vec::new();
     if let Some(spec) = &pod.spec {
         for container in &spec.containers {

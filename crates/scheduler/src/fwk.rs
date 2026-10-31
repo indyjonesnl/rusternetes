@@ -10,13 +10,15 @@
 //!
 //! Deviations: [`NodeInfo`] is a view over the cycle's pod list rather than an
 //! incrementally maintained snapshot, and [`CycleState`] has no
-//! skip-plugin sets or metrics flag yet; they arrive with the plugins that
-//! need them.
+//! skip-score/pre-score sets or metrics flag yet; they arrive with the
+//! plugins that need them. [`CycleState`] is written through `&mut` (only
+//! PreFilter and later write; the per-node Filter pass reads shared), where
+//! upstream's is internally locked.
 
 use async_trait::async_trait;
 use rusternetes_common::resources::{Node, Pod};
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// `fwk.Code` (`interface.go:60-95`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,6 +151,7 @@ impl Status {
 #[derive(Default)]
 pub struct CycleState {
     storage: HashMap<String, Box<dyn Any + Send + Sync>>,
+    skip_filter_plugins: HashSet<String>,
 }
 
 impl CycleState {
@@ -164,6 +167,54 @@ impl CycleState {
     /// `Read`: `None` is upstream's `ErrNotFound`.
     pub fn read<T: Any + Send + Sync>(&self, key: &str) -> Option<&T> {
         self.storage.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+
+    /// `SetSkipFilterPlugins`: plugins whose Filter is skipped this cycle
+    /// (their PreFilter returned Skip).
+    pub fn set_skip_filter_plugins(&mut self, plugins: HashSet<String>) {
+        self.skip_filter_plugins = plugins;
+    }
+
+    /// `GetSkipFilterPlugins`.
+    pub fn skip_filter_plugins(&self) -> &HashSet<String> {
+        &self.skip_filter_plugins
+    }
+}
+
+/// `fwk.PreFilterResult` (`interface.go:332-360`): the nodes that should be
+/// considered downstream. Go's nil `*PreFilterResult` and a nil `NodeNames`
+/// both mean "all nodes"; here an `Option<PreFilterResult>` of `None` or a
+/// `node_names` of `None` do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreFilterResult {
+    pub node_names: Option<HashSet<String>>,
+}
+
+impl PreFilterResult {
+    /// `AllNodes`, for a possibly-nil result.
+    pub fn all_nodes(this: &Option<PreFilterResult>) -> bool {
+        this.as_ref().is_none_or(|r| r.node_names.is_none())
+    }
+
+    /// `Merge`, for possibly-nil results: nil only if both are all-nodes,
+    /// otherwise the intersection of the restricted sets.
+    pub fn merge(
+        this: &Option<PreFilterResult>,
+        other: &Option<PreFilterResult>,
+    ) -> Option<PreFilterResult> {
+        if Self::all_nodes(this) && Self::all_nodes(other) {
+            return None;
+        }
+        let names = |r: &Option<PreFilterResult>| r.as_ref().and_then(|r| r.node_names.clone());
+        let node_names = match (names(this), names(other)) {
+            (Some(a), Some(b)) => a.intersection(&b).cloned().collect(),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => unreachable!("both all-nodes handled above"),
+        };
+        Some(PreFilterResult {
+            node_names: Some(node_names),
+        })
     }
 }
 
@@ -216,4 +267,17 @@ pub trait Plugin: Send + Sync {
 #[async_trait]
 pub trait FilterPlugin: Plugin {
     async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status;
+}
+
+/// `fwk.PreFilterPlugin`: runs once per scheduling cycle before the per-node
+/// Filter pass; it may precompute state into the [`CycleState`], return
+/// `Skip` (its Filter is then not run), or narrow the candidate nodes.
+#[async_trait]
+pub trait PreFilterPlugin: Plugin {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+    ) -> (Option<PreFilterResult>, Status);
 }
