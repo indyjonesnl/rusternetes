@@ -7,6 +7,7 @@ mod framework_runtime;
 mod fwk;
 mod in_tree__node_affinity;
 mod in_tree__node_name;
+mod in_tree__node_ports;
 mod in_tree__node_unschedulable;
 mod in_tree__taint_toleration;
 mod inter_pod_affinity_score;
