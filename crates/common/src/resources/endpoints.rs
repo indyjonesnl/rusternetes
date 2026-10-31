@@ -58,7 +58,7 @@ pub struct EndpointSubset {
 #[serde(rename_all = "camelCase")]
 pub struct EndpointAddress {
     /// The IP of this endpoint.
-    #[serde(default, deserialize_with = "crate::types::deserialize_null_string")]
+    #[serde(default, deserialize_with = "crate::serde_helpers::null_default")]
     pub ip: String,
 
     /// The Hostname of this endpoint.

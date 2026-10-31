@@ -5,8 +5,8 @@ mod __parent {
     pub use chrono::{DateTime, Utc};
     pub use rusternetes_common::serde_helpers::go_zero_time;
     pub use rusternetes_common::serde_helpers::{
-        deserialize_null_string, k8s_float, k8s_micro_time, k8s_micro_time_required, k8s_time,
-        k8s_time_map, k8s_time_required, k8s_time_str, sorted_opt_map,
+        k8s_float, k8s_micro_time, k8s_micro_time_required, k8s_time, k8s_time_map,
+        k8s_time_required, k8s_time_str, sorted_opt_map,
     };
     pub use serde::{Deserialize, Deserializer, Serialize};
     pub use std::collections::HashMap;

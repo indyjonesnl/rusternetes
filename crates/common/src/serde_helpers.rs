@@ -1,7 +1,7 @@
 //! The one home for serde helpers that bridge Go's `encoding/json` zero-value
 //! and `null` handling, and `metav1.Time` marshalling, to Rust (#2953).
 //!
-//! * [`null_default`] / [`deserialize_null_string`]: Go decodes `null` as a
+//! * [`null_default`]: Go decodes `null` as a
 //!   no-op, leaving the zero value.
 //! * [`empty_as_none`]: an unset enum/string-typed field some clients send as `""`.
 //! * [`bytes_b64`]: Go `[]byte`, base64 on the wire, `null` when nil.
@@ -25,14 +25,6 @@ where
     T: Default + Deserialize<'de>,
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// [`null_default`] for a `String`: null or missing is the empty string.
-pub fn deserialize_null_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    null_default(deserializer)
 }
 
 /// Deserialize an `Option<T>` where the JSON value may be `null`, missing,
