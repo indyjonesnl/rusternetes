@@ -350,7 +350,7 @@ impl VolumePlugin for CsiPlugin {
                 .unwrap_or_default(),
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
-            token_manager: self.host.get_service_account_token_func().clone(),
+            token_manager: self.host.service_account_token_manager().clone(),
             need_selinux_relabel: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -585,10 +585,9 @@ struct CsiMounter {
     node_name: String,
     storage: Option<Arc<StorageBackend>>,
     plugin_dir: PathBuf,
-    /// `GetServiceAccountTokenFunc` (`plugins.go:405`): signs the fallback
-    /// token when the backend has no api-server to ask (see
-    /// [`CsiMounter::pod_service_account_token_attrs`]).
-    token_manager: rusternetes_common::auth::TokenManager,
+    /// `serviceAccountTokenGetter` = `host.GetServiceAccountTokenFunc()`
+    /// (`csi_plugin.go:309`): the kubelet token manager.
+    token_manager: Arc<crate::token_manager::Manager>,
     /// `csiMountMgr.needSELinuxRelabel` (`csi_mounter.go:72`): set by `SetUpAt`
     /// when the volume was not mounted with `-o context=` and its filesystem
     /// supports SELinux labels; read by `GetAttributes`.
@@ -1441,10 +1440,9 @@ impl CsiMounter {
     /// CSIDriver `set_up` already fetched; upstream re-reads it from the
     /// lister, `None` being its `IsNotFound` arm.
     ///
-    /// DEVIATION: upstream always asks the api-server (`serviceAccountTokenGetter`
-    /// = TokenRequest). Storage-direct backends have no api-server client, so
-    /// there the token is self-minted with the host's `TokenManager`, exactly as
-    /// the projected volume plugin does (`projected.rs`).
+    /// Tokens come from the kubelet token manager, as upstream's
+    /// `serviceAccountTokenGetter` does; its token source falls back to
+    /// self-minting on storage-direct backends (`token_manager.rs`).
     async fn pod_service_account_token_attrs(
         &self,
         driver: Option<&CSIDriver>,
@@ -1495,66 +1493,42 @@ impl CsiMounter {
 
     /// `serviceAccountTokenGetter(namespace, serviceAccountName, tokenRequest)`
     /// with `BoundObjectRef` = this pod (`csi_mounter.go:382-394`).
+    /// `serviceAccountTokenGetter` is `host.GetServiceAccountTokenFunc()`
+    /// (`csi_plugin.go:309`, `volume_host.go:252-254`), i.e. the kubelet token
+    /// manager: tokens are cached per request and refreshed at 80% of their
+    /// lifetime, so a `RequiresRepublish` re-SetUp reuses a live token.
     async fn get_service_account_token(
         &self,
         audiences: &[String],
         expiration_seconds: i64,
     ) -> Result<rusternetes_common::resources::TokenRequestStatus> {
-        if let Some(st) = self.storage.as_ref() {
-            if let Some((token, expiration_timestamp)) = st
-                .create_sa_token_status(
-                    &self.pod_namespace,
-                    &self.service_account_name,
-                    audiences,
-                    expiration_seconds,
-                    Some((self.pod_name.as_str(), self.pod_uid.as_str())),
-                )
-                .await?
-            {
-                return Ok(rusternetes_common::resources::TokenRequestStatus {
-                    expiration_timestamp,
-                    token,
-                });
-            }
-        }
-        // Self-mint (storage-direct backends), claims as in `projected.rs`.
-        let sa_uid = match self.storage.as_ref() {
-            Some(st) => st
-                .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
-                    "serviceaccounts",
-                    Some(&self.pod_namespace),
-                    &self.service_account_name,
-                ))
-                .await
-                .map(|sa| sa.metadata.uid)
-                .unwrap_or_default(),
-            None => String::new(),
-        };
-        let mut claims = rusternetes_common::auth::ServiceAccountClaims::new(
-            self.service_account_name.clone(),
-            self.pod_namespace.clone(),
-            sa_uid,
-            0,
-        );
-        let exp = chrono::Utc::now() + chrono::Duration::seconds(expiration_seconds);
-        claims.exp = exp.timestamp();
-        claims.aud = if audiences.is_empty() {
-            // TokenREST.Create: empty audiences default to --api-audiences.
-            if self.token_manager.api_audiences().is_empty() {
-                vec!["rusternetes".to_string()]
-            } else {
-                self.token_manager.api_audiences().to_vec()
-            }
-        } else {
-            audiences.to_vec()
-        };
-        claims.pod_name = Some(self.pod_name.clone());
-        claims.pod_uid = Some(self.pod_uid.clone());
-        claims.node_name = Some(self.node_name.clone()).filter(|n| !n.is_empty());
-        let token = self.token_manager.generate_token(claims)?;
+        let tr = self
+            .token_manager
+            .get_service_account_token(
+                &self.pod_namespace,
+                &self.service_account_name,
+                crate::token_manager::TokenRequest {
+                    uid: String::new(),
+                    spec: crate::token_manager::TokenRequestSpec {
+                        audiences: audiences.to_vec(),
+                        expiration_seconds: Some(expiration_seconds),
+                        bound_object_ref: Some(crate::token_manager::BoundObjectReference {
+                            api_version: "v1".to_string(),
+                            kind: "Pod".to_string(),
+                            name: self.pod_name.clone(),
+                            uid: self.pod_uid.clone(),
+                        }),
+                    },
+                    status: Default::default(),
+                },
+            )
+            .await?;
         Ok(rusternetes_common::resources::TokenRequestStatus {
-            expiration_timestamp: exp.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            token,
+            expiration_timestamp: tr
+                .status
+                .expiration_timestamp
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            token: tr.status.token,
         })
     }
 

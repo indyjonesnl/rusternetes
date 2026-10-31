@@ -836,6 +836,42 @@ mod tests {
             .contains_key("csi.storage.k8s.io/serviceAccount.tokens"));
     }
 
+    /// `serviceAccountTokenGetter` is the kubelet token manager
+    /// (`csi_plugin.go:309`, `volume_host.go:252`): a re-SetUp (what
+    /// `RequiresRepublish` drives) is served from its cache, not re-minted.
+    #[tokio::test]
+    async fn republish_reuses_the_cached_service_account_token() {
+        let f = fx(
+            "satokencache",
+            &[],
+            Some(json!({"attachRequired": false,
+                "tokenRequests": [{"audience": "gcp", "expirationSeconds": 3600}]})),
+        )
+        .await;
+        let p = pv(&f.driver, json!({}));
+        let v = claim_volume();
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: Some(&p),
+            read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
+        };
+        let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
+        m.set_up().await.unwrap();
+        // JWT iat/exp have one-second resolution: a re-mint after this sleep differs.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        m.set_up().await.unwrap();
+        let calls = f.fake.calls.lock().unwrap();
+        let token = |i: usize| {
+            let raw = &calls.publish[i].volume_context["csi.storage.k8s.io/serviceAccount.tokens"];
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            v["gcp"]["token"].as_str().unwrap().to_string()
+        };
+        assert!(calls.publish.len() >= 2);
+        assert_eq!(token(0), token(1));
+    }
+
     /// `serviceAccountTokenInSecrets`: the tokens move from `volume_context` to
     /// `node_publish_secrets` (`csi_mounter.go:243-249`), so they stay out of the
     /// PV-visible context.
