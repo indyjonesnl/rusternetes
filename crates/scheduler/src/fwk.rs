@@ -15,6 +15,7 @@
 //! PreFilter and later write; the per-node Filter pass reads shared), where
 //! upstream's is internally locked.
 
+use crate::node_volume_limits::NodeVolumeLimitsSnapshot;
 use async_trait::async_trait;
 use rusternetes_common::resources::{Node, Pod};
 use std::any::Any;
@@ -299,5 +300,28 @@ pub trait PreFilterPlugin: Plugin {
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[Node],
+        handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status);
+}
+
+/// The slice of `framework.Handle` the plugin objects use: access to cluster
+/// objects (upstream's informer-backed listers). Upstream hands a plugin its
+/// `Handle` at construction; here the scheduler's data plane is generic over
+/// its storage and per-scheduler rather than per-profile, so it is passed to
+/// each PreFilter call instead.
+#[async_trait]
+pub trait Handle: Send + Sync {
+    /// The cluster-wide listers NodeVolumeLimits reads (`csi.go` `pvLister`,
+    /// `pvcLister`, `scLister`, `vaLister`, `csiDriverLister`, CSINode lister).
+    async fn node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot, String>;
+}
+
+/// A [`Handle`] with no cluster access, for plugins that need none.
+pub struct NoHandle;
+
+#[async_trait]
+impl Handle for NoHandle {
+    async fn node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot, String> {
+        Err("no cluster access".to_string())
+    }
 }

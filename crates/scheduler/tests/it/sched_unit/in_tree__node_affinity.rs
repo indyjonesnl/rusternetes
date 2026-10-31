@@ -3,7 +3,7 @@
 use rusternetes_common::resources::pod::NodeAffinity;
 use rusternetes_common::resources::{Node, Pod};
 use rusternetes_scheduler::fwk::{
-    Code, CycleState, FilterPlugin, NodeInfo, PreFilterPlugin, PreFilterResult, Status,
+    Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin, PreFilterResult, Status,
 };
 use rusternetes_scheduler::in_tree::{
     NodeAffinityPlugin, ERR_REASON_CONFLICT, ERR_REASON_ENFORCED, ERR_REASON_POD,
@@ -120,7 +120,7 @@ fn match_fields(terms: Vec<Vec<(&str, Vec<&str>)>>) -> Value {
 
 async fn pre_filter(spec: Value) -> (Option<PreFilterResult>, Status) {
     NodeAffinityPlugin::new(None)
-        .pre_filter(&mut CycleState::new(), &pod_of(spec), &[])
+        .pre_filter(&mut CycleState::new(), &pod_of(spec), &[], &NoHandle)
         .await
 }
 
@@ -149,7 +149,7 @@ async fn added_affinity_alone_does_not_skip() {
     let added: NodeAffinity =
         serde_json::from_value(required("foo", "In", json!(["bar"]))).unwrap();
     let (r, s) = NodeAffinityPlugin::new(Some(&added))
-        .pre_filter(&mut CycleState::new(), &pod_of(json!({})), &[])
+        .pre_filter(&mut CycleState::new(), &pod_of(json!({})), &[], &NoHandle)
         .await;
     assert!(r.is_none() && s.is_success());
 }
@@ -203,7 +203,7 @@ async fn filter_uses_the_state_pre_filter_wrote() {
             .unwrap();
     let plugin = NodeAffinityPlugin::new(None);
     let mut state = CycleState::new();
-    let (_, s) = plugin.pre_filter(&mut state, &pod, &[]).await;
+    let (_, s) = plugin.pre_filter(&mut state, &pod, &[], &NoHandle).await;
     assert!(s.is_success());
     let pods: Vec<Pod> = vec![];
     assert!(plugin

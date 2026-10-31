@@ -4,7 +4,7 @@
 //! (`runtime/framework.go:1033-1066`).
 use rusternetes_common::resources::{Node, Pod};
 use rusternetes_scheduler::framework_runtime::ExtensionPoint;
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo};
+use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NoHandle, NodeInfo};
 use rusternetes_scheduler::in_tree::{NodeUnschedulable, ERR_REASON_UNSCHEDULABLE};
 use rusternetes_scheduler::profile::Profile;
 
@@ -76,7 +76,7 @@ async fn framework_dispatches_the_plugin_object_and_names_it() {
     let pods: Vec<Pod> = vec![];
     let mut state = CycleState::new();
     let (_, pre, _) = fw
-        .run_pre_filter_plugins(&mut state, &bare_pod(), &[])
+        .run_pre_filter_plugins(&mut state, &bare_pod(), &[], &NoHandle)
         .await;
     assert!(pre.is_success());
     let s = fw

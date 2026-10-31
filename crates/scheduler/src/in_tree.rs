@@ -5,7 +5,8 @@
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
-    Code, CycleState, FilterPlugin, NodeInfo, Plugin, PreFilterPlugin, PreFilterResult, Status,
+    Code, CycleState, FilterPlugin, Handle, NodeInfo, Plugin, PreFilterPlugin, PreFilterResult,
+    Status,
 };
 use async_trait::async_trait;
 use rusternetes_common::resources::pod::{NodeAffinity, NodeSelector};
@@ -30,6 +31,7 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
         names::NODE_NAME => Some(Arc::new(NodeName)),
+        names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
@@ -47,6 +49,7 @@ pub fn new_pre_filter_plugin(
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         _ => None,
     }
 }
@@ -272,6 +275,7 @@ impl PreFilterPlugin for NodeAffinityPlugin {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         let spec = pod.spec.as_ref();
         let required = spec
@@ -396,6 +400,7 @@ impl PreFilterPlugin for NodePorts {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         let wanted = crate::advanced::collect_host_ports(pod);
         // Skip if a pod has no ports.
@@ -472,6 +477,7 @@ impl PreFilterPlugin for NodeResourcesFit {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         state.write(
             NODE_RESOURCES_FIT_STATE_KEY,
@@ -673,5 +679,71 @@ impl FilterPlugin for InterPodAffinity {
             );
         }
         Status::success()
+    }
+}
+
+/// `preFilterStateKey` of the NodeVolumeLimits plugin.
+const NODE_VOLUME_LIMITS_STATE_KEY: &str = "PreFilterNodeVolumeLimits";
+
+/// The listers Filter reads, snapshotted once per cycle by PreFilter.
+struct NodeVolumeLimitsState(crate::node_volume_limits::NodeVolumeLimitsSnapshot);
+
+/// `nodevolumelimits.CSILimits` (`plugins/nodevolumelimits/csi.go`):
+/// PreFilter (:219-229) returns Skip for a pod without PVC, ephemeral or
+/// inline-migratable volumes; Filter (:236-345) counts the node's attached
+/// CSI volumes against the driver limits.
+///
+/// Deviation: upstream's plugin holds informer-backed listers; here PreFilter
+/// takes one snapshot of them through the [`Handle`] and Filter reads it from
+/// CycleState. A Filter without that state (PreFilter not enabled for the
+/// profile) does not check, as before this plugin was an object. A failed
+/// snapshot is a PreFilter error, which aborts the cycle
+/// (schedule_one.go:496-497).
+pub struct NodeVolumeLimits;
+
+impl Plugin for NodeVolumeLimits {
+    fn name(&self) -> &'static str {
+        names::NODE_VOLUME_LIMITS
+    }
+}
+
+#[async_trait]
+impl PreFilterPlugin for NodeVolumeLimits {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> (Option<PreFilterResult>, Status) {
+        if !crate::node_volume_limits::CsiLimits::pre_filter(pod) {
+            return (None, Status::new(Code::Skip, Vec::new()));
+        }
+        match handle.node_volume_limits_snapshot().await {
+            Ok(snap) => {
+                state.write(NODE_VOLUME_LIMITS_STATE_KEY, NodeVolumeLimitsState(snap));
+                (None, Status::success())
+            }
+            Err(e) => (None, Status::from_error(e)),
+        }
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for NodeVolumeLimits {
+    async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        use crate::node_volume_limits::{CsiLimits, FilterStatus};
+        let Some(NodeVolumeLimitsState(snap)) = state.read(NODE_VOLUME_LIMITS_STATE_KEY) else {
+            return Status::success();
+        };
+        let on_node: Vec<&Pod> = node_info.pods().collect();
+        match CsiLimits::new(snap).filter(pod, node_info.node(), &on_node) {
+            FilterStatus::Success => Status::success(),
+            FilterStatus::Unschedulable(m) => Status::new(Code::Unschedulable, vec![m]),
+            FilterStatus::UnschedulableAndUnresolvable(m) => {
+                Status::new(Code::UnschedulableAndUnresolvable, vec![m])
+            }
+            FilterStatus::Error(m) => Status::from_error(m),
+        }
     }
 }
