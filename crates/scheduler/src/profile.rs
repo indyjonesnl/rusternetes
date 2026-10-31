@@ -113,6 +113,7 @@ impl Profile {
                 plugins: self.plugins.as_ref(),
                 plugin_config_names: &self.plugin_config_names,
                 percentage_of_nodes_to_score: self.percentage_of_nodes_to_score,
+                added_affinity: self.added_affinity.as_ref(),
             },
         )
     }

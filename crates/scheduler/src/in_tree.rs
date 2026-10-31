@@ -6,13 +6,23 @@ use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Plugin, Status};
 use async_trait::async_trait;
+use rusternetes_common::resources::pod::{NodeAffinity, NodeSelector};
 use rusternetes_common::resources::{Pod, Taint};
 use std::sync::Arc;
 
+/// The per-profile plugin arguments the Filter plugin factories read
+/// (`runtime.PluginFactory`'s `args`).
+#[derive(Default)]
+pub struct FilterPluginArgs<'a> {
+    /// `NodeAffinityArgs.AddedAffinity`.
+    pub added_affinity: Option<&'a NodeAffinity>,
+}
+
 /// The factory for an in-tree Filter plugin by name, `None` for names
 /// that are not (yet) plugin objects.
-pub fn new_filter_plugin(name: &str) -> Option<Arc<dyn FilterPlugin>> {
+pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<dyn FilterPlugin>> {
     match name {
+        names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
         names::NODE_NAME => Some(Arc::new(NodeName)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
@@ -141,5 +151,88 @@ impl FilterPlugin for TaintToleration {
             Code::UnschedulableAndUnresolvable,
             vec!["node(s) had untolerated taint(s)".to_string()],
         )
+    }
+}
+
+/// `errReasonEnforced` (node_affinity.go:66-67).
+pub const ERR_REASON_ENFORCED: &str = "node(s) didn't match scheduler-enforced node affinity";
+/// `ErrReasonPod` (node_affinity.go:63-64).
+pub const ERR_REASON_POD: &str = "node(s) didn't match Pod's node affinity/selector";
+
+/// `nodeaffinity.NodeAffinity` Filter (`plugins/nodeaffinity/node_affinity.go:217-238`):
+/// the scheduler-enforced `addedAffinity` first, then the pod's
+/// `spec.nodeSelector` and required node affinity
+/// (`GetRequiredNodeAffinity(pod).Match(node)`).
+///
+/// Deviation: upstream's PreFilter (narrowing candidate nodes by
+/// `matchFields` on `metadata.name`, :146-215) is not ported; Filter alone is
+/// complete, as upstream's own fallback when no PreFilter state exists
+/// (:225-231).
+pub struct NodeAffinityPlugin {
+    /// `addedNodeSelector`.
+    added_node_selector: Option<NodeSelector>,
+}
+
+impl NodeAffinityPlugin {
+    pub fn new(added_affinity: Option<&NodeAffinity>) -> Self {
+        Self {
+            added_node_selector: added_affinity.and_then(|a| {
+                a.required_during_scheduling_ignored_during_execution
+                    .clone()
+            }),
+        }
+    }
+}
+
+impl Plugin for NodeAffinityPlugin {
+    fn name(&self) -> &'static str {
+        names::NODE_AFFINITY
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for NodeAffinityPlugin {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let node = node_info.node();
+        if let Some(added) = &self.added_node_selector {
+            if !rusternetes_common::affinity::matches_node_selector(node, added) {
+                return Status::new(
+                    Code::UnschedulableAndUnresolvable,
+                    vec![ERR_REASON_ENFORCED.to_string()],
+                );
+            }
+        }
+        let spec = pod.spec.as_ref();
+        // `RequiredNodeAffinity.Match`: the nodeSelector labels ...
+        if let Some(selector) = spec.and_then(|s| s.node_selector.as_ref()) {
+            let labels = node.metadata.labels.as_ref();
+            let ok = match labels {
+                None => selector.is_empty(),
+                Some(l) => selector.iter().all(|(k, v)| l.get(k) == Some(v)),
+            };
+            if !ok {
+                return Status::new(
+                    Code::UnschedulableAndUnresolvable,
+                    vec![ERR_REASON_POD.to_string()],
+                );
+            }
+        }
+        // ... and the required node affinity terms.
+        if let Some(required) = spec
+            .and_then(|s| s.affinity.as_ref())
+            .and_then(|a| a.node_affinity.as_ref())
+            .and_then(|na| {
+                na.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            })
+        {
+            if !rusternetes_common::affinity::matches_node_selector(node, required) {
+                return Status::new(
+                    Code::UnschedulableAndUnresolvable,
+                    vec![ERR_REASON_POD.to_string()],
+                );
+            }
+        }
+        Status::success()
     }
 }

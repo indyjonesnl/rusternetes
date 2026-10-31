@@ -1570,7 +1570,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let start_index = self.next_start_node_index.load(Ordering::Relaxed);
         let cycle_state = CycleState::new();
 
-        let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         let ports_on = filter_on(names::NODE_PORTS);
         let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
@@ -1582,12 +1581,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             Some((snap, claims)) if filter_on(names::VOLUME_BINDING) => Some((snap, claims)),
             _ => None,
         };
-        // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter) and
-        // `addedPrefSchedTerms` (Score), node_affinity.go:310-333.
-        let added_required = profile.added_affinity.as_ref().and_then(|a| {
-            a.required_during_scheduling_ignored_during_execution
-                .as_ref()
-        });
+        // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter, in the
+        // NodeAffinity plugin object) and `addedPrefSchedTerms` (Score),
+        // node_affinity.go:310-333.
         let added_preferred = profile.added_affinity.as_ref().and_then(|a| {
             a.preferred_during_scheduling_ignored_during_execution
                 .as_ref()
@@ -1632,7 +1628,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 processed_nodes += 1;
                 let eval = async {
                     // The Filter plugins that are objects (`RunFilterPlugins`,
-                    // framework.go:1033): NodeUnschedulable, NodeName, TaintToleration. They run first,
+                    // framework.go:1033): NodeUnschedulable, NodeName, TaintToleration, NodeAffinity. They run first,
                     // as in the default plugin order, ahead of the filters
                     // still inline below.
                     let status = fw
@@ -1648,28 +1644,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             filter_error = Some(status.message());
                         }
                         return None;
-                    }
-                    // NodeAffinity (`spec.nodeSelector` is part of its filter, as is
-                    // the scheduler-enforced `addedAffinity`, node_affinity.go:217-236).
-                    if node_affinity_filter_on {
-                        if let Some(required) = added_required {
-                            if !rusternetes_common::affinity::matches_node_selector(node, required)
-                            {
-                                diag.add_node_reasons([
-                                    ERR_REASON_ENFORCED_NODE_AFFINITY.to_string()
-                                ]);
-                                diag.add_plugin_status(names::NODE_AFFINITY);
-                                return None;
-                            }
-                        }
-                        if let Some(node_selector) =
-                            pod.spec.as_ref().and_then(|s| s.node_selector.as_ref())
-                        {
-                            if !self.matches_node_selector(node, node_selector) {
-                                diag.add_plugin_status(names::NODE_AFFINITY);
-                                return None;
-                            }
-                        }
                     }
                     // DynamicResources: devices for the pod's ResourceClaims
                     if dra_on && !self.check_dra_device_availability(node, pod).await {
@@ -1756,11 +1730,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         }
                     }
                     // Node affinity (hard requirements and scoring)
-                    let (affinity_ok, mut node_affinity_score) = check_node_affinity(node, pod);
-                    if node_affinity_filter_on && !affinity_ok {
-                        diag.add_plugin_status(names::NODE_AFFINITY);
-                        return None;
-                    }
+                    // (the hard part is the NodeAffinity plugin object above)
+                    let (_, mut node_affinity_score) = check_node_affinity(node, pod);
                     // `addedPrefSchedTerms.Score(node)` (node_affinity.go:276-278)
                     if let Some(terms) = added_preferred {
                         for t in terms {
@@ -2895,10 +2866,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 /// Split a `/registry/pods/{ns}/{name}` storage key into `(ns, name)`. Tolerates
 /// a missing namespace segment (defaults to `default`). The scheduler builds
 /// these keys via `build_key("pods", Some(ns), name)`, so the format is stable.
-/// `errReasonEnforced` (node_affinity.go:66-67).
-const ERR_REASON_ENFORCED_NODE_AFFINITY: &str =
-    "node(s) didn't match scheduler-enforced node affinity";
-
 /// `minFeasibleNodesToFind` (schedule_one.go:52-56): below this many nodes all
 /// of them are examined.
 const MIN_FEASIBLE_NODES_TO_FIND: i32 = 100;
