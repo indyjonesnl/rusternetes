@@ -7,10 +7,9 @@
 //! `GenerateExpandInUseVolumeFunc` / `doOnlineExpansion` — the closure
 //! wrapper around `nodeExpandVolume` — are ported as
 //! [`OperationGenerator::generate_expand_in_use_volume_func`] and
-//! [`GeneratedExpandInUse`]. Nothing in the running kubelet calls these
-//! functions yet: the operation executor that runs a `GeneratedOperations`
-//! (`ExpandInUseVolume`, `operation_executor.go:925`) and the volume-manager
-//! reconciler's expand-in-use hook do not exist (#1970).
+//! [`GeneratedExpandInUse`]. The volume manager's reconciler calls them for a
+//! mounted volume whose PVC grew (`ExpandInUseVolume`, run by
+//! `volumes::VolumeManager::expand_in_use_volume`).
 
 use crate::events::{FILE_SYSTEM_RESIZE_FAILED, FILE_SYSTEM_RESIZE_SUCCESS, VOLUME_RESIZE_FAILED};
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
