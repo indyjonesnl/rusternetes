@@ -5,9 +5,7 @@
 //! Not ported: `Attach`, `VolumesAreAttached`, `Detach`, `NewDetacher` and
 //! `VerifyExhaustedResource` (`attacher.go:65-80`, `:162-164`) belong to the
 //! attach/detach controller, which this project does not run in the kubelet
-//! (#3498). `mountArgs.SELinuxLabel` / `AddSELinuxMountOption`
-//! (`attacher.go:125-127`) waits on [`DeviceMounterArgs`] carrying the label
-//! (#2312, #3493). Nothing calls `UnmountDevice` yet (#3492).
+//! (#3498). Nothing calls `UnmountDevice` yet (#3492).
 
 use super::{
     get_volume_source, volume_spec_to_mounter, DiskManager, FcDisk, FcDiskUnmounter, FcPlugin,
@@ -99,7 +97,7 @@ impl DeviceMounter for FcAttacher {
         spec: &Spec<'_>,
         device_path: &str,
         device_mount_path: &str,
-        _args: &DeviceMounterArgs,
+        args: &DeviceMounterArgs,
     ) -> Result<()> {
         let mounter: Arc<dyn MountInterface> = Arc::new(self.host.get_mounter().clone());
         let not_mnt = match mounter.is_likely_not_mount_point(device_mount_path) {
@@ -116,11 +114,7 @@ impl DeviceMounter for FcAttacher {
 
         let (volume_source, read_only) = get_volume_source(spec)?;
 
-        let mut options: Vec<String> = Vec::new();
-        if read_only {
-            options.push("ro".to_string());
-        }
-        // `mountArgs.SELinuxLabel` -> `AddSELinuxMountOption`: see the module docs.
+        let options = device_mount_options(read_only, &args.selinux_label);
         if not_mnt {
             let exec: Arc<dyn Exec> = Arc::new(RealExec);
             let disk_mounter = SafeFormatAndMount::new(mounter, exec);
@@ -140,6 +134,21 @@ impl DeviceMounter for FcAttacher {
         }
         Ok(())
     }
+}
+
+/// The option list `MountDevice` builds before `MountOptionFromSpec`
+/// (`attacher.go:120-127`): `ro`, then `context="<label>"` via
+/// `AddSELinuxMountOption` when `mountArgs.SELinuxLabel` is set.
+pub fn device_mount_options(read_only: bool, selinux_label: &str) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    if read_only {
+        options.push("ro".to_string());
+    }
+    if !selinux_label.is_empty() {
+        options =
+            crate::volume_plugins::util::selinux::add_selinux_mount_option(options, selinux_label);
+    }
+    options
 }
 
 /// `fcDetacher` (`attacher.go:140-144`).
