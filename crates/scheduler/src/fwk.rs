@@ -16,6 +16,7 @@
 //! upstream's is internally locked.
 
 use crate::node_volume_limits::NodeVolumeLimitsSnapshot;
+use crate::volume_binding::VolumeSnapshot;
 use async_trait::async_trait;
 use rusternetes_common::resources::{Node, Pod};
 use std::any::Any;
@@ -308,20 +309,24 @@ pub trait PreFilterPlugin: Plugin {
 /// objects (upstream's informer-backed listers). Upstream hands a plugin its
 /// `Handle` at construction; here the scheduler's data plane is generic over
 /// its storage and per-scheduler rather than per-profile, so it is passed to
-/// each PreFilter call instead.
+/// each PreFilter call instead. Every method defaults to "no cluster access".
 #[async_trait]
 pub trait Handle: Send + Sync {
     /// The cluster-wide listers NodeVolumeLimits reads (`csi.go` `pvLister`,
     /// `pvcLister`, `scLister`, `vaLister`, `csiDriverLister`, CSINode lister).
-    async fn node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot, String>;
+    async fn node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot, String> {
+        Err("no cluster access".to_string())
+    }
+
+    /// The listers VolumeBinding reads (PVC, PV, StorageClass, CSIDriver,
+    /// CSIStorageCapacity, CSINode) for namespace `ns`; it also feeds the
+    /// binder's assume caches, as the informers do upstream.
+    async fn volume_binding_snapshot(&self, _ns: &str) -> Result<VolumeSnapshot, String> {
+        Err("no cluster access".to_string())
+    }
 }
 
 /// A [`Handle`] with no cluster access, for plugins that need none.
 pub struct NoHandle;
 
-#[async_trait]
-impl Handle for NoHandle {
-    async fn node_volume_limits_snapshot(&self) -> Result<NodeVolumeLimitsSnapshot, String> {
-        Err("no cluster access".to_string())
-    }
-}
+impl Handle for NoHandle {}

@@ -32,6 +32,7 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
         names::NODE_NAME => Some(Arc::new(NodeName)),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
@@ -50,6 +51,7 @@ pub fn new_pre_filter_plugin(
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         _ => None,
     }
 }
@@ -744,6 +746,129 @@ impl FilterPlugin for NodeVolumeLimits {
                 Status::new(Code::UnschedulableAndUnresolvable, vec![m])
             }
             FilterStatus::Error(m) => Status::from_error(m),
+        }
+    }
+}
+
+/// `stateKey` of the VolumeBinding plugin.
+const VOLUME_BINDING_STATE_KEY: &str = "PreFilterVolumeBinding";
+
+/// `volumebinding.stateData`: the listers snapshot and the pod's claims from
+/// PreFilter, and Filter's per-node result.
+struct VolumeBindingFilterState {
+    snap: crate::volume_binding::VolumeSnapshot,
+    claims: crate::volume_binding::PodVolumeClaims,
+    /// `podVolumesByNode`; Filter runs on a shared `&CycleState`, so this is
+    /// behind a lock (upstream's `state.Lock()`).
+    pod_volumes_by_node: std::sync::Mutex<HashMap<String, crate::volume_binding::PodVolumes>>,
+}
+
+/// Forget the per-node results of an earlier pass over the nodes.
+pub fn clear_pod_volumes_by_node(state: &CycleState) {
+    if let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) {
+        s.pod_volumes_by_node
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// `stateData.podVolumesByNode` as the VolumeBinding Filter left it (empty
+/// when the plugin did not run).
+pub fn take_pod_volumes_by_node(
+    state: &CycleState,
+) -> HashMap<String, crate::volume_binding::PodVolumes> {
+    state
+        .read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY)
+        .map(|s| {
+            std::mem::take(
+                &mut *s
+                    .pod_volumes_by_node
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// `volumebinding.VolumeBinding` PreFilter and Filter
+/// (`plugins/volumebinding/volume_binding.go:360-390`, `:424-453`). PreFilter:
+/// a pod without PVCs is Skip; a missing/lost/deleting PVC or an unbound
+/// Immediate claim is UnschedulableAndUnresolvable; other failures are
+/// Errors. Filter (`FindPodVolumes`): bound PV node affinity and matching or
+/// provisionable unbound WaitForFirstConsumer claims, UnschedulableAndUnresolvable
+/// with the binder's reasons otherwise.
+///
+/// Reserve/PreBind/Score stay in the scheduler (`reserve_prebind_bind`).
+pub struct VolumeBinding;
+
+impl Plugin for VolumeBinding {
+    fn name(&self) -> &'static str {
+        names::VOLUME_BINDING
+    }
+}
+
+#[async_trait]
+impl PreFilterPlugin for VolumeBinding {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> (Option<PreFilterResult>, Status) {
+        use crate::volume_binding::{self, PreFilterOutcome};
+        // If the pod does not reference any PVC, there is nothing to do.
+        if !volume_binding::pod_references_pvcs(pod) {
+            return (None, Status::new(Code::Skip, Vec::new()));
+        }
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let snap = match handle.volume_binding_snapshot(ns).await {
+            Ok(snap) => snap,
+            Err(e) => return (None, Status::from_error(e)),
+        };
+        match volume_binding::pre_filter(pod, &snap) {
+            PreFilterOutcome::Skip => (None, Status::new(Code::Skip, Vec::new())),
+            PreFilterOutcome::Unresolvable(m) => (
+                None,
+                Status::new(Code::UnschedulableAndUnresolvable, vec![m]),
+            ),
+            PreFilterOutcome::Error(m) => (None, Status::from_error(m)),
+            PreFilterOutcome::Ready(claims) => {
+                state.write(
+                    VOLUME_BINDING_STATE_KEY,
+                    VolumeBindingFilterState {
+                        snap,
+                        claims,
+                        pod_volumes_by_node: Default::default(),
+                    },
+                );
+                (None, Status::success())
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for VolumeBinding {
+    async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return missing_state(VOLUME_BINDING_STATE_KEY);
+        };
+        let node = node_info.node();
+        match crate::volume_binding::find_pod_volumes(pod, &s.claims, node, &s.snap) {
+            Err(e) => Status::from_error(e),
+            Ok((_, reasons)) if !reasons.is_empty() => Status::new(
+                Code::UnschedulableAndUnresolvable,
+                reasons.into_iter().map(str::to_string).collect(),
+            ),
+            Ok((vols, _)) => {
+                s.pod_volumes_by_node
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(node.metadata.name.clone(), vols);
+                Status::success()
+            }
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::queue::{
     ActionType, ClusterEvent, EventObject, EventResource, NominatingInfo, PriorityQueue,
     PriorityQueueOptions, QueuedPodInfo, EVENT_ASSIGNED_POD_ADD, EVENT_ASSIGNED_POD_DELETE,
 };
-use crate::volume_binding::{self, PreFilterOutcome};
+use crate::volume_binding;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Outcome of one scheduling cycle for `handleSchedulingFailure`.
@@ -1329,20 +1329,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         (picked, diag)
     }
 
-    /// Feed the assume caches (the informer feed upstream), then PreFilter.
-    fn sync_and_pre_filter(
-        &self,
-        ns: &str,
-        pod: &Pod,
-        snap: &volume_binding::VolumeSnapshot,
-    ) -> PreFilterOutcome {
-        self.volume_binder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sync_namespace(ns, snap);
-        volume_binding::pre_filter(pod, snap)
-    }
-
     /// `select_node_diag` that also returns the chosen node's `PodVolumes`
     /// (`stateData.podVolumesByNode[node]`), which Reserve/PreBind consume.
     async fn select_node_diag_volumes(
@@ -1488,8 +1474,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // plugins that restricted the nodes are recorded as unschedulable
         // plugins either way (`diagnosis.UnschedulablePlugins`).
         let mut cycle_state = CycleState::new();
+        let handle = CycleHandle {
+            data: &self.data,
+            binder: &self.volume_binder,
+        };
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
-            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, &self.data)
+            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, &handle)
             .await;
         diag.unschedulable_plugins
             .extend(plugins_with_nodes.iter().cloned());
@@ -1509,44 +1499,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             diag.add_plugin_status(pre_filter_status.plugin());
             return None;
         }
-        // Phase 0: VolumeBinding PreFilter (volume_binding.go PreFilter). A pod
-        // with a missing/lost/deleting PVC or an unbound Immediate claim is
-        // UnschedulableAndUnresolvable; the pod is retried on the next resync.
-        let volume_ctx = if volume_binding::pod_references_pvcs(pod)
-            && fw.has(ExtensionPoint::PreFilter, names::VOLUME_BINDING)
-        {
-            let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-            match self.data.list_volume_snapshot(ns).await {
-                Ok(snap) => match self.sync_and_pre_filter(ns, pod, &snap) {
-                    PreFilterOutcome::Skip => None,
-                    PreFilterOutcome::Ready(claims) => Some((snap, claims)),
-                    PreFilterOutcome::Unresolvable(m) => {
-                        diag.pre_filter_msg = m.clone();
-                        diag.add_plugin_status(names::VOLUME_BINDING);
-                        debug!(
-                            "VolumeBinding PreFilter rejected pod {}/{}: {}",
-                            ns, pod.metadata.name, m
-                        );
-                        return None;
-                    }
-                    PreFilterOutcome::Error(m) => {
-                        diag.pre_filter_msg = m.clone();
-                        debug!(
-                            "VolumeBinding PreFilter rejected pod {}/{}: {}",
-                            ns, pod.metadata.name, m
-                        );
-                        return None;
-                    }
-                },
-                Err(e) => {
-                    warn!("VolumeBinding: failed to list volume objects: {}", e);
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-
         // `findNodesThatPassFilters` (schedule_one.go:624-708): visit the nodes
         // starting where the previous cycle left off (`nextStartNodeIndex`,
         // :544-548) and stop as soon as `numFeasibleNodesToFind` nodes pass
@@ -1593,12 +1545,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
 
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
-        // VolumeBinding Filter (FindPodVolumes) — bound PV node affinity,
-        // matching/provisionable unbound WaitForFirstConsumer claims.
-        let volume_filter = match &volume_ctx {
-            Some((snap, claims)) if filter_on(names::VOLUME_BINDING) => Some((snap, claims)),
-            _ => None,
-        };
         // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter, in the
         // NodeAffinity plugin object) and `addedPrefSchedTerms` (Score),
         // node_affinity.go:310-333.
@@ -1606,10 +1552,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             a.preferred_during_scheduling_ignored_during_execution
                 .as_ref()
         });
-        // `podVolumesByNode` (volume_binding.go stateData): Filter's per-node
-        // result, read back by PreScore/Score.
-        let mut pod_volumes_by_node: std::collections::HashMap<String, volume_binding::PodVolumes> =
-            std::collections::HashMap::new();
         let mut feasible: Vec<NodeEval> = Vec::new();
         // `findNodesThatFitPod` (schedule_one.go:518-530): "NominatedNodeName"
         // set by a previous cycle's preemption is tried first, alone
@@ -1646,7 +1588,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         ));
         for (order, to_find, full_search) in passes {
             feasible.clear();
-            pod_volumes_by_node.clear();
+            crate::in_tree::clear_pod_volumes_by_node(&cycle_state);
             let mut processed_nodes = 0usize;
             for &ix in &order {
                 let node = &nodes[ix];
@@ -1685,32 +1627,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         );
                         diag.add_plugin_status(names::DYNAMIC_RESOURCES);
                         return None;
-                    }
-                    // VolumeBinding
-                    if let Some((snap, claims)) = volume_filter {
-                        match volume_binding::find_pod_volumes(pod, claims, node, snap) {
-                            Ok((vols, reasons)) if reasons.is_empty() => {
-                                pod_volumes_by_node.insert(node.metadata.name.clone(), vols);
-                            }
-                            Ok((_, reasons)) => {
-                                diag.add_node_reasons(reasons.iter().map(|r| r.to_string()));
-                                diag.add_plugin_status(names::VOLUME_BINDING);
-                                debug!(
-                                    "Node {} rejected for pod {}: {}",
-                                    node.metadata.name,
-                                    pod.metadata.name,
-                                    reasons.join(", ")
-                                );
-                                return None;
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "VolumeBinding filter error on node {} for pod {}: {}",
-                                    node.metadata.name, pod.metadata.name, e
-                                );
-                                return None;
-                            }
-                        }
                     }
                     // Node affinity (hard requirements and scoring)
                     // (the hard part is the NodeAffinity plugin object above)
@@ -1769,6 +1685,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             );
         }
 
+        // `stateData.podVolumesByNode` (volume_binding.go): the VolumeBinding
+        // Filter's per-node result, read back by PreScore/Score and Reserve.
+        let mut pod_volumes_by_node = crate::in_tree::take_pod_volumes_by_node(&cycle_state);
         if feasible.is_empty() {
             if let Some(narrowed) = narrowed {
                 // `SetAbsentNodesStatus` (schedule_one.go:561): the nodes the
@@ -2905,5 +2824,41 @@ fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
     match rest.split_once('/') {
         Some((ns, name)) => (ns, name),
         None => ("default", rest),
+    }
+}
+
+/// The scheduler's [`crate::fwk::Handle`]: the data plane's listers, and the
+/// binder whose assume caches the volume listers feed.
+struct CycleHandle<'a, S: Storage + Send + Sync + 'static> {
+    data: &'a DataPlane<S>,
+    binder: &'a std::sync::Mutex<crate::volume_assume::VolumeBinder>,
+}
+
+#[async_trait::async_trait]
+impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, S> {
+    async fn node_volume_limits_snapshot(
+        &self,
+    ) -> Result<crate::node_volume_limits::NodeVolumeLimitsSnapshot, String> {
+        self.data
+            .list_node_volume_limits_snapshot()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn volume_binding_snapshot(
+        &self,
+        ns: &str,
+    ) -> Result<volume_binding::VolumeSnapshot, String> {
+        let snap = self
+            .data
+            .list_volume_snapshot(ns)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Feed the assume caches (the informer feed upstream).
+        self.binder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sync_namespace(ns, &snap);
+        Ok(snap)
     }
 }
