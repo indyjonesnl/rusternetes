@@ -4,6 +4,8 @@ mod advanced;
 mod data_plane;
 mod diagnosis;
 mod framework_runtime;
+mod fwk;
+mod in_tree__node_unschedulable;
 mod inter_pod_affinity_score;
 mod node_volume_limits;
 mod pod_topology_spread_score;

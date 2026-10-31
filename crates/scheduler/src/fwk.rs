@@ -1,0 +1,206 @@
+//! The scheduling framework interface, shaped after
+//! `staging/src/k8s.io/kube-scheduler/framework` (`fwk`), release-1.35:
+//! [`Code`] / [`Status`] (`interface.go:60-236`), [`CycleState`]
+//! (`cycle_state.go`), [`NodeInfo`] (`types.go`) and the plugin traits.
+//!
+//! This is the interface plugin objects are dispatched through
+//! (`runtime/framework.go`). The older `framework` module holds legacy traits
+//! that do not follow upstream's shapes and are not used by the scheduling
+//! cycle.
+//!
+//! Deviations: [`NodeInfo`] is a view over the cycle's pod list rather than an
+//! incrementally maintained snapshot, and [`CycleState`] has no
+//! skip-plugin sets or metrics flag yet; they arrive with the plugins that
+//! need them.
+
+use async_trait::async_trait;
+use rusternetes_common::resources::{Node, Pod};
+use std::any::Any;
+use std::collections::HashMap;
+
+/// `fwk.Code` (`interface.go:60-95`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Code {
+    /// Plugin ran correctly and found the pod schedulable.
+    Success,
+    /// An internal plugin error or an unexpected input.
+    Error,
+    /// The pod cannot be scheduled by the plugin (e.g. a node fails a Filter).
+    Unschedulable,
+    /// Like `Unschedulable`, but preemption would not help.
+    UnschedulableAndUnresolvable,
+    /// A Permit plugin wants the pod to wait.
+    Wait,
+    /// The plugin has nothing to do for this pod at this extension point.
+    Skip,
+    /// The plugin needs an event before it can decide.
+    Pending,
+}
+
+impl Code {
+    /// `Code.String()` (`interface.go:97-103`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Code::Success => "Success",
+            Code::Error => "Error",
+            Code::Unschedulable => "Unschedulable",
+            Code::UnschedulableAndUnresolvable => "UnschedulableAndUnresolvable",
+            Code::Wait => "Wait",
+            Code::Skip => "Skip",
+            Code::Pending => "Pending",
+        }
+    }
+}
+
+/// `fwk.Status` (`interface.go:105-236`). Go's nil `*Status` is Success;
+/// here that is [`Status::success`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Status {
+    code: Code,
+    reasons: Vec<String>,
+    err: Option<String>,
+    plugin: String,
+}
+
+impl Status {
+    /// A nil `*Status`.
+    pub fn success() -> Self {
+        Self::new(Code::Success, Vec::new())
+    }
+
+    /// `NewStatus(code, reasons...)`.
+    pub fn new(code: Code, reasons: Vec<String>) -> Self {
+        Self {
+            code,
+            reasons,
+            err: None,
+            plugin: String::new(),
+        }
+    }
+
+    /// `AsStatus(err)`: an `Error` status carrying `err`.
+    pub fn from_error(err: impl Into<String>) -> Self {
+        Self {
+            code: Code::Error,
+            reasons: Vec::new(),
+            err: Some(err.into()),
+            plugin: String::new(),
+        }
+    }
+
+    pub fn code(&self) -> Code {
+        self.code
+    }
+
+    /// `Reasons()`: the error text first, then the reasons.
+    pub fn reasons(&self) -> Vec<String> {
+        match &self.err {
+            Some(e) => std::iter::once(e.clone())
+                .chain(self.reasons.iter().cloned())
+                .collect(),
+            None => self.reasons.clone(),
+        }
+    }
+
+    /// `Message()`: the reasons joined with ", ".
+    pub fn message(&self) -> String {
+        self.reasons().join(", ")
+    }
+
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
+
+    /// `SetPlugin`.
+    pub fn set_plugin(&mut self, plugin: &str) {
+        self.plugin = plugin.to_string();
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.code == Code::Success
+    }
+
+    pub fn is_wait(&self) -> bool {
+        self.code == Code::Wait
+    }
+
+    pub fn is_skip(&self) -> bool {
+        self.code == Code::Skip
+    }
+
+    /// `IsRejected`: Unschedulable, UnschedulableAndUnresolvable or Pending.
+    pub fn is_rejected(&self) -> bool {
+        matches!(
+            self.code,
+            Code::Unschedulable | Code::UnschedulableAndUnresolvable | Code::Pending
+        )
+    }
+
+    /// `AsError`: `None` for Success/Wait/Skip, otherwise the error text.
+    pub fn as_error(&self) -> Option<String> {
+        if self.is_success() || self.is_wait() || self.is_skip() {
+            return None;
+        }
+        Some(self.err.clone().unwrap_or_else(|| self.message()))
+    }
+}
+
+/// `fwk.CycleState`: per-scheduling-cycle plugin data (`cycle_state.go`).
+#[derive(Default)]
+pub struct CycleState {
+    storage: HashMap<String, Box<dyn Any + Send + Sync>>,
+}
+
+impl CycleState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `Write`.
+    pub fn write<T: Any + Send + Sync>(&mut self, key: &str, value: T) {
+        self.storage.insert(key.to_string(), Box::new(value));
+    }
+
+    /// `Read`: `None` is upstream's `ErrNotFound`.
+    pub fn read<T: Any + Send + Sync>(&self, key: &str) -> Option<&T> {
+        self.storage.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+}
+
+/// `fwk.NodeInfo` for the Filter extension point: the node and the pods bound
+/// to it.
+pub struct NodeInfo<'a> {
+    node: &'a Node,
+    all_pods: &'a [Pod],
+}
+
+impl<'a> NodeInfo<'a> {
+    pub fn new(node: &'a Node, all_pods: &'a [Pod]) -> Self {
+        Self { node, all_pods }
+    }
+
+    /// `Node()`.
+    pub fn node(&self) -> &'a Node {
+        self.node
+    }
+
+    /// `GetPods()`: the pods bound to this node.
+    pub fn pods(&self) -> impl Iterator<Item = &'a Pod> + '_ {
+        let name = self.node.metadata.name.as_str();
+        self.all_pods
+            .iter()
+            .filter(move |p| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(name))
+    }
+}
+
+/// `fwk.Plugin`.
+pub trait Plugin: Send + Sync {
+    /// Name used in the plugin registry and configurations.
+    fn name(&self) -> &'static str;
+}
+
+/// `fwk.FilterPlugin`: a node that fails is not a candidate for the pod.
+#[async_trait]
+pub trait FilterPlugin: Plugin {
+    async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status;
+}

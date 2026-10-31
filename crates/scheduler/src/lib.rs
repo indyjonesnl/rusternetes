@@ -3,6 +3,8 @@ pub mod data_plane;
 pub mod diagnosis;
 pub mod framework;
 pub mod framework_runtime;
+pub mod fwk;
+pub mod in_tree;
 pub mod inter_pod_affinity_score;
 pub mod node_volume_limits;
 pub mod plugins;
