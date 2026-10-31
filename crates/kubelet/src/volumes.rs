@@ -890,7 +890,7 @@ impl VolumeManager {
 
     /// `pendingOperations.IsOperationPending(volumeName, EmptyUniquePodName,
     /// EmptyNodeName)`: a device operation, or a mount, is running on the volume.
-    fn volume_operation_pending(
+    pub fn volume_operation_pending(
         &self,
         volume_name: &crate::volume_plugins::util::types::UniqueVolumeName,
     ) -> bool {
@@ -2162,6 +2162,62 @@ impl VolumeManager {
             }
         };
         Ok((path, attributes))
+    }
+
+    /// Port of `operationExecutor.ExpandInUseVolume`
+    /// (`operation_executor.go:925-931`): expand the in-use volume from
+    /// `current_size` to the desired PVC size under `pendingOperations`
+    /// (keyed on the volume alone, so it backs off after a failure), recording
+    /// a failure as the generated operation's event recorder does.
+    pub async fn expand_in_use_volume(
+        &self,
+        volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+        current_size: rusternetes_common::quantity::Quantity,
+    ) -> Result<()> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(());
+        };
+        let recorder = rusternetes_storage::EventRecorder::new(storage.clone());
+        let og = crate::volume_plugins::util::operation_generator::OperationGenerator {
+            volume_plugin_mgr: &self.plugin_mgr,
+            kube_client: storage.as_ref(),
+            recorder: &recorder,
+        };
+        let op = og.generate_expand_in_use_volume_func(volume_to_mount, &self.asw, current_size)?;
+        let mut outcome = None;
+        let run = self
+            .pending_operations
+            .run_inline(
+                &volume_to_mount.volume_name.0,
+                "",
+                "",
+                op.operation_name,
+                async {
+                    let ctx = op.run().await;
+                    match (ctx.event_err, ctx.detailed_err) {
+                        (None, None) => Ok(()),
+                        (event_err, detailed_err) => {
+                            let msg = detailed_err
+                                .as_ref()
+                                .map(|e| format!("{e:#}"))
+                                .unwrap_or_default();
+                            outcome = Some(event_err);
+                            Err(msg)
+                        }
+                    }
+                },
+            )
+            .await;
+        match run {
+            Err(refused) => Err(anyhow::anyhow!("{refused}")),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => {
+                if let Some(event_err) = outcome.flatten() {
+                    op.record_event_on_error(Some(&event_err)).await;
+                }
+                Err(anyhow::anyhow!(msg))
+            }
+        }
     }
 
     /// The `VolumeToMount` `DesiredStateOfWorld.GetVolumesToMount` would

@@ -2,7 +2,8 @@
 //! `reconciler_common.go`) — the loop that drives the actual state of the
 //! world towards the desired one.
 //!
-//! Only the remount arm of `mountOrAttachVolumes` is ported so far: a volume
+//! Only the remount and expand-in-use arms of `mountOrAttachVolumes` are
+//! ported so far. Remount: a volume
 //! the desired state wants, that the actual state has mounted for the pod,
 //! and whose plugin asked for a remount (`RequiresRemount`: secret, configMap,
 //! projected, downwardAPI), is mounted again through the plugin's `SetUp`.
@@ -62,22 +63,55 @@ impl Reconciler {
     /// the `RemountRequired` outcome of `PodExistsInVolume`.
     pub async fn mount_or_attach_volumes(&self) {
         for volume_to_mount in self.desired_state_of_world.get_volumes_to_mount() {
-            let v = &volume_to_mount.0;
-            let (_, _, pod_exist_error) = self.actual_state_of_world.pod_exists_in_volume(
-                &v.pod_name,
-                &v.volume_name,
-                v.desired_persistent_volume_size,
-                &v.selinux_label,
-            );
-            // Only a volume already mounted for the pod that asks to be
-            // mounted again; everything else is the inline mount's.
-            if !matches!(
-                pod_exist_error,
-                Some(ActualStateOfWorldError::RemountRequired { .. })
-            ) {
+            let mut v = volume_to_mount.0;
+            // `rc.operationExecutor.IsOperationPending(volumeName, "", "")`
+            if self.mounter.volume_operation_pending(&v.volume_name) {
                 continue;
             }
-            self.remount_volume(v).await;
+            let (_, device_path, pod_exist_error) =
+                self.actual_state_of_world.pod_exists_in_volume(
+                    &v.pod_name,
+                    &v.volume_name,
+                    v.desired_persistent_volume_size,
+                    &v.selinux_label,
+                );
+            v.device_path = device_path;
+            // Only a volume already mounted for the pod is handled; everything
+            // else is the inline mount's.
+            match pod_exist_error {
+                Some(ActualStateOfWorldError::RemountRequired { .. }) => {
+                    self.remount_volume(&v).await;
+                }
+                Some(ActualStateOfWorldError::FsResizeRequired { current_size, .. }) => {
+                    self.expand_volume(&v, current_size).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Port of `expandVolume` (`reconciler_common.go:194-206`).
+    async fn expand_volume(
+        &self,
+        v: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+        current_size: Option<rusternetes_common::quantity::Quantity>,
+    ) {
+        debug!(
+            "Starting operationExecutor.ExpandInUseVolume for volume {} pod {}",
+            v.volume_name, v.pod_name
+        );
+        // `None` is upstream's zero `resource.Quantity`; the operation rejects it.
+        let current_size = current_size.unwrap_or_else(|| {
+            rusternetes_common::quantity::Quantity::from_value(
+                0,
+                rusternetes_common::quantity::Format::BinarySI,
+            )
+        });
+        if let Err(e) = self.mounter.expand_in_use_volume(v, current_size).await {
+            error!(
+                "operationExecutor.ExpandInUseVolume failed for volume {} pod {}: {e:#}",
+                v.volume_name, v.pod_name
+            );
         }
     }
 

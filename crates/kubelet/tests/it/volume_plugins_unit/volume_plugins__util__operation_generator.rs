@@ -519,6 +519,99 @@ mod tests {
         op.record_event_on_error(None).await;
     }
 
+    /// The reconciler's expand-in-use arm (`reconciler_common.go:187-189`,
+    /// `expandVolume`): a volume mounted for the pod whose PV grew after the
+    /// mount is expanded on the node, and the actual state records the new size.
+    #[tokio::test]
+    async fn reconciler_expands_a_mounted_volume_whose_pv_grew() {
+        use rusternetes_kubelet::volume_manager::cache::DesiredStateOfWorld;
+        use rusternetes_kubelet::volume_manager::reconciler::Reconciler;
+        use rusternetes_kubelet::volume_plugins::util::operation_executor::{
+            MarkVolumeOpts, VolumeMountState,
+        };
+        use rusternetes_kubelet::volume_plugins::util::selinux::Translator;
+
+        let pvc = test_pvc("2G", "1G", "", "", false, false);
+        let f = Fixture::new(&pvc, FakeExpandPlugin::ok()).await;
+        let storage = Arc::new(StorageBackend::new_memory());
+        storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("ns"), "test-vol0"),
+                &pvc,
+            )
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vm = rusternetes_kubelet::volumes::VolumeManager::new(
+            tmp.path().display().to_string(),
+            Some(storage.clone()),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        );
+        let mgr = Arc::new(VolumePluginMgr::new(vec![Box::new(f.plugin.sharing())]));
+        vm.plugin_mgr = mgr.clone();
+        vm.asw = Arc::new(ActualStateOfWorld::new("node-1", mgr.clone()));
+        let vm = Arc::new(vm);
+
+        let pv = test_pv("2G");
+        let vmt = test_vmt(&pv, "2G");
+        let dsw = Arc::new(DesiredStateOfWorld::new(mgr, Arc::new(Translator)));
+        let volume_name = dsw
+            .add_pod_to_volume(
+                &vmt.pod_name,
+                vmt.pod.clone(),
+                vmt.volume_spec.clone(),
+                "test-vol0",
+                "",
+                &[],
+            )
+            .unwrap();
+        dsw.update_persistent_volume_size(&volume_name, q("2G"));
+        let asw = vm.asw.clone();
+        asw.mark_volume_as_attached(Some(&volume_name), vmt.volume_spec.clone(), "", "/dev/fake")
+            .unwrap();
+        asw.mark_volume_as_mounted(MarkVolumeOpts {
+            pod_name: vmt.pod_name.clone(),
+            pod_uid: vmt.pod.metadata.uid.clone(),
+            volume_name: volume_name.clone(),
+            mounter: None,
+            block_volume_mapper: None,
+            volume_gid_volume: String::new(),
+            volume_spec: vmt.volume_spec.clone(),
+            volume_mount_state: VolumeMountState::VolumeMounted,
+            selinux_mount_context: String::new(),
+        })
+        .unwrap();
+        // The PVC reported 1G when the volume was mounted.
+        asw.initialize_claim_size(&volume_name, q("1G"));
+
+        let reconciler = Reconciler::new(
+            dsw.clone(),
+            asw.clone(),
+            vm.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        reconciler.reconcile().await;
+
+        assert!(f.plugin.called.load(Ordering::SeqCst), "NodeExpand ran");
+        assert_eq!(
+            storage
+                .get::<PersistentVolumeClaim>(&build_key(
+                    "persistentvolumeclaims",
+                    Some("ns"),
+                    "test-vol0"
+                ))
+                .await
+                .unwrap()
+                .status
+                .unwrap()
+                .capacity
+                .unwrap()["storage"],
+            "2G"
+        );
+        let (_, _, err) = asw.pod_exists_in_volume(&vmt.pod_name, &volume_name, Some(q("2G")), "");
+        assert!(err.is_none(), "no resize left: {err:?}");
+    }
+
     /// `FindPluginBySpec` failing aborts generation (`:1818-1821`).
     #[test]
     fn expand_in_use_generation_fails_without_a_plugin() {
