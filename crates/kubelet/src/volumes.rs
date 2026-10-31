@@ -2050,10 +2050,6 @@ impl VolumeManager {
                 // `GenerateVerifyControllerAttachedVolumeFunc` does for a
                 // volume that needs no attach), so the mount can report to it.
                 let volume_to_mount = self.volume_to_mount(plugin, owned.clone(), pod, volume)?;
-                let mount_state = crate::volume_plugins::util::operation_generator::MountState {
-                    volume_to_mount: &volume_to_mount,
-                    actual_state_of_world: &self.asw,
-                };
                 if !self.asw.volume_exists(&volume_to_mount.volume_name) {
                     self.asw
                         .mark_volume_as_attached(
@@ -2066,61 +2062,9 @@ impl VolumeManager {
                             anyhow::anyhow!("MountVolume.MarkVolumeAsAttached failed: {e}")
                         })?;
                 }
-                // The mount is an operation on the volume and pod
-                // (`GenerateMountVolumeFunc` runs under `pendingOperations`).
-                let mut mounted_volume = None;
-                let run = self
-                    .mount_operations
-                    .run_inline(
-                        &volume_to_mount.volume_name.0,
-                        &volume_to_mount.pod_name.0,
-                        crate::volume_plugins::util::nested_pending_operations::EMPTY,
-                        "volume_mount",
-                        async {
-                            let mounted =
-                                crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
-                                    &self.plugin_mgr,
-                                    &spec,
-                                    pod,
-                                    "",
-                                    // `og.recorder`: the kubelet's event recorder over
-                                    // the same API the volumes are read through.
-                                    self.storage.as_ref().map(|s| {
-                                        crate::volume_plugins::plugin::MounterRecorder(
-                                            rusternetes_storage::EventRecorder::new(s.clone()),
-                                        )
-                                    }),
-                                    Some(&mount_state),
-                                )
-                                .await;
-                            match mounted {
-                                Ok(ok) => {
-                                    mounted_volume = Some(Ok(ok));
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    let msg = format!("{e:#}");
-                                    mounted_volume = Some(Err(e));
-                                    Err(msg)
-                                }
-                            }
-                        },
-                    )
-                    .await;
-                let (path, attributes) = match (run, mounted_volume) {
-                    (Ok(_), Some(mounted)) => mounted?,
-                    (Err(refused), _) => {
-                        // Another mount of this pod's volume is in flight: wait.
-                        return Err(crate::lifecycle::VolumeWaitError(format!(
-                            "MountVolume for volume {} not started: {refused}",
-                            volume.name
-                        ))
-                        .into());
-                    }
-                    (Ok(_), None) => {
-                        anyhow::bail!("MountVolume for volume {} did not run", volume.name)
-                    }
-                };
+                let (path, attributes) = self
+                    .run_mount_operation(&spec, pod, &volume_to_mount, &volume.name)
+                    .await?;
                 // Keep an existing `SELinuxLabeled` across a re-mount of the
                 // same pod volume (upstream keeps it on the pod's VolumeInfo).
                 let mut mounted = self.mounted.lock().unwrap();
@@ -2145,6 +2089,79 @@ impl VolumeManager {
             // (`pkg/volume/plugins.go:661-663`).
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// `operationExecutor.MountVolume` for one pod volume: the plugin `SetUp`
+    /// (device mount first) under the mount operation guard, reporting to the
+    /// actual state of the world. Shared by the inline mount
+    /// ([`Self::create_volume`]) and the reconciler's remount.
+    pub async fn run_mount_operation(
+        &self,
+        spec: &crate::volume_plugins::plugin::Spec<'_>,
+        pod: &Pod,
+        volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+        volume_name: &str,
+    ) -> Result<(String, crate::volume_plugins::plugin::Attributes)> {
+        let mount_state = crate::volume_plugins::util::operation_generator::MountState {
+            volume_to_mount,
+            actual_state_of_world: &self.asw,
+        };
+        // The mount is an operation on the volume and pod
+        // (`GenerateMountVolumeFunc` runs under `pendingOperations`).
+        let mut mounted_volume = None;
+        let run = self
+            .mount_operations
+            .run_inline(
+                &volume_to_mount.volume_name.0,
+                &volume_to_mount.pod_name.0,
+                crate::volume_plugins::util::nested_pending_operations::EMPTY,
+                "volume_mount",
+                async {
+                    let mounted =
+                        crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
+                            &self.plugin_mgr,
+                            spec,
+                            pod,
+                            "",
+                            // `og.recorder`: the kubelet's event recorder over
+                            // the same API the volumes are read through.
+                            self.storage.as_ref().map(|s| {
+                                crate::volume_plugins::plugin::MounterRecorder(
+                                    rusternetes_storage::EventRecorder::new(s.clone()),
+                                )
+                            }),
+                            Some(&mount_state),
+                        )
+                        .await;
+                    match mounted {
+                        Ok(ok) => {
+                            mounted_volume = Some(Ok(ok));
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            mounted_volume = Some(Err(e));
+                            Err(msg)
+                        }
+                    }
+                },
+            )
+            .await;
+        let (path, attributes) = match (run, mounted_volume) {
+            (Ok(_), Some(mounted)) => mounted?,
+            (Err(refused), _) => {
+                // Another mount of this pod's volume is in flight: wait.
+                return Err(crate::lifecycle::VolumeWaitError(format!(
+                    "MountVolume for volume {} not started: {refused}",
+                    volume_name
+                ))
+                .into());
+            }
+            (Ok(_), None) => {
+                anyhow::bail!("MountVolume for volume {} did not run", volume_name)
+            }
+        };
+        Ok((path, attributes))
     }
 
     /// The `VolumeToMount` `DesiredStateOfWorld.GetVolumesToMount` would

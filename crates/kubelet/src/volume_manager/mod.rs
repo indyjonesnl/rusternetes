@@ -1,18 +1,19 @@
 //! Port of `pkg/kubelet/volumemanager` — the component that keeps the volumes
 //! a node's pods need attached and mounted.
 //!
-//! The caches and the desired-state populator are here so far. The reconciler
-//! arrives with its own sub-project (#1970); until it does the kubelet's
-//! inline mounting stays authoritative, and the populator only fills the
-//! desired state of the world, which nothing reads yet.
+//! The caches, the desired-state populator and the reconciler's remount arm
+//! are here so far (#1970). The kubelet's inline mounting stays authoritative
+//! for the first mount and for unmounting.
 
 pub mod cache;
 pub mod populator;
+pub mod reconciler;
 
 use crate::volume_manager::cache::{ActualStateOfWorld, DesiredStateOfWorld};
 use crate::volume_manager::populator::{
     DesiredStateOfWorldPopulator, PodManager, PodStateProvider,
 };
+use crate::volume_manager::reconciler::{Reconciler, RECONCILER_LOOP_SLEEP_PERIOD};
 use crate::volume_plugins::util::selinux::Translator;
 use crate::volume_plugins::VolumePluginMgr;
 use rusternetes_storage::StorageBackend;
@@ -29,6 +30,7 @@ pub struct VolumeManager {
     pub desired_state_of_world: Arc<DesiredStateOfWorld>,
     pub actual_state_of_world: Arc<ActualStateOfWorld>,
     pub desired_state_of_world_populator: Arc<DesiredStateOfWorldPopulator>,
+    pub reconciler: Arc<Reconciler>,
 }
 
 impl VolumeManager {
@@ -49,6 +51,12 @@ impl VolumeManager {
         // One actual state of world: the one inline mounting reports into.
         let _ = node_name;
         let actual_state_of_world = spec_factory.asw.clone();
+        let reconciler = Arc::new(Reconciler::new(
+            desired_state_of_world.clone(),
+            actual_state_of_world.clone(),
+            spec_factory.clone(),
+            RECONCILER_LOOP_SLEEP_PERIOD,
+        ));
         let desired_state_of_world_populator = Arc::new(DesiredStateOfWorldPopulator::new(
             storage,
             DESIRED_STATE_OF_WORLD_POPULATOR_LOOP_SLEEP_PERIOD,
@@ -63,14 +71,17 @@ impl VolumeManager {
             desired_state_of_world,
             actual_state_of_world,
             desired_state_of_world_populator,
+            reconciler,
         }
     }
 
     /// Port of `Run` (`volume_manager.go:290-310`): starts the populator
-    /// (`go vm.desiredStateOfWorldPopulator.Run(sourcesReady)`). The reconciler
-    /// loop is not started yet.
+    /// (`go vm.desiredStateOfWorldPopulator.Run(sourcesReady)`) and the
+    /// reconciler (`go vm.reconciler.Run(stopCh)`).
     pub fn run(&self, sources_ready: impl Fn() -> bool + Send + 'static) {
         let populator = self.desired_state_of_world_populator.clone();
         tokio::spawn(async move { populator.run(sources_ready).await });
+        let reconciler = self.reconciler.clone();
+        tokio::spawn(async move { reconciler.run().await });
     }
 }
