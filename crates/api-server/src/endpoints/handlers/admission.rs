@@ -295,6 +295,19 @@ impl Admission<'_> {
         })
         .await?;
 
+        // TaintNodesByCondition.Admit (nodetaint/admission.go:45, :61-77):
+        // `NewHandler(Create)`, nodes without a subresource only. It follows
+        // NodeRestriction in `AllOrderedPlugins`.
+        self.plugin("TaintNodesByCondition", op, ADMIT, async {
+            if self.is_core("nodes") {
+                let mut node: rusternetes_common::resources::Node = recast_obj(&*obj)?;
+                builtin_plugins::node_taint_admit(&mut node);
+                assign(&mut *obj, &node)?;
+            }
+            Ok(())
+        })
+        .await?;
+
         // LimitRanger.Admit (plugin/pkg/admission/limitranger/admission.go).
         self.plugin("LimitRanger", op, ADMIT, async {
             if let (Some(pod), Some(namespace), true) = (pod.as_mut(), namespace, create) {

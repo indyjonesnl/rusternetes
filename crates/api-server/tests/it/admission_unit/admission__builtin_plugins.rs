@@ -590,4 +590,56 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
         .unwrap();
         assert_eq!(got.spec.unwrap().ingress_class_name, None);
     }
+
+    // nodetaint/admission_test.go Test_nodeTaints: the three cases, plus the
+    // plugin's `NewHandler(Create)` and the gate.
+    async fn run_node(enabled: &[&str], obj: Value, old: Option<Value>) -> Value {
+        let _g = EnabledForTest::new(enabled);
+        let node: rusternetes_common::resources::Node =
+            run(&state(), ("", "Node", "nodes"), None, obj, old)
+                .await
+                .unwrap();
+        serde_json::to_value(node).unwrap()["spec"]["taints"].clone()
+    }
+
+    fn not_ready_taint() -> Value {
+        json!({"key": "node.kubernetes.io/not-ready", "value": null, "effect": "NoSchedule"})
+    }
+
+    #[tokio::test]
+    async fn taint_nodes_by_condition_adds_not_ready_on_create() {
+        let node = json!({"apiVersion": "v1", "kind": "Node", "metadata": {"name": "mynode"}});
+        let on = ["TaintNodesByCondition"];
+        // "notReady taint is added on creation"
+        assert_eq!(
+            run_node(&on, node.clone(), None).await,
+            json!([not_ready_taint()])
+        );
+        // "already tainted node is not tainted again"
+        let mut tainted = node.clone();
+        tainted["spec"] =
+            json!({"taints": [{"key": "node.kubernetes.io/not-ready", "effect": "NoSchedule"}]});
+        let got = run_node(&on, tainted, None).await;
+        assert_eq!(got.as_array().unwrap().len(), 1, "{got}");
+        // "NotReady taint is added to an unready node as well"
+        let mut unready = node.clone();
+        unready["status"] = json!({"conditions": [{"type": "Ready", "status": "False"}]});
+        assert_eq!(
+            run_node(&on, unready, None).await,
+            json!([not_ready_taint()])
+        );
+        // A taint with another effect is a different taint (MatchTaint).
+        let mut other = node.clone();
+        other["spec"] =
+            json!({"taints": [{"key": "node.kubernetes.io/not-ready", "effect": "NoExecute"}]});
+        assert_eq!(
+            run_node(&on, other, None).await.as_array().unwrap().len(),
+            2
+        );
+        // Update is not handled (NewHandler(Create)); a disabled plugin does nothing.
+        assert!(run_node(&on, node.clone(), Some(node.clone()))
+            .await
+            .is_null());
+        assert!(run_node(&["ServiceAccount"], node, None).await.is_null());
+    }
 }
