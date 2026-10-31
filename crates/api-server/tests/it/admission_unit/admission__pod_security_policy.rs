@@ -2239,11 +2239,7 @@ mod fixture_gen {
     //! Pods are `serde_json::Value`s (the language-neutral form of the YAML), so a
     //! Go `ptr.To(false)` is `json!(false)` and a Go `nil` is an absent key.
     //!
-    //! Ported generators: `privileged`, `allowPrivilegeEscalation`,
-    //! `runAsNonRoot`, `runAsUser`, `hostNamespaces`, `appArmorProfile`. The
-    //! remaining generators (fixtures_*.go) are tracked in #2904; until they are
-    //! ported, files belonging to those checks are exempt from the extra-file check
-    //! (see [`UNPORTED_CHECKS`]).
+    //! Every `test/fixtures_*.go` generator is ported (#2904).
     use super::__parent::*;
     use rusternetes_api_server::admission::pod_security_api::{Level, Version};
     use rusternetes_api_server::admission::pod_security_policy::*;
@@ -2308,6 +2304,48 @@ mod fixture_gen {
                         set(p, &ptr, json!({}));
                     }
                 }
+            }
+        })
+    }
+
+    /// fixtures_capabilities_baseline.go `ensureCapabilities`.
+    fn ensure_capabilities(p: &Pod) -> Pod {
+        let mut p = ensure_security_context(p);
+        for list in ["containers", "initContainers"] {
+            let n = p["spec"][list].as_array().map_or(0, |a| a.len());
+            for i in 0..n {
+                let ptr = format!("/spec/{list}/{i}/securityContext/capabilities");
+                if p.pointer(&ptr).is_none() {
+                    set(&mut p, &ptr, json!({}));
+                }
+            }
+        }
+        p
+    }
+
+    /// helpers.go `ensureSELinuxOptions`.
+    fn ensure_se_linux_options(p: &Pod) -> Pod {
+        let mut p = ensure_security_context(p);
+        let mut ptrs = vec!["/spec/securityContext/seLinuxOptions".to_string()];
+        for list in ["containers", "initContainers"] {
+            let n = p["spec"][list].as_array().map_or(0, |a| a.len());
+            for i in 0..n {
+                ptrs.push(format!("/spec/{list}/{i}/securityContext/seLinuxOptions"));
+            }
+        }
+        for ptr in ptrs {
+            if p.pointer(&ptr).is_none() {
+                set(&mut p, &ptr, json!({}));
+            }
+        }
+        p
+    }
+
+    /// fixtures_sysctls.go: `if p.Spec.SecurityContext == nil { ... = &PodSecurityContext{} }`.
+    fn ensure_pod_security_context(p: &Pod) -> Pod {
+        tweak(p, |p| {
+            if p.pointer("/spec/securityContext").is_none() {
+                set(p, "/spec/securityContext", json!({}));
             }
         })
     }
@@ -2823,26 +2861,827 @@ mod fixture_gen {
                 },
             },
         );
+
+        // fixtures_capabilities_baseline.go
+        const ALLOWED_CAPS: &[&str] = &[
+            "AUDIT_WRITE",
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "MKNOD",
+            "NET_BIND_SERVICE",
+            "SETFCAP",
+            "SETGID",
+            "SETPCAP",
+            "SETUID",
+            "SYS_CHROOT",
+        ];
+        g.register(
+            key(Level::Baseline, 0, "capabilities_baseline"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    // don't generate fixtures if minimal valid pod drops ALL
+                    if let Some(drop) = p
+                        .pointer("/spec/containers/0/securityContext/capabilities/drop")
+                        .and_then(Value::as_array)
+                    {
+                        if drop.iter().any(|c| c == "ALL") {
+                            return vec![];
+                        }
+                    }
+                    let p = ensure_capabilities(p);
+                    vec![
+                        // all allowed capabilities
+                        tweak(&p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/securityContext/capabilities/add",
+                                json!(ALLOWED_CAPS),
+                            );
+                            set(
+                                p,
+                                "/spec/initContainers/0/securityContext/capabilities/add",
+                                json!(ALLOWED_CAPS),
+                            );
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    let p = ensure_capabilities(p);
+                    let add =
+                        |ptr: &'static str, v: &'static str| tweak(&p, |p| set(p, ptr, json!([v])));
+                    vec![
+                        // NET_RAW
+                        add(
+                            "/spec/containers/0/securityContext/capabilities/add",
+                            "NET_RAW",
+                        ),
+                        // ensure init container is enforced
+                        add(
+                            "/spec/initContainers/0/securityContext/capabilities/add",
+                            "NET_RAW",
+                        ),
+                        // case-difference
+                        add(
+                            "/spec/containers/0/securityContext/capabilities/add",
+                            "chown",
+                        ),
+                        // CAP_ prefix
+                        add(
+                            "/spec/containers/0/securityContext/capabilities/add",
+                            "CAP_CHOWN",
+                        ),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_capabilities_restricted.go
+        const ALL_INDIVIDUAL_CAPS: &[&str] = &[
+            "SYS_TIME",
+            "SYS_MODULE",
+            "SYS_RAWIO",
+            "SYS_PACCT",
+            "SYS_ADMIN",
+            "SYS_NICE",
+            "SYS_RESOURCE",
+            "SYS_TIME",
+            "SYS_TTY_CONFIG",
+            "MKNOD",
+            "AUDIT_WRITE",
+            "AUDIT_CONTROL",
+            "MAC_OVERRIDE",
+            "MAC_ADMIN",
+            "NET_ADMIN",
+            "SYSLOG",
+            "CHOWN",
+            "NET_RAW",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "DAC_READ_SEARCH",
+            "FSETID",
+            "KILL",
+            "SETGID",
+            "SETUID",
+            "LINUX_IMMUTABLE",
+            "NET_BIND_SERVICE",
+            "NET_BROADCAST",
+            "IPC_LOCK",
+            "IPC_OWNER",
+            "SYS_CHROOT",
+            "SYS_PTRACE",
+            "SYS_BOOT",
+            "LEASE",
+            "SETFCAP",
+            "WAKE_ALARM",
+            "BLOCK_SUSPEND",
+        ];
+        g.register(
+            key(Level::Restricted, 22, "capabilities_restricted"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    let p = ensure_capabilities(p);
+                    vec![tweak(&p, |p| {
+                        for c in ["containers", "initContainers"] {
+                            let caps = format!("/spec/{c}/0/securityContext/capabilities");
+                            set(p, &format!("{caps}/drop"), json!(["ALL"]));
+                            set(p, &format!("{caps}/add"), json!(["NET_BIND_SERVICE"]));
+                        }
+                    })]
+                },
+                generate_fail: |p| {
+                    let p = ensure_capabilities(p);
+                    vec![
+                        // test container
+                        tweak(&p, |p| {
+                            unset(p, "/spec/containers/0/securityContext/capabilities/drop")
+                        }),
+                        // test initContainer
+                        tweak(&p, |p| {
+                            unset(
+                                p,
+                                "/spec/initContainers/0/securityContext/capabilities/drop",
+                            )
+                        }),
+                        // dropping all individual capabilities is not sufficient
+                        tweak(&p, |p| {
+                            for c in ["containers", "initContainers"] {
+                                set(
+                                    p,
+                                    &format!("/spec/{c}/0/securityContext/capabilities/drop"),
+                                    json!(ALL_INDIVIDUAL_CAPS),
+                                );
+                            }
+                        }),
+                        tweak(&p, |p| {
+                            for c in ["containers", "initContainers"] {
+                                let caps = format!("/spec/{c}/0/securityContext/capabilities");
+                                set(p, &format!("{caps}/drop"), json!(["ALL"]));
+                                // try adding back capabilities other than
+                                // NET_BIND_SERVICE, should be forbidden
+                                set(p, &format!("{caps}/add"), json!(ALLOWED_CAPS));
+                            }
+                        }),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_hostPathVolumes.go
+        g.register(
+            key(Level::Baseline, 0, "hostPathVolumes"),
+            FixtureGenerator {
+                // minimal valid pod already captures all valid combinations
+                generate_pass: |_, _| vec![],
+                generate_fail: |p| {
+                    vec![
+                        // mix of hostPath and non-hostPath volumes
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/volumes",
+                                json!([
+                                    {"name": "volume-emptydir", "emptyDir": {}},
+                                    {"name": "volume-hostpath", "hostPath": {"path": "/a"}},
+                                ]),
+                            )
+                        }),
+                        // just hostPath volumes
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/volumes",
+                                json!([
+                                    {"name": "volume-hostpath-a", "hostPath": {"path": "/a"}},
+                                    {"name": "volume-hostpath-b", "hostPath": {"path": "/b"}},
+                                ]),
+                            )
+                        }),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_hostPorts.go
+        g.register(
+            key(Level::Baseline, 0, "hostPorts"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    vec![
+                        // no host ports
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/ports",
+                                json!([{"containerPort": 12345}]),
+                            );
+                            set(
+                                p,
+                                "/spec/initContainers/0/ports",
+                                json!([{"containerPort": 12346}]),
+                            );
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    vec![
+                        // Host Port present
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/ports",
+                                json!([{"containerPort": 12345, "hostPort": 12345}]),
+                            )
+                        }),
+                        // check initContainer
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/initContainers/0/ports",
+                                json!([{"containerPort": 12346, "hostPort": 12346}]),
+                            )
+                        }),
+                        // mix of hostPorts and regular ports
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/ports",
+                                json!([
+                                    {"containerPort": 12345, "hostPort": 12345},
+                                    {"containerPort": 12347},
+                                ]),
+                            );
+                            set(
+                                p,
+                                "/spec/initContainers/0/ports",
+                                json!([
+                                    {"containerPort": 12346, "hostPort": 12346},
+                                    {"containerPort": 12348},
+                                ]),
+                            );
+                        }),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_hostProbesAndHostLifecycle.go
+        g.register(
+            key(Level::Baseline, 34, "hostProbesAndHostLifecycle"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    vec![
+                        // A pod with no probes should pass.
+                        p.clone(),
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/livenessProbe",
+                                json!({"httpGet": {"port": 8080}}),
+                            )
+                        }),
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/readinessProbe",
+                                json!({"tcpSocket": {"port": 8080}}),
+                            )
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    vec![
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/livenessProbe",
+                                json!({"httpGet": {"host": "bad.host", "port": 8080}}),
+                            )
+                        }),
+                        tweak(p, |p| {
+                            set(p, "/spec/initContainers/0/restartPolicy", json!("Always"));
+                            set(
+                                p,
+                                "/spec/initContainers/0/readinessProbe",
+                                json!({"tcpSocket": {"host": "8.8.8.8", "port": 8080}}),
+                            );
+                        }),
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/lifecycle",
+                                json!({"postStart": {"httpGet": {"host": "bad.host", "port": 8080}}}),
+                            )
+                        }),
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/livenessProbe",
+                                json!({"httpGet": {"host": "127.0.0.1", "port": 8080}}),
+                            )
+                        }),
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/containers/0/readinessProbe",
+                                json!({"tcpSocket": {"host": "::1", "port": 8080}}),
+                            )
+                        }),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_procMount.go
+        fn proc_mount_pass(p: &Pod, _: Level) -> Vec<Pod> {
+            let p = ensure_security_context(p);
+            vec![
+                // set proc mount of container and init container to a valid value
+                tweak(&p, |c| {
+                    set(
+                        c,
+                        "/spec/containers/0/securityContext/procMount",
+                        json!("Default"),
+                    );
+                    set(
+                        c,
+                        "/spec/initContainers/0/securityContext/procMount",
+                        json!("Default"),
+                    );
+                    set(c, "/spec/hostUsers", json!(false));
+                }),
+            ]
+        }
+        fn proc_mount_fail(p: &Pod, host_users: bool) -> Vec<Pod> {
+            let p = ensure_security_context(p);
+            vec![
+                // set proc mount of container to a forbidden value
+                tweak(&p, |c| {
+                    set(
+                        c,
+                        "/spec/containers/0/securityContext/procMount",
+                        json!("Unmasked"),
+                    );
+                    set(c, "/spec/hostUsers", json!(host_users));
+                }),
+                // set proc mount of init container to a forbidden value
+                tweak(&p, |c| {
+                    set(
+                        c,
+                        "/spec/initContainers/0/securityContext/procMount",
+                        json!("Unmasked"),
+                    );
+                    set(c, "/spec/hostUsers", json!(host_users));
+                }),
+            ]
+        }
+        g.register(
+            key(Level::Baseline, 0, "procMount"),
+            FixtureGenerator {
+                generate_pass: proc_mount_pass,
+                generate_fail: |p| proc_mount_fail(p, false),
+            },
+        );
+        g.register(
+            key(Level::Baseline, 35, "procMount"),
+            FixtureGenerator {
+                generate_pass: |p, level| {
+                    let mut retval = proc_mount_pass(p, level);
+                    if level != Level::Restricted {
+                        // don't expect the unmasked namespace user pod to pass in
+                        // restricted mode
+                        let p = ensure_security_context(p);
+                        retval.push(tweak(&p, |c| {
+                            set(
+                                c,
+                                "/spec/containers/0/securityContext/procMount",
+                                json!("Unmasked"),
+                            );
+                            set(
+                                c,
+                                "/spec/initContainers/0/securityContext/procMount",
+                                json!("Unmasked"),
+                            );
+                            set(c, "/spec/hostUsers", json!(false));
+                        }));
+                    }
+                    retval
+                },
+                generate_fail: |p| proc_mount_fail(p, true),
+            },
+        );
+        g.register(
+            key(Level::Restricted, 35, "procMount_restricted"),
+            FixtureGenerator {
+                generate_pass: proc_mount_pass,
+                generate_fail: |p| proc_mount_fail(p, false),
+            },
+        );
+
+        // fixtures_restrictedVolumes.go
+        g.register(
+            key(Level::Restricted, 0, "restrictedVolumes"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    vec![
+                        // pod that has all allowed volume types
+                        tweak(p, |p| {
+                            set(
+                                p,
+                                "/spec/volumes",
+                                json!([
+                                    // implicit empty dir
+                                    {"name": "volume0"},
+                                    {"name": "volume1", "emptyDir": {}},
+                                    {"name": "volume2", "secret": {"secretName": "test"}},
+                                    {"name": "volume3", "persistentVolumeClaim": {"claimName": "test"}},
+                                    {"name": "volume4", "downwardAPI": {"items": [
+                                        {"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}]}},
+                                    {"name": "volume5", "configMap": {"name": "test"}},
+                                    {"name": "volume6", "projected": {"sources": []}},
+                                ]),
+                            )
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    [
+                        json!({"gcePersistentDisk": {"pdName": "test"}}),
+                        json!({"awsElasticBlockStore": {"volumeID": "test"}}),
+                        json!({"gitRepo": {"repository": "github.com/kubernetes/kubernetes"}}),
+                        json!({"nfs": {"server": "test", "path": "/test"}}),
+                        json!({"iscsi": {"targetPortal": "test",
+                            "iqn": "iqn.2001-04.com.example:storage.kube.sys1.xyz", "lun": 0}}),
+                        json!({"glusterfs": {"path": "test", "endpoints": "test"}}),
+                        json!({"rbd": {"monitors": ["test"], "image": "test"}}),
+                        json!({"flexVolume": {"driver": "test"}}),
+                        json!({"cinder": {"volumeID": "test"}}),
+                        json!({"cephfs": {"monitors": ["test"]}}),
+                        json!({"flocker": {"datasetName": "test"}}),
+                        json!({"fc": {"wwids": ["test"]}}),
+                        json!({"azureFile": {"secretName": "test", "shareName": "test"}}),
+                        json!({"vsphereVolume": {"volumePath": "test"}}),
+                        json!({"quobyte": {"registry": "localhost:1234", "volume": "test"}}),
+                        json!({"azureDisk": {"diskName": "test",
+                            "diskURI": "https://test.blob.core.windows.net/test/test.vhd"}}),
+                        json!({"portworxVolume": {"volumeID": "test", "fsType": "ext4"}}),
+                        json!({"scaleIO": {"gateway": "localhost", "system": "test",
+                            "secretRef": null, "volumeName": "test"}}),
+                        json!({"storageos": {"volumeName": "test"}}),
+                        json!({"hostPath": {"path": "/dev/null"}}),
+                    ]
+                    .into_iter()
+                    .map(|mut source| {
+                        source["name"] = json!("volume1");
+                        tweak(p, |p| set(p, "/spec/volumes", json!([source])))
+                    })
+                    .collect()
+                },
+            },
+        );
+
+        // fixtures_seLinuxOptions.go
+        g.register(
+            key(Level::Baseline, 0, "seLinuxOptions"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    let p = ensure_se_linux_options(p);
+                    vec![
+                        // security context with no seLinuxOptions
+                        tweak(&p, |p| {
+                            // no pod-level
+                            unset(p, "/spec/securityContext/seLinuxOptions");
+                            // no container-level
+                            unset(p, "/spec/containers/0/securityContext/seLinuxOptions");
+                            // empty container-level
+                            set(
+                                p,
+                                "/spec/initContainers/0/securityContext/seLinuxOptions",
+                                json!({}),
+                            );
+                        }),
+                        tweak(&p, |p| {
+                            // seLinuxOptions with all valid types
+                            set(
+                                p,
+                                "/spec/securityContext/seLinuxOptions/type",
+                                json!("container_t"),
+                            );
+                            set(
+                                p,
+                                "/spec/containers/0/securityContext/seLinuxOptions/type",
+                                json!("container_init_t"),
+                            );
+                            set(
+                                p,
+                                "/spec/initContainers/0/securityContext/seLinuxOptions/type",
+                                json!("container_kvm_t"),
+                            );
+                            // with empty level and arbitrary level (Go's empty
+                            // string is omitted)
+                            unset(p, "/spec/securityContext/seLinuxOptions/level");
+                            set(
+                                p,
+                                "/spec/containers/0/securityContext/seLinuxOptions/level",
+                                json!("somevalue"),
+                            );
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    let p = ensure_se_linux_options(p);
+                    let bad = |ptr: &str| tweak(&p, |p| set(p, ptr, json!("somevalue")));
+                    vec![
+                        // seLinuxOptions with out of bounds type
+                        // pod-level
+                        bad("/spec/securityContext/seLinuxOptions/type"),
+                        // container
+                        bad("/spec/containers/0/securityContext/seLinuxOptions/type"),
+                        // initContainer
+                        bad("/spec/initContainers/0/securityContext/seLinuxOptions/type"),
+                        // seLinuxOptions with out of bounds user
+                        bad("/spec/securityContext/seLinuxOptions/user"),
+                        // seLinuxOptions with out of bounds role
+                        bad("/spec/securityContext/seLinuxOptions/role"),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_seccompProfile_baseline.go (helpers_seccomp.go)
+        const ANNOTATION_KEY_POD: &str = "seccomp.security.alpha.kubernetes.io/pod";
+        const ANNOTATION_KEY_CONTAINER_PREFIX: &str =
+            "container.seccomp.security.alpha.kubernetes.io/";
+        fn seccomp_annotation_key(p: &Pod, list: &str) -> String {
+            format!(
+                "{ANNOTATION_KEY_CONTAINER_PREFIX}{}",
+                p["spec"][list][0]["name"].as_str().unwrap()
+            )
+        }
+        fn annotate(p: &Pod, key: &str, v: &str) -> Pod {
+            tweak(p, |p| p["metadata"]["annotations"][key] = json!(v))
+        }
+        g.register(
+            key(Level::Baseline, 0, "seccompProfile_baseline"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    // don't generate fixtures if minimal valid pod already has
+                    // seccomp config
+                    if p["metadata"]["annotations"][ANNOTATION_KEY_POD] == "runtime/default" {
+                        return vec![];
+                    }
+                    let p = ensure_annotation(p);
+                    vec![tweak(&p, |p| {
+                        // pod-level default
+                        p["metadata"]["annotations"][ANNOTATION_KEY_POD] = json!("runtime/default");
+                        // container-level localhost
+                        let k = seccomp_annotation_key(p, "containers");
+                        p["metadata"]["annotations"][k] = json!("localhost/testing");
+                        // init-container unset
+                    })]
+                },
+                generate_fail: |p| {
+                    let p = ensure_annotation(p);
+                    vec![
+                        annotate(&p, ANNOTATION_KEY_POD, "unconfined"),
+                        annotate(&p, &seccomp_annotation_key(&p, "containers"), "unconfined"),
+                        annotate(
+                            &p,
+                            &seccomp_annotation_key(&p, "initContainers"),
+                            "unconfined",
+                        ),
+                    ]
+                },
+            },
+        );
+        g.register(
+            key(Level::Baseline, 19, "seccompProfile_baseline"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    // don't generate fixtures if minimal valid pod already has
+                    // seccomp config
+                    if p["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault" {
+                        return vec![];
+                    }
+                    let p = ensure_security_context(p);
+                    vec![tweak(&p, |p| {
+                        // pod-level default
+                        set(
+                            p,
+                            "/spec/securityContext/seccompProfile",
+                            json!({"type": "RuntimeDefault"}),
+                        );
+                        // container-level localhost
+                        set(
+                            p,
+                            "/spec/containers/0/securityContext/seccompProfile",
+                            json!({"type": "RuntimeDefault"}),
+                        );
+                        // init-container unset
+                    })]
+                },
+                generate_fail: |p| {
+                    let p = ensure_security_context(p);
+                    [
+                        "/spec/securityContext/seccompProfile",
+                        "/spec/containers/0/securityContext/seccompProfile",
+                        "/spec/initContainers/0/securityContext/seccompProfile",
+                    ]
+                    .into_iter()
+                    .map(|ptr| tweak(&p, |p| set(p, ptr, json!({"type": "Unconfined"}))))
+                    .collect()
+                },
+            },
+        );
+
+        // fixtures_seccompProfile_restricted.go
+        const SECCOMP_POD: &str = "/spec/securityContext/seccompProfile";
+        const SECCOMP_C: &str = "/spec/containers/0/securityContext/seccompProfile";
+        const SECCOMP_I: &str = "/spec/initContainers/0/securityContext/seccompProfile";
+        fn seccomp_default() -> Value {
+            json!({"type": "RuntimeDefault"})
+        }
+        fn seccomp_unconfined() -> Value {
+            json!({"type": "Unconfined"})
+        }
+        fn seccomp_localhost(profile: &str) -> Value {
+            json!({"type": "Localhost", "localhostProfile": profile})
+        }
+        g.register(
+            key(Level::Restricted, 19, "seccompProfile_restricted"),
+            FixtureGenerator {
+                generate_pass: |p, _| {
+                    let p = ensure_security_context(p);
+                    vec![
+                        tweak(&p, |p| set(p, SECCOMP_POD, seccomp_default())),
+                        tweak(&p, |p| set(p, SECCOMP_POD, seccomp_localhost("testing"))),
+                        tweak(&p, |p| {
+                            unset(p, SECCOMP_POD);
+                            set(p, SECCOMP_C, seccomp_default());
+                            set(p, SECCOMP_I, seccomp_localhost("testing"));
+                        }),
+                    ]
+                },
+                generate_fail: |p| {
+                    let p = ensure_security_context(p);
+                    vec![
+                        // unset everywhere
+                        tweak(&p, |p| unset(p, SECCOMP_POD)),
+                        // unconfined, pod-level
+                        tweak(&p, |p| set(p, SECCOMP_POD, seccomp_unconfined())),
+                        // unset initContainer
+                        tweak(&p, |p| {
+                            unset(p, SECCOMP_POD);
+                            set(p, SECCOMP_C, seccomp_default());
+                        }),
+                        // unset container
+                        tweak(&p, |p| {
+                            unset(p, SECCOMP_POD);
+                            set(p, SECCOMP_I, seccomp_default());
+                        }),
+                        // unconfined, container-level
+                        tweak(&p, |p| {
+                            unset(p, SECCOMP_POD);
+                            set(p, SECCOMP_C, seccomp_default());
+                            set(p, SECCOMP_I, seccomp_unconfined());
+                        }),
+                    ]
+                },
+            },
+        );
+
+        // fixtures_sysctls.go: one generator per policy version; they differ
+        // only in the allowed set the pass case exercises.
+        macro_rules! sysctls_generator {
+            ($allowed:expr) => {
+                FixtureGenerator {
+                    generate_pass: |p, _| {
+                        let p = ensure_pod_security_context(p);
+                        vec![
+                            // security context with no sysctls
+                            tweak(&p, |p| unset(p, "/spec/securityContext/sysctls")),
+                            tweak(&p, |p| {
+                                let allowed: Vec<(&str, &str)> = $allowed;
+                                let list: Vec<Value> = allowed
+                                    .into_iter()
+                                    .map(|(n, v)| json!({"name": n, "value": v}))
+                                    .collect();
+                                set(p, "/spec/securityContext/sysctls", Value::Array(list));
+                            }),
+                        ]
+                    },
+                    generate_fail: |p| {
+                        let p = ensure_pod_security_context(p);
+                        vec![
+                            // sysctls with out of allowed name
+                            tweak(&p, |p| {
+                                set(
+                                    p,
+                                    "/spec/securityContext/sysctls",
+                                    json!([{"name": "othersysctl", "value": "other"}]),
+                                )
+                            }),
+                        ]
+                    },
+                }
+            };
+        }
+        g.register(
+            key(Level::Baseline, 0, "sysctls"),
+            sysctls_generator!(vec![
+                ("kernel.shm_rmid_forced", "0"),
+                ("net.ipv4.ip_local_port_range", "1024 65535"),
+                ("net.ipv4.tcp_syncookies", "0"),
+                ("net.ipv4.ping_group_range", "1 0"),
+                ("net.ipv4.ip_unprivileged_port_start", "1024"),
+            ]),
+        );
+        g.register(
+            key(Level::Baseline, 27, "sysctls"),
+            sysctls_generator!(vec![
+                ("kernel.shm_rmid_forced", "0"),
+                ("net.ipv4.ip_local_port_range", "1024 65535"),
+                ("net.ipv4.tcp_syncookies", "0"),
+                ("net.ipv4.ping_group_range", "1 0"),
+                ("net.ipv4.ip_unprivileged_port_start", "1024"),
+                ("net.ipv4.ip_local_reserved_ports", "1024-4999"),
+            ]),
+        );
+        g.register(
+            key(Level::Baseline, 29, "sysctls"),
+            sysctls_generator!(vec![
+                ("kernel.shm_rmid_forced", "0"),
+                ("net.ipv4.ip_local_port_range", "1024 65535"),
+                ("net.ipv4.tcp_syncookies", "0"),
+                ("net.ipv4.ping_group_range", "1 0"),
+                ("net.ipv4.ip_unprivileged_port_start", "1024"),
+                ("net.ipv4.ip_local_reserved_ports", "1024-4999"),
+                ("net.ipv4.tcp_keepalive_time", "7200"),
+                ("net.ipv4.tcp_fin_timeout", "60"),
+                ("net.ipv4.tcp_keepalive_intvl", "75"),
+                ("net.ipv4.tcp_keepalive_probes", "9"),
+            ]),
+        );
+        g.register(
+            key(Level::Baseline, 32, "sysctls"),
+            sysctls_generator!(vec![
+                ("net.ipv4.tcp_rmem", "4096 87380 16777216"),
+                ("net.ipv4.tcp_wmem", "4096 65536 16777216"),
+            ]),
+        );
+
+        // fixtures_windowsHostProcess.go
+        g.register(
+            key(Level::Baseline, 0, "windowsHostProcess"),
+            FixtureGenerator {
+                // minimal valid pod already captures all valid combinations
+                generate_pass: |_, _| vec![],
+                generate_fail: |p| {
+                    let mut p = ensure_security_context(p);
+                    for ptr in [
+                        "/spec/securityContext/windowsOptions",
+                        "/spec/containers/0/securityContext/windowsOptions",
+                        "/spec/initContainers/0/securityContext/windowsOptions",
+                    ] {
+                        if p.pointer(ptr).is_none() {
+                            set(&mut p, ptr, json!({}));
+                        }
+                    }
+                    vec![
+                        // true for pod
+                        tweak(&p, |p| {
+                            // HostNetwork is required to be true for HostProcess
+                            // pods. Set to true here so we pass API validation
+                            // and get to admission checks.
+                            set(p, "/spec/hostNetwork", json!(true));
+                            set(
+                                p,
+                                "/spec/securityContext/windowsOptions/hostProcess",
+                                json!(true),
+                            );
+                        }),
+                        // true for containers
+                        tweak(&p, |p| {
+                            set(p, "/spec/hostNetwork", json!(true));
+                            set(
+                                p,
+                                "/spec/containers/0/securityContext/windowsOptions/hostProcess",
+                                json!(true),
+                            );
+                            set(
+                                p,
+                                "/spec/initContainers/0/securityContext/windowsOptions/hostProcess",
+                                json!(true),
+                            );
+                        }),
+                    ]
+                },
+            },
+        );
         g
     }
-
-    /// Checks that have a `test/fixtures_*.go` generator not yet ported (#2904).
-    /// Their `<id><n>.yaml` files are not compared and not counted as extra.
-    const UNPORTED_CHECKS: &[&str] = &[
-        "capabilities_baseline",
-        "capabilities_restricted",
-        "hostPathVolumes",
-        "hostPorts",
-        "hostProbesAndHostLifecycle",
-        "procMount",
-        "procMount_restricted",
-        "restrictedVolumes",
-        "seLinuxOptions",
-        "seccompProfile_baseline",
-        "seccompProfile_restricted",
-        "sysctls",
-        "windowsHostProcess",
-    ];
 
     // ------------------------------------------------------------------ run.go
 
@@ -2925,13 +3764,6 @@ mod fixture_gen {
             .unwrap_or_default()
     }
 
-    fn is_unported_file(file: &str) -> bool {
-        let stem = file
-            .trim_end_matches(".yaml")
-            .trim_end_matches(|c: char| c.is_ascii_digit());
-        UNPORTED_CHECKS.iter().any(|id| id.to_lowercase() == stem)
-    }
-
     /// `TestFixtures`.
     #[test]
     fn fixtures_match_testdata() {
@@ -2991,11 +3823,7 @@ mod fixture_gen {
                         check: id,
                     };
                     let Some(data) = gens.get_fixtures(&mins, key).unwrap() else {
-                        assert!(
-                            UNPORTED_CHECKS.contains(&id),
-                            "{level}/1.{minor}: check {id} has no fixture generator"
-                        );
-                        continue;
+                        panic!("{level}/1.{minor}: check {id} has no fixture generator");
                     };
                     for (i, pod) in data.pass.iter().enumerate() {
                         let n = format!("{}{i}", id.to_lowercase());
@@ -3010,10 +3838,7 @@ mod fixture_gen {
                 }
 
                 for (dir, want) in [(&pass_dir, &want_pass), (&fail_dir, &want_fail)] {
-                    let actual: BTreeSet<String> = yaml_files(dir)
-                        .into_iter()
-                        .filter(|f| !is_unported_file(f))
-                        .collect();
+                    let actual = yaml_files(dir);
                     let extra: Vec<_> = actual.difference(want).collect();
                     if !extra.is_empty() {
                         errs.push(format!(
