@@ -85,7 +85,32 @@ impl VolumePlugin for EmptyDirPlugin {
             .host
             .empty_dir_mount_deps()
             .unwrap_or_else(EmptyDirMountDeps::real);
+        let empty_dir = spec
+            .volume
+            .empty_dir
+            .clone()
+            .expect("checked by can_support");
+        // `newMounterInternal` (`empty_dir.go:143-154`): only a memory-backed
+        // emptyDir has a computed size limit; the default is a zero Quantity.
+        let size_limit = if empty_dir.medium.as_deref() == Some("Memory") {
+            let node_allocatable_memory = self
+                .host
+                .get_node_allocatable()
+                .get("memory")
+                .and_then(|m| crate::runtime::parse_quantity_bytes(m))
+                .map(|b| i64::try_from(b).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            calculate_empty_dir_memory_size(
+                node_allocatable_memory,
+                empty_dir.size_limit.as_deref(),
+                pod,
+            )
+        } else {
+            0
+        };
         Ok(Box::new(EmptyDirMounter {
+            size_limit,
+            plugin_dir: self.host.get_plugin_dir(self.name()),
             pod: pod.clone(),
             mounter: deps.mounter,
             mount_detector: deps.detector,
@@ -94,11 +119,7 @@ impl VolumePlugin for EmptyDirPlugin {
                 .host
                 .get_pod_volume_dir(&pod.metadata.uid, self.name(), &spec.volume.name),
             volume_name: spec.volume.name.clone(),
-            empty_dir: spec
-                .volume
-                .empty_dir
-                .clone()
-                .expect("checked by can_support"),
+            empty_dir,
         }))
     }
 
@@ -195,7 +216,7 @@ pub trait MountDetector: Send + Sync {
 
 /// The `mount.Interface.MountSensitiveWithoutSystemd` call emptyDir's setup
 /// makes (`staging/src/k8s.io/mount-utils/mount.go`).
-pub trait Mount: Send + Sync {
+pub trait Mount: Unmount + Send + Sync {
     /// `IsLikelyNotMountPoint` (`mount-utils/mount.go`), which `SetUpAt`
     /// asks its mounter (`empty_dir.go:236`).
     fn is_likely_not_mount_point(&self, dir: &str) -> std::io::Result<bool>;
@@ -213,6 +234,47 @@ pub trait Mount: Send + Sync {
 /// teardown calls: `Unmount`.
 pub trait Unmount: Send + Sync {
     fn unmount(&self, target: &str) -> Result<()>;
+}
+
+/// `calculateEmptyDirMemorySize` (`empty_dir.go:114-140`): the size limit
+/// defaults to node allocatable memory, is lowered to the pod's memory limit
+/// (`cm.ResourceConfigForPod(..).Memory`) when that is in `(0, size]`, and
+/// finally to the volume's own `sizeLimit` when that is in `(0, size]`.
+pub fn calculate_empty_dir_memory_size(
+    node_allocatable_memory: i64,
+    volume_size_limit: Option<&str>,
+    pod: &Pod,
+) -> i64 {
+    let mut size_limit = node_allocatable_memory;
+    if let Some(pod_memory_limit) = crate::cm_helpers::resource_config_for_pod_memory(pod) {
+        // ensure 0 < value < size
+        if pod_memory_limit > 0 && pod_memory_limit <= size_limit {
+            size_limit = pod_memory_limit;
+        }
+    }
+    // volume local size is used if and only if less than what pod could consume
+    if let Some(volume_size_limit) =
+        volume_size_limit.and_then(crate::runtime::parse_quantity_bytes)
+    {
+        let volume_size_limit = i64::try_from(volume_size_limit).unwrap_or(i64::MAX);
+        if volume_size_limit > 0 && volume_size_limit <= size_limit {
+            size_limit = volume_size_limit;
+        }
+    }
+    size_limit
+}
+
+/// `generateTmpfsMountOptions` (`empty_dir.go:573-584`).
+pub fn generate_tmpfs_mount_options(size_limit: i64, noswap_supported: bool) -> Vec<String> {
+    let mut options = Vec::new();
+    // Linux system default is 50% of capacity.
+    if size_limit > 0 {
+        options.push(format!("size={size_limit}"));
+    }
+    if noswap_supported {
+        options.push(crate::swap_util::TMPFS_NOSWAP_OPTION.to_string());
+    }
+    options
 }
 
 /// `realMountDetector` (`empty_dir_linux.go:41-116`).
@@ -400,10 +462,9 @@ impl EmptyDirMounter {
     /// through the injected mounter, as upstream's
     /// `ed.mounter.MountSensitiveWithoutSystemd("tmpfs", dir, "tmpfs", options, nil)`.
     ///
-    /// Deviation (pre-existing): options start with `mode=0777`, which
-    /// `generateTmpfsMountOptions` (`empty_dir.go:573-584`) does not emit; it
-    /// keeps the tmpfs root world-writable irrespective of the host umask.
-    /// `size=` follows `generateTmpfsMountOptions`; `noswap` is not ported.
+    /// The options are `generateTmpfsMountOptions` (`empty_dir.go:573-584`)
+    /// with `swap.IsTmpfsNoswapOptionSupported(ed.mounter, GetPluginDir(..))`
+    /// (`empty_dir.go:336`).
     fn setup_tmpfs(&self, dir: &str) -> Result<()> {
         setup_dir(dir)?;
         // Make SetUp idempotent.
@@ -413,16 +474,13 @@ impl EmptyDirMounter {
         if is_mnt && medium == Medium::Memory {
             return Ok(());
         }
-        let mut options = vec!["mode=0777".to_string()];
-        if let Some(bytes) = self
-            .empty_dir
-            .size_limit
-            .as_deref()
-            .and_then(crate::runtime::parse_quantity_bytes)
-            .filter(|b| *b > 0)
-        {
-            options.push(format!("size={bytes}"));
-        }
+        let options = generate_tmpfs_mount_options(
+            self.size_limit,
+            crate::swap_util::is_tmpfs_noswap_option_supported(
+                self.mounter.as_ref(),
+                &self.plugin_dir,
+            ),
+        );
         info!(
             "pod {}: mounting tmpfs for volume {}",
             self.pod.metadata.uid, self.volume_name
@@ -671,6 +729,12 @@ pub fn assign_quota_with(
 }
 
 pub struct EmptyDirMounter {
+    /// `ed.sizeLimit.Value()` (`newMounterInternal`): the computed tmpfs size
+    /// for a memory-backed emptyDir, 0 otherwise.
+    pub size_limit: i64,
+    /// `ed.plugin.host.GetPluginDir(emptyDirPluginName)`: scratch space for
+    /// the `noswap` probe.
+    pub plugin_dir: String,
     /// `ed.pod`: `getPageSizeMountOption` reads its resource requests.
     pub pod: Pod,
     pub mounter: Arc<dyn Mount>,
@@ -812,6 +876,12 @@ pub struct RecordingMount {
 impl RecordingMount {
     fn is_mounted(&self, dir: &str) -> bool {
         self.calls.lock().unwrap().iter().any(|c| c.1 == dir)
+    }
+}
+
+impl Unmount for RecordingMount {
+    fn unmount(&self, _target: &str) -> Result<()> {
+        Ok(())
     }
 }
 

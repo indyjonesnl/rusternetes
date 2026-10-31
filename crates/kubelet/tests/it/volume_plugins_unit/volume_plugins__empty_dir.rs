@@ -63,6 +63,8 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o400)).unwrap();
         let gid = std::fs::metadata(&d).unwrap().gid() as i64;
         let m = EmptyDirMounter {
+            size_limit: 0,
+            plugin_dir: String::new(),
             pod: Pod::new("p", Default::default()),
             mounter: Arc::new(RealMounter),
             mount_detector: Arc::new(RealMountDetector),
@@ -181,7 +183,7 @@ mod tests {
             "tmpfs",
             "/nonexistent/emptydir/mountpoint",
             "tmpfs",
-            &["mode=0777".to_string()],
+            &[],
         );
         assert!(r.is_err());
     }
@@ -463,6 +465,8 @@ mod tests {
     #[test]
     fn attributes_are_writable_managed_relabel() {
         let m = EmptyDirMounter {
+            size_limit: 0,
+            plugin_dir: String::new(),
             pod: Pod::new("p", Default::default()),
             mounter: Arc::new(RealMounter),
             mount_detector: Arc::new(RealMountDetector),
@@ -489,6 +493,8 @@ mod tests {
     fn mounter_in(root: &str) -> EmptyDirMounter {
         let p = plugin_in(root);
         EmptyDirMounter {
+            size_limit: 0,
+            plugin_dir: String::new(),
             pod: Pod::new("p", Default::default()),
             mounter: Arc::new(RealMounter),
             mount_detector: Arc::new(RealMountDetector),
@@ -739,6 +745,8 @@ mod tests {
     ) -> (EmptyDirMounter, Arc<RecordingMount>) {
         let rec = Arc::new(RecordingMount::default());
         let m = EmptyDirMounter {
+            size_limit: 0,
+            plugin_dir: String::new(),
             pod,
             mounter: rec.clone(),
             mount_detector: Arc::new(detector),
