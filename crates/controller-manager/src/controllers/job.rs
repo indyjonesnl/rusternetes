@@ -1294,23 +1294,26 @@ impl<S: Storage + 'static> JobController<S> {
             }
         }
 
+        // `PatchPod(ctx, ns, name, removeTrackingFinalizerPatch(pod))` ignoring
+        // NotFound (`job_controller.go:1954-1965`, `:765-769`;
+        // `RealPodControl.PatchPod`, controller_utils.go:557). The strategic
+        // `$deleteFromPrimitiveList` patch is a delta on the LIVE pod, so a
+        // concurrent kubelet status write cannot conflict with it.
         let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-        let mut fresh = match self.storage.get::<Pod>(&pod_key).await {
-            Ok(p) => p,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        if !remove_tracking_finalizer(&mut fresh) {
-            return Ok(());
-        }
-        // `PatchPod` ignoring NotFound (`:765-769`); the full-object update is
-        // CAS'd on resourceVersion, so a Conflict with a concurrent kubelet
-        // status write errors out and is retried by the rate-limited queue.
-        match self.storage.update(&pod_key, &fresh).await {
+        let patch = serde_json::json!({
+            "metadata": {
+                "$deleteFromPrimitiveList/finalizers": [JOB_TRACKING_FINALIZER],
+            }
+        });
+        match self
+            .storage
+            .patch_strategic_merge::<Pod>(&pod_key, &patch)
+            .await
+        {
             Ok(_) => {
                 debug!(
                     "Released orphan pod {}/{} from the job-tracking finalizer",
-                    namespace, fresh.metadata.name
+                    namespace, pod.metadata.name
                 );
                 Ok(())
             }

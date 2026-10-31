@@ -212,11 +212,10 @@ pub trait Storage: Send + Sync {
     /// caller's stale read. API-backed storage overrides this to send a real
     /// `PATCH` with `Content-Type: application/strategic-merge-patch+json` so
     /// the api-server applies it. Direct backends have no schema at this layer,
-    /// so the default re-reads, applies an RFC 7386 JSON merge (objects merge
-    /// recursively, lists replace) and writes with the fresh resourceVersion,
-    /// retrying on [`Error::Conflict`] (upstream `GuaranteedUpdate`). Deviation:
-    /// lists with `patchStrategy:"merge"` are replaced rather than unioned;
-    /// callers must only patch lists they own (podCIDRs is guarded empty).
+    /// so the default re-reads, applies the shared strategic-merge applier
+    /// (`rusternetes_common::patch`, merge keys and `$deleteFromPrimitiveList`
+    /// directives included) and writes with the fresh resourceVersion,
+    /// retrying on [`Error::Conflict`] (upstream `GuaranteedUpdate`).
     async fn patch_strategic_merge<T>(&self, key: &str, patch: &serde_json::Value) -> Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
@@ -746,26 +745,6 @@ pub enum WatchEvent {
 /// Stream of watch events
 pub type WatchStream = futures::stream::BoxStream<'static, Result<WatchEvent>>;
 
-/// RFC 7386 JSON merge: objects merge recursively, `null` deletes, anything
-/// else replaces.
-fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    let serde_json::Value::Object(p) = patch else {
-        *target = patch.clone();
-        return;
-    };
-    if !target.is_object() {
-        *target = serde_json::Value::Object(Default::default());
-    }
-    let t = target.as_object_mut().expect("just made an object");
-    for (k, v) in p {
-        if v.is_null() {
-            t.remove(k);
-        } else {
-            json_merge_patch(t.entry(k.clone()).or_insert(serde_json::Value::Null), v);
-        }
-    }
-}
-
 /// Body of the default [`Storage::patch_strategic_merge`].
 async fn patch_via_update<S, T>(storage: &S, key: &str, patch: &serde_json::Value) -> Result<T>
 where
@@ -791,13 +770,24 @@ where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
+    use rusternetes_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
         let mut current: serde_json::Value = storage.get(key).await?;
         if let Some(p) = preconditions {
             p.check(key, &current)?;
         }
-        json_merge_patch(&mut current, patch);
+        // `strategicPatchObject` (apiserver endpoints/handlers/patch.go): the
+        // shared strategic-merge applier, so merge-keyed lists union and
+        // `$deleteFromPrimitiveList/<key>` removes values, as on a real PATCH.
+        let schema = PatchSchema::for_object(&current);
+        current = apply_patch_with_schema(
+            &current,
+            patch,
+            PatchType::StrategicMergePatch,
+            schema.as_ref(),
+        )
+        .map_err(|e| Error::InvalidResource(format!("invalid patch for {key}: {e}")))?;
         match storage.update::<serde_json::Value>(key, &current).await {
             Ok(updated) => return serde_json::from_value(updated).map_err(Error::Serialization),
             Err(Error::Conflict(_)) if attempt + 1 < MAX_ATTEMPTS => continue,

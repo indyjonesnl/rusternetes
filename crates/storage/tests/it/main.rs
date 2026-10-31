@@ -11,6 +11,7 @@ mod apply_direct_backend_fieldmanager;
 mod etcd_unix_socket;
 mod event_bus_integration;
 mod patch_status_direct_backend;
+mod patch_strategic_merge_direct_backend;
 mod rhino_bus_test;
 mod rhino_bus_ttl_test;
 mod rhino_busy_contention_test;
