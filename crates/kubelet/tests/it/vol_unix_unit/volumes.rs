@@ -68,7 +68,7 @@ mod projected_mode_tests {
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
 
         let file = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
@@ -229,7 +229,7 @@ mod projected_mode_tests {
     }
 
     /// #1652 regression: re-projecting an UNCHANGED ConfigMap volume (via
-    /// `refresh_volumes` on every sync AND `resync_volumes`) must be a true
+    /// the re-`SetUp` the reconciler does on every sync) must be a true
     /// no-op — it must NOT rewrite the user-visible file in place through the
     /// AtomicWriter `..data` symlink. An in-place rewrite bumps the real file's
     /// ctime and fires an fsnotify Write, which crash-loops a config watcher
@@ -304,8 +304,8 @@ mod projected_mode_tests {
 
         // Re-project the UNCHANGED ConfigMap through BOTH sync-loop paths repeatedly.
         for _ in 0..3 {
-            vm.refresh_volumes(&pod).await.unwrap();
-            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+            vm.create_pod_volumes(&pod).await.unwrap();
+            vm.create_pod_volumes(&pod).await.unwrap();
         }
 
         // The user-visible file must still be a symlink, the real inode's ctime
@@ -345,7 +345,7 @@ mod projected_mode_tests {
     }
 
     /// Drives a volume through the initial mount then repeated
-    /// `refresh_volumes` + `resync_volumes`, asserting the visible file stays
+    /// a second `create_pod_volumes` (the reconciler's remount), asserting the visible file stays
     /// an AtomicWriter symlink and its real inode is never rewritten (#1656).
     #[cfg(unix)]
     async fn assert_reproject_is_noop(
@@ -394,8 +394,8 @@ mod projected_mode_tests {
         let ctime_before = std::fs::metadata(&real).unwrap().ctime();
         let link_before = std::fs::read_link(dir.join("..data")).unwrap();
         for _ in 0..3 {
-            vm.refresh_volumes(&pod).await.unwrap();
-            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+            vm.create_pod_volumes(&pod).await.unwrap();
+            vm.create_pod_volumes(&pod).await.unwrap();
         }
         assert!(std::fs::symlink_metadata(&visible)
             .unwrap()
@@ -411,7 +411,7 @@ mod projected_mode_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// #1656: Secret re-projection (`refresh_volumes` + `resync_volumes`) must
+    /// #1656: Secret re-projection (a re-`SetUp`) must
     /// be a true no-op, like ConfigMap.
     #[cfg(unix)]
     #[tokio::test]
@@ -440,7 +440,7 @@ mod projected_mode_tests {
         .await;
     }
 
-    /// #2390: the projected branch of `resync_volumes` must re-project through
+    /// #2390: re-`SetUp` of a projected volume must re-project through
     /// the AtomicWriter like the initial mount (`projected.go:208-221`) --
     /// never write through the `..data` symlinks. Unchanged => zero fs changes
     /// (ctime of every real file and the `..data` target untouched, bound SA
@@ -523,7 +523,7 @@ mod projected_mode_tests {
         let link_before = std::fs::read_link(dir.join("..data")).unwrap();
         let token_before = std::fs::read(dir.join("token")).unwrap();
         for _ in 0..3 {
-            vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+            vm.create_pod_volumes(&pod).await.unwrap();
         }
         assert_eq!(
             before,
@@ -553,7 +553,7 @@ mod projected_mode_tests {
         )
         .await
         .unwrap();
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
         assert_ne!(link_before, std::fs::read_link(dir.join("..data")).unwrap());
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "changed");
         assert!(std::fs::symlink_metadata(dir.join("b")).is_err());
@@ -604,8 +604,8 @@ mod projected_mode_tests {
         .join("token");
         let before = std::fs::read(&token).unwrap();
         assert_eq!(before, b"static-unbound", "stored token projected verbatim");
-        vm.refresh_volumes(&pod).await.unwrap();
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
         assert_eq!(std::fs::read(&token).unwrap(), before);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -687,7 +687,7 @@ mod projected_mode_tests {
             Some(storage.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
 
         let mapped = volume_dir.join("new-path-data-1");
         assert_eq!(std::fs::read(&mapped).unwrap(), b"value-1");
@@ -1234,7 +1234,7 @@ mod projected_mode_tests {
     }
 }
 
-/// #1620: `resync_volumes` / `refresh_volumes` must not run `std::fs` on an
+/// #1620: `create_pod_volumes` (also the remount) must not run `std::fs` on an
 /// async worker. Upstream runs each volume operation in its own goroutine
 /// (`pkg/kubelet/volumemanager/reconciler/reconciler_common.go` ->
 /// `operationexecutor`), never inline in the loop that serves everything else.
@@ -1332,28 +1332,15 @@ mod blocking_fs_offload_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn resync_volumes_does_not_block_the_runtime() {
-        let (vm, pod, storage, fifo) = setup("resync").await;
+    async fn create_pod_volumes_does_not_block_the_runtime() {
+        let (vm, pod, _storage, fifo) = setup("resync").await;
         let ticks = ticks_while_blocked(fifo, async move {
-            let _ = vm.resync_volumes(&pod, storage.as_ref()).await;
+            let _ = vm.create_pod_volumes(&pod).await;
         })
         .await;
         assert!(
             ticks >= 5,
-            "runtime starved by blocking fs in resync_volumes: {ticks} ticks in 300ms"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn refresh_volumes_does_not_block_the_runtime() {
-        let (vm, pod, _storage, fifo) = setup("refresh").await;
-        let ticks = ticks_while_blocked(fifo, async move {
-            let _ = vm.refresh_volumes(&pod).await;
-        })
-        .await;
-        assert!(
-            ticks >= 5,
-            "runtime starved by blocking fs in refresh_volumes: {ticks} ticks in 300ms"
+            "runtime starved by blocking fs in create_pod_volumes: {ticks} ticks in 300ms"
         );
     }
 }
@@ -1432,7 +1419,7 @@ mod pod_certificate_resync_tests {
         );
 
         // An unchanged bundle must keep every file.
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
         assert_eq!(std::fs::read(format!("{path}/key.pem")).unwrap(), b"key1\n");
         assert_eq!(
             std::fs::read(format!("{path}/chain.pem")).unwrap(),
@@ -1441,7 +1428,7 @@ mod pod_certificate_resync_tests {
 
         // Rotate: the manager now hands out a new bundle.
         *mgr.0.lock().unwrap() = (b"key2\n".to_vec(), b"cert2\n".to_vec());
-        vm.resync_volumes(&pod, storage.as_ref()).await.unwrap();
+        vm.create_pod_volumes(&pod).await.unwrap();
         assert_eq!(std::fs::read(format!("{path}/key.pem")).unwrap(), b"key2\n");
         assert_eq!(
             std::fs::read(format!("{path}/chain.pem")).unwrap(),
@@ -1508,10 +1495,7 @@ mod pod_certificate_resync_tests {
         };
         let volume = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap()[0].clone();
         mk(ok).create_volume(&pod, &volume).await.unwrap();
-        mk(Arc::new(Failing))
-            .resync_volumes(&pod, storage.as_ref())
-            .await
-            .unwrap();
+        let _ = mk(Arc::new(Failing)).create_pod_volumes(&pod).await;
         assert_eq!(std::fs::read(dir.join("key.pem")).unwrap(), b"k\n");
     }
 }

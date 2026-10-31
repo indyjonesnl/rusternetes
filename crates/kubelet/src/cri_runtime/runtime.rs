@@ -3021,38 +3021,6 @@ impl CriContainerRuntime {
         }
     }
 
-    /// Refresh a pod's volumes (re-render configMap/secret/projected content).
-    /// No-op when no VolumeManager is attached.
-    pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {
-        if let Some(vm) = self.volumes.as_ref() {
-            vm.refresh_volumes(pod)
-                .await
-                .map_err(|source| CriRuntimeError::Volumes {
-                    pod: pod.metadata.name.clone(),
-                    source,
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Re-provision a pod's volumes from storage (e.g. after a kubelet restart).
-    /// No-op when no VolumeManager is attached.
-    pub async fn resync_volumes<S: rusternetes_storage::Storage>(
-        &self,
-        pod: &Pod,
-        storage: &S,
-    ) -> Result<()> {
-        if let Some(vm) = self.volumes.as_ref() {
-            vm.resync_volumes(pod, storage)
-                .await
-                .map_err(|source| CriRuntimeError::Volumes {
-                    pod: pod.metadata.name.clone(),
-                    source,
-                })?;
-        }
-        Ok(())
-    }
-
     /// Stop and remove every sandbox for `(namespace, name)`; removing a
     /// sandbox tears down its containers. Removes all matches (a pod can have a
     /// stale sandbox alongside a new one), so it is also a no-op when none

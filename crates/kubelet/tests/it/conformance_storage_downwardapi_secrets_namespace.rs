@@ -5,7 +5,7 @@
 //! `release-1.35`.
 //!
 //! Every spec here drives the REAL kubelet volume code
-//! (`VolumeManager::create_pod_volumes` / `resync_volumes` in
+//! (`VolumeManager::create_pod_volumes`, whose re-run is the reconciler's remount, in
 //! `crates/kubelet/src/volumes.rs`, which dispatch to the downwardAPI volume
 //! plugin and the AtomicWriter) against a memory-backed API and a
 //! `tempfile::TempDir` kubelet root, then asserts on the files the container
@@ -37,7 +37,6 @@ use serde_json::{json, Value};
 struct Node {
     _root: tempfile::TempDir,
     vm: VolumeManager,
-    api: Arc<StorageBackend>,
 }
 
 impl Node {
@@ -53,11 +52,7 @@ impl Node {
             Some(api.clone()),
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        Self {
-            _root: root,
-            vm,
-            api,
-        }
+        Self { _root: root, vm }
     }
 
     /// The kubelet's volume setup for the pod.
@@ -67,10 +62,7 @@ impl Node {
 
     /// The kubelet's periodic volume resync.
     async fn resync(&self, pod: &Pod) {
-        self.vm
-            .resync_volumes(pod, self.api.as_ref())
-            .await
-            .unwrap();
+        self.vm.create_pod_volumes(pod).await.unwrap();
     }
 }
 
