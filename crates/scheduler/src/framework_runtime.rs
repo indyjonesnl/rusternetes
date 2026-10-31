@@ -20,7 +20,7 @@
 use crate::fwk::{CycleState, FilterPlugin, NodeInfo, Status};
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
-use rusternetes_common::resources::Pod;
+use rusternetes_common::resources::{Node, Pod};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -556,6 +556,33 @@ impl Framework {
             }
         }
         Status::success()
+    }
+
+    /// `RunFilterPluginsWithNominatedPods` (framework.go:1145-1190): the
+    /// filters run twice when the node has nominated pods of greater or equal
+    /// priority. First with those pods added to the node (so the pod yields to
+    /// them), and, if that passes, again without them (some filters, such as
+    /// inter-pod affinity, may not pass without the nominated pods).
+    /// `nominated` is `addGENominatedPods`'s selection.
+    pub async fn run_filter_plugins_with_nominated_pods(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node: &Node,
+        all_pods: &[Pod],
+        nominated: Vec<&Pod>,
+    ) -> Status {
+        let pods_added = !nominated.is_empty();
+        let info = NodeInfo::new(node, all_pods).with_added_pods(nominated);
+        let status = self.run_filter_plugins(state, pod, &info).await;
+        if !status.is_success() && !status.is_rejected() {
+            return status;
+        }
+        if !pods_added || !status.is_success() {
+            return status;
+        }
+        self.run_filter_plugins(state, pod, &NodeInfo::new(node, all_pods))
+            .await
     }
 
     /// `EnqueueExtensions` (framework.go:736-738): plugin names whose
