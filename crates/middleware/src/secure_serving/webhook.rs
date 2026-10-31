@@ -77,6 +77,8 @@ pub struct ReviewError {
     pub message: String,
     /// `utilnet.IsConnectionReset`.
     pub connection_reset: bool,
+    /// `utilnet.IsHTTP2ConnectionLost`.
+    pub http2_connection_lost: bool,
     /// `apierrors.SuggestsClientDelay`.
     pub suggests_client_delay: bool,
 }
@@ -95,6 +97,7 @@ pub fn default_should_retry(err: &ReviewError) -> bool {
     // IsTimeout || IsTooManyRequests, then SuggestsClientDelay.
     let unknown = !rusternetes_client::api_status::KNOWN_REASONS.contains(&err.reason.as_str());
     err.connection_reset
+        || err.http2_connection_lost
         // IsInternalError (errors.go:711-720)
         || err.reason == "InternalError"
         || (unknown && err.status_code == 500)
@@ -169,21 +172,28 @@ impl ReviewClient for ApiClientReviewClient {
     async fn create(&self, path: &str, review: &Value) -> Result<Value, ReviewError> {
         match self.0.post::<Value, Value>(path, review).await {
             Ok(v) => Ok(v),
-            Err(e) => {
-                let (reason, code) = rusternetes_client::api_status::reason_and_code_for_error(&e);
-                let connection_reset = e.chain().any(|c| {
-                    c.downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionReset)
-                        || c.to_string().contains("connection reset")
-                });
-                Err(ReviewError {
-                    status_code: code,
-                    reason,
-                    message: format!("{e:#}"),
-                    connection_reset,
-                    suggests_client_delay: false,
-                })
-            }
+            Err(e) => Err(review_error_from(&e)),
         }
+    }
+}
+
+/// Classifies a failed `Create` the way `DefaultShouldRetry` reads it
+/// (`reasonAndCodeForError`, `IsConnectionReset`, `IsHTTP2ConnectionLost`,
+/// `SuggestsClientDelay`; webhook.go:63-73).
+pub fn review_error_from(e: &anyhow::Error) -> ReviewError {
+    use rusternetes_client::api_status;
+    let (reason, code) = api_status::reason_and_code_for_error(e);
+    let connection_reset = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionReset)
+            || c.to_string().contains("connection reset")
+    });
+    ReviewError {
+        status_code: code,
+        reason,
+        message: format!("{e:#}"),
+        connection_reset,
+        http2_connection_lost: api_status::is_http2_connection_lost(e),
+        suggests_client_delay: api_status::suggests_client_delay(e).is_some(),
     }
 }

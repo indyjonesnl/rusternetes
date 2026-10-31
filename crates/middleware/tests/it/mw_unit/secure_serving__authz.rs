@@ -277,6 +277,7 @@ mod tests {
                     .into(),
                     message: format!("status {status}"),
                     connection_reset: false,
+                    http2_connection_lost: false,
                     suggests_client_delay: false,
                 });
             }
