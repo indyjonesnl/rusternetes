@@ -224,6 +224,7 @@ impl PreFilterResult {
 pub struct NodeInfo<'a> {
     node: &'a Node,
     all_pods: &'a [Pod],
+    all_nodes: &'a [Node],
     added: Vec<&'a Pod>,
 }
 
@@ -232,8 +233,27 @@ impl<'a> NodeInfo<'a> {
         Self {
             node,
             all_pods,
+            all_nodes: &[],
             added: Vec::new(),
         }
+    }
+
+    /// The cycle's node snapshot, for plugins that look across nodes
+    /// (`SnapshotSharedLister().NodeInfos()` upstream).
+    pub fn with_all_nodes(mut self, nodes: &'a [Node]) -> Self {
+        self.all_nodes = nodes;
+        self
+    }
+
+    /// Every node of the cycle's snapshot (empty unless set with
+    /// [`NodeInfo::with_all_nodes`]).
+    pub fn all_nodes(&self) -> &'a [Node] {
+        self.all_nodes
+    }
+
+    /// Every pod of the cycle's snapshot, bound to any node.
+    pub fn all_pods(&self) -> &'a [Pod] {
+        self.all_pods
     }
 
     /// A node info with `pods` added, as `nodeInfo.AddPod` for each.

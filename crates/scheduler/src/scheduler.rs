@@ -9,10 +9,7 @@ use rusternetes_storage::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::advanced::{
-    check_node_affinity, check_pod_affinity, check_pod_anti_affinity, check_taints_tolerations,
-    check_topology_spread_constraints, parse_resource_quantity,
-};
+use crate::advanced::{check_node_affinity, check_taints_tolerations, parse_resource_quantity};
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
@@ -1622,8 +1619,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
 
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
-        let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
-        let spread_filter_on = filter_on(names::POD_TOPOLOGY_SPREAD);
         // VolumeBinding Filter (FindPodVolumes) — bound PV node affinity,
         // matching/provisionable unbound WaitForFirstConsumer claims.
         let volume_filter = match &volume_ctx {
@@ -1693,6 +1688,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             pod,
                             node,
                             all_pods,
+                            nodes,
                             nominated_pods_for_node(&node.metadata.name),
                         )
                         .await;
@@ -1796,26 +1792,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             }
                         }
                     }
-                    // Pod affinity (hard requirements and scoring)
-                    let (pod_affinity_ok, _) = check_pod_affinity(node, pod, all_pods, nodes);
-                    if inter_pod_filter_on && !pod_affinity_ok {
-                        diag.add_plugin_status(names::INTER_POD_AFFINITY);
-                        return None;
-                    }
-                    // Pod anti-affinity (hard requirements and penalty scoring)
-                    let (pod_anti_affinity_ok, _) =
-                        check_pod_anti_affinity(node, pod, all_pods, nodes);
-                    if inter_pod_filter_on && !pod_anti_affinity_ok {
-                        diag.add_plugin_status(names::INTER_POD_AFFINITY);
-                        return None;
-                    }
-                    // Topology spread constraints (hard requirements and penalty scoring)
-                    let (topology_ok, _) =
-                        check_topology_spread_constraints(node, pod, all_pods, nodes);
-                    if spread_filter_on && !topology_ok {
-                        diag.add_plugin_status(names::POD_TOPOLOGY_SPREAD);
-                        return None;
-                    }
+                    // InterPodAffinity and PodTopologySpread Filters are
+                    // plugin objects (run above).
                     Some(NodeEval {
                         node,
                         node_affinity_score,

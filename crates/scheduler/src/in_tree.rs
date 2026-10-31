@@ -30,6 +30,8 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
         names::NODE_NAME => Some(Arc::new(NodeName)),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
+        names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         _ => None,
     }
@@ -572,5 +574,104 @@ impl NodeResourcesFit {
             Code::Unschedulable
         };
         Status::new(code, insufficient.into_iter().map(|(r, _)| r).collect())
+    }
+}
+
+/// `podtopologyspread.ErrReasonConstraintsNotMatch` (plugin.go:41).
+pub const ERR_REASON_CONSTRAINTS_NOT_MATCH: &str =
+    "node(s) didn't match pod topology spread constraints";
+
+/// `podtopologyspread.PodTopologySpread` Filter
+/// (`plugins/podtopologyspread/filtering.go:309-358`): a node violating a
+/// `DoNotSchedule` constraint is Unschedulable.
+///
+/// Deviations: the skew is recomputed per node by
+/// [`crate::advanced::check_topology_spread_constraints`] instead of from
+/// PreFilter-computed `preFilterState` (:150-280); the node-label-missing
+/// UnschedulableAndUnresolvable case (`ErrReasonNodeLabelNotMatch`) is not
+/// distinguished; nominated pods are not counted. PreFilter, the
+/// default-constraints args and `PreFilterExtensions` (preemption what-if)
+/// are not ported.
+pub struct PodTopologySpread;
+
+impl Plugin for PodTopologySpread {
+    fn name(&self) -> &'static str {
+        names::POD_TOPOLOGY_SPREAD
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for PodTopologySpread {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        if pod.spec.is_none() {
+            return Status::success();
+        }
+        let (ok, _) = crate::advanced::check_topology_spread_constraints(
+            node_info.node(),
+            pod,
+            node_info.all_pods(),
+            node_info.all_nodes(),
+        );
+        if ok {
+            return Status::success();
+        }
+        Status::new(
+            Code::Unschedulable,
+            vec![ERR_REASON_CONSTRAINTS_NOT_MATCH.to_string()],
+        )
+    }
+}
+
+/// `interpodaffinity.ErrReasonAffinityRulesNotMatch` (filtering.go:39).
+pub const ERR_REASON_AFFINITY_RULES_NOT_MATCH: &str = "node(s) didn't match pod affinity rules";
+/// `interpodaffinity.ErrReasonAntiAffinityRulesNotMatch` (filtering.go:41).
+pub const ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH: &str =
+    "node(s) didn't match pod anti-affinity rules";
+
+/// `interpodaffinity.InterPodAffinity` Filter (filtering.go:410-432): required
+/// pod affinity unmet is UnschedulableAndUnresolvable, required pod
+/// anti-affinity violated is Unschedulable.
+///
+/// Deviations: the terms are evaluated per node by
+/// [`crate::advanced::check_pod_affinity`] /
+/// `check_pod_anti_affinity` instead of PreFilter-computed topology counts
+/// (:150-260); existing pods' anti-affinity against the incoming pod
+/// (`ErrReasonExistingAntiAffinityRulesNotMatch`) is not checked; nominated
+/// pods are not counted. PreFilter, namespace selectors' defaulting and
+/// `PreFilterExtensions` are not ported.
+pub struct InterPodAffinity;
+
+impl Plugin for InterPodAffinity {
+    fn name(&self) -> &'static str {
+        names::INTER_POD_AFFINITY
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for InterPodAffinity {
+    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        if pod.spec.is_none() {
+            return Status::success();
+        }
+        let (node, pods, nodes) = (
+            node_info.node(),
+            node_info.all_pods(),
+            node_info.all_nodes(),
+        );
+        let (affinity_ok, _) = crate::advanced::check_pod_affinity(node, pod, pods, nodes);
+        if !affinity_ok {
+            return Status::new(
+                Code::UnschedulableAndUnresolvable,
+                vec![ERR_REASON_AFFINITY_RULES_NOT_MATCH.to_string()],
+            );
+        }
+        let (anti_ok, _) = crate::advanced::check_pod_anti_affinity(node, pod, pods, nodes);
+        if !anti_ok {
+            return Status::new(
+                Code::Unschedulable,
+                vec![ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH.to_string()],
+            );
+        }
+        Status::success()
     }
 }

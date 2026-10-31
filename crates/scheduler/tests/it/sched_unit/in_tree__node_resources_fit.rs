@@ -178,13 +178,27 @@ async fn nominated_pods_reserve_space_in_the_first_pass_only() {
     let all = vec![nominee.clone()];
 
     let with = fw
-        .run_filter_plugins_with_nominated_pods(&state, &candidate, &n, &all, vec![&nominee])
+        .run_filter_plugins_with_nominated_pods(
+            &state,
+            &candidate,
+            &n,
+            &all,
+            std::slice::from_ref(&n),
+            vec![&nominee],
+        )
         .await;
     assert!(with.is_rejected(), "the nominee's space is reserved");
     assert_eq!(with.plugin(), "NodeResourcesFit");
 
     let without = fw
-        .run_filter_plugins_with_nominated_pods(&state, &candidate, &n, &all, vec![])
+        .run_filter_plugins_with_nominated_pods(
+            &state,
+            &candidate,
+            &n,
+            &all,
+            std::slice::from_ref(&n),
+            vec![],
+        )
         .await;
     assert!(without.is_success());
 }
