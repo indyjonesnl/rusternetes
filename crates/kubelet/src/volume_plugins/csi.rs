@@ -1614,6 +1614,36 @@ pub fn is_resource_exhaust_error(attachment: Option<&VolumeAttachment>) -> bool 
 }
 
 impl CsiPlugin {
+    /// Whether the volume's `VolumeAttachment` for this node reports
+    /// `status.attached`: the kubelet-side of the attach the controller does,
+    /// which upstream reads from `node.status.volumesAttached`
+    /// (`GenerateVerifyControllerAttachedVolumeFunc`,
+    /// `operation_generator.go:1396-1409`), the list the attach/detach
+    /// controller fills from the same attachments.
+    pub async fn is_volume_attached(&self, spec: &Spec<'_>, node_name: &str) -> Result<bool> {
+        let Some(csi) = spec.persistent_volume.and_then(|pv| pv.spec.csi.as_ref()) else {
+            return Ok(true);
+        };
+        let Some(storage) = self.host.get_kube_client() else {
+            return Ok(true);
+        };
+        let attachment_name = get_attachment_name(
+            csi.volume_handle.as_deref().unwrap_or_default(),
+            &csi.driver,
+            node_name,
+        );
+        match storage
+            .get::<VolumeAttachment>(&build_key("volumeattachments", None, &attachment_name))
+            .await
+        {
+            Ok(a) => Ok(a.status.is_some_and(|s| s.attached)),
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(false),
+            Err(e) => Err(anyhow!(
+                "failed to get volume attachment {attachment_name}: {e}"
+            )),
+        }
+    }
+
     /// Port of `VerifyExhaustedResource` (`csi_plugin.go:192-232`): true when
     /// the volume's VolumeAttachment reports a `ResourceExhausted` attach
     /// error, after refreshing the CSINode allocatable count

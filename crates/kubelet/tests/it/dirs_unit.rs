@@ -11,6 +11,7 @@ mod fsquota;
 mod fsquota__common;
 mod node_ip__net_interface;
 mod podcertificate__wiring;
+mod volume_manager__attach_limit;
 mod volume_manager__cache__actual_state_of_world;
 mod volume_manager__cache__desired_state_of_world;
 mod volume_manager__cache__desired_state_of_world_selinux_metrics;

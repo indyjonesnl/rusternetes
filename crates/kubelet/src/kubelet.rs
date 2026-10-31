@@ -4210,6 +4210,33 @@ impl Kubelet {
                         Err(e) => {
                             let err_msg = e.to_string();
 
+                            // `kubelet.go:2126-2131`: the node has no room to attach the
+                            // pod's volumes, so the pod is rejected (`rejectPod`: a
+                            // warning event, then Failed with "Pod was rejected: ...").
+                            if let Some(limit) = crate::lifecycle::volume_attach_limit_error(&e) {
+                                let reason =
+                                    crate::volume_manager::VOLUME_ATTACHMENT_LIMIT_EXCEEDED_REASON;
+                                let message = limit.to_string();
+                                warn!("Pod {}/{} rejected: {}", namespace, pod_name, message);
+                                crate::volume_plugins::util::node_expander::record_event(
+                                    &self.node_event_recorder,
+                                    &crate::events::pod_object_reference(pod),
+                                    Some(&self.node_name),
+                                    rusternetes_common::resources::EventType::Warning,
+                                    reason,
+                                    &message,
+                                )
+                                .await;
+                                self.update_pod_status(
+                                    pod,
+                                    Phase::Failed,
+                                    Some(reason),
+                                    Some(&format!("Pod was rejected: {message}")),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+
                             // K8s retries volume mounting when a volume source
                             // isn't ready yet (Secret/ConfigMap not created, or a
                             // PersistentVolumeClaim that doesn't exist / isn't
