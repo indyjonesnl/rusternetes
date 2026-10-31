@@ -710,3 +710,52 @@ async fn a_job_is_never_written_finished_while_uids_are_still_uncounted() {
         "the Job must still end up Failed"
     );
 }
+
+/// `enqueueOrphanPod` only enqueues (`job_controller.go:630-641`): the shared
+/// informer task must not do storage round trips. The orphanWorker
+/// (`processNextOrphanPod`, `:669-686`) / `syncOrphanPod` (`:691-708`) then
+/// strips the finalizer, and a pod that is already gone is not an error.
+#[tokio::test]
+async fn orphan_pod_enqueues_and_the_worker_step_releases_it() {
+    use rusternetes_controller_manager::controllers::pod_informer::PodEventTarget;
+
+    let storage = setup().await;
+    let job = make_job("orphanq", "default", 1, 1);
+    let job_key = build_key("jobs", Some("default"), "orphanq");
+    storage.create(&job_key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+    let pod = job_pods(&storage, "default").await.remove(0);
+    storage.delete(&job_key).await.unwrap();
+
+    controller.orphan_pod("default", &pod.metadata.name).await;
+    assert_eq!(controller.orphan_queue.len().await, 1);
+    let still: Pod = storage
+        .get(&build_key("pods", Some("default"), &pod.metadata.name))
+        .await
+        .unwrap();
+    assert!(
+        still
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|x| x == JOB_TRACKING_FINALIZER)),
+        "enqueueing must not release the pod inline"
+    );
+
+    let key = controller.orphan_queue.get().await.unwrap();
+    controller.sync_orphan_pod(&key).await.unwrap();
+    controller.orphan_queue.done(&key).await;
+    let released: Pod = storage
+        .get(&build_key("pods", Some("default"), &pod.metadata.name))
+        .await
+        .unwrap();
+    assert!(!released
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|x| x == JOB_TRACKING_FINALIZER)));
+
+    // A pod deleted meanwhile is "Orphan pod has been deleted": no error.
+    controller.sync_orphan_pod("default/nope").await.unwrap();
+}

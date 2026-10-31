@@ -28,8 +28,7 @@ use tracing::{debug, error, info, warn};
 /// Upstream `ConcurrentJobSyncs` default, workers launched by `Run`
 /// (pkg/controller/job/config/v1alpha1/defaults.go:34;
 /// pkg/controller/job/job_controller.go:268-270). Upstream also starts one
-/// `orphanWorker` per worker (:272); that sweep is `reconcile_orphan_pods`
-/// here and is unchanged.
+/// `orphanWorker` per worker (:272): see `orphan_queue` / `orphan_worker`.
 const CONCURRENT_JOB_SYNCS: usize = 5;
 
 /// `MaxPodCreateDeletePerSync` (`job_controller.go:79`): "the maximum number of
@@ -66,6 +65,12 @@ pub struct JobController<S: Storage> {
     /// handlers (`job_controller.go:213-224`, `:319-492`) this controller
     /// registers on: [`PodEventTarget`] below.
     pub pod_informer: Arc<SharedPodInformer<S>>,
+    /// Upstream `jm.orphanQueue` (`job_controller.go:140`): `"namespace/name"`
+    /// keys of pods holding the tracking finalizer with no Job able to account
+    /// for them. The pod event handlers only `Add` here (`enqueueOrphanPod`,
+    /// `:630-641`) so the shared informer task never blocks on storage round
+    /// trips; `orphan_worker` does the work and requeues rate-limited on error.
+    pub orphan_queue: WorkQueue,
 }
 
 /// `SyncJobBatchPeriod` (`job_controller.go:64`).
@@ -425,14 +430,13 @@ impl<S: Storage + 'static> PodEventTarget for JobController<S> {
 
     /// `enqueueOrphanPod` -> `syncOrphanPod` -> `handleSingleOrphanPod`
     /// (`job_controller.go:688-766`).
+    ///
+    /// Only enqueues (`enqueueOrphanPod`, `job_controller.go:630-641`); the
+    /// work happens in [`JobController::orphan_worker`].
     async fn orphan_pod(&self, namespace: &str, pod_name: &str) {
-        if let Ok(pod) = self
-            .storage
-            .get::<Pod>(&build_key("pods", Some(namespace), pod_name))
-            .await
-        {
-            self.release_if_orphan(&pod).await;
-        }
+        self.orphan_queue
+            .add(format!("{namespace}/{pod_name}"))
+            .await;
     }
 }
 
@@ -457,6 +461,7 @@ impl<S: Storage + 'static> JobController<S> {
             finalizer_expectations: FinalizerExpectations::new(),
             requeue_delays: std::sync::Mutex::new(HashMap::new()),
             backoff_store: BackoffStore::default(),
+            orphan_queue: WorkQueue::new(),
         }
     }
 
@@ -989,6 +994,14 @@ impl<S: Storage + 'static> JobController<S> {
             }
         });
 
+        // Upstream starts one `orphanWorker` per sync worker (:272).
+        spawn_workers(CONCURRENT_JOB_SYNCS, &self.orphan_queue, |orphan_queue| {
+            let worker_self = Arc::clone(&self);
+            async move {
+                worker_self.orphan_worker(orphan_queue).await;
+            }
+        });
+
         // Upstream registers its pod handlers on the shared pod informer
         // (`podInformer.Informer().AddEventHandler`, job_controller.go:213-224)
         // and the informer factory runs the one watch; the first controller to
@@ -1101,6 +1114,37 @@ impl<S: Storage + 'static> JobController<S> {
         }
     }
 
+    /// `orphanWorker` / `processNextOrphanPod` (`job_controller.go:669-686`).
+    async fn orphan_worker(&self, queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            match self.sync_orphan_pod(&key).await {
+                Ok(()) => queue.forget(&key).await,
+                Err(e) => {
+                    error!("Error syncing orphan pod {}: {}", key, e);
+                    queue.requeue_rate_limited(key.clone()).await;
+                }
+            }
+            queue.done(&key).await;
+        }
+    }
+
+    /// `syncOrphanPod` for `OrphanPodKeyKindName` (`job_controller.go:691-708`):
+    /// a pod that is already gone is done, any other read error is retried.
+    pub async fn sync_orphan_pod(&self, key: &str) -> Result<()> {
+        let Some((namespace, name)) = key.split_once('/') else {
+            return Ok(());
+        };
+        match self
+            .storage
+            .get::<Pod>(&build_key("pods", Some(namespace), name))
+            .await
+        {
+            Ok(pod) => self.handle_single_orphan_pod(&pod).await,
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn enqueue_all(&self, queue: &WorkQueue) {
         match self.storage.list::<Job>("/registry/jobs/").await {
             Ok(items) => {
@@ -1151,7 +1195,7 @@ impl<S: Storage + 'static> JobController<S> {
             return;
         };
         for pod in &pods {
-            self.release_if_orphan(pod).await;
+            self.release_orphan_or_requeue(pod).await;
         }
     }
 
@@ -1180,7 +1224,27 @@ impl<S: Storage + 'static> JobController<S> {
             .iter()
             .filter(|p| selector.matches(p.metadata.labels.as_ref()))
         {
-            self.release_if_orphan(pod).await;
+            self.release_orphan_or_requeue(pod).await;
+        }
+    }
+
+    /// `syncOrphanPodsBySelector` (`job_controller.go:745-756`): a pod that
+    /// fails is logged and `enqueueOrphanPod(pod, true)` retries it rate-limited.
+    async fn release_orphan_or_requeue(&self, pod: &Pod) {
+        if let Err(e) = self.handle_single_orphan_pod(pod).await {
+            error!(
+                "syncing orphan pod {}/{} failed: {}",
+                pod.metadata.namespace.as_deref().unwrap_or_default(),
+                pod.metadata.name,
+                e
+            );
+            self.orphan_queue
+                .requeue_rate_limited(format!(
+                    "{}/{}",
+                    pod.metadata.namespace.as_deref().unwrap_or_default(),
+                    pod.metadata.name
+                ))
+                .await;
         }
     }
 
@@ -1188,12 +1252,15 @@ impl<S: Storage + 'static> JobController<S> {
     /// tracking finalizer unless the pod is controlled by something that is not
     /// a batch/v1 Job, or by a live Job that is still counting (or is managed
     /// by an external controller).
-    async fn release_if_orphan(&self, pod: &Pod) {
+    ///
+    /// Errors go back to the caller, which requeues rate-limited
+    /// (`processNextOrphanPod`, `:681-683`; `syncOrphanPodsBySelector`, `:753`).
+    async fn handle_single_orphan_pod(&self, pod: &Pod) -> Result<()> {
         if !has_job_tracking_finalizer(pod) {
-            return;
+            return Ok(());
         }
         let Some(namespace) = pod.metadata.namespace.as_deref() else {
-            return;
+            return Ok(());
         };
         let owner = pod
             .metadata
@@ -1205,7 +1272,7 @@ impl<S: Storage + 'static> JobController<S> {
             // A pod controlled by something that is not a batch/v1 Job is
             // not ours to strip.
             if owner.kind != "Job" || owner.api_version != "batch/v1" {
-                return;
+                return Ok(());
             }
             let job_key = build_key("jobs", Some(namespace), &owner.name);
             if let Ok(job) = self.storage.get::<Job>(&job_key).await {
@@ -1217,33 +1284,38 @@ impl<S: Storage + 'static> JobController<S> {
                         .as_deref()
                         .is_some_and(|m| m != "kubernetes.io/job-controller")
                     {
-                        return;
+                        return Ok(());
                     }
                     // The Job is alive and still counting. Leave it alone.
                     if !job_is_finished(&job) {
-                        return;
+                        return Ok(());
                     }
                 }
             }
         }
 
         let pod_key = build_key("pods", Some(namespace), &pod.metadata.name);
-        let Ok(mut fresh) = self.storage.get::<Pod>(&pod_key).await else {
-            return;
+        let mut fresh = match self.storage.get::<Pod>(&pod_key).await {
+            Ok(p) => p,
+            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
         if !remove_tracking_finalizer(&mut fresh) {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.storage.update(&pod_key, &fresh).await {
-            warn!(
-                "Failed to release orphan pod {}/{} from the job-tracking finalizer: {}",
-                namespace, fresh.metadata.name, e
-            );
-        } else {
-            debug!(
-                "Released orphan pod {}/{} from the job-tracking finalizer",
-                namespace, fresh.metadata.name
-            );
+        // `PatchPod` ignoring NotFound (`:765-769`); the full-object update is
+        // CAS'd on resourceVersion, so a Conflict with a concurrent kubelet
+        // status write errors out and is retried by the rate-limited queue.
+        match self.storage.update(&pod_key, &fresh).await {
+            Ok(_) => {
+                debug!(
+                    "Released orphan pod {}/{} from the job-tracking finalizer",
+                    namespace, fresh.metadata.name
+                );
+                Ok(())
+            }
+            Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
