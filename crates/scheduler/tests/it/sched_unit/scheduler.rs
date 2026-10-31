@@ -918,6 +918,116 @@ mod tests {
         }
     }
 
+    fn pod_pinned_to(names: &[&str]) -> Pod {
+        let mut pod = make_pending_pod("p", "default");
+        pod.spec.as_mut().unwrap().affinity = Some(
+            serde_json::from_value(serde_json::json!({"nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+                    {"matchFields": [{"key": "metadata.name", "operator": "In", "values": names}]}
+                ]}
+            }}))
+            .unwrap(),
+        );
+        pod
+    }
+
+    /// `findNodesThatFitPod` (schedule_one.go:549-562): the NodeAffinity
+    /// PreFilterResult restricts the search to the named node, and the
+    /// restricting plugin is an unschedulable plugin of the cycle.
+    #[tokio::test]
+    async fn pre_filter_result_restricts_the_search() {
+        let nodes: Vec<Node> = (0..5).map(|i| make_node(&format!("node{i}"))).collect();
+        let scheduler = Scheduler::new_with_name(
+            Arc::new(MemoryStorage::new()),
+            1,
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        );
+        let mut diag = Diagnosis::default();
+        let picked = scheduler
+            .select_node_inner(
+                &pod_pinned_to(&["node3"]),
+                &nodes,
+                &[],
+                &HashMap::new(),
+                &mut diag,
+            )
+            .await
+            .expect("node3 fits");
+        assert_eq!(picked.0.metadata.name, "node3");
+        assert!(diag.unschedulable_plugins.contains("NodeAffinity"));
+    }
+
+    /// A PreFilterResult naming no node of the snapshot leaves every node
+    /// absent: "node(s) didn't satisfy plugin(s) [NodeAffinity]".
+    #[tokio::test]
+    async fn pre_filter_result_with_no_existing_node_is_unschedulable() {
+        let nodes: Vec<Node> = (0..3).map(|i| make_node(&format!("node{i}"))).collect();
+        let scheduler = Scheduler::new_with_name(
+            Arc::new(MemoryStorage::new()),
+            1,
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        );
+        let mut diag = Diagnosis::default();
+        let picked = scheduler
+            .select_node_inner(
+                &pod_pinned_to(&["gone"]),
+                &nodes,
+                &[],
+                &HashMap::new(),
+                &mut diag,
+            )
+            .await;
+        assert!(picked.is_none());
+        assert_eq!(
+            rusternetes_scheduler::diagnosis::fit_error_message(nodes.len(), &diag),
+            "0/3 nodes are available: 3 node(s) didn't satisfy plugin(s) [NodeAffinity]."
+        );
+        assert!(diag.unschedulable_plugins.contains("NodeAffinity"));
+    }
+
+    /// Conflicting `metadata.name` requirements are rejected by PreFilter
+    /// itself, with the plugin recorded and no per-node reasons.
+    #[tokio::test]
+    async fn conflicting_pre_filter_rejects_the_pod() {
+        let nodes: Vec<Node> = (0..3).map(|i| make_node(&format!("node{i}"))).collect();
+        let scheduler = Scheduler::new_with_name(
+            Arc::new(MemoryStorage::new()),
+            1,
+            DEFAULT_SCHEDULER_NAME.to_string(),
+        );
+        let mut pod = pod_pinned_to(&["node1"]);
+        pod.spec
+            .as_mut()
+            .unwrap()
+            .affinity
+            .as_mut()
+            .unwrap()
+            .node_affinity
+            .as_mut()
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .as_mut()
+            .unwrap()
+            .node_selector_terms[0]
+            .match_fields
+            .as_mut()
+            .unwrap()
+            .push(
+                serde_json::from_value(serde_json::json!(
+                    {"key": "metadata.name", "operator": "In", "values": ["node2"]}
+                ))
+                .unwrap(),
+            );
+        let mut diag = Diagnosis::default();
+        assert!(scheduler
+            .select_node_inner(&pod, &nodes, &[], &HashMap::new(), &mut diag)
+            .await
+            .is_none());
+        assert_eq!(diag.pre_filter_msg, "pod affinity terms conflict");
+        assert!(diag.unschedulable_plugins.contains("NodeAffinity"));
+        assert!(diag.node_reasons.is_empty());
+    }
+
     fn running_pod(name: &str, node: &str, cpu: &str, priority: i32) -> Pod {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",

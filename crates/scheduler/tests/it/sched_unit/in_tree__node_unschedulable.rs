@@ -74,7 +74,11 @@ async fn framework_dispatches_the_plugin_object_and_names_it() {
     assert!(fw.has(ExtensionPoint::Filter, "NodeUnschedulable"));
     let n = node(true);
     let pods: Vec<Pod> = vec![];
-    let state = CycleState::new();
+    let mut state = CycleState::new();
+    let (_, pre, _) = fw
+        .run_pre_filter_plugins(&mut state, &bare_pod(), &[])
+        .await;
+    assert!(pre.is_success());
     let s = fw
         .run_filter_plugins(&state, &bare_pod(), &NodeInfo::new(&n, &pods))
         .await;

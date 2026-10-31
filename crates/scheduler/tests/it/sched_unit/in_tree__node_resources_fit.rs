@@ -1,7 +1,9 @@
 //! Cases of `TestEnoughRequests` (`plugins/noderesources/fit_test.go`) and of
 //! `RunFilterPluginsWithNominatedPods` (`runtime/framework.go:1145-1190`).
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Status};
+use rusternetes_scheduler::fwk::{
+    Code, CycleState, FilterPlugin, NodeInfo, PreFilterPlugin, Status,
+};
 use rusternetes_scheduler::in_tree::NodeResourcesFit;
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
@@ -27,9 +29,26 @@ fn alloc() -> Value {
 }
 
 async fn run(p: &Pod, n: &Node, existing: &[Pod]) -> Status {
+    let mut state = CycleState::new();
+    let (result, status) = NodeResourcesFit.pre_filter(&mut state, p, &[]).await;
+    assert!(result.is_none() && status.is_success());
     NodeResourcesFit
-        .filter(&CycleState::new(), p, &NodeInfo::new(n, existing))
+        .filter(&state, p, &NodeInfo::new(n, existing))
         .await
+}
+
+#[tokio::test]
+async fn filter_without_pre_filter_state_is_an_error() {
+    let n = node(alloc());
+    let s = NodeResourcesFit
+        .filter(
+            &CycleState::new(),
+            &pod("p", "", json!({})),
+            &NodeInfo::new(&n, &[]),
+        )
+        .await;
+    assert_eq!(s.code(), Code::Error);
+    assert!(s.message().contains("PreFilterNodeResourcesFit"));
 }
 
 #[tokio::test]
@@ -151,7 +170,11 @@ async fn nominated_pods_reserve_space_in_the_first_pass_only() {
     // A pod nominated to n by preemption, not yet bound.
     let mut nominee = pod("nom", "", json!({"cpu": "2"}));
     nominee.status = Some(serde_json::from_value(json!({"nominatedNodeName": "n"})).unwrap());
-    let state = CycleState::new();
+    let mut state = CycleState::new();
+    let (_, pre, _) = fw
+        .run_pre_filter_plugins(&mut state, &candidate, std::slice::from_ref(&n))
+        .await;
+    assert!(pre.is_success());
     let all = vec![nominee.clone()];
 
     let with = fw

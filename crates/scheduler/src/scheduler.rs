@@ -1484,6 +1484,34 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
         let fw = &profile.framework;
         let filter_on = |name: &str| fw.has(ExtensionPoint::Filter, name);
+        // `RunPreFilterPlugins` over the PreFilter plugin objects, ahead of
+        // the PreFilters still inline below (`findNodesThatFitPod`,
+        // schedule_one.go:482-502): a rejection ends the cycle with the
+        // status' message, any other failure is a scheduling error, and the
+        // plugins that restricted the nodes are recorded as unschedulable
+        // plugins either way (`diagnosis.UnschedulablePlugins`).
+        let mut cycle_state = CycleState::new();
+        let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
+            .run_pre_filter_plugins(&mut cycle_state, pod, nodes)
+            .await;
+        diag.unschedulable_plugins
+            .extend(plugins_with_nodes.iter().cloned());
+        if !pre_filter_status.is_success() {
+            if !pre_filter_status.is_rejected() {
+                diag.scheduling_error = Some(pre_filter_status.message());
+                return None;
+            }
+            let msg = pre_filter_status.message();
+            debug!(
+                "Status after running PreFilter plugins for pod {}/{}: {}",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name,
+                msg
+            );
+            diag.pre_filter_msg = msg;
+            diag.add_plugin_status(pre_filter_status.plugin());
+            return None;
+        }
         // Phase 0: VolumeBinding PreFilter (volume_binding.go PreFilter). A pod
         // with a missing/lost/deleting PVC or an unbound Immediate claim is
         // UnschedulableAndUnresolvable; the pod is retried on the next resync.
@@ -1568,7 +1596,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             1
         };
         let start_index = self.next_start_node_index.load(Ordering::Relaxed);
-        let cycle_state = CycleState::new();
         // `addGENominatedPods` (framework.go): the pods nominated to a node by
         // preemption, of greater or equal priority than this pod, that are
         // not yet bound there. The Filter plugins run with them added.
@@ -1634,9 +1661,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if let Some(idx) = nominated_idx {
             passes.push((vec![idx], 1, false));
         }
+        // `findNodesThatFitPod` (schedule_one.go:549-562): a PreFilterResult
+        // restricts the search to the named nodes that exist in the
+        // snapshot; the others are absent, UnschedulableAndUnresolvable.
+        let narrowed: Option<&std::collections::HashSet<String>> = pre_filter_result
+            .as_ref()
+            .and_then(|r| r.node_names.as_ref());
         passes.push((
             (0..num_all_nodes)
                 .map(|i| (start_index + i) % num_all_nodes)
+                .filter(|&ix| narrowed.is_none_or(|n| n.contains(&nodes[ix].metadata.name)))
                 .collect(),
             num_nodes_to_find,
             true,
@@ -1813,7 +1847,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // failed status stays in `diagnosis.NodeToStatus`; always advance,
             // so every node gets a chance to be searched across cycles.
             if let (true, Some(idx)) = (nominated_failed, nominated_idx) {
-                if (idx + num_all_nodes - start_index) % num_all_nodes >= processed_nodes {
+                if !order.iter().take(processed_nodes).any(|&ix| ix == idx) {
                     processed_nodes += 1;
                 }
             }
@@ -1824,6 +1858,20 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         if feasible.is_empty() {
+            if let Some(narrowed) = narrowed {
+                // `SetAbsentNodesStatus` (schedule_one.go:561): the nodes the
+                // PreFilterResult left out, other than a nominated node whose
+                // own failure was recorded above.
+                let mut plugins: Vec<&str> =
+                    plugins_with_nodes.iter().map(String::as_str).collect();
+                plugins.sort();
+                let reason = format!("node(s) didn't satisfy plugin(s) [{}]", plugins.join(" "));
+                let absent = nodes.iter().enumerate().filter(|(ix, n)| {
+                    !narrowed.contains(&n.metadata.name)
+                        && !(nominated_failed && nominated_idx == Some(*ix))
+                });
+                diag.add_node_reasons(absent.map(|_| reason.clone()));
+            }
             debug!("No nodes satisfy the pod's constraints");
             return None;
         }
