@@ -13,6 +13,7 @@ mod in_tree__node_unschedulable;
 mod in_tree__node_volume_limits;
 mod in_tree__pod_affinity_spread;
 mod in_tree__taint_toleration;
+mod in_tree__volume_binding;
 mod inter_pod_affinity_score;
 mod node_volume_limits;
 mod pod_topology_spread_score;
