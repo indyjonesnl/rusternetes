@@ -5073,12 +5073,29 @@ impl Kubelet {
                             _ => {}
                         }
                     } else {
-                        // Resync projected/secret/configmap volumes (data may have changed)
-                        if let Err(e) = self.runtime.resync_volumes(pod, &*self.storage).await {
-                            debug!(
-                                "Volume resync error for pod {}/{}: {}",
-                                namespace, pod_name, e
-                            );
+                        // Resync projected/secret/configmap volumes (data may have changed).
+                        // Upstream's SyncPod calls `volumeManager.ReprocessPod`
+                        // (`kubelet.go`, `WaitForAttachAndMount`), the populator marks the
+                        // pod's volumes `RemountRequired` and the reconciler mounts them
+                        // again. A pod the actual state does not know yet (kubelet restarted:
+                        // reconstruction is not ported) keeps the inline resync.
+                        let unique_pod_name = crate::volume_plugins::util::get_unique_pod_name(pod);
+                        if self
+                            .volume_manager
+                            .actual_state_of_world
+                            .get_possibly_mounted_volumes_for_pod(&unique_pod_name)
+                            .is_empty()
+                        {
+                            if let Err(e) = self.runtime.resync_volumes(pod, &*self.storage).await {
+                                debug!(
+                                    "Volume resync error for pod {}/{}: {}",
+                                    namespace, pod_name, e
+                                );
+                            }
+                        } else {
+                            self.volume_manager
+                                .desired_state_of_world_populator
+                                .reprocess_pod(&unique_pod_name);
                         }
 
                         // Update container statuses with readiness info.
