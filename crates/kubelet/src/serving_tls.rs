@@ -16,7 +16,6 @@
 //! kubelet-serving posture.
 
 use anyhow::{anyhow, Result};
-use rusternetes_middleware::PeerCertificates;
 use std::sync::Arc;
 
 /// Build an `axum-server` rustls config with a self-signed serving certificate
@@ -125,50 +124,8 @@ impl rustls::server::danger::ClientCertVerifier for RequestClientCert {
     }
 }
 
-/// An `axum-server` acceptor that surfaces the connection's peer certificate
-/// chain to handlers as a [`PeerCertificates`] request extension
-/// (`req.TLS.PeerCertificates`). The chain is unverified here; see
-/// [`RequestClientCert`].
-#[derive(Clone)]
-pub struct PeerCertAcceptor {
-    inner: axum_server::tls_rustls::RustlsAcceptor,
-}
-
-impl PeerCertAcceptor {
-    pub fn new(config: axum_server::tls_rustls::RustlsConfig) -> Self {
-        Self {
-            inner: axum_server::tls_rustls::RustlsAcceptor::new(config),
-        }
-    }
-}
-
-impl<I, S> axum_server::accept::Accept<I, S> for PeerCertAcceptor
-where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    S: Send + 'static,
-{
-    type Stream =
-        <axum_server::tls_rustls::RustlsAcceptor as axum_server::accept::Accept<I, S>>::Stream;
-    type Service = <axum::Extension<PeerCertificates> as tower::Layer<S>>::Service;
-    type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
-        >,
-    >;
-
-    fn accept(&self, stream: I, service: S) -> Self::Future {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let (tls_stream, service) = inner.accept(stream, service).await?;
-            let chain: Vec<Vec<u8>> = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
-                .unwrap_or_default();
-            let service =
-                tower::Layer::layer(&axum::Extension(PeerCertificates(Arc::new(chain))), service);
-            Ok((tls_stream, service))
-        })
-    }
-}
+/// Surfaces the connection's peer certificate chain to handlers as a
+/// [`rusternetes_middleware::PeerCertificates`] request extension (`req.TLS.PeerCertificates`). The
+/// chain is unverified here; see [`RequestClientCert`]. Shared with the other
+/// plain-TLS servers (#3535).
+pub use rusternetes_middleware::secure_serving::serve::PeerCertAcceptor;

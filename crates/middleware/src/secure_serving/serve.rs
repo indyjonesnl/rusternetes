@@ -395,9 +395,22 @@ pub fn build_server_config(info: &SecureServingInfo) -> Result<Arc<rustls::Serve
 /// A TLS acceptor that injects the verified client-cert chain as a
 /// [`crate::PeerCertificates`] request extension (the equivalent of
 /// `req.TLS.PeerCertificates`).
+///
+/// Shared by every plain-TLS server in the workspace (the kubelet re-exports
+/// it). The api-server keeps its own superset that also splits the chain
+/// between the client-CA and request-header authenticators.
 #[derive(Clone)]
-struct PeerCertAcceptor {
+pub struct PeerCertAcceptor {
     inner: RustlsAcceptor,
+}
+
+impl PeerCertAcceptor {
+    /// Build from the same [`RustlsConfig`] you would pass to `bind_rustls`.
+    pub fn new(config: RustlsConfig) -> Self {
+        Self {
+            inner: RustlsAcceptor::new(config),
+        }
+    }
 }
 
 impl<I, S> Accept<I, S> for PeerCertAcceptor
@@ -447,9 +460,7 @@ pub fn serve(handler: Router, info: SecureServingInfo) -> Result<ServerHandle, S
             .try_clone()
             .map_err(|e| format!("unable to clone the listener: {e}"))?,
     )
-    .acceptor(PeerCertAcceptor {
-        inner: RustlsAcceptor::new(rustls_config.clone()),
-    })
+    .acceptor(PeerCertAcceptor::new(rustls_config.clone()))
     .handle(handle.clone());
     let reload_config = rustls_config.clone();
     let task = tokio::spawn(async move {
