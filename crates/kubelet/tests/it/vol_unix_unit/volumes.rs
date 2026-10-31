@@ -1515,3 +1515,156 @@ mod pod_certificate_resync_tests {
         assert_eq!(std::fs::read(dir.join("key.pem")).unwrap(), b"k\n");
     }
 }
+
+/// The kubelet's mounts and unmounts keep the volume manager's actual state of
+/// world (`GenerateMountVolumeFunc` -> `MarkVolumeAsMounted`,
+/// `GenerateUnmountVolumeFunc` -> `MarkVolumeAsUnmounted`), which
+/// `podVolumesExist` consults first (`HasPossiblyMountedVolumesForPod`).
+#[cfg(unix)]
+mod actual_state_tests {
+    use rusternetes_common::resources::Pod;
+    use rusternetes_kubelet::volumes::VolumeManager;
+    use rusternetes_storage::StorageBackend;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn empty_dir_pod() -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "uid-asw"},
+            "spec": {
+                "containers": [{"name": "c", "image": "i",
+                    "volumeMounts": [{"name": "scratch", "mountPath": "/s"}]}],
+                "volumes": [{"name": "scratch", "emptyDir": {}}]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn manager(tmp: &std::path::Path) -> VolumeManager {
+        VolumeManager::new_with_recording_empty_dir_mounts(
+            tmp.to_string_lossy().to_string(),
+            Some(Arc::new(StorageBackend::new_memory())),
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+        )
+        .with_node_name("node-asw")
+    }
+
+    #[tokio::test]
+    async fn mounting_a_volume_records_it_in_the_actual_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = manager(tmp.path());
+        let pod = empty_dir_pod();
+        vm.create_pod_volumes(&pod).await.unwrap();
+
+        let mounted = vm.asw.get_mounted_volumes();
+        assert_eq!(mounted.len(), 1, "the emptyDir is recorded as mounted");
+        assert_eq!(mounted[0].pod_uid, "uid-asw");
+        assert_eq!(mounted[0].inner_volume_spec_name, "scratch");
+        // A volume the pod mounts is attached, with its pod recorded.
+        assert_eq!(vm.asw.get_attached_volumes().len(), 1);
+        // A second mount of the same pod volume leaves one entry.
+        vm.create_pod_volumes(&pod).await.unwrap();
+        assert_eq!(vm.asw.get_mounted_volumes().len(), 1);
+    }
+
+    /// `podVolumesExist` answers true from the actual state alone: the pod's
+    /// directory is left in place even though the volume is not a mount point
+    /// on disk, until the unmount has recorded it.
+    #[tokio::test]
+    async fn the_pod_dir_survives_cleanup_until_the_unmount_is_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = manager(tmp.path());
+        let pod = empty_dir_pod();
+        vm.create_pod_volumes(&pod).await.unwrap();
+        let pod_dir =
+            rusternetes_kubelet::pod_dirs::get_pod_dir(&tmp.path().to_string_lossy(), "uid-asw");
+        assert!(pod_dir.exists());
+
+        vm.cleanup_orphaned_pod_dirs(&HashSet::new());
+        assert!(
+            pod_dir.exists(),
+            "the actual state still has the pod's volume mounted"
+        );
+
+        vm.unmount_orphaned_volumes(&HashSet::new(), &HashSet::new())
+            .await;
+        assert!(vm.asw.get_mounted_volumes().is_empty());
+        assert!(
+            vm.asw.get_attached_volumes().is_empty(),
+            "a volume nothing is mounted to is detached"
+        );
+        vm.cleanup_orphaned_pod_dirs(&HashSet::new());
+        assert!(!pod_dir.exists(), "now the orphaned pod dir is removed");
+    }
+
+    /// A pod that is still live keeps its mounts recorded.
+    #[tokio::test]
+    async fn a_live_pods_mounts_stay_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = manager(tmp.path());
+        vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
+        let live: HashSet<String> = ["uid-asw".to_string()].into();
+        vm.unmount_orphaned_volumes(&live, &HashSet::new()).await;
+        assert_eq!(vm.asw.get_mounted_volumes().len(), 1);
+    }
+
+    /// A terminated pod still in the API is unmounted like a deleted one.
+    #[tokio::test]
+    async fn a_terminated_pods_mounts_are_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = manager(tmp.path());
+        vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
+        let live: HashSet<String> = ["uid-asw".to_string()].into();
+        vm.unmount_orphaned_volumes(&live, &live).await;
+        assert!(vm.asw.get_mounted_volumes().is_empty());
+    }
+
+    /// The detach of an unmounted volume leaves a volume alone while a mount is
+    /// in flight (`IsOperationPending`, `reconciler_common.go:275-277`).
+    #[tokio::test]
+    async fn a_mount_in_flight_protects_its_volume_from_detach() {
+        use rusternetes_kubelet::volume_plugins::util::nested_pending_operations::EMPTY;
+        let tmp = tempfile::tempdir().unwrap();
+        let vm = manager(tmp.path());
+        vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
+        let attached = vm.asw.get_attached_volumes();
+        let name = attached[0].volume_name.clone();
+        // The pod's mount is recorded unmounted, as when a re-mount begins.
+        vm.asw
+            .mark_volume_as_unmounted(
+                &rusternetes_kubelet::volume_plugins::util::types::UniquePodName("uid-asw".into()),
+                &name,
+            )
+            .unwrap();
+
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let ops = vm.mount_operations.clone();
+        let key = name.0.clone();
+        let running = tokio::spawn(async move {
+            ops.run_inline(&key, "uid-asw", EMPTY, "volume_mount", async {
+                let _ = wait.await;
+                Ok(())
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Another pod's teardown runs the sweep meanwhile.
+        vm.unmount_orphaned_volumes(&["other".to_string()].into(), &HashSet::new())
+            .await;
+        assert_eq!(
+            vm.asw.get_attached_volumes().len(),
+            1,
+            "the volume with a mount in flight is not detached"
+        );
+
+        release.send(()).unwrap();
+        running.await.unwrap().unwrap().unwrap();
+        vm.unmount_orphaned_volumes(&["other".to_string()].into(), &HashSet::new())
+            .await;
+        assert!(vm.asw.get_attached_volumes().is_empty());
+    }
+}

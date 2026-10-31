@@ -137,6 +137,16 @@ pub struct VolumeManager {
     /// `UnmountDevice`'s backoff consult. Shared by every clone of the manager.
     pub pending_operations:
         crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations,
+    /// The mounts in flight, so the sweeps that detach an unmounted volume
+    /// leave one alone while a pod is mounting it (`IsOperationPending`,
+    /// `reconciler_common.go:275-277`).
+    ///
+    /// Not upstream: there `MountVolume` is itself an operation on
+    /// `pendingOperations`, which backs failures off exponentially. The kubelet
+    /// retries a failed mount from its own sync loop, so this one never backs
+    /// off.
+    pub mount_operations:
+        crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations,
     /// An iscsi plugin over the same host, for the global-mount enumeration
     /// that stands in for reconstruction (`IscsiPlugin::list_global_mounts`).
     pub iscsi_plugin: Arc<crate::volume_plugins::iscsi::IscsiPlugin>,
@@ -385,6 +395,10 @@ impl VolumeManager {
                 crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations::new(
                     true,
                 ),
+            mount_operations:
+                crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations::new(
+                    false,
+                ),
             csi_migrated_plugin_manager: Default::default(),
             intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
             // `NewActualStateOfWorld(nodeName, volumePluginMgr)`; rebuilt with
@@ -589,11 +603,21 @@ impl VolumeManager {
     /// Deleting a directory whose volumes are still mounted can corrupt data,
     /// so an unreadable path must never be read as "safe to remove".
     ///
-    /// Upstream also consults the volume manager's in-memory record
-    /// (`HasPossiblyMountedVolumesForPod`) before going to disk. We have no such
-    /// record, so this is the disk check alone — noted as a gap rather than
-    /// papered over: it makes the guard weaker than upstream's, never stronger.
+    /// Like upstream it first consults the volume manager's in-memory record
+    /// (`HasPossiblyMountedVolumesForPod`, `volume_manager.go:333`), which the
+    /// mounts and unmounts keep in the actual state of world. After a kubelet
+    /// restart that record is empty until volumes are reconstructed
+    /// (`reconstruct.go`, not ported), so the disk check still decides then.
     fn pod_volumes_exist(&self, pod_uid: &str) -> bool {
+        if !self
+            .asw
+            .get_possibly_mounted_volumes_for_pod(
+                &crate::volume_plugins::util::types::UniquePodName(pod_uid.to_string()),
+            )
+            .is_empty()
+        {
+            return true;
+        }
         let volume_paths = match crate::pod_dirs::get_pod_volume_path_list_from_disk(
             &self.volumes_base_path,
             pod_uid,
@@ -756,17 +780,28 @@ impl VolumeManager {
         terminated_pod_uids: &std::collections::HashSet<String>,
     ) {
         let root = &self.volumes_base_path;
-        let pods = match crate::pod_dirs::list_pods_from_disk(root) {
-            Ok(uids) => uids,
-            Err(e) => {
-                warn!("Could not list pods from disk: {}", e);
-                return;
-            }
-        };
+        let mut pods: std::collections::BTreeSet<String> =
+            match crate::pod_dirs::list_pods_from_disk(root) {
+                Ok(uids) => uids.into_iter().collect(),
+                Err(e) => {
+                    warn!("Could not list pods from disk: {}", e);
+                    std::collections::BTreeSet::new()
+                }
+            };
+        // The actual state of world's pods, whose directories may be gone.
+        pods.extend(
+            self.asw
+                .get_all_mounted_volumes()
+                .into_iter()
+                .map(|v| v.pod_uid.clone()),
+        );
         for uid in pods {
             if live_pod_uids.contains(&uid) && !terminated_pod_uids.contains(&uid) {
                 continue;
             }
+            // Whether every volume on disk was torn down: only then is the
+            // actual state's record of the pod's mounts known to be stale.
+            let mut torn_down = true;
             let volumes = match crate::pod_dirs::get_volumes_from_pod_dir(root, &uid) {
                 Ok(v) => v,
                 Err(e) => {
@@ -790,14 +825,81 @@ impl VolumeManager {
                     Ok(u) => u,
                     Err(e) => {
                         warn!("Orphaned pod {uid}: cannot unmount volume {name}: {e:#}");
+                        torn_down = false;
                         continue;
                     }
                 };
                 if let Err(e) = unmounter.tear_down().await {
                     warn!("Orphaned pod {uid}: TearDown of volume {name} failed: {e:#}");
+                    torn_down = false;
                 }
             }
+            if torn_down {
+                self.mark_pod_volumes_unmounted(&uid);
+            }
         }
+        self.detach_unused_volumes();
+    }
+
+    /// `MarkVolumeAsUnmounted` (`operation_generator.go:760`) for every volume
+    /// the actual state of world has mounted to the pod, once the pod's
+    /// volumes have been torn down.
+    fn mark_pod_volumes_unmounted(&self, pod_uid: &str) {
+        let pod_name = crate::volume_plugins::util::types::UniquePodName(pod_uid.to_string());
+        for mounted in self
+            .asw
+            .get_all_mounted_volumes()
+            .into_iter()
+            .filter(|v| v.pod_name == pod_name)
+        {
+            if let Err(e) = self
+                .asw
+                .mark_volume_as_unmounted(&mounted.pod_name, &mounted.volume_name)
+            {
+                warn!(
+                    "UnmountVolume.MarkVolumeAsUnmounted failed for volume {} pod {pod_uid}: {e}",
+                    mounted.volume_name
+                );
+            }
+        }
+    }
+
+    /// The `else` arm of `unmountDetachDevices` (`reconciler_common.go:299-306`)
+    /// for every volume nothing is mounted to and whose device is not (or may
+    /// not be) mounted: "mark the volume as detached"
+    /// (`controllerAttachDetachEnabled || !PluginIsAttachable`: the kubelet is
+    /// never the one that detaches). A volume with a device that may be mounted
+    /// is left to the device sweeps; one with an operation in flight is left
+    /// alone (`IsOperationPending`, `:275-277`).
+    fn detach_unused_volumes(&self) {
+        for unmounted in self.asw.get_unmounted_volumes() {
+            if self.volume_operation_pending(&unmounted.volume_name) {
+                continue;
+            }
+            // "Re-read the actual state of the world, maybe the volume got
+            // mounted in the meantime" (`:278-281`).
+            let Some(attached) = self.asw.get_attached_volume(&unmounted.volume_name) else {
+                continue;
+            };
+            if !attached.device_may_be_mounted() {
+                self.asw
+                    .mark_volume_as_detached(&attached.volume_name, &attached.node_name);
+            }
+        }
+    }
+
+    /// `pendingOperations.IsOperationPending(volumeName, EmptyUniquePodName,
+    /// EmptyNodeName)`: a device operation, or a mount, is running on the volume.
+    fn volume_operation_pending(
+        &self,
+        volume_name: &crate::volume_plugins::util::types::UniqueVolumeName,
+    ) -> bool {
+        use crate::volume_plugins::util::nested_pending_operations::EMPTY;
+        self.pending_operations
+            .is_operation_pending(&volume_name.0, EMPTY, EMPTY)
+            || self
+                .mount_operations
+                .is_operation_pending(&volume_name.0, EMPTY, EMPTY)
     }
 
     /// `(driver, volumeHandle)` of every persistent CSI volume a pod directory
@@ -916,11 +1018,7 @@ impl VolumeManager {
             }
             // "Check IsOperationPending to avoid marking a volume as detached
             // if it's in the process of mounting" (`:275-277`).
-            if self.pending_operations.is_operation_pending(
-                &unmounted.volume_name.0,
-                crate::volume_plugins::util::nested_pending_operations::EMPTY,
-                crate::volume_plugins::util::nested_pending_operations::EMPTY,
-            ) {
+            if self.volume_operation_pending(&unmounted.volume_name) {
                 continue;
             }
             // "Re-read the actual state of the world, maybe the volume got
@@ -1945,22 +2043,84 @@ impl VolumeManager {
         let spec = owned.as_spec();
 
         match self.plugin_mgr.find_plugin_by_spec(&spec) {
-            Ok(_) => {
-                let (path, attributes) =
-                    crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
-                        &self.plugin_mgr,
-                        &spec,
-                        pod,
-                        "",
-                        // `og.recorder`: the kubelet's event recorder over
-                        // the same API the volumes are read through.
-                        self.storage.as_ref().map(|s| {
-                            crate::volume_plugins::plugin::MounterRecorder(
-                                rusternetes_storage::EventRecorder::new(s.clone()),
-                            )
-                        }),
+            Ok(plugin) => {
+                // The `VolumeToMount` the desired state would hand the
+                // mount, and the volume's entry in the actual state
+                // (`MarkVolumeAsAttached`, what
+                // `GenerateVerifyControllerAttachedVolumeFunc` does for a
+                // volume that needs no attach), so the mount can report to it.
+                let volume_to_mount = self.volume_to_mount(plugin, owned.clone(), pod, volume)?;
+                let mount_state = crate::volume_plugins::util::operation_generator::MountState {
+                    volume_to_mount: &volume_to_mount,
+                    actual_state_of_world: &self.asw,
+                };
+                if !self.asw.volume_exists(&volume_to_mount.volume_name) {
+                    self.asw
+                        .mark_volume_as_attached(
+                            Some(&volume_to_mount.volume_name),
+                            volume_to_mount.volume_spec.clone(),
+                            &self.node_name,
+                            "",
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("MountVolume.MarkVolumeAsAttached failed: {e}")
+                        })?;
+                }
+                // The mount is an operation on the volume and pod
+                // (`GenerateMountVolumeFunc` runs under `pendingOperations`).
+                let mut mounted_volume = None;
+                let run = self
+                    .mount_operations
+                    .run_inline(
+                        &volume_to_mount.volume_name.0,
+                        &volume_to_mount.pod_name.0,
+                        crate::volume_plugins::util::nested_pending_operations::EMPTY,
+                        "volume_mount",
+                        async {
+                            let mounted =
+                                crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
+                                    &self.plugin_mgr,
+                                    &spec,
+                                    pod,
+                                    "",
+                                    // `og.recorder`: the kubelet's event recorder over
+                                    // the same API the volumes are read through.
+                                    self.storage.as_ref().map(|s| {
+                                        crate::volume_plugins::plugin::MounterRecorder(
+                                            rusternetes_storage::EventRecorder::new(s.clone()),
+                                        )
+                                    }),
+                                    Some(&mount_state),
+                                )
+                                .await;
+                            match mounted {
+                                Ok(ok) => {
+                                    mounted_volume = Some(Ok(ok));
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    let msg = format!("{e:#}");
+                                    mounted_volume = Some(Err(e));
+                                    Err(msg)
+                                }
+                            }
+                        },
                     )
-                    .await?;
+                    .await;
+                let (path, attributes) = match (run, mounted_volume) {
+                    (Ok(_), Some(mounted)) => mounted?,
+                    (Err(refused), _) => {
+                        // Another mount of this pod's volume is in flight: wait.
+                        return Err(crate::lifecycle::VolumeWaitError(format!(
+                            "MountVolume for volume {} not started: {refused}",
+                            volume.name
+                        ))
+                        .into());
+                    }
+                    (Ok(_), None) => {
+                        anyhow::bail!("MountVolume for volume {} did not run", volume.name)
+                    }
+                };
                 // Keep an existing `SELinuxLabeled` across a re-mount of the
                 // same pod volume (upstream keeps it on the pod's VolumeInfo).
                 let mut mounted = self.mounted.lock().unwrap();
@@ -1985,6 +2145,60 @@ impl VolumeManager {
             // (`pkg/volume/plugins.go:661-663`).
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The `VolumeToMount` `DesiredStateOfWorld.GetVolumesToMount` would
+    /// return for this pod volume (`desired_state_of_world.go:586-616`): the
+    /// unique volume name the desired state gives it
+    /// ([`get_unique_volume_name_for_pod`]), the effective SELinux label and
+    /// size limit `AddPodToVolume` computes, and the PV's GID annotation.
+    fn volume_to_mount(
+        &self,
+        plugin: &dyn crate::volume_plugins::plugin::VolumePlugin,
+        owned: crate::volume_plugins::plugin::OwnedSpec,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> Result<crate::volume_plugins::util::operation_executor::VolumeToMount> {
+        use crate::volume_manager::cache::desired_state_of_world::get_unique_volume_name_for_pod;
+        let pod_name = crate::volume_plugins::util::get_unique_pod_name(pod);
+        let spec = owned.as_spec();
+        let (volume_name, plugin_is_attachable, plugin_is_device_mountable) =
+            get_unique_volume_name_for_pod(&self.plugin_mgr, &pod_name, plugin, &spec)?;
+        let mounter_args = crate::volume_plugins::util::operation_generator::mounter_args_for(
+            &self.plugin_mgr,
+            &spec,
+            pod,
+            &crate::volume_plugins::util::selinux::Translator,
+        )?;
+        let volume_gid_value = owned
+            .persistent_volume
+            .as_ref()
+            .and_then(|pv| pv.metadata.annotations.as_ref())
+            .and_then(|a| a.get(VOLUME_GID_ANNOTATION_KEY))
+            .cloned()
+            .unwrap_or_default();
+        Ok(
+            crate::volume_plugins::util::operation_executor::VolumeToMount {
+                volume_name,
+                pod_name,
+                outer_volume_spec_names: vec![volume.name.clone()],
+                plugin_is_attachable,
+                plugin_is_device_mountable,
+                volume_gid_value,
+                device_path: String::new(),
+                reported_in_use: true,
+                desired_size_limit:
+                    crate::volume_manager::cache::desired_state_of_world::desired_size_limit(
+                        pod,
+                        &owned.volume,
+                    ),
+                mount_request_time: std::time::SystemTime::now(),
+                desired_persistent_volume_size: None,
+                selinux_label: mounter_args.selinux_label,
+                volume_spec: Arc::new(owned),
+                pod: Arc::new(pod.clone()),
+            },
+        )
     }
 
     /// Refresh Secret and ConfigMap volumes for a running pod.

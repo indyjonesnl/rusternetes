@@ -334,6 +334,182 @@ mod tests {
         assert!(f.fake.calls.lock().unwrap().publish.is_empty());
     }
 
+    /// `GenerateMountVolumeFunc` with its `actualStateOfWorld`: `MountVolume`
+    /// reports the device and the pod mount to it.
+    struct World {
+        mgr: rusternetes_kubelet::volume_plugins::VolumePluginMgr,
+        asw: rusternetes_kubelet::volume_manager::cache::ActualStateOfWorld,
+    }
+
+    fn world(f: &Fx) -> World {
+        let mgr = rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+            CsiPlugin::new(host(&f.root, Some(f.storage.clone()))),
+        )]);
+        let asw = rusternetes_kubelet::volume_manager::cache::ActualStateOfWorld::new(
+            "node-1",
+            Arc::new(rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(
+                vec![Box::new(CsiPlugin::new(host(
+                    &f.root,
+                    Some(f.storage.clone()),
+                )))],
+            )),
+        );
+        World { mgr, asw }
+    }
+
+    /// `volume_name` is the PV's unique name; the volume is marked attached first
+    /// (`MarkVolumeAsAttached`), as the caller of the mount operation does.
+    async fn mount_in_world(
+        w: &World,
+        spec: &rusternetes_kubelet::volume_plugins::OwnedSpec,
+        pod: &Pod,
+    ) -> anyhow::Result<String> {
+        use rusternetes_kubelet::volume_manager::cache::desired_state_of_world::get_unique_volume_name_for_pod;
+        let pod_name = rusternetes_kubelet::volume_plugins::util::get_unique_pod_name(pod);
+        let plugin = w.mgr.find_plugin_by_spec(&spec.as_spec()).unwrap();
+        let (volume_name, attachable, device_mountable) =
+            get_unique_volume_name_for_pod(&w.mgr, &pod_name, plugin, &spec.as_spec()).unwrap();
+        let vtm = rusternetes_kubelet::volume_plugins::util::operation_executor::VolumeToMount {
+            volume_name: volume_name.clone(),
+            pod_name,
+            volume_spec: Arc::new(spec.clone()),
+            outer_volume_spec_names: vec![spec.volume.name.clone()],
+            pod: Arc::new(pod.clone()),
+            plugin_is_attachable: attachable,
+            plugin_is_device_mountable: device_mountable,
+            volume_gid_value: String::new(),
+            device_path: String::new(),
+            reported_in_use: true,
+            desired_size_limit: None,
+            mount_request_time: std::time::SystemTime::now(),
+            desired_persistent_volume_size: None,
+            selinux_label: String::new(),
+        };
+        if !w.asw.volume_exists(&volume_name) {
+            w.asw
+                .mark_volume_as_attached(Some(&volume_name), vtm.volume_spec.clone(), "node-1", "")
+                .unwrap();
+        }
+        let state = rusternetes_kubelet::volume_plugins::util::operation_generator::MountState {
+            volume_to_mount: &vtm,
+            actual_state_of_world: &w.asw,
+        };
+        rusternetes_kubelet::volume_plugins::util::operation_generator::mount_volume_with_attributes(
+            &w.mgr,
+            &spec.as_spec(),
+            pod,
+            "",
+            None,
+            Some(&state),
+        )
+        .await
+        .map(|(path, _)| path)
+    }
+
+    fn owned_pv_spec(f: &Fx) -> rusternetes_kubelet::volume_plugins::OwnedSpec {
+        rusternetes_kubelet::volume_plugins::OwnedSpec {
+            volume: claim_volume(),
+            persistent_volume: Some(pv(&f.driver, json!({}))),
+            read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
+        }
+    }
+
+    /// `MarkDeviceAsMounted` after `MountDevice`, and no second `MountDevice` for
+    /// a device already `DeviceGloballyMounted` (`operation_generator.go:530`,
+    /// `:545-566`): a second pod sharing the volume only publishes.
+    #[tokio::test]
+    async fn mount_volume_marks_the_device_mounted_and_skips_a_second_stage() {
+        use rusternetes_kubelet::volume_plugins::util::operation_executor::{
+            DeviceMountState, VolumeMountState,
+        };
+        let f = fx(
+            "worldstage",
+            &[Cap::StageUnstageVolume],
+            Some(json!({"attachRequired": false})),
+        )
+        .await;
+        let w = world(&f);
+        let spec = owned_pv_spec(&f);
+        mount_in_world(&w, &spec, &pod()).await.unwrap();
+
+        let attached = w.asw.get_attached_volumes();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceGloballyMounted
+        );
+        let name = attached[0].volume_name.clone();
+        assert_eq!(
+            w.asw.get_volume_mount_state(
+                &name,
+                &rusternetes_kubelet::volume_plugins::util::types::UniquePodName("uid-1".into())
+            ),
+            VolumeMountState::VolumeMounted
+        );
+
+        let mut other = pod();
+        other.metadata.uid = "uid-2".into();
+        other.metadata.name = "p2".into();
+        mount_in_world(&w, &spec, &other).await.unwrap();
+        let calls = f.fake.calls.lock().unwrap();
+        assert_eq!(calls.stage.len(), 1, "the device is staged once");
+        assert_eq!(calls.publish.len(), 2, "each pod is published");
+        drop(calls);
+        assert_eq!(w.asw.get_mounted_volumes().len(), 2);
+    }
+
+    /// `markDeviceErrorState` / `markVolumeErrorState` (`:674-728`): a
+    /// non-final `MountDevice` failure leaves the device `DeviceMountUncertain`,
+    /// a final one leaves it `DeviceNotMounted`.
+    #[tokio::test]
+    async fn a_failed_stage_marks_the_device_uncertain_only_for_a_non_final_error() {
+        use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+        let f = fx(
+            "worlduncertain",
+            &[Cap::StageUnstageVolume],
+            Some(json!({"attachRequired": false})),
+        )
+        .await;
+        let w = world(&f);
+        let spec = owned_pv_spec(&f);
+
+        *f.fake.stage_error.lock().unwrap() = Some(tonic::Code::InvalidArgument);
+        mount_in_world(&w, &spec, &pod()).await.unwrap_err();
+        let attached = w.asw.get_attached_volumes();
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceNotMounted
+        );
+
+        *f.fake.stage_error.lock().unwrap() = Some(tonic::Code::DeadlineExceeded);
+        mount_in_world(&w, &spec, &pod()).await.unwrap_err();
+        let attached = w.asw.get_attached_volumes();
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceMountUncertain
+        );
+
+        // A final error on an uncertain device resolves it to not mounted.
+        *f.fake.stage_error.lock().unwrap() = Some(tonic::Code::InvalidArgument);
+        mount_in_world(&w, &spec, &pod()).await.unwrap_err();
+        let attached = w.asw.get_attached_volumes();
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceNotMounted
+        );
+
+        // Staging succeeds: globally mounted.
+        *f.fake.stage_error.lock().unwrap() = None;
+        mount_in_world(&w, &spec, &pod()).await.unwrap();
+        let attached = w.asw.get_attached_volumes();
+        assert_eq!(
+            attached[0].device_mount_state,
+            DeviceMountState::DeviceGloballyMounted
+        );
+    }
+
     /// `VOLUME_MOUNT_GROUP` (`csi_attacher.go:381-385`): the pod's fsGroup reaches
     /// NodeStageVolume only when the driver advertises the capability.
     #[tokio::test]

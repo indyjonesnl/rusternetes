@@ -26,10 +26,13 @@ use crate::volume_plugins::util::hostutil::HostUtils;
 use crate::volume_plugins::util::node_expander::{
     pvc_object_reference, record_event, NodeExpander, NodeResizeOperationOpts,
 };
-use crate::volume_plugins::util::operation_executor::{AttachedVolume, VolumeToMount};
+use crate::volume_plugins::util::operation_executor::{
+    AttachedVolume, DeviceMountState, MarkVolumeOpts, VolumeMountState, VolumeToMount,
+};
 use crate::volume_plugins::util::resize_util::{self, RESOURCE_STORAGE};
 use crate::volume_plugins::util::types::{
-    is_failed_precondition_error, is_operation_not_supported_error, OperationContext,
+    is_failed_precondition_error, is_operation_finished_error, is_operation_not_supported_error,
+    is_uncertain_progress_error, OperationContext,
 };
 use crate::volume_plugins::util::{check_device_mount_refs, fs_group_from};
 use anyhow::{anyhow, Error};
@@ -39,6 +42,7 @@ use rusternetes_common::resources::EventType;
 use rusternetes_common::resources::Pod;
 use rusternetes_storage::{build_key, EventRecorder, Storage};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Port of `operationGenerator.checkIfSupportsNodeExpansion`
@@ -443,6 +447,14 @@ impl<'a, S: Storage + ?Sized> OperationGenerator<'a, S> {
 /// `waitForAttachTimeout` (`pkg/kubelet/volumemanager/volume_manager.go:88`).
 const WAIT_FOR_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// The actual state of world a mount reports to, and the `VolumeToMount` it
+/// reports for: the `volumeToMount` and `actualStateOfWorld` arguments of
+/// `GenerateMountVolumeFunc` (`operation_generator.go:431-436`).
+pub struct MountState<'a> {
+    pub volume_to_mount: &'a VolumeToMount,
+    pub actual_state_of_world: &'a ActualStateOfWorld,
+}
+
 /// Port of the mount half of `operationGenerator.GenerateMountVolumeFunc`
 /// (`operation_generator.go:431-640`): find the plugin, `NewMounter`, and for a
 /// device-mountable plugin `NewDeviceMounter` -> `GetDeviceMountPath` ->
@@ -450,12 +462,10 @@ const WAIT_FOR_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// (`NodePublishVolume`), as the CSI spec orders them. Returns the mounter's
 /// path.
 ///
-/// Not ported (each waits on the reconciler/`ActualStateOfWorld` wiring,
-/// tracked under #1970): skipping `MountDevice` when
-/// `GetDeviceMountState == DeviceGloballyMounted` (`:530`),
-/// `MarkDeviceAsMounted` / `markDeviceErrorState` (`:545-566`), the ReadWriteOncePod-elsewhere check (`:480-489`), the
-/// post-`SetUp` expansion and `MarkVolumeAsMounted` (`:600-640`).
-/// `MountDevice` is idempotent per the CSI spec, so repeating it is safe.
+/// Not ported (each waits on the reconciler wiring, tracked under #1970): the
+/// ReadWriteOncePod-elsewhere check (`:480-489`, which depends on an unmount
+/// ordering only the reconciler provides) and the post-`SetUp` expansion
+/// (`:600-625`).
 ///
 /// `WaitForAttach` (`:511-526`) runs for plugins that return an attacher from
 /// [`VolumePlugin::as_attachable_plugin`] (iscsi); CSI's attacher is not ported.
@@ -466,7 +476,7 @@ pub async fn mount_volume(
     device_path: &str,
 ) -> anyhow::Result<String> {
     Ok(
-        mount_volume_with_attributes(mgr, spec, pod, device_path, None)
+        mount_volume_with_attributes(mgr, spec, pod, device_path, None, None)
             .await?
             .0,
     )
@@ -474,12 +484,21 @@ pub async fn mount_volume(
 
 /// [`mount_volume`], also returning `mounter.GetAttributes()` read after
 /// `SetUp` (`volume.go:187`) - what the kubelet's `makeMounts` consumes.
+///
+/// With `state`, the mount reports to the actual state of world as upstream
+/// does: `MountDevice` is skipped for a device already `DeviceGloballyMounted`
+/// (`:530`) and recorded with `MarkDeviceAsMounted` after (`:545-566`), a
+/// failed `MountDevice` / `SetUp` records the uncertain state
+/// (`markDeviceErrorState`, `markVolumeErrorState`), and a successful `SetUp`
+/// ends in `MarkVolumeAsMounted` (`:600-640`). The volume must already be in
+/// the actual state (`MarkVolumeAsAttached`).
 pub async fn mount_volume_with_attributes(
     mgr: &VolumePluginMgr,
     spec: &Spec<'_>,
     pod: &Pod,
     device_path: &str,
     recorder: Option<crate::volume_plugins::plugin::MounterRecorder>,
+    state: Option<&MountState<'_>>,
 ) -> anyhow::Result<(String, crate::volume_plugins::plugin::Attributes)> {
     let plugin = mgr.find_plugin_by_spec(spec)?;
     let mounter = plugin.new_mounter(spec, pod).await?;
@@ -530,30 +549,190 @@ pub async fn mount_volume_with_attributes(
     )?;
 
     if let Some(device_mounter) = device_mounter {
-        let device_mount_path = device_mounter.get_device_mount_path(spec)?;
-        let args = DeviceMounterArgs {
-            fs_group: fs_group_from(pod),
-            selinux_label: mounter_args.selinux_label.clone(),
-            node_name: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.clone())
-                .unwrap_or_default(),
-        };
-        device_mounter
-            .mount_device(spec, device_path, &device_mount_path, &args)
-            .await?;
-        info!(
-            "MountVolume.MountDevice succeeded for volume {} (device mount path {device_mount_path:?})",
-            spec.name()
-        );
+        // `actualStateOfWorld.GetDeviceMountState(volumeToMount.VolumeName) != DeviceGloballyMounted`
+        let globally_mounted = state.is_some_and(|st| {
+            st.actual_state_of_world
+                .get_device_mount_state(&st.volume_to_mount.volume_name)
+                == DeviceMountState::DeviceGloballyMounted
+        });
+        if !globally_mounted {
+            let device_mount_path = device_mounter.get_device_mount_path(spec)?;
+            let args = DeviceMounterArgs {
+                fs_group: fs_group_from(pod),
+                selinux_label: mounter_args.selinux_label.clone(),
+                node_name: pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.node_name.clone())
+                    .unwrap_or_default(),
+            };
+            if let Err(e) = device_mounter
+                .mount_device(spec, device_path, &device_mount_path, &args)
+                .await
+            {
+                if let Some(st) = state {
+                    mark_device_error_state(st, device_path, &device_mount_path, &e);
+                }
+                return Err(e);
+            }
+            info!(
+                "MountVolume.MountDevice succeeded for volume {} (device mount path {device_mount_path:?})",
+                spec.name()
+            );
+            // Update actual state of world to reflect volume is globally mounted
+            if let Some(st) = state {
+                st.actual_state_of_world
+                    .mark_device_as_mounted(
+                        &st.volume_to_mount.volume_name,
+                        device_path,
+                        &device_mount_path,
+                        &mounter_args.selinux_label,
+                    )
+                    .map_err(|e| {
+                        st.volume_to_mount.generate_error_detailed(
+                            "MountVolume.MarkDeviceAsMounted failed",
+                            &anyhow!(e),
+                        )
+                    })?;
+            }
+        }
     }
 
     // `Recorder: og.recorder` (`operation_generator.go:587`).
     let mut mounter_args = mounter_args;
     mounter_args.recorder = recorder;
-    mounter.set_up_with(&mounter_args).await?;
-    Ok((mounter.get_path(), mounter.get_attributes()))
+    let mount_result = mounter.set_up_with(&mounter_args).await;
+    let path = mounter.get_path();
+    let attributes = mounter.get_attributes();
+    // Update actual state of world
+    if let Some(st) = state {
+        let mark_opts = MarkVolumeOpts {
+            pod_name: st.volume_to_mount.pod_name.clone(),
+            pod_uid: st.volume_to_mount.pod.metadata.uid.clone(),
+            volume_name: st.volume_to_mount.volume_name.clone(),
+            mounter: Some(Arc::from(mounter)),
+            block_volume_mapper: None,
+            volume_gid_volume: st.volume_to_mount.volume_gid_value.clone(),
+            volume_spec: st.volume_to_mount.volume_spec.clone(),
+            volume_mount_state: VolumeMountState::VolumeMounted,
+            selinux_mount_context: mounter_args.selinux_label.clone(),
+        };
+        if let Err(e) = &mount_result {
+            mark_volume_error_state(st, &mark_opts, e);
+        } else {
+            st.actual_state_of_world
+                .mark_volume_as_mounted(mark_opts)
+                .map_err(|e| {
+                    st.volume_to_mount.generate_error_detailed(
+                        "MountVolume.MarkVolumeAsMounted failed",
+                        &anyhow!(e),
+                    )
+                })?;
+        }
+    }
+    mount_result?;
+    Ok((path, attributes))
+}
+
+/// Port of `operationGenerator.markDeviceErrorState`
+/// (`operation_generator.go:674-701`).
+fn mark_device_error_state(
+    st: &MountState<'_>,
+    device_path: &str,
+    device_mount_path: &str,
+    mount_error: &Error,
+) {
+    let (asw, vtm) = (st.actual_state_of_world, st.volume_to_mount);
+    if is_operation_finished_error(mount_error)
+        && asw.get_device_mount_state(&vtm.volume_name) == DeviceMountState::DeviceMountUncertain
+    {
+        if asw.is_volume_device_reconstructed(&vtm.volume_name) {
+            debug!(
+                "MountVolume.markDeviceErrorState leaving volume uncertain: {}",
+                vtm.volume_name
+            );
+            return;
+        }
+
+        // Only devices which were uncertain can be marked as unmounted
+        if let Err(e) = asw.mark_device_as_unmounted(&vtm.volume_name) {
+            error!(
+                "{}",
+                vtm.generate_error_detailed(
+                    "MountDevice.MarkDeviceAsUnmounted failed",
+                    &anyhow!(e)
+                )
+            );
+        }
+        return;
+    }
+
+    if is_uncertain_progress_error(mount_error)
+        && asw.get_device_mount_state(&vtm.volume_name) == DeviceMountState::DeviceNotMounted
+    {
+        // only devices which are not mounted can be marked as uncertain. We do not want to mark a device
+        // which was previously marked as mounted here as uncertain.
+        if let Err(e) = asw.mark_device_as_uncertain(
+            &vtm.volume_name,
+            device_path,
+            device_mount_path,
+            &vtm.selinux_label,
+        ) {
+            error!(
+                "{}",
+                vtm.generate_error_detailed(
+                    "MountDevice.MarkDeviceAsUncertain failed",
+                    &anyhow!(e)
+                )
+            );
+        }
+    }
+}
+
+/// Port of `operationGenerator.markVolumeErrorState`
+/// (`operation_generator.go:703-728`).
+fn mark_volume_error_state(st: &MountState<'_>, mark_opts: &MarkVolumeOpts, mount_error: &Error) {
+    let (asw, vtm) = (st.actual_state_of_world, st.volume_to_mount);
+    if is_operation_finished_error(mount_error)
+        && asw.get_volume_mount_state(&vtm.volume_name, &mark_opts.pod_name)
+            == VolumeMountState::VolumeMountUncertain
+    {
+        // if volume was previously reconstructed we are not going to change its state as unmounted even
+        // if mount operation fails.
+        if asw.is_volume_reconstructed(&vtm.volume_name, &vtm.pod_name) {
+            debug!(
+                "MountVolume.markVolumeErrorState leaving volume uncertain: {}",
+                vtm.volume_name
+            );
+            return;
+        }
+
+        if let Err(e) = asw.mark_volume_as_unmounted(&vtm.pod_name, &vtm.volume_name) {
+            error!(
+                "{}",
+                vtm.generate_error_detailed(
+                    "MountVolume.MarkVolumeAsUnmounted failed",
+                    &anyhow!(e)
+                )
+            );
+        }
+        return;
+    }
+
+    if is_uncertain_progress_error(mount_error)
+        && asw.get_volume_mount_state(&vtm.volume_name, &mark_opts.pod_name)
+            == VolumeMountState::VolumeNotMounted
+    {
+        if let Err(e) = asw.mark_volume_mount_as_uncertain(mark_opts.clone()) {
+            error!(
+                "{}",
+                vtm.generate_error_detailed(
+                    "MountVolume.MarkVolumeMountAsUncertain failed",
+                    &anyhow!(e)
+                )
+            );
+        }
+    }
 }
 
 /// `util.CheckVolumeModeFilesystem` (`pkg/volume/util/util.go:354-365`): true

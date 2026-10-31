@@ -46,10 +46,9 @@ impl VolumeManager {
             volume_plugin_mgr.clone(),
             Arc::new(Translator),
         ));
-        let actual_state_of_world = Arc::new(ActualStateOfWorld::new(
-            node_name,
-            volume_plugin_mgr.clone(),
-        ));
+        // One actual state of world: the one inline mounting reports into.
+        let _ = node_name;
+        let actual_state_of_world = spec_factory.asw.clone();
         let desired_state_of_world_populator = Arc::new(DesiredStateOfWorldPopulator::new(
             storage,
             DESIRED_STATE_OF_WORLD_POPULATOR_LOOP_SLEEP_PERIOD,

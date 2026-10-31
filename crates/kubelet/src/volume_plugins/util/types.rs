@@ -86,6 +86,11 @@ pub const NODE_EXPANSION_NOT_REQUIRED: &str = "volume.kubernetes.io/node-expansi
 /// with `fmt.Errorf("...: %w", err)` (`expander.go:127`), so upstream reads
 /// that one as finished too, and `csi/expander.rs` flattens it likewise.
 pub fn is_operation_finished_error(err: &anyhow::Error) -> bool {
+    // The CSI client keeps its own typed error (the Go code has one type for
+    // both); classify it the same way.
+    if let Some(e) = err.downcast_ref::<crate::volume_plugins::csi_client::CsiError>() {
+        return e.is_operation_finished();
+    }
     !matches!(
         err.downcast_ref::<VolumeOperationError>(),
         Some(
@@ -97,6 +102,12 @@ pub fn is_operation_finished_error(err: &anyhow::Error) -> bool {
 
 /// Port of `IsUncertainProgressError` (`types.go:198-203`).
 pub fn is_uncertain_progress_error(err: &anyhow::Error) -> bool {
+    if let Some(e) = err.downcast_ref::<crate::volume_plugins::csi_client::CsiError>() {
+        return matches!(
+            e,
+            crate::volume_plugins::csi_client::CsiError::UncertainProgress(_)
+        );
+    }
     matches!(
         err.downcast_ref::<VolumeOperationError>(),
         Some(VolumeOperationError::UncertainProgress(_))
