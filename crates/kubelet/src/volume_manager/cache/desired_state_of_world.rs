@@ -91,6 +91,44 @@ pub enum DesiredStateOfWorldError {
     SELinux(#[from] SELinuxLabelError),
 }
 
+/// The unique volume name `AddPodToVolume` gives a pod's volume
+/// (`desired_state_of_world.go:272-299`), with whether the plugin is
+/// attachable and device-mountable. The name depends on those: an
+/// attachable/device-mountable volume is named by what the plugin reports
+/// (shared between pods), any other by the pod and the volume within it.
+///
+/// Shared by the desired state (when the populator adds a volume) and by
+/// whoever records the same volume in the actual state, so both caches key a
+/// volume by one name.
+pub fn get_unique_volume_name_for_pod(
+    volume_plugin_mgr: &VolumePluginMgr,
+    pod_name: &UniquePodName,
+    volume_plugin: &dyn VolumePlugin,
+    spec: &Spec<'_>,
+) -> Result<(UniqueVolumeName, bool, bool), DesiredStateOfWorldError> {
+    // The unique volume name used depends on whether the volume is
+    // attachable/device-mountable or not.
+    let attachable = is_attachable_volume(spec, volume_plugin_mgr);
+    let device_mountable = is_device_mountable_volume(spec, volume_plugin_mgr);
+    let volume_name = if attachable || device_mountable {
+        // For attachable/device-mountable volumes, use the unique volume
+        // name as reported by the plugin.
+        get_unique_volume_name_from_spec(volume_plugin, spec).map_err(|err| {
+            DesiredStateOfWorldError::UniqueVolumeName {
+                volume_name: spec.name().to_string(),
+                plugin_name: volume_plugin.name().to_string(),
+                err,
+            }
+        })?
+    } else {
+        // For non-attachable and non-device-mountable volumes, generate a
+        // unique name based on the unique pod name (refer to podUID) and
+        // the name of the volume within the pod.
+        get_unique_volume_name_from_spec_with_pod(pod_name, volume_plugin, spec)
+    };
+    Ok((volume_name, attachable, device_mountable))
+}
+
 /// Maximum errors to be stored per pod in `pod_errors` to prevent unbound
 /// growth. Port of `maxPodErrors` (`desired_state_of_world.go:255-259`).
 pub const MAX_POD_ERRORS: usize = 10;
@@ -293,26 +331,12 @@ impl DesiredStateOfWorld {
         let volume_plugin_name = get_volume_plugin_name_with_driver(volume_plugin, &spec);
         let access_mode = get_volume_access_mode(&spec);
 
-        // The unique volume name used depends on whether the volume is
-        // attachable/device-mountable or not.
-        let attachable = is_attachable_volume(&spec, &self.volume_plugin_mgr);
-        let device_mountable = is_device_mountable_volume(&spec, &self.volume_plugin_mgr);
-        let volume_name = if attachable || device_mountable {
-            // For attachable/device-mountable volumes, use the unique volume
-            // name as reported by the plugin.
-            get_unique_volume_name_from_spec(volume_plugin, &spec).map_err(|err| {
-                DesiredStateOfWorldError::UniqueVolumeName {
-                    volume_name: spec.name().to_string(),
-                    plugin_name: volume_plugin.name().to_string(),
-                    err,
-                }
-            })?
-        } else {
-            // For non-attachable and non-device-mountable volumes, generate a
-            // unique name based on the unique pod name (refer to podUID) and
-            // the name of the volume within the pod.
-            get_unique_volume_name_from_spec_with_pod(pod_name, volume_plugin, &spec)
-        };
+        let (volume_name, attachable, device_mountable) = get_unique_volume_name_for_pod(
+            &self.volume_plugin_mgr,
+            pod_name,
+            volume_plugin,
+            &spec,
+        )?;
 
         let (selinux_file_label, plugin_supports_selinux_context_mount) = self.get_selinux_label(
             &spec,
