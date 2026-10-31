@@ -683,10 +683,13 @@ impl Framework {
         pod: &Pod,
         node: &Node,
         all_pods: &[Pod],
+        all_nodes: &[Node],
         nominated: Vec<&Pod>,
     ) -> Status {
         let pods_added = !nominated.is_empty();
-        let info = NodeInfo::new(node, all_pods).with_added_pods(nominated);
+        let info = NodeInfo::new(node, all_pods)
+            .with_all_nodes(all_nodes)
+            .with_added_pods(nominated);
         let status = self.run_filter_plugins(state, pod, &info).await;
         if !status.is_success() && !status.is_rejected() {
             return status;
@@ -694,8 +697,12 @@ impl Framework {
         if !pods_added || !status.is_success() {
             return status;
         }
-        self.run_filter_plugins(state, pod, &NodeInfo::new(node, all_pods))
-            .await
+        self.run_filter_plugins(
+            state,
+            pod,
+            &NodeInfo::new(node, all_pods).with_all_nodes(all_nodes),
+        )
+        .await
     }
 
     /// `EnqueueExtensions` (framework.go:736-738): plugin names whose

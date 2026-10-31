@@ -10,6 +10,7 @@ mod in_tree__node_name;
 mod in_tree__node_ports;
 mod in_tree__node_resources_fit;
 mod in_tree__node_unschedulable;
+mod in_tree__pod_affinity_spread;
 mod in_tree__taint_toleration;
 mod inter_pod_affinity_score;
 mod node_volume_limits;
