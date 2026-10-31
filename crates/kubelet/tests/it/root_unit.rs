@@ -35,5 +35,6 @@ mod static_pod_watch;
 mod streaming_server;
 mod sync_locks;
 mod sysctl;
+mod token_manager;
 mod volume_ownership;
 mod volumes;

@@ -78,6 +78,15 @@ mod create_volume_tests {
         )
         .await
         .unwrap();
+        // The self-mint fallback resolves the bound pod's node through storage
+        // (a TokenRequest's BoundObjectRef carries no node).
+        Storage::create(
+            e.storage.as_ref(),
+            &build_key("pods", Some("default"), "p"),
+            &pod(),
+        )
+        .await
+        .unwrap();
         Storage::create(
             e.storage.as_ref(),
             &build_key("nodes", None::<&str>, "node-1"),
@@ -437,45 +446,24 @@ mod create_volume_tests {
         assert!(!token.ends_with(".placeholder"));
     }
 
-    /// The token file is `defaultMode` 0o440; the kubelet runs as root and can
-    /// overwrite it, a non-root test run needs the owner write bit back.
-    fn make_writable(file: &str) {
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o640)).unwrap();
-    }
-
-    fn set_age(file: &str, age_secs: u64) {
-        // Read-only open: the token file is 0o440, and futimens needs only ownership.
-        let f = std::fs::File::open(file).unwrap();
-        f.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
-            .unwrap();
-    }
-
-    /// Freshness check (upstream `requiresRefresh`, token_manager.go:174): a token
-    /// younger than 80% of its lifetime is reused, an older one is re-minted. A
-    /// sentinel written into the file distinguishes reuse from re-mint.
-    /// expirationSeconds=600 => refresh after 480s.
+    /// `Manager.GetServiceAccountToken` (token_manager.go:98-130): a token
+    /// younger than its refresh window is served from the in-memory cache, so a
+    /// per-sync re-SetUp projects the same bytes (the AtomicWriter stays inert).
+    /// The cache and its refresh rules are covered by `token_manager.rs`.
     #[tokio::test]
-    async fn projected_sa_token_is_reminted_only_when_stale() {
+    async fn projected_sa_token_is_served_from_the_manager_cache() {
         let e = env();
         seed_sa_and_node(&e).await;
         let v = projected_token_volume(json!({"expirationSeconds": 600}));
         let path = e.vm.create_volume(&pod(), &v).await.unwrap();
         let file = format!("{path}/sub/token");
-        let c = read_claims(&file);
-        assert_eq!(c.exp - c.iat, 600);
-
-        // Fresh (400s old < 480s): the sentinel survives the per-sync re-SetUp.
-        make_writable(&file);
-        std::fs::write(&file, "SENTINEL").unwrap();
-        set_age(&file, 400);
+        let first = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(read_claims(&file).exp - read_claims(&file).iat, 600);
+        // `iat` has one-second resolution: a re-mint inside the same second
+        // would be identical, so wait it out.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         e.vm.create_volume(&pod(), &v).await.unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "SENTINEL");
-
-        // Stale (500s old > 480s): re-minted.
-        make_writable(&file);
-        set_age(&file, 500);
-        e.vm.create_volume(&pod(), &v).await.unwrap();
-        assert_eq!(read_claims(&file).sub, "system:serviceaccount:default:sa1");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
     }
 }
 

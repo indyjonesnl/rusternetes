@@ -29,17 +29,6 @@ mod tests {
         }
     }
 
-    // Upstream pkg/kubelet/token/token_manager.go:40 `maxTTL = 24 * time.Hour`,
-    // :187 `now.After(iat.Add(maxTTL - jitter))` => refresh by 24h-jitter.
-    #[test]
-    fn refresh_after_is_capped_at_24h_minus_jitter_2358() {
-        // 48h token: 80% (38.4h) exceeds the 24h cap.
-        assert_eq!(token_refresh_after_secs(48 * 3600, 4), 24 * 3600 - 4);
-        // 1h token: 80% rule wins.
-        assert_eq!(token_refresh_after_secs(3600, 0), 2880);
-        // Floor kept (pre-existing 60s minimum).
-        assert_eq!(token_refresh_after_secs(10, 0), 60);
-    }
     use rusternetes_common::resources::Volume;
 
     fn plugin() -> ProjectedPlugin {
@@ -495,6 +484,50 @@ mod tests {
             assert_eq!(meta.uid() as i64, uid, "{name}");
             assert_eq!(meta.gid() as i64, gid, "{name}");
         }
+    }
+
+    /// `projectedVolumeUnmounter.TearDownAt` (`projected.go:443-457`) ends with
+    /// `deleteServiceAccountToken(podUID)`: the pod's cached tokens are evicted
+    /// from the token manager once the wrapped emptyDir is torn down.
+    #[tokio::test]
+    async fn tear_down_evicts_the_pods_cached_service_account_token() {
+        use rusternetes_kubelet::volume_plugins::{VolumeHost, VolumePlugin};
+        let dir = tempfile::tempdir().unwrap();
+        let st = Arc::new(StorageBackend::new_memory());
+        let host = Arc::new(
+            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                dir.path().to_string_lossy().to_string(),
+                Some(st.clone()),
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                HashMap::new(),
+            ),
+        );
+        let p = ProjectedPlugin::new(host.clone());
+        let v = vol(serde_json::json!([
+            {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}}
+        ]));
+        let pod = pod_with_security(serde_json::json!({}), serde_json::json!({}));
+        let spec = Spec {
+            volume: &v,
+            persistent_volume: None,
+            read_only: false,
+            migrated: false,
+            inline_volume_spec_for_csi_migration: false,
+        };
+        let m = p.new_mounter(&spec, &pod).await.unwrap();
+        m.set_up_with(&args_for(&pod)).await.unwrap();
+        assert_eq!(host.service_account_token_manager().cache_len(), 1);
+
+        // Another pod's token survives.
+        let mut other = pod.clone();
+        other.metadata.uid = "uid-2".into();
+        let m2 = p.new_mounter(&spec, &other).await.unwrap();
+        m2.set_up_with(&args_for(&other)).await.unwrap();
+        assert_eq!(host.service_account_token_manager().cache_len(), 2);
+
+        let u = p.new_unmounter("proj", "uid-1").unwrap();
+        u.tear_down_at(&m.get_path()).await.unwrap();
+        assert_eq!(host.service_account_token_manager().cache_len(), 1);
     }
 
     /// `setPerms` is only run when the AtomicWriter writes (`atomic_writer.go:

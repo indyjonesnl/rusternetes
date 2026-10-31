@@ -41,6 +41,7 @@ pub mod streaming_server;
 pub mod swap_util;
 pub mod sync_locks;
 pub mod sysctl;
+pub mod token_manager;
 pub mod volume_manager;
 pub mod volume_ownership;
 pub mod volume_plugins;
