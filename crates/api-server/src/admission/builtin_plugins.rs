@@ -1,16 +1,18 @@
 //! The small in-tree admission plugins of `plugin/pkg/admission/*` that
 //! kube-apiserver registers (`pkg/kubeapiserver/options/plugins.go:69-111`):
 //! `AlwaysAdmit`, `AlwaysDeny`, `DenyServiceExternalIPs`, `AlwaysPullImages`,
-//! `LimitPodHardAntiAffinityTopology`, `PersistentVolumeClaimResize` and
-//! `DefaultIngressClass`.
+//! `LimitPodHardAntiAffinityTopology`, `PersistentVolumeClaimResize`,
+//! `TaintNodesByCondition` and `DefaultIngressClass`.
 
 use std::sync::Arc;
 
 use rusternetes_common::quantity::{Format, Quantity};
+use rusternetes_common::resources::node::{NodeSpec, Taint};
 use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
 use rusternetes_common::resources::{
-    Ingress, IngressClass, PersistentVolumeClaim, Pod, Service, StorageClass,
+    Ingress, IngressClass, Node, PersistentVolumeClaim, Pod, Service, StorageClass,
 };
+use rusternetes_common::tolerations::TAINT_NODE_NOT_READY;
 use rusternetes_common::types::{ObjectMeta, Status};
 use rusternetes_common::validation::field;
 use rusternetes_common::{Error, Result};
@@ -114,6 +116,34 @@ pub fn is_update_with_no_new_images(pod: &Pod, old: Option<&Pod>) -> bool {
     container_images(pod)
         .iter()
         .all(|image| old_images.contains(image))
+}
+
+/// `TaintNodesByCondition.Admit` (nodetaint/admission.go:61-77, `addNotReadyTaint`
+/// :79-91): a node is created carrying `node.kubernetes.io/not-ready:NoSchedule`
+/// so it cannot receive pods before the node lifecycle controller has seen it
+/// Ready. A taint matching on key and effect (`Taint.MatchTaint`) is not added
+/// twice. The caller applies the plugin's `NewHandler(Create)` and the
+/// non-subresource `nodes` resource check (:63-66).
+pub fn node_taint_admit(node: &mut Node) {
+    let spec = node.spec.get_or_insert(NodeSpec {
+        pod_cidr: None,
+        pod_cidrs: None,
+        provider_id: None,
+        unschedulable: None,
+        taints: None,
+    });
+    let taints = spec.taints.get_or_insert_with(Vec::new);
+    if !taints
+        .iter()
+        .any(|t| t.key == TAINT_NODE_NOT_READY && t.effect == "NoSchedule")
+    {
+        taints.push(Taint {
+            key: TAINT_NODE_NOT_READY.to_string(),
+            value: None,
+            effect: "NoSchedule".to_string(),
+            time_added: None,
+        });
+    }
 }
 
 /// `AlwaysPullImages.Admit` (alwayspullimages/admission.go:53-76), after

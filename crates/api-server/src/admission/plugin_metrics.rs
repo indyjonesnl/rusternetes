@@ -60,6 +60,13 @@ const PLUGINS: &[Spec] = &[
         admit: true,
         validate: false,
     },
+    // nodetaint/admission.go:45 (Create only), :61 (Admit only)
+    Spec {
+        name: "TaintNodesByCondition",
+        ops: C,
+        admit: true,
+        validate: false,
+    },
     // security/podsecurity/admission.go:82, :108
     Spec {
         name: "PodSecurity",
