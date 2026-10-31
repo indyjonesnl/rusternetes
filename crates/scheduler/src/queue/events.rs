@@ -21,9 +21,10 @@
 //!
 //! Feature gates fixed at their 1.35 defaults: `SchedulerQueueingHints` is GA
 //! and locked on (`pkg/features/kube_features.go:1762-1766`);
-//! `DynamicResourceAllocation`'s `UpdatePodGeneratedResourceClaim` extractor
-//! and `NodeDeclaredFeatures`' `extractNodeFeaturesChange` are omitted (those
-//! gates are off / the resources are not scheduled here yet).
+//! `DynamicResourceAllocation` is GA (default on) so its
+//! `UpdatePodGeneratedResourceClaim` extractor is always active;
+//! `NodeDeclaredFeatures`' `extractNodeFeaturesChange` is omitted (that gate is
+//! off / the resource is not scheduled here yet).
 
 use rusternetes_common::resources::{Node, Pod};
 use std::any::Any;
@@ -447,11 +448,13 @@ pub fn pod_scheduling_properties_change(new_pod: &Pod, old_pod: &Pod) -> Vec<Clu
         EventResource::AssignedPod
     };
 
-    let extractors: [fn(&Pod, &Pod) -> ActionType; 4] = [
+    let extractors: [fn(&Pod, &Pod) -> ActionType; 5] = [
         extract_pod_labels_change,
         extract_pod_scale_down,
         extract_pod_scheduling_gate_eliminated_change,
         extract_pod_toleration_change,
+        // `features.DynamicResourceAllocation` is GA in 1.35 (always on).
+        extract_pod_generated_resource_claim_change,
     ];
 
     let mut events = Vec::new();
@@ -525,6 +528,47 @@ fn extract_pod_scheduling_gate_eliminated_change(new_pod: &Pod, old_pod: &Pod) -
     if len(new_pod) == 0 && len(old_pod) != 0 {
         // A scheduling gate on the pod is completely removed.
         return ActionType::UPDATE_POD_SCHEDULING_GATES_ELIMINATED;
+    }
+    ActionType::NONE
+}
+
+/// `extractPodGeneratedResourceClaimChange` (`events.go:154-160`) over
+/// `resourceclaim.PodStatusEqual` / `PodExtendedStatusEqual`
+/// (`staging/src/k8s.io/dynamic-resource-allocation/resourceclaim/pod.go:34-69`):
+/// order-sensitive, as upstream ("this cannot be guaranteed" not to be modified).
+fn extract_pod_generated_resource_claim_change(new_pod: &Pod, old_pod: &Pod) -> ActionType {
+    let status = |p: &Pod| p.status.clone().unwrap_or_default();
+    let (new_status, old_status) = (status(new_pod), status(old_pod));
+
+    let a = new_status.resource_claim_statuses.unwrap_or_default();
+    let b = old_status.resource_claim_statuses.unwrap_or_default();
+    let statuses_equal = a.len() == b.len()
+        && a.iter()
+            .zip(&b)
+            .all(|(x, y)| x.name == y.name && x.resource_claim_name == y.resource_claim_name);
+
+    let extended_equal = match (
+        new_status.extended_resource_claim_status.as_ref(),
+        old_status.extended_resource_claim_status.as_ref(),
+    ) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.resource_claim_name == y.resource_claim_name
+                && x.request_mappings.len() == y.request_mappings.len()
+                && x.request_mappings
+                    .iter()
+                    .zip(&y.request_mappings)
+                    .all(|(m, n)| {
+                        m.container_name == n.container_name
+                            && m.request_name == n.request_name
+                            && m.resource_name == n.resource_name
+                    })
+        }
+        _ => false,
+    };
+
+    if !statuses_equal || !extended_equal {
+        return ActionType::UPDATE_POD_GENERATED_RESOURCE_CLAIM;
     }
     ActionType::NONE
 }

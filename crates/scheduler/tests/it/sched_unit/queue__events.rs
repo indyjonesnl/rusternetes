@@ -304,6 +304,54 @@ mod tests {
                 vec![ClusterEvent::new(u, ActionType::UPDATE)],
             ),
             (
+                "pod claim statuses change",
+                base.clone(),
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"resourceClaimStatuses": [{"name": "my-claim", "resourceClaimName": "claim"}]}}),
+                ),
+                vec![ClusterEvent::new(
+                    u,
+                    ActionType::UPDATE_POD_GENERATED_RESOURCE_CLAIM,
+                )],
+            ),
+            (
+                "pod claim statuses swapped",
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"resourceClaimStatuses": [{"name": "my-claim-2", "resourceClaimName": "claim-2"}, {"name": "my-claim", "resourceClaimName": "claim"}]}}),
+                ),
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"resourceClaimStatuses": [{"name": "my-claim", "resourceClaimName": "claim"}, {"name": "my-claim-2", "resourceClaimName": "claim-2"}]}}),
+                ),
+                vec![ClusterEvent::new(
+                    u,
+                    ActionType::UPDATE_POD_GENERATED_RESOURCE_CLAIM,
+                )],
+            ),
+            (
+                "pod extended resource claim status change",
+                base.clone(),
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"extendedResourceClaimStatus": {"resourceClaimName": "claim", "requestMappings": [{"requestName": "request", "containerName": "c", "resourceName": "example.com/gpu"}]}}}),
+                ),
+                vec![ClusterEvent::new(
+                    u,
+                    ActionType::UPDATE_POD_GENERATED_RESOURCE_CLAIM,
+                )],
+            ),
+            (
+                "pod extended resource claim status name changed",
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"extendedResourceClaimStatus": {"resourceClaimName": "claim", "requestMappings": []}}}),
+                ),
+                pod_json(
+                    serde_json::json!({"metadata": {"name": "p"}, "status": {"extendedResourceClaimStatus": {"resourceClaimName": "claim-2", "requestMappings": []}}}),
+                ),
+                vec![ClusterEvent::new(
+                    u,
+                    ActionType::UPDATE_POD_GENERATED_RESOURCE_CLAIM,
+                )],
+            ),
+            (
                 "no specific changed applied on an assigned pod",
                 assigned.clone(),
                 assigned.clone(),
