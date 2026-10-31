@@ -2118,6 +2118,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 .put(handlers::storageversionmigration::update_status)
                 .patch(handlers::storageversionmigration::patch_status),
         )
+        .route(
+            "/apis/storagemigration.k8s.io/v1beta1/watch/storageversionmigrations",
+            get(handlers::watch::watch_storageversionmigrations),
+        )
         // Coordination v1 API - Leases (namespace-scoped)
         .route(
             "/apis/coordination.k8s.io/v1/namespaces/:namespace/leases",
