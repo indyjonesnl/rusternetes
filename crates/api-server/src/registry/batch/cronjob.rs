@@ -102,7 +102,8 @@ impl RestUpdateStrategy<CronJob> for Strategy {
         old: &CronJob,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
-        if obj.metadata.generation != old.metadata.generation {
+        // A plain int64 upstream: an absent generation is 0 (#2955).
+        if obj.metadata.generation.unwrap_or(0) != old.metadata.generation.unwrap_or(0) {
             warnings.extend(warnings_for_job_spec(
                 JOB_TEMPLATE_SPEC_PATH,
                 &obj.spec.job_template.spec,

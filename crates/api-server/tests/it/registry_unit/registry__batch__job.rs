@@ -151,6 +151,22 @@ mod tests {
         assert!(warnings_for_job_spec("spec", &job.spec).is_empty());
     }
 
+    /// `WarningsOnUpdate` (strategy.go:308-316) compares plain int64
+    /// generations, so an unset generation equals `Some(0)`.
+    #[test]
+    fn warnings_on_update_treats_absent_generation_as_zero() {
+        let mut huge = job();
+        huge.spec.completion_mode = Some("Indexed".into());
+        huge.spec.completions = Some(COMPLETIONS_SOFT_LIMIT + 1);
+        huge.spec.parallelism = Some(PARALLELISM_SOFT_LIMIT_FOR_UNLIMITED_COMPLETIONS + 1);
+        let (mut new, mut old) = (huge.clone(), huge);
+        new.metadata.generation = None;
+        old.metadata.generation = Some(0);
+        assert!(Strategy.warnings_on_update(&ctx(), &new, &old).is_empty());
+        old.metadata.generation = Some(1);
+        assert_eq!(Strategy.warnings_on_update(&ctx(), &new, &old).len(), 1);
+    }
+
     #[test]
     fn status_prepare_for_update_keeps_spec() {
         let old = job();

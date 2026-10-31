@@ -197,7 +197,9 @@ impl RestUpdateStrategy<Job> for Strategy {
 
     /// `WarningsOnUpdate` (strategy.go:308-316): only a spec change warns.
     fn warnings_on_update(&self, _ctx: &RequestContext, obj: &Job, old: &Job) -> Vec<String> {
-        if obj.metadata.generation != old.metadata.generation {
+        // `newJob.Generation != oldJob.Generation` over a plain int64: an
+        // absent generation is 0 (#2955).
+        if obj.metadata.generation.unwrap_or(0) != old.metadata.generation.unwrap_or(0) {
             return warnings_for_job_spec("spec", &obj.spec);
         }
         Vec::new()
