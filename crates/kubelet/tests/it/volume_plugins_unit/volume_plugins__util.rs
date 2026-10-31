@@ -1008,3 +1008,85 @@ mod unmount_device_tests {
         assert_eq!(f.unmounted().len(), 1);
     }
 }
+
+mod pod_volume_names_tests {
+    use super::__parent::*;
+    use rusternetes_kubelet::volume_plugins::util::get_pod_volume_names;
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    fn pod(spec: serde_json::Value) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
+            "spec": spec
+        }))
+        .unwrap()
+    }
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `TestGetPodVolumeNames` (`pkg/volume/util/util_test.go:638`).
+    #[test]
+    fn get_pod_volume_names_cases() {
+        // empty pod
+        let (m, d, c) = get_pod_volume_names(&pod(json!({"containers": []})), true);
+        assert!(m.is_empty() && d.is_empty() && c.is_empty());
+
+        // mounts and devices are split
+        let p = pod(json!({"containers": [{
+            "name": "container", "image": "i",
+            "volumeMounts": [{"name": "vol1", "mountPath": "/a"}, {"name": "vol2", "mountPath": "/b"}],
+            "volumeDevices": [{"name": "vol3", "devicePath": "/c"}, {"name": "vol4", "devicePath": "/d"}]
+        }]}));
+        let (m, d, c) = get_pod_volume_names(&p, true);
+        assert_eq!(m, set(&["vol1", "vol2"]));
+        assert_eq!(d, set(&["vol3", "vol4"]));
+        assert!(c.is_empty());
+
+        // init, regular and ephemeral containers are all visited
+        let p = pod(json!({
+            "initContainers": [{"name": "i", "image": "i", "volumeMounts": [{"name": "vol1", "mountPath": "/a"}]}],
+            "containers": [{"name": "c", "image": "i", "volumeMounts": [{"name": "vol2", "mountPath": "/b"}]}],
+            "ephemeralContainers": [{"name": "e", "image": "i", "volumeMounts": [{"name": "vol3", "mountPath": "/c"}]}]
+        }));
+        let (m, _, _) = get_pod_volume_names(&p, false);
+        assert_eq!(m, set(&["vol1", "vol2", "vol3"]));
+    }
+
+    /// The `pod with SELinuxOptions` case: a container's own options win, else
+    /// the pod's; devices carry none; nothing is collected when not asked.
+    #[test]
+    fn get_pod_volume_names_selinux_options() {
+        let p = pod(json!({
+            "securityContext": {"seLinuxOptions": {"type": "global_context_t", "level": "s0:c1,c2"}},
+            "initContainers": [{"name": "i1", "image": "i",
+                "securityContext": {"seLinuxOptions": {"type": "initcontainer1_context_t", "level": "s0:c3,c4"}},
+                "volumeMounts": [{"name": "vol1", "mountPath": "/a"}]}],
+            "containers": [
+                {"name": "c1", "image": "i",
+                    "securityContext": {"seLinuxOptions": {"type": "container1_context_t", "level": "s0:c5,c6"}},
+                    "volumeMounts": [{"name": "vol1", "mountPath": "/a"}, {"name": "vol2", "mountPath": "/b"}]},
+                {"name": "c2", "image": "i",
+                    "volumeMounts": [{"name": "vol2", "mountPath": "/b"}, {"name": "vol3", "mountPath": "/c"}]}
+            ]
+        }));
+        let (m, d, c) = get_pod_volume_names(&p, true);
+        assert_eq!(m, set(&["vol1", "vol2", "vol3"]));
+        assert!(d.is_empty());
+        let levels = |name: &str| -> Vec<String> {
+            c[name]
+                .iter()
+                .map(|o| o.as_ref().unwrap().level.clone().unwrap())
+                .collect()
+        };
+        assert_eq!(levels("vol1"), ["s0:c3,c4", "s0:c5,c6"]);
+        assert_eq!(levels("vol2"), ["s0:c5,c6", "s0:c1,c2"]);
+        assert_eq!(levels("vol3"), ["s0:c1,c2"]);
+
+        let (_, _, c) = get_pod_volume_names(&p, false);
+        assert!(c.is_empty());
+    }
+}
