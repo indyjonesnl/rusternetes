@@ -8,6 +8,7 @@
 //! [`ApiClient`] + [`watch_stream`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -79,6 +80,9 @@ pub struct Reflector<T, K: Fn(&T) -> String> {
     store: Arc<RwLock<HashMap<String, T>>>,
     tx: broadcast::Sender<StoreEvent<T>>,
     last_rv: RwLock<Option<String>>,
+    /// Set once the initial list has populated the store
+    /// (`sharedIndexInformer.HasSynced`).
+    synced: AtomicBool,
 }
 
 impl<T, K> Reflector<T, K>
@@ -94,6 +98,21 @@ where
             store: Arc::new(RwLock::new(HashMap::new())),
             tx,
             last_rv: RwLock::new(None),
+            synced: AtomicBool::new(false),
+        }
+    }
+
+    /// `HasSynced` (client-go `shared_informer.go:588`): true once the initial
+    /// list is in the store. Stays true across later re-lists.
+    pub fn has_synced(&self) -> bool {
+        self.synced.load(Ordering::SeqCst)
+    }
+
+    /// `WaitForCacheSync` (client-go `tools/cache/shared_informer.go`, polling
+    /// `HasSynced` every 100ms): resolves once the initial list is in the store.
+    pub async fn wait_for_cache_sync(&self) {
+        while !self.has_synced() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -126,6 +145,7 @@ where
             }
             drop(store);
             *self.last_rv.write().unwrap() = Some(rv);
+            self.synced.store(true, Ordering::SeqCst);
         }
 
         let rv = self.last_rv.read().unwrap().clone();

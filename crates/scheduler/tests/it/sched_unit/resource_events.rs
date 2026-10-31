@@ -107,6 +107,22 @@ mod tests {
         assert_eq!(got[&EventResource::StorageClass], ActionType::ADD);
     }
 
+    /// The default profile must start feeds for every resource the
+    /// NodeVolumeLimits hints register for (`nodevolumelimits/csi.go:90-109`),
+    /// otherwise the hints are registered but can never fire (#3962).
+    #[test]
+    fn default_profile_unions_node_volume_limits_resources() {
+        use rusternetes_scheduler::profile::Profile;
+        use rusternetes_scheduler::queue::hints::build_queueing_hint_map_per_profile;
+        let profile = Profile::named("default-scheduler");
+        let map = build_queueing_hint_map_per_profile([&profile], &Default::default());
+        let got = unioned_gvks(&map);
+        assert!(got[&EventResource::CsiNode].contains(ActionType::ADD | ActionType::UPDATE));
+        assert!(got[&EventResource::PersistentVolumeClaim].contains(ActionType::ADD));
+        assert!(got[&EventResource::VolumeAttachment].contains(ActionType::DELETE));
+        assert!(got[&EventResource::Pod].contains(ActionType::DELETE));
+    }
+
     /// `buildEvtResHandler`: add on first sight, update (with oldObj) on a
     /// changed resourceVersion, nothing for an unchanged one, delete only for
     /// known objects.
