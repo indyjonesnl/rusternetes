@@ -34,6 +34,7 @@ mod controllers__service;
 mod controllers__serviceaccount;
 mod controllers__servicecidr;
 mod controllers__statefulset;
+mod controllers__storage_version_migrator;
 mod controllers__storageversiongc;
 mod controllers__taint_eviction;
 mod controllers__taint_eviction_timed_workers;
