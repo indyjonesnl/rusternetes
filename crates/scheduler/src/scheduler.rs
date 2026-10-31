@@ -1571,7 +1571,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let cycle_state = CycleState::new();
 
         let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
-        let taint_on = filter_on(names::TAINT_TOLERATION);
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         let ports_on = filter_on(names::NODE_PORTS);
         let inter_pod_filter_on = filter_on(names::INTER_POD_AFFINITY);
@@ -1633,7 +1632,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 processed_nodes += 1;
                 let eval = async {
                     // The Filter plugins that are objects (`RunFilterPlugins`,
-                    // framework.go:1033): NodeUnschedulable. They run first,
+                    // framework.go:1033): NodeUnschedulable, NodeName, TaintToleration. They run first,
                     // as in the default plugin order, ahead of the filters
                     // still inline below.
                     let status = fw
@@ -1648,15 +1647,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             // an Error status aborts the whole search.
                             filter_error = Some(status.message());
                         }
-                        return None;
-                    }
-                    // TaintToleration
-                    if taint_on && !check_taints_tolerations(node, pod) {
-                        debug!(
-                            "Node {} has taints the pod does not tolerate",
-                            node.metadata.name
-                        );
-                        diag.add_plugin_status(names::TAINT_TOLERATION);
                         return None;
                     }
                     // NodeAffinity (`spec.nodeSelector` is part of its filter, as is

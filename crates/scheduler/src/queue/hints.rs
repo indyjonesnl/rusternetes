@@ -672,7 +672,7 @@ pub mod node_ports {
 }
 
 /// Taint helpers shared by NodeUnschedulable and TaintToleration.
-mod taints {
+pub(crate) mod taints {
     use crate::advanced::toleration_matches_taint;
     use rusternetes_common::resources::{Taint, Toleration};
 
