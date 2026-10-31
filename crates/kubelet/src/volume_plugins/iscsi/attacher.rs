@@ -5,9 +5,8 @@
 //! Not ported: `Attach`, `VolumesAreAttached`, `Detach`, `NewDetacher` and
 //! `VerifyExhaustedResource` (`attacher.go:57-59`, `:122-129`) belong to the
 //! attach/detach controller, which this project does not run in the kubelet.
-//! `mountArgs.SELinuxLabel` / `AddSELinuxMountOption` (`attacher.go:128-130`)
-//! waits on [`DeviceMounterArgs`] carrying the label (#2312, #3493). Nothing
-//! drives `UnmountDevice` from `VolumeManager::unmount_unused_iscsi_devices`.
+//! Nothing drives `UnmountDevice` from
+//! `VolumeManager::unmount_unused_iscsi_devices`.
 
 use super::{
     create_secret_map, get_iscsi_volume_info, volume_spec_to_mounter_with, DiskManager, IscsiDisk,
@@ -115,7 +114,7 @@ impl DeviceMounter for IscsiAttacher {
         spec: &Spec<'_>,
         device_path: &str,
         device_mount_path: &str,
-        _args: &DeviceMounterArgs,
+        args: &DeviceMounterArgs,
     ) -> Result<()> {
         let mounter: Arc<dyn MountInterface> = Arc::new(self.plugin.host.get_mounter().clone());
         let not_mnt = match mounter.is_likely_not_mount_point(device_mount_path) {
@@ -131,11 +130,7 @@ impl DeviceMounter for IscsiAttacher {
         };
         let (read_only, fs_type) = get_iscsi_volume_info(spec)?;
 
-        let mut options: Vec<String> = Vec::new();
-        if read_only {
-            options.push("ro".to_string());
-        }
-        // `mountArgs.SELinuxLabel` -> `AddSELinuxMountOption`: see the module docs.
+        let options = device_mount_options(read_only, &args.selinux_label);
         if not_mnt {
             let exec: Arc<dyn Exec> = Arc::new(RealExec);
             let disk_mounter = SafeFormatAndMount::new(mounter, exec);
@@ -153,6 +148,21 @@ impl DeviceMounter for IscsiAttacher {
         }
         Ok(())
     }
+}
+
+/// The option list `MountDevice` builds before `MountOptionFromSpec`
+/// (`attacher.go:124-130`): `ro`, then `context="<label>"` via
+/// `AddSELinuxMountOption` when `mountArgs.SELinuxLabel` is set.
+pub fn device_mount_options(read_only: bool, selinux_label: &str) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    if read_only {
+        options.push("ro".to_string());
+    }
+    if !selinux_label.is_empty() {
+        options =
+            crate::volume_plugins::util::selinux::add_selinux_mount_option(options, selinux_label);
+    }
+    options
 }
 
 #[async_trait]

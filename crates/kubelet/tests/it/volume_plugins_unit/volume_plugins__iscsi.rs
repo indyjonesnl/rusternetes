@@ -468,4 +468,101 @@ mod tests {
             assert!(got.available.unwrap().value() > 0);
         }
     }
+
+    /// `MountDevice`'s option list (`attacher.go:124-130`).
+    #[test]
+    fn device_mount_options_add_selinux_context() {
+        use rusternetes_kubelet::volume_plugins::iscsi::attacher::device_mount_options;
+        assert!(device_mount_options(false, "").is_empty());
+        assert_eq!(device_mount_options(true, ""), ["ro"]);
+        assert_eq!(
+            device_mount_options(true, "system_u:object_r:container_file_t:s0:c1,c2"),
+            [
+                "ro",
+                "context=\"system_u:object_r:container_file_t:s0:c1,c2\""
+            ]
+        );
+        let _off = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+            false,
+        );
+        assert_eq!(device_mount_options(true, "system_u:object_r:x:s0"), ["ro"]);
+    }
+
+    struct ContextHostUtil(String);
+
+    impl rusternetes_kubelet::volume_plugins::util::hostutil::HostUtils for ContextHostUtil {
+        fn device_opened(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn path_is_device(&self, _: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn get_file_type(
+            &self,
+            _: &str,
+        ) -> std::io::Result<rusternetes_kubelet::volume_plugins::util::hostutil::FileType>
+        {
+            Err(std::io::Error::other("not faked"))
+        }
+        fn get_selinux_mount_context(&self, _: &str) -> std::io::Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// `ConstructVolumeSpec` (`iscsi.go:220-296`) returns the pod mount's
+    /// `-o context=` as `SELinuxMountContext` under `SELinuxMountReadWriteOncePod`.
+    #[test]
+    #[serial_test::serial]
+    fn construct_volume_spec_reports_selinux_mount_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let pod_path = root.join("pods/uid/volumes/kubernetes.io~iscsi/mypv");
+        let global = root.join(
+            "plugins/kubernetes.io/iscsi/iface-default/127.0.0.1:3260-iqn.2014-12.server:storage.target01-lun-0",
+        );
+        std::fs::create_dir_all(&pod_path).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        let info = format!(
+            "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n20 10 8:1 /r {} rw - ext4 /dev/sda1 rw\n21 10 8:1 /r {} rw - ext4 /dev/sda1 rw\n",
+            pod_path.display(),
+            global.display()
+        );
+        let mountinfo = root.join("mountinfo");
+        std::fs::write(&mountinfo, info).unwrap();
+        let host: Arc<dyn VolumeHost> = Arc::new(
+            KubeletVolumeHost::new_for_tests(
+                root.to_string_lossy().to_string(),
+                None,
+                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                HashMap::new(),
+            )
+            .with_mounter(
+                rusternetes_kubelet::volume_plugins::util::mount_ops::Mounter::new(
+                    "", false, false,
+                )
+                .with_mountinfo_path(mountinfo.to_str().unwrap()),
+            )
+            .with_host_util(Arc::new(ContextHostUtil(
+                "system_u:object_r:c:s0:c1".into(),
+            ))),
+        );
+        let plug = IscsiPlugin::new(host);
+        let got = plug
+            .construct_volume_spec("mypv", pod_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(got.selinux_mount_context, "system_u:object_r:c:s0:c1");
+        let iscsi = got.volume.unwrap().iscsi.unwrap();
+        assert_eq!(iscsi.iqn, "iqn.2014-12.server:storage.target01");
+
+        // Gate off: upstream never asks the host util.
+        let _off = rusternetes_common::feature_gates::with_feature(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+            false,
+        );
+        let got = plug
+            .construct_volume_spec("mypv", pod_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(got.selinux_mount_context, "");
+    }
 }

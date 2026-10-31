@@ -626,6 +626,9 @@ mod unmount_device_tests {
         ) -> io::Result<rusternetes_kubelet::volume_plugins::util::hostutil::FileType> {
             Err(io::Error::other("FakeHostUtil: GetFileType is not faked"))
         }
+        fn get_selinux_mount_context(&self, _pathname: &str) -> io::Result<String> {
+            Ok(String::new())
+        }
     }
 
     struct Fixture {
