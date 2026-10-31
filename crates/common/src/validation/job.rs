@@ -21,6 +21,7 @@ use crate::resources::pod::{Affinity, PodSpec};
 use crate::resources::workloads::{
     Job, JobCondition, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
 };
+use crate::resources::PodTemplateSpec;
 use crate::types::LabelSelector;
 use crate::validation::field::{BadValue, Error, ErrorList, Path};
 use crate::validation::metav1::{
@@ -126,7 +127,11 @@ const POD_REPLACEMENT_POLICIES: [&str; 2] = ["Failed", "TerminatingOrFailed"];
 /// selector-required / selector-match checks that `ValidateJobSpec` adds). This
 /// is the part shared with CronJob's `ValidateJobTemplateSpec`, whose template
 /// must NOT carry a selector.
-fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
+fn validate_job_spec_core(
+    spec: &JobSpec,
+    old_template: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
     if let Some(p) = spec.parallelism {
@@ -290,11 +295,17 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
     // (`pkg/apis/batch/validation/validation.go:276`), so a Job with no
     // containers answers `spec.template.spec.containers: Required value`
     // rather than a decoder error (#1939).
-    errs.extend(crate::validation::podtemplate::validate_pod_template_spec(
-        &spec.template,
-        &fld_path.child("template"),
-        false,
-    ));
+    // The pod options come from the OLD template on update
+    // (`GetValidationOptionsFromPodTemplate(new, old)`, pkg/registry/batch/job/
+    // strategy.go:184 `validationOptionsForJob`, cronjob/strategy.go:114,147).
+    errs.extend(
+        crate::validation::podtemplate::validate_pod_template_spec_with_old(
+            &spec.template,
+            old_template,
+            &fld_path.child("template"),
+            false,
+        ),
+    );
 
     // template.spec.restartPolicy must be OnFailure or Never (upstream rejects
     // the SetDefaults_PodSpec-defaulted "Always"/empty for Jobs). With a
@@ -366,8 +377,12 @@ fn validate_job_spec_core(spec: &JobSpec, fld_path: &Path) -> ErrorList {
 
 /// Port of upstream `ValidateJobSpec`: the core spec checks plus the
 /// selector-required / selector validity / selector-matches-template checks.
-fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
-    let mut errs = validate_job_spec_core(spec, fld_path);
+fn validate_job_spec(
+    spec: &JobSpec,
+    old_template: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+) -> ErrorList {
+    let mut errs = validate_job_spec_core(spec, old_template, fld_path);
 
     // Selector: required and valid. Upstream `ValidateJobSpec` only requires +
     // validates the selector here; the match check below runs regardless.
@@ -412,9 +427,13 @@ fn validate_job_spec(spec: &JobSpec, fld_path: &Path) -> ErrorList {
 /// Port of upstream `ValidateJobTemplateSpec` — validates the embedded job spec
 /// of a CronJob's `jobTemplate`. The template must NOT carry a selector (it is
 /// auto-generated) and must not set `manualSelector: true`.
-pub fn validate_job_template_spec(template: &JobTemplateSpec, fld_path: &Path) -> ErrorList {
+pub fn validate_job_template_spec(
+    template: &JobTemplateSpec,
+    old_template: Option<&PodTemplateSpec>,
+    fld_path: &Path,
+) -> ErrorList {
     let spec_path = fld_path.child("spec");
-    let mut errs = validate_job_spec_core(&template.spec, &spec_path);
+    let mut errs = validate_job_spec_core(&template.spec, old_template, &spec_path);
 
     if template.spec.selector.is_some() {
         errs.push(Error::invalid(
@@ -583,7 +602,7 @@ pub fn validate_job(job: &Job, opts: &JobValidationOptions) -> ErrorList {
         job,
         opts.require_prefixed_labels,
     ));
-    errs.extend(validate_job_spec(&job.spec, &Path::new("spec")));
+    errs.extend(validate_job_spec(&job.spec, None, &Path::new("spec")));
 
     // Indexed job pods get a `-$INDEX` hostname suffix; the max index is
     // `completions-1`. Reject names that would yield an invalid DNS-1123 label.
@@ -641,7 +660,7 @@ fn validate_job_spec_update(
     fld_path: &Path,
     opts: &JobValidationOptions,
 ) -> ErrorList {
-    let mut errs = validate_job_spec(spec, fld_path);
+    let mut errs = validate_job_spec(spec, Some(&old_spec.template), fld_path);
     errs.extend(validate_completions(
         spec,
         old_spec,
