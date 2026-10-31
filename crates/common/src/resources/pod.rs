@@ -1348,7 +1348,12 @@ pub struct ResourceFieldSelector {
     pub resource: String,
 
     /// Specifies the output format of the exposed resources, defaults to "1"
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt",
+        deserialize_with = "crate::quantity::wire::deserialize_opt"
+    )]
     pub divisor: Option<String>,
 }
 

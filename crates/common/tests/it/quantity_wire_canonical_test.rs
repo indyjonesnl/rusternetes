@@ -72,3 +72,56 @@ fn csi_storage_capacity_canonical() {
     assert_eq!(out["capacity"], "1Gi");
     assert_eq!(out["maximumVolumeSize"], "2Gi");
 }
+
+// #3146 item 2: the remaining `resource.Quantity` fields.
+
+#[test]
+fn downward_api_divisor_canonical_and_validated() {
+    use rusternetes_common::resources::pod::ResourceFieldSelector;
+    let out = roundtrip::<ResourceFieldSelector>(
+        json!({"resource": "limits.memory", "divisor": "1024Mi"}),
+    );
+    assert_eq!(out["divisor"], "1Gi");
+    assert!(serde_json::from_value::<ResourceFieldSelector>(
+        json!({"resource": "limits.memory", "divisor": "bogus"})
+    )
+    .is_err());
+    // absent stays absent
+    let out = roundtrip::<ResourceFieldSelector>(json!({"resource": "limits.cpu"}));
+    assert!(out.get("divisor").is_none());
+}
+
+#[test]
+fn runtime_class_pod_fixed_canonical_and_validated() {
+    use rusternetes_common::resources::runtimeclass::RuntimeClass;
+    let out = roundtrip::<RuntimeClass>(json!({
+        "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+        "metadata": {"name": "rc"}, "handler": "h",
+        "overhead": {"podFixed": {"cpu": "1000m", "memory": "1024Mi"}}
+    }));
+    assert_eq!(out["overhead"]["podFixed"]["cpu"], "1");
+    assert_eq!(out["overhead"]["podFixed"]["memory"], "1Gi");
+    assert!(serde_json::from_value::<RuntimeClass>(json!({
+        "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+        "metadata": {"name": "rc"}, "handler": "h",
+        "overhead": {"podFixed": {"cpu": "bogus"}}
+    }))
+    .is_err());
+}
+
+#[test]
+fn metrics_usage_canonical_and_validated() {
+    use rusternetes_common::resources::metrics::PodMetrics;
+    let _ = std::any::type_name::<PodMetrics>();
+    let out = roundtrip::<PodMetrics>(json!({
+        "metadata": {"name": "p"}, "window": "15s",
+        "containers": [{"name": "c", "usage": {"cpu": "1000m", "memory": "1024Mi"}}]
+    }));
+    assert_eq!(out["containers"][0]["usage"]["cpu"], "1");
+    assert_eq!(out["containers"][0]["usage"]["memory"], "1Gi");
+    assert!(serde_json::from_value::<PodMetrics>(json!({
+        "metadata": {"name": "p"},
+        "containers": [{"name": "c", "usage": {"cpu": "bogus"}}]
+    }))
+    .is_err());
+}

@@ -70,7 +70,12 @@ impl RuntimeClass {
 #[serde(rename_all = "camelCase")]
 pub struct Overhead {
     /// PodFixed represents the fixed resource overhead associated with running a pod.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::quantity::wire::serialize_opt_map",
+        deserialize_with = "crate::quantity::wire::deserialize_opt_map"
+    )]
     pub pod_fixed: Option<HashMap<String, String>>,
 }
 

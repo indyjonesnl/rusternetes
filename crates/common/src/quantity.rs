@@ -756,6 +756,12 @@ pub mod wire {
         }
     }
 
+    pub fn deserialize_opt_map<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<HashMap<String, String>>, D::Error> {
+        crate::types::deserialize_quantity_map(d)
+    }
+
     pub fn serialize_opt_btree_map<S: Serializer>(
         m: &Option<BTreeMap<String, String>>,
         s: S,
