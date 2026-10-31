@@ -950,6 +950,7 @@ impl ReviewClient for TimeoutReviewClient {
                     "Post {path:?}: context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
                 ),
                 connection_reset: false,
+                http2_connection_lost: false,
                 suggests_client_delay: false,
             }),
         }

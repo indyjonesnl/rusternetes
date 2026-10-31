@@ -19,6 +19,7 @@ mod tests {
             reason: reason.into(),
             message: format!("{code} {reason}"),
             connection_reset: false,
+            http2_connection_lost: false,
             suggests_client_delay: false,
         }
     }
@@ -61,9 +62,44 @@ mod tests {
         let mut delay = err(503, "ServiceUnavailable");
         delay.suggests_client_delay = true;
         assert!(default_should_retry(&delay));
+        let mut lost = err(0, "");
+        lost.http2_connection_lost = true;
+        assert!(default_should_retry(&lost));
         assert!(!default_should_retry(&err(403, "Forbidden")));
         assert!(!default_should_retry(&err(401, "Unauthorized")));
         assert!(!default_should_retry(&err(0, "")));
+    }
+
+    // webhook.go:63-73 reads these off the client error: the response's
+    // Status (code/reason/details) and the transport failure text.
+    #[test]
+    fn review_error_from_classifies_client_errors() {
+        use rusternetes_client::api_status::ApiStatusError;
+        let status = |reason: &str, code: u16, retry: Option<i32>| {
+            anyhow::Error::new(ApiStatusError {
+                code,
+                reason: reason.into(),
+                message: "m".into(),
+                retry_after_seconds: retry,
+            })
+        };
+        // Status with details.retryAfterSeconds: SuggestsClientDelay.
+        let e = review_error_from(&status("ServiceUnavailable", 503, Some(3)));
+        assert!(e.suggests_client_delay && default_should_retry(&e));
+        // Status without details: no suggestion, and 503 alone is not retried.
+        let e = review_error_from(&status("ServiceUnavailable", 503, None));
+        assert!(!e.suggests_client_delay && !default_should_retry(&e));
+        // IsHTTP2ConnectionLost matches anywhere in the cause chain.
+        let lost = anyhow::anyhow!("http2: client connection lost").context("Post \"x\"");
+        let e = review_error_from(&lost);
+        assert!(e.http2_connection_lost && !e.connection_reset);
+        assert!(default_should_retry(&e));
+        let reset = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let e = review_error_from(&reset);
+        assert!(e.connection_reset && !e.http2_connection_lost);
+        assert!(!default_should_retry(&review_error_from(&anyhow::anyhow!(
+            "boom"
+        ))));
     }
 
     fn fast(steps: i32) -> Backoff {
