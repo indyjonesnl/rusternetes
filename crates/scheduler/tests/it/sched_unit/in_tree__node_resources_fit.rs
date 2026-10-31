@@ -2,7 +2,7 @@
 //! `RunFilterPluginsWithNominatedPods` (`runtime/framework.go:1145-1190`).
 use rusternetes_common::resources::{Node, Pod};
 use rusternetes_scheduler::fwk::{
-    Code, CycleState, FilterPlugin, NodeInfo, PreFilterPlugin, Status,
+    Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin, Status,
 };
 use rusternetes_scheduler::in_tree::NodeResourcesFit;
 use rusternetes_scheduler::profile::Profile;
@@ -30,7 +30,9 @@ fn alloc() -> Value {
 
 async fn run(p: &Pod, n: &Node, existing: &[Pod]) -> Status {
     let mut state = CycleState::new();
-    let (result, status) = NodeResourcesFit.pre_filter(&mut state, p, &[]).await;
+    let (result, status) = NodeResourcesFit
+        .pre_filter(&mut state, p, &[], &NoHandle)
+        .await;
     assert!(result.is_none() && status.is_success());
     NodeResourcesFit
         .filter(&state, p, &NodeInfo::new(n, existing))
@@ -172,7 +174,7 @@ async fn nominated_pods_reserve_space_in_the_first_pass_only() {
     nominee.status = Some(serde_json::from_value(json!({"nominatedNodeName": "n"})).unwrap());
     let mut state = CycleState::new();
     let (_, pre, _) = fw
-        .run_pre_filter_plugins(&mut state, &candidate, std::slice::from_ref(&n))
+        .run_pre_filter_plugins(&mut state, &candidate, std::slice::from_ref(&n), &NoHandle)
         .await;
     assert!(pre.is_success());
     let all = vec![nominee.clone()];

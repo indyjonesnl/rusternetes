@@ -1,6 +1,6 @@
 //! `fwk.Status`, `fwk.CycleState` and `fwk.NodeInfo` (`kube-scheduler/framework`).
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, NodeInfo, PreFilterResult, Status};
+use rusternetes_scheduler::fwk::{Code, CycleState, NoHandle, NodeInfo, PreFilterResult, Status};
 use rusternetes_scheduler::profile::Profile;
 
 #[test]
@@ -106,7 +106,9 @@ async fn run_pre_filter_plugins_records_skipped_plugins() {
     let fw = Profile::named("default-scheduler").framework;
     let mut state = CycleState::new();
     let pod = pod_with(serde_json::json!({"containers": [{"name": "c"}]}));
-    let (result, status, with_nodes) = fw.run_pre_filter_plugins(&mut state, &pod, &[]).await;
+    let (result, status, with_nodes) = fw
+        .run_pre_filter_plugins(&mut state, &pod, &[], &NoHandle)
+        .await;
     assert!(result.is_none() && status.is_success() && with_nodes.is_empty());
     let skipped = state.skip_filter_plugins();
     assert!(skipped.contains("NodeAffinity"));
@@ -126,7 +128,7 @@ async fn skipped_filters_do_not_run() {
         "status": {"allocatable": {"cpu": "1", "pods": "10"}}
     }))
     .unwrap();
-    fw.run_pre_filter_plugins(&mut state, &pod, std::slice::from_ref(&node))
+    fw.run_pre_filter_plugins(&mut state, &pod, std::slice::from_ref(&node), &NoHandle)
         .await;
     let pods: Vec<Pod> = vec![];
     let s = fw
@@ -150,7 +152,9 @@ async fn run_pre_filter_plugins_stops_on_unresolvable() {
             ]}
         ]}}}
     }));
-    let (result, status, _) = fw.run_pre_filter_plugins(&mut state, &pod, &[]).await;
+    let (result, status, _) = fw
+        .run_pre_filter_plugins(&mut state, &pod, &[], &NoHandle)
+        .await;
     assert!(result.is_none());
     assert_eq!(status.code(), Code::UnschedulableAndUnresolvable);
     assert_eq!(status.plugin(), "NodeAffinity");
@@ -168,7 +172,9 @@ async fn run_pre_filter_plugins_reports_restricting_plugins() {
             {"matchFields": [{"key": "metadata.name", "operator": "In", "values": ["a"]}]}
         ]}}}
     }));
-    let (result, status, with_nodes) = fw.run_pre_filter_plugins(&mut state, &pod, &[]).await;
+    let (result, status, with_nodes) = fw
+        .run_pre_filter_plugins(&mut state, &pod, &[], &NoHandle)
+        .await;
     assert!(status.is_success());
     assert_eq!(result, self::res(&["a"]));
     assert_eq!(

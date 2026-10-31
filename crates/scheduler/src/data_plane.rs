@@ -855,3 +855,14 @@ pub fn api_err_to_common(e: anyhow::Error) -> Error {
         Error::Internal(msg)
     }
 }
+
+#[async_trait::async_trait]
+impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for DataPlane<S> {
+    async fn node_volume_limits_snapshot(
+        &self,
+    ) -> std::result::Result<NodeVolumeLimitsSnapshot, String> {
+        self.list_node_volume_limits_snapshot()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}

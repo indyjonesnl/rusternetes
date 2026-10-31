@@ -1489,7 +1489,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // plugins either way (`diagnosis.UnschedulablePlugins`).
         let mut cycle_state = CycleState::new();
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
-            .run_pre_filter_plugins(&mut cycle_state, pod, nodes)
+            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, &self.data)
             .await;
         diag.unschedulable_plugins
             .extend(plugins_with_nodes.iter().cloned());
@@ -1546,32 +1546,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         } else {
             None
         };
-
-        // NodeVolumeLimits PreFilter (csi.go:219-229): a pod without PVC,
-        // ephemeral or inline-migratable volumes skips the plugin's Filter.
-        let limits_snapshot = if fw.has(ExtensionPoint::PreFilter, names::NODE_VOLUME_LIMITS)
-            && filter_on(names::NODE_VOLUME_LIMITS)
-            && crate::node_volume_limits::CsiLimits::pre_filter(pod)
-        {
-            match self.data.list_node_volume_limits_snapshot().await {
-                Ok(snap) => Some(snap),
-                Err(e) => {
-                    warn!("NodeVolumeLimits: failed to list volume objects: {}", e);
-                    // A plugin error aborts the cycle (schedule_one.go:496-497).
-                    diag.scheduling_error = Some(format!(
-                        "running {:?} filter plugin: {}",
-                        names::NODE_VOLUME_LIMITS,
-                        e
-                    ));
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-        let csi_limits = limits_snapshot
-            .as_ref()
-            .map(crate::node_volume_limits::CsiLimits::new);
 
         // `findNodesThatPassFilters` (schedule_one.go:624-708): visit the nodes
         // starting where the previous cycle left off (`nextStartNodeIndex`,
@@ -1711,46 +1685,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         );
                         diag.add_plugin_status(names::DYNAMIC_RESOURCES);
                         return None;
-                    }
-                    // NodeVolumeLimits (csi.go:236-345); `nodeInfo.GetPods()` is
-                    // the pods bound to this node.
-                    if let Some(limits) = &csi_limits {
-                        use crate::node_volume_limits::FilterStatus;
-                        let on_node: Vec<&Pod> = all_pods
-                            .iter()
-                            .filter(|p| {
-                                p.spec.as_ref().and_then(|s| s.node_name.as_deref())
-                                    == Some(node.metadata.name.as_str())
-                            })
-                            .collect();
-                        match limits.filter(pod, node, &on_node) {
-                            FilterStatus::Success => {}
-                            FilterStatus::Unschedulable(m)
-                            | FilterStatus::UnschedulableAndUnresolvable(m) => {
-                                debug!(
-                                    "Node {} rejected for pod {}: {}",
-                                    node.metadata.name, pod.metadata.name, m
-                                );
-                                diag.add_node_reasons([m]);
-                                return None;
-                            }
-                            FilterStatus::Error(m) => {
-                                warn!(
-                                    "NodeVolumeLimits filter error on node {} for pod {}: {}",
-                                    node.metadata.name, pod.metadata.name, m
-                                );
-                                // `findNodesThatPassFilters` (schedule_one.go:664-668):
-                                // an Error status aborts the whole search; the
-                                // message is wrapped by `RunFilterPlugins`
-                                // (framework.go:1058).
-                                filter_error = Some(format!(
-                                    "running {:?} filter plugin: {}",
-                                    names::NODE_VOLUME_LIMITS,
-                                    m
-                                ));
-                                return None;
-                            }
-                        }
                     }
                     // VolumeBinding
                     if let Some((snap, claims)) = volume_filter {
