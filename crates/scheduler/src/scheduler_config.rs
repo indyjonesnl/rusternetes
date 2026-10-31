@@ -942,6 +942,7 @@ fn resolve_profiles(
                 plugins: p.plugins.as_ref(),
                 plugin_config_names: &p.plugin_config_names,
                 percentage_of_nodes_to_score: p.percentage_of_nodes_to_score,
+                added_affinity: p.added_affinity.as_ref(),
             },
         )
         .ok()

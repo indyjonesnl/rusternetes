@@ -19,6 +19,7 @@
 
 use crate::fwk::{CycleState, FilterPlugin, NodeInfo, Status};
 use rusternetes_common::feature_gates::{self, Feature};
+use rusternetes_common::resources::pod::NodeAffinity;
 use rusternetes_common::resources::Pod;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -487,6 +488,9 @@ pub struct ProfileSpec<'a> {
     pub plugin_config_names: &'a [String],
     /// `profile.PercentageOfNodesToScore` (framework.go:354).
     pub percentage_of_nodes_to_score: Option<i32>,
+    /// `NodeAffinityArgs.AddedAffinity`, handed to the NodeAffinity plugin
+    /// (node_affinity.go:310-333).
+    pub added_affinity: Option<&'a NodeAffinity>,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -733,7 +737,14 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
     f.filter_plugin_objects = FilterPluginObjects(
         f.plugins_at(ExtensionPoint::Filter)
             .iter()
-            .filter_map(|name| crate::in_tree::new_filter_plugin(name))
+            .filter_map(|name| {
+                crate::in_tree::new_filter_plugin(
+                    name,
+                    &crate::in_tree::FilterPluginArgs {
+                        added_affinity: profile.added_affinity,
+                    },
+                )
+            })
             .collect(),
     );
     Ok(f)
