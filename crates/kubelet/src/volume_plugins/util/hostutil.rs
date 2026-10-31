@@ -17,6 +17,11 @@ pub trait HostUtils: Send + Sync {
     /// file at `pathname`; the local plugin reads it through
     /// `VolumeHost.GetHostUtil()` (`local.go:280`, `:406`).
     fn get_file_type(&self, pathname: &str) -> io::Result<FileType>;
+
+    /// `GetSELinuxMountContext` (`hostutil.go:72`, `hostutil_linux.go:301-305`):
+    /// the value of the `-o context=` mount option of the mount at `pathname`
+    /// (empty when none, or when SELinux is disabled).
+    fn get_selinux_mount_context(&self, pathname: &str) -> io::Result<String>;
 }
 
 /// `hostutil.HostUtil` (`hostutil_linux.go`).
@@ -102,6 +107,14 @@ impl HostUtils for HostUtil {
         get_file_type(pathname)
     }
 
+    fn get_selinux_mount_context(&self, pathname: &str) -> io::Result<String> {
+        get_selinux_mount_context(
+            pathname,
+            super::mount_utils::PROC_MOUNT_INFO_PATH,
+            crate::go_selinux::get_enabled,
+        )
+    }
+
     /// `HostUtil.DeviceOpened` (`hostutil_linux.go:57-59`).
     fn device_opened(&self, pathname: &str) -> io::Result<bool> {
         exclusive_open_fails_on_device(pathname)
@@ -151,6 +164,29 @@ pub fn get_selinux(
         .iter()
         .chain(info.mount_options.iter())
         .any(|o| o == "seclabel"))
+}
+
+/// `getSELinuxMountContext` (`hostutil_linux.go:309-331`): the `context=`
+/// super option of the mount `path` lives on, unquoted. The mountinfo parse is
+/// skipped (and `""` returned) when SELinux is disabled.
+pub fn get_selinux_mount_context(
+    path: &str,
+    mountinfo_path: &str,
+    selinux_enabled: impl Fn() -> bool,
+) -> io::Result<String> {
+    // Skip /proc/mounts parsing if SELinux is disabled.
+    if !selinux_enabled() {
+        return Ok(String::new());
+    }
+    let info = find_mount_info(path, mountinfo_path)?;
+    for opt in &info.super_options {
+        let Some(context) = opt.strip_prefix("context=") else {
+            continue;
+        };
+        // Remove double quotes
+        return Ok(context.trim_matches('"').to_string());
+    }
+    Ok(String::new())
 }
 
 /// `HostUtil.GetSELinuxSupport` (`hostutil_linux.go:263-265`).

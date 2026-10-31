@@ -103,7 +103,8 @@ impl MountInterface for Mounter {
     }
 
     fn get_mount_refs(&self, pathname: &str) -> io::Result<Vec<String>> {
-        super::mount_utils::get_mount_refs(pathname)
+        // The inherent method honours the injected mountinfo test seam.
+        Mounter::get_mount_refs(self, pathname)
     }
 
     /// `Mounter.List` (`mount_linux.go:426-428`).

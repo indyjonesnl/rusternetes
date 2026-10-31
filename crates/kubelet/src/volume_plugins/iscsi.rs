@@ -7,8 +7,6 @@
 //!
 //! - `GetMetrics` failing with partial metrics (the trait returns
 //!   `Result<Metrics>`, not upstream's `(*Metrics, error)`).
-//! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`iscsi.go:286`, `:294`):
-//!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of
 //!   `Attacher` (`Attach`, `VolumesAreAttached`): attach/detach-controller
 //!   interfaces with no kubelet caller (#3498).
@@ -353,7 +351,7 @@ impl VolumePlugin for IscsiPlugin {
         }
         let lun: i32 = arr[1].parse().map_err(|e| anyhow!("{e}"))?;
         let (iface, _) = util::extract_iface(&global_pd_path);
-        super::util::reconstructed_volume(
+        let mut reconstructed = super::util::reconstructed_volume(
             volume_name,
             serde_json::json!({"iscsi": {
                 "targetPortal": bkp_portal,
@@ -361,7 +359,17 @@ impl VolumePlugin for IscsiPlugin {
                 "lun": lun,
                 "iscsiInterface": iface,
             }}),
-        )
+        )?;
+        // `iscsi.go:270-294`: the `-o context=` the pod mount carries.
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            reconstructed.selinux_mount_context = self
+                .host
+                .get_host_util()
+                .get_selinux_mount_context(mount_path)?;
+        }
+        Ok(reconstructed)
     }
 }
 

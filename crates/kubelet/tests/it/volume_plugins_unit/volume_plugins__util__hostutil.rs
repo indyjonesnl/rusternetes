@@ -33,6 +33,43 @@ mod tests {
         }
     }
 
+    /// `TestGetSELinuxMountContext` (`hostutil_linux_test.go:208-263`).
+    #[test]
+    fn get_selinux_mount_context_cases() {
+        let info = "840 60 8:0 / /var/lib/kubelet/pods/d4f3b306-ad4c-4f7a-8983-b5b228039a8c/volumes/kubernetes.io~iscsi/mypv rw,relatime shared:421 - ext4 /dev/sda rw,context=\"system_u:object_r:container_file_t:s0:c314,c894\"
+224 62 253:0 /var/lib/docker/devicemapper/test/shared /var/lib/docker/devicemapper/test/shared rw,relatime master:1 shared:44 - ext4 /dev/mapper/ssd-root rw,seclabel,data=ordered
+82 62 0:43 / /var/lib/foo rw,relatime shared:32 - tmpfs tmpfs rw
+83 63 0:44 / /var/lib/bar rw,relatime - tmpfs tmpfs rw
+";
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("mountinfo");
+        std::fs::write(&f, info).unwrap();
+        let f = f.to_str().unwrap();
+        let mypv = "/var/lib/kubelet/pods/d4f3b306-ad4c-4f7a-8983-b5b228039a8c/volumes/kubernetes.io~iscsi/mypv";
+        for (name, mp, enabled, want) in [
+            ("no context", "/var/lib/foo", true, ""),
+            (
+                "with context with SELinux",
+                mypv,
+                true,
+                "system_u:object_r:container_file_t:s0:c314,c894",
+            ),
+            ("with context with no SELinux", mypv, false, ""),
+            (
+                "no context with seclabel",
+                "/var/lib/docker/devicemapper/test/shared",
+                true,
+                "",
+            ),
+        ] {
+            assert_eq!(
+                get_selinux_mount_context(mp, f, || enabled).unwrap(),
+                want,
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn get_owner_follows_symlinks() {
         let d = tempfile::tempdir().unwrap();
