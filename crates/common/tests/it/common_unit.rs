@@ -101,6 +101,7 @@ mod validation__apiservice;
 mod validation__apps;
 mod validation__apps_old_template;
 mod validation__authorization;
+mod validation__batch_old_template;
 mod validation__certificatesigningrequest;
 mod validation__clustertrustbundle;
 mod validation__configmap;

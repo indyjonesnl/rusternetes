@@ -204,8 +204,12 @@ fn validate_cron_job_spec(
         spec.concurrency_policy.as_deref(),
         &fld_path.child("concurrencyPolicy"),
     ));
+    // `old_spec` carries the stored template: upstream derives the pod
+    // options from it (`GetValidationOptionsFromPodTemplate(new, old)`,
+    // cronjob/strategy.go:114,147).
     errs.extend(validate_job_template_spec(
         &spec.job_template,
+        old_spec.map(|o| &o.job_template.spec.template),
         &fld_path.child("jobTemplate"),
     ));
 
