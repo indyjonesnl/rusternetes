@@ -17,9 +17,12 @@
 //! set of extension points it implements; the resolved [`Framework`] is what
 //! the pipeline consults to decide which stages run for a profile.
 
+use crate::fwk::{CycleState, FilterPlugin, NodeInfo, Status};
 use rusternetes_common::feature_gates::{self, Feature};
+use rusternetes_common::resources::Pod;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// `names.*` (pkg/scheduler/framework/plugins/names/names.go).
 pub mod names {
@@ -490,6 +493,11 @@ pub struct ProfileSpec<'a> {
 /// MultiPoint expansion) and the score weights.
 #[derive(Debug, Clone, Default)]
 pub struct Framework {
+    /// `f.filterPlugins` (framework.go:68): the Filter plugin objects, in
+    /// execution order. Only plugins that are objects (see
+    /// [`crate::in_tree::new_filter_plugin`]) appear here; the others still
+    /// run inline in the scheduling cycle while they migrate (#3455).
+    filter_plugin_objects: FilterPluginObjects,
     pub profile_name: String,
     /// `f.percentageOfNodesToScore` (framework.go:354); set even when the
     /// profile has no plugins.
@@ -503,7 +511,49 @@ pub struct Framework {
     enqueue_extensions: Vec<String>,
 }
 
+/// The Filter plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct FilterPluginObjects(Vec<Arc<dyn FilterPlugin>>);
+
+impl std::fmt::Debug for FilterPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
 impl Framework {
+    /// `RunFilterPlugins` (framework.go:1033-1066) over the Filter plugin
+    /// objects: the first plugin that does not succeed ends the run. A status
+    /// other than Success/Unschedulable is wrapped as
+    /// `running "<plugin>" filter plugin: <err>`, and the plugin name is set
+    /// on the returned status.
+    pub async fn run_filter_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        for pl in &self.filter_plugin_objects.0 {
+            let mut status = pl.filter(state, pod, node_info).await;
+            if !status.is_success() {
+                if !status.is_rejected() {
+                    // Filter plugins are not supposed to return any status
+                    // other than Success or Unschedulable.
+                    status = Status::from_error(format!(
+                        "running {:?} filter plugin: {}",
+                        pl.name(),
+                        status.as_error().unwrap_or_default()
+                    ));
+                }
+                status.set_plugin(pl.name());
+                return status;
+            }
+        }
+        Status::success()
+    }
+
     /// `EnqueueExtensions` (framework.go:736-738): plugin names whose
     /// `EventsToRegister` feed the scheduling queue.
     pub fn enqueue_extension_plugins(&self) -> &[String] {
@@ -679,6 +729,13 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
             ));
         }
     }
+    // Instantiate the Filter plugins that are objects, in list order.
+    f.filter_plugin_objects = FilterPluginObjects(
+        f.plugins_at(ExtensionPoint::Filter)
+            .iter()
+            .filter_map(|name| crate::in_tree::new_filter_plugin(name))
+            .collect(),
+    );
     Ok(f)
 }
 

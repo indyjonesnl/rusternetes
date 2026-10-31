@@ -16,6 +16,7 @@ use crate::advanced::{
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
+use crate::fwk::{CycleState, NodeInfo};
 use crate::profile::DEFAULT_SCHEDULER_NAME;
 use crate::queue::{
     hints, node_scheduling_properties_change, pod_scheduling_properties_change, priority_sort_less,
@@ -1567,9 +1568,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             1
         };
         let start_index = self.next_start_node_index.load(Ordering::Relaxed);
+        let cycle_state = CycleState::new();
 
         let node_affinity_filter_on = filter_on(names::NODE_AFFINITY);
-        let unschedulable_on = filter_on(names::NODE_UNSCHEDULABLE);
         let taint_on = filter_on(names::TAINT_TOLERATION);
         let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         let ports_on = filter_on(names::NODE_PORTS);
@@ -1631,15 +1632,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 let node = &nodes[ix];
                 processed_nodes += 1;
                 let eval = async {
-                    // NodeUnschedulable
-                    if unschedulable_on
-                        && node
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.unschedulable)
-                            .unwrap_or(false)
-                    {
-                        diag.add_plugin_status(names::NODE_UNSCHEDULABLE);
+                    // The Filter plugins that are objects (`RunFilterPlugins`,
+                    // framework.go:1033): NodeUnschedulable. They run first,
+                    // as in the default plugin order, ahead of the filters
+                    // still inline below.
+                    let status = fw
+                        .run_filter_plugins(&cycle_state, pod, &NodeInfo::new(node, all_pods))
+                        .await;
+                    if !status.is_success() {
+                        if status.is_rejected() {
+                            diag.add_node_reasons(status.reasons());
+                            diag.add_plugin_status(status.plugin());
+                        } else {
+                            // `findNodesThatPassFilters` (schedule_one.go:664-668):
+                            // an Error status aborts the whole search.
+                            filter_error = Some(status.message());
+                        }
                         return None;
                     }
                     // TaintToleration
