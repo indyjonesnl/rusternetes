@@ -106,6 +106,12 @@ struct Args {
     #[arg(long = "bootstrap-signer-controller", default_value_t = false)]
     bootstrap_signer_controller: bool,
 
+    /// Run the bootstrap token cleaner (`tokencleaner`). Upstream registers it
+    /// `isDisabledByDefault: true` (cmd/kube-controller-manager/app/bootstrap.go:60),
+    /// so it is opt-in here too; same flag as the standalone controller-manager.
+    #[arg(long = "token-cleaner-controller", default_value_t = false)]
+    token_cleaner_controller: bool,
+
     /// Node name for the embedded kubelet
     #[arg(long, default_value = "node-1")]
     node_name: String,
@@ -575,7 +581,7 @@ async fn async_main() -> Result<()> {
         selinux_warning_controller: false,
         terminated_pod_gc_threshold:
             rusternetes_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
-        token_cleaner_controller: false,
+        token_cleaner_controller: args.token_cleaner_controller,
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         legacy_sa_token_clean_up_period:
             rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
