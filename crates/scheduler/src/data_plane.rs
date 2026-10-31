@@ -210,6 +210,17 @@ impl VolumeReflectors {
             volume_attachments
         );
     }
+
+    async fn wait_for_cache_sync(&self) {
+        tokio::join!(
+            self.pvcs.wait_for_cache_sync(),
+            self.pvs.wait_for_cache_sync(),
+            self.classes.wait_for_cache_sync(),
+            self.csi_drivers.wait_for_cache_sync(),
+            self.csi_nodes.wait_for_cache_sync(),
+            self.volume_attachments.wait_for_cache_sync(),
+        );
+    }
 }
 
 /// A reflector keyed by a plain function pointer (no captured state), shared
@@ -217,6 +228,20 @@ impl VolumeReflectors {
 type PodReflector = Arc<Reflector<Pod, fn(&Pod) -> String>>;
 type NodeReflector = Arc<Reflector<Node, fn(&Node) -> String>>;
 type PriorityClassReflector = Arc<Reflector<PriorityClass, fn(&PriorityClass) -> String>>;
+
+impl ApiBackend {
+    /// `cc.InformerFactory.WaitForCacheSync` (cmd/kube-scheduler/app/server.go:278):
+    /// block until every informer the scheduler reads has completed its
+    /// initial list, so no scheduling cycle sees a half-populated lister.
+    pub(crate) async fn wait_for_cache_sync(&self) {
+        tokio::join!(
+            self.pods.wait_for_cache_sync(),
+            self.nodes.wait_for_cache_sync(),
+            self.priority_classes.wait_for_cache_sync(),
+            self.volumes.wait_for_cache_sync(),
+        );
+    }
+}
 
 /// The api-server-backed data plane: client + informers. Event recorders are
 /// built per profile via [`ApiBackend::new_recorder`].

@@ -230,3 +230,17 @@ async fn bookmark_advances_rv_without_store_change() {
     assert!(r.store().get("ignored").is_none());
     assert!(events.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn has_synced_after_initial_list() {
+    let lw = Arc::new(MockLw {
+        batches: Mutex::new(vec![vec![]]),
+        list_result: (vec![], "1".into()),
+        watch_calls: Mutex::new(vec![]),
+    });
+    let r = Reflector::new(lw, key);
+    assert!(!r.has_synced());
+    r.sync_once().await.unwrap();
+    assert!(r.has_synced());
+    r.wait_for_cache_sync().await;
+}

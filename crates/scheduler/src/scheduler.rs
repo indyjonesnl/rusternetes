@@ -382,6 +382,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             tokio::spawn(async move { nodes.run().await });
             tokio::spawn(async move { priority_classes.run().await });
             api.volumes.spawn();
+            // Upstream starts the informers, then WaitForCacheSync before
+            // `sched.Run` (cmd/kube-scheduler/app/server.go:271-285). Pods only
+            // enter the queue from the loop below, so no cycle runs before the
+            // listers (notably NodeVolumeLimits') are populated.
+            api.wait_for_cache_sync().await;
 
             let mut pod_sub = api.pods.subscribe();
             let mut node_sub = api.nodes.subscribe();
