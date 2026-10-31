@@ -3807,11 +3807,14 @@ mod tests {
             "a finished Job does not observe the deletion"
         );
         assert!(drain(&queue, Duration::from_millis(1500)).await.is_empty());
+        let key = controller.orphan_queue.get().await.unwrap();
+        assert_eq!(key, "default/fin-a", "enqueueOrphanPod");
+        controller.sync_orphan_pod(&key).await.unwrap();
         let stored: Pod = storage
             .get(&build_key("pods", Some("default"), "fin-a"))
             .await
             .unwrap();
-        assert!(!has_job_tracking_finalizer(&stored), "enqueueOrphanPod");
+        assert!(!has_job_tracking_finalizer(&stored), "syncOrphanPod");
     }
 
     /// `addPod`: "Otherwise, it's an orphan. Clean the finalizer." (:344-347)
@@ -3828,6 +3831,11 @@ mod tests {
             pod_event(rusternetes_storage::WatchEvent::Added, &pod),
         )
         .await;
+        // `enqueueOrphanPod` only enqueues (:630-641); the orphanWorker
+        // (`syncOrphanPod`) does the release.
+        let key = controller.orphan_queue.get().await.unwrap();
+        assert_eq!(key, "default/orph-a");
+        controller.sync_orphan_pod(&key).await.unwrap();
         let stored: Pod = storage
             .get(&build_key("pods", Some("default"), "orph-a"))
             .await
