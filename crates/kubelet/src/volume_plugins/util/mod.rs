@@ -202,6 +202,93 @@ pub fn fs_user_from(pod: &Pod) -> Option<i64> {
     fs_user
 }
 
+/// Port of `GetPodVolumeNames` (`pkg/volume/util/util.go:507-537`): the names
+/// of the volumes a pod uses, as filesystem mounts and as raw block devices,
+/// and (when `collect_selinux_options`) the effective SELinux options of every
+/// container mounting each volume, keyed by volume name.
+///
+/// Visits init, regular and ephemeral containers
+/// (`podutil.AllFeatureEnabledContainers`). The effective options are the
+/// container's own, else the pod's (`DetermineEffectiveSecurityContext`,
+/// `pkg/securitycontext/util.go:44-62`); a container with neither adds nothing
+/// (`seLinuxOptions != nil` at `util.go:524`). Devices carry no SELinux options.
+#[allow(clippy::type_complexity)]
+pub fn get_pod_volume_names(
+    pod: &Pod,
+    collect_selinux_options: bool,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+    std::collections::HashMap<
+        String,
+        Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>>,
+    >,
+) {
+    let mut mounts = std::collections::HashSet::new();
+    let mut devices = std::collections::HashSet::new();
+    let mut contexts: std::collections::HashMap<
+        String,
+        Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>>,
+    > = std::collections::HashMap::new();
+    let Some(spec) = pod.spec.as_ref() else {
+        return (mounts, devices, contexts);
+    };
+    let pod_opts = spec
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.se_linux_options.clone());
+    let mut visit =
+        |c_mounts: &Option<Vec<rusternetes_common::resources::pod::VolumeMount>>,
+         c_devices: &Option<Vec<rusternetes_common::resources::pod::VolumeDevice>>,
+         container_opts: Option<rusternetes_common::resources::pod::SELinuxOptions>| {
+            let opts = if collect_selinux_options {
+                container_opts.or_else(|| pod_opts.clone())
+            } else {
+                None
+            };
+            for m in c_mounts.iter().flatten() {
+                mounts.insert(m.name.clone());
+                if let Some(opts) = &opts {
+                    contexts
+                        .entry(m.name.clone())
+                        .or_default()
+                        .push(Some(opts.clone()));
+                }
+            }
+            for d in c_devices.iter().flatten() {
+                devices.insert(d.name.clone());
+            }
+        };
+    for c in spec.init_containers.iter().flatten() {
+        visit(
+            &c.volume_mounts,
+            &c.volume_devices,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    for c in &spec.containers {
+        visit(
+            &c.volume_mounts,
+            &c.volume_devices,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    for c in spec.ephemeral_containers.iter().flatten() {
+        visit(
+            &c.volume_mounts,
+            &c.volume_devices,
+            c.security_context
+                .as_ref()
+                .and_then(|sc| sc.se_linux_options.clone()),
+        );
+    }
+    (mounts, devices, contexts)
+}
+
 /// The effective SELinux options of every container that mounts
 /// `volume_name`: the SELinux half of `GetPodVolumeNames(pod, true)`
 /// (`pkg/volume/util/util.go:507-537`).

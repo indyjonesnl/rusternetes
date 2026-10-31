@@ -248,6 +248,52 @@ pub fn init_container_failed_terminally(
         .unwrap_or(false)
 }
 
+/// The kubelet's [`PodStateProvider`](crate::volume_manager::populator::PodStateProvider)
+/// (`podWorkers.ShouldPodContainersBeTerminating` / `ShouldPodRuntimeBeRemoved`,
+/// `pkg/kubelet/pod_workers.go:685-707`).
+///
+/// Upstream answers from `podSyncStatuses`, which holds an entry for every pod
+/// the workers know, running or not. `pod_states` only holds pods that left
+/// `SyncPod`, so a pod without an entry is looked up in the pod manager: one
+/// that is present is running (`SyncPod`) unless its object says otherwise; one
+/// that is not is "unknown to the workers" and answers `podsSynced`, as upstream.
+pub struct KubeletPodStateProvider {
+    pub pod_states: Arc<Mutex<HashMap<String, PodWorkerState>>>,
+    pub pods_synced: Arc<std::sync::atomic::AtomicBool>,
+    pub pod_manager: Arc<dyn crate::podcertificate::PodManager>,
+}
+
+impl crate::volume_manager::populator::PodStateProvider for KubeletPodStateProvider {
+    /// `status.IsTerminationStarted()` for a known pod, else `podsSynced`.
+    fn should_pod_containers_be_terminating(&self, uid: &str) -> bool {
+        let state = self.pod_states.lock().unwrap().get(uid).cloned();
+        match state {
+            Some(PodWorkerState::TerminatingPod | PodWorkerState::TerminatedPod) => true,
+            Some(PodWorkerState::SyncPod) => false,
+            None => match self.pod_manager.get_pod_by_uid(uid) {
+                Some(pod) => {
+                    pod.metadata.deletion_timestamp.is_some()
+                        || terminal_phase_requires_termination(&pod)
+                }
+                None => self.pods_synced.load(Ordering::SeqCst),
+            },
+        }
+    }
+
+    /// `status.IsTerminated()` for a known pod, else `podsSynced`.
+    fn should_pod_runtime_be_removed(&self, uid: &str) -> bool {
+        let state = self.pod_states.lock().unwrap().get(uid).cloned();
+        match state {
+            Some(PodWorkerState::TerminatedPod) => true,
+            Some(PodWorkerState::SyncPod | PodWorkerState::TerminatingPod) => false,
+            None => match self.pod_manager.get_pod_by_uid(uid) {
+                Some(pod) => pod_volumes_released(&pod),
+                None => self.pods_synced.load(Ordering::SeqCst),
+            },
+        }
+    }
+}
+
 /// Whether a pod still in the API no longer wants its volumes mounted: its
 /// phase is terminal and no container is still running. Upstream's populator
 /// drops a pod's volumes from the desired state once
@@ -415,7 +461,14 @@ pub struct Kubelet {
     /// Per-pod worker state. K8s uses a goroutine per pod; we track state
     /// per-UID and dispatch in the sync loop.
     /// K8s ref: pkg/kubelet/pod_workers.go
-    pub pod_states: Mutex<HashMap<String, PodWorkerState>>,
+    pub pod_states: Arc<Mutex<HashMap<String, PodWorkerState>>>,
+    /// `podWorkers.podsSynced`: set once the first sync pass has listed every
+    /// pod, after which a pod the workers do not know is one to tear down.
+    pub pods_synced: Arc<std::sync::atomic::AtomicBool>,
+    /// `kubelet.volumeManager` (`kubelet.go`): its populator fills the desired
+    /// state of the world; the reconciler arrives with #1970, so inline
+    /// mounting stays authoritative until then.
+    pub volume_manager: Arc<crate::volume_manager::VolumeManager>,
     /// Per-pod sync lock, keyed by `"{namespace}/{name}"` (NOT UID).
     /// Prevents concurrent sync_pod calls for the same pod, and — because two
     /// incarnations of a recreated pod (e.g. a StatefulSet replacement) share
@@ -820,6 +873,21 @@ impl Kubelet {
             Some(pod_certificate_manager.clone()),
         )
         .with_node_name(&node_name);
+        let pod_states: Arc<Mutex<HashMap<String, PodWorkerState>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pods_synced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let volume_manager = Arc::new(crate::volume_manager::VolumeManager::new(
+            &node_name,
+            storage.clone(),
+            pod_cache.clone(),
+            Arc::new(KubeletPodStateProvider {
+                pod_states: pod_states.clone(),
+                pods_synced: pods_synced.clone(),
+                pod_manager: pod_cache.clone(),
+            }),
+            Arc::new(volumes.clone()),
+            volumes.plugin_mgr.clone(),
+        ));
 
         // The kubernetes Service host:port injected into pods as
         // KUBERNETES_SERVICE_* so in-cluster clients reach the api-server.
@@ -882,7 +950,9 @@ impl Kubelet {
             eviction_root_dir,
             eviction_manager: Mutex::new(eviction_manager),
             image_gc_manager: std::sync::OnceLock::new(),
-            pod_states: Mutex::new(HashMap::new()),
+            pod_states,
+            pods_synced,
+            volume_manager,
             terminal_finalize_failures: Mutex::new(HashMap::new()),
             pod_sync_locks: crate::sync_locks::SyncLocks::new(),
             restart_backoff: Mutex::new(HashMap::new()),
@@ -1229,6 +1299,14 @@ impl Kubelet {
         // runs for the life of the process, so the token is never cancelled.
         if let Some(issuing) = self.pod_certificate_issuing.clone() {
             tokio::spawn(issuing.run(crate::podcertificate::tokio_util_cancel::Token::new()));
+        }
+
+        // `go kl.volumeManager.Run(ctx, kl.sourcesReady)` (`kubelet.go`): the
+        // sources are ready once the first sync pass has listed the pods.
+        {
+            let synced = self.pods_synced.clone();
+            self.volume_manager
+                .run(move || synced.load(Ordering::SeqCst));
         }
 
         // Check runtime state once before registering so the first Ready
@@ -2545,6 +2623,7 @@ impl Kubelet {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         self.last_sync.store(now, Ordering::Relaxed);
+        self.pods_synced.store(true, Ordering::SeqCst);
 
         Ok(())
     }
