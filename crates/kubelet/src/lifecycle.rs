@@ -359,6 +359,19 @@ pub fn is_volume_wait_error(err: &anyhow::Error) -> bool {
         .is_some_and(is_volume_wait_cri)
 }
 
+/// `errors.As(err, &volumeAttachLimitErr)` (`kubelet.go:2126`): the volume
+/// wait found the node out of attachment room, so the pod is rejected.
+pub fn volume_attach_limit_error(
+    err: &anyhow::Error,
+) -> Option<&crate::volume_manager::VolumeAttachLimitExceededError> {
+    match err.downcast_ref::<crate::cri_runtime::CriRuntimeError>()? {
+        crate::cri_runtime::CriRuntimeError::Volumes { source, .. } => {
+            source.downcast_ref::<crate::volume_manager::VolumeAttachLimitExceededError>()
+        }
+        _ => None,
+    }
+}
+
 pub fn is_volume_wait_cri(err: &crate::cri_runtime::CriRuntimeError) -> bool {
     match err {
         crate::cri_runtime::CriRuntimeError::Volumes { source, .. } => {

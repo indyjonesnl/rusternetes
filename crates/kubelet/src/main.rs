@@ -651,6 +651,9 @@ async fn main() -> Result<()> {
             )
             .with_migrated_plugins(volume_plugins::nodeinfomanager::default_migrated_plugins()),
         );
+        // `VerifyExhaustedResource` (`WaitForAttachAndMount`) refreshes the
+        // CSINode allocatable count through the same node info manager.
+        kubelet.volume_manager.set_node_info_installer(nim.clone());
         let klet = kubelet.clone();
         let updater_storage = storage.clone();
         // Set before the task spawns (csi_plugin.go:374) so the first Ready

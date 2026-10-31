@@ -96,7 +96,7 @@ impl Reconciler {
                 }
                 // `IsVolumeNotAttachedError` -> `waitForVolumeAttach`
                 Some(ActualStateOfWorldError::VolumeNotAttached { .. }) => {
-                    wait_for_volume_attach(&mounter, &v);
+                    operations.push(Box::pin(wait_for_volume_attach(mounter, v)));
                 }
                 Some(ActualStateOfWorldError::RemountRequired { .. }) => {
                     operations.push(Box::pin(mount_attached_volume(mounter, v, true)));
@@ -118,15 +118,16 @@ impl Reconciler {
 /// An operation `mountOrAttachVolumes` starts.
 pub type Operation = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-/// Port of `waitForVolumeAttach` (`reconciler_common.go:234-...`) as far as a
-/// volume the kubelet need not attach goes: `VerifyControllerAttachedVolume`
-/// marks it attached (`operation_generator.go:1431-1446`). The controller
-/// attach-detach state of an attachable plugin (`node.status.volumesAttached`,
-/// `VolumesInUse`) is not consulted: the CSI mounter waits for its own
-/// `VolumeAttachment`.
-fn wait_for_volume_attach(mounter: &VolumeMounter, v: &VolumeToMount) {
-    if let Err(e) = mounter.mark_volume_attached(v) {
-        error!(
+/// Port of `waitForVolumeAttach` (`reconciler_common.go:234-...`) for a volume
+/// the controller attaches or that needs no attach:
+/// `VerifyControllerAttachedVolume`. The kubelet never attaches volumes itself
+/// here (`controllerAttachDetachEnabled`), so upstream's `AttachVolume` arm is
+/// not ported. A volume still waiting for its attachment is an expected
+/// failure (`isExpectedError`): it backs off and shows in the wait message as
+/// unattached.
+async fn wait_for_volume_attach(mounter: Arc<VolumeMounter>, v: VolumeToMount) {
+    if let Err(e) = mounter.verify_controller_attached_volume(&v).await {
+        debug!(
             "operationExecutor.VerifyControllerAttachedVolume failed for volume {} pod {}: {e:#}",
             v.volume_name, v.pod_name
         );

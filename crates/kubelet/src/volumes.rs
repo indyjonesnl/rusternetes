@@ -2184,6 +2184,57 @@ impl VolumeManager {
         Ok((path, attributes))
     }
 
+    /// Port of `GenerateVerifyControllerAttachedVolumeFunc`
+    /// (`operation_generator.go:1396-1446`): a volume an attach/detach
+    /// controller attaches enters the actual state once its attachment is
+    /// reported attached; one that needs no attach enters at once. Under
+    /// `pendingOperations` keyed on the volume, so a volume still waiting for
+    /// its attachment backs off. Only the CSI plugin's attachments are
+    /// consulted; `node.status.volumesAttached` / `VolumesInUse` are not.
+    pub async fn verify_controller_attached_volume(
+        &self,
+        volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+    ) -> Result<()> {
+        if self.asw.volume_exists(&volume_to_mount.volume_name) {
+            return Ok(());
+        }
+        let run = self
+            .pending_operations
+            .run_inline(
+                &volume_to_mount.volume_name.0,
+                "",
+                "",
+                "verify_controller_attached_volume",
+                async {
+                    let spec = volume_to_mount.volume_spec.as_spec();
+                    if volume_to_mount.plugin_is_attachable && self.csi_plugin.can_support(&spec) {
+                        match self
+                            .csi_plugin
+                            .is_volume_attached(&spec, &self.node_name)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return Err(format!(
+                                    "volume {} is not yet attached according to node status",
+                                    volume_to_mount.volume_name
+                                ))
+                            }
+                            Err(e) => return Err(format!("{e:#}")),
+                        }
+                    }
+                    self.mark_volume_attached(volume_to_mount)
+                        .map_err(|e| format!("{e:#}"))
+                },
+            )
+            .await;
+        match run {
+            Err(refused) => Err(anyhow::anyhow!("{refused}")),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(anyhow::anyhow!(msg)),
+        }
+    }
+
     /// `MarkVolumeAsAttached` for a volume the kubelet need not attach: what
     /// `GenerateVerifyControllerAttachedVolumeFunc` does for a non-attachable
     /// plugin (`operation_generator.go:1431-1446`). The volume enters the

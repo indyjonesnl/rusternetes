@@ -14,6 +14,7 @@ use crate::volume_manager::populator::{
     DesiredStateOfWorldPopulator, PodManager, PodStateProvider,
 };
 use crate::volume_manager::reconciler::{Reconciler, RECONCILER_LOOP_SLEEP_PERIOD};
+use crate::volume_plugins::plugin::VolumePlugin;
 use crate::volume_plugins::util::selinux::Translator;
 use crate::volume_plugins::util::types::UniquePodName;
 use crate::volume_plugins::VolumePluginMgr;
@@ -44,7 +45,44 @@ pub struct VolumeManager {
     pub actual_state_of_world: Arc<ActualStateOfWorld>,
     pub desired_state_of_world_populator: Arc<DesiredStateOfWorldPopulator>,
     pub reconciler: Arc<Reconciler>,
+    node_name: String,
+    spec_factory: Arc<crate::volumes::VolumeManager>,
+    /// `nim`, the CSI node info manager `VerifyExhaustedResource` refreshes the
+    /// CSINode allocatable count through. Set once it exists
+    /// ([`Self::set_node_info_installer`]); without it the check reads `false`.
+    node_info_installer:
+        std::sync::OnceLock<Arc<dyn crate::volume_plugins::nodeinfomanager::NodeInfoInstaller>>,
 }
+
+/// `VolumeAttachmentLimitExceededReason` (`volume_manager.go:92`): the reason a
+/// pod is rejected when its volumes cannot attach for lack of room on the node.
+pub const VOLUME_ATTACHMENT_LIMIT_EXCEEDED_REASON: &str = "VolumeAttachmentLimitExceeded";
+
+/// Port of `VolumeAttachLimitExceededError` (`volume_manager.go:287-299`):
+/// `WaitForAttachAndMount` found a volume's attach failing with
+/// `ResourceExhausted`. The kubelet rejects the pod (`kubelet.go:2126-2131`).
+#[derive(Debug)]
+pub struct VolumeAttachLimitExceededError {
+    pub unmounted_volumes: Vec<String>,
+    pub unattached_volumes: Vec<String>,
+    pub volumes_not_in_dsw: Vec<String>,
+    pub original_error: String,
+}
+
+impl std::fmt::Display for VolumeAttachLimitExceededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Node has reached its volume attachment limit, rejecting pod. unmounted volumes={:?}, unattached volumes={:?}, failed to process volumes={:?}: {}",
+            self.unmounted_volumes,
+            self.unattached_volumes,
+            self.volumes_not_in_dsw,
+            self.original_error
+        )
+    }
+}
+
+impl std::error::Error for VolumeAttachLimitExceededError {}
 
 /// Why `WaitForAttachAndMount` failed. The pod is waiting on its volumes, not
 /// failing: the kubelet shows `ContainerCreating` and retries on the next
@@ -69,7 +107,6 @@ impl VolumeManager {
             Arc::new(Translator),
         ));
         // One actual state of world: the one inline mounting reports into.
-        let _ = node_name;
         let actual_state_of_world = spec_factory.asw.clone();
         let reconciler = Arc::new(Reconciler::new(
             desired_state_of_world.clone(),
@@ -84,10 +121,13 @@ impl VolumeManager {
             pod_state_provider,
             desired_state_of_world.clone(),
             actual_state_of_world.clone(),
-            spec_factory,
+            spec_factory.clone(),
             volume_plugin_mgr,
         ));
         Self {
+            node_name: node_name.to_string(),
+            spec_factory,
+            node_info_installer: std::sync::OnceLock::new(),
             desired_state_of_world,
             actual_state_of_world,
             desired_state_of_world_populator,
@@ -135,30 +175,35 @@ impl VolumeManager {
         missing
     }
 
-    /// Port of `getUnattachedVolumes` (`volume_manager.go:545-555`), as outer
-    /// volume names.
-    fn unattached_volumes(&self, pod_name: &UniquePodName) -> Vec<String> {
-        let mut unattached: Vec<String> = self
-            .desired_state_of_world
+    /// Port of `getUnattachedVolumes` (`volume_manager.go:545-555`).
+    fn unattached_volumes_to_mount(
+        &self,
+        pod_name: &UniquePodName,
+    ) -> Vec<crate::volume_plugins::util::operation_executor::VolumeToMount> {
+        self.desired_state_of_world
             .get_volumes_to_mount()
             .into_iter()
+            .map(|v| v.0)
             .filter(|v| {
                 v.pod_name == *pod_name
                     && v.plugin_is_attachable
                     && !self.actual_state_of_world.volume_exists(&v.volume_name)
             })
-            .flat_map(|v| v.outer_volume_spec_names.clone())
-            .collect();
-        unattached.sort();
-        unattached
+            .collect()
+    }
+
+    /// Hand over the node info manager (`nim`) `VerifyExhaustedResource` needs.
+    pub fn set_node_info_installer(
+        &self,
+        installer: Arc<dyn crate::volume_plugins::nodeinfomanager::NodeInfoInstaller>,
+    ) {
+        let _ = self.node_info_installer.set(installer);
     }
 
     /// Port of `WaitForAttachAndMount` (`volume_manager.go:395-472`): waits for
     /// every volume the pod's containers use to be attached and mounted by the
     /// reconciler.
     ///
-    /// Not ported: the `MutableCSINodeAllocatableCount` branch returning
-    /// `VolumeAttachLimitExceededError` (`:425-460`, #2877).
     pub async fn wait_for_attach_and_mount(&self, pod: &Pod) -> anyhow::Result<()> {
         self.wait_for_attach_and_mount_within(pod, POD_ATTACH_AND_MOUNT_TIMEOUT)
             .await
@@ -202,10 +247,53 @@ impl VolumeManager {
         if unmounted.is_empty() {
             return Ok(());
         }
+        // Also get unattached volumes and volumes not in dsw for the message
+        let unattached_to_mount = self.unattached_volumes_to_mount(&pod_name);
+        let mut unattached: Vec<String> = unattached_to_mount
+            .iter()
+            .flat_map(|v| v.outer_volume_spec_names.clone())
+            .collect();
+        unattached.sort();
+        let not_in_dsw = self.volumes_not_in_dsw(&pod_name, &expected);
+
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::MutableCSINodeAllocatableCount,
+        ) {
+            for volume_to_mount in &unattached_to_mount {
+                let spec = volume_to_mount.volume_spec.as_spec();
+                // `FindAttachablePluginBySpec`: the CSI plugin is the attachable
+                // plugin that implements `VerifyExhaustedResource`.
+                if !self.spec_factory.csi_plugin.can_support(&spec) {
+                    continue;
+                }
+                let Some(nim) = self.node_info_installer.get() else {
+                    continue;
+                };
+                if self
+                    .spec_factory
+                    .csi_plugin
+                    .verify_exhausted_resource(
+                        &spec,
+                        &self.node_name,
+                        crate::volume_plugins::csi_drivers_store::csi_drivers(),
+                        nim.as_ref(),
+                    )
+                    .await
+                {
+                    // The kubelet rejects the pod.
+                    return Err(VolumeAttachLimitExceededError {
+                        unmounted_volumes: unmounted,
+                        unattached_volumes: unattached,
+                        volumes_not_in_dsw: not_in_dsw,
+                        original_error: failure,
+                    }
+                    .into());
+                }
+            }
+        }
+
         Err(wait_error(format!(
-            "unmounted volumes={unmounted:?}, unattached volumes={:?}, failed to process volumes={:?}: {failure}",
-            self.unattached_volumes(&pod_name),
-            self.volumes_not_in_dsw(&pod_name, &expected),
+            "unmounted volumes={unmounted:?}, unattached volumes={unattached:?}, failed to process volumes={not_in_dsw:?}: {failure}"
         )))
     }
 
