@@ -9,14 +9,10 @@
 //!   unmounter upstream either (`fcDisk` embeds `volume.MetricsNil`,
 //!   `fc.go:353`), and the block mapper's `NewMetricsBlock` is ported
 //!   ([`super::util::metrics`]).
-//! - `ConstructVolumeSpec`'s `SELinuxMountContext` (`fc.go:283-294`):
-//!   [`ReconstructedVolume`] cannot carry one (#2312, #3493).
 //! - `VerifyExhaustedResource`, `NewDetacher`/`Detach` and the attach side of
 //!   `Attacher` (`Attach`, `VolumesAreAttached`): attach/detach-controller
 //!   interfaces with no kubelet caller (#3498).
-//! - `mountArgs.SELinuxLabel` / `AddSELinuxMountOption`
-//!   (`attacher.go:125-127`): [`DeviceMounterArgs`] cannot carry the label
-//!   (#2312, #3493). No kubelet caller invokes `UnmountDevice` yet (#3492).
+//! - No kubelet caller invokes `UnmountDevice` yet (#3492).
 //! - A real FibreChannel run (`/dev/disk/by-path`, `multipath`, sysfs) is
 //!   unproven in this repository's CI (no FC HBA).
 
@@ -358,7 +354,18 @@ impl VolumePlugin for FcPlugin {
         // Create volume from wwn+lun or wwid
         let fc_source = fc_source_json(&wwns, lun, &wwids);
         tracing::trace!("ConstructVolumeSpec: TargetWWNs: {wwns:?}, Lun: {lun}, WWIDs: {wwids:?}");
-        super::util::reconstructed_volume(volume_name, serde_json::json!({ "fc": fc_source }))
+        let mut reconstructed =
+            super::util::reconstructed_volume(volume_name, serde_json::json!({ "fc": fc_source }))?;
+        // `fc.go:283-294`: the `-o context=` the pod mount carries.
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        ) {
+            reconstructed.selinux_mount_context = self
+                .host
+                .get_host_util()
+                .get_selinux_mount_context(mount_path)?;
+        }
+        Ok(reconstructed)
     }
 }
 
