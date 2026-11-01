@@ -4,6 +4,7 @@
 //! Only the helpers with a consumer in the volume-manager caches are ported;
 //! `pkg/volume/util/util.go` is ~900 lines of which this is a small slice.
 
+pub mod block_operations;
 pub mod device_util;
 pub mod exec;
 pub mod exponential_backoff;
