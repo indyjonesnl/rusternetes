@@ -577,6 +577,106 @@ mod tests {
         assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none());
     }
 
+    /// `bindingCycle` (schedule_one.go:281-299) under
+    /// `NominatedNodeNameForExpectation`: a PreBind that will work (here
+    /// VolumeBinding's) nominates the pod to the chosen node before it runs,
+    /// and the pod stays nominated when PreBind then fails.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_try_schedule_pod_nominates_before_a_prebind_that_will_work() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler
+            .profiles
+            .get_mut("default-scheduler")
+            .unwrap()
+            .volume_bind_timeout = Duration::from_millis(100);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+        let _ = scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
+            .await;
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none());
+        assert_eq!(
+            p.status
+                .as_ref()
+                .and_then(|s| s.nominated_node_name.as_deref()),
+            Some("node-2")
+        );
+    }
+
+    /// With the gate off the PreFlights do not run and nothing is nominated.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_try_schedule_pod_does_not_nominate_without_the_gate() {
+        rusternetes_common::feature_gates::set_from_str("NominatedNodeNameForExpectation=false")
+            .unwrap();
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler
+            .profiles
+            .get_mut("default-scheduler")
+            .unwrap()
+            .volume_bind_timeout = Duration::from_millis(100);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        wffc_fixture(&storage).await;
+        let _ = scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
+            .await;
+        rusternetes_common::feature_gates::reset_to_defaults();
+        let p: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert!(p
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_ref())
+            .is_none());
+    }
+
+    /// `ClearingNominatedNodeNameAfterBinding`: a pod that ends up bound has
+    /// no nomination, whether it was nominated by preemption or by the
+    /// PreFlight path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_bind_clears_the_nomination() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        nominated_fixture(&storage, serde_json::json!({}), true).await;
+        // A node with room for the pod, which is nominated to a full one.
+        let free: Node = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "node-2"},
+            "status": {"allocatable": {"cpu": "4", "memory": "10Gi", "pods": "10"}}
+        }))
+        .unwrap();
+        storage
+            .create("/registry/nodes/node-2", &free)
+            .await
+            .unwrap();
+        scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/nominated")
+            .await
+            .unwrap();
+        let p: Pod = storage
+            .get("/registry/pods/default/nominated")
+            .await
+            .unwrap();
+        assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_some());
+        assert!(p
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_ref())
+            .is_none());
+    }
+
     /// A pod nominated to a node by an earlier preemption, whose cycle now fails.
     async fn nominated_fixture(
         storage: &MemoryStorage,

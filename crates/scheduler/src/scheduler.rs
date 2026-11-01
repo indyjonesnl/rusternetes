@@ -46,7 +46,13 @@ pub struct SeenObjects {
 /// `utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching)`
 /// (Beta, on in 1.35).
 fn opportunistic_batching_enabled() -> bool {
-    rusternetes_common::feature_gates::gate_enabled("OpportunisticBatching").unwrap_or(false)
+    gate_enabled("OpportunisticBatching")
+}
+
+/// `utilfeature.DefaultFeatureGate.Enabled(name)` for a gate no [`Feature`]
+/// variant models.
+fn gate_enabled(name: &str) -> bool {
+    rusternetes_common::feature_gates::gate_enabled(name).unwrap_or(false)
 }
 
 /// `assignedPod` (eventhandlers.go:470-472).
@@ -1449,11 +1455,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // PreBindPreFlights (:282) and PreBind (:327); Unreserve on a failure
         // (`handleBindingCycleError` :368).
-        let status = fw.run_pre_bind_pre_flights(&mut cycle_state, &pod, node_name);
-        if status.code() == crate::fwk::Code::Error || status.is_rejected() {
-            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
-                .await;
-            return Err(rusternetes_common::Error::Internal(status.message()));
+        // The PreFlights, and the nomination they trigger, run only under
+        // `NominatedNodeNameForExpectation` (bindingCycle, schedule_one.go:281-299).
+        if gate_enabled("NominatedNodeNameForExpectation") {
+            let status = fw.run_pre_bind_pre_flights(&mut cycle_state, &pod, node_name);
+            // "Unschedulable status is not supported in PreBindPreFlight and
+            // hence we regard it as an error."
+            if status.code() == crate::fwk::Code::Error || status.is_rejected() {
+                fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                    .await;
+                return Err(rusternetes_common::Error::Internal(status.message()));
+            }
+            // "Add NominatedNodeName to tell the external components (e.g.,
+            // the cluster autoscaler) that the pod is about to be bound to the
+            // node. We only do this when any of WaitOnPermit or PreBind will
+            // work": there is no Permit plugin object yet, so only PreBind.
+            if status.is_success() {
+                self.nominate_for_expectation(&pod, node_name).await;
+            }
         }
         let status = fw
             .run_pre_bind_plugins(&cycle_state, &pod, node_name, &handle)
@@ -1818,6 +1837,33 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .find(|n| &n.metadata.name == best_node_name)
             .cloned()
             .map(|n| (n, cycle_state))
+    }
+
+    /// `updatePod` with `NominatingInfo{ModeOverride, node}` (schedule_one.go:
+    /// 1135-1166): `status.nominatedNodeName` is written only when it differs.
+    /// A failure is only logged ("not critical enough to stop binding
+    /// cycles"; `update_pod_status_with_retry` logs it).
+    async fn nominate_for_expectation(&self, pod: &Pod, node_name: &str) {
+        let current = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_deref())
+            .unwrap_or("");
+        if current == node_name {
+            return;
+        }
+        let key = format!(
+            "{}/{}",
+            pod.metadata.namespace.as_deref().unwrap_or("default"),
+            pod.metadata.name
+        );
+        let node = node_name.to_string();
+        self.update_pod_status_with_retry(&key, move |p| {
+            p.status
+                .get_or_insert_with(Default::default)
+                .nominated_node_name = Some(node.clone());
+        })
+        .await;
     }
 
     async fn bind_pod_to_node(&self, pod: Pod, node_name: &str) -> rusternetes_common::Result<()> {
@@ -2492,6 +2538,15 @@ pub(crate) async fn bind_pod<S: Storage + Send + Sync + 'static>(
     // Update pod spec with node name
     if let Some(ref mut spec) = pod.spec {
         spec.node_name = Some(node_name.to_string());
+    }
+    // "Clear nomination hint to prevent stale information affecting external
+    // components" (registry/core/pod/storage/storage.go:246-249). The
+    // api-server's binding does it in API mode; storage mode writes the pod
+    // itself.
+    if gate_enabled("ClearingNominatedNodeNameAfterBinding") {
+        if let Some(status) = pod.status.as_mut() {
+            status.nominated_node_name = None;
+        }
     }
 
     // Update pod status with PodScheduled condition

@@ -758,6 +758,15 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                         if let Some(spec) = fresh.spec.as_mut() {
                             spec.node_name = Some(node_name.to_string());
                         }
+                        if rusternetes_common::feature_gates::gate_enabled(
+                            "ClearingNominatedNodeNameAfterBinding",
+                        )
+                        .unwrap_or(false)
+                        {
+                            if let Some(fresh_status) = fresh.status.as_mut() {
+                                fresh_status.nominated_node_name = None;
+                            }
+                        }
                         if let (Some(fresh_status), Some(src_status)) =
                             (fresh.status.as_mut(), pod_with_node.status.as_ref())
                         {
