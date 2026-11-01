@@ -238,6 +238,19 @@ struct Args {
     #[arg(long, default_value_t = false)]
     audit_log_compress: bool,
 
+    /// `--audit-log-truncate-enabled` (AuditTruncateOptions.AddFlags,
+    /// options/audit.go:415).
+    #[arg(long, default_value_t = false, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    audit_log_truncate_enabled: bool,
+
+    /// `--audit-log-truncate-max-batch-size` (options/audit.go:418).
+    #[arg(long, default_value_t = 10 * 1024 * 1024, allow_negative_numbers = true)]
+    audit_log_truncate_max_batch_size: i64,
+
+    /// `--audit-log-truncate-max-event-size` (options/audit.go:422).
+    #[arg(long, default_value_t = 100 * 1024, allow_negative_numbers = true)]
+    audit_log_truncate_max_event_size: i64,
+
     /// `--audit-webhook-config-file` (options/audit.go:539): kubeconfig
     /// defining the audit webhook.
     #[arg(long)]
@@ -335,6 +348,20 @@ fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::
     }
 }
 
+/// The `AuditTruncateOptions` the `--audit-log-truncate-*` flags describe.
+fn audit_log_truncate_options(
+    args: &Args,
+) -> rusternetes_api_server::audit_truncate::TruncateOptions {
+    use rusternetes_api_server::audit_truncate::{TruncateConfig, TruncateOptions};
+    TruncateOptions {
+        enabled: args.audit_log_truncate_enabled,
+        config: TruncateConfig {
+            max_event_size: args.audit_log_truncate_max_event_size,
+            max_batch_size: args.audit_log_truncate_max_batch_size,
+        },
+    }
+}
+
 /// `AuditLogOptions.Validate` (options/audit.go:453) for the rotation flags.
 fn audit_rotation_options(
     args: &Args,
@@ -373,6 +400,9 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
     // `AuditLogOptions.Validate` only checks when the backend is enabled
     // (`enabled()` is Path != "").
     let rotation = if args.audit_log_path.is_some() {
+        audit_log_truncate_options(args)
+            .validate("log")
+            .map_err(|e| anyhow::anyhow!("invalid audit log flags: {e}"))?;
         audit_rotation_options(args)?
     } else {
         Default::default()
@@ -399,7 +429,7 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
     let mut sinks: Vec<std::sync::Arc<dyn rusternetes_common::audit::AuditBackend>> = Vec::new();
     if let Some(log_path) = &args.audit_log_path {
-        sinks.push(if log_path == "-" {
+        let log: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
             std::sync::Arc::new(audit::StdoutAuditBackend)
         } else {
             // `AuditLogOptions.getWriter`: a lumberjack writer over the file.
@@ -407,7 +437,9 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
                 rusternetes_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
                     .with_context(|| format!("opening --audit-log-path {log_path}"))?,
             )
-        });
+        };
+        // `AuditLogOptions.newBackend`: truncate wraps the log backend.
+        sinks.push(audit_log_truncate_options(args).wrap_backend(log));
     }
     if webhook.enabled() {
         sinks.push(webhook.new_backend()?.0);
