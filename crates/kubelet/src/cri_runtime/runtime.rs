@@ -747,7 +747,98 @@ impl CriContainerRuntime {
                 }));
             }
         }
-        Ok(cri.pull_image_spec(spec, None).await?)
+        self.pull_image(&mut cri, spec, event_ctx.map(|(p, _)| p))
+            .await
+    }
+
+    /// Port of `getPullSecretsForPod` (`kubelet_pods.go:1070-1095`): the
+    /// pod's `imagePullSecrets` that can be read; unreadable ones emit
+    /// `FailedToRetrieveImagePullSecret`.
+    async fn get_pull_secrets_for_pod(&self, pod: &Pod) -> Vec<Secret> {
+        let refs = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.image_pull_secrets.as_deref())
+            .unwrap_or_default();
+        let storage = self.volumes.as_ref().and_then(|v| v.storage.as_ref());
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let (mut secrets, mut failed) = (Vec::new(), Vec::new());
+        for r in refs {
+            // API validation permitted entries with empty names; ignored.
+            let name = r.name.as_str();
+            if name.is_empty() {
+                continue;
+            };
+            let key = rusternetes_storage::build_key("secrets", Some(ns), name);
+            match storage {
+                Some(st) => match st.get::<Secret>(&key).await {
+                    Ok(s) => secrets.push(s),
+                    Err(_) => failed.push(name.to_string()),
+                },
+                None => failed.push(name.to_string()),
+            }
+        }
+        if !failed.is_empty() {
+            self.emit_event(
+                pod,
+                None,
+                "FailedToRetrieveImagePullSecret",
+                rusternetes_common::resources::EventType::Warning,
+                &format!(
+                    "Unable to retrieve some image pull secrets ({}); attempting to pull the image may not succeed.",
+                    failed.join(", ")
+                ),
+            )
+            .await;
+        }
+        secrets
+    }
+
+    /// Port of `imageManager.makeLookupPullCredentialsFunc` +
+    /// `kubeGenericRuntimeManager.PullImage` (`kuberuntime_image.go:33-71`):
+    /// with no matching credentials pull anonymously, otherwise try each in
+    /// order and aggregate the failures.
+    async fn pull_image(
+        &self,
+        cri: &mut CriClient,
+        spec: v1::ImageSpec,
+        pod: Option<&Pod>,
+    ) -> anyhow::Result<String> {
+        let creds = match pod {
+            Some(p) => {
+                let secrets = self.get_pull_secrets_for_pod(p).await;
+                match crate::credentialprovider::make_docker_keyring(&secrets)? {
+                    Some(kr) => {
+                        kr.lookup(&crate::credentialprovider::parse_image_repo(&spec.image)?)
+                    }
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        if creds.is_empty() {
+            return Ok(cri.pull_image_spec(spec, None).await?);
+        }
+        let mut errs = Vec::new();
+        for c in creds {
+            let auth = v1::AuthConfig {
+                username: c.username,
+                password: c.password,
+                ..Default::default()
+            };
+            match cri
+                .pull_image_spec_with_auth(spec.clone(), Some(auth), None)
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        // `utilerrors.NewAggregate`: a lone error is its own message.
+        match errs.as_slice() {
+            [one] => Err(anyhow::anyhow!("{one}")),
+            _ => Err(anyhow::anyhow!("[{}]", errs.join(", "))),
+        }
     }
 
     /// Port of `getImageVolumes` (`kuberuntime_manager.go:1813-1850`): pull
