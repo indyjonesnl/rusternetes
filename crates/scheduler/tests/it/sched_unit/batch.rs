@@ -327,6 +327,45 @@ async fn pods_after_the_first_take_the_batch_hint() {
     assert_eq!(placed.len(), 3, "one pod per node: {placed:?}");
 }
 
+/// The default profile signs pods now, so identical one-pod-per-node pods
+/// are batched there too (OpportunisticBatching is on by default in 1.35).
+#[tokio::test]
+async fn default_profile_batches_identical_pods() {
+    let scheduler = Scheduler::new_with_name(
+        Arc::new(MemoryStorage::new()),
+        1,
+        "default-scheduler".to_string(),
+    );
+    let nodes = vec![node("n1"), node("n2"), node("n3")];
+    let mut all_pods: Vec<Pod> = Vec::new();
+    let mut placed = Vec::new();
+    for (cycle, name) in ["p1", "p2", "p3"].iter().enumerate() {
+        let mut p = pod(name, &[80], None);
+        p.spec.as_mut().unwrap().scheduler_name = Some("default-scheduler".to_string());
+        let mut diag = Diagnosis::default();
+        let (chosen, _) = scheduler
+            .select_node_cycle(
+                &p,
+                &nodes,
+                &all_pods,
+                &HashMap::new(),
+                &mut diag,
+                Some(cycle as i64 + 1),
+            )
+            .await
+            .expect("a node fits");
+        placed.push(chosen.metadata.name.clone());
+        let mut bound = p.clone();
+        bound.spec.as_mut().unwrap().node_name = Some(chosen.metadata.name.clone());
+        all_pods.push(bound);
+    }
+    let fw = &scheduler.profile_for(&all_pods[0]).unwrap().framework;
+    assert_eq!(fw.batched_pods(), 2, "p2 and p3 used hints: {placed:?}");
+    placed.sort();
+    placed.dedup();
+    assert_eq!(placed.len(), 3, "one pod per node");
+}
+
 /// Without a cycle count (or with the gate off) nothing is hinted or stored.
 #[tokio::test]
 async fn no_cycle_count_means_no_batching() {

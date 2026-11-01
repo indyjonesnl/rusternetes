@@ -160,6 +160,9 @@ pub fn new_sign_plugin(name: &str) -> Option<Arc<dyn SignPlugin>> {
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(None))),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit::default())),
+        names::NODE_RESOURCES_BALANCED_ALLOCATION => Some(Arc::new(BalancedAllocation)),
+        names::VOLUME_RESTRICTIONS => Some(Arc::new(VolumeRestrictions)),
+        names::VOLUME_ZONE => Some(Arc::new(VolumeZone)),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
@@ -1385,17 +1388,87 @@ impl SignPlugin for NodePorts {
     }
 }
 
+/// The `ResourcesSignerName` fragment of `Fit.SignPod` (fit.go:174-185) and
+/// `BalancedAllocation.SignPod` (balanced_allocation.go:121-134), which are
+/// the same: the pod's requests (`computePodResourceRequest`), refused while
+/// DRAExtendedResource is on because the request then depends on the
+/// DeviceClasses.
+fn resources_fragment(pod: &Pod) -> (Vec<SignFragment>, Status) {
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::DRAExtendedResource,
+    ) {
+        return (
+            Vec::new(),
+            Status::new(
+                Code::Unschedulable,
+                vec!["signature disabled when dra extended resources enabled".to_string()],
+            ),
+        );
+    }
+    let request: std::collections::BTreeMap<_, _> = crate::advanced::pod_request_amounts(pod)
+        .into_iter()
+        .collect();
+    signed(vec![SignFragment::new(
+        signers::RESOURCES_SIGNER_NAME,
+        serde_json::json!(request),
+    )])
+}
+
 impl SignPlugin for NodeResourcesFit {
-    /// fit.go:174-185 (`computePodResourceRequest`; the DRA extended
-    /// resource refusal does not apply, that feature is not ported).
+    /// fit.go:174-185.
     fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
-        let request: std::collections::BTreeMap<_, _> = crate::advanced::pod_request_amounts(pod)
-            .into_iter()
-            .collect();
-        signed(vec![SignFragment::new(
-            signers::RESOURCES_SIGNER_NAME,
-            serde_json::json!(request),
-        )])
+        resources_fragment(pod)
+    }
+}
+
+/// `noderesources.BalancedAllocation` as a signer. Its Score runs through
+/// [`ResourceScore`]; this object only carries `SignPod`.
+pub struct BalancedAllocation;
+
+impl Plugin for BalancedAllocation {
+    fn name(&self) -> &'static str {
+        names::NODE_RESOURCES_BALANCED_ALLOCATION
+    }
+}
+
+impl SignPlugin for BalancedAllocation {
+    /// balanced_allocation.go:121-134.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        resources_fragment(pod)
+    }
+}
+
+/// `volumerestrictions.VolumeRestrictions` as a signer (its Filter still runs
+/// inline); this object only carries `SignPod`.
+pub struct VolumeRestrictions;
+
+impl Plugin for VolumeRestrictions {
+    fn name(&self) -> &'static str {
+        names::VOLUME_RESTRICTIONS
+    }
+}
+
+impl SignPlugin for VolumeRestrictions {
+    /// volume_restrictions.go:105-110.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        volumes_fragment(pod)
+    }
+}
+
+/// `volumezone.VolumeZone` as a signer (its Filter still runs inline); this
+/// object only carries `SignPod`.
+pub struct VolumeZone;
+
+impl Plugin for VolumeZone {
+    fn name(&self) -> &'static str {
+        names::VOLUME_ZONE
+    }
+}
+
+impl SignPlugin for VolumeZone {
+    /// volume_zone.go:107-112.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        volumes_fragment(pod)
     }
 }
 
