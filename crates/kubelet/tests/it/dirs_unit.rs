@@ -19,3 +19,4 @@ mod volume_manager__populator;
 mod volume_manager__reconciler;
 mod volume_manager__reconstruct;
 mod volume_manager__unmount;
+mod volume_plugins__util__block_operations;

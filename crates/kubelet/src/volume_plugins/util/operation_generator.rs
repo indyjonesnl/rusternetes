@@ -636,7 +636,7 @@ pub async fn mount_volume_with_attributes(
 
 /// Port of `operationGenerator.markDeviceErrorState`
 /// (`operation_generator.go:674-701`).
-fn mark_device_error_state(
+pub(crate) fn mark_device_error_state(
     st: &MountState<'_>,
     device_path: &str,
     device_mount_path: &str,
@@ -691,7 +691,11 @@ fn mark_device_error_state(
 
 /// Port of `operationGenerator.markVolumeErrorState`
 /// (`operation_generator.go:703-728`).
-fn mark_volume_error_state(st: &MountState<'_>, mark_opts: &MarkVolumeOpts, mount_error: &Error) {
+pub(crate) fn mark_volume_error_state(
+    st: &MountState<'_>,
+    mark_opts: &MarkVolumeOpts,
+    mount_error: &Error,
+) {
     let (asw, vtm) = (st.actual_state_of_world, st.volume_to_mount);
     if is_operation_finished_error(mount_error)
         && asw.get_volume_mount_state(&vtm.volume_name, &mark_opts.pod_name)
@@ -1307,7 +1311,7 @@ impl GeneratedUnmountDevice<'_> {
 
 /// Port of `isDeviceOpened` (`operation_generator.go:2179-2198`): after
 /// `UnmountDevice`, is the device still opened elsewhere on the system?
-fn is_device_opened(
+pub(crate) fn is_device_opened(
     device_to_detach: &AttachedVolume,
     host_util: &dyn HostUtils,
 ) -> anyhow::Result<bool> {
