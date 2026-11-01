@@ -1466,7 +1466,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
         };
         let fw = &profile.framework;
-        let filter_on = |name: &str| fw.has(ExtensionPoint::Filter, name);
         // `RunPreFilterPlugins` over the PreFilter plugin objects, ahead of
         // the PreFilters still inline below (`findNodesThatFitPod`,
         // schedule_one.go:482-502): a rejection ends the cycle with the
@@ -1544,7 +1543,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 .collect()
         };
 
-        let dra_on = filter_on(names::DYNAMIC_RESOURCES);
         // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter, in the
         // NodeAffinity plugin object) and `addedPrefSchedTerms` (Score),
         // node_affinity.go:310-333.
@@ -1617,15 +1615,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             // an Error status aborts the whole search.
                             filter_error = Some(status.message());
                         }
-                        return None;
-                    }
-                    // DynamicResources: devices for the pod's ResourceClaims
-                    if dra_on && !self.check_dra_device_availability(node, pod).await {
-                        debug!(
-                            "Node {} does not have required DRA devices for pod {}",
-                            node.metadata.name, pod.metadata.name
-                        );
-                        diag.add_plugin_status(names::DYNAMIC_RESOURCES);
                         return None;
                     }
                     // Node affinity (hard requirements and scoring)
@@ -2542,212 +2531,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     }
 
     // DRA (Dynamic Resource Allocation) Integration Methods
-
-    /// Check if node has available devices for DRA ResourceClaims
-    /// Returns true if all required devices are available on the node, or if no resource claims are specified
-    async fn check_dra_device_availability(&self, node: &Node, pod: &Pod) -> bool {
-        use rusternetes_common::resources::{ResourceClaim, ResourceSlice};
-
-        // Extract resourceClaims from pod.spec
-        let spec = match &pod.spec {
-            Some(s) => s,
-            None => return true, // No spec, no claims to check
-        };
-
-        let resource_claims_refs = match &spec.resource_claims {
-            Some(claims) => claims,
-            None => return true, // No resource claims, all nodes are suitable
-        };
-
-        if resource_claims_refs.is_empty() {
-            return true;
-        }
-
-        let pod_namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-
-        // For each claim reference, resolve the ResourceClaim object
-        for claim_ref in resource_claims_refs {
-            let claim_name = if let Some(name) = &claim_ref.resource_claim_name {
-                name.as_str()
-            } else if let Some(template_name) = &claim_ref.resource_claim_template_name {
-                // TODO: In a full implementation, we'd need to resolve the template
-                // and create a ResourceClaim from it. For now, we'll treat the template
-                // name as the claim name (simplified)
-                debug!(
-                    "ResourceClaimTemplate '{}' referenced, treating as claim name",
-                    template_name
-                );
-                template_name.as_str()
-            } else {
-                warn!("ResourceClaim reference has no name or template");
-                return false;
-            };
-
-            // Get the ResourceClaim from the data plane.
-            let claim: ResourceClaim = match self
-                .data
-                .get_resource_claim(pod_namespace, claim_name)
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "Failed to get ResourceClaim {}/{}: {}",
-                        pod_namespace, claim_name, e
-                    );
-                    return false;
-                }
-            };
-
-            // Check if the claim is allocated
-            let allocation = match &claim.status {
-                Some(status) => match &status.allocation {
-                    Some(alloc) => alloc,
-                    None => {
-                        debug!(
-                            "ResourceClaim {}/{} is not yet allocated",
-                            pod_namespace, claim_name
-                        );
-                        return false; // Claim not allocated yet
-                    }
-                },
-                None => {
-                    debug!(
-                        "ResourceClaim {}/{} has no status",
-                        pod_namespace, claim_name
-                    );
-                    return false;
-                }
-            };
-
-            // Check if the allocation has a node selector and if this node matches
-            if let Some(node_selector) = &allocation.node_selector {
-                // Check if node matches the node selector
-                let node_labels = node.metadata.labels.as_ref();
-                if let Some(required_labels) = &node_selector.node_selector_terms.first() {
-                    if let Some(match_expressions) = &required_labels.match_expressions {
-                        for expr in match_expressions {
-                            let node_label_value = node_labels.and_then(|l| l.get(&expr.key));
-
-                            match expr.operator.as_str() {
-                                "In" => {
-                                    if let Some(values) = &expr.values {
-                                        let matches = node_label_value
-                                            .map(|v| values.contains(v))
-                                            .unwrap_or(false);
-                                        if !matches {
-                                            debug!(
-                                                "Node {} does not match ResourceClaim node selector (key={}, operator=In)",
-                                                node.metadata.name, expr.key
-                                            );
-                                            return false;
-                                        }
-                                    }
-                                }
-                                "NotIn" => {
-                                    if let Some(values) = &expr.values {
-                                        let matches = node_label_value
-                                            .map(|v| !values.contains(v))
-                                            .unwrap_or(true);
-                                        if !matches {
-                                            debug!(
-                                                "Node {} does not match ResourceClaim node selector (key={}, operator=NotIn)",
-                                                node.metadata.name, expr.key
-                                            );
-                                            return false;
-                                        }
-                                    }
-                                }
-                                "Exists" => {
-                                    if node_label_value.is_none() {
-                                        debug!(
-                                            "Node {} does not match ResourceClaim node selector (key={}, operator=Exists)",
-                                            node.metadata.name, expr.key
-                                        );
-                                        return false;
-                                    }
-                                }
-                                "DoesNotExist" => {
-                                    if node_label_value.is_some() {
-                                        debug!(
-                                            "Node {} does not match ResourceClaim node selector (key={}, operator=DoesNotExist)",
-                                            node.metadata.name, expr.key
-                                        );
-                                        return false;
-                                    }
-                                }
-                                _ => {
-                                    warn!("Unknown node selector operator: {}", expr.operator);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Verify devices are available on this node
-            // Check each allocated device to ensure it's on this node
-            for device_result in &allocation.devices.results {
-                // Get ResourceSlices to find which node has this device
-                let slices: Vec<ResourceSlice> = match self.data.list_resource_slices().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        warn!("Failed to list ResourceSlices: {}", e);
-                        return false;
-                    }
-                };
-
-                let mut device_found_on_node = false;
-
-                for slice in slices {
-                    // Check if this slice is for the right driver and pool
-                    if slice.spec.driver != device_result.driver {
-                        continue;
-                    }
-                    if slice.spec.pool.name != device_result.pool {
-                        continue;
-                    }
-
-                    // Check if slice has node name specified
-                    let slice_node_name = match &slice.spec.node_name {
-                        Some(name) => name,
-                        None => continue, // Slice not associated with a specific node
-                    };
-
-                    // Check if this is the target node
-                    if slice_node_name != &node.metadata.name {
-                        continue;
-                    }
-
-                    // Check if the device exists in this slice
-                    for device in &slice.spec.devices {
-                        if device.name == device_result.device {
-                            device_found_on_node = true;
-                            break;
-                        }
-                    }
-
-                    if device_found_on_node {
-                        break;
-                    }
-                }
-
-                if !device_found_on_node {
-                    debug!(
-                        "Device {} from pool {} (driver {}) not found on node {}",
-                        device_result.device,
-                        device_result.pool,
-                        device_result.driver,
-                        node.metadata.name
-                    );
-                    return false;
-                }
-            }
-        }
-
-        // All resource claims are satisfied on this node
-        true
-    }
 }
 
 /// Split a `/registry/pods/{ns}/{name}` storage key into `(ns, name)`. Tolerates
@@ -2841,6 +2624,26 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
     ) -> Result<crate::node_volume_limits::NodeVolumeLimitsSnapshot, String> {
         self.data
             .list_node_volume_limits_snapshot()
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn resource_claim(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> Result<rusternetes_common::resources::ResourceClaim, String> {
+        self.data
+            .get_resource_claim(ns, name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn resource_slices(
+        &self,
+    ) -> Result<Vec<rusternetes_common::resources::ResourceSlice>, String> {
+        self.data
+            .list_resource_slices()
             .await
             .map_err(|e| e.to_string())
     }

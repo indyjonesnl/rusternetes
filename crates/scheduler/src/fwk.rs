@@ -18,7 +18,7 @@
 use crate::node_volume_limits::NodeVolumeLimitsSnapshot;
 use crate::volume_binding::VolumeSnapshot;
 use async_trait::async_trait;
-use rusternetes_common::resources::{Node, Pod};
+use rusternetes_common::resources::{Node, Pod, ResourceClaim, ResourceSlice};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 
@@ -322,6 +322,16 @@ pub trait Handle: Send + Sync {
     /// CSIStorageCapacity, CSINode) for namespace `ns`; it also feeds the
     /// binder's assume caches, as the informers do upstream.
     async fn volume_binding_snapshot(&self, _ns: &str) -> Result<VolumeSnapshot, String> {
+        Err("no cluster access".to_string())
+    }
+
+    /// `draManager.ResourceClaims().Get(ns, name)`.
+    async fn resource_claim(&self, _ns: &str, _name: &str) -> Result<ResourceClaim, String> {
+        Err("no cluster access".to_string())
+    }
+
+    /// `draManager.ResourceSlices().List()`.
+    async fn resource_slices(&self) -> Result<Vec<ResourceSlice>, String> {
         Err("no cluster access".to_string())
     }
 }

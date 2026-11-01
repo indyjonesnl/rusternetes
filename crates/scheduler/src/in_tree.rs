@@ -33,6 +33,7 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::NODE_NAME => Some(Arc::new(NodeName)),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
@@ -52,6 +53,7 @@ pub fn new_pre_filter_plugin(
         names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         _ => None,
     }
 }
@@ -870,5 +872,143 @@ impl FilterPlugin for VolumeBinding {
                 Status::success()
             }
         }
+    }
+}
+
+/// `stateKey` of the DynamicResources plugin.
+const DYNAMIC_RESOURCES_STATE_KEY: &str = "PreFilterDynamicResources";
+
+/// `dynamicresources.stateData`: the pod's resolved claims, and the
+/// ResourceSlices when an allocated claim has devices to place.
+struct DynamicResourcesState {
+    claims: Vec<rusternetes_common::resources::ResourceClaim>,
+    slices: Vec<rusternetes_common::resources::ResourceSlice>,
+}
+
+/// `dynamicresources.DynamicResources` (`plugins/dynamicresources/dynamicresources.go`):
+/// PreFilter (:402-) resolves the pod's ResourceClaims (a missing or deleting
+/// claim is UnschedulableAndUnresolvable, :350-395) and Skips pods without
+/// any; Filter (:631-) rejects a node outside an allocated claim's node
+/// selector.
+///
+/// Deviations: Rusternetes has no structured-parameters allocator, so an
+/// unallocated claim cannot be satisfied and rejects every node
+/// ("cannot allocate all claims"), and an allocated claim's devices must be
+/// advertised by a ResourceSlice of the node (driver, pool, device). A
+/// ResourceClaimTemplate reference is treated as the claim's name, as the
+/// previous inline check did (no `resourceclaim.Name` owner lookup);
+/// extended-resource DRA, device binding conditions, in-flight allocations
+/// and Reserve/PreBind are not ported. Claims and slices are read once in
+/// PreFilter rather than per node.
+pub struct DynamicResources;
+
+impl Plugin for DynamicResources {
+    fn name(&self) -> &'static str {
+        names::DYNAMIC_RESOURCES
+    }
+}
+
+#[async_trait]
+impl PreFilterPlugin for DynamicResources {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> (Option<PreFilterResult>, Status) {
+        let refs = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.resource_claims.as_deref())
+            .unwrap_or(&[]);
+        if refs.is_empty() {
+            return (None, Status::new(Code::Skip, Vec::new()));
+        }
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let unresolvable = |m: String| {
+            (
+                None,
+                Status::new(Code::UnschedulableAndUnresolvable, vec![m]),
+            )
+        };
+        let mut claims = Vec::with_capacity(refs.len());
+        for r in refs {
+            let name = match (&r.resource_claim_name, &r.resource_claim_template_name) {
+                (Some(n), _) | (None, Some(n)) => n,
+                (None, None) => {
+                    return unresolvable("ResourceClaim reference has no name or template".into())
+                }
+            };
+            match handle.resource_claim(ns, name).await {
+                Ok(c) if c.metadata.deletion_timestamp.is_some() => {
+                    return unresolvable(format!("resourceclaim {name:?} is being deleted"))
+                }
+                Ok(c) => claims.push(c),
+                Err(e) => return unresolvable(e),
+            }
+        }
+        let needs_slices = claims.iter().any(|c| {
+            c.status
+                .as_ref()
+                .and_then(|s| s.allocation.as_ref())
+                .is_some_and(|a| !a.devices.results.is_empty())
+        });
+        let slices = if needs_slices {
+            match handle.resource_slices().await {
+                Ok(s) => s,
+                Err(e) => return (None, Status::from_error(e)),
+            }
+        } else {
+            Vec::new()
+        };
+        state.write(
+            DYNAMIC_RESOURCES_STATE_KEY,
+            DynamicResourcesState { claims, slices },
+        );
+        (None, Status::success())
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for DynamicResources {
+    async fn filter(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let Some(s) = state.read::<DynamicResourcesState>(DYNAMIC_RESOURCES_STATE_KEY) else {
+            return missing_state(DYNAMIC_RESOURCES_STATE_KEY);
+        };
+        let node = node_info.node();
+        for claim in &s.claims {
+            let Some(allocation) = claim.status.as_ref().and_then(|st| st.allocation.as_ref())
+            else {
+                return Status::new(
+                    Code::Unschedulable,
+                    vec!["cannot allocate all claims".to_string()],
+                );
+            };
+            // This node selector only gets set if the claim is allocated.
+            if let Some(selector) = &allocation.node_selector {
+                if !rusternetes_common::affinity::matches_node_selector(node, selector) {
+                    return Status::new(
+                        Code::UnschedulableAndUnresolvable,
+                        vec!["resourceclaim not available on the node".to_string()],
+                    );
+                }
+            }
+            for result in &allocation.devices.results {
+                let on_node = s.slices.iter().any(|slice| {
+                    slice.spec.driver == result.driver
+                        && slice.spec.pool.name == result.pool
+                        && slice.spec.node_name.as_deref() == Some(node.metadata.name.as_str())
+                        && slice.spec.devices.iter().any(|d| d.name == result.device)
+                });
+                if !on_node {
+                    return Status::new(
+                        Code::UnschedulableAndUnresolvable,
+                        vec!["resourceclaim not available on the node".to_string()],
+                    );
+                }
+            }
+        }
+        Status::success()
     }
 }
