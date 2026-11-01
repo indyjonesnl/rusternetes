@@ -225,3 +225,39 @@ async fn image_locality_prefers_node_with_image() {
     .await;
     assert_eq!(got.as_deref(), Some("b"));
 }
+
+/// `NodeResourcesFitArgs.IgnoredResources` (fit.go:218): through the profile,
+/// a pod requesting an extended resource no node advertises is scheduled only
+/// when that resource is ignored.
+#[tokio::test]
+async fn fit_ignored_resources_from_the_profile() {
+    let pod_wanting_foo = || -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default", "uid": "p-uid"},
+            "spec": {"containers": [{"name": "c", "image": "x",
+                "resources": {"requests": {"example.com/foo": "1"}}}]}
+        }))
+        .unwrap()
+    };
+    let nodes = || vec![node("a", json!({}))];
+    assert_eq!(
+        schedule(DEFAULT_DOC, nodes(), vec![], pod_wanting_foo()).await,
+        None
+    );
+    let doc = r#"
+profiles:
+- schedulerName: default-scheduler
+  pluginConfig:
+  - name: NodeResourcesFit
+    args:
+      ignoredResources:
+      - example.com/foo
+"#;
+    assert_eq!(
+        schedule(doc, nodes(), vec![], pod_wanting_foo())
+            .await
+            .as_deref(),
+        Some("a")
+    );
+}
