@@ -785,3 +785,86 @@ fn create_exact_error_lists_match_upstream_table() {
         assert_eq!(got, want, "{name}");
     }
 }
+
+// ------------------------- exact upstream status-update error lists
+
+/// `TestValidatePodCertificateRequestStatusUpdate` compares the WHOLE error
+/// list. These are the cases that need no issued certificate (conditions
+/// only), pinned to the exact type, path, value and detail.
+#[test]
+fn status_update_exact_error_lists_match_upstream_table() {
+    const AT_MOST_ONE: &str =
+        "There may be at most one condition with type \"Issued\", \"Denied\", or \"Failed\"";
+    const IMMUTABLE: &str = "immutable after PodCertificateRequest is issued, denied, or failed";
+    let denied = || vec![cond(CONDITION_TYPE_DENIED, "True")];
+    let failed = || vec![cond(CONDITION_TYPE_FAILED, "True")];
+    let cases: Vec<(&str, Vec<Condition>, Vec<Condition>, Vec<String>)> = vec![
+        ("changing nothing is allowed", vec![], vec![], vec![]),
+        (
+            "adding unknown condition types is not allowed",
+            vec![],
+            vec![cond("Unknown", "True")],
+            vec!["status.conditions[0].type: Unsupported value: \"Unknown\": supported values: \"Issued\", \"Denied\", \"Failed\"".into()],
+        ),
+        (
+            "Issued must have status True",
+            vec![],
+            vec![cond(CONDITION_TYPE_ISSUED, "False")],
+            vec!["status.conditions[0].status: Unsupported value: \"False\": supported values: \"True\"".into()],
+        ),
+        (
+            "Denied must have status True",
+            vec![],
+            vec![cond(CONDITION_TYPE_DENIED, "False")],
+            vec!["status.conditions[0].status: Unsupported value: \"False\": supported values: \"True\"".into()],
+        ),
+        (
+            "Failed must have status True",
+            vec![],
+            vec![cond(CONDITION_TYPE_FAILED, "False")],
+            vec!["status.conditions[0].status: Unsupported value: \"False\": supported values: \"True\"".into()],
+        ),
+        ("transitioning to Denied is allowed", vec![], denied(), vec![]),
+        ("transitioning to Failed is allowed", vec![], failed(), vec![]),
+        (
+            "a request cannot be both Denied and Failed",
+            vec![],
+            vec![cond(CONDITION_TYPE_DENIED, "True"), cond(CONDITION_TYPE_FAILED, "True")],
+            vec![format!("status.conditions[1].type: Invalid value: \"Failed\": {AT_MOST_ONE}")],
+        ),
+        (
+            "a request cannot change from Denied to Failed",
+            denied(),
+            failed(),
+            vec![format!("status: Invalid value: {IMMUTABLE}")],
+        ),
+        (
+            "a request cannot change from Failed to Denied",
+            failed(),
+            denied(),
+            vec![format!("status: Invalid value: {IMMUTABLE}")],
+        ),
+        (
+            "a request cannot change from Denied to pending",
+            denied(),
+            vec![],
+            vec![format!("status: Invalid value: {IMMUTABLE}")],
+        ),
+        (
+            "a request cannot change from Failed to pending",
+            failed(),
+            vec![],
+            vec![format!("status: Invalid value: {IMMUTABLE}")],
+        ),
+    ];
+    for (name, old_conds, new_conds, want) in cases {
+        let old = with_conds(valid(), old_conds);
+        let new = with_conds(valid(), new_conds);
+        let got = msgs(&validate_pod_certificate_request_status_update(
+            &new,
+            &old,
+            now(),
+        ));
+        assert_eq!(got, want, "{name}");
+    }
+}
