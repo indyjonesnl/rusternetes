@@ -494,6 +494,11 @@ pub struct ProfileSpec<'a> {
     /// `NodeAffinityArgs.AddedAffinity`, handed to the NodeAffinity plugin
     /// (node_affinity.go:310-333).
     pub added_affinity: Option<&'a NodeAffinity>,
+    /// `NodeResourcesFitArgs.ScoringStrategy` as a scorer, handed to the
+    /// NodeResourcesFit score plugin.
+    pub fit_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
+    /// `NodeResourcesBalancedAllocationArgs` as a scorer.
+    pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -601,10 +606,11 @@ impl Framework {
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[&Node],
+        all_pods: &[Pod],
     ) -> Status {
         let mut skip: HashSet<String> = HashSet::new();
         for pl in &self.pre_score_plugin_objects.0 {
-            let s = pl.pre_score(state, pod, nodes).await;
+            let s = pl.pre_score(state, pod, nodes, all_pods).await;
             if s.is_skip() {
                 skip.insert(pl.name().to_string());
                 continue;
@@ -1088,58 +1094,39 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
     f.filter_plugin_objects = FilterPluginObjects(
         f.plugins_at(ExtensionPoint::Filter)
             .iter()
-            .filter_map(|name| {
-                crate::in_tree::new_filter_plugin(
-                    name,
-                    &crate::in_tree::FilterPluginArgs {
-                        added_affinity: profile.added_affinity,
-                    },
-                )
-            })
+            .filter_map(|name| crate::in_tree::new_filter_plugin(name, &plugin_args(profile)))
             .collect(),
     );
     // The PreFilter plugins that are objects, in list order.
     f.pre_filter_plugin_objects = PreFilterPluginObjects(
         f.plugins_at(ExtensionPoint::PreFilter)
             .iter()
-            .filter_map(|name| {
-                crate::in_tree::new_pre_filter_plugin(
-                    name,
-                    &crate::in_tree::FilterPluginArgs {
-                        added_affinity: profile.added_affinity,
-                    },
-                )
-            })
+            .filter_map(|name| crate::in_tree::new_pre_filter_plugin(name, &plugin_args(profile)))
             .collect(),
     );
     f.pre_score_plugin_objects = PreScorePluginObjects(
         f.plugins_at(ExtensionPoint::PreScore)
             .iter()
-            .filter_map(|name| {
-                crate::in_tree::new_pre_score_plugin(
-                    name,
-                    &crate::in_tree::FilterPluginArgs {
-                        added_affinity: profile.added_affinity,
-                    },
-                )
-            })
+            .filter_map(|name| crate::in_tree::new_pre_score_plugin(name, &plugin_args(profile)))
             .collect(),
     );
     f.score_plugin_objects = ScorePluginObjects(
         f.plugins_at(ExtensionPoint::Score)
             .iter()
-            .filter_map(|name| {
-                crate::in_tree::new_score_plugin(
-                    name,
-                    &crate::in_tree::FilterPluginArgs {
-                        added_affinity: profile.added_affinity,
-                    },
-                )
-            })
+            .filter_map(|name| crate::in_tree::new_score_plugin(name, &plugin_args(profile)))
             .collect(),
     );
     f.compute_batchable_plugins();
     Ok(f)
+}
+
+/// The plugin factories' arguments from the profile.
+fn plugin_args<'a>(profile: &ProfileSpec<'a>) -> crate::in_tree::FilterPluginArgs<'a> {
+    crate::in_tree::FilterPluginArgs {
+        added_affinity: profile.added_affinity,
+        fit_scorer: profile.fit_scorer,
+        balanced_scorer: profile.balanced_scorer,
+    }
 }
 
 /// `getScoreWeights` (framework.go:514-543): between MultiPoint-Score plugin

@@ -380,15 +380,21 @@ pub fn node_usages(all_pods: &[Pod]) -> HashMap<String, NodeUsage> {
         ) {
             continue;
         }
-        let u = out.entry(node_name.clone()).or_default();
-        let (c0, m0) = non_zero_request_amounts(p);
-        u.non0_cpu += c0;
-        u.non0_mem += m0;
-        for (k, v) in pod_request_amounts(p) {
-            *u.requested.entry(k).or_insert(0) += v;
-        }
+        out.entry(node_name.clone()).or_default().add_pod(p);
     }
     out
+}
+
+impl NodeUsage {
+    /// `NodeInfo.AddPod`'s request accounting.
+    fn add_pod(&mut self, p: &Pod) {
+        let (c0, m0) = non_zero_request_amounts(p);
+        self.non0_cpu += c0;
+        self.non0_mem += m0;
+        for (k, v) in pod_request_amounts(p) {
+            *self.requested.entry(k).or_insert(0) += v;
+        }
+    }
 }
 
 /// `getAllTolerationPreferNoSchedule` (taint_toleration.go).

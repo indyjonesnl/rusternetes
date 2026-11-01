@@ -1706,7 +1706,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // still score inline.
                 let feasible_nodes: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
                 let status = fw
-                    .run_pre_score_plugins(&mut cycle_state, pod, &feasible_nodes)
+                    .run_pre_score_plugins(&mut cycle_state, pod, &feasible_nodes, all_pods)
                     .await;
                 if !status.is_success() {
                     diag.scheduling_error = Some(status.message());
@@ -1721,8 +1721,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             return None;
                         }
                     };
-                let usages = crate::score::node_usages(all_pods);
-                let usage_of = |name: &str| usages.get(name).cloned().unwrap_or_default();
                 let cluster_nodes: Vec<&Node> = nodes.iter().collect();
                 for plugin in fw.plugins_at(ExtensionPoint::Score) {
                     let weight = i64::from(fw.score_weight(plugin));
@@ -1730,44 +1728,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // `RunScorePlugins`) or a plugin without a compiled-in
                     // scorer.
                     let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::NODE_RESOURCES_FIT | names::NODE_RESOURCES_BALANCED_ALLOCATION => {
-                            let is_fit = plugin == names::NODE_RESOURCES_FIT;
-                            let scorer = if is_fit {
-                                &profile.fit_scorer
-                            } else {
-                                &profile.balanced_scorer
-                            };
-                            let reqs = scorer.pod_requests(pod);
-                            // balanced_allocation.go PreScore: best-effort pods
-                            // are skipped.
-                            let skip = !is_fit
-                                && crate::score::ResourceAllocationScorer::is_best_effort(&reqs);
-                            let mut v = Vec::with_capacity(n);
-                            if !skip {
-                                for e in &feasible {
-                                    match scorer.score(
-                                        e.node,
-                                        &usage_of(&e.node.metadata.name),
-                                        &reqs,
-                                    ) {
-                                        Ok(s) => v.push(s),
-                                        Err(m) => {
-                                            warn!(
-                                                "running Score plugins: plugin {:?} failed with: {}",
-                                                plugin, m
-                                            );
-                                            return None;
-                                        }
-                                    }
-                                }
-                            }
-                            let name = if is_fit {
-                                names::NODE_RESOURCES_FIT
-                            } else {
-                                names::NODE_RESOURCES_BALANCED_ALLOCATION
-                            };
-                            (name, (!skip).then_some(v))
-                        }
                         names::IMAGE_LOCALITY => {
                             let states = crate::score::image_states(&cluster_nodes);
                             let v = feasible
