@@ -52,6 +52,7 @@ pub mod flow_control_watch_tracker;
 pub mod flow_control_work_estimator;
 pub mod gnostic;
 pub mod handlers;
+pub mod max_in_flight_filter;
 pub use rusternetes_middleware as middleware;
 pub mod openapi;
 pub mod patch;
@@ -479,6 +480,14 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
 
     // This entry point never enables APF (no `--enable-priority-and-fairness`).
     post_start_hooks::register_generic_server_hooks(post_start_hooks::global(), false);
+    // So `WithMaxInFlightLimit` stands in for it (server/config.go:1033), at
+    // the flags' upstream defaults.
+    if let Some(limits) = max_in_flight_filter::MaxInFlight::new(
+        flow_control::DEFAULT_MAX_REQUESTS_IN_FLIGHT as usize,
+        flow_control::DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT as usize,
+    ) {
+        max_in_flight_filter::install_max_in_flight(Arc::new(limits));
+    }
     // `storage-object-count-tracker-hook` (server/config.go:961-970) is
     // registered with APF off too, as `main.rs` does.
     flow_control_filter::register_object_count_tracker_hook_without_apf(post_start_hooks::global());

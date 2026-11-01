@@ -10,7 +10,8 @@ mod upstream_flags;
 // than recompiling them as a second copy of the crate.
 use rusternetes_api_server::{
     admission, audit, bootstrap, flow_control, flow_control_filter, flow_control_stats_poller,
-    post_start_hooks, prometheus_client, registry, request_timeout, router, state, zpages,
+    max_in_flight_filter, post_start_hooks, prometheus_client, registry, request_timeout, router,
+    state, zpages,
 };
 
 use anyhow::{Context, Result};
@@ -193,14 +194,15 @@ struct Args {
     )]
     request_timeout: std::time::Duration,
 
-    /// `--max-requests-inflight` (server/config.go:443): with
-    /// `--max-mutating-requests-inflight` this is the server concurrency limit
-    /// APF divides between priority levels.
-    #[arg(long, default_value_t = flow_control::DEFAULT_MAX_REQUESTS_IN_FLIGHT)]
+    /// `--max-requests-inflight` (server/config.go:443): the limit on
+    /// concurrent read-only requests when APF is off (`WithMaxInFlightLimit`),
+    /// and with `--max-mutating-requests-inflight` the server concurrency limit
+    /// APF divides between priority levels. 0 means no limit.
+    #[arg(long, allow_negative_numbers = true, default_value_t = flow_control::DEFAULT_MAX_REQUESTS_IN_FLIGHT)]
     max_requests_inflight: i64,
 
     /// `--max-mutating-requests-inflight` (server/config.go:444).
-    #[arg(long, default_value_t = flow_control::DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT)]
+    #[arg(long, allow_negative_numbers = true, default_value_t = flow_control::DEFAULT_MAX_MUTATING_REQUESTS_IN_FLIGHT)]
     max_mutating_requests_inflight: i64,
 
     /// Path to the file that defines the audit policy configuration
@@ -606,6 +608,14 @@ async fn main() -> Result<()> {
         .resolve(args.client_ca_file.as_deref())?;
     request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args)?;
+    // `ServerRunOptions.Validate` (server_run_options.go:197-203).
+    let limit_errs = max_in_flight_filter::validate_limits(
+        args.max_requests_inflight,
+        args.max_mutating_requests_inflight,
+    );
+    if !limit_errs.is_empty() {
+        anyhow::bail!("invalid flags: {}", limit_errs.join(", "));
+    }
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =
         registry::core::service::ipranges::ServiceIpRanges::parse(&args.service_cluster_ip_range)
@@ -855,6 +865,18 @@ async fn main() -> Result<()> {
         flow_control_filter::install_flow_control(apf);
         info!("API Priority and Fairness enabled");
     } else {
+        // `c.FlowControl == nil`: `WithMaxInFlightLimit` (server/config.go:1033).
+        // A limit of 0 leaves that kind of request unlimited.
+        if let Some(limits) = max_in_flight_filter::MaxInFlight::new(
+            args.max_requests_inflight as usize,
+            args.max_mutating_requests_inflight as usize,
+        ) {
+            max_in_flight_filter::install_max_in_flight(Arc::new(limits));
+            info!(
+                "Max-in-flight limiter enabled: {} read-only, {} mutating",
+                args.max_requests_inflight, args.max_mutating_requests_inflight
+            );
+        }
         // `storage-object-count-tracker-hook` is registered whenever the
         // tracker exists (server/config.go:961-970), APF or not.
         flow_control_filter::register_object_count_tracker_hook_without_apf(

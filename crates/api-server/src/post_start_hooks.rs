@@ -195,8 +195,8 @@ pub const MAX_IN_FLIGHT_FILTER_HOOK: &str = "max-in-flight-filter";
 /// - `max-in-flight-filter` (config.go:949-958): registered only when APF is
 ///   off (`c.FlowControl == nil`); starts the executing-request watermark
 ///   flush (`StartMaxInFlightWatermarkMaintenance`, filters/maxinflight.go:91-105).
-///   This server has no max-in-flight filter feeding the watermark (follow-up),
-///   so the loop reports zeros; with APF on, `priority-and-fairness-filter`
+///   The executing watermark is fed by `max_in_flight_filter`
+///   (`WithMaxInFlightLimit`); with APF on, `priority-and-fairness-filter`
 ///   owns the same flush.
 pub fn register_generic_server_hooks(registry: &PostStartHooks, apf_enabled: bool) {
     spawn_starting_hook_with(registry, GENERIC_APISERVER_START_INFORMERS_HOOK, || {});
