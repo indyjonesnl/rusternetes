@@ -6,15 +6,21 @@
 //! `MakeDockerKeyring`, as consumed by `images/image_manager.go`
 //! `makeLookupPullCredentialsFunc`.
 //!
+//! Also `provider.go` `NewDefaultDockerKeyring`: the node-level keyring read
+//! from `config.json` / `.dockercfg` (`config.go` `ReadDockerConfigFile`).
+//!
 //! Not ported: `TrackedAuthConfig` source/hash tracking (only used with the
-//! `KubeletEnsureSecretPulledImages` gate), node-level docker config files
-//! and the external credential provider plugins.
+//! `KubeletEnsureSecretPulledImages` gate) and the external credential
+//! provider plugins.
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use rusternetes_common::resources::Secret;
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// `credentialprovider.AuthConfig` (mirrors the CRI `AuthConfig`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -261,4 +267,134 @@ pub fn parse_image_repo(image: &str) -> Result<String> {
         remainder
     };
     Ok(format!("{domain}/{remainder}"))
+}
+
+/// `configFileName` / `configJSONFileName` (`config.go`).
+const CONFIG_FILE_NAME: &str = ".dockercfg";
+const CONFIG_JSON_FILE_NAME: &str = "config.json";
+
+/// `ReadDockerConfigJSONFile`: the first search path with a valid
+/// `config.json`. An empty path is the working directory (`workingDirPath`).
+pub fn read_docker_config_json_file(search_paths: &[PathBuf]) -> Result<DockerConfig> {
+    for dir in search_paths {
+        let Ok(contents) = std::fs::read(dir.join(CONFIG_JSON_FILE_NAME)) else {
+            continue;
+        };
+        if let Ok(cfg) = parse_docker_config_json(&contents) {
+            return Ok(cfg);
+        }
+    }
+    Err(anyhow!(
+        "couldn't find valid {CONFIG_JSON_FILE_NAME} after checking in {search_paths:?}"
+    ))
+}
+
+/// `ReadDockercfgFile`: the first search path with a valid `.dockercfg`.
+pub fn read_dockercfg_file(search_paths: &[PathBuf]) -> Result<DockerConfig> {
+    for dir in search_paths {
+        let Ok(contents) = std::fs::read(dir.join(CONFIG_FILE_NAME)) else {
+            continue;
+        };
+        if let Ok(cfg) = parse_dockercfg(&contents) {
+            return Ok(cfg);
+        }
+    }
+    Err(anyhow!(
+        "couldn't find valid {CONFIG_FILE_NAME} after checking in {search_paths:?}"
+    ))
+}
+
+/// `DefaultDockerConfigJSONPaths`: preferred path (unset), working dir,
+/// `$HOME/.docker`, `/.docker`.
+pub fn default_docker_config_json_paths() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    vec![
+        PathBuf::new(),
+        PathBuf::new(),
+        home.join(".docker"),
+        PathBuf::from("/.docker"),
+    ]
+}
+
+/// `DefaultDockercfgPaths`: preferred path (unset), working dir, `$HOME`, `/`.
+pub fn default_dockercfg_paths() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    vec![PathBuf::new(), PathBuf::new(), home, PathBuf::from("/")]
+}
+
+/// `CachingDockerConfigProvider` lifetime used by `NewDefaultDockerKeyring`.
+const NODE_CONFIG_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+
+/// `NewDefaultDockerKeyring()`: a `providersDockerKeyring` over the
+/// `CachingDockerConfigProvider{defaultDockerConfigProvider, 5m}`.
+pub struct NodeKeyring {
+    json_paths: Vec<PathBuf>,
+    cfg_paths: Vec<PathBuf>,
+    lifetime: Duration,
+    cache: Mutex<Option<(Instant, DockerConfig)>>,
+}
+
+impl Default for NodeKeyring {
+    fn default() -> Self {
+        Self::new(
+            default_docker_config_json_paths(),
+            default_dockercfg_paths(),
+            NODE_CONFIG_CACHE_LIFETIME,
+        )
+    }
+}
+
+impl NodeKeyring {
+    pub fn new(json_paths: Vec<PathBuf>, cfg_paths: Vec<PathBuf>, lifetime: Duration) -> Self {
+        Self {
+            json_paths,
+            cfg_paths,
+            lifetime,
+            cache: Mutex::new(None),
+        }
+    }
+
+    /// `defaultDockerConfigProvider.Provide` behind the caching provider:
+    /// `ReadDockerConfigFile` (config.json, then .dockercfg), empty when
+    /// neither exists; the result is cached for `lifetime`.
+    fn provide(&self) -> DockerConfig {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((expiry, cfg)) = cache.as_ref() {
+            if Instant::now() < *expiry {
+                return cfg.clone();
+            }
+        }
+        let cfg = read_docker_config_json_file(&self.json_paths)
+            .or_else(|_| read_dockercfg_file(&self.cfg_paths))
+            .unwrap_or_default();
+        *cache = Some((Instant::now() + self.lifetime, cfg.clone()));
+        cfg
+    }
+
+    /// `providersDockerKeyring.Lookup`.
+    pub fn lookup(&self, image: &str) -> Vec<AuthConfig> {
+        let mut kr = BasicDockerKeyring::default();
+        kr.add(self.provide());
+        kr.lookup(image)
+    }
+}
+
+/// `makeLookupPullCredentialsFunc`'s keyring: pull-secret credentials first,
+/// then the node keyring (`MakeDockerKeyring(pullSecrets, default)`).
+pub fn lookup_pull_credentials(
+    secrets: &[Secret],
+    node: &NodeKeyring,
+    image: &str,
+) -> Result<Vec<AuthConfig>> {
+    let repo = parse_image_repo(image)?;
+    let mut out = match make_docker_keyring(secrets)? {
+        Some(kr) => kr.lookup(&repo),
+        None => Vec::new(),
+    };
+    out.extend(node.lookup(&repo));
+    Ok(out)
 }

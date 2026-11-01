@@ -282,3 +282,99 @@ async fn pull_passes_pod_sandbox_config() {
     );
     assert!(got[1].is_none());
 }
+
+fn write(dir: &std::path::Path, name: &str, body: &str) {
+    std::fs::write(dir.join(name), body).unwrap();
+}
+
+#[test]
+fn node_keyring_prefers_config_json_over_dockercfg_and_skips_invalid() {
+    let (bad, good, legacy) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    // ReadDockerConfigJSONFile skips an invalid file and takes the next path.
+    write(bad.path(), "config.json", "{");
+    write(
+        good.path(),
+        "config.json",
+        r#"{"auths":{"reg.example.com":{"username":"json","password":"p"}}}"#,
+    );
+    write(
+        legacy.path(),
+        ".dockercfg",
+        r#"{"reg.example.com":{"username":"legacy","password":"p"}}"#,
+    );
+    let nk = NodeKeyring::new(
+        vec![bad.path().into(), good.path().into()],
+        vec![legacy.path().into()],
+        std::time::Duration::from_secs(300),
+    );
+    assert_eq!(nk.lookup("reg.example.com/x"), vec![auth("json", "p", "")]);
+
+    // No config.json anywhere: falls back to .dockercfg (ReadDockerConfigFile).
+    let nk = NodeKeyring::new(
+        vec![bad.path().into()],
+        vec![legacy.path().into()],
+        std::time::Duration::from_secs(300),
+    );
+    assert_eq!(
+        nk.lookup("reg.example.com/x"),
+        vec![auth("legacy", "p", "")]
+    );
+
+    // Neither: empty, not an error.
+    let nk = NodeKeyring::new(vec![], vec![], std::time::Duration::from_secs(300));
+    assert!(nk.lookup("reg.example.com/x").is_empty());
+}
+
+#[test]
+fn node_keyring_caches_for_its_lifetime() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        d.path(),
+        "config.json",
+        r#"{"auths":{"r.io":{"username":"a","password":"p"}}}"#,
+    );
+    let long = NodeKeyring::new(
+        vec![d.path().into()],
+        vec![],
+        std::time::Duration::from_secs(300),
+    );
+    let none = NodeKeyring::new(vec![d.path().into()], vec![], std::time::Duration::ZERO);
+    assert_eq!(long.lookup("r.io/x"), vec![auth("a", "p", "")]);
+    assert_eq!(none.lookup("r.io/x"), vec![auth("a", "p", "")]);
+    write(
+        d.path(),
+        "config.json",
+        r#"{"auths":{"r.io":{"username":"b","password":"p"}}}"#,
+    );
+    assert_eq!(long.lookup("r.io/x"), vec![auth("a", "p", "")], "cached");
+    assert_eq!(none.lookup("r.io/x"), vec![auth("b", "p", "")], "expired");
+}
+
+#[test]
+fn pull_secret_credentials_come_before_node_credentials() {
+    let d = tempfile::tempdir().unwrap();
+    write(
+        d.path(),
+        "config.json",
+        r#"{"auths":{"reg.example.com":{"username":"node","password":"p"}}}"#,
+    );
+    let nk = NodeKeyring::new(
+        vec![d.path().into()],
+        vec![],
+        std::time::Duration::from_secs(300),
+    );
+    let sec = secret(
+        "s",
+        "kubernetes.io/dockercfg",
+        ".dockercfg",
+        r#"{"reg.example.com":{"username":"secret","password":"p"}}"#,
+    );
+    let got = lookup_pull_credentials(&[sec], &nk, "reg.example.com/app:1").unwrap();
+    assert_eq!(got, vec![auth("secret", "p", ""), auth("node", "p", "")]);
+    let got = lookup_pull_credentials(&[], &nk, "reg.example.com/app:1").unwrap();
+    assert_eq!(got, vec![auth("node", "p", "")]);
+}

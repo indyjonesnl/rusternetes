@@ -385,6 +385,9 @@ pub struct CriContainerRuntime {
     /// Threshold-tracking state for liveness/startup probes, keyed
     /// `<pod>/<container>/<liveness|startup>`. `Arc` so clones share it.
     pub probe_states: Arc<Mutex<std::collections::HashMap<String, ProbeState>>>,
+    /// `NewDefaultDockerKeyring()` (`kuberuntime_manager.go:348`): node-level
+    /// docker config credentials for image pulls. `Arc` so clones share the cache.
+    pub node_keyring: Arc<crate::credentialprovider::NodeKeyring>,
     /// Records Kubernetes lifecycle events. `None` disables event emission.
     pub event_recorder:
         Option<rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>>,
@@ -427,6 +430,7 @@ impl CriContainerRuntime {
             log_root: log_root.into(),
             volumes: None,
             probe_states: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            node_keyring: Arc::new(crate::credentialprovider::NodeKeyring::default()),
             event_recorder: None,
             service_host: "10.96.0.1".to_string(),
             service_port: "443".to_string(),
@@ -816,18 +820,15 @@ impl CriContainerRuntime {
         pod: Option<&Pod>,
         sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<String> {
-        let creds = match pod {
-            Some(p) => {
-                let secrets = self.get_pull_secrets_for_pod(p).await;
-                match crate::credentialprovider::make_docker_keyring(&secrets)? {
-                    Some(kr) => {
-                        kr.lookup(&crate::credentialprovider::parse_image_repo(&spec.image)?)
-                    }
-                    None => Vec::new(),
-                }
-            }
+        let secrets = match pod {
+            Some(p) => self.get_pull_secrets_for_pod(p).await,
             None => Vec::new(),
         };
+        let creds = crate::credentialprovider::lookup_pull_credentials(
+            &secrets,
+            &self.node_keyring,
+            &spec.image,
+        )?;
         if creds.is_empty() {
             return Ok(cri.pull_image_spec(spec, sandbox_cfg.cloned()).await?);
         }
