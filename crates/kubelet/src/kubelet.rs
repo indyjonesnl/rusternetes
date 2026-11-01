@@ -2589,29 +2589,10 @@ impl Kubelet {
             .map(|p| p.metadata.uid.clone())
             .filter(|uid| !uid.is_empty())
             .collect();
-        // Unmount volumes first: upstream's reconciler unmounts before
-        // cleanupOrphanedPodDirs, which refuses to remove a mounted volume.
-        // Pods that are deleted (not in the live set) and pods that are
-        // terminated but still in the API both no longer want their volumes.
-        let terminated_pod_uids: std::collections::HashSet<String> = all_pods
-            .iter()
-            .chain(node_pods.iter())
-            .filter(|p| pod_volumes_released(p))
-            .map(|p| p.metadata.uid.clone())
-            .filter(|uid| !uid.is_empty())
-            .collect();
-        self.runtime
-            .unmount_orphaned_volumes(&live_pod_uids, &terminated_pod_uids)
-            .await;
-        // ...then release the staged devices nothing holds or wants any more
-        // (reconciler unmountDetachDevices, reconciler_common.go:273): after
-        // unpublish, so a shared device outlives every pod using it.
-        let desired_pods: Vec<Pod> = node_pods
-            .iter()
-            .filter(|p| !pod_volumes_released(p))
-            .cloned()
-            .collect();
-        self.runtime.unmount_unused_devices(&desired_pods).await;
+        // Volumes are unmounted by the volume manager's reconciler
+        // (`unmountVolumes`, `unmountDetachDevices`), which refuses nothing
+        // here: `cleanupOrphanedPodDirs` itself refuses to remove a pod
+        // directory with a mounted volume (`kubelet_volumes.go:169`).
         self.runtime.cleanup_orphaned_pod_dirs(&live_pod_uids);
 
         // Garbage-collect terminal pods (Succeeded/Failed) from storage.

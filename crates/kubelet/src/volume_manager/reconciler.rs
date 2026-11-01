@@ -2,15 +2,12 @@
 //! `reconciler_common.go`) — the loop that drives the actual state of the
 //! world towards the desired one.
 //!
-//! Only `mountOrAttachVolumes` is ported so far (the first mount, remount and
-//! expand-in-use arms); unmount and device detach stay with the kubelet's
-//! disk-driven cleanup (#1970). Remount: a volume
-//! the desired state wants, that the actual state has mounted for the pod,
-//! and whose plugin asked for a remount (`RequiresRemount`: secret, configMap,
-//! projected, downwardAPI), is mounted again through the plugin's `SetUp`.
-//! The first mount, unmount and device detach stay with the kubelet's inline
-//! mounting (#1970); the reconciler never touches a volume the actual state
-//! does not know, so the two cannot disagree about who owns it.
+//! `reconcile` runs `unmountVolumes`, `mountOrAttachVolumes`,
+//! `unmountDetachDevices` and `cleanOrphanVolumes`, the unmounts only once the
+//! desired state is populated (`readyToUnmount`). Remount: a volume the desired
+//! state wants, that the actual state has mounted for the pod, and whose plugin
+//! asked for a remount (`RequiresRemount`: secret, configMap, projected,
+//! downwardAPI), is mounted again through the plugin's `SetUp`.
 
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorldError;
 use crate::volume_manager::cache::{ActualStateOfWorld, DesiredStateOfWorld};
@@ -65,6 +62,10 @@ impl Reconciler {
         &self.desired_state_of_world
     }
 
+    pub(crate) fn mounter(&self) -> &VolumeMounter {
+        &self.mounter
+    }
+
     pub(crate) fn plugin_mgr(&self) -> &crate::volume_plugins::VolumePluginMgr {
         &self.mounter.plugin_mgr
     }
@@ -87,23 +88,137 @@ impl Reconciler {
         // `rc.reconstructVolumes()` before the loop (`reconciler.go:70-72`).
         self.reconstruct_volumes().await;
         loop {
-            for operation in self.mount_or_attach_volumes() {
+            for operation in self.reconcile_operations().await {
                 tokio::spawn(operation);
-            }
-            // `readyToUnmount()` then `cleanOrphanVolumes` (`reconciler.go`):
-            // the desired state must be fully populated before a volume that
-            // failed reconstruction is called an orphan.
-            if (self.populator_has_added_pods)() {
-                self.clean_orphan_volumes().await;
             }
             tokio::time::sleep(self.loop_sleep_duration).await;
         }
     }
 
-    /// Port of `reconcile` (`reconciler.go:74-...`), `mountOrAttachVolumes`
-    /// only, running the operations it starts to completion.
+    /// Port of `reconcile` (`reconciler.go:33-70`), running the operations it
+    /// starts to completion.
     pub async fn reconcile(&self) {
-        futures::future::join_all(self.mount_or_attach_volumes()).await;
+        futures::future::join_all(self.reconcile_operations().await).await;
+    }
+
+    /// The operations one `reconcile` pass starts.
+    async fn reconcile_operations(&self) -> Vec<Operation> {
+        let ready_to_unmount = self.ready_to_unmount();
+        let mut operations: Vec<Operation> = Vec::new();
+        if ready_to_unmount {
+            // Unmounts are triggered before mounts so that a volume that was
+            // referenced by a pod that was deleted and is now referenced by
+            // another pod is unmounted from the first pod before being mounted
+            // to the new pod.
+            operations.extend(self.unmount_volumes());
+        }
+
+        // Next we mount required volumes. If underlying PVC was resized while
+        // in-use then this also handles volume resizing.
+        operations.extend(self.mount_or_attach_volumes());
+
+        // Unmount volumes only when DSW and ASW are fully populated to prevent
+        // unmounting a volume that is still needed, but it did not reach DSW
+        // yet.
+        if ready_to_unmount {
+            // Ensure devices that should be detached/unmounted are
+            // detached/unmounted.
+            operations.extend(self.unmount_detach_devices());
+
+            // Clean up any orphan volumes that failed reconstruction.
+            self.clean_orphan_volumes().await;
+        }
+        operations
+    }
+
+    /// Port of `readyToUnmount` (`reconstruct.go:30-44`). During kubelet
+    /// startup, all volumes present on disk are added as uncertain to the
+    /// actual state; unmount only when the desired state is fully populated,
+    /// to prevent unmounting volumes that did not reach it yet. Not ported:
+    /// the wait for `volumesNeedUpdateFromNodeStatus`.
+    pub fn ready_to_unmount(&self) -> bool {
+        (self.populator_has_added_pods)()
+    }
+
+    /// Port of `unmountVolumes` (`reconciler_common.go:148-167`): the unmount
+    /// of every volume the actual state has mounted for a pod that the desired
+    /// state no longer wants it mounted for.
+    pub fn unmount_volumes(&self) -> Vec<Operation> {
+        let mut operations: Vec<Operation> = Vec::new();
+        // Ensure volumes that should be unmounted are unmounted.
+        for mounted_volume in self.actual_state_of_world.get_all_mounted_volumes() {
+            if self
+                .mounter
+                .volume_pod_operation_pending(&mounted_volume.volume_name, &mounted_volume.pod_name)
+            {
+                continue;
+            }
+            if !self.desired_state_of_world.pod_exists_in_volume(
+                &mounted_volume.pod_name,
+                &mounted_volume.volume_name,
+                &mounted_volume.selinux_mount_context,
+            ) {
+                // Volume is mounted, unmount it
+                debug!(
+                    "Starting operationExecutor.UnmountVolume for volume {} pod {}",
+                    mounted_volume.volume_name, mounted_volume.pod_name
+                );
+                let mounter = self.mounter.clone();
+                operations.push(Box::pin(async move {
+                    mounter.unmount_volume(&mounted_volume).await;
+                }));
+            }
+        }
+        operations
+    }
+
+    /// Port of `unmountDetachDevices` (`reconciler_common.go:273-315`): the
+    /// device unmount of every volume nothing is mounted to and the desired
+    /// state does not want, and "detach" (the kubelet never detaches:
+    /// `controllerAttachDetachEnabled || !PluginIsAttachable`) of those whose
+    /// device is not mounted.
+    pub fn unmount_detach_devices(&self) -> Vec<Operation> {
+        let mut operations: Vec<Operation> = Vec::new();
+        for attached_volume in self.actual_state_of_world.get_unmounted_volumes() {
+            // Check IsOperationPending to avoid marking a volume as detached
+            // if it's in the process of mounting.
+            if self.desired_state_of_world.volume_exists(
+                &attached_volume.volume_name,
+                &attached_volume.selinux_mount_context,
+            ) || self
+                .mounter
+                .volume_operation_pending(&attached_volume.volume_name)
+            {
+                continue;
+            }
+            // Re-read the actual state of the world, maybe the volume got
+            // mounted in the meantime. This is safe, because there is no
+            // pending operation (checked above) and no new operation could
+            // start in the meantime.
+            let Some(attached_volume) = self
+                .actual_state_of_world
+                .get_attached_volume(&attached_volume.volume_name)
+            else {
+                continue;
+            };
+            if attached_volume.device_may_be_mounted() {
+                // Volume is globally mounted to device, unmount it
+                let mounter = self.mounter.clone();
+                operations.push(Box::pin(async move {
+                    mounter.unmount_device(&attached_volume).await;
+                }));
+            } else {
+                // Volume is attached to node, detach it. Kubelet not
+                // responsible for detaching or this volume has a non-attachable
+                // volume plugin.
+                self.actual_state_of_world.mark_volume_as_detached(
+                    &attached_volume.volume_name,
+                    &attached_volume.node_name,
+                );
+                debug!("Volume detached: {}", attached_volume.volume_name);
+            }
+        }
+        operations
     }
 
     /// Port of `mountOrAttachVolumes` (`reconciler_common.go:132-190`): the

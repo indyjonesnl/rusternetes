@@ -1195,6 +1195,18 @@ impl VolumeManager {
         }
     }
 
+    /// The stand-ins for the part of `reconstructVolumes` that finds devices
+    /// with no pod directory left (a crash between a pod directory's removal
+    /// and its device's): every staged CSI device and iscsi global mount the
+    /// actual state does not know is added to it as globally mounted, so
+    /// `unmountDetachDevices` releases it once nothing wants it.
+    pub fn reconstruct_orphaned_devices(&self) {
+        self.reconstruct_staged_devices();
+        for path in self.iscsi_plugin.list_global_mounts() {
+            self.reconstruct_iscsi_device(&path);
+        }
+    }
+
     /// Record one iscsi global mount in the actual state of world as attached
     /// and globally mounted (the stand-in for `reconciler/reconstruct.go`).
     pub fn reconstruct_iscsi_device(&self, device_mount_path: &str) {
@@ -1248,7 +1260,7 @@ impl VolumeManager {
     /// `reconciler/reconstruct.go`, which does the same for each volume found on
     /// disk at startup. A device already known keeps its recorded state (an
     /// uncertain mount stays uncertain until `UnmountDevice` resolves it).
-    fn reconstruct_staged_devices(&self) {
+    pub(crate) fn reconstruct_staged_devices(&self) {
         use crate::volume_plugins::plugin::OwnedSpec;
 
         let plugin_name = crate::pod_dirs::plugin::CSI;
@@ -1318,6 +1330,75 @@ impl VolumeManager {
         }
     }
 
+    /// `pendingOperations.IsOperationPending(volumeName, podName,
+    /// EmptyNodeName)` (`reconciler_common.go:151`): an unmount or a mount is
+    /// running on the volume for the pod.
+    pub fn volume_pod_operation_pending(
+        &self,
+        volume_name: &crate::volume_plugins::util::types::UniqueVolumeName,
+        pod_name: &crate::volume_plugins::util::types::UniquePodName,
+    ) -> bool {
+        use crate::volume_plugins::util::nested_pending_operations::EMPTY;
+        self.pending_operations
+            .is_operation_pending(&volume_name.0, &pod_name.0, EMPTY)
+            || self
+                .mount_operations
+                .is_operation_pending(&volume_name.0, &pod_name.0, EMPTY)
+    }
+
+    /// `operationExecutor.UnmountVolume(mountedVolume, actualStateOfWorld,
+    /// kubeletPodsDir)` (`operation_executor.go`): `GenerateUnmountVolumeFunc`
+    /// run under `pendingOperations` keyed on the volume and pod, so it is
+    /// refused while an operation is pending or backing off. A failure is
+    /// logged and retried on the next reconcile.
+    pub async fn unmount_volume(
+        &self,
+        mounted: &crate::volume_plugins::util::operation_executor::MountedVolume,
+    ) {
+        use crate::volume_plugins::util::nested_pending_operations::EMPTY;
+        use crate::volume_plugins::util::operation_generator::generate_unmount_volume_func;
+
+        let what = format!("{} pod {}", mounted.volume_name, mounted.pod_name);
+        let op = match generate_unmount_volume_func(&self.plugin_mgr, mounted, &self.asw) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!("UnmountVolume of {what}: {e:#}");
+                return;
+            }
+        };
+        let name = op.operation_name;
+        let run = self.pending_operations.run_inline(
+            &mounted.volume_name.0,
+            &mounted.pod_name.0,
+            EMPTY,
+            name,
+            async {
+                match op.run_operation().await.detailed_err {
+                    Some(e) => Err(format!("{e:#}")),
+                    None => Ok(()),
+                }
+            },
+        );
+        match run.await {
+            Err(refused) => debug!("UnmountVolume of {what} not started: {refused}"),
+            Ok(Err(e)) => debug!("UnmountVolume of {what} failed: {e}"),
+            Ok(Ok(())) => {
+                // The pod's volume records live as long as the actual state's
+                // mounts do (upstream reads them from it).
+                if self
+                    .asw
+                    .get_possibly_mounted_volumes_for_pod(&mounted.pod_name)
+                    .is_empty()
+                {
+                    self.mounted
+                        .lock()
+                        .unwrap()
+                        .retain(|(uid, _), _| *uid != mounted.pod_uid);
+                }
+            }
+        }
+    }
+
     /// `operationExecutor.UnmountDevice(attachedVolume.AttachedVolume,
     /// actualStateOfWorld, hostutil)` (`operation_executor.go`, called from
     /// `unmountDetachDevices`, `reconciler_common.go:296-306`):
@@ -1325,7 +1406,7 @@ impl VolumeManager {
     /// persistent actual state of world, so `MarkDeviceAsUncertain` /
     /// `MarkDeviceAsUnmounted` land on the entry the next sweep reads.
     /// A failure is logged and retried on the next sync, as the reconciler does.
-    async fn unmount_device(
+    pub async fn unmount_device(
         &self,
         attached: &crate::volume_manager::cache::actual_state_of_world::AttachedVolume,
     ) {
