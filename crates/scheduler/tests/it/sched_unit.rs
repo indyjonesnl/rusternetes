@@ -13,6 +13,7 @@ mod in_tree__node_resources_fit;
 mod in_tree__node_unschedulable;
 mod in_tree__node_volume_limits;
 mod in_tree__pod_affinity_spread;
+mod in_tree__score_resources;
 mod in_tree__score_taint_node_affinity;
 mod in_tree__taint_toleration;
 mod in_tree__volume_binding;

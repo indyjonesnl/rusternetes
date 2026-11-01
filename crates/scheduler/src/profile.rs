@@ -114,6 +114,8 @@ impl Profile {
                 plugin_config_names: &self.plugin_config_names,
                 percentage_of_nodes_to_score: self.percentage_of_nodes_to_score,
                 added_affinity: self.added_affinity.as_ref(),
+                fit_scorer: Some(&self.fit_scorer),
+                balanced_scorer: Some(&self.balanced_scorer),
             },
         )
     }

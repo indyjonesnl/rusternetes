@@ -23,6 +23,10 @@ use std::sync::Arc;
 pub struct FilterPluginArgs<'a> {
     /// `NodeAffinityArgs.AddedAffinity`.
     pub added_affinity: Option<&'a NodeAffinity>,
+    /// The NodeResourcesFit scoring strategy.
+    pub fit_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
+    /// The NodeResourcesBalancedAllocation scoring strategy.
+    pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
 }
 
 /// The factory for an in-tree Filter plugin by name, `None` for names
@@ -69,6 +73,10 @@ pub fn new_pre_score_plugin(
     match name {
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(ResourceScore::fit(args.fit_scorer))),
+        names::NODE_RESOURCES_BALANCED_ALLOCATION => {
+            Some(Arc::new(ResourceScore::balanced(args.balanced_scorer)))
+        }
         _ => None,
     }
 }
@@ -78,6 +86,10 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
     match name {
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(ResourceScore::fit(args.fit_scorer))),
+        names::NODE_RESOURCES_BALANCED_ALLOCATION => {
+            Some(Arc::new(ResourceScore::balanced(args.balanced_scorer)))
+        }
         _ => None,
     }
 }
@@ -1234,7 +1246,13 @@ struct TaintTolerationScoreState(Vec<Toleration>);
 #[async_trait]
 impl PreScorePlugin for TaintToleration {
     /// taint_toleration.go PreScore (:178-193).
-    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, nodes: &[&Node]) -> Status {
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[&Node],
+        _all_pods: &[Pod],
+    ) -> Status {
         if nodes.is_empty() {
             return Status::success();
         }
@@ -1305,7 +1323,13 @@ fn preferred_terms_score(terms: &[PreferredSchedulingTerm], node: &Node) -> i64 
 impl PreScorePlugin for NodeAffinityPlugin {
     /// node_affinity.go PreScore (:253-267): Skip when neither the pod nor
     /// the plugin's added affinity prefers anything.
-    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, _nodes: &[&Node]) -> Status {
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[&Node],
+        _all_pods: &[Pod],
+    ) -> Status {
         let preferred = pod
             .spec
             .as_ref()
@@ -1352,5 +1376,106 @@ impl ScorePlugin for NodeAffinityPlugin {
     ) -> Option<Status> {
         normalize(scores, false);
         Some(Status::success())
+    }
+}
+
+/// `preScoreStateKey` of the resource scorers (one per plugin).
+fn resource_score_state_key(plugin: &str) -> String {
+    format!("PreScore{plugin}")
+}
+
+/// The pod's requests and every node's usage, from PreScore.
+struct ResourceScoreState {
+    pod_requests: Vec<i64>,
+    usages: std::collections::HashMap<String, crate::score::NodeUsage>,
+}
+
+/// The score side of `noderesources.Fit` (fit.go PreScore/Score, :215-260)
+/// and `noderesources.BalancedAllocation` (balanced_allocation.go
+/// PreScore/Score), which share `resourceAllocationScorer`
+/// (resource_allocation.go). PreScore computes the pod's requests (and
+/// Balanced skips best-effort pods); Score scores the node's usage plus the
+/// pod's requests with the plugin's strategy.
+///
+/// Deviation: a node's usage is computed in PreScore from the cycle's pods
+/// for every node, rather than read from an incrementally maintained
+/// `NodeInfo`. Neither plugin has score extensions (no normalisation).
+pub struct ResourceScore {
+    name: &'static str,
+    scorer: crate::score::ResourceAllocationScorer,
+    skip_best_effort: bool,
+}
+
+impl ResourceScore {
+    pub fn fit(scorer: Option<&crate::score::ResourceAllocationScorer>) -> Self {
+        Self {
+            name: names::NODE_RESOURCES_FIT,
+            scorer: scorer
+                .cloned()
+                .unwrap_or_else(crate::score::ResourceAllocationScorer::default_fit),
+            skip_best_effort: false,
+        }
+    }
+
+    pub fn balanced(scorer: Option<&crate::score::ResourceAllocationScorer>) -> Self {
+        Self {
+            name: names::NODE_RESOURCES_BALANCED_ALLOCATION,
+            scorer: scorer
+                .cloned()
+                .unwrap_or_else(crate::score::ResourceAllocationScorer::default_balanced),
+            skip_best_effort: true,
+        }
+    }
+}
+
+impl Plugin for ResourceScore {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+#[async_trait]
+impl PreScorePlugin for ResourceScore {
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[&Node],
+        all_pods: &[Pod],
+    ) -> Status {
+        let pod_requests = self.scorer.pod_requests(pod);
+        // balanced_allocation.go PreScore: best-effort pods are skipped.
+        if self.skip_best_effort
+            && crate::score::ResourceAllocationScorer::is_best_effort(&pod_requests)
+        {
+            return Status::new(Code::Skip, Vec::new());
+        }
+        state.write(
+            &resource_score_state_key(self.name),
+            ResourceScoreState {
+                pod_requests,
+                usages: crate::score::node_usages(all_pods),
+            },
+        );
+        Status::success()
+    }
+}
+
+impl ScorePlugin for ResourceScore {
+    fn score(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let key = resource_score_state_key(self.name);
+        let Some(s) = state.read::<ResourceScoreState>(&key) else {
+            return (0, missing_state(&key));
+        };
+        let node = node_info.node();
+        let usage = s
+            .usages
+            .get(&node.metadata.name)
+            .cloned()
+            .unwrap_or_default();
+        match self.scorer.score(node, &usage, &s.pod_requests) {
+            Ok(score) => (score, Status::success()),
+            Err(m) => (0, Status::from_error(m)),
+        }
     }
 }

@@ -399,7 +399,15 @@ pub struct NodeScore {
 /// run).
 #[async_trait]
 pub trait PreScorePlugin: Plugin {
-    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, nodes: &[&Node]) -> Status;
+    /// `all_pods` is every pod of the snapshot, the pods that upstream's
+    /// `NodeInfo`s carry.
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[&Node],
+        all_pods: &[Pod],
+    ) -> Status;
 }
 
 /// `fwk.ScorePlugin`: ranks the nodes that passed filtering.
