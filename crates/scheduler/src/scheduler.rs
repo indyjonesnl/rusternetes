@@ -925,6 +925,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 pod = key,
                 "Unable to schedule pod; no nodes are registered to the cluster; waiting"
             );
+            // `ScheduleResult{nominatingInfo: clearNominatedNode}`
+            // (schedule_one.go:155-157).
+            self.clear_nominated_node(queue, &pod, &pod_key).await;
             return Ok(ScheduleOutcome::Unschedulable(Default::default()));
         }
         let priority_classes = self.load_priority_classes().await?;
@@ -981,70 +984,80 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             error!("Error selecting node for pod {}/{}: {}", ns, name, msg);
             self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
                 .await;
+            // `clearNominatedNode` (schedule_one.go:160-163).
+            self.clear_nominated_node(queue, &pod, &pod_key).await;
             return Err(rusternetes_common::Error::Internal(msg));
-        } else if let Some((node_name, victims)) = self
-            .try_preempt(
-                &pod,
-                &nodes,
-                &all_pods,
-                &priority_classes,
-                &pdbs,
-                &diagnosis,
-            )
-            .await
-        {
-            // No node fits — preempt lower-priority pods. The production
-            // watch/work-queue path (this method) previously never attempted
-            // preemption; it only existed in the test-only schedule_pending_pods,
-            // so [sig-scheduling] SchedulerPreemption never worked. Evict the
-            // victims and set nominatedNodeName; once the victims terminate, the
-            // resync re-enqueues this pod and select_node binds it to the node.
-            info!(
-                "Preempting {} pod(s) on node {} for higher-priority pod {}/{}",
-                victims.len(),
-                node_name,
-                ns,
-                name
-            );
-            // `prepareCandidate` (preemption.go:464-500): a failed eviction
-            // is a scheduling error and nothing is nominated.
-            if let Err(e) = self
-                .prepare_candidate(Some(queue), &pod, &node_name, &victims)
-                .await
-            {
-                error!("Error preempting for pod {}/{}: {}", ns, name, e);
-                return Err(e);
-            }
-            self.nominate(queue, &pod, &pod_key, &node_name).await;
-            // The preemptor stays unschedulable this cycle (PostFilter only
-            // nominates); the victims' Pod/Delete events requeue it.
-            return Ok(ScheduleOutcome::Unschedulable(
-                diagnosis.unschedulable_plugins,
-            ));
         } else {
-            // No node fits and preemption can't help — surface FailedScheduling.
-            // The production path previously stayed silent here; the
-            // [sig-scheduling] SchedulerPredicates specs perform an action and
-            // wait (via WaitForSchedulerAfterAction) for a Warning/
-            // FailedScheduling event for the pod, so without it they time out.
-            // The recorder's correlator dedups across cycles, matching upstream
-            // recorder.Eventf(pod, Warning, "FailedScheduling", …).
-            // Aggregate per-plugin reasons (VolumeBinding etc.) the way
-            // upstream FitError.Error() does; fall back to the generic text
-            // when no plugin recorded a reason.
-            let msg = if diagnosis.is_empty() {
-                format!(
+            let outcome = self
+                .post_filter(
+                    &pod,
+                    &nodes,
+                    &all_pods,
+                    &priority_classes,
+                    &pdbs,
+                    &diagnosis,
+                )
+                .await;
+            if let PostFilterOutcome::Preempt(node_name, victims) = &outcome {
+                // No node fits — preempt lower-priority pods. The production
+                // watch/work-queue path (this method) previously never attempted
+                // preemption; it only existed in the test-only schedule_pending_pods,
+                // so [sig-scheduling] SchedulerPreemption never worked. Evict the
+                // victims and set nominatedNodeName; once the victims terminate, the
+                // resync re-enqueues this pod and select_node binds it to the node.
+                info!(
+                    "Preempting {} pod(s) on node {} for higher-priority pod {}/{}",
+                    victims.len(),
+                    node_name,
+                    ns,
+                    name
+                );
+                // `prepareCandidate` (preemption.go:464-500): a failed eviction
+                // is a scheduling error and nothing is nominated.
+                if let Err(e) = self
+                    .prepare_candidate(Some(queue), &pod, node_name, victims)
+                    .await
+                {
+                    error!("Error preempting for pod {}/{}: {}", ns, name, e);
+                    return Err(e);
+                }
+                self.nominate(queue, &pod, &pod_key, node_name).await;
+                // The preemptor stays unschedulable this cycle (PostFilter only
+                // nominates); the victims' Pod/Delete events requeue it.
+                return Ok(ScheduleOutcome::Unschedulable(
+                    diagnosis.unschedulable_plugins,
+                ));
+            } else {
+                // No node fits and preemption can't help — surface FailedScheduling.
+                // The production path previously stayed silent here; the
+                // [sig-scheduling] SchedulerPredicates specs perform an action and
+                // wait (via WaitForSchedulerAfterAction) for a Warning/
+                // FailedScheduling event for the pod, so without it they time out.
+                // The recorder's correlator dedups across cycles, matching upstream
+                // recorder.Eventf(pod, Warning, "FailedScheduling", …).
+                // Aggregate per-plugin reasons (VolumeBinding etc.) the way
+                // upstream FitError.Error() does; fall back to the generic text
+                // when no plugin recorded a reason.
+                let msg = if diagnosis.is_empty() {
+                    format!(
                     "0/{} nodes are available: no nodes match the pod's scheduling requirements.",
                     nodes.len()
                 )
-            } else {
-                fit_error_message(nodes.len(), &diagnosis)
-            };
-            self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
-                .await;
-            return Ok(ScheduleOutcome::Unschedulable(
-                diagnosis.unschedulable_plugins,
-            ));
+                } else {
+                    fit_error_message(nodes.len(), &diagnosis)
+                };
+                self.emit_pod_event(&pod, EventType::Warning, "FailedScheduling", &msg)
+                    .await;
+                // A PostFilter that found nothing to preempt clears the nomination
+                // (`NewPostFilterResultWithNominatedNode("")`); a pod that must
+                // wait or is ineligible keeps it.
+                if matches!(outcome, PostFilterOutcome::ClearNomination) {
+                    self.clear_nominated_node(queue, &pod, &pod_key).await;
+                }
+                return Ok(ScheduleOutcome::Unschedulable(
+                    diagnosis.unschedulable_plugins,
+                ));
+            }
         }
 
         Ok(ScheduleOutcome::Done)
@@ -1845,6 +1858,27 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
         diagnosis: &Diagnosis,
     ) -> Option<(String, Vec<Pod>)> {
+        match self
+            .post_filter(pod, nodes, all_pods, priority_classes, pdbs, diagnosis)
+            .await
+        {
+            PostFilterOutcome::Preempt(node, victims) => Some((node, victims)),
+            PostFilterOutcome::Wait | PostFilterOutcome::ClearNomination => None,
+        }
+    }
+
+    /// `RunPostFilterPlugins` with DefaultPreemption (`Evaluator.Preempt`,
+    /// preemption.go:268-342), reduced to what the caller needs: the victims, or
+    /// what to do with the pod's `nominatedNodeName` when there are none.
+    pub async fn post_filter(
+        &self,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+        pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
+        diagnosis: &Diagnosis,
+    ) -> PostFilterOutcome {
         // `RunPostFilterPlugins` runs only the pod's profile's PostFilter
         // plugins; DefaultPreemption is the one that evicts victims
         // (schedule_one.go:172 `HasPostFilterPlugins`).
@@ -1857,7 +1891,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 "Pod {} profile does not run DefaultPreemption, skipping preemption",
                 pod.metadata.name
             );
-            return None;
+            // `HasPostFilterPlugins` is false: `clearNominatedNode`
+            // (schedule_one.go:170-173).
+            return PostFilterOutcome::ClearNomination;
         }
         // If the pod's preemptionPolicy is "Never", skip preemption entirely.
         // Fall back to the PriorityClass's policy when the pod spec doesn't
@@ -1881,7 +1917,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 "Pod {} has preemptionPolicy=Never, skipping preemption",
                 pod.metadata.name
             );
-            return None;
+            return PostFilterOutcome::Wait;
         }
 
         // A pod that already preempted must wait for the room it made instead of
@@ -1908,7 +1944,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     .as_ref()
                     .and_then(|s| s.nominated_node_name.as_deref())
             );
-            return None;
+            return PostFilterOutcome::Wait;
         }
 
         // Collect EVERY node preemption could use, then score them. Returning
@@ -2004,11 +2040,37 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let mut candidates = non_violating;
         candidates.extend(violating);
 
-        let chosen = crate::advanced::pick_one_node_for_preemption(&candidates)?;
-        candidates
-            .into_iter()
-            .find(|c| c.node_name == chosen)
-            .map(|c| (c.node_name, c.victims))
+        // No candidate: "preemption is not helpful for scheduling" returns
+        // `NewPostFilterResultWithNominatedNode("")` (preemption.go:309-312), so
+        // the pod's stale nomination is cleared.
+        let Some(chosen) = crate::advanced::pick_one_node_for_preemption(&candidates) else {
+            return PostFilterOutcome::ClearNomination;
+        };
+        match candidates.into_iter().find(|c| c.node_name == chosen) {
+            Some(c) => PostFilterOutcome::Preempt(c.node_name, c.victims),
+            None => PostFilterOutcome::Wait,
+        }
+    }
+
+    /// Drop the pod's `nominatedNodeName` in the queue's nominator and on the
+    /// pod: `handleSchedulingFailure` with `nominatingInfo = clearNominatedNode`
+    /// (schedule_one.go:1103-1105 and `updatePod`'s `nnnNeedsUpdate`, :1161-1170,
+    /// which writes only when the value differs).
+    async fn clear_nominated_node(&self, queue: &PriorityQueue, pod: &Pod, pod_key: &str) {
+        queue.add_nominated_pod(pod, Some(&NominatingInfo::override_node("")));
+        let nominated = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.nominated_node_name.as_deref())
+            .is_some_and(|n| !n.is_empty());
+        if nominated {
+            self.update_pod_status_with_retry(pod_key, |p| {
+                if let Some(ref mut status) = p.status {
+                    status.nominated_node_name = None;
+                }
+            })
+            .await;
+        }
     }
 
     /// `prepareCandidate` (preemption.go:464-500): evict the victims in
@@ -2546,4 +2608,18 @@ fn get_lower_priority_nominated_pods(
         .into_iter()
         .filter(|p| p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0) < priority)
         .collect()
+}
+
+/// What `RunPostFilterPlugins` leaves to do with the pod
+/// (`PostFilterResult.NominatingInfo`, schedule_one.go:175-189).
+#[derive(Debug, Clone)]
+pub enum PostFilterOutcome {
+    /// Evict these victims on this node and nominate it (`ModeOverride`, node).
+    Preempt(String, Vec<Pod>),
+    /// Nil result: the pod is not eligible or must wait for a preemption it
+    /// already made; the nomination stays as it is (`ModeNoop`).
+    Wait,
+    /// `clearNominatedNode` (`ModeOverride`, ""): preemption cannot help, so
+    /// the pod's `nominatedNodeName` is dropped.
+    ClearNomination,
 }
