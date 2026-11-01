@@ -1,7 +1,8 @@
 //! InterPodAffinity PreScore/Score/NormalizeScore through the plugin object
 //! (`interpodaffinity/scoring_test.go` TestPreferredAffinity).
+use super::listers::EmptyListers;
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, NoHandle};
+use rusternetes_scheduler::fwk::{Code, CycleState};
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
@@ -36,7 +37,7 @@ async fn run(p: &Pod, nodes: &[Node], existing: &[Pod]) -> (Code, Option<Vec<i64
     let refs: Vec<&Node> = nodes.iter().collect();
     let mut state = CycleState::new();
     let s = fw
-        .run_pre_score_plugins(&mut state, p, &refs, existing, nodes, &NoHandle)
+        .run_pre_score_plugins(&mut state, p, &refs, existing, nodes, &EmptyListers)
         .await;
     let scores = fw
         .run_score_plugins(&state, p, &refs, existing, nodes)

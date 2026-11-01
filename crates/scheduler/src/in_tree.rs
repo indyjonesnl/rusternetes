@@ -29,6 +29,8 @@ pub struct FilterPluginArgs<'a> {
     pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
     /// `InterPodAffinityArgs`.
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
+    /// `PodTopologySpreadArgs`.
+    pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
 }
 
 /// The factory for an in-tree Filter plugin by name, `None` for names
@@ -82,6 +84,9 @@ pub fn new_pre_score_plugin(
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinityScore {
             args: args.inter_pod_affinity,
         })),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadScore {
+            args: args.pod_topology_spread.cloned().unwrap_or_default(),
+        })),
         _ => None,
     }
 }
@@ -98,6 +103,9 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
         names::IMAGE_LOCALITY => Some(Arc::new(ImageLocality)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinityScore {
             args: args.inter_pod_affinity,
+        })),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadScore {
+            args: args.pod_topology_spread.cloned().unwrap_or_default(),
         })),
         _ => None,
     }
@@ -1641,6 +1649,99 @@ impl ScorePlugin for InterPodAffinityScore {
     ) -> Option<Status> {
         let mut v: Vec<i64> = scores.iter().map(|s| s.score).collect();
         crate::score::normalize_inter_pod_affinity(&mut v);
+        for (s, n) in scores.iter_mut().zip(v) {
+            s.score = n;
+        }
+        Some(Status::success())
+    }
+}
+
+/// Key of the PodTopologySpread PreScore state (`preScoreStateKey`).
+const POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY: &str = "PreScorePodTopologySpread";
+
+/// `podtopologyspread.PodTopologySpread` PreScore/Score/NormalizeScore
+/// (`scoring.go:126-271`) over [`crate::pod_topology_spread_score`].
+pub struct PodTopologySpreadScore {
+    pub args: crate::pod_topology_spread_score::Args,
+}
+
+impl Plugin for PodTopologySpreadScore {
+    fn name(&self) -> &'static str {
+        names::POD_TOPOLOGY_SPREAD
+    }
+}
+
+#[async_trait]
+impl PreScorePlugin for PodTopologySpreadScore {
+    /// scoring.go PreScore (:126-199): `Skip` when there is nothing to score.
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[&Node],
+        all_pods: &[Pod],
+        all_nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> Status {
+        use crate::pod_topology_spread_score as pts;
+        let default_selector = if pts::needs_default_selector(pod, &self.args) {
+            match handle.default_selector_inputs(pod).await {
+                Ok(inputs) => Some(pts::default_selector(pod, &inputs)),
+                Err(e) => return Status::from_error(format!("reading listers: {e}")),
+            }
+        } else {
+            None
+        };
+        let by_node = pts::pods_by_node(all_pods);
+        match pts::pre_score(
+            pod,
+            nodes,
+            all_nodes,
+            &by_node,
+            &self.args,
+            default_selector.as_ref(),
+        ) {
+            Ok(Some(s)) => {
+                state.write(POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY, s);
+                Status::success()
+            }
+            Ok(None) => Status::new(Code::Skip, Vec::new()),
+            Err(e) => Status::from_error(e),
+        }
+    }
+}
+
+impl ScorePlugin for PodTopologySpreadScore {
+    /// scoring.go Score (:204-231).
+    fn score(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let Some(s) = state.read::<crate::pod_topology_spread_score::PreScoreState>(
+            POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY,
+        ) else {
+            return (0, missing_state(POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY));
+        };
+        let pods: Vec<&Pod> = node_info.pods().collect();
+        (
+            crate::pod_topology_spread_score::score(s, pod, node_info.node(), &pods),
+            Status::success(),
+        )
+    }
+
+    /// scoring.go NormalizeScore (:234-271).
+    fn normalize_score(
+        &self,
+        state: &CycleState,
+        _pod: &Pod,
+        scores: &mut [NodeScore],
+    ) -> Option<Status> {
+        let Some(s) = state.read::<crate::pod_topology_spread_score::PreScoreState>(
+            POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY,
+        ) else {
+            return Some(missing_state(POD_TOPOLOGY_SPREAD_SCORE_STATE_KEY));
+        };
+        let names: Vec<String> = scores.iter().map(|s| s.name.clone()).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut v: Vec<i64> = scores.iter().map(|s| s.score).collect();
+        crate::pod_topology_spread_score::normalize_score(s, &names, &mut v);
         for (s, n) in scores.iter_mut().zip(v) {
             s.score = n;
         }

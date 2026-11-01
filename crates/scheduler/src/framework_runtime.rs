@@ -501,6 +501,8 @@ pub struct ProfileSpec<'a> {
     pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
     /// `InterPodAffinityArgs`, handed to the InterPodAffinity score plugin.
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
+    /// `PodTopologySpreadArgs`, handed to the PodTopologySpread score plugin.
+    pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -1133,6 +1135,7 @@ fn plugin_args<'a>(profile: &ProfileSpec<'a>) -> crate::in_tree::FilterPluginArg
         fit_scorer: profile.fit_scorer,
         balanced_scorer: profile.balanced_scorer,
         inter_pod_affinity: profile.inter_pod_affinity,
+        pod_topology_spread: profile.pod_topology_spread,
     }
 }
 
