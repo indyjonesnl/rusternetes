@@ -225,10 +225,15 @@ async fn pull_sends_matching_pod_secret_credentials() {
         name: "pull".into(),
     }]);
 
-    rt.ensure_image_ref("reg.example.com/app:1", Some("Always"), Some((&pod, "")))
-        .await
-        .unwrap();
-    rt.ensure_image_ref("other.io/app:1", Some("Always"), Some((&pod, "")))
+    rt.ensure_image_ref(
+        "reg.example.com/app:1",
+        Some("Always"),
+        Some((&pod, "")),
+        None,
+    )
+    .await
+    .unwrap();
+    rt.ensure_image_ref("other.io/app:1", Some("Always"), Some((&pod, "")), None)
         .await
         .unwrap();
     let auths = fake.pull_auths();
@@ -241,4 +246,39 @@ async fn pull_sends_matching_pod_secret_credentials() {
         auths[1].is_none(),
         "no credentials leak to other registries"
     );
+}
+
+#[tokio::test]
+async fn pull_passes_pod_sandbox_config() {
+    use rusternetes_cri::v1;
+    let fake = FakeCri::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("fake-cri.sock");
+    fake.serve(&sock);
+    let rt = rusternetes_kubelet::cri_runtime::CriContainerRuntime::connect(
+        &sock,
+        tmp.path().to_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    let pod = Pod::new("p", PodSpec::default());
+    let cfg = v1::PodSandboxConfig {
+        metadata: Some(v1::PodSandboxMetadata {
+            name: "p".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    rt.ensure_image_ref("a.io/x:1", Some("Always"), Some((&pod, "")), Some(&cfg))
+        .await
+        .unwrap();
+    rt.ensure_image_ref("a.io/y:1", Some("Always"), None, None)
+        .await
+        .unwrap();
+    let got = fake.pull_sandbox_configs();
+    assert_eq!(
+        got[0].as_ref().unwrap().metadata.as_ref().unwrap().name,
+        "p"
+    );
+    assert!(got[1].is_none());
 }

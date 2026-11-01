@@ -3911,12 +3911,14 @@ impl Kubelet {
                                     ic.name, idx, namespace, pod_name
                                 );
                                 // Ensure image is available before starting
+                                let sandbox_cfg = self.runtime.pod_sandbox_config(pod).await.ok();
                                 if let Err(e) = self
                                     .runtime
                                     .ensure_image(
                                         &ic.image,
                                         ic.image_pull_policy.as_deref(),
                                         Some((pod, ic.name.as_str())),
+                                        sandbox_cfg.as_ref(),
                                     )
                                     .await
                                 {

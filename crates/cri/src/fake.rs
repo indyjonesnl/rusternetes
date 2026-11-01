@@ -46,6 +46,8 @@ struct FakeState {
     images: HashMap<String, v1::Image>,
     /// `PullImageRequest.Auth` of each `PullImage`, in call order.
     pull_auths: Vec<Option<v1::AuthConfig>>,
+    /// `PullImageRequest.SandboxConfig` of each `PullImage`, in call order.
+    pull_sandbox_configs: Vec<Option<v1::PodSandboxConfig>>,
     /// `ContainerStatus.StartedAt` / `FinishedAt` (unix nanos) by container id:
     /// the part of upstream's embedded `ContainerStatus` that `v1::Container`
     /// (the list item) does not carry.
@@ -115,6 +117,11 @@ impl FakeCri {
     /// The `auth` of every `PullImage` call, in order.
     pub fn pull_auths(&self) -> Vec<Option<v1::AuthConfig>> {
         self.state.lock().unwrap().pull_auths.clone()
+    }
+
+    /// The `sandbox_config` of every `PullImage` call, in order.
+    pub fn pull_sandbox_configs(&self) -> Vec<Option<v1::PodSandboxConfig>> {
+        self.state.lock().unwrap().pull_sandbox_configs.clone()
     }
 
     pub fn called(&self) -> Vec<String> {
@@ -527,6 +534,7 @@ impl ImageService for FakeCri {
         let mut st = self.state.lock().unwrap();
         st.record("PullImage");
         st.pull_auths.push(req.auth);
+        st.pull_sandbox_configs.push(req.sandbox_config);
         let id = spec.image.clone();
         st.images.entry(id.clone()).or_insert_with(|| v1::Image {
             id: id.clone(),
