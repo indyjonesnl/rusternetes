@@ -17,3 +17,4 @@ mod volume_manager__cache__desired_state_of_world;
 mod volume_manager__cache__desired_state_of_world_selinux_metrics;
 mod volume_manager__populator;
 mod volume_manager__reconciler;
+mod volume_manager__reconstruct;
