@@ -31,6 +31,8 @@ pub struct FilterPluginArgs<'a> {
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
     /// `PodTopologySpreadArgs`.
     pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
+    /// `VolumeBindingArgs.Shape`.
+    pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
 }
 
 /// The factory for an in-tree Filter plugin by name, `None` for names
@@ -87,6 +89,10 @@ pub fn new_pre_score_plugin(
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadScore {
             args: args.pod_topology_spread.cloned().unwrap_or_default(),
         })),
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBindingScore::new(
+            args.volume_shape
+                .map_or_else(crate::volume_binding::default_shape, <[_]>::to_vec),
+        ))),
         _ => None,
     }
 }
@@ -107,6 +113,10 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadScore {
             args: args.pod_topology_spread.cloned().unwrap_or_default(),
         })),
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBindingScore::new(
+            args.volume_shape
+                .map_or_else(crate::volume_binding::default_shape, <[_]>::to_vec),
+        ))),
         _ => None,
     }
 }
@@ -1746,5 +1756,98 @@ impl ScorePlugin for PodTopologySpreadScore {
             s.score = n;
         }
         Some(Status::success())
+    }
+}
+
+/// `volumebinding.VolumeBinding` PreScore and Score
+/// (`volume_binding.go:456-523`) over [`crate::volume_binding`]; reads the
+/// per-node `PodVolumes` the Filter left in the state.
+///
+/// Deviation: a pod without PVCs has no VolumeBinding state here (upstream's
+/// PreFilter writes an empty `stateData` before its `Skip`); a missing state
+/// reads as "no per-node volumes", which scores 0 as the empty state does.
+pub struct VolumeBindingScore {
+    /// `pl.scorer`, built from `VolumeBindingArgs.Shape`; upstream leaves it
+    /// nil when `StorageCapacityScoring` is off, here the gate is read per
+    /// call.
+    scorer: Box<dyn Fn(&crate::volume_binding::ClassResourceMap) -> i64 + Send + Sync>,
+}
+
+impl VolumeBindingScore {
+    pub fn new(shape: Vec<crate::volume_binding::FunctionShapePoint>) -> Self {
+        Self {
+            scorer: Box::new(crate::volume_binding::build_scorer_function(&shape)),
+        }
+    }
+}
+
+fn storage_capacity_scoring() -> bool {
+    rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    )
+}
+
+impl Plugin for VolumeBindingScore {
+    fn name(&self) -> &'static str {
+        names::VOLUME_BINDING
+    }
+}
+
+#[async_trait]
+impl PreScorePlugin for VolumeBindingScore {
+    /// volume_binding.go PreScore (:456-468).
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        _pod: &Pod,
+        _nodes: &[&Node],
+        _all_pods: &[Pod],
+        _all_nodes: &[Node],
+        _handle: &dyn Handle,
+    ) -> Status {
+        let enabled = storage_capacity_scoring();
+        if !enabled {
+            // `pl.scorer == nil`
+            return Status::new(Code::Skip, Vec::new());
+        }
+        let skip = match state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) {
+            Some(s) => crate::volume_binding::pre_score_skip(
+                &s.pod_volumes_by_node
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+                enabled,
+            ),
+            None => false,
+        };
+        if skip {
+            Status::new(Code::Skip, Vec::new())
+        } else {
+            Status::success()
+        }
+    }
+}
+
+impl ScorePlugin for VolumeBindingScore {
+    /// volume_binding.go Score (:471-523).
+    fn score(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let enabled = storage_capacity_scoring();
+        if !enabled {
+            return (0, Status::success());
+        }
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return (0, Status::success());
+        };
+        let by_node = s
+            .pod_volumes_by_node
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (
+            crate::volume_binding::score(
+                by_node.get(&node_info.node().metadata.name),
+                &*self.scorer,
+                enabled,
+            ),
+            Status::success(),
+        )
     }
 }

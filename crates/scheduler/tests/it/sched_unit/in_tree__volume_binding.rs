@@ -4,12 +4,13 @@
 use async_trait::async_trait;
 use rusternetes_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
 use rusternetes_scheduler::fwk::{
-    Code, CycleState, FilterPlugin, Handle, NoHandle, NodeInfo, PreFilterPlugin,
+    Code, CycleState, FilterPlugin, Handle, NoHandle, NodeInfo, PreFilterPlugin, PreScorePlugin,
+    ScorePlugin,
 };
 use rusternetes_scheduler::in_tree::{
-    clear_pod_volumes_by_node, take_pod_volumes_by_node, VolumeBinding,
+    clear_pod_volumes_by_node, take_pod_volumes_by_node, VolumeBinding, VolumeBindingScore,
 };
-use rusternetes_scheduler::volume_binding::VolumeSnapshot;
+use rusternetes_scheduler::volume_binding::{default_shape, VolumeSnapshot};
 use serde_json::json;
 
 struct Listers(VolumeSnapshot);
@@ -136,4 +137,53 @@ async fn filter_without_pre_filter_state_is_an_error() {
         )
         .await;
     assert_eq!(s.code(), Code::Error);
+}
+
+/// `PreScore` (volume_binding.go:456-468): `pl.scorer == nil` (the gate is
+/// off) is `Skip`.
+#[tokio::test]
+#[serial_test::serial]
+async fn pre_score_skips_without_storage_capacity_scoring() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+        false,
+    );
+    let s = VolumeBindingScore::new(default_shape())
+        .pre_score(
+            &mut CycleState::new(),
+            &pod_with_pvc("c"),
+            &[],
+            &[],
+            &[],
+            &NoHandle,
+        )
+        .await;
+    assert!(s.is_skip());
+}
+
+/// With the gate on, a pod whose Filter recorded nothing for the node scores
+/// 0 (`podVolumesByNode[nodeName]` absent, :480-483).
+#[tokio::test]
+#[serial_test::serial]
+async fn score_is_zero_for_a_node_without_recorded_volumes() {
+    let _gate = rusternetes_common::feature_gates::with_feature(
+        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+        true,
+    );
+    let plugin = VolumeBindingScore::new(default_shape());
+    let p = pod_with_pvc("c");
+    let mut state = CycleState::new();
+    let (_, s) = VolumeBinding
+        .pre_filter(&mut state, &p, &[], &Listers(bound_snapshot()))
+        .await;
+    assert!(s.is_success());
+    let s = plugin
+        .pre_score(&mut state, &p, &[], &[], &[], &NoHandle)
+        .await;
+    assert!(s.is_success());
+    let pods: Vec<Pod> = vec![];
+    let n = node("nb");
+    let (score, s) = plugin.score(&state, &p, &NodeInfo::new(&n, &pods));
+    assert!(s.is_success());
+    assert_eq!(score, 0);
 }
