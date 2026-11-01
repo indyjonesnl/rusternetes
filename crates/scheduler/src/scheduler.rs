@@ -1496,26 +1496,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // `addGENominatedPods` (framework.go): the pods nominated to a node by
         // preemption, of greater or equal priority than this pod, that are
         // not yet bound there. The Filter plugins run with them added.
-        let candidate_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
         let nominated_pods_for_node = |node_name: &str| -> Vec<&Pod> {
-            all_pods
-                .iter()
-                .filter(|p| {
-                    !(p.metadata.name == pod.metadata.name
-                        && p.metadata.namespace == pod.metadata.namespace)
-                        && p.status
-                            .as_ref()
-                            .and_then(|s| s.nominated_node_name.as_deref())
-                            == Some(node_name)
-                        && p.spec
-                            .as_ref()
-                            .and_then(|s| s.node_name.as_deref())
-                            .is_none_or(str::is_empty)
-                        && p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0)
-                            >= candidate_priority
-                        && p.metadata.deletion_timestamp.is_none()
-                })
-                .collect()
+            crate::default_preemption::nominated_pods_for_node(pod, all_pods, node_name)
         };
 
         let mut feasible: Vec<NodeEval> = Vec::new();
@@ -1982,27 +1964,40 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 fixed => fixed % num_potential,
             }
         };
+        let fallback_profile;
+        let profile_ref = match profile {
+            Some(p) => p,
+            None => {
+                fallback_profile = crate::profile::Profile::named(DEFAULT_SCHEDULER_NAME);
+                &fallback_profile
+            }
+        };
+        let fw = &profile_ref.framework;
+        let handle = CycleHandle {
+            data: &self.data,
+            binder: &self.volume_binder,
+            bind_timeout: profile_ref.volume_bind_timeout,
+            bind_poll: self.volume_bind_poll,
+        };
         let mut non_violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
         let mut violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
         for i in 0..num_potential {
             let node = potential_nodes[(offset + i) % num_potential];
-            // PDB-aware selection: check_preemption_with_pdbs sorts
-            // budget-protected pods last and reprieves them where the
-            // preemptor still fits without them, which is upstream's
-            // filterPodsWithPDBViolation
-            // (pkg/scheduler/framework/preemption/preemption.go). Passing an
-            // empty slice here — as this path did until #1797 — silently
-            // disabled all of it.
-            let (can_preempt, pods_to_evict) = crate::advanced::select_preemption_victims(
-                node,
-                pod,
-                all_pods,
-                pdbs,
-                priority_classes,
-            );
-            if can_preempt && !pods_to_evict.is_empty() {
-                let num_pdb_violations =
-                    crate::advanced::count_pdb_violating_victims(&pods_to_evict, all_pods, pdbs);
+            // `SelectVictimsOnNode` over the Filter plugin objects
+            // (default_preemption.go:207-307), with the PDB-violating victims
+            // reprieved first.
+            let selected = crate::default_preemption::select_victims_on_node(
+                fw, &handle, pod, node, all_pods, nodes, pdbs,
+            )
+            .await;
+            if let Ok(crate::default_preemption::NodeVictims {
+                victims: pods_to_evict,
+                num_pdb_violations,
+            }) = selected
+            {
+                if pods_to_evict.is_empty() {
+                    continue;
+                }
                 let c = crate::advanced::PreemptionCandidate {
                     num_pdb_violations,
                     node_name: node.metadata.name.clone(),

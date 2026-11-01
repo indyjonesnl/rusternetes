@@ -612,7 +612,7 @@ impl Plugin for NodeResourcesFit {
 /// The pods `NodeInfo` holds: the scheduler's pod informer leaves out the
 /// terminal ones (`status.phase!=Succeeded,status.phase!=Failed`), while
 /// terminating pods still count against the node until they are gone.
-fn counts_against_node(pod: &Pod) -> bool {
+pub(crate) fn counts_against_node(pod: &Pod) -> bool {
     !matches!(
         pod.status.as_ref().and_then(|s| s.phase.as_ref()),
         Some(rusternetes_common::types::Phase::Succeeded)

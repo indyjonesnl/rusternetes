@@ -1184,7 +1184,11 @@ pub fn count_pdb_violating_victims(
         .count() as i64
 }
 
-fn pod_violates_any_pdb(victim: &Pod, pdbs: &[PodDisruptionBudget], all_pods: &[Pod]) -> bool {
+pub(crate) fn pod_violates_any_pdb(
+    victim: &Pod,
+    pdbs: &[PodDisruptionBudget],
+    all_pods: &[Pod],
+) -> bool {
     for pdb in pdbs {
         if !pdb_covers_pod(pdb, victim) {
             continue;

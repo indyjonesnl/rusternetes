@@ -2,6 +2,7 @@
 #![allow(non_snake_case)]
 mod advanced;
 mod data_plane;
+mod default_preemption;
 mod diagnosis;
 mod framework_runtime;
 mod fwk;
