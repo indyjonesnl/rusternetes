@@ -192,6 +192,7 @@ fn failed_volume(dir: &Path, uid: &str) -> (PodVolume, PathBuf) {
             volume_spec_name: "volume-name".to_string(),
             volume_path: path.clone(),
             plugin_name: "kubernetes.io/empty-dir".to_string(),
+            volume_mode: rusternetes_kubelet::pod_dirs::PodVolumeMode::Filesystem,
         },
         path,
     )

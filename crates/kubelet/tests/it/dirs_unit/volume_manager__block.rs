@@ -244,3 +244,44 @@ async fn reconciler_unmaps_and_releases_a_block_volume() {
     assert!(f.vm.asw.get_all_mounted_volumes().is_empty());
     assert!(calls.contains(&"remove".to_string()), "{calls:?}");
 }
+
+/// `reconstructVolumes` finds a block volume under `<pod>/volumeDevices`,
+/// rebuilds its spec with `ConstructBlockVolumeSpec` and records it in the
+/// actual state as uncertainly mapped, with a `BlockVolumeMapper` instead of a
+/// mounter and its device (the global map path) uncertain.
+#[tokio::test]
+async fn reconstruction_recovers_a_mapped_block_volume() {
+    use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+    let f = fx().await;
+    let link = f
+        ._dir
+        .path()
+        .join("pods/uid-bk/volumeDevices/kubernetes.io~local-volume/pv-block");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::fs::write(&link, "").unwrap();
+
+    f.shell.reconciler.reconstruct_volumes().await;
+
+    let mounted = f.vm.asw.get_all_mounted_volumes();
+    assert_eq!(mounted.len(), 1);
+    assert!(mounted[0].block_volume_mapper.is_some());
+    assert!(mounted[0].mounter.is_none());
+    let attached = f.vm.asw.get_attached_volumes();
+    assert_eq!(attached.len(), 1);
+    assert_eq!(
+        attached[0].device_mount_state,
+        DeviceMountState::DeviceMountUncertain
+    );
+    assert!(
+        attached[0]
+            .device_mount_path
+            .contains("plugins/kubernetes.io~local-volume/volumeDevices/pv-block"),
+        "{}",
+        attached[0].device_mount_path
+    );
+    assert!(f
+        .shell
+        .reconciler
+        .volumes_failed_reconstruction()
+        .is_empty());
+}

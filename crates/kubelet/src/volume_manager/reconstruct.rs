@@ -12,12 +12,14 @@
 //! `volumesFailedReconstruction` and is force-unmounted by `cleanOrphanVolumes`
 //! once the desired state is populated and does not want it.
 //!
-//! Not ported yet: block volumes (`volumeDevices`, `FindMapperPluginByName`,
-//! `NewBlockVolumeMapper`; the kubelet does not support them).
+//! A block volume is found under `<pod>/volumeDevices` and rebuilt through its
+//! `BlockVolumePlugin` (`ConstructBlockVolumeSpec`, `NewBlockVolumeMapper`);
+//! its device is the mapper's global map path.
 
 use crate::pod_dirs::PodVolume;
+use crate::pod_dirs::PodVolumeMode;
 use crate::volume_manager::reconciler::Reconciler;
-use crate::volume_plugins::plugin::{DeviceMounter, Mounter, OwnedSpec};
+use crate::volume_plugins::plugin::{BlockVolumeMapper, DeviceMounter, Mounter, OwnedSpec};
 use crate::volume_plugins::util::operation_executor::{MarkVolumeOpts, VolumeMountState};
 use crate::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
 use anyhow::{anyhow, Context, Result};
@@ -26,14 +28,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-/// Port of `reconstructedVolume` (`reconstruct_common.go:62-72`), minus the
-/// block `blockVolumeMapper`.
+/// Port of `reconstructedVolume` (`reconstruct_common.go:62-72`).
 struct ReconstructedVolume {
     volume_name: UniqueVolumeName,
     pod_name: UniquePodName,
     volume_spec: Arc<OwnedSpec>,
     device_path: String,
-    mounter: Arc<dyn Mounter>,
+    /// Set for a filesystem volume.
+    mounter: Option<Arc<dyn Mounter>>,
+    /// Set for a block volume.
+    block_volume_mapper: Option<Arc<dyn BlockVolumeMapper>>,
     device_mounter: Option<Box<dyn DeviceMounter>>,
     selinux_mount_context: String,
 }
@@ -45,6 +49,7 @@ struct GlobalVolumeInfo {
     volume_spec: Arc<OwnedSpec>,
     device_path: String,
     device_mounter: Option<Box<dyn DeviceMounter>>,
+    block_volume_mapper: Option<Arc<dyn BlockVolumeMapper>>,
     pod_volumes: BTreeMap<UniquePodName, ReconstructedVolume>,
 }
 
@@ -119,6 +124,7 @@ impl Reconciler {
                     volume_spec: reconstructed.volume_spec.clone(),
                     device_path: reconstructed.device_path.clone(),
                     device_mounter: None,
+                    block_volume_mapper: reconstructed.block_volume_mapper.clone(),
                     pod_volumes: BTreeMap::new(),
                 });
             if gvl.device_mounter.is_none() {
@@ -144,8 +150,7 @@ impl Reconciler {
         debug!("Volume reconstruction finished");
     }
 
-    /// Port of `reconstructVolume` (`reconstruct_common.go:242-420`) for a
-    /// filesystem volume.
+    /// Port of `reconstructVolume` (`reconstruct_common.go:242-420`).
     async fn reconstruct_volume(&self, volume: &PodVolume) -> Result<ReconstructedVolume> {
         let plugin_mgr = self.plugin_mgr();
         // plugin initializations
@@ -159,33 +164,73 @@ impl Reconciler {
         pod.spec = None;
         pod.metadata.uid = volume.pod_uid.clone();
 
-        let reconstructed = plugin
-            .construct_volume_spec(
-                &volume.volume_spec_name,
-                &volume.volume_path.to_string_lossy(),
-            )
-            .with_context(|| {
-                format!(
-                    "ReconstructVolumeOperation failed for plugin {:?} (spec.Name: {:?}) pod {:?}",
-                    volume.plugin_name, volume.volume_spec_name, volume.pod_uid
-                )
-            })?;
-        let Some(v1_volume) = reconstructed.volume else {
+        let mapper_plugin = plugin_mgr
+            .find_mapper_plugin_by_name(&volume.plugin_name)
+            .map_err(|e| anyhow!("{e}"))?;
+        let block = volume.volume_mode == PodVolumeMode::Block;
+        if block && mapper_plugin.is_none() {
             return Err(anyhow!(
-                "failed to reconstruct volume for plugin {:?} (spec.Name: {:?}) pod {:?} (UID: {:?}): got nil",
+                "could not find block volume plugin {:?} (spec.Name: {:?}) pod {:?} (UID: {:?})",
                 volume.plugin_name,
                 volume.volume_spec_name,
                 pod_name,
                 pod.metadata.uid
             ));
+        }
+
+        // `ReconstructVolumeOperation` (`operation_executor.go:954-993`).
+        let (volume_spec, reconstructed_selinux_mount_context) = match mapper_plugin {
+            // Block volume case: `volumePath` is the pod device map path, whose
+            // `{volumeName}` is the symbolic link to the raw block device.
+            Some(mapper) if block => {
+                let spec = mapper
+                    .construct_block_volume_spec(
+                        &volume.pod_uid,
+                        &volume.volume_spec_name,
+                        &volume.volume_path.to_string_lossy(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "ReconstructVolumeOperation failed for plugin {:?} (spec.Name: {:?}) pod {:?}",
+                            volume.plugin_name, volume.volume_spec_name, volume.pod_uid
+                        )
+                    })?;
+                (Arc::new(spec), String::new())
+            }
+            // Filesystem volume case.
+            _ => {
+                let reconstructed = plugin
+                    .construct_volume_spec(
+                        &volume.volume_spec_name,
+                        &volume.volume_path.to_string_lossy(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "ReconstructVolumeOperation failed for plugin {:?} (spec.Name: {:?}) pod {:?}",
+                            volume.plugin_name, volume.volume_spec_name, volume.pod_uid
+                        )
+                    })?;
+                let Some(v1_volume) = reconstructed.volume else {
+                    return Err(anyhow!(
+                        "failed to reconstruct volume for plugin {:?} (spec.Name: {:?}) pod {:?} (UID: {:?}): got nil",
+                        volume.plugin_name,
+                        volume.volume_spec_name,
+                        pod_name,
+                        pod.metadata.uid
+                    ));
+                };
+                (
+                    Arc::new(OwnedSpec {
+                        volume: v1_volume,
+                        persistent_volume: reconstructed.persistent_volume,
+                        read_only: false,
+                        migrated: false,
+                        inline_volume_spec_for_csi_migration: false,
+                    }),
+                    reconstructed.selinux_mount_context,
+                )
+            }
         };
-        let volume_spec = Arc::new(OwnedSpec {
-            volume: v1_volume,
-            persistent_volume: reconstructed.persistent_volume,
-            read_only: false,
-            migrated: false,
-            inline_volume_spec_for_csi_migration: false,
-        });
         let spec = volume_spec.as_spec();
 
         // We have to find the plugins by volume spec (NOT by plugin name) here
@@ -207,26 +252,37 @@ impl Reconciler {
             )
         };
 
-        let mounter: Arc<dyn Mounter> = Arc::from(
-            plugin.new_mounter(&spec, &pod).await.map_err(|e| {
+        let mut mounter: Option<Arc<dyn Mounter>> = None;
+        let mut block_volume_mapper: Option<Arc<dyn BlockVolumeMapper>> = None;
+        let mut device_mounter: Option<Box<dyn DeviceMounter>> = None;
+        if let Some(mapper) = mapper_plugin.filter(|_| block) {
+            block_volume_mapper = Some(Arc::from(mapper.new_block_volume_mapper(&spec, &pod).map_err(|e| {
                 anyhow!(
-                    "reconstructVolume.NewMounter failed for volume {volume_name:?} (spec.Name: {:?}) pod {pod_name:?} (UID: {:?}) with: {e:#}",
+                    "reconstructVolume.NewBlockVolumeMapper failed for volume {volume_name:?} (spec.Name: {:?}) pod {pod_name:?} (UID: {:?}) with: {e:#}",
                     volume_spec.name(),
                     pod.metadata.uid
                 )
-            })?,
-        );
-        let device_mounter = match device_mountable_plugin.and_then(|p| p.as_device_mountable_plugin())
-        {
-            Some(p) => Some(p.new_device_mounter().map_err(|e| {
-                anyhow!(
-                    "reconstructVolume.NewDeviceMounter failed for volume {volume_name:?} (spec.Name: {:?}) pod {pod_name:?} (UID: {:?}) with: {e:#}",
-                    volume_spec.name(),
-                    pod.metadata.uid
-                )
-            })?),
-            None => None,
-        };
+            })?));
+        } else {
+            mounter = Some(Arc::from(
+                plugin.new_mounter(&spec, &pod).await.map_err(|e| {
+                    anyhow!(
+                        "reconstructVolume.NewMounter failed for volume {volume_name:?} (spec.Name: {:?}) pod {pod_name:?} (UID: {:?}) with: {e:#}",
+                        volume_spec.name(),
+                        pod.metadata.uid
+                    )
+                })?,
+            ));
+            if let Some(p) = device_mountable_plugin.and_then(|p| p.as_device_mountable_plugin()) {
+                device_mounter = Some(p.new_device_mounter().map_err(|e| {
+                    anyhow!(
+                        "reconstructVolume.NewDeviceMounter failed for volume {volume_name:?} (spec.Name: {:?}) pod {pod_name:?} (UID: {:?}) with: {e:#}",
+                        volume_spec.name(),
+                        pod.metadata.uid
+                    )
+                })?);
+            }
+        }
 
         Ok(ReconstructedVolume {
             volume_name,
@@ -236,8 +292,9 @@ impl Reconciler {
             // upstream; not ported yet (module comment).
             device_path: String::new(),
             mounter,
+            block_volume_mapper,
             device_mounter,
-            selinux_mount_context: reconstructed.selinux_mount_context,
+            selinux_mount_context: reconstructed_selinux_mount_context,
         })
     }
 
@@ -263,8 +320,8 @@ impl Reconciler {
                     pod_name: volume.pod_name.clone(),
                     pod_uid: volume.pod_name.0.clone(),
                     volume_name: volume.volume_name.clone(),
-                    mounter: Some(volume.mounter.clone()),
-                    block_volume_mapper: None,
+                    mounter: volume.mounter.clone(),
+                    block_volume_mapper: volume.block_volume_mapper.clone(),
                     volume_gid_volume: String::new(),
                     volume_spec: volume.volume_spec.clone(),
                     volume_mount_state: VolumeMountState::VolumeMountUncertain,
@@ -284,18 +341,25 @@ impl Reconciler {
                 );
             }
             // If the volume has device to mount, we mark its device as uncertain.
-            if let Some(device_mounter) = gvl.device_mounter.as_ref() {
-                let device_mount_path =
-                    match device_mounter.get_device_mount_path(&gvl.volume_spec.as_spec()) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            error!(
-                                "Could not find device mount path for volume {}: {e:#}",
-                                gvl.volume_name
-                            );
-                            continue;
-                        }
-                    };
+            if gvl.device_mounter.is_some() || gvl.block_volume_mapper.is_some() {
+                // `getDeviceMountPath` (`reconstruct_common.go:176-189`): a block
+                // volume's is its global map path.
+                let spec = gvl.volume_spec.as_spec();
+                let device_mount_path = match (&gvl.block_volume_mapper, &gvl.device_mounter) {
+                    (Some(mapper), _) => mapper.get_global_map_path(&spec),
+                    (None, Some(device_mounter)) => device_mounter.get_device_mount_path(&spec),
+                    (None, None) => unreachable!("checked above"),
+                };
+                let device_mount_path = match device_mount_path {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(
+                            "Could not find device mount path for volume {}: {e:#}",
+                            gvl.volume_name
+                        );
+                        continue;
+                    }
+                };
                 if let Err(e) = asw.mark_device_as_uncertain(
                     &gvl.volume_name,
                     &gvl.device_path,
