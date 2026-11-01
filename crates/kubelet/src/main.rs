@@ -424,6 +424,14 @@ async fn main() -> Result<()> {
             tracing::error!("Failed to register CRI auth plugins: {e}");
             e
         })?;
+        credentialprovider_plugin::register_validated_providers(
+            &args.image_credential_provider_bin_dir,
+            &cfg,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to register CRI auth plugins: {e}");
+            e
+        })?;
         info!(
             "Registered {} image credential provider(s), config hash {hash}",
             cfg.providers.len()

@@ -360,8 +360,12 @@ fn node_keyring_caches_for_its_lifetime() {
     assert_eq!(none.lookup("r.io/x"), vec![auth("b", "p", "")], "expired");
 }
 
-#[test]
-fn pull_secret_credentials_come_before_node_credentials() {
+fn ext() -> rusternetes_kubelet::credentialprovider_plugin::ExternalCredentialProviderKeyring {
+    rusternetes_kubelet::credentialprovider_plugin::ExternalCredentialProviderKeyring::from_providers(vec![])
+}
+
+#[tokio::test]
+async fn pull_secret_credentials_come_before_node_credentials() {
     let d = tempfile::tempdir().unwrap();
     write(
         d.path(),
@@ -379,8 +383,12 @@ fn pull_secret_credentials_come_before_node_credentials() {
         ".dockercfg",
         r#"{"reg.example.com":{"username":"secret","password":"p"}}"#,
     );
-    let got = lookup_pull_credentials(&[sec], &nk, "reg.example.com/app:1").unwrap();
+    let got = lookup_pull_credentials(&[sec], &nk, &ext(), "reg.example.com/app:1")
+        .await
+        .unwrap();
     assert_eq!(got, vec![auth("secret", "p", ""), auth("node", "p", "")]);
-    let got = lookup_pull_credentials(&[], &nk, "reg.example.com/app:1").unwrap();
+    let got = lookup_pull_credentials(&[], &nk, &ext(), "reg.example.com/app:1")
+        .await
+        .unwrap();
     assert_eq!(got, vec![auth("node", "p", "")]);
 }

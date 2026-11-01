@@ -12,17 +12,27 @@
 //! `strict decoding error: unknown field "providers[0].x"` text. The
 //! `KubeletServiceAccountTokenForCredentialProviders` gate is not modelled by
 //! this kubelet's feature gates; callers pass its (default, Beta on) value.
-//! Not ported yet: running the plugins (`execPlugin`), the response cache and
-//! the keyring (`pluginProvider.Provide`), and service account tokens.
+//! Also `plugin.go` `execPlugin` / `pluginProvider.provide` (matchImages,
+//! response cache with per-response key type and expiry, singleflight, the
+//! one minute exec timeout) and `plugins.go` (the process-wide provider
+//! registry and `externalCredentialProviderKeyring`).
+//!
+//! Not ported yet: service account tokens (`serviceAccountProvider`, the
+//! service-account part of the cache and singleflight keys) and the plugin
+//! duration/error and config-hash metrics (`metrics.go`).
 
+use crate::credentialprovider::{AuthConfig, DockerConfig};
 use anyhow::{anyhow, Result};
 use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
 use rusternetes_common::validation::metav1::is_qualified_name;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 /// `credentialproviderv1.SchemeGroupVersion` and its siblings: the provider
 /// `apiVersion`s the kubelet can speak (`plugin.go` `apiVersions`).
@@ -469,4 +479,439 @@ pub fn register_credential_provider_plugins(
         }
     }
     Ok((config, hash))
+}
+
+// ---- plugin.go: exec, cache, provide -------------------------------------
+
+/// `credentialproviderapi.CredentialProviderResponse`, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialProviderResponse {
+    pub cache_key_type: String,
+    /// `CacheDuration` in nanoseconds; `None` when unset.
+    pub cache_duration: Option<i64>,
+    pub auth: BTreeMap<String, (String, String)>,
+}
+
+/// `Plugin` (`plugin.go`): the seam between `provide` and the exec.
+#[async_trait::async_trait]
+pub trait Plugin: Send + Sync {
+    async fn exec_plugin(&self, image: &str) -> Result<CredentialProviderResponse, String>;
+}
+
+/// `execPlugin`'s timeout (`plugin.go`: `context.WithTimeout(ctx, 1*time.Minute)`).
+const EXEC_PLUGIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `execPlugin`.
+pub struct ExecPlugin {
+    pub name: String,
+    pub api_version: String,
+    pub plugin_bin_dir: PathBuf,
+    pub args: Vec<String>,
+    pub env_vars: Vec<ExecEnvVar>,
+    pub timeout: Duration,
+}
+
+impl ExecPlugin {
+    pub fn new(bin_dir: &str, p: &CredentialProvider) -> Self {
+        Self {
+            name: p.name.clone(),
+            api_version: p.api_version.clone(),
+            plugin_bin_dir: PathBuf::from(bin_dir),
+            args: p.args.clone(),
+            env_vars: p.env.clone(),
+            timeout: EXEC_PLUGIN_TIMEOUT,
+        }
+    }
+
+    /// `encodeRequest`: `CredentialProviderRequest` at the provider's version.
+    fn encode_request(&self, image: &str) -> Vec<u8> {
+        serde_json::json!({
+            "kind": "CredentialProviderRequest",
+            "apiVersion": self.api_version,
+            "image": image,
+        })
+        .to_string()
+        .into_bytes()
+    }
+}
+
+/// `decodeResponse` (strict, like the scheme's `EnableStrict` codecs).
+fn decode_response(data: &[u8]) -> Result<CredentialProviderResponse> {
+    let v: JsonValue = serde_json::from_slice(data)?;
+    let kind = v.get("kind").and_then(JsonValue::as_str).unwrap_or("");
+    if kind != "CredentialProviderResponse" {
+        return Err(anyhow!(
+            "failed to decode CredentialProviderResponse, unexpected Kind: {kind:?}"
+        ));
+    }
+    let group = v
+        .get("apiVersion")
+        .and_then(JsonValue::as_str)
+        .and_then(|a| a.split_once('/'))
+        .map_or("", |(g, _)| g);
+    if group != "credentialprovider.kubelet.k8s.io" {
+        return Err(anyhow!(
+            "failed to decode CredentialProviderResponse, unexpected Group: {group}"
+        ));
+    }
+    if let Some(m) = v.as_object() {
+        for k in m.keys() {
+            if ![
+                "kind",
+                "apiVersion",
+                "cacheKeyType",
+                "cacheDuration",
+                "auth",
+            ]
+            .contains(&k.as_str())
+            {
+                return Err(anyhow!("strict decoding error: unknown field {k:?}"));
+            }
+        }
+    }
+    let cache_duration = match v.get("cacheDuration").and_then(JsonValue::as_str) {
+        Some(d) => Some(parse_go_duration(d).map_err(|e| anyhow!(e))?),
+        None => None,
+    };
+    let mut auth = BTreeMap::new();
+    if let Some(m) = v.get("auth").and_then(JsonValue::as_object) {
+        for (k, e) in m {
+            let f = |n: &str| {
+                e.get(n)
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            auth.insert(k.clone(), (f("username"), f("password")));
+        }
+    }
+    Ok(CredentialProviderResponse {
+        cache_key_type: v
+            .get("cacheKeyType")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .to_string(),
+        cache_duration,
+        auth,
+    })
+}
+
+#[async_trait::async_trait]
+impl Plugin for ExecPlugin {
+    /// `execPlugin.ExecPlugin` + `runPlugin`.
+    async fn exec_plugin(&self, image: &str) -> Result<CredentialProviderResponse, String> {
+        use tokio::io::AsyncWriteExt;
+        let data = self.encode_request(image);
+        let mut cmd = tokio::process::Command::new(self.plugin_bin_dir.join(&self.name));
+        cmd.args(&self.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        // `mergeEnvVars(os.Environ(), configEnvVars)`: the configured vars are
+        // appended, so they win over an inherited variable of the same name.
+        for v in &self.env_vars {
+            cmd.env(&v.name, &v.value);
+        }
+        let name = &self.name;
+        let run = async {
+            let mut child = cmd.spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                // The plugin may exit without reading; that surfaces as its status.
+                let _ = stdin.write_all(&data).await;
+            }
+            child.wait_with_output().await
+        };
+        let out = match tokio::time::timeout(self.timeout, run).await {
+            Err(_) => {
+                return Err(format!(
+                    "error execing credential provider plugin {name} for image {image}: context deadline exceeded: "
+                ))
+            }
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "error execing credential provider plugin {name} for image {image}: {e}: "
+                ))
+            }
+            Ok(Ok(out)) => out,
+        };
+        if !out.status.success() {
+            return Err(format!(
+                "error execing credential provider plugin {name} for image {image}: {}: {}",
+                exit_status_text(&out.status),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let v: JsonValue = serde_json::from_slice(&out.stdout)
+            .map_err(|e| format!("error reading GVK from response: {e}"))?;
+        let got = v
+            .get("apiVersion")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("");
+        if got != self.api_version {
+            return Err(format!(
+                "apiVersion from credential plugin response did not match expected apiVersion:{}, actual apiVersion:{got}",
+                self.api_version
+            ));
+        }
+        decode_response(&out.stdout).map_err(|_| {
+            "error decoding credential provider plugin response from stdout".to_string()
+        })
+    }
+}
+
+/// `exec.ExitError`'s text.
+fn exit_status_text(s: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (s.code(), s.signal()) {
+        (Some(c), _) => format!("exit status {c}"),
+        (None, Some(sig)) => format!("signal: {sig}"),
+        _ => s.to_string(),
+    }
+}
+
+/// `parseRegistry`: the first `/`-separated part.
+fn parse_registry(image: &str) -> &str {
+    image.split('/').next().unwrap_or(image)
+}
+
+const GLOBAL_CACHE_KEY: &str = "<global>";
+/// `cachePurgeInterval`.
+const CACHE_PURGE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+struct CacheEntry {
+    credentials: DockerConfig,
+    expires_at: Instant,
+}
+
+type InFlight = Arc<tokio::sync::OnceCell<Result<CredentialProviderResponse, String>>>;
+
+/// `pluginProvider`.
+pub struct PluginProvider {
+    pub name: String,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    match_images: Vec<String>,
+    /// `cache.NewExpirationStore` keyed by cache key.
+    cache: Mutex<HashMap<String, CacheEntry>>,
+    default_cache_duration: Duration,
+    last_cache_purge: Mutex<Instant>,
+    plugin: Box<dyn Plugin>,
+    /// `singleflight.Group`, keyed by image.
+    in_flight: Mutex<HashMap<String, InFlight>>,
+}
+
+impl PluginProvider {
+    /// `newPluginProvider`.
+    pub fn new(bin_dir: &str, provider: &CredentialProvider) -> Self {
+        Self::with_plugin(provider, Box::new(ExecPlugin::new(bin_dir, provider)))
+    }
+
+    pub fn with_plugin(provider: &CredentialProvider, plugin: Box<dyn Plugin>) -> Self {
+        Self::with_plugin_and_clock(provider, plugin, Arc::new(Instant::now))
+    }
+
+    pub fn with_plugin_and_clock(
+        provider: &CredentialProvider,
+        plugin: Box<dyn Plugin>,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    ) -> Self {
+        let now = clock();
+        Self {
+            name: provider.name.clone(),
+            clock,
+            match_images: provider.match_images.clone(),
+            cache: Mutex::new(HashMap::new()),
+            default_cache_duration: Duration::from_nanos(
+                provider.default_cache_duration.unwrap_or(0).max(0) as u64,
+            ),
+            last_cache_purge: Mutex::new(now),
+            plugin,
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The keys of the response cache (`cache.ListKeys`), sorted.
+    pub fn cache_keys(&self) -> Vec<String> {
+        let mut k: Vec<String> = self.cache.lock().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    /// `isImageAllowed`.
+    fn is_image_allowed(&self, image: &str) -> bool {
+        self.match_images
+            .iter()
+            .any(|m| crate::credentialprovider::urls_match_str(m, image))
+    }
+
+    /// `getCachedCredentials` (+ `lookupCredentialsInCache`): image, registry,
+    /// then global key; an expired entry is a miss.
+    fn get_cached_credentials(&self, image: &str) -> Option<DockerConfig> {
+        let now = (self.clock)();
+        {
+            let mut last = self.last_cache_purge.lock().unwrap();
+            if now > *last + CACHE_PURGE_INTERVAL {
+                // `p.cache.List()` drops expired entries.
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .retain(|_, e| now <= e.expires_at);
+                *last = now;
+            }
+        }
+        let cache = self.cache.lock().unwrap();
+        [image, parse_registry(image), GLOBAL_CACHE_KEY]
+            .iter()
+            .find_map(|k| {
+                cache
+                    .get(*k)
+                    .filter(|e| now <= e.expires_at)
+                    .map(|e| e.credentials.clone())
+            })
+    }
+
+    /// `pluginProvider.provide` without service accounts.
+    pub async fn provide(&self, image: &str) -> Result<DockerConfig, String> {
+        if !self.is_image_allowed(image) {
+            return Ok(Vec::new());
+        }
+        if let Some(c) = self.get_cached_credentials(image) {
+            return Ok(c);
+        }
+        // `p.group.Do(image, ExecPlugin)`: concurrent callers for one image
+        // share a single exec.
+        let cell: InFlight = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .entry(image.to_string())
+            .or_default()
+            .clone();
+        let res = cell
+            .get_or_init(|| async { self.plugin.exec_plugin(image).await })
+            .await
+            .clone();
+        self.in_flight.lock().unwrap().remove(image);
+        let response = res.map_err(|e| {
+            format!("failed to get credential from external registry credential provider: {e}")
+        })?;
+
+        let cache_key = match response.cache_key_type.as_str() {
+            "Image" => image.to_string(),
+            "Registry" => parse_registry(image).to_string(),
+            "Global" => GLOBAL_CACHE_KEY.to_string(),
+            other => {
+                return Err(format!(
+                    "credential provider plugin did not return a valid cacheKeyType: {other}"
+                ))
+            }
+        };
+        let docker_config: DockerConfig = response
+            .auth
+            .into_iter()
+            .map(|(k, (username, password))| {
+                (
+                    k,
+                    AuthConfig {
+                        username,
+                        password,
+                        email: String::new(),
+                    },
+                )
+            })
+            .collect();
+
+        // A zero response duration means "do not cache"; an unset one uses the
+        // provider default, where zero also means do not cache.
+        let ttl = match response.cache_duration {
+            Some(0) => return Ok(docker_config),
+            Some(d) => Duration::from_nanos(d.max(0) as u64),
+            None if self.default_cache_duration.is_zero() => return Ok(docker_config),
+            None => self.default_cache_duration,
+        };
+        self.cache.lock().unwrap().insert(
+            cache_key,
+            CacheEntry {
+                credentials: docker_config.clone(),
+                expires_at: (self.clock)() + ttl,
+            },
+        );
+        Ok(docker_config)
+    }
+
+    /// `perPodPluginProvider.provideWithCoordinates`: errors are logged and
+    /// yield an empty config.
+    async fn provide_or_empty(&self, image: &str) -> DockerConfig {
+        match self.provide(image).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to provide credentials for image: {e} (provider {}, image {image})",
+                    self.name
+                );
+                Vec::new()
+            }
+        }
+    }
+}
+
+// ---- plugins.go: registry and keyring ------------------------------------
+
+static PROVIDERS: RwLock<Vec<(String, Arc<PluginProvider>)>> = RwLock::new(Vec::new());
+
+/// `registerCredentialProviderPlugin`: a name may be registered once.
+pub fn register_credential_provider_plugin(name: &str, p: Arc<PluginProvider>) -> Result<()> {
+    let mut providers = PROVIDERS.write().unwrap_or_else(|e| e.into_inner());
+    if providers.iter().any(|(n, _)| n == name) {
+        return Err(anyhow!("Credential provider {name:?} was registered twice"));
+    }
+    providers.push((name.to_string(), p));
+    tracing::debug!("Registered credential provider {name}");
+    Ok(())
+}
+
+/// The registration loop of `RegisterCredentialProviderPlugins`
+/// (`newPluginProvider` + `registerCredentialProviderPlugin`), after
+/// [`register_credential_provider_plugins`] validated the config.
+pub fn register_validated_providers(
+    bin_dir: &str,
+    config: &CredentialProviderConfig,
+) -> Result<()> {
+    for p in &config.providers {
+        register_credential_provider_plugin(&p.name, Arc::new(PluginProvider::new(bin_dir, p)))?;
+    }
+    Ok(())
+}
+
+/// `externalCredentialProviderKeyring`.
+pub struct ExternalCredentialProviderKeyring {
+    providers: Vec<Arc<PluginProvider>>,
+}
+
+/// `NewExternalCredentialProviderDockerKeyring` (without the per-pod service
+/// account arguments): a keyring over every registered provider.
+pub fn new_external_credential_provider_docker_keyring() -> ExternalCredentialProviderKeyring {
+    ExternalCredentialProviderKeyring {
+        providers: PROVIDERS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect(),
+    }
+}
+
+impl ExternalCredentialProviderKeyring {
+    pub fn from_providers(providers: Vec<Arc<PluginProvider>>) -> Self {
+        Self { providers }
+    }
+
+    /// `externalCredentialProviderKeyring.Lookup`.
+    pub async fn lookup(&self, image: &str) -> Vec<AuthConfig> {
+        let mut keyring = crate::credentialprovider::BasicDockerKeyring::default();
+        for p in &self.providers {
+            keyring.add(p.provide_or_empty(image).await);
+        }
+        keyring.lookup(image)
+    }
 }

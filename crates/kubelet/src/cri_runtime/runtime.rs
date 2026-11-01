@@ -832,11 +832,17 @@ impl CriContainerRuntime {
             Some(p) => self.get_pull_secrets_for_pod(p).await,
             None => Vec::new(),
         };
+        // `NewExternalCredentialProviderDockerKeyring` reads the process-wide
+        // registry of providers registered at startup.
+        let external =
+            crate::credentialprovider_plugin::new_external_credential_provider_docker_keyring();
         let creds = crate::credentialprovider::lookup_pull_credentials(
             &secrets,
             &self.node_keyring,
+            &external,
             &spec.image,
-        )?;
+        )
+        .await?;
         if creds.is_empty() {
             return Ok(cri.pull_image_spec(spec, sandbox_cfg.cloned()).await?);
         }
