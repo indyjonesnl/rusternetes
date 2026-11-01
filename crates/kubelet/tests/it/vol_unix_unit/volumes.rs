@@ -110,6 +110,16 @@ mod projected_mode_tests {
         .unwrap();
     }
 
+    async fn world_of(vm: &VolumeManager, pods: Vec<Pod>) -> crate::volume_world::World {
+        crate::volume_world::world(
+            vm,
+            "node-7",
+            Arc::new(rusternetes_storage::StorageBackend::new_memory()),
+            pods,
+        )
+        .await
+    }
+
     /// #3820: the kubelet's node name reaches the world (`NewVolumeManager`'s
     /// `nodeName`, `volume_manager.go:202`), so a reconstructed device's
     /// `AttachedVolume` carries it (`newAttachedVolume`, `:1186-1210`).
@@ -124,20 +134,20 @@ mod projected_mode_tests {
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name("node-7");
-        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        world_of(&vm, vec![]).await.restart().await;
         let attached = vm.asw.get_attached_volumes();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].node_name, "node-7");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// #3601: the device-unmount sweep runs against ONE persistent
+    /// #3601: `unmountDetachDevices` runs against ONE persistent
     /// `ActualStateOfWorld`. A failed `UnmountDevice` leaves the device
     /// `DeviceMountUncertain` (`operation_generator.go:859-868`) and the next
-    /// sweep finds it there, instead of rebuilding a transient world that
+    /// pass finds it there, instead of rebuilding a transient world that
     /// forgets it.
     #[tokio::test]
-    async fn device_unmount_sweep_keeps_uncertain_state_across_sweeps() {
+    async fn device_unmount_keeps_uncertain_state_across_reconciles() {
         use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
 
         let tmp = std::env::temp_dir().join(format!("rn-asw-sweep-{}", std::process::id()));
@@ -150,7 +160,9 @@ mod projected_mode_tests {
         );
         assert!(vm.asw.get_attached_volumes().is_empty());
 
-        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        let w = world_of(&vm, vec![]).await;
+        w.restart().await;
+        w.reconcile(1).await;
         let after_first = vm.asw.get_attached_volumes();
         assert_eq!(after_first.len(), 1, "the staged device is reconstructed");
         assert_eq!(
@@ -166,8 +178,8 @@ mod projected_mode_tests {
             "{body}"
         );
 
-        // A second sweep must neither duplicate nor reset the entry.
-        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        // A second pass must neither duplicate nor reset the entry.
+        w.reconcile(1).await;
         let after_second = vm.asw.get_attached_volumes();
         assert_eq!(after_second.len(), 1);
         assert_eq!(
@@ -183,7 +195,7 @@ mod projected_mode_tests {
     /// volume the world knows whose device is no longer mounted and that
     /// nothing wants is marked detached, i.e. leaves the world.
     #[tokio::test]
-    async fn device_unmount_sweep_detaches_unmounted_unwanted_volumes() {
+    async fn unmount_detach_devices_detaches_unmounted_unwanted_volumes() {
         use rusternetes_kubelet::volume_plugins::plugin::OwnedSpec;
 
         let tmp = std::env::temp_dir().join(format!("rn-asw-detach-{}", std::process::id()));
@@ -218,12 +230,9 @@ mod projected_mode_tests {
             .unwrap();
         assert!(vm.asw.volume_exists(&name));
 
-        let desired =
-            std::collections::HashSet::from([("gone.example.com".to_string(), "x".to_string())]);
-        vm.unmount_csi_devices_not_in(&desired).await;
-        assert!(vm.asw.volume_exists(&name), "desired volumes are kept");
-
-        vm.unmount_csi_devices_not_in(&Default::default()).await;
+        let w = world_of(&vm, vec![]).await;
+        w.restart().await;
+        w.reconcile(1).await;
         assert!(!vm.asw.volume_exists(&name), "unwanted volume is detached");
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1535,6 +1544,11 @@ mod actual_state_tests {
         .with_node_name("node-asw")
     }
 
+    async fn world_of(vm: &VolumeManager, pods: Vec<Pod>) -> crate::volume_world::World {
+        crate::volume_world::world(vm, "node-asw", Arc::new(StorageBackend::new_memory()), pods)
+            .await
+    }
+
     #[tokio::test]
     async fn mounting_a_volume_records_it_in_the_actual_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1572,8 +1586,9 @@ mod actual_state_tests {
             "the actual state still has the pod's volume mounted"
         );
 
-        vm.unmount_orphaned_volumes(&HashSet::new(), &HashSet::new())
-            .await;
+        let w = world_of(&vm, vec![]).await;
+        w.ready().await;
+        w.reconcile(2).await;
         assert!(vm.asw.get_mounted_volumes().is_empty());
         assert!(
             vm.asw.get_attached_volumes().is_empty(),
@@ -1589,8 +1604,9 @@ mod actual_state_tests {
         let tmp = tempfile::tempdir().unwrap();
         let vm = manager(tmp.path());
         vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
-        let live: HashSet<String> = ["uid-asw".to_string()].into();
-        vm.unmount_orphaned_volumes(&live, &HashSet::new()).await;
+        let w = world_of(&vm, vec![empty_dir_pod()]).await;
+        w.ready().await;
+        w.reconcile(2).await;
         assert_eq!(vm.asw.get_mounted_volumes().len(), 1);
     }
 
@@ -1600,8 +1616,10 @@ mod actual_state_tests {
         let tmp = tempfile::tempdir().unwrap();
         let vm = manager(tmp.path());
         vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
-        let live: HashSet<String> = ["uid-asw".to_string()].into();
-        vm.unmount_orphaned_volumes(&live, &live).await;
+        let w = world_of(&vm, vec![empty_dir_pod()]).await;
+        w.terminate("uid-asw");
+        w.ready().await;
+        w.reconcile(2).await;
         assert!(vm.asw.get_mounted_volumes().is_empty());
     }
 
@@ -1636,9 +1654,10 @@ mod actual_state_tests {
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Another pod's teardown runs the sweep meanwhile.
-        vm.unmount_orphaned_volumes(&["other".to_string()].into(), &HashSet::new())
-            .await;
+        // The reconciler runs meanwhile.
+        let w = world_of(&vm, vec![]).await;
+        w.ready().await;
+        w.reconcile(1).await;
         assert_eq!(
             vm.asw.get_attached_volumes().len(),
             1,
@@ -1647,8 +1666,7 @@ mod actual_state_tests {
 
         release.send(()).unwrap();
         running.await.unwrap().unwrap().unwrap();
-        vm.unmount_orphaned_volumes(&["other".to_string()].into(), &HashSet::new())
-            .await;
+        w.reconcile(1).await;
         assert!(vm.asw.get_attached_volumes().is_empty());
     }
 }

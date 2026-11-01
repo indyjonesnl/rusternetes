@@ -148,9 +148,41 @@ mod orphan_sweep_tests {
         assert!(rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
     }
 
-    /// `unmountVolumes` -> `NewUnmounter` -> `TearDown`, then the sweep.
+    /// A pod known to the kubelet that mounts `volumes` (plugin, name) as
+    /// emptyDirs the desired state of world can hold.
+    fn pod_with_empty_dirs(uid: &str, names: &[&str]) -> Pod {
+        let volumes: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "emptyDir": {}}))
+            .collect();
+        let mounts: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "mountPath": format!("/{n}")}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": uid, "namespace": "ns", "uid": uid},
+            "spec": {"containers": [{"name": "c", "image": "i", "volumeMounts": mounts}],
+                     "volumes": volumes}
+        }))
+        .unwrap()
+    }
+
+    async fn world_of(vm: &VolumeManager, pods: Vec<Pod>) -> crate::volume_world::World {
+        crate::volume_world::world(
+            vm,
+            "node-1",
+            Arc::new(rusternetes_storage::StorageBackend::new_memory()),
+            pods,
+        )
+        .await
+    }
+
+    /// The restart flow: `reconstructVolumes` finds the volumes on disk, and
+    /// the reconciler's `unmountVolumes` -> `NewUnmounter` -> `TearDown` reaps
+    /// those of pods the kubelet no longer has.
     #[tokio::test]
-    async fn teardown_then_sweep_reaps_every_non_csi_volume_kind() {
+    async fn teardown_then_cleanup_reaps_every_non_csi_volume_kind() {
         let root = tmp("filled-teardown");
         use rusternetes_kubelet::pod_dirs::plugin;
         for (p, v) in [
@@ -167,7 +199,9 @@ mod orphan_sweep_tests {
         let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
 
         let vm = vm(&root);
-        vm.unmount_orphaned_volumes(&live, &HashSet::new()).await;
+        let w = world_of(&vm, vec![pod_with_empty_dirs("uid-live", &["scratch"])]).await;
+        w.restart().await;
+        w.reconcile(2).await;
         vm.cleanup_orphaned_pod_dirs(&live);
 
         assert!(
@@ -189,15 +223,18 @@ mod orphan_sweep_tests {
             rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
             "scratch",
         );
-        let uids: HashSet<String> = ["uid-done".to_string()].into_iter().collect();
 
-        vm(&root).unmount_orphaned_volumes(&uids, &uids).await;
+        let vm = vm(&root);
+        let w = world_of(&vm, vec![pod_with_empty_dirs("uid-done", &["scratch"])]).await;
+        w.terminate("uid-done");
+        w.restart().await;
+        w.reconcile(2).await;
 
         assert!(!dir.exists());
     }
 
     /// A hostPath volume's `TearDown` does nothing (`host_path.go:272-274`),
-    /// and a directory no plugin owns is left for the sweep.
+    /// and a directory no plugin owns is left for the cleanup.
     #[tokio::test]
     async fn host_path_and_unowned_dirs_are_left_alone_by_teardown() {
         let root = tmp("hostpath-unowned");
@@ -214,9 +251,10 @@ mod orphan_sweep_tests {
             "x",
         );
 
-        vm(&root)
-            .unmount_orphaned_volumes(&HashSet::new(), &HashSet::new())
-            .await;
+        let vm = vm(&root);
+        let w = world_of(&vm, vec![]).await;
+        w.restart().await;
+        w.reconcile(2).await;
 
         assert!(hp.join("sub/data").exists());
         assert!(other.join("sub/data").exists());
@@ -1060,11 +1098,10 @@ mod dispatch_tests {
 
     /// #3492: a reconstructed iscsi global mount round-trips through
     /// `GetDeviceMountPath` to the very directory it came from (so the
-    /// desired-state comparison and `UnmountDevice` act on the same path), is
-    /// recorded as globally mounted, and a wanted one is left alone while an
-    /// unwanted one is not.
+    /// desired-state comparison and `UnmountDevice` act on the same path) and
+    /// is recorded as globally mounted.
     #[tokio::test]
-    async fn iscsi_global_mount_reconstructs_and_is_swept_by_desire() {
+    async fn iscsi_global_mount_reconstructs() {
         use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1092,26 +1129,6 @@ mod dispatch_tests {
         // Reconstructing again keeps the one entry.
         vm.reconstruct_iscsi_device(&global_str);
         assert_eq!(vm.asw.get_attached_volumes().len(), 1);
-
-        // The same volume as a pod's inline source wants the same path.
-        let pod: Pod = serde_json::from_value(json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": {"name": "p", "namespace": "default"},
-            "spec": {"containers": [], "volumes": [{"name": "i", "iscsi": {
-                "targetPortal": "10.0.0.1:3260",
-                "iqn": "iqn.2017-05.com.example:test",
-                "lun": 0, "iscsiInterface": "default"}}]}
-        }))
-        .unwrap();
-        let desired = vm.iscsi_device_paths_desired_by(&[pod]).await.unwrap();
-        assert!(desired.contains(&global_str), "{desired:?}");
-
-        // Not a mount point on this host: the enumeration sees no device, so a
-        // sweep neither unmounts nor forgets the recorded one.
-        assert!(vm.iscsi_plugin.list_global_mounts().is_empty());
-        vm.unmount_iscsi_devices_not_in(&desired).await;
-        assert_eq!(vm.asw.get_attached_volumes().len(), 1);
-        assert!(global.exists(), "a wanted device is untouched");
     }
 
     /// `fc.ProbeVolumePlugins` is registered by the kubelet

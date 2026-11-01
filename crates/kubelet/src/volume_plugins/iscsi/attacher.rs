@@ -5,8 +5,7 @@
 //! Not ported: `Attach`, `VolumesAreAttached`, `Detach`, `NewDetacher` and
 //! `VerifyExhaustedResource` (`attacher.go:57-59`, `:122-129`) belong to the
 //! attach/detach controller, which this project does not run in the kubelet.
-//! Nothing drives `UnmountDevice` from
-//! `VolumeManager::unmount_unused_iscsi_devices`.
+//! `UnmountDevice` is driven by the reconciler's `unmountDetachDevices` arm.
 
 use super::{
     create_secret_map, get_iscsi_volume_info, volume_spec_to_mounter_with, DiskManager, IscsiDisk,

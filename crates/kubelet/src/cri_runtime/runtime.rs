@@ -2999,28 +2999,6 @@ impl CriContainerRuntime {
         }
     }
 
-    /// Tear down the volumes of pods that are gone. No-op when no
-    /// VolumeManager is attached.
-    pub async fn unmount_orphaned_volumes(
-        &self,
-        live_pod_uids: &std::collections::HashSet<String>,
-        terminated_pod_uids: &std::collections::HashSet<String>,
-    ) {
-        if let Some(volumes) = self.volumes.as_ref() {
-            volumes
-                .unmount_orphaned_volumes(live_pod_uids, terminated_pod_uids)
-                .await;
-        }
-    }
-
-    /// NodeUnstage staged CSI devices and unmount iscsi global mounts no pod holds or wants. No-op when no
-    /// VolumeManager is attached.
-    pub async fn unmount_unused_devices(&self, desired_pods: &[Pod]) {
-        if let Some(volumes) = self.volumes.as_ref() {
-            volumes.unmount_unused_devices(desired_pods).await;
-        }
-    }
-
     /// Stop and remove every sandbox for `(namespace, name)`; removing a
     /// sandbox tears down its containers. Removes all matches (a pod can have a
     /// stale sandbox alongside a new one), so it is also a no-op when none

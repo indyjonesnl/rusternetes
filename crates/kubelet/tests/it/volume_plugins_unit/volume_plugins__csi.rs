@@ -1394,25 +1394,18 @@ mod tests {
         let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
         m.set_up().await.unwrap();
         let mount = std::path::PathBuf::from(m.get_path());
-        let vm = rusternetes_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
-            f.root.clone(),
-            None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
-        );
+        let vm = volume_manager(&f.root);
+        let w = csi_world(&f, &vm, vec![pod_claiming("uid-1")]).await;
 
         // Live pod: untouched.
-        let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
-        vm.unmount_orphaned_volumes(&live, &std::collections::HashSet::new())
-            .await;
+        w.restart().await;
+        w.reconcile(1).await;
         assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
         assert!(mount.is_dir());
 
-        // Orphaned pod: NodeUnpublishVolume with the saved handle + mount path.
-        vm.unmount_orphaned_volumes(
-            &std::collections::HashSet::new(),
-            &std::collections::HashSet::new(),
-        )
-        .await;
+        // Pod gone: NodeUnpublishVolume with the saved handle + mount path.
+        w.delete_pod("uid-1");
+        w.reconcile(2).await;
         let calls = f.fake.calls.lock().unwrap();
         assert_eq!(calls.unpublish.len(), 1);
         assert_eq!(calls.unpublish[0].volume_id, "vol-1");
@@ -1428,6 +1421,54 @@ mod tests {
             None,
             rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
         )
+    }
+
+    /// A pod that mounts the claim `c` (bound to `pv1`) as `data`.
+    fn pod_claiming(uid: &str) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": format!("p-{uid}"), "namespace": "ns1", "uid": uid},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "c", "image": "i",
+                    "volumeMounts": [{"name": "data", "mountPath": "/data"}]}],
+                "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": "c"}}]
+            }
+        }))
+        .unwrap()
+    }
+
+    /// The kubelet's volume manager over `vm` (the restart flow of
+    /// `volume_world`), with claim `c` bound to `pv1` in its API.
+    async fn csi_world(
+        f: &Fx,
+        vm: &rusternetes_kubelet::volumes::VolumeManager,
+        pods: Vec<Pod>,
+    ) -> crate::volume_world::World {
+        let w = crate::volume_world::world(
+            vm,
+            "node-1",
+            Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new()))),
+            pods,
+        )
+        .await;
+        let mut pv_obj = serde_json::to_value(pv(&f.driver, json!({}))).unwrap();
+        // The API server defaults it; `GetVolumeMode` errors without.
+        pv_obj["spec"]["volumeMode"] = json!("Filesystem");
+        pv_obj["spec"]["claimRef"] = json!({"namespace": "ns1", "name": "c", "uid": "pvc-uid"});
+        w.storage
+            .create(&build_key("persistentvolumes", None, "pv1"), &pv_obj)
+            .await
+            .unwrap();
+        w.storage
+            .create(
+                &build_key("persistentvolumeclaims", Some("ns1"), "c"),
+                &json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                    "metadata": {"name": "c", "namespace": "ns1", "uid": "pvc-uid"},
+                    "spec": {"volumeName": "pv1"}, "status": {"phase": "Bound"}}),
+            )
+            .await
+            .unwrap();
+        w
     }
 
     /// `TestPluginConstructVolumeSpec` (`csi_plugin_test.go:319-434`): the spec
@@ -1635,10 +1676,9 @@ mod tests {
         let vm = volume_manager(&f.root);
 
         // Pod 2 is live, pod 1 gone: unpublish pod 1 only; the device stays staged.
-        let none = std::collections::HashSet::new();
-        let live2: std::collections::HashSet<String> = ["uid-2".to_string()].into();
-        vm.unmount_orphaned_volumes(&live2, &none).await;
-        vm.unmount_unused_csi_devices(&[]).await;
+        let w = csi_world(&f, &vm, vec![pod_claiming("uid-2")]).await;
+        w.restart().await;
+        w.reconcile(3).await;
         assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
         assert!(
             f.fake.calls.lock().unwrap().unstage.is_empty(),
@@ -1646,8 +1686,8 @@ mod tests {
         );
 
         // Both gone: unpublish pod 2, then unstage exactly once.
-        vm.unmount_orphaned_volumes(&none, &none).await;
-        vm.unmount_unused_csi_devices(&[]).await;
+        w.delete_pod("uid-2");
+        w.reconcile(3).await;
         let calls = f.fake.calls.lock().unwrap();
         assert_eq!(calls.unpublish.len(), 2);
         assert_eq!(calls.unstage.len(), 1);
@@ -1676,14 +1716,15 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::rename(device.parent().unwrap(), &target).unwrap();
 
-        let desired = std::collections::HashSet::from([(f.driver.clone(), "vol-1".to_string())]);
-        vm.unmount_csi_devices_not_in(&desired).await;
+        let w = csi_world(&f, &vm, vec![pod_claiming("uid-1")]).await;
+        w.restart().await;
+        w.reconcile(1).await;
         assert!(f.fake.calls.lock().unwrap().unstage.is_empty());
         assert!(target.exists());
 
         // Once nothing wants it, it is unstaged.
-        vm.unmount_csi_devices_not_in(&std::collections::HashSet::new())
-            .await;
+        w.delete_pod("uid-1");
+        w.reconcile(3).await;
         assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
         assert!(!target.exists());
     }
@@ -1744,10 +1785,11 @@ mod tests {
         vm.plugin_mgr = Arc::new(rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(
             vec![Box::new(CsiPlugin::new(host))],
         ));
-        let none = std::collections::HashSet::new();
+        let w = csi_world(&f, &vm, vec![]).await;
+        w.restart().await;
 
         write_info(true);
-        vm.unmount_csi_devices_not_in(&none).await;
+        w.reconcile(1).await;
         assert!(
             f.fake.calls.lock().unwrap().unstage.is_empty(),
             "an outside reference must block NodeUnstageVolume"
@@ -1758,13 +1800,13 @@ mod tests {
         // The failed `UnmountDevice` is in exponential backoff
         // (`nestedpendingoperations`, 500ms after the first error), so an
         // immediate retry is refused even though the reference is gone.
-        vm.unmount_csi_devices_not_in(&none).await;
+        w.reconcile(1).await;
         assert!(
             f.fake.calls.lock().unwrap().unstage.is_empty(),
             "a retry inside the backoff window must not run UnmountDevice"
         );
         tokio::time::sleep(std::time::Duration::from_millis(550)).await;
-        vm.unmount_csi_devices_not_in(&none).await;
+        w.reconcile(1).await;
         assert_eq!(f.fake.calls.lock().unwrap().unstage.len(), 1);
         assert!(!target.exists());
     }
@@ -1787,11 +1829,12 @@ mod tests {
         let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
         m.set_up().await.unwrap();
         let vm = volume_manager(&f.root);
-        let live: std::collections::HashSet<String> = ["uid-1".to_string()].into();
-        vm.unmount_orphaned_volumes(&live, &std::collections::HashSet::new())
-            .await;
+        let w = csi_world(&f, &vm, vec![pod_claiming("uid-1")]).await;
+        w.restart().await;
+        w.reconcile(1).await;
         assert!(f.fake.calls.lock().unwrap().unpublish.is_empty());
-        vm.unmount_orphaned_volumes(&live, &live).await;
+        w.terminate("uid-1");
+        w.reconcile(2).await;
         assert_eq!(f.fake.calls.lock().unwrap().unpublish.len(), 1);
     }
 

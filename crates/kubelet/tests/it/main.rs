@@ -59,3 +59,4 @@ mod static_pods_test;
 mod status_idempotency_test;
 mod vol_unix_unit;
 mod volume_plugins_unit;
+mod volume_world;
