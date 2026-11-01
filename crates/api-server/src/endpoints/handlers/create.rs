@@ -61,6 +61,16 @@ pub async fn create_resource<T: Object>(
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
     let (mut obj, decode_warnings) = decode(scope, params, body)?;
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &obj,
+        (
+            &scope.resource.group,
+            &scope.resource.version,
+            &scope.resource.resource,
+        ),
+        scope.subresource,
+    );
     let ctx = RequestContext::new(namespace)
         .with_user(user)
         .with_group_version(&scope.kind.group, &scope.kind.version);

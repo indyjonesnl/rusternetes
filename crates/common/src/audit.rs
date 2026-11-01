@@ -54,6 +54,11 @@ pub struct AuditEvent {
     /// object): set only at `RequestResponse` level, by `LogResponseObject`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_object: Option<serde_json::Value>,
+    /// `Event.RequestObject` (a `runtime.Unknown`, serialised as the raw
+    /// object): set at `Request` level and above by `LogRequestObject` /
+    /// `LogRequestPatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_object: Option<serde_json::Value>,
     /// Request received timestamp
     #[serde(
         serialize_with = "crate::types::k8s_micro_time_required::serialize",
@@ -105,7 +110,7 @@ pub struct UserInfo {
     pub extra: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectReference {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +386,7 @@ impl AuditLogger {
             object_ref,
             response_status: None,
             response_object: None,
+            request_object: None,
             request_received_timestamp: now,
             stage_timestamp: now,
             annotations: None,
@@ -429,6 +435,7 @@ impl AuditLogger {
                 ..Default::default()
             }),
             response_object: None,
+            request_object: None,
             request_received_timestamp: now, // Should be the original timestamp
             stage_timestamp: now,
             annotations: None,

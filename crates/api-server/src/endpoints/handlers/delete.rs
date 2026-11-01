@@ -59,6 +59,31 @@ pub fn decode_delete_options(
     Ok(options)
 }
 
+/// delete.go:118 and :294: with a body, the decoded `DeleteOptions` are the
+/// audit event's request object (`audit.LogRequestObject`). The options carry
+/// no TypeMeta here, so the `v1` `DeleteOptions` identity the decoder would
+/// have set is added.
+fn log_delete_options<T: Object>(scope: &RequestScope<T>, options: &DeleteOptions, body: &[u8]) {
+    if body.is_empty() {
+        return;
+    }
+    if let Ok(mut v) = serde_json::to_value(options) {
+        if let Some(m) = v.as_object_mut() {
+            m.entry("kind").or_insert_with(|| "DeleteOptions".into());
+            m.entry("apiVersion").or_insert_with(|| "v1".into());
+        }
+        crate::audit::log_request_object(
+            &v,
+            (
+                &scope.resource.group,
+                &scope.resource.version,
+                &scope.resource.resource,
+            ),
+            scope.subresource,
+        );
+    }
+}
+
 /// DELETE of a named object.
 #[allow(clippy::too_many_arguments)]
 pub async fn delete_resource<T: Object>(
@@ -82,6 +107,7 @@ pub async fn delete_resource<T: Object>(
     .await?;
 
     let options = decode_delete_options(params, body)?;
+    log_delete_options(scope, &options, body);
     let ctx =
         RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
     let admission = Admission {
@@ -153,6 +179,7 @@ pub async fn delete_collection<T: Object>(
     }
 
     let options = decode_delete_options(params, body)?;
+    log_delete_options(scope, &options, body);
     let ctx =
         RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);
 

@@ -28,6 +28,7 @@ fn event() -> AuditEvent {
         object_ref: None,
         response_status: None,
         response_object: None,
+        request_object: None,
         request_received_timestamp: chrono::Utc::now(),
         stage_timestamp: chrono::Utc::now(),
         annotations: None,
