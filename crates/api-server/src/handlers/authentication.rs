@@ -99,12 +99,16 @@ pub async fn create_token_review(
                 ]),
                 extra: Some({
                     let mut extra = std::collections::HashMap::new();
-                    // K8s expects credential-id with JTI prefix for SA tokens
-                    let jti = format!("JTI={}", uuid::Uuid::new_v4());
-                    extra.insert(
-                        "authentication.kubernetes.io/credential-id".to_string(),
-                        vec![jti],
-                    );
+                    // `ServiceAccountInfo.UserInfo` (util.go:147-151): only when the
+                    // token carries a `jti` (claims.go:279-290).
+                    let credential_id =
+                        rusternetes_common::auth::credential_id_for_jti(&claims.jti);
+                    if !credential_id.is_empty() {
+                        extra.insert(
+                            "authentication.kubernetes.io/credential-id".to_string(),
+                            vec![credential_id],
+                        );
+                    }
                     // Include pod binding info if present in claims
                     if let Some(ref pod_name) = claims.pod_name {
                         extra.insert(
@@ -313,6 +317,8 @@ pub async fn create_token_request(
         pod_uid: None,
         node_name: None,
         node_uid: None,
+        // `token.Claims` (claims.go:79-81): sc.ID = newUUID().
+        jti: uuid::Uuid::new_v4().to_string(),
     };
 
     // Set audience from the request (TokenRequestSpec.audiences is Vec<String>, not Option)
@@ -447,6 +453,14 @@ pub async fn create_token_request(
     } else {
         expiration_timestamp
     };
+
+    // token.go:254-256: audit the identifier of the credential just issued.
+    if !claims.jti.is_empty() {
+        crate::audit::add_audit_annotation(
+            rusternetes_common::auth::ISSUED_CREDENTIAL_ID_AUDIT_ANNOTATION_KEY,
+            &rusternetes_common::auth::credential_id_for_jti(&claims.jti),
+        );
+    }
 
     let token = state.token_manager.generate_token(claims)?;
 

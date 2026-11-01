@@ -105,7 +105,26 @@ pub struct ServiceAccountClaims {
     /// Node UID where the bound pod is running
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_uid: Option<String>,
+
+    /// JWT ID (`jti`), the credential identifier of the token
+    /// (`token.Claims`, claims.go:79-81: `sc.ID = newUUID()`). Empty for
+    /// tokens that carry none (legacy secret tokens).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jti: String,
 }
+
+/// `authenticationtokenjwt.CredentialIDForJTI` (`authentication/token/jwt/jwt.go:21`).
+pub fn credential_id_for_jti(jti: &str) -> String {
+    if jti.is_empty() {
+        return String::new();
+    }
+    format!("JTI={jti}")
+}
+
+/// `serviceaccount.IssuedCredentialIDAuditAnnotationKey`
+/// (`authentication/serviceaccount/util.go:38`).
+pub const ISSUED_CREDENTIAL_ID_AUDIT_ANNOTATION_KEY: &str =
+    "authentication.kubernetes.io/issued-credential-id";
 
 fn is_zero(v: &i64) -> bool {
     *v == 0
@@ -198,6 +217,7 @@ impl ServiceAccountClaims {
             pod_uid: None,
             node_name: None,
             node_uid: None,
+            jti: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -1060,12 +1080,15 @@ impl UserInfo {
             );
         }
 
-        // Add credential-id
-        let jti = format!("JTI={}", uuid::Uuid::new_v4());
-        extra.insert(
-            "authentication.kubernetes.io/credential-id".to_string(),
-            vec![jti],
-        );
+        // `ServiceAccountInfo.UserInfo` (serviceaccount/util.go:147-151): the
+        // credential-id is set only when the token carries a `jti`.
+        let credential_id = credential_id_for_jti(&claims.jti);
+        if !credential_id.is_empty() {
+            extra.insert(
+                "authentication.kubernetes.io/credential-id".to_string(),
+                vec![credential_id],
+            );
+        }
 
         Self {
             username: claims.sub.clone(),

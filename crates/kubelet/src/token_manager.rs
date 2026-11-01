@@ -395,6 +395,8 @@ async fn request_token(
         pod_uid: bound.as_ref().map(|_| pod_uid.clone()),
         node_name,
         node_uid,
+        // `token.Claims` (claims.go:79-81): sc.ID = newUUID().
+        jti: uuid::Uuid::new_v4().to_string(),
     };
     let token = signer.generate_token(claims)?;
     tr.status = TokenRequestStatus {

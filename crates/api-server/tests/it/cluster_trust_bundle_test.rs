@@ -306,6 +306,7 @@ mod attest {
             pod_uid: None,
             node_name: None,
             node_uid: None,
+            jti: String::new(),
         };
         rusternetes_common::auth::TokenManager::new(SECRET)
             .generate_token(claims)

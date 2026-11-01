@@ -82,6 +82,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         pod_uid: None,
         node_name: None,
         node_uid: None,
+        jti: String::new(),
     };
     rusternetes_common::auth::TokenManager::new(TOKEN_SECRET)
         .generate_token(claims)
