@@ -21,16 +21,71 @@ impl AuditBackend for Capture {
     }
 }
 
+/// The sink is process-global (`install_audit` is a `OnceLock`), so the tests
+/// in this file share one.
+fn capture() -> Arc<Capture> {
+    static CAP: std::sync::OnceLock<Arc<Capture>> = std::sync::OnceLock::new();
+    CAP.get_or_init(|| {
+        let cap = Arc::new(Capture(Default::default()));
+        rusternetes_api_server::audit::install_audit(rusternetes_api_server::audit::AuditConfig {
+            policy: rusternetes_api_server::audit::Policy::from_yaml(
+                "apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Request\n",
+            )
+            .unwrap(),
+            sink: cap.clone(),
+        });
+        cap
+    })
+    .clone()
+}
+
+/// Binding and Eviction are `pods/binding` and `pods/eviction` creates served
+/// by hand-written handlers; the request object is recorded once the body is
+/// decoded, whatever the outcome of the request.
+#[tokio::test]
+async fn pod_binding_and_eviction_record_their_request_object() {
+    let cap = capture();
+    let api = TestApiServer::new();
+    let cases = [
+        (
+            "/api/v1/namespaces/default/pods/p/binding",
+            json!({"apiVersion": "v1", "kind": "Binding",
+                   "metadata": {"name": "p", "namespace": "default"},
+                   "target": {"kind": "Node", "name": "n"}}),
+            "binding",
+        ),
+        (
+            "/api/v1/namespaces/default/pods/p/eviction",
+            json!({"apiVersion": "policy/v1", "kind": "Eviction",
+                   "metadata": {"name": "p", "namespace": "default"}}),
+            "eviction",
+        ),
+    ];
+    for (path, body, sub) in cases {
+        let _ = api.post(path, &body).await;
+        let events = cap.0.lock().await;
+        let ev = events
+            .iter()
+            .rev()
+            .find(|e| {
+                e.request_uri == path
+                    && e.stage == rusternetes_common::audit::AuditStage::ResponseComplete
+            })
+            .unwrap_or_else(|| panic!("{path}: no ResponseComplete event"));
+        let ro = ev
+            .request_object
+            .as_ref()
+            .unwrap_or_else(|| panic!("{path}: no request object"));
+        assert_eq!(ro["kind"], body["kind"], "{path}");
+        let r = ev.object_ref.as_ref().unwrap();
+        assert_eq!(r.resource.as_deref(), Some("pods"), "{path}");
+        assert_eq!(r.subresource.as_deref(), Some(sub), "{path}");
+    }
+}
+
 #[tokio::test]
 async fn review_requests_record_their_request_object() {
-    let cap = Arc::new(Capture(Default::default()));
-    rusternetes_api_server::audit::install_audit(rusternetes_api_server::audit::AuditConfig {
-        policy: rusternetes_api_server::audit::Policy::from_yaml(
-            "apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Request\n",
-        )
-        .unwrap(),
-        sink: cap.clone(),
-    });
+    let cap = capture();
     let api = TestApiServer::new();
 
     let cases = [

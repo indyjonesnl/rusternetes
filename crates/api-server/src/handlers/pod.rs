@@ -411,6 +411,16 @@ pub async fn create_binding(
     let dry_run = endpoints::is_dry_run(options.dry_run.as_deref());
 
     let mut binding: Binding = decode_request_body(&body)?;
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &binding,
+        (
+            &scope.resource.group,
+            &scope.resource.version,
+            &scope.resource.resource,
+        ),
+        scope.subresource,
+    );
     // `CreateNamedResource` (create.go:119-140): the strict serializer is used
     // for Warn (the default, `fieldValidation("")`) and Strict; Warn turns the
     // strict decoding errors into warnings, Strict rejects them.
@@ -512,6 +522,16 @@ pub async fn create_eviction(
     if eviction.type_meta.api_version.is_empty() {
         eviction.type_meta.api_version = "policy/v1".to_string();
     }
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &eviction,
+        (
+            &scope.resource.group,
+            &scope.resource.version,
+            &scope.resource.resource,
+        ),
+        scope.subresource,
+    );
 
     let ctx = RequestContext::new(Some(&namespace))
         .with_user(&auth_ctx.user)
