@@ -72,6 +72,18 @@ async fn kubelet(dir: &Path, pods: Vec<Pod>) -> (Arc<VolumeManager>, VolumeManag
         &config_map(),
     )
     .await;
+    let node: rusternetes_common::resources::Node = serde_json::from_value(json!({
+        "apiVersion": "v1", "kind": "Node",
+        "metadata": {"name": "node-rr"},
+        "status": {"volumesAttached": [{"name": "kubernetes.io/csi/other", "devicePath": "/dev/x"}]}
+    }))
+    .unwrap();
+    let _ = Storage::create(
+        storage.as_ref(),
+        &build_key("nodes", None, "node-rr"),
+        &node,
+    )
+    .await;
     let mounter = Arc::new(
         VolumeManager::new_with_recording_empty_dir_mounts(
             dir.display().to_string(),
@@ -140,6 +152,10 @@ async fn volume_of_a_pod_the_desired_state_lacks_is_unmounted() {
     shell
         .desired_state_of_world_populator
         .set_has_added_pods(true);
+    shell
+        .reconciler
+        .update_reconstructed_from_node_status()
+        .await;
     assert!(shell.reconciler.ready_to_unmount());
     shell.reconciler.reconcile().await;
 
@@ -172,10 +188,53 @@ async fn unmounted_volume_is_detached() {
     shell
         .desired_state_of_world_populator
         .set_has_added_pods(true);
+    shell
+        .reconciler
+        .update_reconstructed_from_node_status()
+        .await;
 
     shell.reconciler.reconcile().await; // unmountVolumes
     assert_eq!(mounter.asw.get_unmounted_volumes().len(), 1);
     shell.reconciler.reconcile().await; // unmountDetachDevices
 
     assert!(mounter.asw.get_unmounted_volumes().is_empty());
+}
+
+/// `readyToUnmount`: "allow unmount only when ASW device paths were corrected
+/// from node.status to prevent calling unmount with a wrong devicePath".
+#[tokio::test]
+async fn unmount_waits_for_the_device_paths_from_node_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mounter, shell, _) = restarted(dir.path(), "gone", vec![]).await;
+    shell
+        .desired_state_of_world_populator
+        .set_has_added_pods(true);
+    assert!(
+        !shell.reconciler.ready_to_unmount(),
+        "device paths not read yet"
+    );
+
+    // `reconcile` reads the node status; the next pass may unmount.
+    shell.reconciler.reconcile().await;
+    assert_eq!(mounter.asw.get_all_mounted_volumes().len(), 1);
+    assert!(shell.reconciler.ready_to_unmount());
+    shell.reconciler.reconcile().await;
+    assert!(mounter.asw.get_all_mounted_volumes().is_empty());
+}
+
+/// `updateReconstructedFromNodeStatus`: a volume the node does not list as
+/// attached is not attachable.
+#[tokio::test]
+async fn volume_missing_from_node_status_is_not_attachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mounter, shell, _) = restarted(dir.path(), "gone", vec![]).await;
+    let name = mounter.asw.get_all_mounted_volumes()[0].volume_name.clone();
+
+    shell
+        .reconciler
+        .update_reconstructed_from_node_status()
+        .await;
+
+    let attached = mounter.asw.get_attached_volume(&name).unwrap();
+    assert!(!attached.plugin_is_attachable);
 }
