@@ -18,7 +18,7 @@
 use crate::node_volume_limits::NodeVolumeLimitsSnapshot;
 use crate::volume_binding::VolumeSnapshot;
 use async_trait::async_trait;
-use rusternetes_common::resources::{Node, Pod, ResourceClaim, ResourceSlice};
+use rusternetes_common::resources::{Namespace, Node, Pod, ResourceClaim, ResourceSlice};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 
@@ -360,6 +360,11 @@ pub trait Handle: Send + Sync {
         Err("no cluster access".to_string())
     }
 
+    /// `nsLister.List` (interpodaffinity/scoring.go PreScore).
+    async fn list_namespaces(&self) -> Result<Vec<Namespace>, String> {
+        Err("no cluster access".to_string())
+    }
+
     /// `draManager.ResourceSlices().List()`.
     async fn resource_slices(&self) -> Result<Vec<ResourceSlice>, String> {
         Err("no cluster access".to_string())
@@ -417,14 +422,17 @@ pub struct NodeScore {
 /// run).
 #[async_trait]
 pub trait PreScorePlugin: Plugin {
-    /// `all_pods` is every pod of the snapshot, the pods that upstream's
-    /// `NodeInfo`s carry.
+    /// `nodes` are the feasible nodes. `all_pods` and `all_nodes` are the
+    /// snapshot (the `NodeInfo`s upstream's shared lister returns); `handle`
+    /// is the cluster-object access (informer listers upstream).
     async fn pre_score(
         &self,
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[&Node],
         all_pods: &[Pod],
+        all_nodes: &[Node],
+        handle: &dyn Handle,
     ) -> Status;
 }
 

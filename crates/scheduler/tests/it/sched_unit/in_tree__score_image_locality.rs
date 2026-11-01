@@ -1,7 +1,7 @@
 //! ImageLocality through the plugin object and `Framework::run_score_plugins`
 //! (`imagelocality/image_locality_test.go`: `TestImageLocalityPriority`).
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{CycleState, SignPlugin};
+use rusternetes_scheduler::fwk::{CycleState, NoHandle, SignPlugin};
 use rusternetes_scheduler::in_tree::ImageLocality;
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
@@ -28,7 +28,9 @@ async fn scores(p: &Pod, nodes: &[Node]) -> Vec<i64> {
     let fw = Profile::named("default-scheduler").framework;
     let refs: Vec<&Node> = nodes.iter().collect();
     let mut state = CycleState::new();
-    let s = fw.run_pre_score_plugins(&mut state, p, &refs, &[]).await;
+    let s = fw
+        .run_pre_score_plugins(&mut state, p, &refs, &[], nodes, &NoHandle)
+        .await;
     assert!(s.is_success(), "{s:?}");
     fw.run_score_plugins(&state, p, &refs, &[], nodes)
         .unwrap()

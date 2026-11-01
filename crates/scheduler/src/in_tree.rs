@@ -27,6 +27,8 @@ pub struct FilterPluginArgs<'a> {
     pub fit_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
     /// The NodeResourcesBalancedAllocation scoring strategy.
     pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
+    /// `InterPodAffinityArgs`.
+    pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
 }
 
 /// The factory for an in-tree Filter plugin by name, `None` for names
@@ -77,6 +79,9 @@ pub fn new_pre_score_plugin(
         names::NODE_RESOURCES_BALANCED_ALLOCATION => {
             Some(Arc::new(ResourceScore::balanced(args.balanced_scorer)))
         }
+        names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinityScore {
+            args: args.inter_pod_affinity,
+        })),
         _ => None,
     }
 }
@@ -91,6 +96,9 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
             Some(Arc::new(ResourceScore::balanced(args.balanced_scorer)))
         }
         names::IMAGE_LOCALITY => Some(Arc::new(ImageLocality)),
+        names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinityScore {
+            args: args.inter_pod_affinity,
+        })),
         _ => None,
     }
 }
@@ -1254,6 +1262,8 @@ impl PreScorePlugin for TaintToleration {
         pod: &Pod,
         nodes: &[&Node],
         _all_pods: &[Pod],
+        _all_nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> Status {
         if nodes.is_empty() {
             return Status::success();
@@ -1331,6 +1341,8 @@ impl PreScorePlugin for NodeAffinityPlugin {
         pod: &Pod,
         _nodes: &[&Node],
         _all_pods: &[Pod],
+        _all_nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> Status {
         let preferred = pod
             .spec
@@ -1444,6 +1456,8 @@ impl PreScorePlugin for ResourceScore {
         pod: &Pod,
         _nodes: &[&Node],
         all_pods: &[Pod],
+        _all_nodes: &[Node],
+        _handle: &dyn Handle,
     ) -> Status {
         let pod_requests = self.scorer.pod_requests(pod);
         // balanced_allocation.go PreScore: best-effort pods are skipped.
@@ -1545,5 +1559,91 @@ impl SignPlugin for ImageLocality {
             signers::IMAGE_NAMES_SIGNER_NAME,
             serde_json::json!(names),
         )])
+    }
+}
+
+/// Key of the InterPodAffinity PreScore state (`preScoreStateKey`).
+const INTER_POD_AFFINITY_SCORE_STATE_KEY: &str = "PreScoreInterPodAffinity";
+
+/// `interpodaffinity.InterPodAffinity` PreScore/Score/NormalizeScore
+/// (`scoring.go:135-275`) over [`crate::inter_pod_affinity_score`].
+///
+/// Deviation: the namespace list (`nsLister`) is read through
+/// [`Handle::list_namespaces`] only when a term carries a
+/// `namespaceSelector`, as before this was a plugin object.
+pub struct InterPodAffinityScore {
+    pub args: crate::inter_pod_affinity_score::Args,
+}
+
+impl Plugin for InterPodAffinityScore {
+    fn name(&self) -> &'static str {
+        names::INTER_POD_AFFINITY
+    }
+}
+
+#[async_trait]
+impl PreScorePlugin for InterPodAffinityScore {
+    /// scoring.go PreScore (:135-244): `Skip` when there is nothing to score.
+    async fn pre_score(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        _nodes: &[&Node],
+        all_pods: &[Pod],
+        all_nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> Status {
+        let namespaces = if crate::inter_pod_affinity_score::needs_namespaces(pod, all_pods) {
+            match handle.list_namespaces().await {
+                Ok(n) => n,
+                Err(e) => return Status::from_error(format!("listing namespaces: {e}")),
+            }
+        } else {
+            Vec::new()
+        };
+        match crate::inter_pod_affinity_score::pre_score(
+            pod,
+            all_nodes,
+            all_pods,
+            &namespaces,
+            &self.args,
+        ) {
+            Ok(Some(s)) => {
+                state.write(INTER_POD_AFFINITY_SCORE_STATE_KEY, s);
+                Status::success()
+            }
+            Ok(None) => Status::new(Code::Skip, Vec::new()),
+            Err(e) => Status::from_error(e),
+        }
+    }
+}
+
+impl ScorePlugin for InterPodAffinityScore {
+    /// scoring.go Score (:259-275).
+    fn score(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let Some(s) = state.read::<crate::inter_pod_affinity_score::PreScoreState>(
+            INTER_POD_AFFINITY_SCORE_STATE_KEY,
+        ) else {
+            return (0, missing_state(INTER_POD_AFFINITY_SCORE_STATE_KEY));
+        };
+        (
+            crate::inter_pod_affinity_score::score(s, node_info.node()),
+            Status::success(),
+        )
+    }
+
+    /// scoring.go NormalizeScore (:277-317).
+    fn normalize_score(
+        &self,
+        _state: &CycleState,
+        _pod: &Pod,
+        scores: &mut [NodeScore],
+    ) -> Option<Status> {
+        let mut v: Vec<i64> = scores.iter().map(|s| s.score).collect();
+        crate::score::normalize_inter_pod_affinity(&mut v);
+        for (s, n) in scores.iter_mut().zip(v) {
+            s.score = n;
+        }
+        Some(Status::success())
     }
 }

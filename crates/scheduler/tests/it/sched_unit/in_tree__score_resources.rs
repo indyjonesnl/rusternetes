@@ -2,7 +2,7 @@
 //! plugin objects and `Framework::run_score_plugins`
 //! (`noderesources/least_allocated_test.go`, `balanced_allocation_test.go`).
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::CycleState;
+use rusternetes_scheduler::fwk::{CycleState, NoHandle};
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
@@ -27,7 +27,7 @@ async fn scores(p: &Pod, nodes: &[Node], existing: &[Pod], plugin: &str) -> Opti
     let refs: Vec<&Node> = nodes.iter().collect();
     let mut state = CycleState::new();
     let s = fw
-        .run_pre_score_plugins(&mut state, p, &refs, existing)
+        .run_pre_score_plugins(&mut state, p, &refs, existing, nodes, &NoHandle)
         .await;
     assert!(s.is_success(), "{s:?}");
     fw.run_score_plugins(&state, p, &refs, existing, nodes)
