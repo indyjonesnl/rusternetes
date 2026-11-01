@@ -90,6 +90,7 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
         names::NODE_RESOURCES_BALANCED_ALLOCATION => {
             Some(Arc::new(ResourceScore::balanced(args.balanced_scorer)))
         }
+        names::IMAGE_LOCALITY => Some(Arc::new(ImageLocality)),
         _ => None,
     }
 }
@@ -109,6 +110,7 @@ pub fn new_sign_plugin(name: &str) -> Option<Arc<dyn SignPlugin>> {
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
+        names::IMAGE_LOCALITY => Some(Arc::new(ImageLocality)),
         _ => None,
     }
 }
@@ -1477,5 +1479,71 @@ impl ScorePlugin for ResourceScore {
             Ok(score) => (score, Status::success()),
             Err(m) => (0, Status::from_error(m)),
         }
+    }
+}
+
+/// Key of ImageLocality's lazily computed image summary.
+const IMAGE_LOCALITY_STATE_KEY: &str = "ImageLocalityImageStates";
+
+/// The per-image `ImageStateSummary` over every node and the node count.
+struct ImageLocalityState {
+    states: std::collections::HashMap<String, (i64, usize)>,
+    total_num_nodes: usize,
+}
+
+/// `imagelocality.ImageLocality` (`plugins/imagelocality/image_locality.go`):
+/// favours nodes that already have the pod's container images, weighted by
+/// how widely each image has spread (the "node heating" mitigation).
+///
+/// Deviation: upstream reads `nodeInfo.GetImageStates()`, maintained by the
+/// scheduler cache; here the first Score of a cycle summarises the images of
+/// every node and the rest of the cycle reuses it. No PreScore, no score
+/// extensions.
+pub struct ImageLocality;
+
+impl Plugin for ImageLocality {
+    fn name(&self) -> &'static str {
+        names::IMAGE_LOCALITY
+    }
+}
+
+impl ScorePlugin for ImageLocality {
+    /// image_locality.go Score (:78-88).
+    fn score(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let all_nodes = node_info.all_nodes();
+        let s = state.read_or_init(IMAGE_LOCALITY_STATE_KEY, || {
+            let refs: Vec<&Node> = all_nodes.iter().collect();
+            ImageLocalityState {
+                states: crate::score::image_states(&refs),
+                total_num_nodes: all_nodes.len(),
+            }
+        });
+        (
+            crate::score::image_locality_score(node_info.node(), pod, &s.states, s.total_num_nodes),
+            Status::success(),
+        )
+    }
+}
+
+impl SignPlugin for ImageLocality {
+    /// image_locality.go SignPod (:53-66): the sorted, normalised image names
+    /// of the containers and init containers.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let mut names: Vec<String> = pod
+            .spec
+            .iter()
+            .flat_map(|s| {
+                s.containers
+                    .iter()
+                    .chain(s.init_containers.iter().flatten())
+            })
+            .map(|c| crate::score::normalized_image_name(&c.image))
+            .collect();
+        names.sort();
+        names.dedup();
+        signed(vec![SignFragment::new(
+            signers::IMAGE_NAMES_SIGNER_NAME,
+            serde_json::json!(names),
+        )])
     }
 }

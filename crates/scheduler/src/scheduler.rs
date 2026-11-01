@@ -1721,28 +1721,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             return None;
                         }
                     };
-                let cluster_nodes: Vec<&Node> = nodes.iter().collect();
                 for plugin in fw.plugins_at(ExtensionPoint::Score) {
                     let weight = i64::from(fw.score_weight(plugin));
                     // `None` is a PreScore `Skip` (the plugin is left out of
                     // `RunScorePlugins`) or a plugin without a compiled-in
                     // scorer.
                     let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::IMAGE_LOCALITY => {
-                            let states = crate::score::image_states(&cluster_nodes);
-                            let v = feasible
-                                .iter()
-                                .map(|e| {
-                                    crate::score::image_locality_score(
-                                        e.node,
-                                        pod,
-                                        &states,
-                                        cluster_nodes.len(),
-                                    )
-                                })
-                                .collect();
-                            (names::IMAGE_LOCALITY, Some(v))
-                        }
                         names::INTER_POD_AFFINITY => {
                             // interpodaffinity/scoring.go PreScore + Score +
                             // NormalizeScore. A PreScore `Skip` leaves the
