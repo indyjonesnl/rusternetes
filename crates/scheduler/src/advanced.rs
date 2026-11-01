@@ -601,6 +601,9 @@ pub fn non_zero_request_amounts(pod: &Pod) -> (i64, i64) {
 /// ```go
 /// nomNodeName := pod.Status.NominatedNodeName
 /// if len(nomNodeName) > 0 {
+///     // If the pod's nominated node is considered as UnschedulableAndUnresolvable
+///     // by the filters, then the pod should be considered for preempting again.
+///     if nominatedNodeStatus.Code() == fwk.UnschedulableAndUnresolvable { return true, "" }
 ///     if nodeInfo, _ := nodeInfos.Get(nomNodeName); nodeInfo != nil {
 ///         for _, p := range nodeInfo.GetPods() {
 ///             if pl.isPreemptionAllowed(nodeInfo, p, pod) && podTerminatingByPreemption(p.GetPod()) {
@@ -610,7 +613,11 @@ pub fn non_zero_request_amounts(pod: &Pod) -> (i64, i64) {
 ///
 /// Returns `false` when a lower-priority pod on the nominated node is still
 /// terminating, i.e. the preemptor should wait for the room it already made.
-pub fn pod_eligible_to_preempt_others(pod: &Pod, all_pods: &[Pod]) -> bool {
+pub fn pod_eligible_to_preempt_others(
+    pod: &Pod,
+    all_pods: &[Pod],
+    nominated_node_code: crate::fwk::Code,
+) -> bool {
     let nominated = match pod
         .status
         .as_ref()
@@ -619,6 +626,9 @@ pub fn pod_eligible_to_preempt_others(pod: &Pod, all_pods: &[Pod]) -> bool {
         Some(n) if !n.is_empty() => n,
         _ => return true,
     };
+    if nominated_node_code == crate::fwk::Code::UnschedulableAndUnresolvable {
+        return true;
+    }
 
     let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
 

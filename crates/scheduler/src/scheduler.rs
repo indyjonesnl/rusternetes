@@ -1877,7 +1877,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // [sig-scheduling] SchedulerPreemption (#1130).
         // Upstream: PodEligibleToPreemptOthers
         // (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:317-341).
-        if !crate::advanced::pod_eligible_to_preempt_others(pod, all_pods) {
+        // `nominatedNodeStatus := m.Get(pod.Status.NominatedNodeName)`
+        // (preemption.go:283): the nominated node's status in the failed cycle.
+        let nominated_node_code = diagnosis.node_code(
+            pod.status
+                .as_ref()
+                .and_then(|s| s.nominated_node_name.as_deref())
+                .unwrap_or_default(),
+        );
+        if !crate::advanced::pod_eligible_to_preempt_others(pod, all_pods, nominated_node_code) {
             debug!(
                 "Pod {} already nominated to {:?} with a victim still terminating; not preempting again",
                 pod.metadata.name,
