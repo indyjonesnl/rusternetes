@@ -103,4 +103,14 @@ mod tests {
         let names: Vec<_> = reg.checks().into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["poststarthook/start-kube-aggregator-informers"]);
     }
+
+    /// apiextensions-apiserver apiserver.go:224: registered, finishes at once.
+    #[tokio::test]
+    async fn apiextensions_informers_hook_registers_and_finishes() {
+        let reg = PostStartHooks::new();
+        register_apiextensions_informers_hook(&reg);
+        assert!(finished(&reg, "start-apiextensions-informers").await);
+        let names: Vec<_> = reg.checks().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["poststarthook/start-apiextensions-informers"]);
+    }
 }

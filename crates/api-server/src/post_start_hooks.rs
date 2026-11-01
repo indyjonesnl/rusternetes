@@ -223,3 +223,17 @@ pub const AGGREGATOR_INFORMERS_HOOK: &str = "start-kube-aggregator-informers";
 pub fn register_aggregator_informers_hook(registry: &PostStartHooks) {
     spawn_starting_hook_with(registry, AGGREGATOR_INFORMERS_HOOK, || {});
 }
+
+/// `start-apiextensions-informers` (apiextensions-apiserver/pkg/apiserver/
+/// apiserver.go:224-227): `s.Informers.Start(stop)`, then returns nil, so it
+/// finishes at once and is never fatal. The CRD informer is a storage-backed
+/// loop here (`crd-informer-synced`, the CRD controllers' watch), with no
+/// informer factory to start. Registered before
+/// `start-apiextensions-controllers`, as upstream. Deliberate deviation, as
+/// for [`AGGREGATOR_INFORMERS_HOOK`].
+pub const APIEXTENSIONS_INFORMERS_HOOK: &str = "start-apiextensions-informers";
+
+/// Register [`APIEXTENSIONS_INFORMERS_HOOK`] on `registry`.
+pub fn register_apiextensions_informers_hook(registry: &PostStartHooks) {
+    spawn_starting_hook_with(registry, APIEXTENSIONS_INFORMERS_HOOK, || {});
+}

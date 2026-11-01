@@ -1597,6 +1597,11 @@ pub fn start_controllers(
     storage: Arc<StorageBackend>,
     controllers: Arc<super::controller_queue::CrdControllers>,
 ) -> tokio::task::JoinHandle<()> {
+    // `start-apiextensions-informers` (apiserver.go:224) precedes the
+    // controllers hook.
+    crate::post_start_hooks::register_apiextensions_informers_hook(
+        crate::post_start_hooks::global(),
+    );
     crate::post_start_hooks::spawn_starting_hook(
         crate::bootstrap::APIEXTENSIONS_CONTROLLERS_HOOK,
         move || {
