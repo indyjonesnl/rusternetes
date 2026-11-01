@@ -729,6 +729,25 @@ impl AuditContext {
         g.event.request_object = Some(patch);
     }
 
+    /// `AuditContext.LogImpersonatedUser` (context.go:135-156): below Metadata
+    /// nothing is recorded. The constraint half (`AuthenticationMetadata`)
+    /// belongs to constrained impersonation, which is not ported.
+    fn log_impersonated_user(&self, user: &UserInfo) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if level_ord(&g.event.level) < 1 {
+            return;
+        }
+        let mut u = user.clone();
+        // `Extra` is always a (possibly empty) map upstream; empty is omitted
+        // by this event's encoding.
+        if u.extra.as_ref().is_some_and(|e| e.is_empty()) {
+            u.extra = None;
+        }
+        g.event.impersonated_user = Some(u);
+    }
+
     /// `GetEventLevel`.
     pub fn level(&self) -> AuditLevel {
         self.inner
@@ -943,6 +962,7 @@ fn new_audit_context(
         response_status: None,
         response_object: None,
         request_object: None,
+        impersonated_user: None,
         request_received_timestamp: received,
         stage_timestamp: received,
         annotations: None,
@@ -957,11 +977,22 @@ fn new_audit_context(
 /// `evaluatePolicyAndCreateAuditEvent` (:119-) + `audit.LogRequestMetadata`
 /// (request.go:43-82).
 pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Response {
-    let user = req
+    let effective = req
         .extensions()
         .get::<rusternetes_middleware::AuthContext>()
         .map(|c| c.user.clone())
         .unwrap_or_else(rusternetes_common::auth::UserInfo::anonymous);
+    // Upstream's audit filter sits before the impersonation filter, so the
+    // event's user (and the policy's) is the real caller; the impersonated
+    // identity is added by `LogImpersonatedUser` once impersonation ran.
+    let impersonated = req
+        .extensions()
+        .get::<rusternetes_middleware::AuthImpersonator>()
+        .map(|i| (i.0.clone(), effective.clone()));
+    let user = impersonated
+        .as_ref()
+        .map(|(requestor, _)| requestor.clone())
+        .unwrap_or(effective);
     let mut attrs = request_info(req.method(), req.uri().path(), req.uri().query());
     let user_info = UserInfo {
         username: user.username.clone(),
@@ -999,6 +1030,21 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
         // "failed to store audit event" (audit.go:62)
         crate::audit_metrics::observe_request_rejected();
         return internal_error("failed to store audit event");
+    }
+    // `audit.LogImpersonatedUser` (impersonation.go:170): the impersonation
+    // filter runs after RequestReceived is emitted, so only the later stages
+    // carry it.
+    if let Some((_, effective)) = &impersonated {
+        ac.log_impersonated_user(&UserInfo {
+            username: effective.username.clone(),
+            uid: effective.uid.clone(),
+            groups: effective.groups.clone(),
+            extra: if effective.extra.is_empty() {
+                None
+            } else {
+                Some(effective.extra.clone())
+            },
+        });
     }
 
     let long_running = attrs.verb == "watch" || attrs.verb == "proxy";
