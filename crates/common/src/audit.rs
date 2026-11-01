@@ -28,6 +28,10 @@ pub struct AuditEvent {
     pub kind: String,
     /// Level of audit detail
     pub level: AuditLevel,
+    /// `Event.ImpersonatedUser`: the user the request impersonates, set by
+    /// `LogImpersonatedUser` (the `user` field is then the real caller).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impersonated_user: Option<UserInfo>,
     /// Unique ID for this audit event
     pub audit_id: String,
     /// Stage of the request (RequestReceived, ResponseStarted, ResponseComplete, Panic)
@@ -387,6 +391,7 @@ impl AuditLogger {
             response_status: None,
             response_object: None,
             request_object: None,
+            impersonated_user: None,
             request_received_timestamp: now,
             stage_timestamp: now,
             annotations: None,
@@ -436,6 +441,7 @@ impl AuditLogger {
             }),
             response_object: None,
             request_object: None,
+            impersonated_user: None,
             request_received_timestamp: now, // Should be the original timestamp
             stage_timestamp: now,
             annotations: None,

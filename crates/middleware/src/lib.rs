@@ -37,6 +37,15 @@ pub struct AuthContext {
     pub user: UserInfo,
 }
 
+/// The authenticated user before inbound impersonation replaced the request's
+/// [`AuthContext`] user. Present only on an impersonated request; the audit
+/// filter, which upstream sits before the impersonation filter, records this
+/// user as the event's `user` and the [`AuthContext`] user as its
+/// `impersonatedUser` (`audit.LogImpersonatedUser`,
+/// impersonation/impersonation.go:170).
+#[derive(Clone, Debug)]
+pub struct AuthImpersonator(pub UserInfo);
+
 /// What authentication observed about a request beyond who it is: audit
 /// annotations (`audit.AddAuditAnnotation`) and `Warning` headers
 /// (`warning.AddWarning`). Upstream writes both to the request context; the
@@ -473,8 +482,9 @@ fn forbidden(message: &str) -> Response {
 /// verb on every requested subject (authorized via `authorizer`) before the
 /// identity is switched, matching upstream `WithImpersonation`.
 ///
-/// Returns the effective [`UserInfo`] for the request. On a missing-user or
-/// authorization failure it returns the appropriate `Err(Response)`.
+/// Returns the effective [`UserInfo`] for the request and, when impersonation
+/// was applied, the requestor it replaced. On a missing-user or authorization
+/// failure it returns the appropriate `Err(Response)`.
 #[allow(
     clippy::result_large_err,
     reason = "axum middleware early-returns a Response as the Err; it is never propagated further"
@@ -483,10 +493,10 @@ async fn apply_impersonation(
     headers: &axum::http::HeaderMap,
     requestor: UserInfo,
     authorizer: &Arc<dyn Authorizer>,
-) -> Result<UserInfo, Response> {
+) -> Result<(UserInfo, Option<UserInfo>), Response> {
     let intent = match parse_impersonation_headers(headers) {
         Ok(Some(intent)) => intent,
-        Ok(None) => return Ok(requestor),
+        Ok(None) => return Ok((requestor, None)),
         Err(ImpersonationParseError::GroupsWithoutUser) => {
             return Err(bad_request(
                 "requested impersonation without impersonating a user",
@@ -560,12 +570,15 @@ async fn apply_impersonation(
         requestor.username, intent.username
     );
 
-    Ok(UserInfo {
-        username: intent.username,
-        uid: intent.uid,
-        groups,
-        extra: intent.extra,
-    })
+    Ok((
+        UserInfo {
+            username: intent.username,
+            uid: intent.uid,
+            groups,
+            extra: intent.extra,
+        },
+        Some(requestor),
+    ))
 }
 
 /// Middleware that adds a default admin AuthContext when skip_auth is enabled
@@ -594,10 +607,14 @@ pub async fn skip_auth_middleware(
 
     // Honor inbound impersonation headers even in skip-auth mode so that
     // SubjectReview / SelfSubjectReview reflect the impersonated identity.
-    let user = apply_impersonation(request.headers(), admin_user, &authorizer).await?;
+    let (user, impersonator) =
+        apply_impersonation(request.headers(), admin_user, &authorizer).await?;
 
     // Insert AuthContext into request extensions
     request.extensions_mut().insert(AuthContext { user });
+    if let Some(u) = impersonator {
+        request.extensions_mut().insert(AuthImpersonator(u));
+    }
 
     debug!("AuthContext inserted into request extensions");
 
@@ -1130,10 +1147,13 @@ pub async fn auth_middleware(
     // Apply inbound impersonation headers. The authenticated caller must hold
     // the `impersonate` verb on each requested subject; on success the
     // effective user becomes the impersonated identity.
-    let user = apply_impersonation(request.headers(), user, &authorizer).await?;
+    let (user, impersonator) = apply_impersonation(request.headers(), user, &authorizer).await?;
 
     // Insert UserInfo into request extensions
     request.extensions_mut().insert(AuthContext { user });
+    if let Some(u) = impersonator {
+        request.extensions_mut().insert(AuthImpersonator(u));
+    }
     // The audit filter sits inside this one, so hand it the annotations
     // authentication recorded (upstream records them on a context that
     // `WithAuditInit` created before authentication ran).
