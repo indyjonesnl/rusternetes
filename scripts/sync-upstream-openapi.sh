@@ -42,6 +42,7 @@ GVS = [
     "apis__policy__v1",
     "apis__rbac.authorization.k8s.io__v1",
     "apis__resource.k8s.io__v1",
+    "apis__resource.k8s.io__v1alpha3",
     "apis__scheduling.k8s.io__v1",
     "apis__storage.k8s.io__v1",
     "apis__storagemigration.k8s.io__v1beta1",
