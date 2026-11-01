@@ -11,6 +11,7 @@ mod __parent {
         IntOrString, Node, Pod, PodDisruptionBudget, PriorityClass, Taint, Toleration,
         TopologySpreadConstraint,
     };
+    pub use rusternetes_scheduler::fwk::Code;
     pub use std::collections::HashMap;
     pub use tracing::debug;
 }
@@ -760,9 +761,29 @@ mod tests {
         mark_preempted(&mut victim);
 
         assert!(
-            !pod_eligible_to_preempt_others(&preemptor, &[victim]),
+            !pod_eligible_to_preempt_others(&preemptor, &[victim], Code::Unschedulable),
             "must wait for the room it already made"
         );
+    }
+
+    /// default_preemption.go:326-329: when the filters now reject the nominated
+    /// node as UnschedulableAndUnresolvable, waiting for its victims is pointless
+    /// and the pod is considered for preemption again, elsewhere.
+    #[test]
+    fn a_pod_whose_nominated_node_became_unresolvable_may_preempt_again() {
+        let mut preemptor = make_incoming_pod("preemptor", 1000, "100m", "128Mi", None);
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("node-1".to_string()),
+            ..Default::default()
+        });
+        let mut victim = make_scheduled_pod("victim", 1, "100m", "128Mi", "node-1");
+        mark_preempted(&mut victim);
+
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[victim],
+            Code::UnschedulableAndUnresolvable
+        ));
     }
 
     /// Once the victim is gone, the pod may preempt again (it will normally just
@@ -778,7 +799,11 @@ mod tests {
         // Only a healthy, higher-priority neighbour remains on the node.
         let neighbour = make_scheduled_pod("neighbour", 2000, "100m", "128Mi", "node-1");
 
-        assert!(pod_eligible_to_preempt_others(&preemptor, &[neighbour]));
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[neighbour],
+            Code::Unschedulable
+        ));
     }
 
     /// A terminating pod on a DIFFERENT node must not block preemption — the
@@ -794,7 +819,11 @@ mod tests {
         let mut elsewhere = make_scheduled_pod("elsewhere", 1, "100m", "128Mi", "node-2");
         mark_preempted(&mut elsewhere);
 
-        assert!(pod_eligible_to_preempt_others(&preemptor, &[elsewhere]));
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[elsewhere],
+            Code::Unschedulable
+        ));
     }
 
     /// A terminating pod of EQUAL or higher priority is not a victim of this
@@ -810,7 +839,11 @@ mod tests {
         let mut other = make_scheduled_pod("other", 5000, "100m", "128Mi", "node-1");
         mark_preempted(&mut other);
 
-        assert!(pod_eligible_to_preempt_others(&preemptor, &[other]));
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[other],
+            Code::Unschedulable
+        ));
     }
 
     /// Regression: a pod terminating for an ordinary reason must NOT count as
@@ -836,7 +869,7 @@ mod tests {
         ordinary.metadata.deletion_timestamp = Some(chrono::Utc::now());
 
         assert!(
-            pod_eligible_to_preempt_others(&preemptor, &[ordinary]),
+            pod_eligible_to_preempt_others(&preemptor, &[ordinary], Code::Unschedulable),
             "an ordinary termination must not be mistaken for our own victim"
         );
     }
@@ -866,14 +899,22 @@ mod tests {
             },
         );
 
-        assert!(pod_eligible_to_preempt_others(&preemptor, &[drained]));
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[drained],
+            Code::Unschedulable
+        ));
     }
 
     /// A pod that has never preempted (no nominatedNodeName) is always eligible.
     #[test]
     fn a_pod_without_a_nominated_node_is_eligible() {
         let preemptor = make_incoming_pod("fresh", 1000, "100m", "128Mi", None);
-        assert!(pod_eligible_to_preempt_others(&preemptor, &[]));
+        assert!(pod_eligible_to_preempt_others(
+            &preemptor,
+            &[],
+            Code::Unschedulable
+        ));
     }
 
     // -----------------------------------------------------------------------

@@ -1101,6 +1101,69 @@ mod tests {
             .is_none());
     }
 
+    /// `PodEligibleToPreemptOthers` (default_preemption.go:326-329) gets the
+    /// nominated node's status from the failed cycle: a pod whose nominated node
+    /// is now unresolvable does not wait for that node's terminating victim.
+    #[tokio::test]
+    async fn test_try_preempt_ignores_victims_on_an_unresolvable_nominated_node() {
+        use rusternetes_scheduler::fwk::Code;
+        let node = |name: &str| -> Node {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name},
+                "status": {"allocatable": {"cpu": "2", "memory": "10Gi", "pods": "10"}}
+            }))
+            .unwrap()
+        };
+        let nodes = vec![node("full"), node("gone")];
+        let mut dying = running_pod("dying", "gone", "2", 0);
+        dying.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        dying.status.as_mut().unwrap().conditions =
+            Some(vec![serde_json::from_value(serde_json::json!({
+                "type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"
+            }))
+            .unwrap()]);
+        let all_pods = vec![running_pod("a", "full", "2", 0), dying];
+        let mut preemptor = make_pending_pod("hi", "default");
+        {
+            let spec = preemptor.spec.as_mut().unwrap();
+            spec.priority = Some(1000);
+            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
+                limits: None,
+                claims: None,
+            });
+        }
+        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+            nominated_node_name: Some("gone".to_string()),
+            ..Default::default()
+        });
+        let scheduler = Scheduler::new_with_name(
+            Arc::new(MemoryStorage::new()),
+            1,
+            "default-scheduler".to_string(),
+        );
+        let run = |gone: Code| {
+            let mut diag = rusternetes_scheduler::diagnosis::Diagnosis::default();
+            diag.set_node_code("full", Code::Unschedulable);
+            diag.set_node_code("gone", gone);
+            let (scheduler, preemptor, nodes, all_pods) =
+                (&scheduler, &preemptor, &nodes, &all_pods);
+            async move {
+                scheduler
+                    .try_preempt(preemptor, nodes, all_pods, &HashMap::new(), &[], &diag)
+                    .await
+                    .map(|(node, victims)| (node, victims.len()))
+            }
+        };
+        // Still Unschedulable: wait for the room already being made.
+        assert_eq!(run(Code::Unschedulable).await, None);
+        // Unresolvable: preempt again, on the node that can still gain room.
+        assert_eq!(
+            run(Code::UnschedulableAndUnresolvable).await,
+            Some(("full".to_string(), 1))
+        );
+    }
+
     /// default_preemption_test.go TestCalculateNumCandidates /
     /// TestDryRunPreemption shape: with `minCandidateNodesPercentage: 0` and
     /// `minCandidateNodesAbsolute: 1` the dry run stops at the first candidate
