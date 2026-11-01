@@ -43,6 +43,12 @@ pub struct SeenObjects {
     nodes: HashMap<String, Node>,
 }
 
+/// `utilfeature.DefaultFeatureGate.Enabled(features.OpportunisticBatching)`
+/// (Beta, on in 1.35).
+fn opportunistic_batching_enabled() -> bool {
+    rusternetes_common::feature_gates::gate_enabled("OpportunisticBatching").unwrap_or(false)
+}
+
 /// `assignedPod` (eventhandlers.go:470-472).
 fn assigned_pod(pod: &Pod) -> bool {
     !pod_node_name(pod).is_empty()
@@ -963,7 +969,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // Try to schedule
         let (selected, cycle_state, diagnosis) = self
-            .select_node_diag_volumes(&pod, &nodes, &all_pods, &priority_classes)
+            .select_node_diag_volumes(
+                &pod,
+                &nodes,
+                &all_pods,
+                &priority_classes,
+                Some(queue.scheduling_cycle()),
+            )
             .await;
         if let (Some(node), Some(cycle_state)) = (selected, cycle_state) {
             if let Err(e) = self
@@ -1366,7 +1378,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         priority_classes: &HashMap<String, PriorityClass>,
     ) -> (Option<Node>, Diagnosis) {
         let (picked, _vols, diag) = self
-            .select_node_diag_volumes(pod, nodes, all_pods, priority_classes)
+            .select_node_diag_volumes(pod, nodes, all_pods, priority_classes, None)
             .await;
         (picked, diag)
     }
@@ -1379,10 +1391,18 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         nodes: &[Node],
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
+        cycle_count: Option<i64>,
     ) -> (Option<Node>, Option<CycleState>, Diagnosis) {
         let mut diag = Diagnosis::default();
         let picked = self
-            .select_node_inner(pod, nodes, all_pods, priority_classes, &mut diag)
+            .select_node_cycle(
+                pod,
+                nodes,
+                all_pods,
+                priority_classes,
+                &mut diag,
+                cycle_count,
+            )
             .await;
         match picked {
             Some((node, state)) => (Some(node), Some(state), diag),
@@ -1458,8 +1478,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+        diag: &mut Diagnosis,
+    ) -> Option<(Node, CycleState)> {
+        self.select_node_cycle(pod, nodes, all_pods, priority_classes, diag, None)
+            .await
+    }
+
+    /// `schedulePod` for one scheduling cycle. `cycle_count` is the queue's
+    /// `SchedulingCycle()` (`sched.CurrentCycle()`); it drives the
+    /// opportunistic batch (`OpportunisticBatching`, schedule_one.go:450-470,
+    /// :512-516), which is skipped without one.
+    pub async fn select_node_cycle(
+        &self,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
         _priority_classes: &HashMap<String, PriorityClass>,
         diag: &mut Diagnosis,
+        cycle_count: Option<i64>,
     ) -> Option<(Node, CycleState)> {
         // Advanced scheduling algorithm:
         // 1. Filter out unschedulable nodes
@@ -1552,10 +1589,30 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // the only candidate and the search below (and its
         // `nextStartNodeIndex` update, :547-548) is skipped. A node missing
         // from the snapshot is an error that is only logged (:522-523).
-        let nominated_idx = pod
+        let nominated_name = pod
             .status
             .as_ref()
             .and_then(|s| s.nominated_node_name.as_deref())
+            .filter(|n| !n.is_empty());
+        // `GetNodeHint` (schedule_one.go:509-516): "We get the node hint even
+        // if we have a nominated name for simplicity"; the hint is only
+        // evaluated when there is no nominated node (`evaluateNominatedNode`,
+        // :578-582).
+        let batch_cycle = cycle_count.filter(|_| opportunistic_batching_enabled());
+        let (node_hint, signature) = match batch_cycle {
+            Some(cycle) => {
+                let (hint, signature) = fw
+                    .get_node_hint(pod, &cycle_state, cycle, nodes, all_pods)
+                    .await;
+                (hint.unwrap_or_default(), signature)
+            }
+            None => (String::new(), None),
+        };
+        let first_eval = match nominated_name {
+            Some(n) => n,
+            None => node_hint.as_str(),
+        };
+        let nominated_idx = Some(first_eval)
             .filter(|n| !n.is_empty())
             .and_then(|n| nodes.iter().position(|x| x.metadata.name == n));
         let mut nominated_failed = false;
@@ -1674,6 +1731,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
         // `schedulePod` (schedule_one.go:443-451): "When only one node after
         // predicate, just use it" - no Score plugin runs.
+        let mut sorted_others: Option<crate::score::SortedNodeScores> = None;
         let chosen = if feasible.len() == 1 {
             0
         } else {
@@ -1720,7 +1778,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     }
                 }
             };
-            let idx = crate::score::select_host(&totals)?;
+            let mut sorted = crate::score::SortedNodeScores::new(
+                feasible
+                    .iter()
+                    .map(|e| e.node.metadata.name.clone())
+                    .collect(),
+                totals.clone(),
+            );
+            let idx = sorted.pop_index()?;
+            sorted_others = Some(sorted);
             debug!(
                 "Selected node {} with score {} for pod {}",
                 feasible[idx].node.metadata.name, totals[idx], pod.metadata.name
@@ -1729,6 +1795,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         };
         let best_owned = feasible[chosen].node.metadata.name.clone();
         let best_node_name = &best_owned;
+        // `StoreScheduleResults` (schedule_one.go:450, :469-471).
+        if let Some(cycle) = batch_cycle {
+            fw.store_schedule_results(signature, &node_hint, best_node_name, sorted_others, cycle);
+        }
 
         // The cycle state (the VolumeBinding Filter's per-node result among
         // it) is carried to Reserve/PreBind/Unreserve.

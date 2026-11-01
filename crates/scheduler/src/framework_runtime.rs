@@ -537,6 +537,8 @@ pub struct Framework {
     batchable_plugins: SignPluginObjects,
     /// `f.enableSignatures` (framework.go:104).
     enable_signatures: bool,
+    /// `f.batch` (framework.go:102): the opportunistic batch of this profile.
+    batch: Arc<crate::batch::OpportunisticBatch>,
     pub profile_name: String,
     /// `f.percentageOfNodesToScore` (framework.go:354); set even when the
     /// profile has no plugins.
@@ -901,6 +903,73 @@ impl Framework {
             }
         }
         serde_json::to_vec(&sig).ok()
+    }
+
+    /// `GetNodeHint` (framework.go:1402, batch.go:68-95): a node for the pod
+    /// from the results of the previous cycle, and the pod's signature (for
+    /// [`Framework::store_schedule_results`]). Caching works only for
+    /// consecutive pods with the same signature that are scheduled one per
+    /// node, which is assured by checking that the best node of the previous
+    /// cycle now rejects this pod (`batchStateCompatible`, batch.go:168-232).
+    /// `nodes` and `all_pods` are the cycle's snapshot.
+    pub async fn get_node_hint(
+        &self,
+        pod: &Pod,
+        state: &CycleState,
+        cycle_count: i64,
+        nodes: &[Node],
+        all_pods: &[Pod],
+    ) -> (Option<String>, Option<PodSignature>) {
+        use crate::batch::{FlushReason, OpportunisticBatch, Precheck};
+        let signature = self.sign_pod(pod);
+        let last_chosen = match self.batch.precheck(signature.as_ref(), cycle_count) {
+            Precheck::Unusable => return (None, signature),
+            Precheck::CheckLastChosenNode(n) => n,
+        };
+        // "We can only reuse the previous state if the new pod will not fit
+        // on the node we used for the last pod."
+        let Some(node) = nodes.iter().find(|n| n.metadata.name == last_chosen) else {
+            OpportunisticBatch::log_unusable_state(cycle_count, FlushReason::NodeMissing);
+            return (None, signature);
+        };
+        let info = NodeInfo::new(node, all_pods).with_all_nodes(nodes);
+        let status = self.run_filter_plugins(state, pod, &info).await;
+        if !status.is_rejected() {
+            OpportunisticBatch::log_unusable_state(cycle_count, FlushReason::NodeNotFull);
+            return (None, signature);
+        }
+        (self.batch.take_hint(cycle_count), signature)
+    }
+
+    /// `StoreScheduleResults` (framework.go:1406, batch.go:96-158): keep the
+    /// cycle's results for the next pod. `other_nodes` are the feasible nodes
+    /// that were not chosen, best first (`None` when only one node was
+    /// feasible).
+    pub fn store_schedule_results(
+        &self,
+        signature: Option<PodSignature>,
+        hinted_node: &str,
+        chosen_node: &str,
+        other_nodes: Option<crate::score::SortedNodeScores>,
+        cycle_count: i64,
+    ) {
+        self.batch.store_schedule_results(
+            signature,
+            hinted_node,
+            chosen_node,
+            other_nodes,
+            cycle_count,
+        );
+    }
+
+    /// The signature and remaining nodes of the batch's cached state.
+    pub fn batch_state(&self) -> Option<(PodSignature, Vec<String>)> {
+        self.batch.cached_state()
+    }
+
+    /// The pods scheduled with a hint (`BatchedPods`, framework.go:1936).
+    pub fn batched_pods(&self) -> i64 {
+        self.batch.batched_pods()
     }
 
     /// `RunPreFilterPlugins` (framework.go:862-923) over the PreFilter plugin

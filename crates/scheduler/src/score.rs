@@ -555,17 +555,41 @@ pub fn total_scores(plugins: &[PluginScores], num_nodes: usize) -> Result<Vec<i6
     Ok(totals)
 }
 
-/// `container/heap` over `nodeScoreHeap`: `Less` is a higher total score
-/// (`Randomizer` is always 0 without extenders, schedule_one.go:938).
-/// Returns the index of the node `heap.Pop` would return after `heap.Init`.
-pub fn select_host(totals: &[i64]) -> Option<usize> {
-    if totals.is_empty() {
-        return None;
+/// `sortedNodeScores` (schedule_one.go:904-927) over `nodeScoreHeap`
+/// (`:929-955`): the scored nodes as a `container/heap`, popped best first.
+/// `Less` is a higher total score (`Randomizer` is always 0 without
+/// extenders, schedule_one.go:938), so nodes with equal scores come out in
+/// the order the heap algorithm yields them, which this reproduces.
+#[derive(Debug, Clone, Default)]
+pub struct SortedNodeScores {
+    names: Vec<String>,
+    totals: Vec<i64>,
+    /// The heap, as indexes into `names`/`totals`.
+    heap: Vec<usize>,
+}
+
+impl SortedNodeScores {
+    /// `newSortedNodeScores` (`:908-912`): `heap.Init` over the list.
+    pub fn new(names: Vec<String>, totals: Vec<i64>) -> Self {
+        debug_assert_eq!(names.len(), totals.len());
+        let mut s = Self {
+            heap: (0..totals.len()).collect(),
+            names,
+            totals,
+        };
+        let n = s.heap.len();
+        for i in (0..n / 2).rev() {
+            s.down(i, n);
+        }
+        s
     }
-    let mut h: Vec<usize> = (0..totals.len()).collect();
-    let less = |h: &[usize], i: usize, j: usize| totals[h[i]] > totals[h[j]];
-    // heap.down
-    fn down(h: &mut [usize], i0: usize, n: usize, less: &dyn Fn(&[usize], usize, usize) -> bool) {
+
+    fn less(&self, i: usize, j: usize) -> bool {
+        self.totals[self.heap[i]] > self.totals[self.heap[j]]
+    }
+
+    /// `heap.down`.
+    fn down(&mut self, i0: usize, n: usize) {
         let mut i = i0;
         loop {
             let j1 = 2 * i + 1;
@@ -574,23 +598,40 @@ pub fn select_host(totals: &[i64]) -> Option<usize> {
             }
             let mut j = j1;
             let j2 = j1 + 1;
-            if j2 < n && less(h, j2, j1) {
+            if j2 < n && self.less(j2, j1) {
                 j = j2;
             }
-            if !less(h, j, i) {
+            if !self.less(j, i) {
                 break;
             }
-            h.swap(i, j);
+            self.heap.swap(i, j);
             i = j;
         }
     }
-    let n = h.len();
-    // heap.Init
-    for i in (0..n / 2).rev() {
-        down(&mut h, i, n, &less);
+
+    /// `Len` (`:925-927`).
+    pub fn len(&self) -> usize {
+        self.heap.len()
     }
-    // heap.Pop: swap(0, n-1), down(0, n-1), pop last.
-    h.swap(0, n - 1);
-    down(&mut h, 0, n - 1, &less);
-    h.pop()
+
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    /// `heap.Pop`: swap(0, n-1), down(0, n-1), pop last. The index into the
+    /// list the heap was built from.
+    pub fn pop_index(&mut self) -> Option<usize> {
+        let n = self.heap.len();
+        if n == 0 {
+            return None;
+        }
+        self.heap.swap(0, n - 1);
+        self.down(0, n - 1);
+        self.heap.pop()
+    }
+
+    /// `Pop` (`:914-917`): the name of the best remaining node.
+    pub fn pop(&mut self) -> Option<String> {
+        self.pop_index().map(|i| self.names[i].clone())
+    }
 }
