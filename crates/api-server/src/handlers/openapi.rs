@@ -81,6 +81,16 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
             path_entry("apis/admissionregistration.k8s.io/v1beta1"),
         );
     }
+    // resource.k8s.io/v1alpha3 (DeviceTaintRule) is installed only under the
+    // DRADeviceTaintRules gate (pkg/registry/resource/rest/storage_resource.go).
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::DRADeviceTaintRules,
+    ) {
+        paths.insert(
+            "apis/resource.k8s.io/v1alpha3".into(),
+            path_entry("apis/resource.k8s.io/v1alpha3"),
+        );
+    }
     for (group, version) in &[
         ("apps", "v1"),
         ("batch", "v1"),
@@ -474,6 +484,9 @@ pub(crate) fn upstream_v3_schemas(
         }
         ("resource.k8s.io", "v1") => {
             include_str!("../../openapi/upstream/v1.35/resource.k8s.io__v1.schemas.json")
+        }
+        ("resource.k8s.io", "v1alpha3") => {
+            include_str!("../../openapi/upstream/v1.35/resource.k8s.io__v1alpha3.schemas.json")
         }
         ("scheduling.k8s.io", "v1") => {
             include_str!("../../openapi/upstream/v1.35/scheduling.k8s.io__v1.schemas.json")

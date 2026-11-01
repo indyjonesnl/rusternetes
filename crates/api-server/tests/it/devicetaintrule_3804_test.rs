@@ -58,6 +58,34 @@ async fn not_served_while_the_gate_is_off() {
     assert_eq!(code, StatusCode::NOT_FOUND);
 }
 
+/// The v3 OpenAPI index lists resource.k8s.io/v1alpha3 only while the gate
+/// is on, and its document is upstream's (#3811;
+/// `api/openapi-spec/v3/apis__resource.k8s.io__v1alpha3_openapi.json`).
+#[tokio::test]
+#[serial_test::serial]
+async fn openapi_v3_publishes_v1alpha3_under_the_gate() {
+    let key = "apis/resource.k8s.io/v1alpha3";
+    {
+        let _g = with_feature(Feature::DRADeviceTaintRules, false);
+        let (_, root) = TestApiServer::new().get("/openapi/v3").await;
+        assert!(root["paths"].get(key).is_none());
+    }
+    let _g = with_feature(Feature::DRADeviceTaintRules, true);
+    let api = TestApiServer::new();
+    let (_, root) = api.get("/openapi/v3").await;
+    assert_eq!(
+        root["paths"][key]["serverRelativeURL"],
+        "/openapi/v3/apis/resource.k8s.io/v1alpha3"
+    );
+    let (code, doc) = api.get("/openapi/v3/apis/resource.k8s.io/v1alpha3").await;
+    assert_eq!(code, StatusCode::OK);
+    let schema = &doc["components"]["schemas"]["io.k8s.api.resource.v1alpha3.DeviceTaintRule"];
+    assert_eq!(
+        schema["x-kubernetes-group-version-kind"][0]["kind"],
+        "DeviceTaintRule"
+    );
+}
+
 /// PrepareForCreate: status dropped, generation forced to 1; TimeAdded is
 /// defaulted (SetDefaults_DeviceTaint).
 #[tokio::test]
