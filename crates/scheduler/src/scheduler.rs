@@ -1706,7 +1706,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // still score inline.
                 let feasible_nodes: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
                 let status = fw
-                    .run_pre_score_plugins(&mut cycle_state, pod, &feasible_nodes, all_pods)
+                    .run_pre_score_plugins(
+                        &mut cycle_state,
+                        pod,
+                        &feasible_nodes,
+                        all_pods,
+                        nodes,
+                        &handle,
+                    )
                     .await;
                 if !status.is_success() {
                     diag.scheduling_error = Some(status.message());
@@ -1727,53 +1734,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // `RunScorePlugins`) or a plugin without a compiled-in
                     // scorer.
                     let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::INTER_POD_AFFINITY => {
-                            // interpodaffinity/scoring.go PreScore + Score +
-                            // NormalizeScore. A PreScore `Skip` leaves the
-                            // plugin out of RunScorePlugins.
-                            let namespaces =
-                                if crate::inter_pod_affinity_score::needs_namespaces(pod, all_pods)
-                                {
-                                    match self.data.list_namespaces().await {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            warn!(
-                                                "InterPodAffinity: failed to list namespaces: {}",
-                                                e
-                                            );
-                                            return None;
-                                        }
-                                    }
-                                } else {
-                                    Vec::new()
-                                };
-                            match crate::inter_pod_affinity_score::pre_score(
-                                pod,
-                                nodes,
-                                all_pods,
-                                &namespaces,
-                                &profile.inter_pod_affinity,
-                            ) {
-                                Ok(Some(state)) => {
-                                    let mut v: Vec<i64> = feasible
-                                        .iter()
-                                        .map(|e| {
-                                            crate::inter_pod_affinity_score::score(&state, e.node)
-                                        })
-                                        .collect();
-                                    crate::score::normalize_inter_pod_affinity(&mut v);
-                                    (names::INTER_POD_AFFINITY, Some(v))
-                                }
-                                Ok(None) => (names::INTER_POD_AFFINITY, None),
-                                Err(e) => {
-                                    warn!(
-                                        "running PreScore plugin {:?} failed with: {}",
-                                        plugin, e
-                                    );
-                                    return None;
-                                }
-                            }
-                        }
                         names::POD_TOPOLOGY_SPREAD => {
                             // podtopologyspread/scoring.go PreScore + Score +
                             // NormalizeScore; `Skip` leaves the plugin out.
@@ -2545,6 +2505,12 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
             .get_resource_claim(ns, name)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn list_namespaces(
+        &self,
+    ) -> Result<Vec<rusternetes_common::resources::Namespace>, String> {
+        self.data.list_namespaces().await.map_err(|e| e.to_string())
     }
 
     async fn resource_slices(

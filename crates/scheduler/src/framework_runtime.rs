@@ -499,6 +499,8 @@ pub struct ProfileSpec<'a> {
     pub fit_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
     /// `NodeResourcesBalancedAllocationArgs` as a scorer.
     pub balanced_scorer: Option<&'a crate::score::ResourceAllocationScorer>,
+    /// `InterPodAffinityArgs`, handed to the InterPodAffinity score plugin.
+    pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -607,10 +609,14 @@ impl Framework {
         pod: &Pod,
         nodes: &[&Node],
         all_pods: &[Pod],
+        all_nodes: &[Node],
+        handle: &dyn Handle,
     ) -> Status {
         let mut skip: HashSet<String> = HashSet::new();
         for pl in &self.pre_score_plugin_objects.0 {
-            let s = pl.pre_score(state, pod, nodes, all_pods).await;
+            let s = pl
+                .pre_score(state, pod, nodes, all_pods, all_nodes, handle)
+                .await;
             if s.is_skip() {
                 skip.insert(pl.name().to_string());
                 continue;
@@ -1126,6 +1132,7 @@ fn plugin_args<'a>(profile: &ProfileSpec<'a>) -> crate::in_tree::FilterPluginArg
         added_affinity: profile.added_affinity,
         fit_scorer: profile.fit_scorer,
         balanced_scorer: profile.balanced_scorer,
+        inter_pod_affinity: profile.inter_pod_affinity,
     }
 }
 

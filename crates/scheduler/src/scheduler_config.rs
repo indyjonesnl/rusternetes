@@ -945,6 +945,7 @@ fn resolve_profiles(
                 added_affinity: p.added_affinity.as_ref(),
                 fit_scorer: Some(&p.fit_scorer),
                 balanced_scorer: Some(&p.balanced_scorer),
+                inter_pod_affinity: p.inter_pod_affinity,
             },
         )
         .ok()

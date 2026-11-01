@@ -14,6 +14,7 @@ mod in_tree__node_unschedulable;
 mod in_tree__node_volume_limits;
 mod in_tree__pod_affinity_spread;
 mod in_tree__score_image_locality;
+mod in_tree__score_inter_pod_affinity;
 mod in_tree__score_resources;
 mod in_tree__score_taint_node_affinity;
 mod in_tree__taint_toleration;
