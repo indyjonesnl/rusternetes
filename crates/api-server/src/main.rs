@@ -723,8 +723,16 @@ async fn main() -> Result<()> {
     let service_account = args.service_account.to_options();
     let token_manager = Arc::new(
         TokenManager::new_auto(args.jwt_secret.as_bytes())
-            .with_service_account_options(&service_account)?,
+            .with_service_account_options(&service_account)?
+            .with_external_address(rusternetes_api_server::bootstrap::external_address(
+                rusternetes_api_server::bootstrap::AdvertiseAddress::new(
+                    args.advertise_address,
+                    &args.bind_address,
+                ),
+                &args.bind_address,
+            )?),
     );
+    rusternetes_api_server::log_openid_metadata_status(&token_manager);
 
     // Authorizer chain, shared with the all-in-one entry point (#2679).
     if args.skip_auth {

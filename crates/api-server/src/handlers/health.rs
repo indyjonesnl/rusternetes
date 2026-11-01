@@ -1,5 +1,10 @@
 use crate::state::ApiServerState;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -306,16 +311,15 @@ pub async fn pprof_trace() -> Result<String, (StatusCode, String)> {
 
 /// OpenID Connect discovery endpoint
 /// Returns the OIDC provider metadata for service account issuer discovery
-pub async fn openid_configuration(
-    State(state): State<Arc<ApiServerState>>,
-) -> Json<serde_json::Value> {
+pub async fn openid_configuration(State(state): State<Arc<ApiServerState>>) -> Response {
     // Configured keys: `openIDConfigJSON` (pkg/serviceaccount/openidmetadata.go),
     // honouring --service-account-issuer and --service-account-jwks-uri.
-    if let Some(cfg) = state
-        .token_manager
-        .openid_config_json("https://kubernetes.default.svc.cluster.local/openid/v1/jwks")
-    {
-        return Json(cfg);
+    match state.token_manager.openid_config_json() {
+        Ok(Some(cfg)) => return Json(cfg).into_response(),
+        // `NewOpenIDMetadataProvider` refused (controlplane/apiserver/
+        // server.go:104-125): the endpoints are not installed.
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => {}
     }
     Json(serde_json::json!({
         "issuer": "https://kubernetes.default.svc.cluster.local",
@@ -324,15 +328,21 @@ pub async fn openid_configuration(
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"]
     }))
+    .into_response()
 }
 
 /// JSON Web Key Set endpoint
 /// Returns the public keys used to verify service account tokens.
 /// K8s ref: pkg/serviceaccount/openidmetadata.go — publicJWKSFromKeys
-pub async fn openid_jwks(State(state): State<Arc<ApiServerState>>) -> Json<serde_json::Value> {
+pub async fn openid_jwks(State(state): State<Arc<ApiServerState>>) -> Response {
+    // Both endpoints are installed or skipped together
+    // (controlplane/apiserver/server.go:104-125).
+    if state.token_manager.openid_config_json().is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Configured keys: `openIDKeysetJSON` (--service-account-key-file).
     if let Some(set) = state.token_manager.openid_keyset_json() {
-        return Json(set);
+        return Json(set).into_response();
     }
     // Try to load the RSA public key from standard paths
     let key_paths = [
@@ -343,13 +353,13 @@ pub async fn openid_jwks(State(state): State<Arc<ApiServerState>>) -> Json<serde
     for path in &key_paths {
         if let Ok(pem_data) = std::fs::read(path) {
             if let Some(jwk) = rsa_pem_to_jwk(&pem_data) {
-                return Json(serde_json::json!({ "keys": [jwk] }));
+                return Json(serde_json::json!({ "keys": [jwk] })).into_response();
             }
         }
     }
 
     // No RSA key available — return empty JWKS
-    Json(serde_json::json!({ "keys": [] }))
+    Json(serde_json::json!({ "keys": [] })).into_response()
 }
 
 /// Convert an RSA public key PEM to JWK format for OIDC discovery.

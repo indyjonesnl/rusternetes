@@ -413,6 +413,10 @@ pub struct TokenManager {
     max_token_expiration_seconds: i64,
     /// `--service-account-jwks-uri`.
     jwks_uri: Option<String>,
+    /// `Config.ExternalAddress` (`host:port`), the default host of the
+    /// discovery document's `jwks_uri` (`NewOpenIDMetadataProvider`'s
+    /// `defaultExternalAddress`).
+    external_address: Option<String>,
     /// `--service-account-lookup` (`ServiceAccountLookup`, config.go:69);
     /// defaults to true.
     lookup: bool,
@@ -437,6 +441,7 @@ impl TokenManager {
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
             jwks_uri: None,
+            external_address: None,
             lookup: true,
             extend_expiration: true,
             max_extended_expiration_seconds: EXPIRATION_EXTENSION_SECONDS,
@@ -462,6 +467,7 @@ impl TokenManager {
             api_audiences: Vec::new(),
             max_token_expiration_seconds: 0,
             jwks_uri: None,
+            external_address: None,
             lookup: true,
             extend_expiration: true,
             max_extended_expiration_seconds: EXPIRATION_EXTENSION_SECONDS,
@@ -560,25 +566,84 @@ impl TokenManager {
         Some(serde_json::json!({ "keys": jwks }))
     }
 
-    /// `openIDConfigJSON` (`openidmetadata.go:223-246`): the discovery
-    /// document. `jwks_uri` is `--service-account-jwks-uri`, else
-    /// `default_jwks_uri` (upstream: `https://<external address>/openid/v1/jwks`).
-    pub fn openid_config_json(&self, default_jwks_uri: &str) -> Option<serde_json::Value> {
-        let keys = self.verification_keys();
-        let issuer = self.issuer()?;
-        if keys.is_empty() {
-            return None;
+    /// `Config.ExternalAddress` (server/config.go:700-721), the `host:port`
+    /// that `NewOpenIDMetadataProvider` builds the default `jwks_uri` from.
+    pub fn with_external_address(mut self, external_address: impl Into<String>) -> Self {
+        self.external_address = Some(external_address.into());
+        self
+    }
+
+    /// The checks `NewOpenIDMetadataProvider` runs before it renders the
+    /// discovery responses (`openidmetadata.go:113-179`); returns the
+    /// `jwks_uri` to advertise. The upstream apiserver skips installing the
+    /// endpoints when any of them fails.
+    fn openid_jwks_uri(&self, issuer: &str) -> std::result::Result<String, String> {
+        let iss = url::Url::parse(issuer).map_err(|e| e.to_string())?;
+        if iss.scheme() != "https" {
+            return Err(format!("issuer URL must use https scheme, got: {issuer}"));
         }
+        if iss.query().is_some() {
+            return Err(format!("issuer URL may not include a query, got: {issuer}"));
+        }
+        if iss.fragment().is_some() {
+            return Err(format!(
+                "issuer URL may not include a fragment, got: {issuer}"
+            ));
+        }
+        if let Some(uri) = self.jwks_uri.as_deref() {
+            let u = url::Url::parse(uri).map_err(|e| e.to_string())?;
+            if u.scheme() != "https" {
+                return Err(format!("jwksURI requires https scheme, parsed as: {u}"));
+            }
+            return Ok(uri.to_string());
+        }
+        let msg = |addr: &str, e: &str| {
+            format!(
+                "attempted to build jwks_uri from external address {addr}, but could not construct a valid URL. Error: {e}"
+            )
+        };
+        let addr = self.external_address.as_deref().unwrap_or_default();
+        if addr.is_empty() {
+            return Err(msg(addr, "empty address"));
+        }
+        let built = format!("https://{addr}/openid/v1/jwks");
+        // Sanity check that the jwksURI we produced is the valid URL we
+        // expect (ExternalAddress must be just host + port).
+        let parsed = url::Url::parse(&built).map_err(|e| msg(addr, &e.to_string()))?;
+        let host_port = match (parsed.host_str(), parsed.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            _ => String::new(),
+        };
+        if parsed.path() != "/openid/v1/jwks" || host_port != addr.to_ascii_lowercase() {
+            return Err(msg(addr, &format!("got {parsed}, expected {built}")));
+        }
+        Ok(built)
+    }
+
+    /// `openIDConfigJSON` (`openidmetadata.go:223-246`): the discovery
+    /// document. `Ok(None)` when no issuer or verification keys are
+    /// configured; `Err` when `NewOpenIDMetadataProvider` would refuse, in
+    /// which case upstream does not serve the endpoints.
+    pub fn openid_config_json(&self) -> std::result::Result<Option<serde_json::Value>, String> {
+        let keys = self.verification_keys();
+        let Some(issuer) = self.issuer() else {
+            return Ok(None);
+        };
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let jwks_uri = self.openid_jwks_uri(issuer)?;
         // getAlgs: sorted, de-duplicated.
         let algs: std::collections::BTreeSet<&str> =
             keys.iter().filter_map(|k| k.jwk["alg"].as_str()).collect();
-        Some(serde_json::json!({
+        Ok(Some(serde_json::json!({
             "issuer": issuer,
-            "jwks_uri": self.jwks_uri.as_deref().unwrap_or(default_jwks_uri),
+            "jwks_uri": jwks_uri,
             "response_types_supported": ["id_token"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": algs.into_iter().collect::<Vec<_>>(),
-        }))
+        })))
     }
 
     /// `--service-account-lookup`: whether the legacy token validator looks the

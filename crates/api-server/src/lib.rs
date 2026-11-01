@@ -402,6 +402,22 @@ impl Default for ApiServerConfig {
     }
 }
 
+/// The startup log of `NewOpenIDMetadataProvider`'s failure
+/// (`controlplane/apiserver/server.go:109-123`): an error when an issuer is
+/// set (the operator expects the endpoints), info otherwise.
+pub fn log_openid_metadata_status(token_manager: &TokenManager) {
+    if let Err(e) = token_manager.openid_config_json() {
+        let msg = format!(
+            "Could not construct pre-rendered responses for ServiceAccountIssuerDiscovery endpoints. Endpoints will not be enabled. Error: {e}"
+        );
+        if token_manager.issuer().is_some() {
+            tracing::error!("{msg}");
+        } else {
+            info!("{msg}");
+        }
+    }
+}
+
 /// Run the API server component.
 ///
 /// This is the main entry point for embedding the API server in the all-in-one binary.
@@ -421,8 +437,13 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
 
     let token_manager = Arc::new(
         TokenManager::new_auto(config.jwt_secret.as_bytes())
-            .with_service_account_options(&config.service_account)?,
+            .with_service_account_options(&config.service_account)?
+            .with_external_address(bootstrap::external_address(
+                bootstrap::AdvertiseAddress::new(config.advertise_address, &config.bind_address),
+                &config.bind_address,
+            )?),
     );
+    log_openid_metadata_status(&token_manager);
 
     // `EgressSelectorOptions.Validate` then `ApplyTo`
     // (pkg/server/options/egress_selector.go:80, :55); before the authorizer is
