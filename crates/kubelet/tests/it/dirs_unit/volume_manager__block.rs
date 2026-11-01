@@ -162,7 +162,6 @@ async fn fx() -> Fx {
     let pods = Arc::new(Pods(Mutex::new(vec![pod])));
     let state = Arc::new(Running::default());
     let shell = VolumeManagerShell::new(
-        "node-bk",
         storage,
         pods.clone(),
         state.clone(),

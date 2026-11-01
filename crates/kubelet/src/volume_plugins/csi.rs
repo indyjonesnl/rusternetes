@@ -343,11 +343,8 @@ impl VolumePlugin for CsiPlugin {
                 .as_ref()
                 .and_then(|s| s.service_account_name.clone())
                 .unwrap_or_default(),
-            node_name: pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.clone())
-                .unwrap_or_default(),
+            // `host.GetNodeName()` (`csi_mounter.go:276`).
+            node_name: self.host.get_node_name(),
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
             token_manager: self.host.service_account_token_manager().clone(),
@@ -808,6 +805,7 @@ pub fn make_device_mount_path(
 /// (`csi_attacher.go:254-411`), built by `csiPlugin.NewDeviceMounter`
 /// (`csi_plugin.go:667-669`).
 struct CsiAttacher {
+    host: Arc<dyn VolumeHost>,
     storage: Option<Arc<StorageBackend>>,
     plugin_dir: PathBuf,
 }
@@ -816,6 +814,7 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
     /// `NewDeviceMounter` (`csi_plugin.go:667-669`).
     fn new_device_mounter(&self) -> Result<Box<dyn DeviceMounter>> {
         Ok(Box::new(CsiAttacher {
+            host: self.host.clone(),
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
         }))
@@ -833,6 +832,7 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
     /// same `csiAttacher` `NewDeviceMounter` builds.
     fn new_device_unmounter(&self) -> Result<Box<dyn DeviceUnmounter>> {
         Ok(Box::new(CsiAttacher {
+            host: self.host.clone(),
             storage: self.host.get_kube_client().cloned(),
             plugin_dir: plugin_dir(self.host.get_volumes_base_path()),
         }))
@@ -940,7 +940,7 @@ impl DeviceMounter for CsiAttacher {
             self.storage.as_ref(),
             driver.as_ref(),
             &pv_src.driver,
-            &args.node_name,
+            &self.host.get_node_name(),
             &handle,
         )
         .await
@@ -1649,14 +1649,13 @@ impl CsiPlugin {
     /// error, after refreshing the CSINode allocatable count
     /// (`updateCSIDriver`, `csi_node_updater::update_csi_driver`).
     ///
-    /// Deliberate expression difference: upstream reads `p.host.GetNodeName()`
-    /// and the package-level `nim` / `csiDrivers`; `VolumeHost` here has no node
-    /// name and those are not globals on `CsiPlugin`, so the caller passes them.
+    /// Deliberate expression difference: upstream reads the package-level
+    /// `nim` / `csiDrivers`, which are not globals on `CsiPlugin`, so the
+    /// caller passes them. The node name is `p.host.GetNodeName()`.
     /// Like upstream every failure is logged and reads as `false`.
     pub async fn verify_exhausted_resource(
         &self,
         spec: &Spec<'_>,
-        node_name: &str,
         drivers: &crate::volume_plugins::csi_drivers_store::DriversStore,
         nim: &dyn crate::volume_plugins::nodeinfomanager::NodeInfoInstaller,
     ) -> bool {
@@ -1686,7 +1685,8 @@ impl CsiPlugin {
         }
 
         let volume_handle = csi.volume_handle.as_deref().unwrap_or_default();
-        let attachment_name = get_attachment_name(volume_handle, plugin_name, node_name);
+        let attachment_name =
+            get_attachment_name(volume_handle, plugin_name, &self.host.get_node_name());
         let Some(storage) = self.host.get_kube_client() else {
             error!("Failed to get volume attachment {attachment_name}: no kubernetes client");
             return false;

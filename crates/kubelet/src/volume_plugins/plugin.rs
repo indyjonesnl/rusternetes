@@ -235,15 +235,10 @@ pub struct ReconstructedVolume {
 ///
 /// `selinux_label` is `SELinuxLabel`: with `SELinuxMountReadWriteOncePod` the
 /// CSI attacher adds it to the stage mount flags as `-o context=`.
-///
-/// **Deviation:** `node_name` is not upstream. Upstream's attacher reads it
-/// from `host.GetNodeName()` (`csi_attacher.go:297`); our `VolumeHost` has no
-/// node-name accessor, so the caller passes it here.
 #[derive(Clone, Debug, Default)]
 pub struct DeviceMounterArgs {
     pub fs_group: Option<i64>,
     pub selinux_label: String,
-    pub node_name: String,
 }
 
 /// Port of `volume.DeviceMounter` (`pkg/volume/volume.go:296-311`): mounts a

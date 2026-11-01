@@ -877,7 +877,6 @@ impl Kubelet {
             Arc::new(Mutex::new(HashMap::new()));
         let pods_synced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let volume_manager = Arc::new(crate::volume_manager::VolumeManager::new(
-            &node_name,
             storage.clone(),
             pod_cache.clone(),
             Arc::new(KubeletPodStateProvider {

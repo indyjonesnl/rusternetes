@@ -91,9 +91,8 @@ struct CsiBlockMapper {
     spec: Option<OwnedSpec>,
     pod: Option<Pod>,
     pod_uid: String,
-    /// `m.plugin.host.GetNodeName()` (`csi_block.go:272`, `:337`). `VolumeHost`
-    /// here has no node name (see `verify_exhausted_resource`), so it is read
-    /// off the pod the mapper was built for, as `CsiMounter` does.
+    /// `m.plugin.host.GetNodeName()` (`csi_block.go:272`, `:337`), read when
+    /// the mapper is built.
     node_name: String,
 }
 
@@ -128,11 +127,8 @@ impl BlockVolumePlugin for CsiPlugin {
         };
 
         let spec_name = CsiPlugin::spec_name(spec);
-        let node_name = pod
-            .spec
-            .as_ref()
-            .and_then(|s| s.node_name.clone())
-            .unwrap_or_default();
+        // `m.plugin.host.GetNodeName()` (`csi_block.go:302`, `:364`).
+        let node_name = self.host.get_node_name();
         let mapper = CsiBlockMapper {
             storage: Some(storage),
             plugin: CsiPlugin::new(self.host.clone()),
