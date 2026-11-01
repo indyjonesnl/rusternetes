@@ -2,6 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use crate::preempt_support::check_preemption;
     pub use rusternetes_common::affinity::{
         check_node_affinity, check_pod_anti_affinity, match_selector, matches_pod_affinity_term,
     };
@@ -412,10 +413,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_preemption_policy_never_should_not_preempt() {
+    #[tokio::test]
+    async fn test_preemption_policy_never_should_not_preempt() {
         // Node with 2 CPUs
-        let node = make_node("node-1", "2", "4Gi");
+        let mut node = make_node("node-1", "2", "4Gi");
+        for q in node
+            .status
+            .iter_mut()
+            .filter_map(|s| s.allocatable.as_mut())
+        {
+            q.insert("pods".to_string(), "110".to_string());
+        }
 
         // Existing low-priority pod using 1 CPU on node-1
         let existing = make_scheduled_pod("low-pri-pod", 100, "1", "1Gi", "node-1");
@@ -423,15 +431,22 @@ mod tests {
         // Incoming high-priority pod with preemptionPolicy=Never
         let incoming = make_incoming_pod("high-pri-pod", 1000, "2", "2Gi", Some("Never"));
 
-        let (can_preempt, pods_to_evict) = check_preemption(&node, &incoming, &[existing]);
+        let scheduler = rusternetes_scheduler::scheduler::Scheduler::new_with_name(
+            std::sync::Arc::new(rusternetes_storage::memory::MemoryStorage::new()),
+            1,
+            "default-scheduler".to_string(),
+        );
+        let diag = rusternetes_scheduler::diagnosis::Diagnosis {
+            absent_nodes_code: Some(rusternetes_scheduler::fwk::Code::Unschedulable),
+            ..Default::default()
+        };
+        let preempted = scheduler
+            .try_preempt(&incoming, &[node], &[existing], &HashMap::new(), &[], &diag)
+            .await;
 
         assert!(
-            !can_preempt,
-            "Pod with preemptionPolicy=Never should not preempt"
-        );
-        assert!(
-            pods_to_evict.is_empty(),
-            "No pods should be evicted when preemptionPolicy=Never"
+            preempted.is_none(),
+            "Pod with preemptionPolicy=Never should not preempt and evicts no pods"
         );
     }
 
@@ -1054,6 +1069,15 @@ mod tests {
         )
     }
 
+    /// How many of `victims` break a budget: `numViolatingVictim` is this count
+    /// over the victims `select_victims_on_node` chooses.
+    fn pdb_violations(victims: &[Pod], all_pods: &[Pod], pdbs: &[PodDisruptionBudget]) -> i64 {
+        victims
+            .iter()
+            .filter(|v| pod_violates_any_pdb(v, pdbs, all_pods))
+            .count() as i64
+    }
+
     fn labelled_pod(name: &str, priority: i32, node: &str, app: &str) -> Pod {
         let mut pod = make_scheduled_pod(name, priority, "100m", "64Mi", node);
         pod.metadata.namespace = Some("default".to_string());
@@ -1064,25 +1088,25 @@ mod tests {
     }
 
     #[test]
-    fn test_count_pdb_violating_victims_zero_without_budgets() {
+    fn test_pod_violates_any_pdb_zero_without_budgets() {
         let pods = vec![labelled_pod("a", 100, "node-1", "web")];
         assert_eq!(
-            count_pdb_violating_victims(&pods[..1], &pods, &[]),
+            pdb_violations(&pods[..1], &pods, &[]),
             0,
             "no budgets means nothing can violate one"
         );
     }
 
     #[test]
-    fn test_count_pdb_violating_victims_counts_covered_pod() {
+    fn test_pod_violates_any_pdb_counts_covered_pod() {
         // One replica, minAvailable=1: evicting it breaks the budget.
         let pods = vec![labelled_pod("only-web", 100, "node-1", "web")];
         let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(count_pdb_violating_victims(&pods[..1], &pods, &pdbs), 1,);
+        assert_eq!(pdb_violations(&pods[..1], &pods, &pdbs), 1,);
     }
 
     #[test]
-    fn test_count_pdb_violating_victims_ignores_uncovered_pod() {
+    fn test_pod_violates_any_pdb_ignores_uncovered_pod() {
         // The budget selects app=web; the victim is app=batch.
         let pods = vec![
             labelled_pod("web-1", 100, "node-1", "web"),
@@ -1090,11 +1114,11 @@ mod tests {
             labelled_pod("batch-1", 100, "node-1", "batch"),
         ];
         let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(count_pdb_violating_victims(&pods[2..], &pods, &pdbs), 0,);
+        assert_eq!(pdb_violations(&pods[2..], &pods, &pdbs), 0,);
     }
 
     #[test]
-    fn test_count_pdb_violating_victims_sums_across_victims() {
+    fn test_pod_violates_any_pdb_sums_across_victims() {
         let pods = vec![
             labelled_pod("web-1", 100, "node-1", "web"),
             labelled_pod("api-1", 100, "node-1", "api"),
@@ -1103,7 +1127,7 @@ mod tests {
             make_pdb_min_available("web-pdb", "default", "web", 1),
             make_pdb_min_available("api-pdb", "default", "api", 1),
         ];
-        assert_eq!(count_pdb_violating_victims(&pods, &pods, &pdbs), 2,);
+        assert_eq!(pdb_violations(&pods, &pods, &pdbs), 2,);
     }
 
     #[test]
@@ -1120,12 +1144,12 @@ mod tests {
             PreemptionCandidate {
                 node_name: "node-1".to_string(),
                 victims: vec![pods[0].clone()],
-                num_pdb_violations: count_pdb_violating_victims(&pods[..1], &pods, &pdbs),
+                num_pdb_violations: pdb_violations(&pods[..1], &pods, &pdbs),
             },
             PreemptionCandidate {
                 node_name: "node-2".to_string(),
                 victims: vec![pods[1].clone()],
-                num_pdb_violations: count_pdb_violating_victims(&pods[1..], &pods, &pdbs),
+                num_pdb_violations: pdb_violations(&pods[1..], &pods, &pdbs),
             },
         ];
         assert_eq!(

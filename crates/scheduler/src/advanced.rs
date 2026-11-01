@@ -1,7 +1,6 @@
 use rusternetes_common::quantity::parse_resource_value;
 use rusternetes_common::resources::{
-    IntOrString, Node, Pod, PodDisruptionBudget, PriorityClass, Taint, Toleration,
-    TopologySpreadConstraint,
+    IntOrString, Node, Pod, PodDisruptionBudget, Taint, Toleration, TopologySpreadConstraint,
 };
 use std::collections::HashMap;
 use tracing::debug;
@@ -581,10 +580,6 @@ pub fn non_zero_request_amounts(pod: &Pod) -> (i64, i64) {
     )
 }
 
-/// System-critical priority threshold. Pods at or above this priority
-/// can only be preempted by pods with strictly higher priority.
-const SYSTEM_CRITICAL_PRIORITY: i32 = 2_000_000_000;
-
 /// Is this pod allowed to preempt *again*?
 ///
 /// A pod that has already preempted carries `status.nominatedNodeName`, and its
@@ -690,13 +685,12 @@ fn pod_terminating_by_preemption(p: &Pod) -> bool {
 #[derive(Debug, Clone)]
 pub struct PreemptionCandidate {
     pub node_name: String,
-    /// Victim pod objects, as returned by [`select_preemption_victims`]
-    /// (upstream `extenderv1.Victims.Pods`).
+    /// Victim pod objects, as returned by
+    /// [`crate::default_preemption::select_victims_on_node`] (upstream
+    /// `extenderv1.Victims.Pods`).
     pub victims: Vec<Pod>,
-    /// How many of those victims violate a PodDisruptionBudget. The live
-    /// scheduling path calls the PDB-unaware [`check_preemption`], so this is
-    /// currently always 0 there; the field exists so the score chain is the
-    /// real one and becomes correct the moment PDBs are threaded through.
+    /// How many of those victims violate a PodDisruptionBudget
+    /// (`numViolatingVictim` of `SelectVictimsOnNode`).
     pub num_pdb_violations: i64,
 }
 
@@ -742,7 +736,7 @@ pub fn pick_one_node_for_preemption(candidates: &[PreemptionCandidate]) -> Optio
     // Highest victim priority on a candidate. Upstream reads
     // `nodesToVictims[node].Pods[0]` because its victim list is sorted
     // highest-priority-first; we take the max explicitly rather than depend on
-    // check_preemption's ordering.
+    // the victim order.
     let highest_victim_priority =
         |c: &PreemptionCandidate| -> i32 { c.victims.iter().map(&priority_of).max().unwrap_or(0) };
 
@@ -798,44 +792,6 @@ pub fn pick_one_node_for_preemption(candidates: &[PreemptionCandidate]) -> Optio
     remaining.first().map(|c| c.node_name.clone())
 }
 
-/// Check if preemption should occur and return pods to evict.
-///
-/// This is the PDB-unaware entry point retained for callers that don't have
-/// PodDisruptionBudgets loaded. Equivalent to
-/// `check_preemption_with_pdbs(node, pod, all_pods, &[], &HashMap::new())`.
-///
-/// Returns (should_preempt, pods_to_evict).
-///
-/// Passes an empty PriorityClass map, so the `preemptionPolicy: Never` check
-/// honours only the pod's own `spec.preemptionPolicy` (no class fallback) — its
-/// callers don't load PriorityClasses. Use [`check_preemption_with_pdbs`] with a
-/// populated map when the class fallback is needed.
-pub fn check_preemption(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (bool, Vec<String>) {
-    check_preemption_with_pdbs(node, pod, all_pods, &[], &HashMap::new())
-}
-
-/// PDB-aware preemption victim selection.
-///
-/// The base algorithm (resource-fit, lowest-priority-first eviction with the
-/// "remove all, then reprieve" reprieve pass) is identical to
-/// `check_preemption`. After candidate victims are chosen, we run a second
-/// reprieve pass that swaps PDB-covered victims for non-PDB-covered candidates
-/// when resources still fit. This mirrors upstream Kubernetes' behavior at
-/// `pkg/scheduler/framework/preemption/preemption.go::selectVictimsOnNode`,
-/// which sorts candidates so that PDB-violating evictions are picked last.
-///
-/// Returns (should_preempt, pods_to_evict).
-pub fn check_preemption_with_pdbs(
-    node: &Node,
-    pod: &Pod,
-    all_pods: &[Pod],
-    pdbs: &[PodDisruptionBudget],
-    priority_classes: &HashMap<String, PriorityClass>,
-) -> (bool, Vec<String>) {
-    let (ok, victims) = select_preemption_victims(node, pod, all_pods, pdbs, priority_classes);
-    (ok, victims.into_iter().map(|v| v.metadata.name).collect())
-}
-
 /// Identity of a pod for preemption bookkeeping: its UID, falling back to
 /// `namespace/name` for pods that carry none (unit-test fixtures).
 ///
@@ -854,341 +810,8 @@ pub fn pod_key(p: &Pod) -> String {
     )
 }
 
-/// Victim selection returning the victim pod *objects*, as upstream's
-/// `SelectVictimsOnNode` returns `[]*v1.Pod`
-/// (pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:207-213).
-/// The caller deletes by `pod.Namespace`/`pod.Name` like
-/// `util.DeletePod` (pkg/scheduler/util/utils.go:137-138).
-///
-/// Returns (should_preempt, victims).
-pub fn select_preemption_victims(
-    node: &Node,
-    pod: &Pod,
-    all_pods: &[Pod],
-    pdbs: &[PodDisruptionBudget],
-    priority_classes: &HashMap<String, PriorityClass>,
-) -> (bool, Vec<Pod>) {
-    // Get the priority of the incoming pod
-    let incoming_priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
-
-    // If incoming pod has priority <= 0, don't preempt
-    if incoming_priority <= 0 {
-        return (false, vec![]);
-    }
-
-    // Check preemptionPolicy — if "Never", do not preempt. Fall back to the
-    // PriorityClass's policy when the pod spec doesn't carry one (mirrors
-    // scheduler.rs::try_preempt: admission normally copies the class policy
-    // onto the pod, but pods written directly to storage may miss it).
-    let preemption_policy = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.preemption_policy.as_deref())
-        .or_else(|| {
-            pod.spec
-                .as_ref()
-                .and_then(|s| s.priority_class_name.as_deref())
-                .and_then(|name| priority_classes.get(name))
-                .and_then(|pc| pc.preemption_policy.as_deref())
-        })
-        .unwrap_or("PreemptLowerPriority");
-    if preemption_policy == "Never" {
-        debug!(
-            "Pod {} has preemptionPolicy=Never, skipping preemption",
-            pod.metadata.name
-        );
-        return (false, vec![]);
-    }
-
-    // Find all non-terminal pods on this node (K8s considers Pending and
-    // Running pods as resource consumers and potential preemption victims).
-    // Only skip terminal pods (Succeeded/Failed) and pods already terminating.
-    let node_pods: Vec<&Pod> = all_pods
-        .iter()
-        .filter(|p| {
-            let on_this_node = p
-                .spec
-                .as_ref()
-                .and_then(|s| s.node_name.as_ref())
-                .map(|n| n == &node.metadata.name)
-                .unwrap_or(false);
-            if !on_this_node {
-                return false;
-            }
-            // Skip terminal pods (Succeeded/Failed) and terminating pods
-            let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-            if matches!(
-                phase,
-                Some(rusternetes_common::types::Phase::Succeeded)
-                    | Some(rusternetes_common::types::Phase::Failed)
-            ) {
-                return false;
-            }
-            p.metadata.deletion_timestamp.is_none()
-        })
-        .collect();
-
-    // Find pods with lower priority that could be evicted
-    // System-critical pods (priority >= 2000000000) are protected:
-    // only pods with strictly higher priority may preempt them.
-    let mut candidates: Vec<(&Pod, i32)> = node_pods
-        .iter()
-        .filter_map(|p| {
-            let pod_priority = p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
-            if pod_priority >= incoming_priority {
-                return None; // Can't evict equal or higher priority
-            }
-            // Protect system-critical pods — only strictly higher priority can preempt
-            if pod_priority >= SYSTEM_CRITICAL_PRIORITY && incoming_priority <= pod_priority {
-                return None;
-            }
-            Some((*p, pod_priority))
-        })
-        .collect();
-
-    // If no candidates, can't preempt
-    if candidates.is_empty() {
-        return (false, vec![]);
-    }
-
-    // Sort by priority (lowest first) for eviction
-    candidates.sort_by_key(|(_, priority)| *priority);
-
-    // Calculate ALL resources needed by incoming pod (cpu, memory, AND extended resources)
-    // K8s preemption considers all resource types, not just cpu/memory.
-    // See: pkg/scheduler/framework/preemption/preemption.go
-    let mut resources_needed: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
-    for (key, amount) in pod_request_amounts(pod) {
-        *resources_needed.entry(key).or_insert(0) += amount;
-    }
-
-    // Get node's total allocatable resources (all types)
-    let allocatable: &std::collections::HashMap<String, String> =
-        match node.status.as_ref().and_then(|s| s.allocatable.as_ref()) {
-            Some(a) => a,
-            None => return (false, vec![]),
-        };
-    let mut total_resources: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
-    for (key, val) in allocatable {
-        total_resources.insert(key.clone(), parse_resource_quantity(val, key));
-    }
-
-    // If the pod can't fit even on a completely empty node, preemption won't help
-    for (key, needed) in &resources_needed {
-        let total = total_resources.get(key).copied().unwrap_or(0);
-        if *needed > total {
-            return (false, vec![]);
-        }
-    }
-
-    // Calculate resources used by ALL pods on this node (including non-candidates)
-    let mut total_used: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for p in &node_pods {
-        for (key, amount) in pod_request_amounts(p) {
-            *total_used.entry(key).or_insert(0) += amount;
-        }
-    }
-
-    // Current remaining resources (before any eviction)
-    let remaining = |key: &str| -> i64 {
-        let total = total_resources.get(key).copied().unwrap_or(0);
-        let used = total_used.get(key).copied().unwrap_or(0);
-        total - used
-    };
-
-    // Check if all resources fit without eviction
-    let all_fit = resources_needed
-        .iter()
-        .all(|(key, needed)| remaining(key) >= *needed);
-    if all_fit {
-        return (true, vec![]);
-    }
-
-    // K8s preemption algorithm: "remove all, then reprieve"
-    // 1. Remove ALL lower-priority candidates and check if pod fits
-    // 2. If it doesn't fit even with all removed → node not suitable
-    // 3. Try to add back (reprieve) candidates from highest to lowest priority
-    // 4. If adding a candidate back still lets the pod fit → reprieve it
-    // 5. Final victims = candidates that could NOT be reprieved
-    // See: pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:233-300
-
-    // Calculate total freed resources if ALL candidates are evicted
-    let mut total_freed: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for (candidate_pod, _) in &candidates {
-        for (key, amount) in pod_request_amounts(candidate_pod) {
-            *total_freed.entry(key).or_insert(0) += amount;
-        }
-    }
-
-    // Check if pod fits even with ALL candidates removed
-    let fits_without_all = resources_needed.iter().all(|(key, needed)| {
-        let rem = remaining(key);
-        let free = total_freed.get(key).copied().unwrap_or(0);
-        (rem + free) >= *needed
-    });
-    if !fits_without_all {
-        return (false, vec![]);
-    }
-
-    // Sort candidates by DESCENDING priority (highest first) for reprieve pass
-    // K8s tries to reprieve higher-priority pods first
-    let mut candidates_for_reprieve = candidates.clone();
-    candidates_for_reprieve.sort_by_key(|(_, priority)| std::cmp::Reverse(*priority));
-
-    // Track which candidates are victims (start with all as victims)
-    let mut reprieved: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Try to reprieve each candidate (highest priority first)
-    for (candidate_pod, _) in &candidates_for_reprieve {
-        // Calculate resources freed by all NON-reprieved candidates (excluding this one)
-        let mut freed_without_this: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for (other_pod, _) in &candidates {
-            if pod_key(other_pod) == pod_key(candidate_pod) {
-                continue; // Skip the candidate we're trying to reprieve
-            }
-            if reprieved.contains(&pod_key(other_pod)) {
-                continue; // Skip already-reprieved pods
-            }
-            for (key, amount) in pod_request_amounts(other_pod) {
-                *freed_without_this.entry(key).or_insert(0) += amount;
-            }
-        }
-
-        // Check if pod still fits without evicting this candidate
-        let fits_without = resources_needed.iter().all(|(key, needed)| {
-            let rem = remaining(key);
-            let free = freed_without_this.get(key).copied().unwrap_or(0);
-            (rem + free) >= *needed
-        });
-
-        if fits_without {
-            // Pod fits without evicting this candidate → reprieve it
-            reprieved.insert(pod_key(candidate_pod));
-        }
-        // else: must evict this candidate
-    }
-
-    // PDB-aware reprieve: if any PDBs are supplied, re-run the reprieve pass
-    // with PDB-covered candidates considered FIRST. The reprieve pass favors
-    // keeping candidates that are visited early (they get their "fits without
-    // me?" check while the rest of the candidates are still presumed to be
-    // evicted, which gives them the best chance of being reprieved). Visiting
-    // PDB-covered candidates first therefore biases the algorithm toward
-    // evicting PDB-free pods. This mirrors the upstream Kubernetes scheduler's
-    // dryRunPreemption/selectVictimsOnNode preference for non-PDB-violating
-    // victims at pkg/scheduler/framework/preemption/preemption.go.
-    if !pdbs.is_empty() {
-        let pdb_covered: std::collections::HashSet<String> = candidates
-            .iter()
-            .filter(|(p, _)| pod_violates_any_pdb(p, pdbs, all_pods))
-            .map(|(p, _)| pod_key(p))
-            .collect();
-
-        let mut pdb_aware_order = candidates.clone();
-        // Primary key: PDB-covered first (reverse: true → 0, false → 1).
-        // Secondary key: highest priority first (existing behavior).
-        pdb_aware_order.sort_by_key(|(p, priority)| {
-            let covered = pdb_covered.contains(&pod_key(p));
-            (if covered { 0 } else { 1 }, std::cmp::Reverse(*priority))
-        });
-
-        let mut reprieved_pdb: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (candidate_pod, _) in &pdb_aware_order {
-            let mut freed_without_this: std::collections::HashMap<String, i64> =
-                std::collections::HashMap::new();
-            for (other_pod, _) in &candidates {
-                if pod_key(other_pod) == pod_key(candidate_pod) {
-                    continue;
-                }
-                if reprieved_pdb.contains(&pod_key(other_pod)) {
-                    continue;
-                }
-                for (key, amount) in pod_request_amounts(other_pod) {
-                    *freed_without_this.entry(key).or_insert(0) += amount;
-                }
-            }
-
-            let fits_without = resources_needed.iter().all(|(key, needed)| {
-                let rem = remaining(key);
-                let free = freed_without_this.get(key).copied().unwrap_or(0);
-                (rem + free) >= *needed
-            });
-
-            if fits_without {
-                reprieved_pdb.insert(pod_key(candidate_pod));
-            }
-        }
-
-        reprieved = reprieved_pdb;
-    }
-
-    // Collect final victims (candidates that were NOT reprieved)
-    let pods_to_evict: Vec<Pod> = candidates
-        .iter()
-        .filter(|(p, _)| !reprieved.contains(&pod_key(p)))
-        .map(|(p, _)| (*p).clone())
-        .collect();
-
-    if pods_to_evict.is_empty() {
-        // All candidates were reprieved — pod fits without any eviction
-        return (true, vec![]);
-    }
-
-    debug!(
-        "Preemption possible on node {}: evicting {} pods (reprieved {})",
-        node.metadata.name,
-        pods_to_evict.len(),
-        reprieved.len()
-    );
-    (true, pods_to_evict)
-}
-
-/// Returns true if evicting `victim` would violate any of the supplied PDBs.
-///
-/// Conservative definition: any PDB whose selector matches the victim's labels
-/// is considered to cover it. If the PDB's `minAvailable` is an integer, we
-/// compare against the current count of running matching pods; if removing
-/// `victim` drops the count below `minAvailable`, eviction is a violation.
-/// Percentage minAvailable values are also evaluated against the current
-/// matching population. `maxUnavailable` is treated as "1 disruption allowed"
-/// from the current matching set (we don't track historical disruptions here).
-/// How many of `victims` would break a PodDisruptionBudget if evicted.
-///
-/// Feeds [`PreemptionCandidate::num_pdb_violations`], which is the first of
-/// upstream's victim-node score functions — `minNumPDBViolatingScoreFunc` in
-/// `pickOneNodeForPreemption`
-/// (pkg/scheduler/framework/preemption/preemption.go:662-665), scoring
-/// `-nodesToVictims[node].NumPDBViolations`.
-///
-/// Upstream counts violations while *selecting* victims
-/// (`selectVictimsOnNode` returns `numViolatingVictim` alongside the list); our
-/// [`check_preemption_with_pdbs`] returns only the names, so the count is
-/// recomputed here over the victims it chose. Same inputs, same predicate
-/// ([`pod_violates_any_pdb`]) — so the number agrees with the selection that
-/// produced it.
-///
-pub fn count_pdb_violating_victims(
-    victims: &[Pod],
-    all_pods: &[Pod],
-    pdbs: &[PodDisruptionBudget],
-) -> i64 {
-    if pdbs.is_empty() {
-        return 0;
-    }
-    victims
-        .iter()
-        .filter(|victim| pod_violates_any_pdb(victim, pdbs, all_pods))
-        .count() as i64
-}
-
-pub(crate) fn pod_violates_any_pdb(
-    victim: &Pod,
-    pdbs: &[PodDisruptionBudget],
-    all_pods: &[Pod],
-) -> bool {
+/// Whether evicting `victim` breaks a PodDisruptionBudget that covers it.
+pub fn pod_violates_any_pdb(victim: &Pod, pdbs: &[PodDisruptionBudget], all_pods: &[Pod]) -> bool {
     for pdb in pdbs {
         if !pdb_covers_pod(pdb, victim) {
             continue;

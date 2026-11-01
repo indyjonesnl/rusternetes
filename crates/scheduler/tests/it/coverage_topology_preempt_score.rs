@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 
+use crate::preempt_support::{check_preemption, check_preemption_with_pdbs};
 use rusternetes_common::resources::{
     Container, ContainerPort, IntOrString, Node, NodeStatus, Pod, PodDisruptionBudget,
     PodDisruptionBudgetSpec, PodSpec, PodStatus, TopologySpreadConstraint,
@@ -24,7 +25,7 @@ use rusternetes_common::resources::{
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
 use rusternetes_scheduler::advanced::{
     calculate_resource_score, calculate_resource_score_with_pods, check_host_port_conflicts,
-    check_preemption, check_preemption_with_pdbs, check_topology_spread_constraints,
+    check_topology_spread_constraints,
 };
 
 // ---------------------------------------------------------------------------
@@ -957,9 +958,11 @@ fn preemption_policy_never_is_respected() {
     let mut preemptor = incoming_pod("nice", 1000, "1", "1Gi");
     preemptor.spec.as_mut().unwrap().preemption_policy = Some("Never".to_string());
 
-    let (ok, victims) = check_preemption(&node, &preemptor, &[victim]);
-    assert!(!ok, "preemptionPolicy=Never must not preempt");
-    assert!(victims.is_empty());
+    let preempted = crate::preempt_support::try_preempt(&node, &preemptor, &[victim]);
+    assert!(
+        preempted.is_none(),
+        "preemptionPolicy=Never must not preempt; got {preempted:?}"
+    );
 }
 
 /// system-cluster-critical pod (priority 2_000_000_000) cannot be preempted by lower priority.
@@ -1098,13 +1101,7 @@ fn preemption_pdb_covered_pod_protected_when_alternative_exists() {
     let all_pods = vec![p1, p2];
     let preemptor = incoming_pod("high", 1000, "1", "1Gi");
 
-    let (ok, victims) = check_preemption_with_pdbs(
-        &node,
-        &preemptor,
-        &all_pods,
-        &[pdb],
-        &std::collections::HashMap::new(),
-    );
+    let (ok, victims) = check_preemption_with_pdbs(&node, &preemptor, &all_pods, &[pdb]);
     assert!(ok, "preemption must succeed — p2 can be evicted");
     assert!(
         victims.contains(&"p2-free".to_string()),
@@ -1167,13 +1164,7 @@ fn preemption_pdb_covered_pod_reprieved_when_non_pdb_victim_suffices() {
     let preemptor = incoming_pod("high", 1000, "2", "1Gi");
     let all_pods = vec![p_pdb, p_free];
 
-    let (ok, victims) = check_preemption_with_pdbs(
-        &node,
-        &preemptor,
-        &all_pods,
-        &[pdb],
-        &std::collections::HashMap::new(),
-    );
+    let (ok, victims) = check_preemption_with_pdbs(&node, &preemptor, &all_pods, &[pdb]);
     assert!(ok, "preemption must succeed — p-free can be evicted");
     assert!(
         victims.contains(&"p-free".to_string()),

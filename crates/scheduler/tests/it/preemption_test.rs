@@ -17,11 +17,11 @@
 
 use std::collections::HashMap;
 
+use crate::preempt_support::check_preemption_with_pdbs;
 use rusternetes_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
-use rusternetes_scheduler::advanced::check_preemption_with_pdbs;
 
 fn make_container(cpu: &str, memory: &str) -> Container {
     let mut requests = HashMap::new();
@@ -163,13 +163,7 @@ fn preemption_prefers_non_pdb_victim_when_possible() {
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
     let all_pods = vec![rs1, rs2, rs3, filler];
-    let (can_preempt, victims) = check_preemption_with_pdbs(
-        &node,
-        &incoming,
-        &all_pods,
-        &[pdb],
-        &std::collections::HashMap::new(),
-    );
+    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
 
     assert!(can_preempt, "Preemption should succeed");
     assert_eq!(
@@ -228,13 +222,7 @@ fn preemption_minimizes_pdb_victim_count() {
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
     let all_pods = vec![rs1, rs2, rs3];
-    let (can_preempt, victims) = check_preemption_with_pdbs(
-        &node,
-        &incoming,
-        &all_pods,
-        &[pdb],
-        &std::collections::HashMap::new(),
-    );
+    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
 
     assert!(
         can_preempt,
@@ -268,13 +256,7 @@ fn preemption_without_pdb_matches_legacy_behavior() {
 
     let incoming = make_incoming_pod("high-pri", 1000, "1", "1Gi");
 
-    let (can_preempt, victims) = check_preemption_with_pdbs(
-        &node,
-        &incoming,
-        &[p1, p2],
-        &[],
-        &std::collections::HashMap::new(),
-    );
+    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &[p1, p2], &[]);
 
     assert!(can_preempt);
     assert_eq!(
@@ -287,16 +269,28 @@ fn preemption_without_pdb_matches_legacy_behavior() {
 
 /// PriorityClass `preemptionPolicy: Never` fallback (#1111). A pod whose spec
 /// omits `preemptionPolicy` but references a class with `Never` must NOT preempt
-/// — `check_preemption_with_pdbs` falls back to the class policy via the
-/// PriorityClass map, mirroring `scheduler.rs::try_preempt`. The empty-map case
-/// (no fallback available) confirms the victim would otherwise be preempted, so
-/// it is the class fallback — not some other guard — that blocks it.
-#[test]
-fn preemption_falls_back_to_priorityclass_never_policy() {
+/// — `try_preempt` falls back to the class policy via the PriorityClass map.
+/// The empty-map case (no fallback available) confirms the victim would
+/// otherwise be preempted, so it is the class fallback — not some other guard —
+/// that blocks it.
+#[tokio::test]
+async fn preemption_falls_back_to_priorityclass_never_policy() {
     use rusternetes_common::resources::PriorityClass;
+    use rusternetes_scheduler::diagnosis::Diagnosis;
+    use rusternetes_scheduler::fwk::Code;
+    use rusternetes_scheduler::scheduler::Scheduler;
+    use rusternetes_storage::memory::MemoryStorage;
+    use std::sync::Arc;
 
     // Node with room for exactly one unit pod, currently full.
-    let node = make_node("node-1", "1", "1Gi");
+    let mut node = make_node("node-1", "1", "1Gi");
+    for q in node
+        .status
+        .iter_mut()
+        .filter_map(|s| s.allocatable.as_mut())
+    {
+        q.insert("pods".to_string(), "110".to_string());
+    }
     let victim = make_pod_with_labels("victim", 100, "1", "1Gi", "node-1", None);
 
     // Incoming high-priority pod: spec.preemptionPolicy is unset; it references
@@ -310,25 +304,42 @@ fn preemption_falls_back_to_priorityclass_never_policy() {
     let mut pcs = std::collections::HashMap::new();
     pcs.insert("no-preempt".to_string(), never_class);
 
+    let scheduler = Scheduler::new_with_name(
+        Arc::new(MemoryStorage::new()),
+        1,
+        "default-scheduler".to_string(),
+    );
+    // The node failed the cycle with Unschedulable, so preemption may help.
+    let diag = Diagnosis {
+        absent_nodes_code: Some(Code::Unschedulable),
+        ..Default::default()
+    };
+    let nodes = [node];
+    let pods = [victim];
+
     // With the class map: the Never policy is resolved via the fallback → no preempt.
-    let (can_preempt, victims) =
-        check_preemption_with_pdbs(&node, &incoming, std::slice::from_ref(&victim), &[], &pcs);
+    let blocked = scheduler
+        .try_preempt(&incoming, &nodes, &pods, &pcs, &[], &diag)
+        .await;
     assert!(
-        !can_preempt && victims.is_empty(),
-        "preemptionPolicy=Never from the PriorityClass must block preemption; got can_preempt={can_preempt} victims={victims:?}"
+        blocked.is_none(),
+        "preemptionPolicy=Never from the PriorityClass must block preemption; got {blocked:?}"
     );
 
     // Control: without the map there is no fallback, so the lower-priority
     // victim is preempted — proving the class fallback is what blocked it above.
-    let (can_preempt_no_map, _) = check_preemption_with_pdbs(
-        &node,
-        &incoming,
-        &[victim],
-        &[],
-        &std::collections::HashMap::new(),
-    );
+    let control = scheduler
+        .try_preempt(
+            &incoming,
+            &nodes,
+            &pods,
+            &std::collections::HashMap::new(),
+            &[],
+            &diag,
+        )
+        .await;
     assert!(
-        can_preempt_no_map,
+        control.is_some(),
         "without the class map the lower-priority victim should be preempted"
     );
 }

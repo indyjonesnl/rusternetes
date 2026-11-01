@@ -15,6 +15,7 @@ mod conformance_scheduling_priority_preemption_hostport;
 mod coverage_affinity_taints;
 mod coverage_topology_preempt_score;
 mod predicates_test;
+mod preempt_support;
 mod preemption_test;
 mod preemption_victim_identity_test;
 mod profile_node_scoring;
