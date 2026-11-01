@@ -44,6 +44,8 @@ struct FakeState {
     called: Vec<String>,
     /// Image store (upstream `FakeImageService.Images`), keyed by image name.
     images: HashMap<String, v1::Image>,
+    /// `PullImageRequest.Auth` of each `PullImage`, in call order.
+    pull_auths: Vec<Option<v1::AuthConfig>>,
     /// `ContainerStatus.StartedAt` / `FinishedAt` (unix nanos) by container id:
     /// the part of upstream's embedded `ContainerStatus` that `v1::Container`
     /// (the list item) does not carry.
@@ -110,6 +112,11 @@ impl FakeCri {
     }
 
     /// RPC names received so far, in order (upstream `Called`).
+    /// The `auth` of every `PullImage` call, in order.
+    pub fn pull_auths(&self) -> Vec<Option<v1::AuthConfig>> {
+        self.state.lock().unwrap().pull_auths.clone()
+    }
+
     pub fn called(&self) -> Vec<String> {
         self.state.lock().unwrap().called.clone()
     }
@@ -515,9 +522,11 @@ impl ImageService for FakeCri {
         &self,
         request: Request<v1::PullImageRequest>,
     ) -> Result<Response<v1::PullImageResponse>, Status> {
-        let spec = request.into_inner().image.unwrap_or_default();
+        let req = request.into_inner();
+        let spec = req.image.unwrap_or_default();
         let mut st = self.state.lock().unwrap();
         st.record("PullImage");
+        st.pull_auths.push(req.auth);
         let id = spec.image.clone();
         st.images.entry(id.clone()).or_insert_with(|| v1::Image {
             id: id.clone(),

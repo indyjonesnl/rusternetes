@@ -244,9 +244,21 @@ impl CriClient {
         spec: v1::ImageSpec,
         sandbox_config: Option<v1::PodSandboxConfig>,
     ) -> Result<String> {
+        self.pull_image_spec_with_auth(spec, None, sandbox_config)
+            .await
+    }
+
+    /// `PullImage` with registry credentials (`kuberuntime_image.go`
+    /// `PullImage` builds a `runtimeapi.AuthConfig` per credential).
+    pub async fn pull_image_spec_with_auth(
+        &mut self,
+        spec: v1::ImageSpec,
+        auth: Option<v1::AuthConfig>,
+        sandbox_config: Option<v1::PodSandboxConfig>,
+    ) -> Result<String> {
         let request = v1::PullImageRequest {
             image: Some(spec),
-            auth: None,
+            auth,
             sandbox_config,
         };
         let resp = self
