@@ -3223,6 +3223,13 @@ impl Kubelet {
                 }
             }
 
+            // "volumes are unmounted after the pod worker reports
+            // ShouldPodRuntimeBeRemoved (which is satisfied before
+            // syncTerminatedPod is invoked)": wait for the reconciler to unmount
+            // them (`kubelet.go:2364`, `WaitForUnmount`). An error is retried
+            // by the next sync, as upstream's pod worker retries.
+            self.volume_manager.wait_for_unmount(pod).await?;
+
             let has_finalizers = pod
                 .metadata
                 .finalizers
