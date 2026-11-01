@@ -26,7 +26,8 @@ use crate::volume_plugins::util::node_expander::{
     pvc_object_reference, record_event, NodeExpander, NodeResizeOperationOpts,
 };
 use crate::volume_plugins::util::operation_executor::{
-    AttachedVolume, DeviceMountState, MarkVolumeOpts, VolumeMountState, VolumeToMount,
+    AttachedVolume, DeviceMountState, MarkVolumeOpts, MountedVolume, VolumeMountState,
+    VolumeToMount,
 };
 use crate::volume_plugins::util::resize_util::{self, RESOURCE_STORAGE};
 use crate::volume_plugins::util::types::{
@@ -973,6 +974,135 @@ pub struct GeneratedUnmountDevice<'a> {
     device_to_detach: &'a AttachedVolume,
     actual_state_of_world: &'a ActualStateOfWorld,
     hostutil: &'a dyn HostUtils,
+}
+
+/// The operation [`generate_unmount_volume_func`] builds.
+pub struct GeneratedUnmountVolume<'a> {
+    /// `OperationName`.
+    pub operation_name: &'static str,
+    /// `CompleteFunc`.
+    pub complete_func: crate::volume_plugins::util::metrics::OperationCompleteHook,
+    volume_unmounter: Box<dyn crate::volume_plugins::plugin::Unmounter>,
+    volume_to_unmount: &'a MountedVolume,
+    actual_state_of_world: &'a ActualStateOfWorld,
+}
+
+/// Port of `operationGenerator.GenerateUnmountVolumeFunc`
+/// (`operation_generator.go:730-806`): find the plugin by name, make its
+/// `Unmounter` from the volume's name as per the pod spec and the pod UID, and
+/// return the operation that tears it down.
+///
+/// Not ported: `Subpather.CleanSubPaths` (`:751-755`): subPath bind mounts are
+/// made by the container runtime here, there is nothing under
+/// `volume-subpaths` for the kubelet to clean. `getMigratedStatusBySpec` is
+/// always false (no in-tree-to-CSI migration of mounted volumes).
+pub fn generate_unmount_volume_func<'a>(
+    mgr: &'a VolumePluginMgr,
+    volume_to_unmount: &'a MountedVolume,
+    actual_state_of_world: &'a ActualStateOfWorld,
+) -> anyhow::Result<GeneratedUnmountVolume<'a>> {
+    // Get mountable plugin
+    let volume_plugin = mgr
+        .find_plugin_by_name(&volume_to_unmount.plugin_name)
+        .map_err(|e| {
+            anyhow!(
+                "UnmountVolume.FindPluginByName failed for volume {} pod {}: {e}",
+                volume_to_unmount.volume_name,
+                volume_to_unmount.pod_name
+            )
+        })?;
+    let volume_unmounter = volume_plugin
+        .new_unmounter(
+            &volume_to_unmount.inner_volume_spec_name,
+            &volume_to_unmount.pod_uid,
+        )
+        .map_err(|e| {
+            anyhow!(
+                "UnmountVolume.NewUnmounter failed for volume {} pod {}: {e:#}",
+                volume_to_unmount.volume_name,
+                volume_to_unmount.pod_name
+            )
+        })?;
+    let complete_func = crate::volume_plugins::util::metrics::operation_complete_hook(
+        &crate::volume_plugins::util::metrics::get_full_qualified_plugin_name_for_volume(
+            volume_plugin.name(),
+            Some(&volume_to_unmount.volume_spec.as_spec()),
+        ),
+        "volume_unmount",
+    );
+    Ok(GeneratedUnmountVolume {
+        operation_name: "volume_unmount",
+        complete_func,
+        volume_unmounter,
+        volume_to_unmount,
+        actual_state_of_world,
+    })
+}
+
+impl GeneratedUnmountVolume<'_> {
+    /// `GeneratedOperations.Run` (`types.go:68-85`).
+    pub async fn run_operation(&self) -> OperationContext {
+        let ctx = self.run().await;
+        self.complete_func
+            .complete(ctx.detailed_err.as_ref(), Some(ctx.migrated));
+        ctx
+    }
+
+    /// The `unmountVolumeFunc` closure (`operation_generator.go:745-798`).
+    pub async fn run(&self) -> OperationContext {
+        let v = self.volume_to_unmount;
+        let asw = self.actual_state_of_world;
+        let migrated = false;
+
+        // Execute unmount
+        if let Err(unmount_err) = self.volume_unmounter.tear_down().await {
+            // Mark the volume as uncertain, so SetUp is called for new pods.
+            // Teardown may be already in progress.
+            let opts = MarkVolumeOpts {
+                pod_name: v.pod_name.clone(),
+                pod_uid: v.pod_uid.clone(),
+                volume_name: v.volume_name.clone(),
+                mounter: None,
+                block_volume_mapper: None,
+                volume_gid_volume: v.volume_gid_value.clone(),
+                volume_spec: v.volume_spec.clone(),
+                volume_mount_state: VolumeMountState::VolumeMountUncertain,
+                selinux_mount_context: String::new(),
+            };
+            if let Err(e) = asw.mark_volume_mount_as_uncertain(opts) {
+                // There is nothing else we can do. Hope that UnmountVolume
+                // will be re-tried shortly.
+                error!(
+                    "UnmountVolume.MarkVolumeMountAsUncertain failed for volume {} pod {}: {e}",
+                    v.volume_name, v.pod_name
+                );
+            }
+            // On failure, return error. Caller will log and retry.
+            let err = anyhow!(
+                "UnmountVolume.TearDown failed for volume {} ({}) pod {} ({}): {unmount_err:#}",
+                v.volume_name,
+                v.inner_volume_spec_name,
+                v.pod_name,
+                v.pod_uid
+            );
+            return OperationContext::new(Some(anyhow!("{err}")), Some(err), migrated);
+        }
+
+        info!(
+            "UnmountVolume.TearDown succeeded for volume {} pod {} (UID: {}). InnerVolumeSpecName {}. PluginName {}",
+            v.volume_name, v.pod_name, v.pod_uid, v.inner_volume_spec_name, v.plugin_name
+        );
+
+        // Update actual state of world
+        if let Err(e) = asw.mark_volume_as_unmounted(&v.pod_name, &v.volume_name) {
+            // On failure, just log and exit
+            error!(
+                "UnmountVolume.MarkVolumeAsUnmounted failed for volume {} pod {}: {e}",
+                v.volume_name, v.pod_name
+            );
+        }
+        OperationContext::new(None, None, migrated)
+    }
 }
 
 /// Port of `operationGenerator.GenerateUnmountDeviceFunc`

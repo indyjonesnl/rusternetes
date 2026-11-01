@@ -137,6 +137,7 @@ impl Reconciler {
             // Add the volumes to ASW
             self.update_states(reconstructed_volumes);
         }
+        self.mounter().reconstruct_orphaned_devices();
         debug!("Volume reconstruction finished");
     }
 
