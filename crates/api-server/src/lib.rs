@@ -192,6 +192,9 @@ pub struct ApiServerConfig {
     /// `--advertise-address`: the IP the `kubernetes` Endpoints advertise.
     /// Unset -> resolved from `bind_address` (`utilnet.ResolveBindAddress`).
     pub advertise_address: Option<std::net::IpAddr>,
+    /// `--external-hostname` (`ServerRunOptions.ExternalHost`): the host of
+    /// externalized URLs such as the OIDC `jwks_uri`.
+    pub external_hostname: Option<String>,
     pub jwt_secret: String,
     /// `--service-account-key-file` / `--service-account-signing-key-file` /
     /// `--service-account-issuer` / `--api-audiences` (#1575).
@@ -374,6 +377,7 @@ impl Default for ApiServerConfig {
         Self {
             bind_address: "0.0.0.0:6443".to_string(),
             advertise_address: None,
+            external_hostname: None,
             jwt_secret: "rusternetes-secret-change-in-production".to_string(),
             service_account: Default::default(),
             tls: false,
@@ -439,6 +443,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         TokenManager::new_auto(config.jwt_secret.as_bytes())
             .with_service_account_options(&config.service_account)?
             .with_external_address(bootstrap::external_address(
+                config.external_hostname.as_deref(),
                 bootstrap::AdvertiseAddress::new(config.advertise_address, &config.bind_address),
                 &config.bind_address,
             )?),

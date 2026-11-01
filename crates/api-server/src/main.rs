@@ -70,6 +70,12 @@ struct Args {
     #[arg(long)]
     advertise_address: Option<std::net::IpAddr>,
 
+    /// The hostname to use when generating externalized URLs for this master
+    /// (e.g. OpenID Discovery); the secure port is appended when it has none
+    /// (upstream `--external-hostname`).
+    #[arg(long)]
+    external_hostname: Option<String>,
+
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
@@ -725,6 +731,7 @@ async fn main() -> Result<()> {
         TokenManager::new_auto(args.jwt_secret.as_bytes())
             .with_service_account_options(&service_account)?
             .with_external_address(rusternetes_api_server::bootstrap::external_address(
+                args.external_hostname.as_deref(),
                 rusternetes_api_server::bootstrap::AdvertiseAddress::new(
                     args.advertise_address,
                     &args.bind_address,
@@ -757,6 +764,7 @@ async fn main() -> Result<()> {
     let api_config = rusternetes_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         advertise_address: args.advertise_address,
+        external_hostname: args.external_hostname.clone(),
         tls: args.tls,
         tls_cert_file: args.tls_cert_file.clone(),
         tls_key_file: args.tls_key_file.clone(),
