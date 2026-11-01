@@ -154,6 +154,7 @@ impl Status {
 pub struct CycleState {
     storage: HashMap<String, Box<dyn Any + Send + Sync>>,
     skip_filter_plugins: HashSet<String>,
+    skip_score_plugins: HashSet<String>,
 }
 
 impl CycleState {
@@ -180,6 +181,17 @@ impl CycleState {
     /// `GetSkipFilterPlugins`.
     pub fn skip_filter_plugins(&self) -> &HashSet<String> {
         &self.skip_filter_plugins
+    }
+
+    /// `SetSkipScorePlugins`: plugins whose Score is skipped this cycle
+    /// (their PreScore returned Skip).
+    pub fn set_skip_score_plugins(&mut self, plugins: HashSet<String>) {
+        self.skip_score_plugins = plugins;
+    }
+
+    /// `GetSkipScorePlugins`.
+    pub fn skip_score_plugins(&self) -> &HashSet<String> {
+        &self.skip_score_plugins
     }
 }
 
@@ -373,4 +385,38 @@ pub trait SignPlugin: Plugin {
     /// optimization); Error for something unexpected (the framework signs
     /// nothing and the pod is scheduled without the optimization).
     fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status);
+}
+
+/// `fwk.NodeScore`: a node's name and score for one plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeScore {
+    pub name: String,
+    pub score: i64,
+}
+
+/// `fwk.PreScorePlugin`: runs once per cycle over the feasible nodes before
+/// Score; it may precompute state or return `Skip` (its Score is then not
+/// run).
+#[async_trait]
+pub trait PreScorePlugin: Plugin {
+    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, nodes: &[&Node]) -> Status;
+}
+
+/// `fwk.ScorePlugin`: ranks the nodes that passed filtering.
+pub trait ScorePlugin: Plugin {
+    /// `Score`: the node's score and a status; a non-success status aborts
+    /// the cycle.
+    fn score(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status);
+
+    /// `ScoreExtensions().NormalizeScore`: `None` when the plugin has no
+    /// score extensions, otherwise the status of normalising `scores` in
+    /// place.
+    fn normalize_score(
+        &self,
+        _state: &CycleState,
+        _pod: &Pod,
+        _scores: &mut [NodeScore],
+    ) -> Option<Status> {
+        None
+    }
 }

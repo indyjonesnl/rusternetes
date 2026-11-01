@@ -1543,13 +1543,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 .collect()
         };
 
-        // `NodeAffinityArgs.AddedAffinity`: `addedNodeSelector` (Filter, in the
-        // NodeAffinity plugin object) and `addedPrefSchedTerms` (Score),
-        // node_affinity.go:310-333.
-        let added_preferred = profile.added_affinity.as_ref().and_then(|a| {
-            a.preferred_during_scheduling_ignored_during_execution
-                .as_ref()
-        });
         let mut feasible: Vec<NodeEval> = Vec::new();
         // `findNodesThatFitPod` (schedule_one.go:518-530): "NominatedNodeName"
         // set by a previous cycle's preemption is tried first, alone
@@ -1617,26 +1610,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         }
                         return None;
                     }
-                    // Node affinity (hard requirements and scoring)
-                    // (the hard part is the NodeAffinity plugin object above)
-                    let (_, mut node_affinity_score) = check_node_affinity(node, pod);
-                    // `addedPrefSchedTerms.Score(node)` (node_affinity.go:276-278)
-                    if let Some(terms) = added_preferred {
-                        for t in terms {
-                            if rusternetes_common::affinity::matches_node_selector_term(
-                                node,
-                                &t.preference,
-                            ) {
-                                node_affinity_score += t.weight;
-                            }
-                        }
-                    }
                     // InterPodAffinity and PodTopologySpread Filters are
                     // plugin objects (run above).
-                    Some(NodeEval {
-                        node,
-                        node_affinity_score,
-                    })
+                    Some(NodeEval { node })
                 }
                 .await;
                 if let Some(e) = filter_error.take() {
@@ -1725,46 +1701,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // prioritizeNodes :802-811: every node scores 1.
                 vec![1i64; n]
             } else {
+                // `RunPreScorePlugins` and `RunScorePlugins` over the plugin
+                // objects (TaintToleration, NodeAffinity); the plugins below
+                // still score inline.
+                let feasible_nodes: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
+                let status = fw
+                    .run_pre_score_plugins(&mut cycle_state, pod, &feasible_nodes)
+                    .await;
+                if !status.is_success() {
+                    diag.scheduling_error = Some(status.message());
+                    return None;
+                }
+                let mut ran: Vec<crate::score::PluginScores> =
+                    match fw.run_score_plugins(&cycle_state, pod, &feasible_nodes, all_pods, nodes)
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            diag.scheduling_error = Some(e);
+                            return None;
+                        }
+                    };
                 let usages = crate::score::node_usages(all_pods);
                 let usage_of = |name: &str| usages.get(name).cloned().unwrap_or_default();
                 let cluster_nodes: Vec<&Node> = nodes.iter().collect();
-                let mut ran: Vec<crate::score::PluginScores> = Vec::new();
                 for plugin in fw.plugins_at(ExtensionPoint::Score) {
                     let weight = i64::from(fw.score_weight(plugin));
                     // `None` is a PreScore `Skip` (the plugin is left out of
                     // `RunScorePlugins`) or a plugin without a compiled-in
                     // scorer.
                     let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::TAINT_TOLERATION => {
-                            let tols = crate::score::tolerations_prefer_no_schedule(pod);
-                            let mut v: Vec<i64> = feasible
-                                .iter()
-                                .map(|e| {
-                                    crate::score::count_intolerable_taints_prefer_no_schedule(
-                                        e.node, &tols,
-                                    )
-                                })
-                                .collect();
-                            // taint_toleration.go NormalizeScore: reverse.
-                            crate::score::default_normalize_score(
-                                crate::score::MAX_NODE_SCORE,
-                                true,
-                                &mut v,
-                            );
-                            (names::TAINT_TOLERATION, Some(v))
-                        }
-                        names::NODE_AFFINITY => {
-                            let mut v: Vec<i64> = feasible
-                                .iter()
-                                .map(|e| i64::from(e.node_affinity_score))
-                                .collect();
-                            crate::score::default_normalize_score(
-                                crate::score::MAX_NODE_SCORE,
-                                false,
-                                &mut v,
-                            );
-                            (names::NODE_AFFINITY, Some(v))
-                        }
                         names::NODE_RESOURCES_FIT | names::NODE_RESOURCES_BALANCED_ALLOCATION => {
                             let is_fit = plugin == names::NODE_RESOURCES_FIT;
                             let scorer = if is_fit {
@@ -2596,7 +2561,6 @@ fn random_offset(num_nodes: usize) -> usize {
 /// while filtering.
 struct NodeEval<'a> {
     node: &'a Node,
-    node_affinity_score: i32,
 }
 
 fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
