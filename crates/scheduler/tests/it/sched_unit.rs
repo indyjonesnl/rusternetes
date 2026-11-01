@@ -9,6 +9,7 @@ mod diagnosis;
 mod framework_runtime;
 mod fwk;
 mod in_tree__dynamic_resources;
+mod in_tree__dynamic_resources_bind;
 mod in_tree__node_affinity;
 mod in_tree__node_name;
 mod in_tree__node_ports;

@@ -425,9 +425,34 @@ pub trait Handle: Send + Sync {
         Err("no cluster access".to_string())
     }
 
+    /// `ClientSet().ResourceV1().ResourceClaims(ns).UpdateStatus(claim)`
+    /// (dynamicresources.go `bindClaim`, `Unreserve`): the updated claim.
+    async fn update_resource_claim_status(
+        &self,
+        _claim: &ResourceClaim,
+    ) -> Result<ResourceClaim, ClaimWriteError> {
+        Err(ClaimWriteError::Other("no cluster access".to_string()))
+    }
+
     /// `ClientSet().CoreV1().Pods(ns).Bind(binding)` (DefaultBinder.Bind).
     async fn bind_pod(&self, _pod: &Pod, _node_name: &str) -> Result<(), String> {
         Err("no cluster access".to_string())
+    }
+}
+
+/// Why a ResourceClaim write failed: a conflict is retried
+/// (`retry.RetryOnConflict`), anything else is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimWriteError {
+    Conflict(String),
+    Other(String),
+}
+
+impl std::fmt::Display for ClaimWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(m) | Self::Other(m) => f.write_str(m),
+        }
     }
 }
 
