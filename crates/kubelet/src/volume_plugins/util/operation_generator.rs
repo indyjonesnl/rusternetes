@@ -462,10 +462,8 @@ pub struct MountState<'a> {
 /// (`NodePublishVolume`), as the CSI spec orders them. Returns the mounter's
 /// path.
 ///
-/// Not ported (each waits on the reconciler wiring, tracked under #1970): the
-/// ReadWriteOncePod-elsewhere check (`:480-489`, which depends on an unmount
-/// ordering only the reconciler provides) and the post-`SetUp` expansion
-/// (`:600-625`).
+/// With a `state` the ReadWriteOncePod-elsewhere check (`:476-486`) runs, as it
+/// needs the actual state of world.
 ///
 /// `WaitForAttach` (`:511-526`) runs for plugins that return an attacher from
 /// [`VolumePlugin::as_attachable_plugin`] (iscsi); CSI's attacher is not ported.
@@ -502,6 +500,26 @@ pub async fn mount_volume_with_attributes(
 ) -> anyhow::Result<(String, crate::volume_plugins::plugin::Attributes)> {
     let plugin = mgr.find_plugin_by_spec(spec)?;
     let mounter = plugin.new_mounter(spec, pod).await?;
+
+    // Enforce ReadWriteOncePod access mode if it is the only one present. This
+    // is also enforced during scheduling (`:476-486`).
+    if let (Some(st), Some(pv)) = (state, spec.persistent_volume) {
+        // Because we do not know what access mode the pod intends to use if
+        // there are multiple.
+        let modes = &pv.spec.access_modes;
+        if st.actual_state_of_world.is_volume_mounted_elsewhere(
+            &st.volume_to_mount.volume_name,
+            &st.volume_to_mount.pod_name,
+        ) && modes.len() == 1
+            && modes[0]
+                == rusternetes_common::resources::PersistentVolumeAccessMode::ReadWriteOncePod
+        {
+            return Err(anyhow!(
+                "MountVolume.SetUp failed for volume {}: volume uses the ReadWriteOncePod access mode and is already in use by another pod",
+                spec.name()
+            ));
+        }
+    }
 
     // Get attacher, if possible (`:486-492`)
     let volume_attacher = mgr
