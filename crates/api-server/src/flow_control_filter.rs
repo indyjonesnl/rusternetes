@@ -872,6 +872,21 @@ pub fn register_post_start_hooks<S: Storage + 'static>(
     register_storage_object_count_tracker_hook(registry, tracker, stop);
 }
 
+/// The hook with APF off: a fresh tracker (`NewConfig` sets
+/// `StorageObjectCountTracker = flowcontrolrequest.NewStorageObjectCountTracker()`,
+/// config.go:472) whose stop channel never fires for the process lifetime.
+pub fn register_object_count_tracker_hook_without_apf(
+    registry: &crate::post_start_hooks::PostStartHooks,
+) {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    std::mem::forget(stop_tx);
+    register_storage_object_count_tracker_hook(
+        registry,
+        Arc::new(ObjectCountTracker::new()),
+        stop_rx,
+    );
+}
+
 /// `storage-object-count-tracker-hook` (server/config.go:961-970). Upstream
 /// registers it whenever `c.StorageObjectCountTracker != nil`, which
 /// `NewConfig` always sets (config.go:472), independent of APF vs

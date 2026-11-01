@@ -9,9 +9,8 @@ mod upstream_flags;
 // The bin shares the lib's modules (and so its process-global state) rather
 // than recompiling them as a second copy of the crate.
 use rusternetes_api_server::{
-    admission, audit, bootstrap, flow_control, flow_control_filter, flow_control_object_count,
-    flow_control_stats_poller, post_start_hooks, prometheus_client, registry, request_timeout,
-    router, state, zpages,
+    admission, audit, bootstrap, flow_control, flow_control_filter, flow_control_stats_poller,
+    post_start_hooks, prometheus_client, registry, request_timeout, router, state, zpages,
 };
 
 use anyhow::{Context, Result};
@@ -718,12 +717,8 @@ async fn main() -> Result<()> {
     } else {
         // `storage-object-count-tracker-hook` is registered whenever the
         // tracker exists (server/config.go:961-970), APF or not.
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        std::mem::forget(stop_tx);
-        flow_control_filter::register_storage_object_count_tracker_hook(
+        flow_control_filter::register_object_count_tracker_hook_without_apf(
             post_start_hooks::global(),
-            Arc::new(flow_control_object_count::ObjectCountTracker::new()),
-            stop_rx,
         );
     }
 
