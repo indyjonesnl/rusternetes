@@ -28,6 +28,12 @@ pub async fn create_token_review(
     axum::http::HeaderMap,
     Json<TokenReview>,
 )> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &token_review,
+        ("authentication.k8s.io", "v1", "tokenreviews"),
+        None,
+    );
     info!("Creating token review");
 
     // Check authorization - creating a TokenReview requires impersonation privileges
@@ -183,6 +189,9 @@ pub async fn create_token_request(
         );
         rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
     })?;
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded; the
+    // TokenRequest is the `serviceaccounts/token` subresource's object.
+    crate::audit::log_request_object(&token_request, ("", "v1", "serviceaccounts"), Some("token"));
     info!(
         "Creating token request for service account {}/{}",
         namespace, service_account_name
@@ -473,6 +482,12 @@ pub async fn create_self_subject_review(
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut self_subject_review): DumpingJson<SelfSubjectReview>,
 ) -> Result<(axum::http::StatusCode, Json<SelfSubjectReview>)> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &self_subject_review,
+        ("authentication.k8s.io", "v1", "selfsubjectreviews"),
+        None,
+    );
     info!("Creating self subject review for user: {:?}", auth_ctx.user);
 
     // Check authorization - creating a SelfSubjectReview is always allowed
