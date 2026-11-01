@@ -288,8 +288,25 @@ mod tests {
         assert_eq!(normalized_image_name("r:5000/app:v1"), "r:5000/app:v1");
     }
 
+    fn select_host(totals: &[i64]) -> Option<usize> {
+        SortedNodeScores::new(vec![String::new(); totals.len()], totals.to_vec()).pop_index()
+    }
+
     // schedule_one.go newSortedNodeScores + Pop: highest total wins, a tie
     // follows container/heap order (heap.Init does not reorder equal items).
+    // The remaining nodes after the first Pop come out best first, which is
+    // what `OpportunisticBatch` hands to the following pods.
+    #[test]
+    fn sorted_node_scores_pop_best_first() {
+        let names: Vec<String> = ["a", "b", "c", "d"].iter().map(|n| n.to_string()).collect();
+        let mut s = SortedNodeScores::new(names, vec![10, 40, 30, 20]);
+        assert_eq!(s.len(), 4);
+        let order: Vec<String> = std::iter::from_fn(|| s.pop()).collect();
+        assert_eq!(order, ["b", "c", "d", "a"]);
+        assert!(s.is_empty());
+        assert_eq!(s.pop(), None);
+    }
+
     #[test]
     fn select_host_picks_highest_and_first_of_ties() {
         assert_eq!(select_host(&[]), None);

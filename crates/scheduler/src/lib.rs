@@ -1,4 +1,5 @@
 pub mod advanced;
+pub mod batch;
 pub mod data_plane;
 pub mod default_preemption;
 pub mod diagnosis;
