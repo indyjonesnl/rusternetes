@@ -798,7 +798,8 @@ fn status_update_exact_error_lists_match_upstream_table() {
     const IMMUTABLE: &str = "immutable after PodCertificateRequest is issued, denied, or failed";
     let denied = || vec![cond(CONDITION_TYPE_DENIED, "True")];
     let failed = || vec![cond(CONDITION_TYPE_FAILED, "True")];
-    let cases: Vec<(&str, Vec<Condition>, Vec<Condition>, Vec<String>)> = vec![
+    type Case = (&'static str, Vec<Condition>, Vec<Condition>, Vec<String>);
+    let cases: Vec<Case> = vec![
         ("changing nothing is allowed", vec![], vec![], vec![]),
         (
             "adding unknown condition types is not allowed",
