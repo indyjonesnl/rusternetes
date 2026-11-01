@@ -13,10 +13,7 @@
 //! once the desired state is populated and does not want it.
 //!
 //! Not ported yet: block volumes (`volumeDevices`, `FindMapperPluginByName`,
-//! `NewBlockVolumeMapper`; the kubelet does not support them) and
-//! `updateReconstructedFromNodeStatus` (the devicePath and attachability from
-//! `node.status.volumesAttached`; `readyToUnmount` only matters once the
-//! reconciler has an unmount arm to gate, #1970).
+//! `NewBlockVolumeMapper`; the kubelet does not support them).
 
 use crate::pod_dirs::PodVolume;
 use crate::volume_manager::reconciler::Reconciler;
@@ -134,8 +131,14 @@ impl Reconciler {
         }
 
         if !reconstructed_volumes.is_empty() {
+            let names: Vec<UniqueVolumeName> = reconstructed_volumes.keys().cloned().collect();
             // Add the volumes to ASW
             self.update_states(reconstructed_volumes);
+            // Remember to update devicePath from node.status.volumesAttached
+            *self
+                .volumes_need_update_from_node_status
+                .lock()
+                .expect("volumes need update lock") = names;
         }
         self.mounter().reconstruct_orphaned_devices();
         debug!("Volume reconstruction finished");
@@ -330,6 +333,72 @@ impl Reconciler {
             .volumes_failed_reconstruction
             .lock()
             .expect("volumes failed reconstruction lock") = volumes;
+    }
+
+    /// Whether `volumesNeedUpdateFromNodeStatus` is non-empty.
+    pub(crate) fn needs_update_from_node_status(&self) -> bool {
+        !self
+            .volumes_need_update_from_node_status
+            .lock()
+            .expect("volumes need update lock")
+            .is_empty()
+    }
+
+    /// Port of `updateReconstructedFromNodeStatus` (`reconstruct.go:180-215`):
+    /// file the devicePath of every reconstructed volume from
+    /// `node.status.volumesAttached`, and settle whether it is attachable.
+    /// Only possible once the node can be read, so it cannot be part of
+    /// [`Self::reconstruct_volumes`]; a failed read is retried on the next
+    /// reconcile.
+    pub async fn update_reconstructed_from_node_status(&self) {
+        debug!("Updating reconstructed devicePaths");
+        let Some(storage) = self.mounter().storage.clone() else {
+            // Skip reconstructing devicePath from node objects if kubelet is in
+            // standalone mode. Such kubelet is not expected to mount any
+            // attachable volume or Secrets / ConfigMap.
+            debug!("Skipped reconstruction of DevicePaths from node.status in standalone mode");
+            self.volumes_need_update_from_node_status
+                .lock()
+                .expect("volumes need update lock")
+                .clear();
+            return;
+        };
+        let key = rusternetes_storage::build_key("nodes", None, self.node_name());
+        let node: rusternetes_common::resources::Node =
+            match rusternetes_storage::Storage::get(storage.as_ref(), &key).await {
+                Ok(node) => node,
+                Err(e) => {
+                    // This may repeat few times per second until kubelet is able
+                    // to read its own status for the first time.
+                    debug!("Failed to get Node status to reconstruct device paths: {e}");
+                    return;
+                }
+            };
+        let attached = node
+            .status
+            .and_then(|s| s.volumes_attached)
+            .unwrap_or_default();
+        let volumes = std::mem::take(
+            &mut *self
+                .volumes_need_update_from_node_status
+                .lock()
+                .expect("volumes need update lock"),
+        );
+        for volume_id in volumes {
+            let mut attachable = false;
+            for attached_volume in attached.iter().filter(|a| a.name == volume_id.0) {
+                self.actual_state_of_world()
+                    .update_reconstructed_device_path(&volume_id, &attached_volume.device_path);
+                attachable = true;
+                debug!(
+                    "Updated devicePath from node status for volume {}: {}",
+                    attached_volume.name, attached_volume.device_path
+                );
+            }
+            self.actual_state_of_world()
+                .update_reconstructed_volume_attachability(&volume_id, attachable);
+        }
+        debug!("DevicePaths of reconstructed volumes updated");
     }
 
     /// Port of `cleanOrphanVolumes` (`reconstruct.go:159-178`): force-unmount

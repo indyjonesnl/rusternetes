@@ -33,6 +33,10 @@ pub struct Reconciler {
     /// reconstructed, force-unmounted once nothing desires them
     /// (`reconstruct.rs`).
     pub(crate) volumes_failed_reconstruction: std::sync::Mutex<Vec<crate::pod_dirs::PodVolume>>,
+    /// `volumesNeedUpdateFromNodeStatus`: reconstructed volumes whose
+    /// devicePath is still to be read from the node's `volumesAttached`.
+    pub(crate) volumes_need_update_from_node_status:
+        std::sync::Mutex<Vec<crate::volume_plugins::util::types::UniqueVolumeName>>,
 }
 
 impl Reconciler {
@@ -51,6 +55,7 @@ impl Reconciler {
             loop_sleep_duration,
             populator_has_added_pods: Box::new(populator_has_added_pods),
             volumes_failed_reconstruction: std::sync::Mutex::new(Vec::new()),
+            volumes_need_update_from_node_status: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -128,16 +133,24 @@ impl Reconciler {
             // Clean up any orphan volumes that failed reconstruction.
             self.clean_orphan_volumes().await;
         }
+
+        if self.needs_update_from_node_status() {
+            self.update_reconstructed_from_node_status().await;
+        }
         operations
     }
 
     /// Port of `readyToUnmount` (`reconstruct.go:30-44`). During kubelet
     /// startup, all volumes present on disk are added as uncertain to the
     /// actual state; unmount only when the desired state is fully populated,
-    /// to prevent unmounting volumes that did not reach it yet. Not ported:
-    /// the wait for `volumesNeedUpdateFromNodeStatus`.
+    /// to prevent unmounting volumes that did not reach it yet, and only once
+    /// the device paths were corrected from node.status, to prevent calling
+    /// unmount with a wrong devicePath.
     pub fn ready_to_unmount(&self) -> bool {
-        (self.populator_has_added_pods)()
+        if !(self.populator_has_added_pods)() {
+            return false;
+        }
+        !self.needs_update_from_node_status()
     }
 
     /// Port of `unmountVolumes` (`reconciler_common.go:148-167`): the unmount
