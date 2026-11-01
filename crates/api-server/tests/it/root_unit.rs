@@ -41,6 +41,7 @@ mod flow_control_work_estimator;
 mod gnostic;
 mod legacy_token_tracking;
 mod lib;
+mod max_in_flight;
 mod openapi;
 mod post_start_hooks;
 mod prometheus_client;

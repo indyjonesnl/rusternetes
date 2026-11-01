@@ -2994,6 +2994,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 >,
             ));
         }
+        // `c.FlowControl == nil`: WithMaxInFlightLimit stands in for APF
+        // (server/config.go:1033).
+        else if let Some(limits) = crate::max_in_flight_filter::installed() {
+            protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+                limits,
+                crate::max_in_flight_filter::with_max_in_flight_limit,
+            ));
+        }
         protected_routes = protected_routes
             // WithAudit sits after authentication and before the handler's
             // authorization/admission (server/config.go DefaultBuildHandlerChain).
@@ -3065,6 +3073,14 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
                 crate::flow_control_filter::priority_and_fairness::<
                     rusternetes_storage::StorageBackend,
                 >,
+            ));
+        }
+        // `c.FlowControl == nil`: WithMaxInFlightLimit stands in for APF
+        // (server/config.go:1033).
+        else if let Some(limits) = crate::max_in_flight_filter::installed() {
+            protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+                limits,
+                crate::max_in_flight_filter::with_max_in_flight_limit,
             ));
         }
         protected_routes = protected_routes
