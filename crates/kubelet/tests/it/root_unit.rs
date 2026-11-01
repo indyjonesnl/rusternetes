@@ -29,6 +29,7 @@ mod server_debug;
 mod server_logs;
 mod server_metrics;
 mod server_metrics_endpoints;
+mod server_resource_metrics;
 mod serving_tls;
 mod static_pod_url;
 mod static_pod_watch;
