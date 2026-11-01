@@ -504,6 +504,9 @@ pub struct ProfileSpec<'a> {
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
     /// `PodTopologySpreadArgs`, handed to the PodTopologySpread score plugin.
     pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
+    /// `NodeResourcesFitArgs.IgnoredResources`/`IgnoredResourceGroups`, handed
+    /// to the NodeResourcesFit Filter.
+    pub fit_ignored: Option<&'a crate::in_tree::FitIgnoredResources>,
     /// `VolumeBindingArgs.Shape`, handed to the VolumeBinding score plugin.
     pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
 }
@@ -1292,6 +1295,7 @@ fn plugin_args<'a>(profile: &ProfileSpec<'a>) -> crate::in_tree::FilterPluginArg
         inter_pod_affinity: profile.inter_pod_affinity,
         pod_topology_spread: profile.pod_topology_spread,
         volume_shape: profile.volume_shape,
+        fit_ignored: profile.fit_ignored,
     }
 }
 

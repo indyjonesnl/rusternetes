@@ -902,6 +902,10 @@ fn resolve_profiles(
                     if let Some(s) = crate::score::ResourceAllocationScorer::from_fit_args(&a) {
                         p.fit_scorer = s;
                     }
+                    p.fit_ignored = crate::in_tree::FitIgnoredResources {
+                        resources: a.ignored_resources.iter().cloned().collect(),
+                        groups: a.ignored_resource_groups.iter().cloned().collect(),
+                    };
                 }
                 "NodeResourcesBalancedAllocation" => {
                     let mut a: NodeResourcesBalancedAllocationArgs = decode_args(pc, &args_path)?;
@@ -948,6 +952,7 @@ fn resolve_profiles(
                 inter_pod_affinity: p.inter_pod_affinity,
                 pod_topology_spread: Some(&p.pod_topology_spread),
                 volume_shape: Some(&p.volume_shape),
+                fit_ignored: Some(&p.fit_ignored),
             },
         )
         .ok()

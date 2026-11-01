@@ -4,7 +4,7 @@ use rusternetes_common::resources::{Node, Pod};
 use rusternetes_scheduler::fwk::{
     Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin, Status,
 };
-use rusternetes_scheduler::in_tree::NodeResourcesFit;
+use rusternetes_scheduler::in_tree::{FitIgnoredResources, NodeResourcesFit};
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
@@ -30,11 +30,11 @@ fn alloc() -> Value {
 
 async fn run(p: &Pod, n: &Node, existing: &[Pod]) -> Status {
     let mut state = CycleState::new();
-    let (result, status) = NodeResourcesFit
+    let (result, status) = NodeResourcesFit::default()
         .pre_filter(&mut state, p, &[], &[], &NoHandle)
         .await;
     assert!(result.is_none() && status.is_success());
-    NodeResourcesFit
+    NodeResourcesFit::default()
         .filter(&state, p, &NodeInfo::new(n, existing))
         .await
 }
@@ -42,7 +42,7 @@ async fn run(p: &Pod, n: &Node, existing: &[Pod]) -> Status {
 #[tokio::test]
 async fn filter_without_pre_filter_state_is_an_error() {
     let n = node(alloc());
-    let s = NodeResourcesFit
+    let s = NodeResourcesFit::default()
         .filter(
             &CycleState::new(),
             &pod("p", "", json!({})),
@@ -217,4 +217,61 @@ async fn node_without_allocatable_is_not_filtered() {
     assert!(run(&pod("p", "", json!({"cpu": "100"})), &n, &[])
         .await
         .is_success());
+}
+
+fn ignored(resources: &[&str], groups: &[&str]) -> NodeResourcesFit {
+    NodeResourcesFit {
+        ignored: FitIgnoredResources {
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+        },
+    }
+}
+
+async fn run_with(plugin: &NodeResourcesFit, p: &Pod, n: &Node) -> Status {
+    let mut state = CycleState::new();
+    plugin.pre_filter(&mut state, p, &[], &[], &NoHandle).await;
+    plugin.filter(&state, p, &NodeInfo::new(n, &[])).await
+}
+
+/// `IgnoredResources` (fit.go:710-718; TestEnoughRequests "skip checking
+/// ignored extended resource"): the named extended resource is not checked,
+/// any other still is.
+#[tokio::test]
+async fn ignored_extended_resource_is_not_checked() {
+    let n = node(json!({"cpu": "10", "pods": "32"}));
+    let p = pod("p", "", json!({"example.com/bar": "1"}));
+    let s = run_with(&NodeResourcesFit::default(), &p, &n).await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+    assert!(run_with(&ignored(&["example.com/bar"], &[]), &p, &n)
+        .await
+        .is_success());
+    let s = run_with(&ignored(&["example.com/foo"], &[]), &p, &n).await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+}
+
+/// `IgnoredResourceGroups` (TestEnoughRequests "resources group"): every
+/// extended resource of the group is skipped.
+#[tokio::test]
+async fn ignored_resource_group_skips_the_whole_group() {
+    let n = node(json!({"cpu": "10", "pods": "32"}));
+    let p = pod(
+        "p",
+        "",
+        json!({"example.com/bar": "1", "example.com/baz": "1"}),
+    );
+    assert!(run_with(&ignored(&[], &["example.com"]), &p, &n)
+        .await
+        .is_success());
+    let s = run_with(&ignored(&[], &["other.io"]), &p, &n).await;
+    assert!(s.is_rejected());
+}
+
+/// Native resources cannot be ignored: only extended ones are skipped.
+#[tokio::test]
+async fn native_resources_are_never_ignored() {
+    let n = node(json!({"cpu": "1", "pods": "32"}));
+    let p = pod("p", "", json!({"cpu": "2"}));
+    let s = run_with(&ignored(&["cpu"], &["cpu"]), &p, &n).await;
+    assert!(s.is_rejected());
 }

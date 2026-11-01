@@ -61,6 +61,8 @@ pub struct Profile {
     /// `NodeResourcesFit` scorer built from `NodeResourcesFitArgs.ScoringStrategy`
     /// (fit.go `nodeResourceStrategyTypeMap`).
     pub fit_scorer: crate::score::ResourceAllocationScorer,
+    /// `NodeResourcesFitArgs.IgnoredResources`/`IgnoredResourceGroups`.
+    pub fit_ignored: crate::in_tree::FitIgnoredResources,
     /// `NodeResourcesBalancedAllocation` scorer
     /// (`NodeResourcesBalancedAllocationArgs.Resources`).
     pub balanced_scorer: crate::score::ResourceAllocationScorer,
@@ -93,6 +95,7 @@ impl Profile {
             min_candidate_nodes_percentage: 10,
             min_candidate_nodes_absolute: 100,
             fit_scorer: crate::score::ResourceAllocationScorer::default_fit(),
+            fit_ignored: crate::in_tree::FitIgnoredResources::default(),
             balanced_scorer: crate::score::ResourceAllocationScorer::default_balanced(),
             inter_pod_affinity: crate::inter_pod_affinity_score::Args::default(),
             pod_topology_spread: crate::pod_topology_spread_score::Args::default(),
@@ -119,6 +122,7 @@ impl Profile {
                 inter_pod_affinity: self.inter_pod_affinity,
                 pod_topology_spread: Some(&self.pod_topology_spread),
                 volume_shape: Some(&self.volume_shape),
+                fit_ignored: Some(&self.fit_ignored),
             },
         )
     }

@@ -32,6 +32,8 @@ pub struct FilterPluginArgs<'a> {
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
     /// `PodTopologySpreadArgs`.
     pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
+    /// `NodeResourcesFitArgs.IgnoredResources` / `IgnoredResourceGroups`.
+    pub fit_ignored: Option<&'a FitIgnoredResources>,
     /// `VolumeBindingArgs.Shape`.
     pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
 }
@@ -40,7 +42,9 @@ pub struct FilterPluginArgs<'a> {
 /// that are not (yet) plugin objects.
 pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<dyn FilterPlugin>> {
     match name {
-        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit {
+            ignored: args.fit_ignored.cloned().unwrap_or_default(),
+        })),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
@@ -66,7 +70,9 @@ pub fn new_pre_filter_plugin(
     match name {
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
-        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit {
+            ignored: args.fit_ignored.cloned().unwrap_or_default(),
+        })),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
@@ -153,7 +159,7 @@ pub fn new_sign_plugin(name: &str) -> Option<Arc<dyn SignPlugin>> {
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(None))),
         names::NODE_PORTS => Some(Arc::new(NodePorts)),
-        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit::default())),
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
@@ -566,12 +572,40 @@ impl FilterPlugin for NodePorts {
 ///   supported here).
 /// - A node that reports no `status.allocatable` at all is not filtered
 ///   (upstream would reject every pod there); the kubelet always reports it.
-/// - `NodeResourcesFitArgs.IgnoredResources`/`IgnoredResourceGroups` and the
-///   DRA extended-resource delegation (`shouldDelegateResourceToDRA`) are not
-///   honoured yet.
+/// - The DRA extended-resource delegation (`shouldDelegateResourceToDRA`) is
+///   not honoured yet.
 /// - Terminating pods do not count against the node, as in the scheduler's
 ///   other accounting here.
-pub struct NodeResourcesFit;
+#[derive(Default)]
+pub struct NodeResourcesFit {
+    pub ignored: FitIgnoredResources,
+}
+
+/// `NodeResourcesFitArgs.IgnoredResources` and `IgnoredResourceGroups`
+/// (fit.go:93-94, :218-219): extended resources, by name or by group
+/// (the part before the `/`), that Filter does not check.
+#[derive(Default, Clone, Debug)]
+pub struct FitIgnoredResources {
+    pub resources: HashSet<String>,
+    pub groups: HashSet<String>,
+}
+
+impl FitIgnoredResources {
+    /// The skip in `fitsRequest` (fit.go:710-718): only extended resources
+    /// can be ignored.
+    fn ignores(&self, name: &str) -> bool {
+        if !rusternetes_common::quota::is_extended_resource_name(name) {
+            return false;
+        }
+        // rName is guaranteed to have a slash due to API validation.
+        let prefix = if self.groups.is_empty() {
+            ""
+        } else {
+            name.split('/').next().unwrap_or("")
+        };
+        self.resources.contains(name) || self.groups.contains(prefix)
+    }
+}
 
 impl Plugin for NodeResourcesFit {
     fn name(&self) -> &'static str {
@@ -682,6 +716,9 @@ impl FilterPlugin for NodeResourcesFit {
             }
         }
         for (name, w) in scalars {
+            if self.ignored.ignores(name) {
+                continue;
+            }
             if *w > alloc(name) - used(name) {
                 insufficient.push((format!("Insufficient {name}"), *w > alloc(name)));
             }
