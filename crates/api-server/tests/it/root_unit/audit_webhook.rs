@@ -436,6 +436,7 @@ mod tests {
                 mode: MODE_BATCH.into(),
                 batch_config: cfg,
             },
+            truncate: Default::default(),
         };
         assert!(o.validate().is_empty());
         let (b, buffered) = o.new_backend().unwrap();
@@ -467,6 +468,7 @@ mod tests {
                 mode: MODE_BATCH.into(),
                 batch_config: BatchConfig::default_webhook(),
             },
+            truncate: Default::default(),
         };
         // Not enabled: nothing is validated.
         assert!(o.validate().is_empty());
@@ -491,6 +493,7 @@ mod tests {
                     mode: mode.into(),
                     batch_config: BatchConfig::default_webhook(),
                 },
+                truncate: Default::default(),
             };
             o.new_backend().unwrap().0
         };
