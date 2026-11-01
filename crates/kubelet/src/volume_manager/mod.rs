@@ -46,7 +46,6 @@ pub struct VolumeManager {
     pub actual_state_of_world: Arc<ActualStateOfWorld>,
     pub desired_state_of_world_populator: Arc<DesiredStateOfWorldPopulator>,
     pub reconciler: Arc<Reconciler>,
-    node_name: String,
     spec_factory: Arc<crate::volumes::VolumeManager>,
     /// `nim`, the CSI node info manager `VerifyExhaustedResource` refreshes the
     /// CSINode allocatable count through. Set once it exists
@@ -96,7 +95,6 @@ impl VolumeManager {
     /// Port of `NewVolumeManager` (`volume_manager.go:182-254`), without the
     /// reconciler and the operation executor.
     pub fn new(
-        node_name: &str,
         storage: Arc<StorageBackend>,
         pod_manager: Arc<dyn PodManager>,
         pod_state_provider: Arc<dyn PodStateProvider>,
@@ -128,7 +126,6 @@ impl VolumeManager {
             move || populator_has_added_pods.has_added_pods(),
         ));
         Self {
-            node_name: node_name.to_string(),
             spec_factory,
             node_info_installer: std::sync::OnceLock::new(),
             desired_state_of_world,
@@ -277,7 +274,6 @@ impl VolumeManager {
                     .csi_plugin
                     .verify_exhausted_resource(
                         &spec,
-                        &self.node_name,
                         crate::volume_plugins::csi_drivers_store::csi_drivers(),
                         nim.as_ref(),
                     )

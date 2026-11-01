@@ -504,6 +504,22 @@ mod mounter_args_tests {
         ))
     }
 
+    /// `VolumeHost.GetNodeName` (`pkg/volume/plugins.go:413`,
+    /// `pkg/kubelet/volume_host.go:294`) returns the kubelet's node name.
+    #[test]
+    fn get_node_name_returns_the_configured_node() {
+        use rusternetes_kubelet::volume_plugins::VolumeHost;
+        assert_eq!(host().get_node_name(), "");
+        let h = KubeletVolumeHost::new_for_tests(
+            "/var/lib/rusternetes".to_string(),
+            None,
+            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            HashMap::new(),
+        )
+        .with_node_name("node-7");
+        assert_eq!(h.get_node_name(), "node-7");
+    }
+
     fn pod(fs_group: Option<i64>) -> Pod {
         let mut spec = json!({"containers": []});
         if let Some(g) = fs_group {

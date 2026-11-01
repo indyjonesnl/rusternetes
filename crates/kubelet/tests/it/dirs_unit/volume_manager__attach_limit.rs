@@ -149,7 +149,6 @@ async fn started(attach_error_code: i32) -> (Arc<VolumeManager>, Pod, Arc<Instal
     std::mem::forget(dir);
     let pod = pod();
     let shell = Arc::new(VolumeManager::new(
-        NODE,
         storage,
         Arc::new(Pods(vec![pod.clone()])),
         Arc::new(Running),

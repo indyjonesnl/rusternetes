@@ -92,6 +92,7 @@ mod tests {
                 rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
+            .with_node_name("node-1")
             .with_csi_driver_lister(lister),
         );
         Fx {

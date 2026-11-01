@@ -171,6 +171,9 @@ pub struct VolumeManager {
     /// `nodeName` of `NewVolumeManager` (`volume_manager.go:186`): the node the
     /// kubelet runs for. Empty until [`VolumeManager::with_node_name`].
     pub node_name: String,
+    /// The cell behind `VolumeHost::get_node_name`, shared with the host the
+    /// plugins were built with.
+    node_name_cell: Arc<std::sync::RwLock<String>>,
     /// Each mounted pod volume's `Mounter.GetAttributes()` result plus the
     /// `SELinuxLabeled` bit, keyed by (pod UID, volume name). Stands in for the
     /// `VolumeInfo{Mounter, SELinuxLabeled}` map upstream's `makeMounts` reads
@@ -322,12 +325,14 @@ impl VolumeManager {
         empty_dir_mount_deps: Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps>,
     ) -> Self {
         let node_allocatable = crate::kubelet::node_allocatable_map();
+        let node_name_cell: Arc<std::sync::RwLock<String>> = Arc::default();
         let mut kubelet_host = crate::volume_plugins::KubeletVolumeHost::new(
             volumes_base_path.clone(),
             storage.clone(),
             token_manager.clone(),
             node_allocatable.clone(),
-        );
+        )
+        .with_node_name_cell(node_name_cell.clone());
         if let Some(m) = pod_certificate_manager.clone() {
             kubelet_host = kubelet_host.with_pod_certificate_manager(m);
         }
@@ -406,6 +411,7 @@ impl VolumeManager {
             ),
             plugin_mgr,
             node_name: String::new(),
+            node_name_cell,
             mounted: Arc::default(),
             pod_certificate_manager,
             volume_manager: Arc::default(),
@@ -442,6 +448,10 @@ impl VolumeManager {
     /// this before the manager is cloned or used.
     pub fn with_node_name(mut self, node_name: impl Into<String>) -> Self {
         self.node_name = node_name.into();
+        *self
+            .node_name_cell
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = self.node_name.clone();
         self.asw = Arc::new(
             crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld::new(
                 self.node_name.clone(),

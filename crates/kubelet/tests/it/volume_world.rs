@@ -68,7 +68,6 @@ pub async fn world(
     let removed = Arc::new(PodStates(Mutex::new(HashSet::new())));
     let mounter = Arc::new(vm.clone());
     let shell = VolumeManagerShell::new(
-        node,
         storage.clone(),
         pods.clone(),
         removed.clone(),

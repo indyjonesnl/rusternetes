@@ -99,7 +99,6 @@ async fn fx_inner() -> Fx {
     );
     let pod = pod();
     let shell = VolumeManagerShell::new(
-        "node-rc",
         storage.clone(),
         Arc::new(Pods(Mutex::new(vec![pod.clone()]))),
         Arc::new(Running),
@@ -206,7 +205,6 @@ fn started(f: &Fx) -> Arc<VolumeManagerShell> {
     // Same shell as `f.shell`, which owns plain fields: build the one the
     // mounter hands its `create_pod_volumes` to.
     let shell = Arc::new(VolumeManagerShell::new(
-        "node-rc",
         f.storage.clone(),
         Arc::new(Pods(Mutex::new(vec![f.pod.clone()]))),
         Arc::new(Running),

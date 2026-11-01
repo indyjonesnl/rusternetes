@@ -58,7 +58,8 @@ mod tests {
                 storage,
                 rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
-            ),
+            )
+            .with_node_name("node-1"),
         )
     }
 
@@ -533,7 +534,6 @@ mod tests {
         let path = dm.get_device_mount_path(&spec).unwrap();
         let args = DeviceMounterArgs {
             fs_group: Some(4242),
-            node_name: "node-1".into(),
             ..Default::default()
         };
         dm.mount_device(&spec, "", &path, &args).await.unwrap();
@@ -2210,7 +2210,7 @@ mod tests {
                 inline_volume_spec_for_csi_migration: false,
             };
             f.plugin
-                .verify_exhausted_resource(&spec, NODE, f.drivers, &f.rec)
+                .verify_exhausted_resource(&spec, f.drivers, &f.rec)
                 .await
         }
 
@@ -2262,7 +2262,7 @@ mod tests {
             };
             assert!(
                 !f.plugin
-                    .verify_exhausted_resource(&spec, NODE, f.drivers, &f.rec)
+                    .verify_exhausted_resource(&spec, f.drivers, &f.rec)
                     .await
             );
         }
@@ -2776,7 +2776,6 @@ mod tests {
         let path = dm.get_device_mount_path(&spec).unwrap();
         let args = DeviceMounterArgs {
             selinux_label: label.into(),
-            node_name: "node-1".into(),
             ..Default::default()
         };
         dm.mount_device(&spec, "", &path, &args).await.unwrap();

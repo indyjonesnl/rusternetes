@@ -578,11 +578,6 @@ pub async fn mount_volume_with_attributes(
             let args = DeviceMounterArgs {
                 fs_group: fs_group_from(pod),
                 selinux_label: mounter_args.selinux_label.clone(),
-                node_name: pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.node_name.clone())
-                    .unwrap_or_default(),
             };
             if let Err(e) = device_mounter
                 .mount_device(spec, device_path, &device_mount_path, &args)

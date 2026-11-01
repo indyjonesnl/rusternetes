@@ -68,6 +68,11 @@ pub trait VolumeHost: Send + Sync {
     /// nothing to return but `Ok`.
     fn get_node_allocatable(&self) -> &HashMap<String, String>;
 
+    /// `GetNodeName` (`plugins.go:413`, `pkg/kubelet/volume_host.go:294-296`:
+    /// `kvh.kubelet.nodeName`). The CSI attacher/mounter read it instead of
+    /// the pod's `spec.nodeName` (`csi_attacher.go:297`, `csi_mounter.go:276`).
+    fn get_node_name(&self) -> String;
+
     /// Not a port — upstream's `VolumeHost` has no root-directory accessor
     /// (`pkg/volume/plugins.go` and `pkg/kubelet/volume_host.go` expose only
     /// derived dirs: `GetPluginDir`, `GetPodsDir`, `GetPodVolumeDir`,
@@ -132,6 +137,9 @@ pub struct KubeletVolumeHost {
     mounter: Mounter,
     empty_dir_mount_deps: Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps>,
     host_util: Arc<dyn HostUtils>,
+    /// `kubelet.nodeName`. Shared so the volume manager can set it after the
+    /// plugins (which hold this host) are built.
+    node_name: Arc<std::sync::RwLock<String>>,
 }
 
 impl KubeletVolumeHost {
@@ -161,6 +169,7 @@ impl KubeletVolumeHost {
                 crate::volume_plugins::util::mount_ops::detect_safe_not_mounted_behavior(),
             ),
             empty_dir_mount_deps: None,
+            node_name: Arc::default(),
         }
     }
 
@@ -184,6 +193,18 @@ impl KubeletVolumeHost {
         deps: crate::volume_plugins::empty_dir::EmptyDirMountDeps,
     ) -> Self {
         self.empty_dir_mount_deps = Some(deps);
+        self
+    }
+
+    /// Set the node name `GetNodeName` returns (`kubelet.nodeName`).
+    pub fn with_node_name(self, node_name: impl Into<String>) -> Self {
+        *self.node_name.write().unwrap_or_else(|e| e.into_inner()) = node_name.into();
+        self
+    }
+
+    /// Share an externally owned node-name cell (see [`Self::with_node_name`]).
+    pub(crate) fn with_node_name_cell(mut self, cell: Arc<std::sync::RwLock<String>>) -> Self {
+        self.node_name = cell;
         self
     }
 
@@ -222,6 +243,13 @@ impl KubeletVolumeHost {
 }
 
 impl VolumeHost for KubeletVolumeHost {
+    fn get_node_name(&self) -> String {
+        self.node_name
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn csi_driver_lister(&self) -> Option<&CsiDriverLister> {
         self.csi_driver_lister.as_ref()
     }

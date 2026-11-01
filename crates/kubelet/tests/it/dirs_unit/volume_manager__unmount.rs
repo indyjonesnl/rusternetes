@@ -93,7 +93,6 @@ async fn kubelet(dir: &Path, pods: Vec<Pod>) -> (Arc<VolumeManager>, VolumeManag
         .with_node_name("node-rr"),
     );
     let shell = VolumeManagerShell::new(
-        "node-rr",
         storage,
         Arc::new(Pods(Mutex::new(pods))),
         Arc::new(Running),
