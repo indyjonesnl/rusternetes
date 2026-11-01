@@ -635,6 +635,14 @@ impl CriContainerRuntime {
         self
     }
 
+    /// Replace the node-level docker keyring (default: `NewDefaultDockerKeyring`),
+    /// e.g. with fixed search paths.
+    #[must_use]
+    pub fn with_node_keyring(mut self, keyring: crate::credentialprovider::NodeKeyring) -> Self {
+        self.node_keyring = Arc::new(keyring);
+        self
+    }
+
     /// Emit Kubernetes lifecycle events through `storage`.
     #[must_use]
     pub fn with_event_recorder(

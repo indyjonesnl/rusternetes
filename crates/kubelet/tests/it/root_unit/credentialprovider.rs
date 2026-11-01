@@ -217,7 +217,13 @@ async fn pull_sends_matching_pod_secret_credentials() {
     )
     .await
     .unwrap()
-    .with_volumes(vm);
+    .with_volumes(vm)
+    // Hermetic: never read the machine's real $HOME/.docker or ./config.json.
+    .with_node_keyring(NodeKeyring::new(
+        vec![],
+        vec![],
+        std::time::Duration::from_secs(300),
+    ));
 
     let mut pod = Pod::new("p", PodSpec::default());
     pod.metadata.namespace = Some("ns".into());
