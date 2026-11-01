@@ -30,6 +30,12 @@ pub struct Reconciler {
     /// Runs the mount as `operationExecutor.MountVolume` does.
     mounter: Arc<VolumeMounter>,
     loop_sleep_duration: Duration,
+    /// `populatorHasAddedPods`: whether the desired state is fully populated.
+    populator_has_added_pods: Box<dyn Fn() -> bool + Send + Sync>,
+    /// `volumesFailedReconstruction`: volumes found on disk that could not be
+    /// reconstructed, force-unmounted once nothing desires them
+    /// (`reconstruct.rs`).
+    pub(crate) volumes_failed_reconstruction: std::sync::Mutex<Vec<crate::pod_dirs::PodVolume>>,
 }
 
 impl Reconciler {
@@ -39,13 +45,38 @@ impl Reconciler {
         actual_state_of_world: Arc<ActualStateOfWorld>,
         mounter: Arc<VolumeMounter>,
         loop_sleep_duration: Duration,
+        populator_has_added_pods: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         Self {
             desired_state_of_world,
             actual_state_of_world,
             mounter,
             loop_sleep_duration,
+            populator_has_added_pods: Box::new(populator_has_added_pods),
+            volumes_failed_reconstruction: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn actual_state_of_world(&self) -> &ActualStateOfWorld {
+        &self.actual_state_of_world
+    }
+
+    pub(crate) fn desired_state_of_world(&self) -> &DesiredStateOfWorld {
+        &self.desired_state_of_world
+    }
+
+    pub(crate) fn plugin_mgr(&self) -> &crate::volume_plugins::VolumePluginMgr {
+        &self.mounter.plugin_mgr
+    }
+
+    /// `kubeletPodsDir`.
+    pub(crate) fn kubelet_pods_dir(&self) -> &str {
+        &self.mounter.volumes_base_path
+    }
+
+    /// `nodeName`.
+    pub(crate) fn node_name(&self) -> &str {
+        &self.mounter.node_name
     }
 
     /// Port of `Run` (`reconciler.go:70-72`): `wait.Until(rc.reconcile, ...)`.
@@ -53,9 +84,17 @@ impl Reconciler {
     /// runs each in its own goroutine, so a slow mount does not hold up the
     /// others; `isOperationPending` keeps a volume's operations apart.
     pub async fn run(&self) {
+        // `rc.reconstructVolumes()` before the loop (`reconciler.go:70-72`).
+        self.reconstruct_volumes().await;
         loop {
             for operation in self.mount_or_attach_volumes() {
                 tokio::spawn(operation);
+            }
+            // `readyToUnmount()` then `cleanOrphanVolumes` (`reconciler.go`):
+            // the desired state must be fully populated before a volume that
+            // failed reconstruction is called an orphan.
+            if (self.populator_has_added_pods)() {
+                self.clean_orphan_volumes().await;
             }
             tokio::time::sleep(self.loop_sleep_duration).await;
         }

@@ -8,6 +8,7 @@
 pub mod cache;
 pub mod populator;
 pub mod reconciler;
+pub mod reconstruct;
 
 use crate::volume_manager::cache::{ActualStateOfWorld, DesiredStateOfWorld};
 use crate::volume_manager::populator::{
@@ -108,12 +109,6 @@ impl VolumeManager {
         ));
         // One actual state of world: the one inline mounting reports into.
         let actual_state_of_world = spec_factory.asw.clone();
-        let reconciler = Arc::new(Reconciler::new(
-            desired_state_of_world.clone(),
-            actual_state_of_world.clone(),
-            spec_factory.clone(),
-            RECONCILER_LOOP_SLEEP_PERIOD,
-        ));
         let desired_state_of_world_populator = Arc::new(DesiredStateOfWorldPopulator::new(
             storage,
             DESIRED_STATE_OF_WORLD_POPULATOR_LOOP_SLEEP_PERIOD,
@@ -123,6 +118,14 @@ impl VolumeManager {
             actual_state_of_world.clone(),
             spec_factory.clone(),
             volume_plugin_mgr,
+        ));
+        let populator_has_added_pods = desired_state_of_world_populator.clone();
+        let reconciler = Arc::new(Reconciler::new(
+            desired_state_of_world.clone(),
+            actual_state_of_world.clone(),
+            spec_factory.clone(),
+            RECONCILER_LOOP_SLEEP_PERIOD,
+            move || populator_has_added_pods.has_added_pods(),
         ));
         Self {
             node_name: node_name.to_string(),

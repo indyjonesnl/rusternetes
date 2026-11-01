@@ -589,6 +589,7 @@ mod tests {
             asw.clone(),
             vm.clone(),
             std::time::Duration::from_millis(100),
+            || true,
         );
         reconciler.reconcile().await;
 
