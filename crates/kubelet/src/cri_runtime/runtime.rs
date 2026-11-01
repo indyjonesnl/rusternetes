@@ -696,6 +696,15 @@ impl CriContainerRuntime {
         }
     }
 
+    /// `generatePodSandboxConfig` as the pull path needs it (log dir + DNS):
+    /// `PodSandboxConfig` rides on `PullImage` (`EnsureImageExists`'s
+    /// `podSandboxConfig`, `images/image_manager.go:160`).
+    pub async fn pod_sandbox_config(&self, pod: &Pod) -> anyhow::Result<v1::PodSandboxConfig> {
+        let mut cfg = translate::sandbox_config(pod, &self.log_dir_for(pod));
+        cfg.dns_config = Some(self.pod_dns(pod).await?);
+        Ok(cfg)
+    }
+
     /// Ensure an image is present, honoring the pull policy. `Never` requires it
     /// to already exist; `Always` always pulls; `IfNotPresent` (default) pulls
     /// only when absent.
@@ -704,8 +713,9 @@ impl CriContainerRuntime {
         image: &str,
         pull_policy: Option<&str>,
         event_ctx: Option<(&Pod, &str)>,
+        sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<()> {
-        self.ensure_image_ref(image, pull_policy, event_ctx)
+        self.ensure_image_ref(image, pull_policy, event_ctx, sandbox_cfg)
             .await
             .map(|_| ())
     }
@@ -720,6 +730,7 @@ impl CriContainerRuntime {
         image: &str,
         pull_policy: Option<&str>,
         event_ctx: Option<(&Pod, &str)>,
+        sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<String> {
         let policy = pull_policy.unwrap_or("IfNotPresent");
         let mut cri = self.cri.clone();
@@ -747,7 +758,7 @@ impl CriContainerRuntime {
                 }));
             }
         }
-        self.pull_image(&mut cri, spec, event_ctx.map(|(p, _)| p))
+        self.pull_image(&mut cri, spec, event_ctx.map(|(p, _)| p), sandbox_cfg)
             .await
     }
 
@@ -803,6 +814,7 @@ impl CriContainerRuntime {
         cri: &mut CriClient,
         spec: v1::ImageSpec,
         pod: Option<&Pod>,
+        sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<String> {
         let creds = match pod {
             Some(p) => {
@@ -817,7 +829,7 @@ impl CriContainerRuntime {
             None => Vec::new(),
         };
         if creds.is_empty() {
-            return Ok(cri.pull_image_spec(spec, None).await?);
+            return Ok(cri.pull_image_spec(spec, sandbox_cfg.cloned()).await?);
         }
         let mut errs = Vec::new();
         for c in creds {
@@ -827,7 +839,7 @@ impl CriContainerRuntime {
                 ..Default::default()
             };
             match cri
-                .pull_image_spec_with_auth(spec.clone(), Some(auth), None)
+                .pull_image_spec_with_auth(spec.clone(), Some(auth), sandbox_cfg.cloned())
                 .await
             {
                 Ok(r) => return Ok(r),
@@ -848,7 +860,11 @@ impl CriContainerRuntime {
     /// ([`to_kube_container_image_volumes`] fails late, per container). Empty
     /// when the `ImageVolume` gate is off (`:1815-1817`). Errors only when the
     /// pod runtime handler cannot be resolved (`:1819-1823`).
-    pub(crate) async fn get_image_volumes(&self, pod: &Pod) -> anyhow::Result<ImageVolumePulls> {
+    pub(crate) async fn get_image_volumes(
+        &self,
+        pod: &Pod,
+        sandbox_cfg: &v1::PodSandboxConfig,
+    ) -> anyhow::Result<ImageVolumePulls> {
         use rusternetes_common::feature_gates::{enabled, Feature};
         let mut res = ImageVolumePulls::new();
         if !enabled(Feature::ImageVolume) {
@@ -866,7 +882,12 @@ impl CriContainerRuntime {
             };
             let reference = image.reference.clone().unwrap_or_default();
             match self
-                .ensure_image_ref(&reference, image.pull_policy.as_deref(), Some((pod, "")))
+                .ensure_image_ref(
+                    &reference,
+                    image.pull_policy.as_deref(),
+                    Some((pod, "")),
+                    Some(sandbox_cfg),
+                )
                 .await
             {
                 Ok(image_ref) => {
@@ -961,7 +982,7 @@ impl CriContainerRuntime {
         let mut sandbox_cfg = translate::sandbox_config(pod, &log_dir);
         sandbox_cfg.dns_config = Some(self.pod_dns(pod).await?);
         let mut cri = self.cri.clone();
-        let image_volume_pulls = self.get_image_volumes(pod).await?;
+        let image_volume_pulls = self.get_image_volumes(pod, &sandbox_cfg).await?;
         self.create_and_start_container(
             &mut cri,
             pod,
@@ -1115,6 +1136,7 @@ impl CriContainerRuntime {
             &container.image,
             container.image_pull_policy.as_deref(),
             Some((pod, &container.name)),
+            Some(sandbox_cfg),
         )
         .await?;
         let (config_maps, secrets) = self.resolve_env_sources(pod, container).await;
@@ -1703,7 +1725,7 @@ impl CriContainerRuntime {
 
         // `getImageVolumes` (`kuberuntime_manager.go:1622`): once per sync,
         // after the sandbox exists and before any container starts.
-        let image_volume_pulls = self.get_image_volumes(pod).await?;
+        let image_volume_pulls = self.get_image_volumes(pod, &sandbox_cfg).await?;
 
         // Plain init containers run sequentially to completion before app
         // containers. Restartable init containers (sidecars) start here too,
