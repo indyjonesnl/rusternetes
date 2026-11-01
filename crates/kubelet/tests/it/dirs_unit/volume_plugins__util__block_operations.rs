@@ -344,3 +344,49 @@ async fn unmap_device_removes_the_global_map_path() {
         .unwrap()
         .device_may_be_mounted());
 }
+
+/// `GenerateMountVolumeFunc`'s ReadWriteOncePod check (`operation_generator.go:476-486`):
+/// a filesystem mount is refused while another pod has the volume mounted.
+#[tokio::test]
+async fn read_write_once_pod_filesystem_mount_in_use_by_another_pod_is_refused() {
+    use rusternetes_kubelet::volume_plugins::util::operation_executor::{
+        MarkVolumeOpts, VolumeMountState,
+    };
+    use rusternetes_kubelet::volume_plugins::util::operation_generator::{
+        mount_volume_with_attributes, MountState,
+    };
+    let f = fx(json!(["ReadWriteOncePod"]));
+    // A filesystem local volume is a directory.
+    std::fs::remove_file(&f.device).unwrap();
+    std::fs::create_dir(&f.device).unwrap();
+    f.asw
+        .mark_volume_as_mounted(MarkVolumeOpts {
+            pod_name: UniquePodName("uid-1".into()),
+            pod_uid: "uid-1".into(),
+            volume_name: f.volume_name.clone(),
+            mounter: None,
+            block_volume_mapper: None,
+            volume_gid_volume: String::new(),
+            volume_spec: f.spec.clone(),
+            volume_mount_state: VolumeMountState::VolumeMounted,
+            selinux_mount_context: String::new(),
+        })
+        .unwrap();
+
+    let vtm = to_mount(&f, "uid-2");
+    let err = mount_volume_with_attributes(
+        &f.vm.plugin_mgr,
+        &f.spec.as_spec(),
+        &pod("uid-2"),
+        "",
+        None,
+        Some(&MountState {
+            volume_to_mount: &vtm,
+            actual_state_of_world: &f.asw,
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ReadWriteOncePod"), "{err}");
+}
