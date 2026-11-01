@@ -1734,60 +1734,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // `RunScorePlugins`) or a plugin without a compiled-in
                     // scorer.
                     let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::POD_TOPOLOGY_SPREAD => {
-                            // podtopologyspread/scoring.go PreScore + Score +
-                            // NormalizeScore; `Skip` leaves the plugin out.
-                            use crate::pod_topology_spread_score as pts;
-                            let args = &profile.pod_topology_spread;
-                            let default_sel = if pts::needs_default_selector(pod, args) {
-                                match pts::read_default_selector_inputs(&self.data, pod).await {
-                                    Ok(inputs) => Some(pts::default_selector(pod, &inputs)),
-                                    Err(e) => {
-                                        warn!("PodTopologySpread: failed to read listers: {}", e);
-                                        return None;
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-                            let by_node = pts::pods_by_node(all_pods);
-                            let filtered: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
-                            match pts::pre_score(
-                                pod,
-                                &filtered,
-                                nodes,
-                                &by_node,
-                                args,
-                                default_sel.as_ref(),
-                            ) {
-                                Ok(Some(state)) => {
-                                    let no_pods: Vec<&Pod> = Vec::new();
-                                    let mut v: Vec<i64> = feasible
-                                        .iter()
-                                        .map(|e| {
-                                            let pods = by_node
-                                                .get(e.node.metadata.name.as_str())
-                                                .unwrap_or(&no_pods);
-                                            pts::score(&state, pod, e.node, pods)
-                                        })
-                                        .collect();
-                                    let names: Vec<&str> = feasible
-                                        .iter()
-                                        .map(|e| e.node.metadata.name.as_str())
-                                        .collect();
-                                    pts::normalize_score(&state, &names, &mut v);
-                                    (names::POD_TOPOLOGY_SPREAD, Some(v))
-                                }
-                                Ok(None) => (names::POD_TOPOLOGY_SPREAD, None),
-                                Err(e) => {
-                                    warn!(
-                                        "running PreScore plugin {:?} failed with: {}",
-                                        plugin, e
-                                    );
-                                    return None;
-                                }
-                            }
-                        }
                         names::VOLUME_BINDING => (
                             names::VOLUME_BINDING,
                             volume_scorer.as_ref().map(|scorer| {
@@ -2503,6 +2449,15 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
     ) -> Result<rusternetes_common::resources::ResourceClaim, String> {
         self.data
             .get_resource_claim(ns, name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn default_selector_inputs(
+        &self,
+        pod: &Pod,
+    ) -> Result<crate::pod_topology_spread_score::DefaultSelectorInputs, String> {
+        crate::pod_topology_spread_score::read_default_selector_inputs(self.data, pod)
             .await
             .map_err(|e| e.to_string())
     }

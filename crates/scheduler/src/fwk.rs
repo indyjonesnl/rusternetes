@@ -360,6 +360,15 @@ pub trait Handle: Send + Sync {
         Err("no cluster access".to_string())
     }
 
+    /// The Service/RC/RS/StatefulSet listers `helper.DefaultSelector` reads
+    /// for `pod` (podtopologyspread/scoring.go PreScore).
+    async fn default_selector_inputs(
+        &self,
+        _pod: &Pod,
+    ) -> Result<crate::pod_topology_spread_score::DefaultSelectorInputs, String> {
+        Err("no cluster access".to_string())
+    }
+
     /// `nsLister.List` (interpodaffinity/scoring.go PreScore).
     async fn list_namespaces(&self) -> Result<Vec<Namespace>, String> {
         Err("no cluster access".to_string())

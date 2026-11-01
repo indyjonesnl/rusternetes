@@ -2,9 +2,10 @@
 //! plugin objects and `Framework::run_score_plugins`
 //! (`tainttoleration/taint_toleration_test.go` TestTaintTolerationScore,
 //! `nodeaffinity/node_affinity_test.go` TestNodeAffinityPriority).
+use super::listers::EmptyListers;
 use rusternetes_common::resources::pod::NodeAffinity;
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{CycleState, NoHandle, PreScorePlugin};
+use rusternetes_scheduler::fwk::{CycleState, PreScorePlugin};
 use rusternetes_scheduler::in_tree::NodeAffinityPlugin;
 use rusternetes_scheduler::profile::Profile;
 use serde_json::{json, Value};
@@ -33,7 +34,7 @@ async fn scores(
     let refs: Vec<&Node> = nodes.iter().collect();
     let mut state = CycleState::new();
     let s = fw
-        .run_pre_score_plugins(&mut state, p, &refs, &[], nodes, &NoHandle)
+        .run_pre_score_plugins(&mut state, p, &refs, &[], nodes, &EmptyListers)
         .await;
     assert!(s.is_success(), "{s:?}");
     let out = fw.run_score_plugins(&state, p, &refs, &[], nodes).unwrap();
@@ -91,7 +92,7 @@ async fn node_affinity_skips_pods_that_prefer_nothing() {
     assert_eq!(scores(&fw, &p, &nodes, "NodeAffinity").await, None);
     let mut state = CycleState::new();
     let state = NodeAffinityPlugin::new(None)
-        .pre_score(&mut state, &p, &[&nodes[0]], &[], &[], &NoHandle)
+        .pre_score(&mut state, &p, &[&nodes[0]], &[], &[], &EmptyListers)
         .await;
     assert!(state.is_skip());
 }
@@ -113,7 +114,7 @@ async fn added_affinity_scores_even_without_pod_preferences() {
             &[&n],
             &[],
             &[],
-            &NoHandle,
+            &EmptyListers,
         )
         .await;
     assert!(s.is_success());
