@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 const PODS_DIR_NAME: &str = "pods";
 /// `pkg/kubelet/kubeletconfig/defaults.go:22`
 pub const VOLUMES_DIR_NAME: &str = "volumes";
+
+/// `DefaultKubeletVolumeDevicesDirName` (`pkg/kubelet/config/defaults.go`):
+/// where a pod's block volumes are mapped.
+pub const VOLUME_DEVICES_DIR_NAME: &str = "volumeDevices";
 /// `pkg/kubelet/kubeletconfig/defaults.go:23`
 const VOLUME_SUBPATHS_DIR_NAME: &str = "volume-subpaths";
 
@@ -94,6 +98,12 @@ pub fn get_pod_dir(root: &str, pod_uid: &str) -> PathBuf {
 /// (`kubelet_getters.go:174-176`).
 pub fn get_pod_volumes_dir(root: &str, pod_uid: &str) -> PathBuf {
     get_pod_dir(root, pod_uid).join(VOLUMES_DIR_NAME)
+}
+
+/// `<root>/pods/<podUID>/volumeDevices` — `getPodVolumeDevicesDir`
+/// (`kubelet_getters.go:186-188`).
+pub fn get_pod_volume_devices_dir(root: &str, pod_uid: &str) -> PathBuf {
+    get_pod_dir(root, pod_uid).join(VOLUME_DEVICES_DIR_NAME)
 }
 
 /// `<root>/pods/<podUID>/plugins/<escaped-plugin>` — `getPodPluginDir`
@@ -240,60 +250,80 @@ pub fn get_pod_volume_subpath_list_from_disk(
     Ok(subpaths)
 }
 
+/// `v1.PersistentVolumeMode` of a volume found on disk: which of the pod's
+/// directories (`volumes` or `volumeDevices`) it was found under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodVolumeMode {
+    Filesystem,
+    Block,
+}
+
 /// A volume found under a pod directory: upstream's `podVolume`
-/// (`reconstruct_common.go:44-50`), minus the `volumeMode` field.
+/// (`reconstruct_common.go:44-50`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodVolume {
     pub pod_uid: String,
     /// The directory name under the plugin directory: the volume's name as per
     /// the `v1.Volume` spec (`volumeSpecName`).
     pub volume_spec_name: String,
-    /// `<pod>/volumes/<escaped plugin>/<volume>` (`volumePath`).
+    /// `<pod>/volumes/<escaped plugin>/<volume>` or, for a block volume,
+    /// `<pod>/volumeDevices/<escaped plugin>/<volume>` (`volumePath`).
     pub volume_path: PathBuf,
     /// The unescaped plugin name, e.g. `kubernetes.io/empty-dir`.
     pub plugin_name: String,
+    pub volume_mode: PodVolumeMode,
 }
 
 /// The volumes a pod directory holds on disk.
 ///
 /// Port of `getVolumesFromPodDir` (`pkg/kubelet/volumemanager/reconciler/
-/// reconstruct_common.go:191-240`) for one pod: the `volumes` half of its
-/// `<pod>/volumes/{escapeQualifiedPluginName}/{volumeName}` walk. Upstream
-/// scans every pod under the pods dir in one call and also walks
-/// `volumeDevices` (block volumes); the per-pod split is because the only
-/// caller asks about one orphaned pod at a time, and block volumes are not
-/// supported by this kubelet yet. A pod without a volumes dir has none, as
-/// upstream's `continue` on a failed `ReadDir` says.
+/// reconstruct_common.go:191-240`) for one pod: its
+/// `<pod>/volumes/{escapeQualifiedPluginName}/{volumeName}` walk and its
+/// `<pod>/volumeDevices/...` walk (block volumes). Upstream scans every pod
+/// under the pods dir in one call; the per-pod split is because the callers
+/// ask about one pod at a time. A pod without such a dir has no volumes of
+/// that mode, as upstream's `continue` on a failed `ReadDir` says.
 pub fn get_volumes_from_pod_dir(root: &str, pod_uid: &str) -> std::io::Result<Vec<PodVolume>> {
-    let volumes_dir = get_pod_volumes_dir(root, pod_uid);
-    let plugin_dirs = match std::fs::read_dir(&volumes_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
     let mut volumes = Vec::new();
-    for plugin_dir in plugin_dirs.flatten() {
-        let escaped = plugin_dir.file_name().to_string_lossy().into_owned();
-        let plugin_path = volumes_dir.join(&escaped);
-        let volume_dirs = match std::fs::read_dir(&plugin_path) {
+    for (volume_mode, volumes_dir) in [
+        (
+            PodVolumeMode::Filesystem,
+            get_pod_volumes_dir(root, pod_uid),
+        ),
+        (
+            PodVolumeMode::Block,
+            get_pod_volume_devices_dir(root, pod_uid),
+        ),
+    ] {
+        let plugin_dirs = match std::fs::read_dir(&volumes_dir) {
             Ok(e) => e,
-            Err(e) => {
-                tracing::error!(
-                    "Could not read volume plugin directory {}: {}",
-                    plugin_path.display(),
-                    e
-                );
-                continue;
-            }
+            Err(_) => continue,
         };
-        let plugin_name = unescape_qualified_name(&escaped);
-        for volume_dir in volume_dirs.flatten() {
-            let volume_spec_name = volume_dir.file_name().to_string_lossy().into_owned();
-            volumes.push(PodVolume {
-                pod_uid: pod_uid.to_string(),
-                volume_path: plugin_path.join(&volume_spec_name),
-                volume_spec_name,
-                plugin_name: plugin_name.clone(),
-            });
+        for plugin_dir in plugin_dirs.flatten() {
+            let escaped = plugin_dir.file_name().to_string_lossy().into_owned();
+            let plugin_path = volumes_dir.join(&escaped);
+            let volume_dirs = match std::fs::read_dir(&plugin_path) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(
+                        "Could not read volume plugin directory {}: {}",
+                        plugin_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let plugin_name = unescape_qualified_name(&escaped);
+            for volume_dir in volume_dirs.flatten() {
+                let volume_spec_name = volume_dir.file_name().to_string_lossy().into_owned();
+                volumes.push(PodVolume {
+                    pod_uid: pod_uid.to_string(),
+                    volume_path: plugin_path.join(&volume_spec_name),
+                    volume_spec_name,
+                    plugin_name: plugin_name.clone(),
+                    volume_mode,
+                });
+            }
         }
     }
     Ok(volumes)
