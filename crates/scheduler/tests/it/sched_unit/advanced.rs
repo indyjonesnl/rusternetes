@@ -1110,15 +1110,6 @@ mod tests {
         )
     }
 
-    /// How many of `victims` break a budget: `numViolatingVictim` is this count
-    /// over the victims `select_victims_on_node` chooses.
-    fn pdb_violations(victims: &[Pod], all_pods: &[Pod], pdbs: &[PodDisruptionBudget]) -> i64 {
-        victims
-            .iter()
-            .filter(|v| pod_violates_any_pdb(v, pdbs, all_pods))
-            .count() as i64
-    }
-
     fn labelled_pod(name: &str, priority: i32, node: &str, app: &str) -> Pod {
         let mut pod = make_scheduled_pod(name, priority, "100m", "64Mi", node);
         pod.metadata.namespace = Some("default".to_string());
@@ -1129,68 +1120,24 @@ mod tests {
     }
 
     #[test]
-    fn test_pod_violates_any_pdb_zero_without_budgets() {
-        let pods = vec![labelled_pod("a", 100, "node-1", "web")];
-        assert_eq!(
-            pdb_violations(&pods[..1], &pods, &[]),
-            0,
-            "no budgets means nothing can violate one"
-        );
-    }
-
-    #[test]
-    fn test_pod_violates_any_pdb_counts_covered_pod() {
-        // One replica, minAvailable=1: evicting it breaks the budget.
-        let pods = vec![labelled_pod("only-web", 100, "node-1", "web")];
-        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(pdb_violations(&pods[..1], &pods, &pdbs), 1,);
-    }
-
-    #[test]
-    fn test_pod_violates_any_pdb_ignores_uncovered_pod() {
-        // The budget selects app=web; the victim is app=batch.
-        let pods = vec![
-            labelled_pod("web-1", 100, "node-1", "web"),
-            labelled_pod("web-2", 100, "node-1", "web"),
-            labelled_pod("batch-1", 100, "node-1", "batch"),
-        ];
-        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
-        assert_eq!(pdb_violations(&pods[2..], &pods, &pdbs), 0,);
-    }
-
-    #[test]
-    fn test_pod_violates_any_pdb_sums_across_victims() {
-        let pods = vec![
-            labelled_pod("web-1", 100, "node-1", "web"),
-            labelled_pod("api-1", 100, "node-1", "api"),
-        ];
-        let pdbs = vec![
-            make_pdb_min_available("web-pdb", "default", "web", 1),
-            make_pdb_min_available("api-pdb", "default", "api", 1),
-        ];
-        assert_eq!(pdb_violations(&pods, &pods, &pdbs), 2,);
-    }
-
-    #[test]
     fn test_pdb_violation_count_steers_node_choice() {
         // The whole point of the count: node-1's victim is cheaper by priority
         // but protected, so the score chain must prefer node-2 even though its
         // victim has the higher priority.
-        let pods = vec![
+        let pods = [
             labelled_pod("guarded-low", 100, "node-1", "web"),
             labelled_pod("free-medium", 500, "node-2", "batch"),
         ];
-        let pdbs = vec![make_pdb_min_available("web-pdb", "default", "web", 1)];
         let candidates = vec![
             PreemptionCandidate {
                 node_name: "node-1".to_string(),
                 victims: vec![pods[0].clone()],
-                num_pdb_violations: pdb_violations(&pods[..1], &pods, &pdbs),
+                num_pdb_violations: 1,
             },
             PreemptionCandidate {
                 node_name: "node-2".to_string(),
                 victims: vec![pods[1].clone()],
-                num_pdb_violations: pdb_violations(&pods[1..], &pods, &pdbs),
+                num_pdb_violations: 0,
             },
         ];
         assert_eq!(

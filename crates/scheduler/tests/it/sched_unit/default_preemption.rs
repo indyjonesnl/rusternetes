@@ -174,7 +174,8 @@ async fn pdb_violating_victims_are_reprieved_before_the_others() {
     ];
     let pdb: PodDisruptionBudget = serde_json::from_value(json!({
         "metadata": {"name": "b", "namespace": "default"},
-        "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "guarded"}}}
+        "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "guarded"}}},
+        "status": {"currentHealthy": 1, "desiredHealthy": 1, "disruptionsAllowed": 0, "expectedPods": 1}
     }))
     .unwrap();
     let (victims, violations) = select(&pod("p", "", 10, "1", json!({})), &n, &existing, &[pdb])
@@ -190,7 +191,8 @@ async fn a_victim_that_must_go_despite_its_pdb_is_counted() {
     let existing = vec![pod("guarded", "n", 1, "1", json!({}))];
     let pdb: PodDisruptionBudget = serde_json::from_value(json!({
         "metadata": {"name": "b", "namespace": "default"},
-        "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "guarded"}}}
+        "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app": "guarded"}}},
+        "status": {"currentHealthy": 1, "desiredHealthy": 1, "disruptionsAllowed": 0, "expectedPods": 1}
     }))
     .unwrap();
     let (victims, violations) = select(&pod("p", "", 10, "1", json!({})), &n, &existing, &[pdb])
@@ -238,5 +240,111 @@ fn nominated_pods_are_unbound_alive_and_at_least_as_important() {
             .map(|p| p.metadata.name.as_str())
             .collect::<Vec<_>>(),
         vec!["equal"]
+    );
+}
+
+/// `filterPodsWithPDBViolation` (default_preemption.go:373-419), seen through
+/// the violation count of the victims it classifies.
+fn pdb(ns: &str, selector: Value, status: Value) -> PodDisruptionBudget {
+    let mut v = json!({
+        "metadata": {"name": "b", "namespace": ns},
+        "spec": {"minAvailable": 1, "selector": selector},
+    });
+    if !status.is_null() {
+        v["status"] = status;
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+fn allowed(n: i32) -> Value {
+    json!({"currentHealthy": 2, "desiredHealthy": 2, "disruptionsAllowed": n, "expectedPods": 2})
+}
+
+async fn violations(pdbs: &[PodDisruptionBudget], victims: Vec<Pod>) -> i64 {
+    // The preemptor needs the whole node, so every pod is a victim.
+    let n = node("2");
+    let (_, violations) = select(&pod("p", "", 10, "2", json!({})), &n, &victims, pdbs)
+        .await
+        .unwrap();
+    violations
+}
+
+fn app(name: &str) -> Value {
+    json!({"matchLabels": {"app": name}})
+}
+
+#[tokio::test]
+async fn each_victim_spends_the_budget_and_only_the_excess_violates() {
+    let victims = vec![
+        pod("a", "n", 1, "1", json!({})),
+        pod("b", "n", 1, "1", json!({})),
+    ];
+    let both =
+        json!({"matchExpressions": [{"key": "app", "operator": "In", "values": ["a", "b"]}]});
+    assert_eq!(
+        violations(&[pdb("default", both.clone(), allowed(2))], victims.clone()).await,
+        0
+    );
+    assert_eq!(
+        violations(&[pdb("default", both.clone(), allowed(1))], victims.clone()).await,
+        1
+    );
+    assert_eq!(
+        violations(&[pdb("default", both, allowed(0))], victims).await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_budget_without_status_allows_no_disruption() {
+    let victims = vec![pod("a", "n", 1, "2", json!({}))];
+    assert_eq!(
+        violations(&[pdb("default", app("a"), Value::Null)], victims).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn pods_already_in_disrupted_pods_do_not_violate() {
+    let victims = vec![pod("a", "n", 1, "2", json!({}))];
+    let status = json!({
+        "currentHealthy": 1, "desiredHealthy": 1, "disruptionsAllowed": 0, "expectedPods": 1,
+        "disruptedPods": {"a": "2026-01-01T00:00:00Z"}
+    });
+    assert_eq!(
+        violations(&[pdb("default", app("a"), status)], victims).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn budgets_that_select_nothing_or_elsewhere_never_violate() {
+    let victims = vec![pod("a", "n", 1, "2", json!({}))];
+    // A nil or empty selector matches nothing.
+    assert_eq!(
+        violations(&[pdb("default", Value::Null, allowed(0))], victims.clone()).await,
+        0
+    );
+    assert_eq!(
+        violations(&[pdb("default", json!({}), allowed(0))], victims.clone()).await,
+        0
+    );
+    // An invalid selector matches nothing.
+    let bad = json!({"matchExpressions": [{"key": "app", "operator": "Bogus"}]});
+    assert_eq!(
+        violations(&[pdb("default", bad, allowed(0))], victims.clone()).await,
+        0
+    );
+    // Another namespace's budget does not apply.
+    assert_eq!(
+        violations(&[pdb("other", app("a"), allowed(0))], victims.clone()).await,
+        0
+    );
+    // A pod without labels matches no budget.
+    let mut unlabelled = victims;
+    unlabelled[0].metadata.labels = None;
+    assert_eq!(
+        violations(&[pdb("default", app("a"), allowed(0))], unlabelled).await,
+        0
     );
 }
