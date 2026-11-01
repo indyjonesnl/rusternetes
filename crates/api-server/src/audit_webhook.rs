@@ -13,7 +13,7 @@
 //!   and `pkg/audit/union.go` (`Union`).
 //!
 //! Not ported (tracked on #2605): dynamic backends (`AuditSink`, removed
-//! upstream in 1.19), the egress selector dial, tracing spans, and the
+//! upstream in 1.19), tracing spans, and the
 //! `apiserver_audit_error_total` metric `HandlePluginError` bumps.
 
 use crate::authorization_webhook::WebhookClientConfig;
@@ -298,7 +298,7 @@ struct EventList<'a> {
 /// `webhook.backend` (webhook.go:81-84): POSTs batches of events to the
 /// kubeconfig's server.
 pub struct WebhookBackend {
-    client: reqwest::Client,
+    client: crate::authorization_webhook::WebhookHttp,
     config: WebhookClientConfig,
     retry_backoff: Backoff,
 }
@@ -317,26 +317,25 @@ impl WebhookBackend {
             anyhow::bail!("webhook plugin requires enabling extension resource: {group_version}");
         }
         let config = WebhookClientConfig::load(kubeconfig)?;
+        // `AuditOptions.ApplyTo` (options/audit.go:300-312): with an egress
+        // selector, `Lookup(ControlPlane)` is the webhook's custom dial
+        // (`LoadKubeconfig`, util/webhook/webhook.go:157).
         Ok(Self {
-            client: config.build_client()?,
+            client: crate::authorization_webhook::WebhookHttp::for_config(&config)?,
             config,
             retry_backoff,
         })
     }
 
-    async fn post_once(&self, body: &[u8]) -> Result<(), String> {
+    async fn post_once(&self, body: &EventList<'_>) -> Result<(), String> {
         let resp = self
-            .config
-            .post(&self.client)
-            .header("Content-Type", "application/json")
-            .body(body.to_vec())
-            .send()
+            .client
+            .post_json(&self.config, body)
             .await
-            .map_err(|e| e.to_string())?;
-        let status = resp.status();
+            .map_err(|e| e.message)?;
         // `transformResponse`: outside 200..=206 is an error.
-        if !(200..=206).contains(&status.as_u16()) {
-            return Err(format!("webhook returned HTTP {status}"));
+        if !(200..=206).contains(&resp.status) {
+            return Err(format!("webhook returned HTTP {}", resp.status));
         }
         Ok(())
     }
@@ -345,13 +344,12 @@ impl WebhookBackend {
     /// `WithExponentialBackoff` (util/webhook/webhook.go:105-135) with
     /// `retryOnError`: every error is retried, up to `Steps` attempts.
     pub async fn try_process_events(&self, events: &[AuditEvent]) -> Result<(), String> {
-        let body = serde_json::to_vec(&EventList {
+        let body = EventList {
             kind: "EventList",
             api_version: AUDIT_GROUP_VERSION,
             metadata: serde_json::json!({}),
             items: events,
-        })
-        .map_err(|e| e.to_string())?;
+        };
         let mut backoff = self.retry_backoff.clone();
         let mut last = String::new();
         while backoff.steps > 0 {

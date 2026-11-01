@@ -13,6 +13,7 @@ mod audit_metrics;
 mod audit_request_object;
 mod audit_truncate;
 mod audit_webhook;
+mod audit_webhook_egress;
 mod authorization_config;
 mod authorization_config_metrics;
 mod authorization_metrics;
