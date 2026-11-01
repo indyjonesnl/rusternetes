@@ -18,8 +18,9 @@
 //! the pipeline consults to decide which stages run for a profile.
 
 use crate::fwk::{
-    CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature, PreFilterPlugin,
-    PreFilterResult, PreScorePlugin, ScorePlugin, SignPlugin, Status,
+    CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature, PreBindPlugin,
+    PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin, SignPlugin,
+    Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -524,6 +525,10 @@ pub struct Framework {
     /// score inline (#4231).
     pre_score_plugin_objects: PreScorePluginObjects,
     score_plugin_objects: ScorePluginObjects,
+    /// `f.reservePlugins` / `f.preBindPlugins` (framework.go:70-71): the
+    /// Reserve and PreBind plugin objects, in execution order.
+    reserve_plugin_objects: ReservePluginObjects,
+    pre_bind_plugin_objects: PreBindPluginObjects,
     /// `f.batchablePlugins` (framework.go:75): the signers of the
     /// PreFilter/Filter/PreScore/Score plugins, once per plugin name.
     batchable_plugins: SignPluginObjects,
@@ -559,6 +564,30 @@ impl std::fmt::Debug for FilterPluginObjects {
 pub struct PreScorePluginObjects(Vec<Arc<dyn PreScorePlugin>>);
 
 impl std::fmt::Debug for PreScorePluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The Reserve plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct ReservePluginObjects(Vec<Arc<dyn ReservePlugin>>);
+
+impl std::fmt::Debug for ReservePluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The PreBind plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PreBindPluginObjects(Vec<Arc<dyn PreBindPlugin>>);
+
+impl std::fmt::Debug for PreBindPluginObjects {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list()
             .entries(self.0.iter().map(|p| p.name()))
@@ -635,6 +664,116 @@ impl Framework {
             }
         }
         state.set_skip_score_plugins(skip);
+        Status::success()
+    }
+
+    /// `RunReservePluginsReserve` (framework.go:1598-1628): stops at the first
+    /// plugin that does not succeed; the caller then runs
+    /// [`Framework::run_reserve_plugins_unreserve`]. A rejection is returned
+    /// as is (tagged with the plugin), any other failure is wrapped as
+    /// `running Reserve plugin "<name>": <err>`.
+    pub async fn run_reserve_plugins_reserve(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        for pl in &self.reserve_plugin_objects.0 {
+            let mut s = pl.reserve(state, pod, node_name, handle).await;
+            if s.is_success() {
+                continue;
+            }
+            if s.is_rejected() {
+                s.set_plugin(pl.name());
+                return s;
+            }
+            return Status::from_error(format!(
+                "running Reserve plugin {:?}: {}",
+                pl.name(),
+                s.as_error().unwrap_or_default()
+            ));
+        }
+        Status::success()
+    }
+
+    /// `RunReservePluginsUnreserve` (framework.go:1642-1664): every plugin's
+    /// `Unreserve`, in the reverse order of `Reserve`.
+    pub async fn run_reserve_plugins_unreserve(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) {
+        for pl in self.reserve_plugin_objects.0.iter().rev() {
+            pl.unreserve(state, pod, node_name, handle).await;
+        }
+    }
+
+    /// `RunPreBindPreFlights` (framework.go:1464-1501): Success when one or
+    /// more plugins will work, Skip when all skip, Error otherwise; the
+    /// skipping plugins are recorded in the cycle state.
+    pub fn run_pre_bind_pre_flights(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        node_name: &str,
+    ) -> Status {
+        let mut skip: HashSet<String> = HashSet::new();
+        let mut returning = Status::new(crate::fwk::Code::Skip, Vec::new());
+        for pl in &self.pre_bind_plugin_objects.0 {
+            let s = pl.pre_bind_pre_flight(state, pod, node_name);
+            if s.code() == crate::fwk::Code::Error {
+                return Status::from_error(format!(
+                    "running PreBindPreFlight {:?}: {}",
+                    pl.name(),
+                    s.as_error().unwrap_or_default()
+                ));
+            } else if s.is_success() {
+                returning = Status::success();
+            } else if s.is_skip() {
+                skip.insert(pl.name().to_string());
+            } else {
+                return Status::from_error(format!(
+                    "PreBindPreFlight {} returned {:?}, which is unsupported. It is supposed to return Success, Skip, or Error status",
+                    pl.name(),
+                    s.code()
+                ));
+            }
+        }
+        state.set_skip_pre_bind_plugins(skip);
+        returning
+    }
+
+    /// `RunPreBindPlugins` (framework.go:1413-1447): plugins skipped by their
+    /// PreBindPreFlight do not run; a rejection is returned as is, any other
+    /// failure is wrapped as `running PreBind plugin "<name>": <err>`.
+    pub async fn run_pre_bind_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        for pl in &self.pre_bind_plugin_objects.0 {
+            if state.skip_pre_bind_plugins().contains(pl.name()) {
+                continue;
+            }
+            let mut s = pl.pre_bind(state, pod, node_name, handle).await;
+            if s.is_success() {
+                continue;
+            }
+            if s.is_rejected() {
+                s.set_plugin(pl.name());
+                return s;
+            }
+            return Status::from_error(format!(
+                "running PreBind plugin {:?}: {}",
+                pl.name(),
+                s.as_error().unwrap_or_default()
+            ));
+        }
         Status::success()
     }
 
@@ -1124,6 +1263,18 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
         f.plugins_at(ExtensionPoint::Score)
             .iter()
             .filter_map(|name| crate::in_tree::new_score_plugin(name, &plugin_args(profile)))
+            .collect(),
+    );
+    f.reserve_plugin_objects = ReservePluginObjects(
+        f.plugins_at(ExtensionPoint::Reserve)
+            .iter()
+            .filter_map(|name| crate::in_tree::new_reserve_plugin(name))
+            .collect(),
+    );
+    f.pre_bind_plugin_objects = PreBindPluginObjects(
+        f.plugins_at(ExtensionPoint::PreBind)
+            .iter()
+            .filter_map(|name| crate::in_tree::new_pre_bind_plugin(name))
             .collect(),
     );
     f.compute_batchable_plugins();
