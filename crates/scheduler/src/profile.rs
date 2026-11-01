@@ -118,6 +118,7 @@ impl Profile {
                 balanced_scorer: Some(&self.balanced_scorer),
                 inter_pod_affinity: self.inter_pod_affinity,
                 pod_topology_spread: Some(&self.pod_topology_spread),
+                volume_shape: Some(&self.volume_shape),
             },
         )
     }

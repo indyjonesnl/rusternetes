@@ -1650,9 +1650,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             );
         }
 
-        // `stateData.podVolumesByNode` (volume_binding.go): the VolumeBinding
-        // Filter's per-node result, read back by PreScore/Score and Reserve.
-        let mut pod_volumes_by_node = crate::in_tree::take_pod_volumes_by_node(&cycle_state);
         if feasible.is_empty() {
             if let Some(narrowed) = narrowed {
                 // `SetAbsentNodesStatus` (schedule_one.go:561): the nodes the
@@ -1671,22 +1668,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             debug!("No nodes satisfy the pod's constraints");
             return None;
         }
-
-        // VolumeBinding PreScore (volume_binding.go:456-468): `pl.scorer` is
-        // only built when StorageCapacityScoring is on (volume_binding.go:642-653);
-        // otherwise, or when PreScore says Skip, Score is not run.
-        // Per-profile VolumeBindingArgs.Shape (the pod's own framework).
-        let volume_shape = profile.volume_shape.clone();
-        let scoring_enabled = rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
-        );
-        let volume_scorer = if scoring_enabled
-            && !volume_binding::pre_score_skip(&pod_volumes_by_node, scoring_enabled)
-        {
-            Some(volume_binding::build_scorer_function(&volume_shape))
-        } else {
-            None
-        };
 
         // `schedulePod` (schedule_one.go:443-451): "When only one node after
         // predicate, just use it" - no Score plugin runs.
@@ -1719,7 +1700,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     diag.scheduling_error = Some(status.message());
                     return None;
                 }
-                let mut ran: Vec<crate::score::PluginScores> =
+                let ran: Vec<crate::score::PluginScores> =
                     match fw.run_score_plugins(&cycle_state, pod, &feasible_nodes, all_pods, nodes)
                     {
                         Ok(r) => r,
@@ -1728,37 +1709,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                             return None;
                         }
                     };
-                for plugin in fw.plugins_at(ExtensionPoint::Score) {
-                    let weight = i64::from(fw.score_weight(plugin));
-                    // `None` is a PreScore `Skip` (the plugin is left out of
-                    // `RunScorePlugins`) or a plugin without a compiled-in
-                    // scorer.
-                    let (name, scores): (&'static str, Option<Vec<i64>>) = match plugin.as_str() {
-                        names::VOLUME_BINDING => (
-                            names::VOLUME_BINDING,
-                            volume_scorer.as_ref().map(|scorer| {
-                                feasible
-                                    .iter()
-                                    .map(|e| {
-                                        volume_binding::score(
-                                            pod_volumes_by_node.get(&e.node.metadata.name),
-                                            scorer,
-                                            scoring_enabled,
-                                        )
-                                    })
-                                    .collect()
-                            }),
-                        ),
-                        _ => ("", None),
-                    };
-                    if let Some(scores) = scores {
-                        ran.push(crate::score::PluginScores {
-                            name,
-                            weight,
-                            scores,
-                        });
-                    }
-                }
                 match crate::score::total_scores(&ran, n) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1777,8 +1727,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let best_owned = feasible[chosen].node.metadata.name.clone();
         let best_node_name = &best_owned;
 
-        // `state.podVolumesByNode[nodeName]` (volume_binding.go:537) is carried
-        // to Reserve/PreBind for the chosen node only.
+        // `stateData.podVolumesByNode` (volume_binding.go): the VolumeBinding
+        // Filter's per-node result, scored above; `[nodeName]`
+        // (volume_binding.go:537) is carried to Reserve/PreBind for the
+        // chosen node only.
+        let mut pod_volumes_by_node = crate::in_tree::take_pod_volumes_by_node(&cycle_state);
         let chosen_volumes = pod_volumes_by_node.remove(best_node_name);
         nodes
             .iter()

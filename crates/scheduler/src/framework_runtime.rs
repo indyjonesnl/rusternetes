@@ -503,6 +503,8 @@ pub struct ProfileSpec<'a> {
     pub inter_pod_affinity: crate::inter_pod_affinity_score::Args,
     /// `PodTopologySpreadArgs`, handed to the PodTopologySpread score plugin.
     pub pod_topology_spread: Option<&'a crate::pod_topology_spread_score::Args>,
+    /// `VolumeBindingArgs.Shape`, handed to the VolumeBinding score plugin.
+    pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
 }
 
 /// A resolved profile framework: per-extension-point plugin lists (after
@@ -1136,6 +1138,7 @@ fn plugin_args<'a>(profile: &ProfileSpec<'a>) -> crate::in_tree::FilterPluginArg
         balanced_scorer: profile.balanced_scorer,
         inter_pod_affinity: profile.inter_pod_affinity,
         pod_topology_spread: profile.pod_topology_spread,
+        volume_shape: profile.volume_shape,
     }
 }
 
