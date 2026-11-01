@@ -577,6 +577,150 @@ mod tests {
         assert!(p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none());
     }
 
+    /// A pod nominated to a node by an earlier preemption, whose cycle now fails.
+    async fn nominated_fixture(
+        storage: &MemoryStorage,
+        pod_spec: serde_json::Value,
+        with_node: bool,
+    ) {
+        if with_node {
+            let node: Node = serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "node-1"},
+                "status": {"allocatable": {"cpu": "1", "memory": "10Gi", "pods": "10"}}
+            }))
+            .unwrap();
+            storage
+                .create("/registry/nodes/node-1", &node)
+                .await
+                .unwrap();
+            let held = stored_pod(storage, "held", "node-1", 0, None).await;
+            let mut held = held;
+            held.spec.as_mut().unwrap().containers[0].resources =
+                Some(rusternetes_common::types::ResourceRequirements {
+                    requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
+                    limits: None,
+                    claims: None,
+                });
+            storage
+                .update("/registry/pods/default/held", &held)
+                .await
+                .unwrap();
+        }
+        let mut p = stored_pod(storage, "nominated", "", 1000, Some("node-1")).await;
+        {
+            let spec = p.spec.as_mut().unwrap();
+            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
+                limits: None,
+                claims: None,
+            });
+            for (k, v) in pod_spec.as_object().unwrap() {
+                match k.as_str() {
+                    "preemptionPolicy" => spec.preemption_policy = v.as_str().map(str::to_string),
+                    "nodeSelector" => {
+                        spec.node_selector = serde_json::from_value(v.clone()).unwrap()
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        storage
+            .update("/registry/pods/default/nominated", &p)
+            .await
+            .unwrap();
+    }
+
+    async fn nominated_node_of(storage: &MemoryStorage) -> Option<String> {
+        let p: Pod = storage
+            .get("/registry/pods/default/nominated")
+            .await
+            .unwrap();
+        p.status.and_then(|s| s.nominated_node_name)
+    }
+
+    /// `PostFilterResult` with `NominatedNodeName: ""` when preemption cannot
+    /// help (preemption.go:309-312), applied by `handleSchedulingFailure`
+    /// (schedule_one.go:1103-1105, `updatePod`): the stale nomination goes, in
+    /// the nominator and on the pod.
+    #[tokio::test]
+    async fn test_failed_preemption_clears_the_nomination() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        // The node is full for the pod, but its nodeSelector can never match:
+        // UnschedulableAndUnresolvable, so no candidate.
+        nominated_fixture(
+            &storage,
+            serde_json::json!({"nodeSelector": {"disk": "ssd"}}),
+            true,
+        )
+        .await;
+        let queue = test_queue();
+        let pod: Pod = storage
+            .get("/registry/pods/default/nominated")
+            .await
+            .unwrap();
+        queue.add_nominated_pod(
+            &pod,
+            Some(&rusternetes_scheduler::queue::nominator::NominatingInfo::noop()),
+        );
+        assert_eq!(
+            queue
+                .nominated_nodes()
+                .get("nominated-uid")
+                .map(String::as_str),
+            Some("node-1")
+        );
+
+        scheduler
+            .try_schedule_pod(&queue, "pods/default/nominated")
+            .await
+            .unwrap();
+
+        assert_eq!(nominated_node_of(&storage).await, None);
+        assert_ne!(
+            queue
+                .nominated_nodes()
+                .get("nominated-uid")
+                .map(String::as_str),
+            Some("node-1")
+        );
+    }
+
+    /// A nil PostFilter result (not eligible: `preemptionPolicy: Never`) leaves
+    /// the nomination as it is (`ModeNoop`).
+    #[tokio::test]
+    async fn test_ineligible_pod_keeps_its_nomination() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        nominated_fixture(
+            &storage,
+            serde_json::json!({"preemptionPolicy": "Never"}),
+            true,
+        )
+        .await;
+        scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/nominated")
+            .await
+            .unwrap();
+        assert_eq!(nominated_node_of(&storage).await.as_deref(), Some("node-1"));
+    }
+
+    /// `ErrNoNodesAvailable` returns `clearNominatedNode` (schedule_one.go:155-157).
+    #[tokio::test]
+    async fn test_no_nodes_clears_the_nomination() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        nominated_fixture(&storage, serde_json::json!({}), false).await;
+        scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/nominated")
+            .await
+            .unwrap();
+        assert_eq!(nominated_node_of(&storage).await, None);
+    }
+
     #[tokio::test]
     async fn test_scheduler_emits_event_for_unschedulable_pod() {
         let storage = Arc::new(MemoryStorage::new());
