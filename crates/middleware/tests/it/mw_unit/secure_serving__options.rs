@@ -126,6 +126,20 @@ mod tests {
         assert!(!o.disable_http2_serving);
     }
 
+    // serving.go:208: `--http2-max-streams-per-connection` feeds the option; unset
+    // keeps 0 ("use the server default").
+    #[test]
+    fn http2_max_streams_flag_is_applied() {
+        let mut o = SecureServingOptions::new();
+        assert_eq!(o.http2_max_streams_per_connection, 0);
+        parse(&[]).serving.apply_to_options(&mut o);
+        assert_eq!(o.http2_max_streams_per_connection, 0);
+        parse(&["--http2-max-streams-per-connection=42"])
+            .serving
+            .apply_to_options(&mut o);
+        assert_eq!(o.http2_max_streams_per_connection, 42);
+    }
+
     // pflag bool: `--x=false` is accepted.
     #[test]
     fn bool_flags_accept_explicit_false() {

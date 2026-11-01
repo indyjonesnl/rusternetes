@@ -80,6 +80,8 @@ pub struct SecureServingOptions {
     pub cipher_suites: Vec<String>,
     pub min_tls_version: String,
     pub disable_http2_serving: bool,
+    /// `HTTP2MaxStreamsPerConnection` (serving.go:71-73); 0 = the server default.
+    pub http2_max_streams_per_connection: i32,
 }
 
 impl SecureServingOptions {
@@ -98,6 +100,7 @@ impl SecureServingOptions {
             cipher_suites: vec![],
             min_tls_version: String::new(),
             disable_http2_serving: false,
+            http2_max_streams_per_connection: 0,
         }
     }
 
@@ -190,6 +193,7 @@ impl SecureServingOptions {
             cipher_suites,
             min_tls_version,
             disable_http2: self.disable_http2_serving,
+            http2_max_streams_per_connection: self.http2_max_streams_per_connection,
             client_cas: vec![],
         }))
     }
@@ -337,6 +341,14 @@ pub struct SecureServingFlags {
     #[arg(long = "disable-http2-serving", num_args = 0..=1, default_missing_value = "true")]
     pub disable_http2_serving: Option<bool>,
 
+    /// The limit that the server gives to clients for the maximum number of
+    /// streams in an HTTP/2 connection. Zero means to use the server default.
+    #[arg(
+        long = "http2-max-streams-per-connection",
+        allow_negative_numbers = true
+    )]
+    pub http2_max_streams_per_connection: Option<i32>,
+
     /// The directory where the TLS certs are located. If --tls-cert-file and
     /// --tls-private-key-file are provided, this flag will be ignored.
     #[arg(long = "cert-dir")]
@@ -376,6 +388,9 @@ impl SecureServingFlags {
         }
         if let Some(v) = self.disable_http2_serving {
             o.disable_http2_serving = v;
+        }
+        if let Some(v) = self.http2_max_streams_per_connection {
+            o.http2_max_streams_per_connection = v;
         }
         if let Some(v) = &self.cert_dir {
             o.server_cert.cert_directory = v.clone();
