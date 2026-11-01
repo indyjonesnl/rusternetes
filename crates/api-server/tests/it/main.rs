@@ -143,6 +143,7 @@ mod deployment_generic_store_test;
 mod deployment_handler_test;
 mod deployment_scale_test;
 mod devicetaintrule_3804_test;
+mod devicetaintrule_registry_test;
 mod dra_finalizers_test;
 mod dra_test;
 mod dynamic_ca_reload_test;
