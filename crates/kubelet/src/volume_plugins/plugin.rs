@@ -104,9 +104,8 @@ impl OwnedSpec {
 /// Port of `volume.VolumePlugin` (`pkg/volume/plugins.go:128`).
 ///
 /// Only the methods with a consumer are ported. `NewUnmounter` and
-/// `ConstructVolumeSpec` arrived with the orphaned-volume teardown
-/// ([`crate::volumes::VolumeManager::unmount_orphaned_volumes`]) and the CSI
-/// held-device scan; `GetVolumeName`, `RequiresRemount` and
+/// `ConstructVolumeSpec` arrived with the reconciler's unmount arm
+/// ([`crate::volume_manager::reconciler::Reconciler`]) and reconstruction; `GetVolumeName`, `RequiresRemount` and
 /// `SupportsSELinuxContextMount` arrived with `DesiredStateOfWorld`, which
 /// calls all three.
 #[async_trait]
