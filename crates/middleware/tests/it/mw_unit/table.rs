@@ -348,6 +348,46 @@ mod tests {
         );
     }
 
+    // printers.go:700-713 (`deviceTaintColumnDefinitions`) + 3255-3267
+    // (`printDeviceTaint`): the rule list prints the taint, not the filter.
+    #[test]
+    fn device_taint_rule_columns_and_cells_match_upstream() {
+        let cols = printer_columns("DeviceTaintRuleList").expect("has a printer");
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Name", "Key", "Value", "Effect", "TimeAdded", "Age"]
+        );
+        assert_eq!(cols[0].format, "name");
+        assert!(cols[1]
+            .description
+            .starts_with("The taint key to be applied to a device."));
+        let cells = |obj: serde_json::Value| printer_row_cells("DeviceTaintRule", &obj).unwrap();
+        // No timeAdded is an empty cell.
+        let c = cells(json!({
+            "metadata": {"name": "r", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "spec": {"taint": {"key": "k", "value": "v", "effect": "NoExecute"}}
+        }));
+        assert_eq!(
+            &c[..5],
+            &[
+                json!("r"),
+                json!("k"),
+                json!("v"),
+                json!("NoExecute"),
+                json!("")
+            ]
+        );
+        // A set timeAdded is rendered as a duration since.
+        let c = cells(json!({
+            "metadata": {"name": "r"},
+            "spec": {"taint": {"key": "k", "effect": "None", "timeAdded": "2020-01-01T00:00:00Z"}}
+        }));
+        assert_ne!(c[4], json!(""));
+        assert_ne!(c[4], json!("<unknown>"));
+        assert_eq!(c[5], json!("<unknown>"));
+    }
+
     // duration_test.go TestHumanDuration + TestHumanDurationBoundaries.
     #[test]
     fn human_duration_matches_upstream_cases() {
