@@ -83,7 +83,19 @@ fn make_container(cpu: &str, memory: &str) -> Container {
     }
 }
 
-use rusternetes_test_support::node_with_resources as make_node;
+/// A node as the kubelet reports it: `NodeResourcesFit` counts `pods` against
+/// the node's allocatable, so a node without it admits no pod.
+fn make_node(name: &str, cpu: &str, memory: &str) -> rusternetes_common::resources::Node {
+    let mut node = rusternetes_test_support::node_with_resources(name, cpu, memory);
+    for q in node
+        .status
+        .iter_mut()
+        .flat_map(|s| s.capacity.iter_mut().chain(s.allocatable.iter_mut()))
+    {
+        q.insert("pods".to_string(), "110".to_string());
+    }
+    node
+}
 
 fn make_scheduled_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {
     make_pod_with_labels(name, priority, cpu, memory, Some(node_name), None)
