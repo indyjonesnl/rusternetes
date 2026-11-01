@@ -24,13 +24,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::preempt_support::check_preemption;
 use rusternetes_common::resources::{
     Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus, PriorityClass, ReplicaSet,
     ReplicaSetSpec,
 };
 use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
 use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_scheduler::advanced::{check_host_port_conflicts, check_preemption};
+use rusternetes_scheduler::advanced::check_host_port_conflicts;
 use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
@@ -290,9 +291,11 @@ fn preemption_skipped_when_pod_has_preemption_policy_never() {
     let mut incoming = make_incoming_pod("nice-preemptor", 1000, "1", "512Mi");
     incoming.spec.as_mut().unwrap().preemption_policy = Some("Never".to_string());
 
-    let (can_preempt, victims) = check_preemption(&node, &incoming, &[low]);
-    assert!(!can_preempt, "preemptionPolicy=Never must not preempt");
-    assert!(victims.is_empty());
+    let preempted = crate::preempt_support::try_preempt(&node, &incoming, &[low]);
+    assert!(
+        preempted.is_none(),
+        "preemptionPolicy=Never must not preempt; got {preempted:?}"
+    );
 }
 
 /// [sig-scheduling] SchedulerPreemption protects system-critical pods

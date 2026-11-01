@@ -5,9 +5,9 @@
 //! contract laid out in
 //! `pkg/scheduler/framework/preemption/preemption.go::selectVictimsOnNode`.
 //!
-//! Scope: scheduler unit. The tests drive the published
-//! `rusternetes_scheduler::advanced` helpers (`check_preemption`,
-//! `check_preemption_with_pdbs`) and exercise the priority-queue ordering
+//! Scope: scheduler unit. The tests drive victim selection through
+//! `preempt_support` (`check_preemption`, `check_preemption_with_pdbs`, on
+//! `default_preemption::select_victims_on_node`) and exercise the priority-queue ordering
 //! comparator the scheduler uses in `schedule_all_pending`. No HTTP harness;
 //! every helper here is pure or takes `Arc<MemoryStorage>`.
 //!
@@ -24,12 +24,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::preempt_support::{check_preemption, check_preemption_with_pdbs};
 use rusternetes_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
     PriorityClass,
 };
 use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
-use rusternetes_scheduler::advanced::{check_preemption, check_preemption_with_pdbs};
 use rusternetes_scheduler::scheduler::Scheduler;
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 
@@ -319,13 +319,7 @@ fn pdb_aware_victim_selection_with_mixed_priority_candidates() {
     let incoming = make_incoming_pod("preemptor", 1000, "1", "1Gi");
 
     let all_pods = vec![rs_a, rs_b, filler_a, filler_b];
-    let (can_preempt, victims) = check_preemption_with_pdbs(
-        &node,
-        &incoming,
-        &all_pods,
-        &[pdb],
-        &std::collections::HashMap::new(),
-    );
+    let (can_preempt, victims) = check_preemption_with_pdbs(&node, &incoming, &all_pods, &[pdb]);
 
     assert!(can_preempt, "preemption must succeed");
     assert_eq!(

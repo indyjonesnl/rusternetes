@@ -39,11 +39,12 @@
 
 use std::collections::HashMap;
 
+use crate::preempt_support::check_preemption;
 use rusternetes_common::resources::{
     Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{Phase, ResourceRequirements};
-use rusternetes_scheduler::advanced::{check_host_port_conflicts, check_preemption};
+use rusternetes_scheduler::advanced::check_host_port_conflicts;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures

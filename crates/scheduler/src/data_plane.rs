@@ -420,9 +420,8 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
     /// all-namespaces collection — like PriorityClasses these change rarely, so
     /// there is no informer for them.
     ///
-    /// Preemption needs these. Without them `try_preempt` fell back to the
-    /// PDB-unaware [`check_preemption`] and evicted budget-protected pods as
-    /// freely as unprotected ones (#1797).
+    /// Preemption needs these. Without them `try_preempt` evicted
+    /// budget-protected pods as freely as unprotected ones (#1797).
     pub async fn list_pod_disruption_budgets(&self) -> Result<Vec<PodDisruptionBudget>> {
         match self {
             DataPlane::Storage(s) => {
