@@ -254,3 +254,41 @@ async fn legacy_watch_route_is_served_and_gated() {
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// `/openapi/v3` publishes the group version (and its group document) only
+/// while the gate is on: upstream installs no storage for it otherwise
+/// (`storage_storagemigration.go:41-43,54-70`), so kube-openapi has nothing to
+/// publish. The document holds the vendored upstream schemas.
+#[tokio::test]
+#[serial_test::serial]
+async fn openapi_is_published_only_when_gate_is_on() {
+    const GV: &str = "apis/storagemigration.k8s.io/v1beta1";
+    const GROUP: &str = "apis/storagemigration.k8s.io";
+    const KIND: &str = "io.k8s.api.storagemigration.v1beta1.StorageVersionMigration";
+    {
+        let _g = with_feature(Feature::StorageVersionMigrator, false);
+        let api = TestApiServer::new();
+        let (_, index) = api.get("/openapi/v3").await;
+        assert!(index["paths"].get(GV).is_none() && index["paths"].get(GROUP).is_none());
+        for p in [GV, GROUP] {
+            let (code, _) = api.get(&format!("/openapi/v3/{p}")).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{p}");
+        }
+        let (_, v2) = api.get("/openapi/v2").await;
+        assert!(v2["definitions"].get(KIND).is_none());
+    }
+    let _g = with_feature(Feature::StorageVersionMigrator, true);
+    let api = TestApiServer::new();
+    let (_, index) = api.get("/openapi/v3").await;
+    for p in [GV, GROUP] {
+        assert_eq!(
+            index["paths"][p]["serverRelativeURL"],
+            format!("/openapi/v3/{p}")
+        );
+    }
+    let (code, doc) = api.get(&format!("/openapi/v3/{GV}")).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(doc["components"]["schemas"].get(KIND).is_some());
+    let (_, v2) = api.get("/openapi/v2").await;
+    assert!(v2["definitions"].get(KIND).is_some());
+}
