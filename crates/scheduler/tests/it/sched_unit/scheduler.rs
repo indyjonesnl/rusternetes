@@ -677,6 +677,59 @@ mod tests {
             .is_none());
     }
 
+    /// DynamicResources PreBind through `try_schedule_pod` (storage mode): the
+    /// pod that binds with an allocated claim is recorded in its `reservedFor`.
+    #[tokio::test]
+    async fn test_try_schedule_pod_reserves_allocated_claims() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        let claim: rusternetes_common::resources::ResourceClaim =
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": "c", "namespace": "default"},
+                "spec": {"devices": {}},
+                "status": {"allocation": {"devices": {}}}
+            }))
+            .unwrap();
+        storage
+            .create("/registry/resourceclaims/default/c", &claim)
+            .await
+            .unwrap();
+        let mut pod = make_pending_pod("p", "default");
+        pod.metadata.uid = "p-uid".to_string();
+        pod.spec.as_mut().unwrap().resource_claims = Some(
+            serde_json::from_value(serde_json::json!([
+                {"name": "r", "resourceClaimName": "c"}
+            ]))
+            .unwrap(),
+        );
+        storage
+            .create("/registry/pods/default/p", &pod)
+            .await
+            .unwrap();
+        scheduler
+            .try_schedule_pod(&test_queue(), "pods/default/p")
+            .await
+            .unwrap();
+        let bound: Pod = storage.get("/registry/pods/default/p").await.unwrap();
+        assert_eq!(
+            bound.spec.as_ref().and_then(|s| s.node_name.as_deref()),
+            Some("node-1")
+        );
+        let claim: rusternetes_common::resources::ResourceClaim = storage
+            .get("/registry/resourceclaims/default/c")
+            .await
+            .unwrap();
+        let reserved = claim.status.unwrap().reserved_for;
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].uid, "p-uid");
+        assert_eq!(reserved[0].resource, "pods");
+    }
+
     /// A pod nominated to a node by an earlier preemption, whose cycle now fails.
     async fn nominated_fixture(
         storage: &MemoryStorage,

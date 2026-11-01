@@ -2641,6 +2641,21 @@ impl<S: Storage + Send + Sync + 'static> CycleHandle<'_, S> {
 
 #[async_trait::async_trait]
 impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, S> {
+    async fn update_resource_claim_status(
+        &self,
+        claim: &rusternetes_common::resources::ResourceClaim,
+    ) -> Result<rusternetes_common::resources::ResourceClaim, crate::fwk::ClaimWriteError> {
+        use crate::fwk::ClaimWriteError;
+        let ns = claim.metadata.namespace.as_deref().unwrap_or("default");
+        self.data
+            .update_resource_claim_status(ns, &claim.metadata.name, claim)
+            .await
+            .map_err(|e| match e {
+                rusternetes_common::Error::Conflict(m) => ClaimWriteError::Conflict(m),
+                e => ClaimWriteError::Other(e.to_string()),
+            })
+    }
+
     async fn bind_pod(&self, pod: &Pod, node_name: &str) -> Result<(), String> {
         bind_pod(self.data, pod.clone(), node_name)
             .await

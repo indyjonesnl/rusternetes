@@ -5,9 +5,9 @@
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
-    BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreBindPlugin,
-    PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin, SignFragment,
-    SignPlugin, Status,
+    BindPlugin, ClaimWriteError, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore,
+    Plugin, PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin,
+    ScorePlugin, SignFragment, SignPlugin, Status,
 };
 use crate::signers;
 use async_trait::async_trait;
@@ -138,6 +138,7 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
 pub fn new_reserve_plugin(name: &str) -> Option<Arc<dyn ReservePlugin>> {
     match name {
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         _ => None,
     }
 }
@@ -146,6 +147,7 @@ pub fn new_reserve_plugin(name: &str) -> Option<Arc<dyn ReservePlugin>> {
 pub fn new_pre_bind_plugin(name: &str) -> Option<Arc<dyn PreBindPlugin>> {
     match name {
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         _ => None,
     }
 }
@@ -1228,6 +1230,11 @@ const DYNAMIC_RESOURCES_STATE_KEY: &str = "PreFilterDynamicResources";
 struct DynamicResourcesState {
     claims: Vec<rusternetes_common::resources::ResourceClaim>,
     slices: Vec<rusternetes_common::resources::ResourceSlice>,
+    /// `state.claims.set(index, claim)` (dynamicresources.go:1100-1101): the
+    /// claims as PreBind updated them, for Unreserve.
+    updated: std::sync::Mutex<
+        std::collections::HashMap<usize, rusternetes_common::resources::ResourceClaim>,
+    >,
 }
 
 /// `dynamicresources.DynamicResources` (`plugins/dynamicresources/dynamicresources.go`):
@@ -1243,7 +1250,9 @@ struct DynamicResourcesState {
 /// ResourceClaimTemplate reference is treated as the claim's name, as the
 /// previous inline check did (no `resourceclaim.Name` owner lookup);
 /// extended-resource DRA, device binding conditions, in-flight allocations
-/// and Reserve/PreBind are not ported. Claims and slices are read once in
+/// and the allocator half of Reserve and PreBind (an unallocated claim never
+/// gets this far) are not ported; PreBind only records the pod in the
+/// claims' `reservedFor` and Unreserve takes it out. Claims and slices are read once in
 /// PreFilter rather than per node.
 pub struct DynamicResources;
 
@@ -1310,10 +1319,197 @@ impl PreFilterPlugin for DynamicResources {
         };
         state.write(
             DYNAMIC_RESOURCES_STATE_KEY,
-            DynamicResourcesState { claims, slices },
+            DynamicResourcesState {
+                claims,
+                slices,
+                updated: Default::default(),
+            },
         );
         (None, Status::success())
     }
+}
+
+#[async_trait]
+impl ReservePlugin for DynamicResources {
+    /// dynamicresources.go:919-1016. Claims that are allocated are only
+    /// assumed to be reservable ("we assume that reserving will work and only
+    /// do it for real during binding"); claims the scheduler would have to
+    /// allocate need the allocator, which cannot reach this point since
+    /// Filter rejects them.
+    async fn reserve(
+        &self,
+        _state: &CycleState,
+        _pod: &Pod,
+        _node_name: &str,
+        _handle: &dyn Handle,
+    ) -> Status {
+        Status::success()
+    }
+
+    /// dynamicresources.go:1018-1066: remove the pod from `reservedFor` of
+    /// the allocated claims that list it. A failure is only logged; "we will
+    /// get here again when pod scheduling is retried". Upstream sends a
+    /// strategic-merge patch, which needs no fresh claim; here the claim is
+    /// re-read and updated, retrying on conflict.
+    async fn unreserve(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        _node_name: &str,
+        handle: &dyn Handle,
+    ) {
+        let Some(s) = state.read::<DynamicResourcesState>(DYNAMIC_RESOURCES_STATE_KEY) else {
+            return;
+        };
+        let updated = s.updated.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (index, original) in s.claims.iter().enumerate() {
+            let claim = updated.get(&index).unwrap_or(original);
+            let allocated = claim
+                .status
+                .as_ref()
+                .is_some_and(|st| st.allocation.is_some());
+            if !allocated || !is_reserved_for_pod(pod, claim) {
+                continue;
+            }
+            let ns = claim.metadata.namespace.as_deref().unwrap_or("default");
+            let mut attempt = claim.clone();
+            for retry in 0..CLAIM_UPDATE_ATTEMPTS {
+                if retry > 0 {
+                    match handle.resource_claim(ns, &claim.metadata.name).await {
+                        Ok(c) => attempt = c,
+                        Err(e) => {
+                            tracing::error!(claim = %claim.metadata.name, error = %e, "unreserve");
+                            break;
+                        }
+                    }
+                }
+                if let Some(st) = attempt.status.as_mut() {
+                    st.reserved_for.retain(|r| r.uid != pod.metadata.uid);
+                }
+                match handle.update_resource_claim_status(&attempt).await {
+                    Ok(_) => break,
+                    Err(ClaimWriteError::Conflict(_)) if retry + 1 < CLAIM_UPDATE_ATTEMPTS => {}
+                    Err(e) => {
+                        tracing::error!(claim = %claim.metadata.name, error = %e, "unreserve");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `retry.DefaultRetry` (`Steps: 5`).
+const CLAIM_UPDATE_ATTEMPTS: usize = 5;
+
+/// `resourceclaim.IsReservedForPod`.
+fn is_reserved_for_pod(pod: &Pod, claim: &rusternetes_common::resources::ResourceClaim) -> bool {
+    claim
+        .status
+        .as_ref()
+        .is_some_and(|s| s.reserved_for.iter().any(|r| r.uid == pod.metadata.uid))
+}
+
+#[async_trait]
+impl PreBindPlugin for DynamicResources {
+    /// dynamicresources.go:1130-1144.
+    fn pre_bind_pre_flight(&self, state: &CycleState, _pod: &Pod, _node_name: &str) -> Status {
+        match state.read::<DynamicResourcesState>(DYNAMIC_RESOURCES_STATE_KEY) {
+            Some(s) if !s.claims.is_empty() => Status::success(),
+            _ => Status::new(Code::Skip, Vec::new()),
+        }
+    }
+
+    /// dynamicresources.go:1068-1128 and `bindClaim` (:1146-1244), without
+    /// allocation or device binding conditions: every claim that does not
+    /// list the pod gets the pod appended to `status.reservedFor`.
+    async fn pre_bind(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        let Some(s) = state.read::<DynamicResourcesState>(DYNAMIC_RESOURCES_STATE_KEY) else {
+            return Status::success();
+        };
+        for (index, claim) in s.claims.iter().enumerate() {
+            if is_reserved_for_pod(pod, claim) {
+                continue;
+            }
+            match bind_claim(claim, pod, handle).await {
+                Ok(updated) => {
+                    tracing::debug!(pod = %pod.metadata.name, node = node_name, claim = %updated.metadata.name, "reserved");
+                    s.updated
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(index, updated);
+                }
+                Err(e) => return Status::from_error(e),
+            }
+        }
+        Status::success()
+    }
+}
+
+/// `bindClaim`'s retry loop (dynamicresources.go:1200-1244): "We can simply
+/// try to add the pod here without checking preconditions. The apiserver will
+/// tell us with a non-conflict error if this isn't possible." On a conflict
+/// the latest claim is fetched and the update retried.
+async fn bind_claim(
+    claim: &rusternetes_common::resources::ResourceClaim,
+    pod: &Pod,
+    handle: &dyn Handle,
+) -> Result<rusternetes_common::resources::ResourceClaim, String> {
+    use rusternetes_common::resources::dra::ResourceClaimConsumerReference;
+    let ns = claim.metadata.namespace.as_deref().unwrap_or("default");
+    let mut claim = claim.clone();
+    let mut refresh = false;
+    let mut last = String::new();
+    for _ in 0..CLAIM_UPDATE_ATTEMPTS {
+        if refresh {
+            claim = handle
+                .resource_claim(ns, &claim.metadata.name)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "get updated claim {}/{} after conflict: {e}",
+                        ns, claim.metadata.name
+                    )
+                })?;
+        }
+        refresh = true;
+        if claim.metadata.deletion_timestamp.is_some() {
+            return Err(format!(
+                "claim {}/{} got deleted in the meantime",
+                ns, claim.metadata.name
+            ));
+        }
+        claim
+            .status
+            .get_or_insert_with(Default::default)
+            .reserved_for
+            .push(ResourceClaimConsumerReference {
+                api_group: None,
+                resource: "pods".to_string(),
+                name: pod.metadata.name.clone(),
+                uid: pod.metadata.uid.clone(),
+            });
+        match handle.update_resource_claim_status(&claim).await {
+            Ok(updated) => return Ok(updated),
+            Err(ClaimWriteError::Conflict(m)) => last = m,
+            Err(e) => {
+                return Err(format!(
+                    "add reservation to claim {}/{}: {e}",
+                    ns, claim.metadata.name
+                ))
+            }
+        }
+    }
+    Err(format!(
+        "add reservation to claim {}/{}: {last}",
+        ns, claim.metadata.name
+    ))
 }
 
 #[async_trait]

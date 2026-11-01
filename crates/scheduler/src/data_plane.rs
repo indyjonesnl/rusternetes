@@ -622,6 +622,35 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
         }
     }
 
+    /// `UpdateStatus` of a ResourceClaim: the stored claim with its status.
+    pub async fn update_resource_claim_status<T>(
+        &self,
+        ns: &str,
+        name: &str,
+        claim: &T,
+    ) -> Result<T>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+    {
+        match self {
+            DataPlane::Storage(s) => {
+                s.update(&build_key("resourceclaims", Some(ns), name), claim)
+                    .await
+            }
+            DataPlane::Api(a) => a
+                .client
+                .put(
+                    &format!(
+                        "/apis/resource.k8s.io/v1/namespaces/{}/resourceclaims/{}/status",
+                        ns, name
+                    ),
+                    claim,
+                )
+                .await
+                .map_err(api_err_to_common),
+        }
+    }
+
     /// List every ResourceSlice (DRA device topology).
     pub async fn list_resource_slices<T>(&self) -> Result<Vec<T>>
     where
