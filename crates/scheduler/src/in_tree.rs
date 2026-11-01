@@ -5,12 +5,14 @@
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
-    Code, CycleState, FilterPlugin, Handle, NodeInfo, Plugin, PreFilterPlugin, PreFilterResult,
-    SignFragment, SignPlugin, Status,
+    Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreFilterPlugin,
+    PreFilterResult, PreScorePlugin, ScorePlugin, SignFragment, SignPlugin, Status,
 };
 use crate::signers;
 use async_trait::async_trait;
-use rusternetes_common::resources::pod::{NodeAffinity, NodeSelector};
+use rusternetes_common::resources::pod::{
+    NodeAffinity, NodeSelector, PreferredSchedulingTerm, Toleration,
+};
 use rusternetes_common::resources::{Node, Pod, Taint};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,6 +57,27 @@ pub fn new_pre_filter_plugin(
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
+        _ => None,
+    }
+}
+
+/// The factory for an in-tree PreScore plugin by name.
+pub fn new_pre_score_plugin(
+    name: &str,
+    args: &FilterPluginArgs<'_>,
+) -> Option<Arc<dyn PreScorePlugin>> {
+    match name {
+        names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
+        names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
+        _ => None,
+    }
+}
+
+/// The factory for an in-tree Score plugin by name.
+pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<dyn ScorePlugin>> {
+    match name {
+        names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
+        names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(args.added_affinity))),
         _ => None,
     }
 }
@@ -278,6 +301,8 @@ impl RequiredNodeAffinity {
 pub struct NodeAffinityPlugin {
     /// `addedNodeSelector`.
     added_node_selector: Option<NodeSelector>,
+    /// `addedPrefSchedTerms`.
+    added_pref_sched_terms: Option<Vec<PreferredSchedulingTerm>>,
 }
 
 impl NodeAffinityPlugin {
@@ -285,6 +310,10 @@ impl NodeAffinityPlugin {
         Self {
             added_node_selector: added_affinity.and_then(|a| {
                 a.required_during_scheduling_ignored_during_execution
+                    .clone()
+            }),
+            added_pref_sched_terms: added_affinity.and_then(|a| {
+                a.preferred_during_scheduling_ignored_during_execution
                     .clone()
             }),
         }
@@ -1193,5 +1222,135 @@ impl SignPlugin for InterPodAffinity {
             signers::LABELS_SIGNER_NAME,
             serde_json::to_value(pod.metadata.labels.as_ref()).unwrap_or_default(),
         )])
+    }
+}
+
+/// `preScoreStateKey` of the TaintToleration plugin.
+const TAINT_TOLERATION_SCORE_STATE_KEY: &str = "PreScoreTaintToleration";
+
+/// `tainttoleration.preScoreState`: the pod's PreferNoSchedule tolerations.
+struct TaintTolerationScoreState(Vec<Toleration>);
+
+#[async_trait]
+impl PreScorePlugin for TaintToleration {
+    /// taint_toleration.go PreScore (:178-193).
+    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, nodes: &[&Node]) -> Status {
+        if nodes.is_empty() {
+            return Status::success();
+        }
+        state.write(
+            TAINT_TOLERATION_SCORE_STATE_KEY,
+            TaintTolerationScoreState(crate::score::tolerations_prefer_no_schedule(pod)),
+        );
+        Status::success()
+    }
+}
+
+impl ScorePlugin for TaintToleration {
+    /// taint_toleration.go Score (:195-210): the number of intolerable
+    /// PreferNoSchedule taints on the node.
+    fn score(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let Some(TaintTolerationScoreState(tols)) = state.read(TAINT_TOLERATION_SCORE_STATE_KEY)
+        else {
+            return (0, missing_state(TAINT_TOLERATION_SCORE_STATE_KEY));
+        };
+        (
+            crate::score::count_intolerable_taints_prefer_no_schedule(node_info.node(), tols),
+            Status::success(),
+        )
+    }
+
+    /// `NormalizeScore` (:212-215): fewer intolerable taints is better, so
+    /// the default normalisation is reversed.
+    fn normalize_score(
+        &self,
+        _state: &CycleState,
+        _pod: &Pod,
+        scores: &mut [NodeScore],
+    ) -> Option<Status> {
+        normalize(scores, true);
+        Some(Status::success())
+    }
+}
+
+/// `helper.DefaultNormalizeScore(fwk.MaxNodeScore, reverse, scores)`.
+fn normalize(scores: &mut [NodeScore], reverse: bool) {
+    let mut v: Vec<i64> = scores.iter().map(|s| s.score).collect();
+    crate::score::default_normalize_score(crate::score::MAX_NODE_SCORE, reverse, &mut v);
+    for (s, n) in scores.iter_mut().zip(v) {
+        s.score = n;
+    }
+}
+
+/// `preScoreStateKey` of the NodeAffinity plugin.
+const NODE_AFFINITY_SCORE_STATE_KEY: &str = "PreScoreNodeAffinity";
+
+/// `nodeaffinity.preScoreState`: the pod's preferred scheduling terms.
+struct NodeAffinityScoreState(Vec<PreferredSchedulingTerm>);
+
+/// `PreferredSchedulingTerms.Score`: the summed weight of the terms matching
+/// the node.
+fn preferred_terms_score(terms: &[PreferredSchedulingTerm], node: &Node) -> i64 {
+    terms
+        .iter()
+        .filter(|t| {
+            t.weight != 0
+                && rusternetes_common::affinity::matches_node_selector_term(node, &t.preference)
+        })
+        .map(|t| i64::from(t.weight))
+        .sum()
+}
+
+#[async_trait]
+impl PreScorePlugin for NodeAffinityPlugin {
+    /// node_affinity.go PreScore (:253-267): Skip when neither the pod nor
+    /// the plugin's added affinity prefers anything.
+    async fn pre_score(&self, state: &mut CycleState, pod: &Pod, _nodes: &[&Node]) -> Status {
+        let preferred = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.affinity.as_ref())
+            .and_then(|a| a.node_affinity.as_ref())
+            .and_then(|n| {
+                n.preferred_during_scheduling_ignored_during_execution
+                    .clone()
+            });
+        if preferred.is_none() && self.added_pref_sched_terms.is_none() {
+            return Status::new(Code::Skip, Vec::new());
+        }
+        state.write(
+            NODE_AFFINITY_SCORE_STATE_KEY,
+            NodeAffinityScoreState(preferred.unwrap_or_default()),
+        );
+        Status::success()
+    }
+}
+
+impl ScorePlugin for NodeAffinityPlugin {
+    /// node_affinity.go Score (:269-296): the terms from the pod's affinity
+    /// and from the plugin's default affinity.
+    fn score(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> (i64, Status) {
+        let node = node_info.node();
+        let mut score = 0;
+        // `addedPrefSchedTerms.Score(node)` (:276-278).
+        if let Some(terms) = &self.added_pref_sched_terms {
+            score += preferred_terms_score(terms, node);
+        }
+        // `s.preferredNodeAffinity.Score(node)` (:280-283).
+        if let Some(NodeAffinityScoreState(terms)) = state.read(NODE_AFFINITY_SCORE_STATE_KEY) {
+            score += preferred_terms_score(terms, node);
+        }
+        (score, Status::success())
+    }
+
+    /// `NormalizeScore` (:299): `helper.DefaultNormalizeScore(MaxNodeScore, false, ...)`.
+    fn normalize_score(
+        &self,
+        _state: &CycleState,
+        _pod: &Pod,
+        scores: &mut [NodeScore],
+    ) -> Option<Status> {
+        normalize(scores, false);
+        Some(Status::success())
     }
 }

@@ -18,8 +18,8 @@
 //! the pipeline consults to decide which stages run for a profile.
 
 use crate::fwk::{
-    CycleState, FilterPlugin, Handle, NodeInfo, PodSignature, PreFilterPlugin, PreFilterResult,
-    SignPlugin, Status,
+    CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature, PreFilterPlugin,
+    PreFilterResult, PreScorePlugin, ScorePlugin, SignPlugin, Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -508,6 +508,11 @@ pub struct Framework {
     /// `f.preFilterPlugins` (framework.go:66): the PreFilter plugin objects,
     /// in execution order; the rest still run inline (#3455).
     pre_filter_plugin_objects: PreFilterPluginObjects,
+    /// `f.preScorePlugins` / `f.scorePlugins` (framework.go:67-68): the
+    /// PreScore and Score plugin objects, in execution order; the rest still
+    /// score inline (#4231).
+    pre_score_plugin_objects: PreScorePluginObjects,
+    score_plugin_objects: ScorePluginObjects,
     /// `f.batchablePlugins` (framework.go:75): the signers of the
     /// PreFilter/Filter/PreScore/Score plugins, once per plugin name.
     batchable_plugins: SignPluginObjects,
@@ -531,6 +536,30 @@ pub struct Framework {
 pub struct FilterPluginObjects(Vec<Arc<dyn FilterPlugin>>);
 
 impl std::fmt::Debug for FilterPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The PreScore plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PreScorePluginObjects(Vec<Arc<dyn PreScorePlugin>>);
+
+impl std::fmt::Debug for PreScorePluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The Score plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct ScorePluginObjects(Vec<Arc<dyn ScorePlugin>>);
+
+impl std::fmt::Debug for ScorePluginObjects {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list()
             .entries(self.0.iter().map(|p| p.name()))
@@ -563,6 +592,88 @@ impl std::fmt::Debug for PreFilterPluginObjects {
 }
 
 impl Framework {
+    /// `RunPreScorePlugins` (framework.go:1230-1262) over the PreScore plugin
+    /// objects: a Skip records the plugin in the cycle state's skip-score
+    /// set; any other non-success is wrapped as
+    /// `running PreScore plugin "<name>": <err>`.
+    pub async fn run_pre_score_plugins(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[&Node],
+    ) -> Status {
+        let mut skip: HashSet<String> = HashSet::new();
+        for pl in &self.pre_score_plugin_objects.0 {
+            let s = pl.pre_score(state, pod, nodes).await;
+            if s.is_skip() {
+                skip.insert(pl.name().to_string());
+                continue;
+            }
+            if !s.is_success() {
+                state.set_skip_score_plugins(skip);
+                return Status::from_error(format!(
+                    "running PreScore plugin {:?}: {}",
+                    pl.name(),
+                    s.as_error().unwrap_or_default()
+                ));
+            }
+        }
+        state.set_skip_score_plugins(skip);
+        Status::success()
+    }
+
+    /// `RunScorePlugins` (framework.go:1273-1382) over the Score plugin
+    /// objects, up to the weighted sum (which [`crate::score::total_scores`]
+    /// does, with the `[0, 100]` check): each plugin not skipped by PreScore
+    /// scores every node, then normalises, in place. Errors are
+    /// `plugin "<name>" failed with: <err>`.
+    pub fn run_score_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        nodes: &[&Node],
+        all_pods: &[Pod],
+        all_nodes: &[Node],
+    ) -> Result<Vec<crate::score::PluginScores>, String> {
+        let mut out = Vec::new();
+        for pl in &self.score_plugin_objects.0 {
+            if state.skip_score_plugins().contains(pl.name()) {
+                continue;
+            }
+            let mut scores = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let info = NodeInfo::new(node, all_pods).with_all_nodes(all_nodes);
+                let (score, status) = pl.score(state, pod, &info);
+                if !status.is_success() {
+                    return Err(format!(
+                        "plugin {:?} failed with: {}",
+                        pl.name(),
+                        status.as_error().unwrap_or_default()
+                    ));
+                }
+                scores.push(NodeScore {
+                    name: node.metadata.name.clone(),
+                    score,
+                });
+            }
+            if let Some(status) = pl.normalize_score(state, pod, &mut scores) {
+                if !status.is_success() {
+                    return Err(format!(
+                        "plugin {:?} failed with: {}",
+                        pl.name(),
+                        status.as_error().unwrap_or_default()
+                    ));
+                }
+            }
+            out.push(crate::score::PluginScores {
+                name: pl.name(),
+                weight: i64::from(self.score_weight(pl.name())),
+                scores: scores.into_iter().map(|s| s.score).collect(),
+            });
+        }
+        Ok(out)
+    }
+
     /// `computeBatchablePlugins` (framework.go:757-803): signatures are only
     /// enabled when every PreFilter, Filter, PreScore and Score plugin can
     /// sign. (Rusternetes has no extenders to disable them.)
@@ -993,6 +1104,32 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
             .iter()
             .filter_map(|name| {
                 crate::in_tree::new_pre_filter_plugin(
+                    name,
+                    &crate::in_tree::FilterPluginArgs {
+                        added_affinity: profile.added_affinity,
+                    },
+                )
+            })
+            .collect(),
+    );
+    f.pre_score_plugin_objects = PreScorePluginObjects(
+        f.plugins_at(ExtensionPoint::PreScore)
+            .iter()
+            .filter_map(|name| {
+                crate::in_tree::new_pre_score_plugin(
+                    name,
+                    &crate::in_tree::FilterPluginArgs {
+                        added_affinity: profile.added_affinity,
+                    },
+                )
+            })
+            .collect(),
+    );
+    f.score_plugin_objects = ScorePluginObjects(
+        f.plugins_at(ExtensionPoint::Score)
+            .iter()
+            .filter_map(|name| {
+                crate::in_tree::new_score_plugin(
                     name,
                     &crate::in_tree::FilterPluginArgs {
                         added_affinity: profile.added_affinity,
