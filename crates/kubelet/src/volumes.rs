@@ -148,6 +148,9 @@ pub struct VolumeManager {
     /// attached ([`Self::set_volume_manager`]), so the reconciler's 100ms loop
     /// does not hammer a mount that keeps failing; the inline mount, retried
     /// by the kubelet's own sync loop, never backs off.
+    /// `blkUtil` of the operation generator: the host side of block-volume
+    /// mapping (`volumepathhandler.NewBlockVolumePathHandler()`).
+    pub block_util: Arc<dyn crate::volume_plugins::util::block_operations::BlockVolumePathHandler>,
     pub mount_operations:
         crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations,
     /// An iscsi plugin over the same host, for the global-mount enumeration
@@ -403,6 +406,7 @@ impl VolumeManager {
                 crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations::new(
                     true,
                 ),
+            block_util: Arc::new(crate::volume_plugins::util::volumepathhandler::VolumePathHandler),
             mount_operations:
                 crate::volume_plugins::util::nested_pending_operations::NestedPendingOperations::new(
                     false,
@@ -436,6 +440,16 @@ impl VolumeManager {
             .lock()
             .unwrap()
             .exponential_back_off_on_error = true;
+    }
+
+    /// Replace `blkUtil`, for tests that cannot bind-mount devices.
+    #[doc(hidden)]
+    pub fn with_block_util(
+        mut self,
+        block_util: Arc<dyn crate::volume_plugins::util::block_operations::BlockVolumePathHandler>,
+    ) -> Self {
+        self.block_util = block_util;
+        self
     }
 
     /// Give the manager the kubelet's node name, the `nodeName` argument of
@@ -1359,21 +1373,52 @@ impl VolumeManager {
         use crate::volume_plugins::util::operation_generator::generate_unmount_volume_func;
 
         let what = format!("{} pod {}", mounted.volume_name, mounted.pod_name);
-        let op = match generate_unmount_volume_func(&self.plugin_mgr, mounted, &self.asw) {
-            Ok(op) => op,
-            Err(e) => {
-                warn!("UnmountVolume of {what}: {e:#}");
-                return;
+        // `operationExecutor.UnmountVolume`: a Filesystem volume is unmounted,
+        // a Block volume unmapped (`operation_executor.go:868-897`).
+        let fs_volume =
+            match crate::volume_plugins::util::operation_generator::check_volume_mode_filesystem(
+                &mounted.volume_spec.as_spec(),
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    warn!("UnmountVolume of {what}: {e:#}");
+                    return;
+                }
+            };
+        let op = if fs_volume {
+            match generate_unmount_volume_func(&self.plugin_mgr, mounted, &self.asw) {
+                Ok(op) => Some(op),
+                Err(e) => {
+                    warn!("UnmountVolume of {what}: {e:#}");
+                    return;
+                }
             }
+        } else {
+            None
         };
-        let name = op.operation_name;
+        let name = if fs_volume {
+            "volume_unmount"
+        } else {
+            "volume_unmap"
+        };
         let run = self.pending_operations.run_inline(
             &mounted.volume_name.0,
             &mounted.pod_name.0,
             EMPTY,
             name,
             async {
-                match op.run_operation().await.detailed_err {
+                let ctx = match &op {
+                    Some(op) => op.run_operation().await,
+                    None => crate::volume_plugins::util::block_operations::unmap_volume_with(
+                        &self.plugin_mgr,
+                        mounted,
+                        &self.asw,
+                        self.block_util.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))?,
+                };
+                match ctx.detailed_err {
                     Some(e) => Err(format!("{e:#}")),
                     None => Ok(()),
                 }
@@ -1419,30 +1464,62 @@ impl VolumeManager {
             device_to_detach.volume_name, device_to_detach.device_mount_path
         );
         let hostutil = crate::volume_plugins::util::hostutil::HostUtil;
-        let op = match generate_unmount_device_func(
-            &self.plugin_mgr,
-            device_to_detach,
-            &self.asw,
-            &hostutil,
-        ) {
-            Ok(op) => op,
-            Err(e) => {
-                warn!("UnmountDevice of {what}: {e:#}");
-                return;
+        // `operationExecutor.UnmountDevice`: a Filesystem volume's device is
+        // unmounted, a Block volume's unmapped (`operation_executor.go:899-930`).
+        let fs_volume =
+            match crate::volume_plugins::util::operation_generator::check_volume_mode_filesystem(
+                &device_to_detach.volume_spec.as_spec(),
+            ) {
+                Ok(fs) => fs,
+                Err(e) => {
+                    warn!("UnmountDevice of {what}: {e:#}");
+                    return;
+                }
+            };
+        let op = if fs_volume {
+            match generate_unmount_device_func(
+                &self.plugin_mgr,
+                device_to_detach,
+                &self.asw,
+                &hostutil,
+            ) {
+                Ok(op) => Some(op),
+                Err(e) => {
+                    warn!("UnmountDevice of {what}: {e:#}");
+                    return;
+                }
             }
+        } else {
+            None
         };
         // `oe.pendingOperations.Run(deviceToDetach.VolumeName, EmptyUniquePodName,
         // "" /* nodeName */, generatedOperations)` (`operation_executor.go:922-927`):
         // refused while one is pending or its failure's backoff has not elapsed.
         use crate::volume_plugins::util::nested_pending_operations::EMPTY;
-        let name = op.operation_name;
+        let name = if fs_volume {
+            "unmount_device"
+        } else {
+            "unmap_device"
+        };
         let run = self.pending_operations.run_inline(
             &device_to_detach.volume_name.0,
             EMPTY,
             EMPTY,
             name,
             async {
-                match op.run_operation().await.detailed_err {
+                let ctx = match &op {
+                    Some(op) => op.run_operation().await,
+                    None => crate::volume_plugins::util::block_operations::unmap_device_with(
+                        &self.plugin_mgr,
+                        device_to_detach,
+                        &self.asw,
+                        &hostutil,
+                        self.block_util.as_ref(),
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))?,
+                };
+                match ctx.detailed_err {
                     Some(e) => Err(format!("{e:#}")),
                     None => Ok(()),
                 }
@@ -1928,6 +2005,49 @@ impl VolumeManager {
         }
     }
 
+    /// The mode dispatch of `operationExecutor.MountVolume`
+    /// (`operation_executor.go:827-866`): a Filesystem volume goes to
+    /// `GenerateMountVolumeFunc`, a Block volume to `GenerateMapVolumeFunc`.
+    /// A mapped volume's path is its pod device map symlink.
+    async fn mount_or_map(
+        &self,
+        spec: &crate::volume_plugins::plugin::Spec<'_>,
+        pod: &Pod,
+        volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
+        mount_state: &crate::volume_plugins::util::operation_generator::MountState<'_>,
+    ) -> Result<(String, crate::volume_plugins::plugin::Attributes)> {
+        use crate::volume_plugins::util::{block_operations, operation_generator};
+        if !operation_generator::check_volume_mode_filesystem(spec)? {
+            let ctx = block_operations::map_volume_with(
+                &self.plugin_mgr,
+                volume_to_mount,
+                mount_state.actual_state_of_world,
+                self.block_util.as_ref(),
+            )
+            .await?;
+            if let Some(e) = ctx.detailed_err {
+                return Err(e);
+            }
+            let path = block_operations::pod_device_path(&self.plugin_mgr, spec, pod)?;
+            return Ok((path, crate::volume_plugins::plugin::Attributes::default()));
+        }
+        operation_generator::mount_volume_with_attributes(
+            &self.plugin_mgr,
+            spec,
+            pod,
+            "",
+            // `og.recorder`: the kubelet's event recorder over the same API
+            // the volumes are read through.
+            self.storage.as_ref().map(|s| {
+                crate::volume_plugins::plugin::MounterRecorder(
+                    rusternetes_storage::EventRecorder::new(s.clone()),
+                )
+            }),
+            Some(mount_state),
+        )
+        .await
+    }
+
     /// `operationExecutor.MountVolume` for one pod volume: the plugin `SetUp`
     /// (device mount first) under the mount operation guard, reporting to the
     /// actual state of the world. Shared by the inline mount
@@ -1954,21 +2074,8 @@ impl VolumeManager {
                 crate::volume_plugins::util::nested_pending_operations::EMPTY,
                 "volume_mount",
                 async {
-                    let mounted =
-                        crate::volume_plugins::util::operation_generator::mount_volume_with_attributes(
-                            &self.plugin_mgr,
-                            spec,
-                            pod,
-                            "",
-                            // `og.recorder`: the kubelet's event recorder over
-                            // the same API the volumes are read through.
-                            self.storage.as_ref().map(|s| {
-                                crate::volume_plugins::plugin::MounterRecorder(
-                                    rusternetes_storage::EventRecorder::new(s.clone()),
-                                )
-                            }),
-                            Some(&mount_state),
-                        )
+                    let mounted = self
+                        .mount_or_map(spec, pod, volume_to_mount, &mount_state)
                         .await;
                     match mounted {
                         Ok(ok) => {

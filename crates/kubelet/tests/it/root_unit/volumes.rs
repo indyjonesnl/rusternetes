@@ -431,6 +431,9 @@ mod pvc_resolution_tests {
             "spec": {
                 "capacity": {"storage": "1Gi"},
                 "accessModes": ["ReadWriteOnce"],
+                // The API server defaults it (`SetDefaults_PersistentVolumeSpec`);
+                // `MountVolume` reads it (`CheckVolumeModeFilesystem`).
+                "volumeMode": "Filesystem",
                 "hostPath": {"path": "/mnt/data"}
             }
         }))
@@ -504,6 +507,9 @@ mod pvc_resolution_tests {
             "spec": {
                 "capacity": {"storage": "1Gi"},
                 "accessModes": ["ReadWriteOnce"],
+                // The API server defaults it (`SetDefaults_PersistentVolumeSpec`);
+                // `MountVolume` reads it (`CheckVolumeModeFilesystem`).
+                "volumeMode": "Filesystem",
                 "hostPath": {"path": "/mnt/data"}
             }
         }))

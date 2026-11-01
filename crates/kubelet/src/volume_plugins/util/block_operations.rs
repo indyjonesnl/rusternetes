@@ -16,7 +16,7 @@
 //! `expandVolumeDuringMount`.
 
 use crate::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
-use crate::volume_plugins::plugin::BlockVolumeMapper;
+use crate::volume_plugins::plugin::{BlockVolumeMapper, Spec};
 use crate::volume_plugins::registry::VolumePluginMgr;
 use crate::volume_plugins::util::hostutil::HostUtils;
 use crate::volume_plugins::util::operation_executor::{
@@ -29,6 +29,7 @@ use crate::volume_plugins::util::operation_generator::{
 use crate::volume_plugins::util::types::{OperationContext, VolumeOperationError};
 use crate::volume_plugins::util::volumepathhandler::VolumePathHandler;
 use anyhow::{anyhow, Error, Result};
+use rusternetes_common::resources::Pod;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -672,4 +673,16 @@ pub async fn unmap_device_with(
         return Ok(failed("MarkDeviceAsUnmounted failed", &anyhow!(e)));
     }
     Ok(OperationContext::new(None, None, false))
+}
+
+/// The path the runtime is given for a mapped block volume: the symlink
+/// `GetPodDeviceMapPath` names, `<pod device map path>/<volume name>`.
+pub fn pod_device_path(mgr: &VolumePluginMgr, spec: &Spec<'_>, pod: &Pod) -> Result<String> {
+    let plugin = mgr
+        .find_mapper_plugin_by_spec(spec)?
+        .ok_or_else(|| anyhow!("no BlockVolumeMapper plugin for volume {}", spec.name()))?;
+    let (dir, name) = plugin
+        .new_block_volume_mapper(spec, pod)?
+        .get_pod_device_map_path();
+    Ok(Path::new(&dir).join(name).to_string_lossy().into_owned())
 }

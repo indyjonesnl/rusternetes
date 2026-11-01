@@ -742,7 +742,7 @@ pub(crate) fn mark_volume_error_state(
 /// `util.CheckVolumeModeFilesystem` (`pkg/volume/util/util.go:354-365`): true
 /// for Filesystem, false for Block; a PV without `volumeMode` is an error
 /// (`GetVolumeMode`).
-fn check_volume_mode_filesystem(spec: &Spec<'_>) -> anyhow::Result<bool> {
+pub(crate) fn check_volume_mode_filesystem(spec: &Spec<'_>) -> anyhow::Result<bool> {
     let mode = crate::volume_plugins::iscsi::get_volume_mode(spec)?;
     Ok(!matches!(
         mode,
