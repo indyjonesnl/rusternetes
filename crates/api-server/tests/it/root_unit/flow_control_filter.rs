@@ -1105,6 +1105,21 @@ mod tests {
         );
     }
 
+    // The APF-off entry points (`main.rs` and `lib.rs::run`) share one helper,
+    // so the hook is on `/readyz/poststarthook/...` for both and finishes.
+    #[tokio::test]
+    async fn tracker_hook_without_apf_helper_registers_and_finishes() {
+        let registry = rusternetes_api_server::post_start_hooks::PostStartHooks::new();
+        register_object_count_tracker_hook_without_apf(&registry);
+        for _ in 0..50 {
+            if registry.check("storage-object-count-tracker-hook") == Some(Ok(())) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("storage-object-count-tracker-hook never finished");
+    }
+
     // GenericAPIServer.New (server/config.go:921-970) registers exactly these
     // three hooks when FlowControl and StorageObjectCountTracker are set; each
     // is a `poststarthook/<name>` check that finishes (the hooks return nil

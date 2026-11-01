@@ -478,6 +478,9 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
 
     // This entry point never enables APF (no `--enable-priority-and-fairness`).
     post_start_hooks::register_generic_server_hooks(post_start_hooks::global(), false);
+    // `storage-object-count-tracker-hook` (server/config.go:961-970) is
+    // registered with APF off too, as `main.rs` does.
+    flow_control_filter::register_object_count_tracker_hook_without_apf(post_start_hooks::global());
     let crd_controllers = Default::default();
     startup::register_post_start_hooks(
         storage.clone(),
