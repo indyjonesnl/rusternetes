@@ -570,12 +570,8 @@ impl FilterPlugin for NodePorts {
 /// - PreFilter's SidecarContainers-disabled rejection and pod-level
 ///   resources are not ported (restartable init containers are always
 ///   supported here).
-/// - A node that reports no `status.allocatable` at all is not filtered
-///   (upstream would reject every pod there); the kubelet always reports it.
 /// - The DRA extended-resource delegation (`shouldDelegateResourceToDRA`) is
 ///   not honoured yet.
-/// - Terminating pods do not count against the node, as in the scheduler's
-///   other accounting here.
 #[derive(Default)]
 pub struct NodeResourcesFit {
     pub ignored: FitIgnoredResources,
@@ -613,12 +609,15 @@ impl Plugin for NodeResourcesFit {
     }
 }
 
+/// The pods `NodeInfo` holds: the scheduler's pod informer leaves out the
+/// terminal ones (`status.phase!=Succeeded,status.phase!=Failed`), while
+/// terminating pods still count against the node until they are gone.
 fn counts_against_node(pod: &Pod) -> bool {
     !matches!(
         pod.status.as_ref().and_then(|s| s.phase.as_ref()),
         Some(rusternetes_common::types::Phase::Succeeded)
             | Some(rusternetes_common::types::Phase::Failed)
-    ) && pod.metadata.deletion_timestamp.is_none()
+    )
 }
 
 /// `preFilterStateKey` of the NodeResourcesFit plugin.
@@ -654,14 +653,16 @@ impl FilterPlugin for NodeResourcesFit {
         let Some(FitState(request)) = state.read(NODE_RESOURCES_FIT_STATE_KEY) else {
             return missing_state(NODE_RESOURCES_FIT_STATE_KEY);
         };
-        let Some(allocatable) = node_info
+        // A node that reports no allocatable has none of any resource, so
+        // `GetAllowedPodNumber()` is 0 and the pod does not fit ("Too many
+        // pods"), as for any node out of room.
+        let no_allocatable = HashMap::new();
+        let allocatable = node_info
             .node()
             .status
             .as_ref()
             .and_then(|s| s.allocatable.as_ref())
-        else {
-            return Status::success();
-        };
+            .unwrap_or(&no_allocatable);
         let alloc = |name: &str| -> i64 {
             allocatable
                 .get(name)

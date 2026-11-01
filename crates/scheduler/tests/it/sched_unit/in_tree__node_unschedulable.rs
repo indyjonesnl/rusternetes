@@ -19,7 +19,8 @@ fn bare_pod() -> Pod {
 fn node(unschedulable: bool) -> Node {
     serde_json::from_value(serde_json::json!({
         "metadata": {"name": "n"},
-        "spec": {"unschedulable": unschedulable}
+        "spec": {"unschedulable": unschedulable},
+        "status": {"allocatable": {"cpu": "4", "memory": "4Gi", "pods": "110"}}
     }))
     .unwrap()
 }
