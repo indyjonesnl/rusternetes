@@ -4,6 +4,7 @@ mod atomic_writer;
 mod clustertrustbundle;
 mod config;
 mod credentialprovider;
+mod credentialprovider_plugin;
 mod downward_api;
 mod events;
 mod eviction;

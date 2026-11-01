@@ -3,6 +3,7 @@ pub mod clustertrustbundle;
 pub mod cm_helpers;
 pub mod config;
 pub mod credentialprovider;
+pub mod credentialprovider_plugin;
 pub mod cri_runtime;
 pub mod downward_api;
 pub mod events;

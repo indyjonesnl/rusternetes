@@ -6,9 +6,9 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rusternetes_kubelet::{
-    config, eviction, image_gc, kubelet, node_ip, pluginmanager, server, server_auth, server_debug,
-    server_logs, server_metrics_endpoints, server_resource_metrics, serving_tls, streaming_server,
-    volume_plugins,
+    config, credentialprovider_plugin, eviction, image_gc, kubelet, node_ip, pluginmanager, server,
+    server_auth, server_debug, server_logs, server_metrics_endpoints, server_resource_metrics,
+    serving_tls, streaming_server, volume_plugins,
 };
 
 use anyhow::{Context, Result};
@@ -66,6 +66,16 @@ struct Args {
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
+
+    /// File or directory of `CredentialProviderConfig` files for image
+    /// credential provider plugins (upstream `--image-credential-provider-config`).
+    #[arg(long, default_value = "")]
+    image_credential_provider_config: String,
+
+    /// Directory the credential provider plugin binaries live in (upstream
+    /// `--image-credential-provider-bin-dir`).
+    #[arg(long, default_value = "")]
+    image_credential_provider_bin_dir: String,
 
     /// Path to kubelet configuration file
     #[arg(long, value_name = "FILE")]
@@ -398,6 +408,27 @@ async fn main() -> Result<()> {
             std::fs::read_to_string("/proc/sys/kernel/hostname")
         })
         .map_err(|e| anyhow::anyhow!(e))?;
+
+    // `kuberuntime_manager.go:309-313`: when either flag is set, registering
+    // the credential provider plugins must succeed or the kubelet exits.
+    if !args.image_credential_provider_config.is_empty()
+        || !args.image_credential_provider_bin_dir.is_empty()
+    {
+        // KubeletServiceAccountTokenForCredentialProviders is Beta (on) in 1.35.
+        let (cfg, hash) = credentialprovider_plugin::register_credential_provider_plugins(
+            &args.image_credential_provider_config,
+            &args.image_credential_provider_bin_dir,
+            true,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to register CRI auth plugins: {e}");
+            e
+        })?;
+        info!(
+            "Registered {} image credential provider(s), config hash {hash}",
+            cfg.providers.len()
+        );
+    }
 
     // Build eviction manager from CLI flags BEFORE consuming `args` into
     // RuntimeConfig::build — that call moves out several String fields.
