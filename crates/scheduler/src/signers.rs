@@ -13,6 +13,7 @@ use rusternetes_common::resources::Pod;
 use serde_json::{json, Value};
 
 pub const DYNAMIC_RESOURCES_SIGNER_NAME: &str = "v1.Pod.Spec.DynamicResources";
+pub const IMAGE_NAMES_SIGNER_NAME: &str = "v1.Pod.Spec.CanonicalImageNames()";
 pub const LABELS_SIGNER_NAME: &str = "v1.Pod.Labels";
 pub const NODE_NAME_SIGNER_NAME: &str = "v1.Pod.Spec.NodeName";
 pub const NODE_AFFINITY_SIGNER_NAME: &str = "v1.Pod.Spec.Affinity.NodeAffinity";

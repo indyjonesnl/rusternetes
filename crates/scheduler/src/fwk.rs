@@ -153,6 +153,7 @@ impl Status {
 #[derive(Default)]
 pub struct CycleState {
     storage: HashMap<String, Box<dyn Any + Send + Sync>>,
+    lazy: std::sync::Mutex<HashMap<String, std::sync::Arc<dyn Any + Send + Sync>>>,
     skip_filter_plugins: HashSet<String>,
     skip_score_plugins: HashSet<String>,
 }
@@ -170,6 +171,23 @@ impl CycleState {
     /// `Read`: `None` is upstream's `ErrNotFound`.
     pub fn read<T: Any + Send + Sync>(&self, key: &str) -> Option<&T> {
         self.storage.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+
+    /// A value computed on first use and shared for the rest of the cycle, for
+    /// plugins without a PreFilter/PreScore to compute it in (upstream reads
+    /// it from the snapshot's `NodeInfo`s). Scoring runs on a shared
+    /// `&CycleState`, hence the lock.
+    pub fn read_or_init<T: Any + Send + Sync>(
+        &self,
+        key: &str,
+        init: impl FnOnce() -> T,
+    ) -> std::sync::Arc<T> {
+        let mut lazy = self.lazy.lock().unwrap_or_else(|e| e.into_inner());
+        let v = lazy
+            .entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(init()))
+            .clone();
+        v.downcast::<T>().expect("a lazy key holds one type")
     }
 
     /// `SetSkipFilterPlugins`: plugins whose Filter is skipped this cycle
