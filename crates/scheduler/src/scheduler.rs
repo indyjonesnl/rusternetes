@@ -9,7 +9,7 @@ use rusternetes_storage::{
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
-use crate::advanced::{check_node_affinity, check_taints_tolerations, parse_resource_quantity};
+use crate::advanced::parse_resource_quantity;
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
@@ -968,7 +968,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 .await;
             return Err(rusternetes_common::Error::Internal(msg));
         } else if let Some((node_name, victims)) = self
-            .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
+            .try_preempt(
+                &pod,
+                &nodes,
+                &all_pods,
+                &priority_classes,
+                &pdbs,
+                &diagnosis,
+            )
             .await
         {
             // No node fits — preempt lower-priority pods. The production
@@ -1166,7 +1173,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             {
                 // No suitable node found, try preemption if pod has priority
                 if let Some(preemption_result) = self
-                    .try_preempt(&pod, &nodes, &all_pods, &priority_classes, &pdbs)
+                    .try_preempt(
+                        &pod,
+                        &nodes,
+                        &all_pods,
+                        &priority_classes,
+                        &pdbs,
+                        &diagnosis,
+                    )
                     .await
                 {
                     let (node_name, pods_to_evict) = preemption_result;
@@ -1470,6 +1484,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 msg
             );
             diag.pre_filter_msg = msg;
+            // `SetAbsentNodesStatus` (schedule_one.go:495): every node gets the
+            // PreFilter status so preemption handles them alike.
+            diag.absent_nodes_code = Some(pre_filter_status.code());
             diag.add_plugin_status(pre_filter_status.plugin());
             return None;
         }
@@ -1560,6 +1577,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         if status.is_rejected() {
                             diag.add_node_reasons(status.reasons());
                             diag.add_plugin_status(status.plugin());
+                            diag.set_node_code(&node.metadata.name, status.code());
                         } else {
                             // `findNodesThatPassFilters` (schedule_one.go:664-668):
                             // an Error status aborts the whole search.
@@ -1693,24 +1711,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .map(|n| (n, cycle_state))
     }
 
-    fn matches_node_selector(&self, node: &Node, selector: &HashMap<String, String>) -> bool {
-        let node_labels = node.metadata.labels.as_ref();
-
-        if node_labels.is_none() {
-            return selector.is_empty();
-        }
-
-        let labels = node_labels.unwrap();
-
-        for (key, value) in selector {
-            if labels.get(key) != Some(value) {
-                return false;
-            }
-        }
-
-        true
-    }
-
     async fn bind_pod_to_node(
         &self,
         mut pod: Pod,
@@ -1828,6 +1828,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
         pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
+        diagnosis: &Diagnosis,
     ) -> Option<(String, Vec<Pod>)> {
         // `RunPostFilterPlugins` runs only the pod's profile's PostFilter
         // plugins; DefaultPreemption is the one that evicts victims
@@ -1894,55 +1895,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // [sig-scheduling] SchedulerPreemption passed or failed by luck (#1130).
         // Upstream: pickOneNodeForPreemption
         // (pkg/scheduler/framework/preemption/preemption.go:651-730).
-        // `potentialNodes` (preemption.go:343-365 findCandidates): nodes whose
-        // failed predicates preemption may fix. Rusternetes filters them here
-        // (everything except resource fit).
+        // `findCandidates` (preemption.go:343-365): the nodes whose failure
+        // (Unschedulable, not UnschedulableAndUnresolvable) removing pods may fix.
         let profile = self.profile_for(pod).ok();
-        let added_required = profile
-            .and_then(|p| p.added_affinity.as_ref())
-            .and_then(|a| {
-                a.required_during_scheduling_ignored_during_execution
-                    .as_ref()
-            });
-        let mut potential_nodes: Vec<&Node> = Vec::new();
-        for node in nodes {
-            // Skip unschedulable nodes
-            if node
-                .spec
-                .as_ref()
-                .and_then(|s| s.unschedulable)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            // Check taints/tolerations
-            if !check_taints_tolerations(node, pod) {
-                continue;
-            }
-
-            // Check node selector
-            if let Some(node_selector) = pod.spec.as_ref().and_then(|s| s.node_selector.as_ref()) {
-                if !self.matches_node_selector(node, node_selector) {
-                    continue;
-                }
-            }
-
-            // NodeAffinity's scheduler-enforced addedAffinity
-            // (node_affinity.go:221-223 Filter).
-            if let Some(required) = added_required {
-                if !rusternetes_common::affinity::matches_node_selector(node, required) {
-                    continue;
-                }
-            }
-
-            // Check node affinity (hard requirements only)
-            let (affinity_ok, _) = check_node_affinity(node, pod);
-            if !affinity_ok {
-                continue;
-            }
-            potential_nodes.push(node);
-        }
+        let potential_nodes: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| diagnosis.node_code(&n.metadata.name) == crate::fwk::Code::Unschedulable)
+            .collect();
 
         // `GetOffsetAndNumCandidates` (default_preemption.go:191-193) then
         // `DryRunPreemption` (preemption.go:768-821): dry-run the potential

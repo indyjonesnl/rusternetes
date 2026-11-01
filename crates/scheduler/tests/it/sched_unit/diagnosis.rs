@@ -48,4 +48,18 @@ mod tests {
             "0/2 nodes are available."
         );
     }
+
+    #[test]
+    fn node_codes_default_to_the_absent_nodes_status() {
+        use rusternetes_scheduler::fwk::Code;
+        // `NewDefaultNodeToStatus` (interface.go:42-44).
+        let mut d = Diagnosis::default();
+        assert_eq!(d.node_code("n"), Code::UnschedulableAndUnresolvable);
+        d.set_node_code("n", Code::Unschedulable);
+        assert_eq!(d.node_code("n"), Code::Unschedulable);
+        assert_eq!(d.node_code("m"), Code::UnschedulableAndUnresolvable);
+        // `SetAbsentNodesStatus` after a PreFilter rejection.
+        d.absent_nodes_code = Some(Code::Unschedulable);
+        assert_eq!(d.node_code("m"), Code::Unschedulable);
+    }
 }

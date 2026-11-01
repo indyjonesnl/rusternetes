@@ -4,8 +4,9 @@
 //! Ported from upstream `pkg/scheduler/framework/types.go`:
 //! `Diagnosis` (PreFilterMsg + per-node statuses) and `FitError.Error()`
 //! (`:807-847`), with `NoNodeAvailableMsg = "0/%v nodes are available"`
-//! (`:784`). Only the reason histogram is modelled; Rusternetes has no
-//! PostFilter message or NodeToStatus absent-node default.
+//! (`:784`), and `NodeToStatus` (`interface.go:35-110`) reduced to the status
+//! codes preemption reads. The FailedScheduling message uses the reason
+//! histogram only.
 
 #[derive(Debug, Default, Clone)]
 pub struct Diagnosis {
@@ -23,6 +24,14 @@ pub struct Diagnosis {
     /// this error instead of a `FitError`, so the cycle is a scheduling
     /// *error* (no PostFilter, error backoff), not "unschedulable".
     pub scheduling_error: Option<String>,
+    /// `Diagnosis.NodeToStatus` (`types.go:762`): the code of each node's
+    /// rejection, by node name.
+    pub node_codes: std::collections::HashMap<String, crate::fwk::Code>,
+    /// `NodeToStatus.absentNodesStatus` (interface.go:42-45, :73-85): the code
+    /// of the nodes without an entry. `None` is the default,
+    /// UnschedulableAndUnresolvable; a PreFilter rejection sets it to its own
+    /// code so every node is handled alike in preemption.
+    pub absent_nodes_code: Option<crate::fwk::Code>,
 }
 
 impl Diagnosis {
@@ -38,6 +47,19 @@ impl Diagnosis {
             return;
         }
         self.unschedulable_plugins.insert(plugin.to_string());
+    }
+
+    /// `NodeToStatus.Set`.
+    pub fn set_node_code(&mut self, node: &str, code: crate::fwk::Code) {
+        self.node_codes.insert(node.to_string(), code);
+    }
+
+    /// `NodeToStatus.Get(..).Code()`.
+    pub fn node_code(&self, node: &str) -> crate::fwk::Code {
+        self.node_codes.get(node).copied().unwrap_or_else(|| {
+            self.absent_nodes_code
+                .unwrap_or(crate::fwk::Code::UnschedulableAndUnresolvable)
+        })
     }
 
     pub fn is_empty(&self) -> bool {
