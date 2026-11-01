@@ -208,3 +208,18 @@ pub fn register_generic_server_hooks(registry: &PostStartHooks, apf_enabled: boo
         });
     }
 }
+
+/// `start-kube-aggregator-informers` (kube-aggregator/pkg/apiserver/
+/// apiserver.go:316-320): `informerFactory.Start(stop)` and
+/// `c.GenericConfig.SharedInformerFactory.Start(stop)`, then returns nil, so it
+/// finishes at once and is never fatal. The aggregator's APIService informers
+/// are watch-driven loops here (`autoregister`, `apiservice_registration`) and
+/// there is no shared informer factory to start, so the hook is registered
+/// (for `/healthz/poststarthook/<name>`) with nothing to start. Deliberate
+/// deviation, as for `generic-apiserver-start-informers`.
+pub const AGGREGATOR_INFORMERS_HOOK: &str = "start-kube-aggregator-informers";
+
+/// Register [`AGGREGATOR_INFORMERS_HOOK`] on `registry`.
+pub fn register_aggregator_informers_hook(registry: &PostStartHooks) {
+    spawn_starting_hook_with(registry, AGGREGATOR_INFORMERS_HOOK, || {});
+}

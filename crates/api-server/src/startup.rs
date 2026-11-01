@@ -82,6 +82,9 @@ pub async fn register_post_start_hooks(
         rusternetes_discovery::delegate_listed_paths(),
     );
 
+    // start-kube-aggregator-informers (kube-aggregator apiserver.go:316).
+    crate::post_start_hooks::register_aggregator_informers_hook(crate::post_start_hooks::global());
+
     // apiservice-registration-controller + apiservice-discovery-controller
     // PostStartHooks (kube-aggregator apiserver.go:368-420).
     crate::apiservice_registration::spawn_apiservice_registration_hooks(storage.clone());
