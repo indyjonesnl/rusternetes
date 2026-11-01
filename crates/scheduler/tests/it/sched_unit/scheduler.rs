@@ -1363,6 +1363,131 @@ mod tests {
         assert_eq!(dt.reason.as_deref(), Some("PreemptionByScheduler"));
     }
 
+    async fn stored_pod(
+        storage: &MemoryStorage,
+        name: &str,
+        node: &str,
+        priority: i32,
+        nominated: Option<&str>,
+    ) -> Pod {
+        let mut p = make_pending_pod(name, "default");
+        p.metadata.uid = format!("{name}-uid");
+        let spec = p.spec.as_mut().unwrap();
+        spec.node_name = (!node.is_empty()).then(|| node.to_string());
+        spec.priority = Some(priority);
+        p.status = Some(PodStatus {
+            nominated_node_name: nominated.map(str::to_string),
+            ..Default::default()
+        });
+        storage
+            .create(&format!("/registry/pods/default/{name}"), &p)
+            .await
+            .unwrap();
+        p
+    }
+
+    /// `prepareCandidate` (preemption.go:464-500): every victim is evicted, in
+    /// parallel batches of at most 16 (more victims than workers here), except
+    /// one whose deletion already started, which gets no API call.
+    #[tokio::test]
+    async fn test_prepare_candidate_evicts_every_victim_but_terminating_ones() {
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        let mut victims = Vec::new();
+        for i in 0..40 {
+            victims.push(stored_pod(&storage, &format!("v{i}"), "node-1", 1, None).await);
+        }
+        let mut dying = stored_pod(&storage, "dying", "node-1", 1, None).await;
+        // Whole seconds: that is what survives serialization.
+        let stamp =
+            chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() - 60, 0).unwrap();
+        dying.metadata.deletion_timestamp = Some(stamp);
+        victims.push(dying.clone());
+        storage
+            .update("/registry/pods/default/dying", &dying)
+            .await
+            .unwrap();
+
+        let preemptor = make_pending_pod("high-pod", "default");
+        scheduler
+            .prepare_candidate(None, &preemptor, "node-1", &victims)
+            .await
+            .unwrap();
+
+        for i in 0..40 {
+            let v: Pod = storage
+                .get(&format!("/registry/pods/default/v{i}"))
+                .await
+                .unwrap();
+            assert!(v.metadata.deletion_timestamp.is_some(), "v{i} evicted");
+            assert!(
+                v.status
+                    .as_ref()
+                    .and_then(|s| s.conditions.as_ref())
+                    .is_some_and(|c| c.iter().any(|c| c.condition_type == "DisruptionTarget")),
+                "v{i} carries DisruptionTarget"
+            );
+        }
+        let untouched: Pod = storage.get("/registry/pods/default/dying").await.unwrap();
+        assert_eq!(untouched.metadata.deletion_timestamp, Some(stamp));
+        assert!(
+            untouched
+                .status
+                .as_ref()
+                .and_then(|s| s.conditions.as_ref())
+                .is_none(),
+            "a victim already terminating gets no second eviction"
+        );
+    }
+
+    /// `prepareCandidate` clears the nomination of the lower-priority pods
+    /// nominated to the node (`getLowerPriorityNominatedPods`, :746-761), in
+    /// the queue's nominator and on the pod; others keep theirs.
+    #[tokio::test]
+    async fn test_prepare_candidate_clears_lower_priority_nominations() {
+        use rusternetes_scheduler::queue::nominator::NominatingInfo;
+        let storage = Arc::new(MemoryStorage::new());
+        let scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        let queue = test_queue();
+        let victim = stored_pod(&storage, "victim", "node-1", 1, None).await;
+        let low = stored_pod(&storage, "low", "", 5, Some("node-1")).await;
+        let high = stored_pod(&storage, "high", "", 5000, Some("node-1")).await;
+        let other_node = stored_pod(&storage, "other", "", 5, Some("node-2")).await;
+        // The queue holds the real pods, as in the scheduler; `high` is in the
+        // active queue so the nominator sees its priority.
+        for p in [&low, &high, &other_node] {
+            queue.add_nominated_pod(p, Some(&NominatingInfo::noop()));
+        }
+        queue.add(high.clone());
+
+        let mut preemptor = make_pending_pod("preemptor", "default");
+        preemptor.spec.as_mut().unwrap().priority = Some(1000);
+        scheduler
+            .prepare_candidate(Some(&queue), &preemptor, "node-1", &[victim])
+            .await
+            .unwrap();
+
+        let nominated = |name: &str| {
+            let storage = storage.clone();
+            let name = name.to_string();
+            async move {
+                let p: Pod = storage
+                    .get(&format!("/registry/pods/default/{name}"))
+                    .await
+                    .unwrap();
+                p.status.and_then(|s| s.nominated_node_name)
+            }
+        };
+        assert_eq!(nominated("low").await, None);
+        assert_eq!(nominated("high").await.as_deref(), Some("node-1"));
+        assert_eq!(nominated("other").await.as_deref(), Some("node-2"));
+        let noms = queue.nominated_nodes();
+        assert_ne!(noms.get("low-uid").map(String::as_str), Some("node-1"));
+        assert_eq!(noms.get("high-uid").map(String::as_str), Some("node-1"));
+    }
+
     /// #2477: evicting a victim deletes that namespace's pod only. Upstream
     /// `util.DeletePod` deletes `Pods(pod.Namespace)` / `pod.Name`
     /// (pkg/scheduler/util/utils.go:137-138); a name-only scan evicted the
