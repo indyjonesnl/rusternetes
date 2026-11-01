@@ -9,6 +9,7 @@ pub mod inter_pod_affinity_filter;
 pub mod inter_pod_affinity_score;
 pub mod node_volume_limits;
 pub mod plugins;
+pub mod pod_topology_spread_filter;
 pub mod pod_topology_spread_score;
 pub mod profile;
 pub mod queue;
