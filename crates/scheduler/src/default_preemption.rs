@@ -16,15 +16,13 @@
 //!   (`CycleState` is not clonable), so every fit check here runs PreFilter
 //!   again on the snapshot without the removed pods, which yields the state the
 //!   extensions would have produced.
-//! - `filterPodsWithPDBViolation` (:373-419) reads `status.disruptionsAllowed`;
-//!   this keeps the scheduler's existing budget arithmetic
-//!   ([`crate::advanced::pod_violates_any_pdb`]) to leave PDB behaviour as is.
 
 use std::collections::HashSet;
 
 use rusternetes_common::resources::{Node, Pod, PodDisruptionBudget};
+use rusternetes_common::types::label_selector_as_selector;
 
-use crate::advanced::{pod_key, pod_violates_any_pdb};
+use crate::advanced::pod_key;
 use crate::framework_runtime::Framework;
 use crate::fwk::{Code, CycleState, Handle, Status};
 
@@ -74,6 +72,49 @@ pub fn nominated_pods_for_node<'a>(
                 && p.metadata.deletion_timestamp.is_none()
         })
         .collect()
+}
+
+/// `filterPodsWithPDBViolation` (default_preemption.go:373-419): the keys of the
+/// `pods` whose eviction exceeds a PodDisruptionBudget, taking the pods in order
+/// and spending each matching budget's `status.disruptionsAllowed` as it goes.
+fn pods_with_pdb_violation(pods: &[&Pod], pdbs: &[PodDisruptionBudget]) -> HashSet<String> {
+    let mut allowed: Vec<i32> = pdbs
+        .iter()
+        .map(|pdb| pdb.status.as_ref().map_or(0, |s| s.disruptions_allowed))
+        .collect();
+    let mut violating = HashSet::new();
+    for pod in pods {
+        // A pod with no labels matches no PDB.
+        if pod.metadata.labels.as_ref().is_none_or(|l| l.is_empty()) {
+            continue;
+        }
+        for (i, pdb) in pdbs.iter().enumerate() {
+            if pdb.metadata.namespace != pod.metadata.namespace {
+                continue;
+            }
+            // An invalid selector matches nothing, and so does a nil or empty one.
+            let Ok(selector) = label_selector_as_selector(pdb.spec.selector.as_ref()) else {
+                continue;
+            };
+            if selector.is_everything() || !selector.matches(pod.metadata.labels.as_ref()) {
+                continue;
+            }
+            // A pod in DisruptedPods was already processed by the API server.
+            let disrupted = pdb
+                .status
+                .as_ref()
+                .and_then(|s| s.disrupted_pods.as_ref())
+                .is_some_and(|d| d.contains_key(&pod.metadata.name));
+            if disrupted {
+                continue;
+            }
+            allowed[i] -= 1;
+            if allowed[i] < 0 {
+                violating.insert(pod_key(pod));
+            }
+        }
+    }
+    violating
 }
 
 /// What `SelectVictimsOnNode` returns on success.
@@ -148,10 +189,11 @@ pub async fn select_victims_on_node(
 
     // Reprieve the most important pods first; PDB-violating ones before the rest.
     potential.sort_by(|a, b| more_important(a, b));
+    let violating = pods_with_pdb_violation(&potential, pdbs);
     let (violating, non_violating): (Vec<&Pod>, Vec<&Pod>) = potential
         .iter()
         .copied()
-        .partition(|p| pod_violates_any_pdb(p, pdbs, all_pods));
+        .partition(|p| violating.contains(&pod_key(p)));
     let mut victims: Vec<&Pod> = Vec::new();
     let mut num_violating = 0i64;
     for (group, counts_violation) in [(&violating, true), (&non_violating, false)] {

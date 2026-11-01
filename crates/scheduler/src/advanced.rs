@@ -1,7 +1,5 @@
 use rusternetes_common::quantity::parse_resource_value;
-use rusternetes_common::resources::{
-    IntOrString, Node, Pod, PodDisruptionBudget, Taint, Toleration, TopologySpreadConstraint,
-};
+use rusternetes_common::resources::{Node, Pod, Taint, Toleration, TopologySpreadConstraint};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -818,83 +816,6 @@ pub fn pod_key(p: &Pod) -> String {
         p.metadata.namespace.as_deref().unwrap_or(""),
         p.metadata.name
     )
-}
-
-/// Whether evicting `victim` breaks a PodDisruptionBudget that covers it.
-pub fn pod_violates_any_pdb(victim: &Pod, pdbs: &[PodDisruptionBudget], all_pods: &[Pod]) -> bool {
-    for pdb in pdbs {
-        if !pdb_covers_pod(pdb, victim) {
-            continue;
-        }
-        let healthy_now = all_pods
-            .iter()
-            .filter(|p| pdb_covers_pod(pdb, p))
-            .filter(|p| !is_pod_terminal(p))
-            .count() as i32;
-
-        if let Some(ref min_avail) = pdb.spec.min_available {
-            let min_avail_i = match min_avail {
-                IntOrString::Int(n) => *n,
-                IntOrString::String(s) => parse_min_available_percent(s, healthy_now),
-            };
-            if healthy_now - 1 < min_avail_i {
-                return true;
-            }
-        }
-        if let Some(ref max_unavail) = pdb.spec.max_unavailable {
-            let max_unavail_i = match max_unavail {
-                IntOrString::Int(n) => *n,
-                IntOrString::String(s) => parse_min_available_percent(s, healthy_now),
-            };
-            // A single eviction counts as one unavailable.
-            if max_unavail_i < 1 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// True if the PDB's selector matches the pod's labels and the pod's namespace
-/// equals the PDB's namespace.
-fn pdb_covers_pod(pdb: &PodDisruptionBudget, pod: &Pod) -> bool {
-    if pdb.metadata.namespace != pod.metadata.namespace
-        && pdb.metadata.namespace.is_some()
-        && pod.metadata.namespace.is_some()
-    {
-        return false;
-    }
-    // A null selector matches no pods: upstream reads it through
-    // `LabelSelectorAsSelector`, which returns `labels.Nothing()` for nil
-    // (`apimachinery/pkg/apis/meta/v1/helpers.go:37-43`).
-    let Some(selector) = &pdb.spec.selector else {
-        return false;
-    };
-    match_selector(selector, &pod.metadata.labels)
-}
-
-fn is_pod_terminal(p: &Pod) -> bool {
-    let phase = p.status.as_ref().and_then(|s| s.phase.as_ref());
-    if matches!(
-        phase,
-        Some(rusternetes_common::types::Phase::Succeeded)
-            | Some(rusternetes_common::types::Phase::Failed)
-    ) {
-        return true;
-    }
-    p.metadata.deletion_timestamp.is_some()
-}
-
-/// Parse a percentage string like "20%" into an absolute count given the
-/// current healthy population. Falls back to 0 on parse error.
-fn parse_min_available_percent(s: &str, healthy_now: i32) -> i32 {
-    if let Some(num) = s.strip_suffix('%') {
-        if let Ok(pct) = num.trim().parse::<f32>() {
-            // Round up like K8s does (ceil): minimum of pct% of healthy.
-            return ((healthy_now as f32) * pct / 100.0).ceil() as i32;
-        }
-    }
-    s.trim().parse::<i32>().unwrap_or(0)
 }
 
 /// Check topology spread constraints for a pod

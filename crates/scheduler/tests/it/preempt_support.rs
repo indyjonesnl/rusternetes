@@ -10,6 +10,43 @@ use rusternetes_scheduler::default_preemption::select_victims_on_node;
 use rusternetes_scheduler::fwk::NoHandle;
 use rusternetes_scheduler::profile::Profile;
 
+/// The `status` the disruption controller gives a budget over `pods`
+/// (`updatePdbStatus`, disruption.go:1001-1050): `disruptionsAllowed` is the
+/// healthy pods it selects minus the desired healthy count, never negative.
+/// Fixtures build budgets from their spec only, as an API client would.
+fn with_controller_status(pdb: &PodDisruptionBudget, pods: &[Pod]) -> PodDisruptionBudget {
+    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetStatus};
+    let mut pdb = pdb.clone();
+    if pdb.status.is_some() {
+        return pdb;
+    }
+    let healthy = pods
+        .iter()
+        .filter(|p| {
+            p.metadata.namespace == pdb.metadata.namespace
+                && p.metadata.deletion_timestamp.is_none()
+                && pdb.spec.selector.as_ref().is_some_and(|sel| {
+                    rusternetes_common::affinity::match_selector(sel, &p.metadata.labels)
+                })
+        })
+        .count() as i32;
+    let desired = match (&pdb.spec.min_available, &pdb.spec.max_unavailable) {
+        (Some(IntOrString::Int(n)), _) => *n,
+        (_, Some(IntOrString::Int(n))) => healthy - *n,
+        _ => 0,
+    };
+    pdb.status = Some(PodDisruptionBudgetStatus {
+        current_healthy: healthy,
+        desired_healthy: desired,
+        disruptions_allowed: (healthy - desired).max(0),
+        expected_pods: healthy,
+        observed_generation: None,
+        conditions: None,
+        disrupted_pods: None,
+    });
+    pdb
+}
+
 fn as_reported_by_kubelet(node: &Node) -> Node {
     let mut node = node.clone();
     if let Some(status) = node.status.as_mut() {
@@ -55,13 +92,11 @@ pub fn check_preemption_with_pdbs(
     all_pods: &[Pod],
     pdbs: &[PodDisruptionBudget],
 ) -> (bool, Vec<String>) {
-    let mut node = node.clone();
-    if let Some(status) = node.status.as_mut() {
-        for q in [status.allocatable.as_mut()].into_iter().flatten() {
-            q.entry("pods".to_string())
-                .or_insert_with(|| "110".to_string());
-        }
-    }
+    let node = as_reported_by_kubelet(node);
+    let pdbs: Vec<PodDisruptionBudget> = pdbs
+        .iter()
+        .map(|pdb| with_controller_status(pdb, all_pods))
+        .collect();
     let profile = Profile::named("default-scheduler");
     let nodes = [node.clone()];
     let selected = futures::executor::block_on(select_victims_on_node(
@@ -71,7 +106,7 @@ pub fn check_preemption_with_pdbs(
         &node,
         all_pods,
         &nodes,
-        pdbs,
+        &pdbs,
     ));
     match selected {
         Ok(v) => (
