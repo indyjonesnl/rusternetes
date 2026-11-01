@@ -30,6 +30,8 @@ use tracing::{error, warn};
 
 /// `pluginwebhook.PluginName`.
 pub const WEBHOOK_PLUGIN_NAME: &str = "webhook";
+/// `pluginlog.PluginName`.
+pub const LOG_PLUGIN_NAME: &str = "log";
 /// `pluginbuffered.PluginName`.
 pub const BUFFERED_PLUGIN_NAME: &str = "buffered";
 /// `pluginwebhook.DefaultInitialBackoffDelay`.
@@ -85,6 +87,23 @@ impl BatchConfig {
             throttle_qps: 10.0,
             throttle_burst: 15,
             async_delegate: true,
+        }
+    }
+}
+
+impl BatchConfig {
+    /// `defaultLogBatchConfig` (options/audit.go:602-612): batching is not
+    /// useful for the log backend, so `MaxBatchSize` is 1, `MaxBatchWait` is
+    /// ignored, there is no throttle and the delegate runs synchronously.
+    pub fn default_log() -> Self {
+        Self {
+            buffer_size: 10000,
+            max_batch_size: 1,
+            max_batch_wait: Duration::ZERO,
+            throttle_enable: false,
+            throttle_qps: 0.0,
+            throttle_burst: 0,
+            async_delegate: false,
         }
     }
 }
@@ -171,6 +190,28 @@ pub trait BatchBackend: Send + Sync {
     async fn process_events(&self, events: Vec<AuditEvent>) -> bool;
     /// `Backend.String()`.
     fn name(&self) -> String;
+}
+
+/// The log backend's `ProcessEvents` (plugin/pkg/audit/log/backend.go:60-90)
+/// as a delegate for [`BatchOptions::wrap_backend`]: each event is written; a
+/// failure is reported through `HandlePluginError` and fails the batch.
+pub struct LogDelegate(pub Arc<dyn AuditBackend>);
+
+#[async_trait]
+impl BatchBackend for LogDelegate {
+    async fn process_events(&self, events: Vec<AuditEvent>) -> bool {
+        let mut success = true;
+        for ev in events {
+            if let Err(e) = self.0.log(ev).await {
+                handle_plugin_error(LOG_PLUGIN_NAME, &e, 1);
+                success = false;
+            }
+        }
+        success
+    }
+    fn name(&self) -> String {
+        LOG_PLUGIN_NAME.to_string()
+    }
 }
 
 /// `audit.HandlePluginError` (pkg/audit/metrics.go): log the failure and the
