@@ -26,7 +26,9 @@ fn new_pod(host: &str, ports: &[&str]) -> Pod {
 async fn run(pod: Pod, existing: Vec<Pod>) -> rusternetes_scheduler::fwk::Status {
     let node: Node = serde_json::from_value(json!({"metadata": {"name": "m1"}})).unwrap();
     let mut state = CycleState::new();
-    let (result, status) = NodePorts.pre_filter(&mut state, &pod, &[], &NoHandle).await;
+    let (result, status) = NodePorts
+        .pre_filter(&mut state, &pod, &[], &[], &NoHandle)
+        .await;
     assert!(result.is_none(), "NodePorts never narrows the nodes");
     if status.is_skip() {
         return rusternetes_scheduler::fwk::Status::success();
@@ -47,7 +49,13 @@ async fn skip_filter_no_ports() {
     assert!(run(new_pod("m1", &[]), vec![]).await.is_success());
     // PreFilter says Skip, so the framework does not run Filter.
     let (result, status) = NodePorts
-        .pre_filter(&mut CycleState::new(), &new_pod("m1", &[]), &[], &NoHandle)
+        .pre_filter(
+            &mut CycleState::new(),
+            &new_pod("m1", &[]),
+            &[],
+            &[],
+            &NoHandle,
+        )
         .await;
     assert!(result.is_none());
     assert!(status.is_skip());

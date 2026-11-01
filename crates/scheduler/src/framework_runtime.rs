@@ -916,11 +916,12 @@ impl Framework {
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[Node],
+        all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status, HashSet<String>) {
         let mut skip_plugins: HashSet<String> = HashSet::new();
         let out = self
-            .pre_filter_plugins_inner(state, pod, nodes, handle, &mut skip_plugins)
+            .pre_filter_plugins_inner(state, pod, nodes, all_pods, handle, &mut skip_plugins)
             .await;
         // Upstream sets this in a defer, so it applies on every return path.
         state.set_skip_filter_plugins(skip_plugins);
@@ -932,6 +933,7 @@ impl Framework {
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[Node],
+        all_pods: &[Pod],
         handle: &dyn Handle,
         skip_plugins: &mut HashSet<String>,
     ) -> (Option<PreFilterResult>, Status, HashSet<String>) {
@@ -939,7 +941,7 @@ impl Framework {
         let mut plugins_with_nodes: HashSet<String> = HashSet::new();
         let mut return_status = Status::success();
         for pl in &self.pre_filter_plugin_objects.0 {
-            let (r, mut s) = pl.pre_filter(state, pod, nodes, handle).await;
+            let (r, mut s) = pl.pre_filter(state, pod, nodes, all_pods, handle).await;
             if s.is_skip() {
                 skip_plugins.insert(pl.name().to_string());
                 continue;

@@ -69,6 +69,7 @@ async fn pod_without_pvcs_is_skipped() {
             &mut CycleState::new(),
             &pod(json!([{"name": "v", "emptyDir": {}}])),
             &[],
+            &[],
             &NoHandle,
         )
         .await;
@@ -82,6 +83,7 @@ async fn missing_pvc_is_unresolvable() {
             &mut CycleState::new(),
             &pod_with_pvc("gone"),
             &[],
+            &[],
             &Listers(VolumeSnapshot::default()),
         )
         .await;
@@ -91,7 +93,13 @@ async fn missing_pvc_is_unresolvable() {
 #[tokio::test]
 async fn snapshot_failure_is_an_error() {
     let (_, s) = VolumeBinding
-        .pre_filter(&mut CycleState::new(), &pod_with_pvc("c"), &[], &NoHandle)
+        .pre_filter(
+            &mut CycleState::new(),
+            &pod_with_pvc("c"),
+            &[],
+            &[],
+            &NoHandle,
+        )
         .await;
     assert_eq!(s.code(), Code::Error);
 }
@@ -101,7 +109,7 @@ async fn filter_records_volumes_per_node_and_rejects_on_affinity() {
     let p = pod_with_pvc("c");
     let mut state = CycleState::new();
     let (_, s) = VolumeBinding
-        .pre_filter(&mut state, &p, &[], &Listers(bound_snapshot()))
+        .pre_filter(&mut state, &p, &[], &[], &Listers(bound_snapshot()))
         .await;
     assert!(s.is_success());
 
@@ -175,7 +183,7 @@ async fn score_is_zero_for_a_node_without_recorded_volumes() {
     let p = pod_with_pvc("c");
     let mut state = CycleState::new();
     let (_, s) = VolumeBinding
-        .pre_filter(&mut state, &p, &[], &Listers(bound_snapshot()))
+        .pre_filter(&mut state, &p, &[], &[], &Listers(bound_snapshot()))
         .await;
     assert!(s.is_success());
     let s = plugin
@@ -240,7 +248,9 @@ impl Handle for Binder {
 
 async fn filtered_state(binder: &Binder, p: &Pod) -> CycleState {
     let mut state = CycleState::new();
-    let (_, s) = VolumeBinding.pre_filter(&mut state, p, &[], binder).await;
+    let (_, s) = VolumeBinding
+        .pre_filter(&mut state, p, &[], &[], binder)
+        .await;
     assert!(s.is_success());
     let mut a = node("na");
     a.metadata.labels = Some([("zone".to_string(), "a".to_string())].into());

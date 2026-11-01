@@ -1453,7 +1453,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             bind_poll: self.volume_bind_poll,
         };
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
-            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, &handle)
+            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, all_pods, &handle)
             .await;
         diag.unschedulable_plugins
             .extend(plugins_with_nodes.iter().cloned());

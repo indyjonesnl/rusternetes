@@ -64,7 +64,7 @@ fn slice(node: &str) -> ResourceSlice {
 async fn filter(handle: &Dra, p: &Pod, n: &Node) -> (Code, Vec<String>) {
     let mut state = CycleState::new();
     let (_, s) = DynamicResources
-        .pre_filter(&mut state, p, &[], handle)
+        .pre_filter(&mut state, p, &[], &[], handle)
         .await;
     assert!(s.is_success(), "{s:?}");
     let pods: Vec<Pod> = vec![];
@@ -77,7 +77,7 @@ async fn filter(handle: &Dra, p: &Pod, n: &Node) -> (Code, Vec<String>) {
 #[tokio::test]
 async fn pod_without_claims_is_skipped() {
     let (r, s) = DynamicResources
-        .pre_filter(&mut CycleState::new(), &pod(None), &[], &NoHandle)
+        .pre_filter(&mut CycleState::new(), &pod(None), &[], &[], &NoHandle)
         .await;
     assert!(r.is_none() && s.is_skip());
 }
@@ -88,6 +88,7 @@ async fn missing_claim_is_unresolvable() {
         .pre_filter(
             &mut CycleState::new(),
             &pod(Some("c")),
+            &[],
             &[],
             &Dra::default(),
         )
