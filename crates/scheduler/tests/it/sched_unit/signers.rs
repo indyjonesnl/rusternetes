@@ -200,10 +200,79 @@ fn sign_pod_combines_the_plugins_fragments() {
 }
 
 #[test]
-fn signatures_are_disabled_when_a_plugin_cannot_sign() {
-    // The default profile still has plugins that are not plugin objects (the
-    // Score plugins), so upstream's `computeBatchablePlugins` disables
-    // signatures.
+#[serial_test::serial]
+fn default_profile_can_sign_pods() {
+    // Every plugin of the default profile has a SignPod, so
+    // `computeBatchablePlugins` leaves signatures enabled and
+    // OpportunisticBatching has something to compare.
+    let fw = Profile::named("default-scheduler").framework;
+    assert!(fw.signatures_enabled());
+    let a = pod(json!({"containers": [{"name": "c"}]}));
+    let sig = fw.sign_pod(&a).expect("signable");
+    let parsed: Value = serde_json::from_slice(&sig).unwrap();
+    for key in [
+        RESOURCES_SIGNER_NAME,
+        VOLUMES_SIGNER_NAME,
+        HOST_PORTS_SIGNER_NAME,
+        TOLERATIONS_SIGNER_NAME,
+    ] {
+        assert!(parsed.get(key).is_some(), "{key} in {parsed}");
+    }
+    // A different volume changes the signature (VolumeRestrictions,
+    // VolumeZone, VolumeBinding and NodeVolumeLimits all sign it).
+    let v = pod(json!({"containers": [{"name": "c"}],
+        "volumes": [{"name": "d", "gcePersistentDisk": {"pdName": "x"}}]}));
+    assert_ne!(Some(&sig), fw.sign_pod(&v).as_ref());
+    // Different requests too (NodeResourcesFit, BalancedAllocation).
+    let r = pod(json!({"containers": [{"name": "c",
+        "resources": {"requests": {"cpu": "1"}}}]}));
+    assert_ne!(Some(&sig), fw.sign_pod(&r).as_ref());
+}
+
+#[test]
+fn volume_and_balanced_allocation_signers() {
+    use rusternetes_scheduler::in_tree::{BalancedAllocation, VolumeRestrictions, VolumeZone};
+    let p = pod(json!({"containers": [{"name": "c",
+        "resources": {"requests": {"cpu": "1"}}}],
+        "volumes": [{"name": "d", "gcePersistentDisk": {"pdName": "x"}}]}));
+    for fragments in [VolumeRestrictions.sign_pod(&p), VolumeZone.sign_pod(&p)] {
+        assert!(fragments.1.is_success());
+        assert_eq!(fragments.0.len(), 1);
+        assert_eq!(fragments.0[0].key, VOLUMES_SIGNER_NAME);
+        assert_eq!(fragments.0[0].value, volumes_signer(&p));
+    }
+    let (f, status) = BalancedAllocation.sign_pod(&p);
+    assert!(status.is_success());
+    assert_eq!(f[0].key, RESOURCES_SIGNER_NAME);
+}
+
+#[test]
+#[serial_test::serial]
+fn resource_signers_refuse_while_dra_extended_resource_is_on() {
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use rusternetes_scheduler::in_tree::{BalancedAllocation, NodeResourcesFit};
+    let p = pod(json!({"containers": []}));
+    let _g = with_feature(Feature::DRAExtendedResource, true);
+    for status in [
+        BalancedAllocation.sign_pod(&p).1,
+        NodeResourcesFit::default().sign_pod(&p).1,
+    ] {
+        assert_eq!(status.code(), Code::Unschedulable);
+        assert_eq!(
+            status.message(),
+            "signature disabled when dra extended resources enabled"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn signatures_stay_disabled_while_node_declared_features_cannot_sign() {
+    // NodeDeclaredFeatures (Alpha, off in 1.35) joins the default profile
+    // when its gate is on; it has no plugin object yet, so signatures turn
+    // off rather than ignore it (`computeBatchablePlugins`).
+    use rusternetes_common::feature_gates::{with_feature, Feature};
+    let _g = with_feature(Feature::NodeDeclaredFeatures, true);
     let fw = Profile::named("default-scheduler").framework;
     assert!(!fw.signatures_enabled());
     assert_eq!(fw.sign_pod(&pod(json!({"containers": []}))), None);
