@@ -384,10 +384,12 @@ impl NodeKeyring {
 }
 
 /// `makeLookupPullCredentialsFunc`'s keyring: pull-secret credentials first,
-/// then the node keyring (`MakeDockerKeyring(pullSecrets, default)`).
-pub fn lookup_pull_credentials(
+/// then `UnionDockerKeyring{nodeKeyring, externalCredentialProviderKeyring}`
+/// (`MakeDockerKeyring(pullSecrets, default)`).
+pub async fn lookup_pull_credentials(
     secrets: &[Secret],
     node: &NodeKeyring,
+    external: &crate::credentialprovider_plugin::ExternalCredentialProviderKeyring,
     image: &str,
 ) -> Result<Vec<AuthConfig>> {
     let repo = parse_image_repo(image)?;
@@ -396,5 +398,6 @@ pub fn lookup_pull_credentials(
         None => Vec::new(),
     };
     out.extend(node.lookup(&repo));
+    out.extend(external.lookup(&repo).await);
     Ok(out)
 }

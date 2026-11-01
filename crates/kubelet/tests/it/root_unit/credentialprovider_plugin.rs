@@ -326,3 +326,350 @@ fn registration_checks_bin_dir_validation_and_binaries() {
         "{e}"
     );
 }
+
+// ---- plugin.go: provide / cache / exec / keyring -------------------------
+
+mod provide {
+    use super::*;
+    use rusternetes_kubelet::credentialprovider::AuthConfig;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// `fakeExecPlugin` / `countingFakeExecPlugin`.
+    struct Fake {
+        resp: Result<CredentialProviderResponse, String>,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for Fake {
+        async fn exec_plugin(&self, _image: &str) -> Result<CredentialProviderResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.resp.clone()
+        }
+    }
+
+    fn response(key: &str, dur: Option<i64>, pattern: &str) -> CredentialProviderResponse {
+        CredentialProviderResponse {
+            cache_key_type: key.into(),
+            cache_duration: dur,
+            auth: BTreeMap::from([(
+                pattern.to_string(),
+                ("user".to_string(), "password".to_string()),
+            )]),
+        }
+    }
+
+    fn cp(match_images: &[&str], default_dur: i64) -> CredentialProvider {
+        CredentialProvider {
+            name: "test-plugin".into(),
+            match_images: match_images.iter().map(|s| s.to_string()).collect(),
+            default_cache_duration: Some(default_dur),
+            api_version: "credentialprovider.kubelet.k8s.io/v1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn provider(
+        resp: Result<CredentialProviderResponse, String>,
+        match_images: &[&str],
+        default_dur: i64,
+    ) -> (PluginProvider, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let p = PluginProvider::with_plugin(
+            &cp(match_images, default_dur),
+            Box::new(Fake {
+                resp,
+                calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+        );
+        (p, calls)
+    }
+
+    const MIN: i64 = 60_000_000_000;
+
+    fn user() -> Vec<(String, AuthConfig)> {
+        vec![(
+            "*.registry.io".to_string(),
+            AuthConfig {
+                username: "user".into(),
+                password: "password".into(),
+                email: String::new(),
+            },
+        )]
+    }
+
+    #[tokio::test]
+    async fn cache_key_type_decides_the_cache_key() {
+        for (key_type, want) in [
+            ("Registry", "test.registry.io"),
+            ("Image", "test.registry.io/foo/bar"),
+            ("Global", "<global>"),
+        ] {
+            let (p, calls) = provider(
+                Ok(response(key_type, Some(MIN), "*.registry.io")),
+                &["*.registry.io"],
+                0,
+            );
+            assert_eq!(p.provide("test.registry.io/foo/bar").await.unwrap(), user());
+            assert_eq!(p.cache_keys(), vec![want.to_string()], "{key_type}");
+            // Second call is served from the cache.
+            assert_eq!(p.provide("test.registry.io/foo/bar").await.unwrap(), user());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn images_not_matching_are_skipped_without_exec() {
+        let (p, calls) = provider(
+            Ok(response("Global", Some(MIN), "x")),
+            &["*.registry.io"],
+            0,
+        );
+        assert!(p.provide("other.io/foo").await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_duration_response_is_not_cached() {
+        // Test_NoCacheResponse.
+        let (p, calls) = provider(
+            Ok(response("Global", Some(0), "*.registry.io")),
+            &["*.registry.io"],
+            MIN,
+        );
+        assert_eq!(p.provide("test.registry.io/foo/bar").await.unwrap(), user());
+        assert!(p.cache_keys().is_empty());
+        p.provide("test.registry.io/foo/bar").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unset_duration_uses_the_provider_default_and_zero_default_skips_caching() {
+        let (p, _) = provider(
+            Ok(response("Registry", None, "*.registry.io")),
+            &["*.registry.io"],
+            MIN,
+        );
+        p.provide("test.registry.io/x").await.unwrap();
+        assert_eq!(p.cache_keys(), vec!["test.registry.io".to_string()]);
+        let (p, _) = provider(
+            Ok(response("Registry", None, "*.registry.io")),
+            &["*.registry.io"],
+            0,
+        );
+        p.provide("test.registry.io/x").await.unwrap();
+        assert!(p.cache_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_cache_key_type_and_exec_errors() {
+        let (p, _) = provider(Ok(response("Bogus", Some(MIN), "x")), &["*.registry.io"], 0);
+        assert_eq!(
+            p.provide("test.registry.io/x").await.unwrap_err(),
+            "credential provider plugin did not return a valid cacheKeyType: Bogus"
+        );
+        let (p, _) = provider(Err("boom".into()), &["*.registry.io"], 0);
+        assert_eq!(
+            p.provide("test.registry.io/x").await.unwrap_err(),
+            "failed to get credential from external registry credential provider: boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_misses_and_purged() {
+        // Test_getCachedCredentials: expiry is "now after expiresAt"; the
+        // purge every 15 minutes drops expired entries.
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let base = Instant::now();
+        let o = offset.clone();
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> =
+            Arc::new(move || base + *o.lock().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let p = PluginProvider::with_plugin_and_clock(
+            &cp(&["*.registry.io"], MIN),
+            Box::new(Fake {
+                resp: Ok(response("Image", Some(MIN), "*.registry.io")),
+                calls: calls.clone(),
+                delay: Duration::ZERO,
+            }),
+            clock,
+        );
+        p.provide("a.registry.io/x").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        *offset.lock().unwrap() = Duration::from_secs(30);
+        p.provide("a.registry.io/x").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "not expired");
+        *offset.lock().unwrap() = Duration::from_secs(61);
+        p.provide("a.registry.io/x").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "expired entry is a miss");
+        // Another image's expired entry is deleted by the purge.
+        p.provide("b.registry.io/y").await.unwrap();
+        assert_eq!(p.cache_keys().len(), 2);
+        *offset.lock().unwrap() = Duration::from_secs(61 + 16 * 60);
+        p.provide("a.registry.io/x").await.unwrap();
+        assert_eq!(p.cache_keys(), vec!["a.registry.io/x".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_provides_share_one_exec() {
+        // TestSingleflightProvide.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let p = Arc::new(PluginProvider::with_plugin(
+            &cp(&["test.registry.io"], 0),
+            Box::new(Fake {
+                resp: Ok(response("Registry", None, "test.registry.io")),
+                calls: calls.clone(),
+                delay: Duration::from_millis(100),
+            }),
+        ));
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let p = p.clone();
+            tasks.push(tokio::spawn(
+                async move { p.provide("test.registry.io").await },
+            ));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keyring_collects_provider_credentials_and_hides_errors() {
+        let (ok, _) = provider(
+            Ok(response("Global", Some(MIN), "test.registry.io")),
+            &["test.registry.io"],
+            0,
+        );
+        let (bad, _) = provider(Err("boom".into()), &["test.registry.io"], 0);
+        let kr =
+            ExternalCredentialProviderKeyring::from_providers(vec![Arc::new(bad), Arc::new(ok)]);
+        let got = kr.lookup("test.registry.io/foo").await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].username, "user");
+        assert!(kr.lookup("other.io/foo").await.is_empty());
+    }
+
+    #[test]
+    fn registering_a_name_twice_fails() {
+        let (p, _) = provider(Ok(response("Global", None, "x")), &["x"], 0);
+        let p = Arc::new(p);
+        register_credential_provider_plugin("dup-test", p.clone()).unwrap();
+        let e = register_credential_provider_plugin("dup-test", p)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "Credential provider \"dup-test\" was registered twice");
+    }
+
+    // ---- execPlugin --------------------------------------------------
+
+    fn script(dir: &std::path::Path, name: &str, body: &str) {
+        let f = dir.join(name);
+        std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn exec(dir: &std::path::Path, api: &str) -> ExecPlugin {
+        ExecPlugin {
+            name: "plug".into(),
+            api_version: api.into(),
+            plugin_bin_dir: dir.into(),
+            args: vec![],
+            env_vars: vec![],
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    const V1: &str = "credentialprovider.kubelet.k8s.io/v1";
+
+    #[tokio::test]
+    async fn exec_sends_the_request_on_stdin_and_decodes_the_response() {
+        let d = tempfile::tempdir().unwrap();
+        // Echo the image from the request back as the auth key.
+        script(
+            d.path(),
+            "plug",
+            r#"in=$(cat)
+img=$(echo "$in" | sed -n 's/.*"image":"\([^"]*\)".*/\1/p')
+case "$in" in *'"kind":"CredentialProviderRequest"'*'"apiVersion":"credentialprovider.kubelet.k8s.io/v1"'*|*'"apiVersion":"credentialprovider.kubelet.k8s.io/v1"'*'"kind":"CredentialProviderRequest"'*) ;; *) echo bad request >&2; exit 3;; esac
+echo "{\"kind\":\"CredentialProviderResponse\",\"apiVersion\":\"credentialprovider.kubelet.k8s.io/v1\",\"cacheKeyType\":\"Registry\",\"cacheDuration\":\"1h\",\"auth\":{\"$img\":{\"username\":\"u\",\"password\":\"$FOO\"}}}""#,
+        );
+        let mut e = exec(d.path(), V1);
+        e.env_vars = vec![ExecEnvVar {
+            name: "FOO".into(),
+            value: "bar".into(),
+        }];
+        let r = e.exec_plugin("reg.io/a").await.unwrap();
+        assert_eq!(r.cache_key_type, "Registry");
+        assert_eq!(r.cache_duration, Some(3_600_000_000_000));
+        assert_eq!(r.auth["reg.io/a"], ("u".to_string(), "bar".to_string()));
+    }
+
+    #[tokio::test]
+    async fn exec_configured_env_overrides_the_inherited_one() {
+        let d = tempfile::tempdir().unwrap();
+        script(
+            d.path(),
+            "plug",
+            r#"echo "{\"kind\":\"CredentialProviderResponse\",\"apiVersion\":\"credentialprovider.kubelet.k8s.io/v1\",\"cacheKeyType\":\"Global\",\"auth\":{\"x\":{\"username\":\"u\",\"password\":\"$PATH\"}}}""#,
+        );
+        let mut e = exec(d.path(), V1);
+        e.env_vars = vec![ExecEnvVar {
+            name: "PATH".into(),
+            value: "/usr/bin:/bin".into(),
+        }];
+        let r = e.exec_plugin("x").await.unwrap();
+        assert_eq!(r.auth["x"].1, "/usr/bin:/bin");
+    }
+
+    #[tokio::test]
+    async fn exec_error_cases_match_upstream_messages() {
+        let d = tempfile::tempdir().unwrap();
+        script(d.path(), "plug", "echo oops >&2; exit 2");
+        let err = exec(d.path(), V1).exec_plugin("img").await.unwrap_err();
+        assert_eq!(
+            err,
+            "error execing credential provider plugin plug for image img: exit status 2: oops\n"
+        );
+
+        script(
+            d.path(),
+            "plug",
+            r#"echo '{"kind":"CredentialProviderResponse","apiVersion":"credentialprovider.kubelet.k8s.io/v1beta1","cacheKeyType":"Global"}'"#,
+        );
+        let err = exec(d.path(), V1).exec_plugin("img").await.unwrap_err();
+        assert_eq!(err, "apiVersion from credential plugin response did not match expected apiVersion:credentialprovider.kubelet.k8s.io/v1, actual apiVersion:credentialprovider.kubelet.k8s.io/v1beta1");
+
+        script(
+            d.path(),
+            "plug",
+            r#"echo '{"kind":"WrongKind","apiVersion":"credentialprovider.kubelet.k8s.io/v1"}'"#,
+        );
+        let err = exec(d.path(), V1).exec_plugin("img").await.unwrap_err();
+        assert_eq!(
+            err,
+            "error decoding credential provider plugin response from stdout"
+        );
+
+        script(d.path(), "plug", "echo not json");
+        let err = exec(d.path(), V1).exec_plugin("img").await.unwrap_err();
+        assert!(err.starts_with("error reading GVK from response"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn exec_times_out() {
+        let d = tempfile::tempdir().unwrap();
+        script(d.path(), "plug", "sleep 30");
+        let mut e = exec(d.path(), V1);
+        e.timeout = Duration::from_millis(200);
+        let err = e.exec_plugin("img").await.unwrap_err();
+        assert!(err.contains("context deadline exceeded"), "{err}");
+    }
+}
