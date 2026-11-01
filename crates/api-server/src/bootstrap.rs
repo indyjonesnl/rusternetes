@@ -649,17 +649,46 @@ impl AdvertiseAddress {
     }
 }
 
-/// `Config.ExternalAddress` as `Complete` derives it (`server/config.go:706-721`)
-/// when `--external-hostname` is unset: the public (advertise) address joined
-/// with the secure serving port, `net.JoinHostPort` style (IPv6 bracketed).
-pub fn external_address(advertise: AdvertiseAddress, bind_address: &str) -> Result<String> {
-    let ip = advertise.resolve()?;
+/// `Config.ExternalAddress` as `Complete` derives it (`server/config.go:706-721`):
+/// `--external-hostname` when set, else the public (advertise) address; the
+/// secure serving port is appended when the value carries none
+/// (`net.SplitHostPort` fails -> `net.JoinHostPort`, IPv6 bracketed).
+pub fn external_address(
+    external_hostname: Option<&str>,
+    advertise: AdvertiseAddress,
+    bind_address: &str,
+) -> Result<String> {
     let port = bind_address
         .rsplit(':')
         .next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
-    Ok(std::net::SocketAddr::new(ip, port).to_string())
+    let host = match external_hostname.filter(|h| !h.is_empty()) {
+        Some(h) => h.to_string(),
+        None => advertise.resolve()?.to_string(),
+    };
+    if split_host_port(&host) {
+        return Ok(host);
+    }
+    // JoinHostPort brackets a host that contains a colon.
+    Ok(if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
+}
+
+/// Whether `net.SplitHostPort` accepts `s`: `host:port` or `[host]:port`.
+fn split_host_port(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix('[') {
+        return rest
+            .split_once("]:")
+            .is_some_and(|(h, p)| !h.contains(['[', ']']) && !p.contains([':', '[', ']']));
+    }
+    match s.split_once(':') {
+        Some((h, p)) => !h.contains(['[', ']']) && !p.contains([':', '[', ']']),
+        None => false,
+    }
 }
 
 /// The single canonical `EndpointSubset` the `kubernetes` Endpoints must hold:

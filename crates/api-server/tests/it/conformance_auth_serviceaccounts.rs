@@ -1617,3 +1617,56 @@ async fn oidc_discovery_reflects_configured_issuer_jwks_uri_and_keys_3684() {
     assert_eq!(keys[0]["use"], "sig");
     assert!(keys[0]["kid"].as_str().is_some_and(|k| !k.is_empty()));
 }
+
+/// `NewOpenIDMetadataProvider` (pkg/serviceaccount/openidmetadata.go:113-179)
+/// refusing the configuration means the endpoints are not installed
+/// (pkg/controlplane/apiserver/server.go:104-125): both answer 404. A valid
+/// issuer without `--service-account-jwks-uri` advertises the external address.
+#[tokio::test]
+async fn oidc_discovery_endpoints_are_absent_when_the_provider_is_refused_3725() {
+    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    let fixtures = format!("{}/../common/tests/fixtures/sa", env!("CARGO_MANIFEST_DIR"));
+    let manager = |issuer: &str| {
+        TokenManager::new(b"oidc-secret")
+            .with_service_account_options(&ServiceAccountOptions {
+                key_files: vec![format!("{fixtures}/rsa.pub")],
+                signing_key_file: Some(format!("{fixtures}/rsa-pkcs1.key")),
+                issuers: vec![issuer.to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+    };
+
+    // An http issuer is refused.
+    let state = TestApiServer::builder()
+        .token_manager(manager("http://issuer.example.com").with_external_address("10.0.0.1:6443"))
+        .build();
+    for path in ["/.well-known/openid-configuration", "/openid/v1/jwks"] {
+        let (status, _) = get_json(state.clone(), path).await;
+        assert_eq!(status, 404, "{path}");
+    }
+
+    // A valid issuer but no external address and no jwks uri is refused too.
+    let state = TestApiServer::builder()
+        .token_manager(manager("https://issuer.example.com"))
+        .build();
+    for path in ["/.well-known/openid-configuration", "/openid/v1/jwks"] {
+        let (status, _) = get_json(state.clone(), path).await;
+        assert_eq!(status, 404, "{path}");
+    }
+
+    // With an external address the default jwks_uri is built from it.
+    let state = TestApiServer::builder()
+        .token_manager(
+            manager("https://issuer.example.com").with_external_address("api.example.com:6443"),
+        )
+        .build();
+    let (status, cfg) = get_json(state.clone(), "/.well-known/openid-configuration").await;
+    assert_eq!(status, 200, "{cfg}");
+    assert_eq!(
+        cfg["jwks_uri"],
+        "https://api.example.com:6443/openid/v1/jwks"
+    );
+    let (status, _) = get_json(state, "/openid/v1/jwks").await;
+    assert_eq!(status, 200);
+}

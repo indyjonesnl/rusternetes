@@ -1267,14 +1267,29 @@ mod advertise_address_tests {
     fn external_address_joins_the_advertise_address_and_port() {
         let a = AdvertiseAddress::new(Some(ip("10.2.3.4")), "0.0.0.0:7443");
         assert_eq!(
-            external_address(a, "0.0.0.0:7443").unwrap(),
+            external_address(None, a, "0.0.0.0:7443").unwrap(),
             "10.2.3.4:7443"
         );
         let a = AdvertiseAddress::new(None, "[2001:db8::9]:6443");
         assert_eq!(
-            external_address(a, "[2001:db8::9]:6443").unwrap(),
+            external_address(None, a, "[2001:db8::9]:6443").unwrap(),
             "[2001:db8::9]:6443"
         );
+    }
+
+    /// `--external-hostname` wins over the advertise address; the secure port is
+    /// appended only when the value has none (config.go:706-721).
+    #[test]
+    fn external_hostname_overrides_and_gets_the_port() {
+        let a = AdvertiseAddress::new(Some(ip("10.2.3.4")), "0.0.0.0:7443");
+        let ext = |h| external_address(h, a, "0.0.0.0:7443").unwrap();
+        assert_eq!(ext(Some("api.example.com")), "api.example.com:7443");
+        assert_eq!(ext(Some("api.example.com:443")), "api.example.com:443");
+        assert_eq!(ext(Some("[2001:db8::1]:443")), "[2001:db8::1]:443");
+        assert_eq!(ext(Some("2001:db8::1")), "[2001:db8::1]:7443");
+        // Empty is unset.
+        assert_eq!(ext(Some("")), "10.2.3.4:7443");
+        assert_eq!(ext(None), "10.2.3.4:7443");
     }
 
     /// `endpointSliceFromEndpoints`: IPv6 address -> IPv6 slice; a transition
