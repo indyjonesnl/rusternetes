@@ -237,6 +237,40 @@ struct Args {
     #[arg(long, default_value_t = false)]
     audit_log_compress: bool,
 
+    /// `--audit-log-mode` (AuditBatchOptions.AddFlags, options/audit.go:357):
+    /// batch, blocking or blocking-strict.
+    #[arg(long, default_value = "blocking")]
+    audit_log_mode: String,
+
+    /// `--audit-log-batch-buffer-size` (options/audit.go:362).
+    #[arg(long, default_value_t = 10000, allow_negative_numbers = true)]
+    audit_log_batch_buffer_size: i64,
+
+    /// `--audit-log-batch-max-size` (options/audit.go:365); the log default
+    /// is 1 (`defaultLogBatchConfig`).
+    #[arg(long, default_value_t = 1, allow_negative_numbers = true)]
+    audit_log_batch_max_size: i64,
+
+    /// `--audit-log-batch-max-wait` (options/audit.go:367).
+    #[arg(
+        long,
+        default_value = "0s",
+        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+    )]
+    audit_log_batch_max_wait: std::time::Duration,
+
+    /// `--audit-log-batch-throttle-enable` (options/audit.go:370).
+    #[arg(long, default_value_t = false, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    audit_log_batch_throttle_enable: bool,
+
+    /// `--audit-log-batch-throttle-qps` (options/audit.go:372).
+    #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+    audit_log_batch_throttle_qps: f32,
+
+    /// `--audit-log-batch-throttle-burst` (options/audit.go:375).
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    audit_log_batch_throttle_burst: i64,
+
     /// `--audit-log-truncate-enabled` (AuditTruncateOptions.AddFlags,
     /// options/audit.go:415).
     #[arg(long, default_value_t = false, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
@@ -347,6 +381,27 @@ fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::
     }
 }
 
+/// The `AuditBatchOptions` the `--audit-log-mode`/`--audit-log-batch-*` flags
+/// describe.
+fn audit_log_batch_options(args: &Args) -> rusternetes_api_server::audit_webhook::BatchOptions {
+    use rusternetes_api_server::audit_webhook::{BatchConfig, BatchOptions};
+    let pos = |v: i64| v.max(0) as usize;
+    BatchOptions {
+        mode: args.audit_log_mode.clone(),
+        batch_config: BatchConfig {
+            buffer_size: pos(args.audit_log_batch_buffer_size),
+            max_batch_size: pos(args.audit_log_batch_max_size),
+            max_batch_wait: args.audit_log_batch_max_wait,
+            throttle_enable: args.audit_log_batch_throttle_enable,
+            throttle_qps: args.audit_log_batch_throttle_qps,
+            throttle_burst: pos(args.audit_log_batch_throttle_burst),
+            // `defaultLogBatchConfig`: asynchronous log threads only add lock
+            // contention; there is no flag for it.
+            async_delegate: false,
+        },
+    }
+}
+
 /// The `AuditTruncateOptions` the `--audit-log-truncate-*` flags describe.
 fn audit_log_truncate_options(
     args: &Args,
@@ -401,6 +456,9 @@ async fn install_audit_from_flags(
     // `AuditLogOptions.Validate` only checks when the backend is enabled
     // (`enabled()` is Path != "").
     let rotation = if args.audit_log_path.is_some() {
+        audit_log_batch_options(args)
+            .validate("log")
+            .map_err(|e| anyhow::anyhow!("invalid audit log flags: {e}"))?;
         audit_log_truncate_options(args)
             .validate("log")
             .map_err(|e| anyhow::anyhow!("invalid audit log flags: {e}"))?;
@@ -429,6 +487,7 @@ async fn install_audit_from_flags(
     let policy = audit::Policy::from_yaml(&yaml)
         .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
     let mut sinks: Vec<std::sync::Arc<dyn rusternetes_common::audit::AuditBackend>> = Vec::new();
+    let mut buffered = Vec::new();
     if let Some(log_path) = &args.audit_log_path {
         let log: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
             std::sync::Arc::new(audit::StdoutAuditBackend)
@@ -439,10 +498,13 @@ async fn install_audit_from_flags(
                     .with_context(|| format!("opening --audit-log-path {log_path}"))?,
             )
         };
-        // `AuditLogOptions.newBackend`: truncate wraps the log backend.
+        // `AuditLogOptions.newBackend`: log, then the batch wrap, then truncate.
+        let (log, b) = audit_log_batch_options(args).wrap_backend(std::sync::Arc::new(
+            rusternetes_api_server::audit_webhook::LogDelegate(log),
+        ));
+        buffered.extend(b);
         sinks.push(audit_log_truncate_options(args).wrap_backend(log));
     }
-    let mut buffered = Vec::new();
     if webhook.enabled() {
         let (backend, b) = webhook.new_backend()?;
         sinks.push(backend);
