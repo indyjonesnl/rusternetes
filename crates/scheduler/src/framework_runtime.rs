@@ -18,7 +18,8 @@
 //! the pipeline consults to decide which stages run for a profile.
 
 use crate::fwk::{
-    CycleState, FilterPlugin, Handle, NodeInfo, PreFilterPlugin, PreFilterResult, Status,
+    CycleState, FilterPlugin, Handle, NodeInfo, PodSignature, PreFilterPlugin, PreFilterResult,
+    SignPlugin, Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -507,6 +508,11 @@ pub struct Framework {
     /// `f.preFilterPlugins` (framework.go:66): the PreFilter plugin objects,
     /// in execution order; the rest still run inline (#3455).
     pre_filter_plugin_objects: PreFilterPluginObjects,
+    /// `f.batchablePlugins` (framework.go:75): the signers of the
+    /// PreFilter/Filter/PreScore/Score plugins, once per plugin name.
+    batchable_plugins: SignPluginObjects,
+    /// `f.enableSignatures` (framework.go:104).
+    enable_signatures: bool,
     pub profile_name: String,
     /// `f.percentageOfNodesToScore` (framework.go:354); set even when the
     /// profile has no plugins.
@@ -532,6 +538,18 @@ impl std::fmt::Debug for FilterPluginObjects {
     }
 }
 
+/// The sign plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct SignPluginObjects(Vec<Arc<dyn SignPlugin>>);
+
+impl std::fmt::Debug for SignPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
 /// The PreFilter plugin objects of a [`Framework`].
 #[derive(Clone, Default)]
 pub struct PreFilterPluginObjects(Vec<Arc<dyn PreFilterPlugin>>);
@@ -545,6 +563,77 @@ impl std::fmt::Debug for PreFilterPluginObjects {
 }
 
 impl Framework {
+    /// `computeBatchablePlugins` (framework.go:757-803): signatures are only
+    /// enabled when every PreFilter, Filter, PreScore and Score plugin can
+    /// sign. (Rusternetes has no extenders to disable them.)
+    fn compute_batchable_plugins(&mut self) {
+        self.enable_signatures = true;
+        self.batchable_plugins = SignPluginObjects::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for ep in [
+            ExtensionPoint::PreFilter,
+            ExtensionPoint::Filter,
+            ExtensionPoint::PreScore,
+            ExtensionPoint::Score,
+        ] {
+            for name in self.plugins_at(ep).to_vec() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                match crate::in_tree::new_sign_plugin(&name) {
+                    Some(pl) => self.batchable_plugins.0.push(pl),
+                    None => self.enable_signatures = false,
+                }
+            }
+        }
+    }
+
+    /// Whether [`Framework::sign_pod`] can produce signatures for this profile.
+    pub fn signatures_enabled(&self) -> bool {
+        self.enable_signatures
+    }
+
+    /// `SignPod` (framework.go:805-854): a signature for the pod. Any two
+    /// pods with the same signature get the same feasibility and scoring for
+    /// the same set of nodes in the same state. `None` when a plugin cannot
+    /// sign the pod (or signatures are disabled), which turns off the
+    /// optimizations for this pod.
+    pub fn sign_pod(&self, pod: &Pod) -> Option<PodSignature> {
+        if !self.enable_signatures {
+            return None;
+        }
+        let mut sig: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
+        sig.insert(
+            crate::signers::SCHEDULER_NAME_SIGNER_NAME.to_string(),
+            serde_json::json!(pod
+                .spec
+                .as_ref()
+                .and_then(|s| s.scheduler_name.as_deref())
+                .unwrap_or("")),
+        );
+        for plugin in &self.batchable_plugins.0 {
+            let (fragments, status) = plugin.sign_pod(pod);
+            if !status.is_success() {
+                if status.code() == crate::fwk::Code::Error {
+                    tracing::error!(
+                        plugin = plugin.name(),
+                        "SignPod failed for plugin: {}",
+                        status.message()
+                    );
+                }
+                tracing::trace!(
+                    plugin = plugin.name(),
+                    "SignPod can't sign pod due to plugin"
+                );
+                return None;
+            }
+            for f in fragments {
+                sig.insert(f.key, f.value);
+            }
+        }
+        serde_json::to_vec(&sig).ok()
+    }
+
     /// `RunPreFilterPlugins` (framework.go:862-923) over the PreFilter plugin
     /// objects. Returns the merged [`PreFilterResult`] (`None` is all nodes),
     /// the status, and the names of the plugins that restricted the nodes
@@ -912,6 +1001,7 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
             })
             .collect(),
     );
+    f.compute_batchable_plugins();
     Ok(f)
 }
 
