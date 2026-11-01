@@ -1464,12 +1464,23 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return Err(rusternetes_common::Error::Internal(status.message()));
         }
 
-        // Bind (schedule_one.go:332)
-        if let Err(e) = self.bind_pod_to_node(pod.clone(), node_name).await {
+        // `bind` (schedule_one.go:978-990): `RunBindPlugins`, then
+        // `finishBinding`. Anything but Success is a binding failure
+        // (:332 `!status.IsSuccess()`), a Skip from every plugin included.
+        let status = fw
+            .run_bind_plugins(&cycle_state, &pod, node_name, &handle)
+            .await;
+        if !status.is_success() {
             fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
                 .await;
-            return Err(e);
+            let msg = if status.is_skip() {
+                "no Bind plugin bound the pod".to_string()
+            } else {
+                status.message()
+            };
+            return Err(rusternetes_common::Error::Internal(msg));
         }
+        self.finish_binding(&pod, node_name).await;
         Ok(())
     }
 
@@ -1809,98 +1820,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .map(|n| (n, cycle_state))
     }
 
-    async fn bind_pod_to_node(
-        &self,
-        mut pod: Pod,
-        node_name: &str,
-    ) -> rusternetes_common::Result<()> {
-        // K8s scheduler validates node_name is non-empty before binding.
-        // An empty node_name means select_node returned a node with no name,
-        // which should never happen but would leave the pod stuck Pending.
-        if node_name.is_empty() {
-            return Err(rusternetes_common::Error::Internal(
-                "cannot bind pod to empty node name".to_string(),
-            ));
-        }
+    async fn bind_pod_to_node(&self, pod: Pod, node_name: &str) -> rusternetes_common::Result<()> {
+        let bound_pod = bind_pod(&self.data, pod, node_name).await?;
+        self.finish_binding(&bound_pod, node_name).await;
+        Ok(())
+    }
 
-        debug!(
-            "Binding pod {}/{} to node {}",
-            pod.metadata
-                .namespace
-                .as_ref()
-                .unwrap_or(&"default".to_string()),
-            pod.metadata.name,
-            node_name
-        );
-
-        // Update pod spec with node name
-        if let Some(ref mut spec) = pod.spec {
-            spec.node_name = Some(node_name.to_string());
-        }
-
-        // Update pod status with PodScheduled condition
-        let scheduled_condition = rusternetes_common::resources::PodCondition {
-            condition_type: "PodScheduled".to_string(),
-            status: "True".to_string(),
-            last_probe_time: None,
-            last_transition_time: Some(chrono::Utc::now()),
-            reason: Some("Scheduled".to_string()),
-            message: Some(format!("Successfully assigned to {}", node_name)),
-            observed_generation: None,
-        };
-
-        if let Some(ref mut status) = pod.status {
-            status.phase = Some(Phase::Pending);
-            status.message = Some("Pod scheduled".to_string());
-            // Add or update PodScheduled condition
-            let conditions = status.conditions.get_or_insert_with(Vec::new);
-            if let Some(existing) = conditions
-                .iter_mut()
-                .find(|c| c.condition_type == "PodScheduled")
-            {
-                *existing = scheduled_condition;
-            } else {
-                conditions.push(scheduled_condition);
-            }
-        } else {
-            pod.status = Some(rusternetes_common::resources::PodStatus {
-                phase: Some(Phase::Pending),
-                message: Some("Pod scheduled".to_string()),
-                reason: None,
-                host_ip: None,
-                pod_ip: None,
-                conditions: Some(vec![scheduled_condition]),
-                container_statuses: None,
-                init_container_statuses: None,
-                ephemeral_container_statuses: None,
-                resize: None,
-                resource_claim_statuses: None,
-                observed_generation: None,
-                host_i_ps: None,
-                pod_i_ps: None,
-                nominated_node_name: None,
-                qos_class: None,
-                start_time: None,
-                ..Default::default()
-            });
-        }
-
-        // Bind: storage mode writes the fully-mutated pod (spec.nodeName +
-        // PodScheduled condition) in one update with a re-GET-on-conflict retry;
-        // API mode POSTs the binding subresource (the only way to set the
-        // immutable spec.nodeName) and PUTs the PodScheduled condition via the
-        // status subresource. See `DataPlane::bind`.
-        let ns = pod
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        match self.data.bind(&ns, &pod, node_name).await {
-            Ok(()) => info!("Successfully bound pod to node {}", node_name),
-            Err(e) => return Err(e),
-        }
-        let bound_pod = pod;
-
+    /// `finishBinding` (schedule_one.go:1005-1017): the Scheduled event after
+    /// a successful bind.
+    async fn finish_binding(&self, bound_pod: &Pod, node_name: &str) {
         // Emit the Scheduled event once on successful bind via the unified
         // recorder, regardless of which attempt succeeded — upstream's
         // default-scheduler always records `recorder.Eventf(pod, Normal,
@@ -1912,9 +1840,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             "Successfully assigned {}/{} to {}",
             ns, bound_pod.metadata.name, node_name
         );
-        self.emit_pod_event(&bound_pod, EventType::Normal, "Scheduled", &message)
+        self.emit_pod_event(bound_pod, EventType::Normal, "Scheduled", &message)
             .await;
-        Ok(())
     }
 
     /// Try to preempt lower-priority pods to make room for a high-priority pod
@@ -2535,6 +2462,102 @@ fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
     }
 }
 
+/// The binding itself (`DefaultBinder.Bind`, defaultbinder/default_binder.go):
+/// set `spec.nodeName` and the PodScheduled condition through the data
+/// plane. Returns the bound pod.
+pub(crate) async fn bind_pod<S: Storage + Send + Sync + 'static>(
+    data: &DataPlane<S>,
+    mut pod: Pod,
+    node_name: &str,
+) -> rusternetes_common::Result<Pod> {
+    // K8s scheduler validates node_name is non-empty before binding.
+    // An empty node_name means select_node returned a node with no name,
+    // which should never happen but would leave the pod stuck Pending.
+    if node_name.is_empty() {
+        return Err(rusternetes_common::Error::Internal(
+            "cannot bind pod to empty node name".to_string(),
+        ));
+    }
+
+    debug!(
+        "Binding pod {}/{} to node {}",
+        pod.metadata
+            .namespace
+            .as_ref()
+            .unwrap_or(&"default".to_string()),
+        pod.metadata.name,
+        node_name
+    );
+
+    // Update pod spec with node name
+    if let Some(ref mut spec) = pod.spec {
+        spec.node_name = Some(node_name.to_string());
+    }
+
+    // Update pod status with PodScheduled condition
+    let scheduled_condition = rusternetes_common::resources::PodCondition {
+        condition_type: "PodScheduled".to_string(),
+        status: "True".to_string(),
+        last_probe_time: None,
+        last_transition_time: Some(chrono::Utc::now()),
+        reason: Some("Scheduled".to_string()),
+        message: Some(format!("Successfully assigned to {}", node_name)),
+        observed_generation: None,
+    };
+
+    if let Some(ref mut status) = pod.status {
+        status.phase = Some(Phase::Pending);
+        status.message = Some("Pod scheduled".to_string());
+        // Add or update PodScheduled condition
+        let conditions = status.conditions.get_or_insert_with(Vec::new);
+        if let Some(existing) = conditions
+            .iter_mut()
+            .find(|c| c.condition_type == "PodScheduled")
+        {
+            *existing = scheduled_condition;
+        } else {
+            conditions.push(scheduled_condition);
+        }
+    } else {
+        pod.status = Some(rusternetes_common::resources::PodStatus {
+            phase: Some(Phase::Pending),
+            message: Some("Pod scheduled".to_string()),
+            reason: None,
+            host_ip: None,
+            pod_ip: None,
+            conditions: Some(vec![scheduled_condition]),
+            container_statuses: None,
+            init_container_statuses: None,
+            ephemeral_container_statuses: None,
+            resize: None,
+            resource_claim_statuses: None,
+            observed_generation: None,
+            host_i_ps: None,
+            pod_i_ps: None,
+            nominated_node_name: None,
+            qos_class: None,
+            start_time: None,
+            ..Default::default()
+        });
+    }
+
+    // Bind: storage mode writes the fully-mutated pod (spec.nodeName +
+    // PodScheduled condition) in one update with a re-GET-on-conflict retry;
+    // API mode POSTs the binding subresource (the only way to set the
+    // immutable spec.nodeName) and PUTs the PodScheduled condition via the
+    // status subresource. See `DataPlane::bind`.
+    let ns = pod
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    match data.bind(&ns, &pod, node_name).await {
+        Ok(()) => info!("Successfully bound pod to node {}", node_name),
+        Err(e) => return Err(e),
+    }
+    Ok(pod)
+}
+
 /// The scheduler's [`crate::fwk::Handle`]: the data plane's listers, and the
 /// binder whose assume caches the volume listers feed.
 struct CycleHandle<'a, S: Storage + Send + Sync + 'static> {
@@ -2563,6 +2586,13 @@ impl<S: Storage + Send + Sync + 'static> CycleHandle<'_, S> {
 
 #[async_trait::async_trait]
 impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, S> {
+    async fn bind_pod(&self, pod: &Pod, node_name: &str) -> Result<(), String> {
+        bind_pod(self.data, pod.clone(), node_name)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
     async fn node_volume_limits_snapshot(
         &self,
     ) -> Result<crate::node_volume_limits::NodeVolumeLimitsSnapshot, String> {

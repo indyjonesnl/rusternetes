@@ -18,9 +18,9 @@
 //! the pipeline consults to decide which stages run for a profile.
 
 use crate::fwk::{
-    CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature, PreBindPlugin,
-    PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin, SignPlugin,
-    Status,
+    BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature,
+    PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin,
+    SignPlugin, Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -532,6 +532,9 @@ pub struct Framework {
     /// Reserve and PreBind plugin objects, in execution order.
     reserve_plugin_objects: ReservePluginObjects,
     pre_bind_plugin_objects: PreBindPluginObjects,
+    /// `f.bindPlugins` (framework.go:72): the Bind plugin objects, in
+    /// execution order.
+    bind_plugin_objects: BindPluginObjects,
     /// `f.batchablePlugins` (framework.go:75): the signers of the
     /// PreFilter/Filter/PreScore/Score plugins, once per plugin name.
     batchable_plugins: SignPluginObjects,
@@ -550,6 +553,18 @@ pub struct Framework {
     /// (`shouldHaveEnqueueExtensions`, framework.go:663-671), in
     /// `fillEnqueueExtensions` order.
     enqueue_extensions: Vec<String>,
+}
+
+/// The Bind plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct BindPluginObjects(Vec<Arc<dyn BindPlugin>>);
+
+impl std::fmt::Debug for BindPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
 }
 
 /// The Filter plugin objects of a [`Framework`].
@@ -780,6 +795,48 @@ impl Framework {
             ));
         }
         Status::success()
+    }
+
+    /// This framework with `plugins` as its Bind plugin objects, for
+    /// embedders and tests that bring their own binder (upstream registers
+    /// them through the out-of-tree registry).
+    pub fn with_bind_plugins(mut self, plugins: Vec<Arc<dyn BindPlugin>>) -> Self {
+        self.bind_plugin_objects = BindPluginObjects(plugins);
+        self
+    }
+
+    /// `RunBindPlugins` (framework.go:1514-1550): the Bind plugins run in
+    /// order; a Skip moves on to the next one, a rejection is returned with
+    /// the plugin set, any other failure is wrapped as
+    /// `running Bind plugin "<name>": <err>`, and the first Success wins. No
+    /// plugin, or all of them skipping, is a Skip.
+    pub async fn run_bind_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        let mut status = Status::new(Code::Skip, Vec::new());
+        for pl in &self.bind_plugin_objects.0 {
+            status = pl.bind(state, pod, node_name, handle).await;
+            if status.is_skip() {
+                continue;
+            }
+            if status.is_success() {
+                return status;
+            }
+            if status.is_rejected() {
+                status.set_plugin(pl.name());
+                return status;
+            }
+            return Status::from_error(format!(
+                "running Bind plugin {:?}: {}",
+                pl.name(),
+                status.as_error().unwrap_or_default()
+            ));
+        }
+        status
     }
 
     /// `RunScorePlugins` (framework.go:1273-1382) over the Score plugin
@@ -1349,6 +1406,12 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
         f.plugins_at(ExtensionPoint::PreBind)
             .iter()
             .filter_map(|name| crate::in_tree::new_pre_bind_plugin(name))
+            .collect(),
+    );
+    f.bind_plugin_objects = BindPluginObjects(
+        f.plugins_at(ExtensionPoint::Bind)
+            .iter()
+            .filter_map(|name| crate::in_tree::new_bind_plugin(name))
             .collect(),
     );
     f.compute_batchable_plugins();

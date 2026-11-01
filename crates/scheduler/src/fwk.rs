@@ -424,6 +424,11 @@ pub trait Handle: Send + Sync {
     async fn resource_slices(&self) -> Result<Vec<ResourceSlice>, String> {
         Err("no cluster access".to_string())
     }
+
+    /// `ClientSet().CoreV1().Pods(ns).Bind(binding)` (DefaultBinder.Bind).
+    async fn bind_pod(&self, _pod: &Pod, _node_name: &str) -> Result<(), String> {
+        Err("no cluster access".to_string())
+    }
 }
 
 /// A [`Handle`] with no cluster access, for plugins that need none.
@@ -516,6 +521,20 @@ pub trait PreBindPlugin: Plugin {
     fn pre_bind_pre_flight(&self, state: &CycleState, pod: &Pod, node_name: &str) -> Status;
 
     async fn pre_bind(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status;
+}
+
+/// `fwk.BindPlugin`: binds the pod to the chosen node.
+#[async_trait]
+pub trait BindPlugin: Plugin {
+    /// `Bind`: `Skip` when the plugin does not handle the pod (the next Bind
+    /// plugin runs), `Success` once bound, anything else is a failure.
+    async fn bind(
         &self,
         state: &CycleState,
         pod: &Pod,

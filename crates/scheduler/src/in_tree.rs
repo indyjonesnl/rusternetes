@@ -5,7 +5,7 @@
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
-    Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreBindPlugin,
+    BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreBindPlugin,
     PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin, SignFragment,
     SignPlugin, Status,
 };
@@ -147,6 +147,41 @@ pub fn new_pre_bind_plugin(name: &str) -> Option<Arc<dyn PreBindPlugin>> {
     match name {
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         _ => None,
+    }
+}
+
+/// The factory for an in-tree Bind plugin by name.
+pub fn new_bind_plugin(name: &str) -> Option<Arc<dyn BindPlugin>> {
+    match name {
+        names::DEFAULT_BINDER => Some(Arc::new(DefaultBinder)),
+        _ => None,
+    }
+}
+
+/// `defaultbinder.DefaultBinder`
+/// (`plugins/defaultbinder/default_binder.go`): binds the pod through the
+/// API (here the data plane) with a Binding to the node.
+pub struct DefaultBinder;
+
+impl Plugin for DefaultBinder {
+    fn name(&self) -> &'static str {
+        names::DEFAULT_BINDER
+    }
+}
+
+#[async_trait]
+impl BindPlugin for DefaultBinder {
+    async fn bind(
+        &self,
+        _state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        match handle.bind_pod(pod, node_name).await {
+            Ok(()) => Status::success(),
+            Err(e) => Status::from_error(e),
+        }
     }
 }
 
