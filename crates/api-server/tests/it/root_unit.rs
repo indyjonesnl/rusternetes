@@ -7,6 +7,7 @@ mod apiserver_identity;
 mod apiserver_request_metrics;
 mod apiservice_registration;
 mod audit;
+mod audit_truncate;
 mod audit_webhook;
 mod authorization_config;
 mod authorization_config_metrics;

@@ -12,8 +12,7 @@
 //!   `Validate`/`wrapBackend`, `defaultWebhookBatchConfig`, `ignoreErrorsBackend`)
 //!   and `pkg/audit/union.go` (`Union`).
 //!
-//! Not ported (tracked on #2605): the truncate backend
-//! (`--audit-webhook-truncate-*`), dynamic backends (`AuditSink`, removed
+//! Not ported (tracked on #2605): dynamic backends (`AuditSink`, removed
 //! upstream in 1.19), the egress selector dial, tracing spans, and the
 //! `apiserver_audit_error_total` metric `HandlePluginError` bumps.
 
@@ -176,7 +175,7 @@ pub trait BatchBackend: Send + Sync {
 
 /// `audit.HandlePluginError` (pkg/audit/metrics.go): log the failure and the
 /// events it cost.
-fn handle_plugin_error(plugin: &str, err: &str, count: usize) {
+pub(crate) fn handle_plugin_error(plugin: &str, err: &str, count: usize) {
     error!("Error in audit plugin '{plugin}' affecting {count} audit events: {err}");
 }
 
@@ -588,6 +587,8 @@ pub struct WebhookOptions {
     pub initial_backoff: Duration,
     pub group_version: String,
     pub batch: BatchOptions,
+    /// `AuditWebhookOptions.TruncateOptions`.
+    pub truncate: crate::audit_truncate::TruncateOptions,
 }
 
 impl WebhookOptions {
@@ -596,14 +597,16 @@ impl WebhookOptions {
         self.config_file.as_deref().is_some_and(|f| !f.is_empty())
     }
 
-    /// `AuditWebhookOptions.Validate` (options/audit.go:551-568); the
-    /// truncate options are not ported.
+    /// `AuditWebhookOptions.Validate` (options/audit.go:551-568).
     pub fn validate(&self) -> Vec<String> {
         if !self.enabled() {
             return Vec::new();
         }
         let mut errs = Vec::new();
         if let Err(e) = self.batch.validate(WEBHOOK_PLUGIN_NAME) {
+            errs.push(e);
+        }
+        if let Err(e) = self.truncate.validate(WEBHOOK_PLUGIN_NAME) {
             errs.push(e);
         }
         // `validateGroupVersionString` (options/audit.go:226-240).
@@ -615,7 +618,8 @@ impl WebhookOptions {
         errs
     }
 
-    /// `newUntruncatedBackend` (options/audit.go:576-584).
+    /// `newUntruncatedBackend` (options/audit.go:576-584) wrapped by
+    /// `TruncateOptions.wrapBackend` (options/audit.go:330).
     pub fn new_backend(&self) -> anyhow::Result<WrappedBackend> {
         let path = self.config_file.as_deref().unwrap_or_default();
         let webhook = WebhookBackend::new(
@@ -624,6 +628,7 @@ impl WebhookOptions {
             default_retry_backoff_with_initial_delay(self.initial_backoff),
         )
         .map_err(|e| anyhow::anyhow!("initializing audit webhook: {e}"))?;
-        Ok(self.batch.wrap_backend(Arc::new(webhook)))
+        let (backend, buffered) = self.batch.wrap_backend(Arc::new(webhook));
+        Ok((self.truncate.wrap_backend(backend), buffered))
     }
 }

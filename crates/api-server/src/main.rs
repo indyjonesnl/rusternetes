@@ -289,6 +289,19 @@ struct Args {
     /// `--audit-webhook-batch-throttle-burst` (options/audit.go:375).
     #[arg(long, default_value_t = 15, allow_negative_numbers = true)]
     audit_webhook_batch_throttle_burst: i64,
+
+    /// `--audit-webhook-truncate-enabled` (AuditTruncateOptions.AddFlags,
+    /// options/audit.go:415).
+    #[arg(long, default_value_t = false, num_args = 0..=1, require_equals = true, default_missing_value = "true", action = clap::ArgAction::Set)]
+    audit_webhook_truncate_enabled: bool,
+
+    /// `--audit-webhook-truncate-max-batch-size` (options/audit.go:418).
+    #[arg(long, default_value_t = 10 * 1024 * 1024, allow_negative_numbers = true)]
+    audit_webhook_truncate_max_batch_size: i64,
+
+    /// `--audit-webhook-truncate-max-event-size` (options/audit.go:422).
+    #[arg(long, default_value_t = 100 * 1024, allow_negative_numbers = true)]
+    audit_webhook_truncate_max_event_size: i64,
 }
 
 /// The `AuditWebhookOptions` the `--audit-webhook-*` flags describe.
@@ -310,6 +323,13 @@ fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::
                 throttle_qps: args.audit_webhook_batch_throttle_qps,
                 throttle_burst: pos(args.audit_webhook_batch_throttle_burst),
                 async_delegate: true,
+            },
+        },
+        truncate: rusternetes_api_server::audit_truncate::TruncateOptions {
+            enabled: args.audit_webhook_truncate_enabled,
+            config: rusternetes_api_server::audit_truncate::TruncateConfig {
+                max_event_size: args.audit_webhook_truncate_max_event_size,
+                max_batch_size: args.audit_webhook_truncate_max_batch_size,
             },
         },
     }
