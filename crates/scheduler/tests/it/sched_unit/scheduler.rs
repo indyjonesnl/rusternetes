@@ -1045,6 +1045,62 @@ mod tests {
         .unwrap()
     }
 
+    /// `findNodesThatPassFilters` records each rejected node's status in
+    /// `Diagnosis.NodeToStatus` (schedule_one.go:660-690), and `findCandidates`
+    /// only dry-runs the Unschedulable ones (preemption.go:343-356): a node
+    /// that is full can gain room, a cordoned one cannot.
+    #[tokio::test]
+    async fn test_cycle_records_node_codes_for_preemption() {
+        let node = |name: &str, unschedulable: bool| -> Node {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {"name": name},
+                "spec": {"unschedulable": unschedulable},
+                "status": {"allocatable": {"cpu": "2", "memory": "10Gi", "pods": "10"}}
+            }))
+            .unwrap()
+        };
+        let nodes = vec![node("full", false), node("cordoned", true)];
+        let all_pods = vec![running_pod("a", "full", "2", 0)];
+        let mut preemptor = make_pending_pod("hi", "default");
+        preemptor.spec.as_mut().unwrap().priority = Some(1000);
+        preemptor.spec.as_mut().unwrap().containers[0].resources =
+            Some(rusternetes_common::types::ResourceRequirements {
+                requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
+                limits: None,
+                claims: None,
+            });
+        let scheduler = Scheduler::new_with_name(
+            Arc::new(MemoryStorage::new()),
+            1,
+            "default-scheduler".to_string(),
+        );
+        let mut diag = rusternetes_scheduler::diagnosis::Diagnosis::default();
+        let picked = scheduler
+            .select_node_inner(&preemptor, &nodes, &all_pods, &HashMap::new(), &mut diag)
+            .await;
+        assert!(picked.is_none());
+        use rusternetes_scheduler::fwk::Code;
+        assert_eq!(diag.node_code("full"), Code::Unschedulable);
+        assert_eq!(
+            diag.node_code("cordoned"),
+            Code::UnschedulableAndUnresolvable
+        );
+        // A node the cycle never saw is absent: UnschedulableAndUnresolvable.
+        assert_eq!(diag.node_code("other"), Code::UnschedulableAndUnresolvable);
+
+        let preempted = scheduler
+            .try_preempt(&preemptor, &nodes, &all_pods, &HashMap::new(), &[], &diag)
+            .await
+            .map(|(node, victims)| (node, victims.len()));
+        assert_eq!(preempted, Some(("full".to_string(), 1)));
+        // With every node unresolvable, preemption is not attempted.
+        let none = rusternetes_scheduler::diagnosis::Diagnosis::default();
+        assert!(scheduler
+            .try_preempt(&preemptor, &nodes, &all_pods, &HashMap::new(), &[], &none)
+            .await
+            .is_none());
+    }
+
     /// default_preemption_test.go TestCalculateNumCandidates /
     /// TestDryRunPreemption shape: with `minCandidateNodesPercentage: 0` and
     /// `minCandidateNodesAbsolute: 1` the dry run stops at the first candidate
@@ -1088,7 +1144,20 @@ mod tests {
                     .preemption_offset_override
                     .store(0, Ordering::Relaxed);
                 scheduler
-                    .try_preempt(&preemptor, &nodes, &all_pods, &HashMap::new(), &[])
+                    .try_preempt(
+                        &preemptor,
+                        &nodes,
+                        &all_pods,
+                        &HashMap::new(),
+                        &[],
+                        &rusternetes_scheduler::diagnosis::Diagnosis {
+                            // As after a PreFilter rejection: every node is Unschedulable.
+                            absent_nodes_code: Some(
+                                rusternetes_scheduler::fwk::Code::Unschedulable,
+                            ),
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .map(|(node, victims)| (node, victims.len()))
             }
