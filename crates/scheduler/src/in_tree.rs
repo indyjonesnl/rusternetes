@@ -48,7 +48,9 @@ pub fn new_filter_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
-        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadFilter {
+            args: args.pod_topology_spread.cloned().unwrap_or_default(),
+        })),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
         _ => None,
@@ -69,6 +71,9 @@ pub fn new_pre_filter_plugin(
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpreadFilter {
+            args: args.pod_topology_spread.cloned().unwrap_or_default(),
+        })),
         _ => None,
     }
 }
@@ -702,21 +707,15 @@ impl NodeResourcesFit {
     }
 }
 
-/// `podtopologyspread.ErrReasonConstraintsNotMatch` (plugin.go:41).
-pub const ERR_REASON_CONSTRAINTS_NOT_MATCH: &str =
-    "node(s) didn't match pod topology spread constraints";
+pub use crate::pod_topology_spread_filter::{
+    ERR_REASON_CONSTRAINTS_NOT_MATCH, ERR_REASON_NODE_LABEL_NOT_MATCH,
+};
 
-/// `podtopologyspread.PodTopologySpread` Filter
-/// (`plugins/podtopologyspread/filtering.go:309-358`): a node violating a
-/// `DoNotSchedule` constraint is Unschedulable.
-///
-/// Deviations: the skew is recomputed per node by
-/// [`crate::advanced::check_topology_spread_constraints`] instead of from
-/// PreFilter-computed `preFilterState` (:150-280); the node-label-missing
-/// UnschedulableAndUnresolvable case (`ErrReasonNodeLabelNotMatch`) is not
-/// distinguished; nominated pods are not counted. PreFilter, the
-/// default-constraints args and `PreFilterExtensions` (preemption what-if)
-/// are not ported.
+/// `preFilterStateKey` of the PodTopologySpread plugin.
+const POD_TOPOLOGY_SPREAD_STATE_KEY: &str = "PreFilterPodTopologySpread";
+
+/// `podtopologyspread.PodTopologySpread` signer (see [`PodTopologySpreadFilter`]
+/// for PreFilter and Filter, [`PodTopologySpreadScore`] for scoring).
 pub struct PodTopologySpread;
 
 impl Plugin for PodTopologySpread {
@@ -725,25 +724,78 @@ impl Plugin for PodTopologySpread {
     }
 }
 
+/// `podtopologyspread.PodTopologySpread` PreFilter and Filter
+/// (`plugins/podtopologyspread/filtering.go:154-163`, `:321-358`) over
+/// [`crate::pod_topology_spread_filter`]: a node violating a `DoNotSchedule`
+/// constraint is Unschedulable, a node missing a constraint's topology label
+/// UnschedulableAndUnresolvable.
+///
+/// Deviation: `PreFilterExtensions` (AddPod/RemovePod) are not ported, so
+/// nominated pods and preemption what-ifs do not update the counts.
+#[derive(Default)]
+pub struct PodTopologySpreadFilter {
+    pub args: crate::pod_topology_spread_score::Args,
+}
+
+impl Plugin for PodTopologySpreadFilter {
+    fn name(&self) -> &'static str {
+        names::POD_TOPOLOGY_SPREAD
+    }
+}
+
 #[async_trait]
-impl FilterPlugin for PodTopologySpread {
-    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
-        if pod.spec.is_none() {
-            return Status::success();
-        }
-        let (ok, _) = crate::advanced::check_topology_spread_constraints(
-            node_info.node(),
+impl PreFilterPlugin for PodTopologySpreadFilter {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        handle: &dyn Handle,
+    ) -> (Option<PreFilterResult>, Status) {
+        use crate::pod_topology_spread_score as pts;
+        let default_selector = if pts::needs_default_selector_for(pod, &self.args, "DoNotSchedule")
+        {
+            match handle.default_selector_inputs(pod).await {
+                Ok(inputs) => Some(pts::default_selector(pod, &inputs)),
+                Err(e) => return (None, Status::from_error(format!("reading listers: {e}"))),
+            }
+        } else {
+            None
+        };
+        let by_node = pts::pods_by_node(all_pods);
+        match crate::pod_topology_spread_filter::pre_filter(
             pod,
-            node_info.all_pods(),
-            node_info.all_nodes(),
-        );
-        if ok {
-            return Status::success();
+            nodes,
+            &by_node,
+            &self.args,
+            default_selector.as_ref(),
+        ) {
+            Ok(Some(s)) => {
+                state.write(POD_TOPOLOGY_SPREAD_STATE_KEY, s);
+                (None, Status::success())
+            }
+            Ok(None) => (None, Status::new(Code::Skip, Vec::new())),
+            Err(e) => (None, Status::from_error(e)),
         }
-        Status::new(
-            Code::Unschedulable,
-            vec![ERR_REASON_CONSTRAINTS_NOT_MATCH.to_string()],
-        )
+    }
+}
+
+#[async_trait]
+impl FilterPlugin for PodTopologySpreadFilter {
+    async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let Some(s) = state.read::<crate::pod_topology_spread_filter::PreFilterState>(
+            POD_TOPOLOGY_SPREAD_STATE_KEY,
+        ) else {
+            return missing_state(POD_TOPOLOGY_SPREAD_STATE_KEY);
+        };
+        match crate::pod_topology_spread_filter::filter(s, pod, node_info.node()) {
+            None => Status::success(),
+            Some((reason, true)) => {
+                Status::new(Code::UnschedulableAndUnresolvable, vec![reason.to_string()])
+            }
+            Some((reason, false)) => Status::new(Code::Unschedulable, vec![reason.to_string()]),
+        }
     }
 }
 

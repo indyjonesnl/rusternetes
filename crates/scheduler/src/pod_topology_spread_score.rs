@@ -93,13 +93,14 @@ impl Args {
     }
 }
 
-/// `topologySpreadConstraint` (common.go:32-39), without `MinDomains`, which
-/// only the Filter reads.
+/// `topologySpreadConstraint` (common.go:32-39).
 #[derive(Clone, Debug)]
 pub struct Constraint {
     pub max_skew: i32,
     pub topology_key: String,
     pub selector: Selector,
+    /// `MinDomains` (1 when unset); only the Filter reads it.
+    pub min_domains: i32,
     /// `NodeAffinityPolicy == Honor`.
     pub node_affinity_honor: bool,
     /// `NodeTaintsPolicy == Honor`.
@@ -107,7 +108,7 @@ pub struct Constraint {
 }
 
 /// `filterTopologySpreadConstraints` (common.go:92-130).
-fn filter_topology_spread_constraints(
+pub(crate) fn filter_topology_spread_constraints(
     constraints: &[TopologySpreadConstraint],
     pod_labels: Option<&HashMap<String, String>>,
     action: &str,
@@ -139,6 +140,7 @@ fn filter_topology_spread_constraints(
             max_skew: c.max_skew,
             topology_key: c.topology_key.clone(),
             selector,
+            min_domains: c.min_domains.unwrap_or(1),
             // nil NodeAffinityPolicy is Honor, nil NodeTaintsPolicy is Ignore.
             node_affinity_honor: c.node_affinity_policy.as_deref().unwrap_or("Honor") == "Honor",
             node_taints_honor: c.node_taints_policy.as_deref() == Some("Honor"),
@@ -255,7 +257,7 @@ pub fn default_selector(pod: &Pod, inputs: &DefaultSelectorInputs) -> Selector {
     label_selector_as_selector(Some(&combined)).unwrap_or(Selector::Everything)
 }
 
-fn has_own_constraints(pod: &Pod) -> bool {
+pub(crate) fn has_own_constraints(pod: &Pod) -> bool {
     pod.spec
         .as_ref()
         .and_then(|s| s.topology_spread_constraints.as_ref())
@@ -265,15 +267,21 @@ fn has_own_constraints(pod: &Pod) -> bool {
 /// Whether `PreScore` will call `buildDefaultConstraints` with a non-empty
 /// default list, i.e. whether the Services/controller of the pod must be read.
 pub fn needs_default_selector(pod: &Pod, args: &Args) -> bool {
+    needs_default_selector_for(pod, args, "ScheduleAnyway")
+}
+
+/// [`needs_default_selector`] for the constraints of `action` (`PreFilter`
+/// builds the `DoNotSchedule` ones).
+pub fn needs_default_selector_for(pod: &Pod, args: &Args, action: &str) -> bool {
     !has_own_constraints(pod)
         && args
             .default_constraints
             .iter()
-            .any(|c| c.when_unsatisfiable == "ScheduleAnyway")
+            .any(|c| c.when_unsatisfiable == action)
 }
 
 /// `buildDefaultConstraints` (common.go:57-71).
-fn build_default_constraints(
+pub(crate) fn build_default_constraints(
     pod: &Pod,
     args: &Args,
     default_selector: Option<&Selector>,
@@ -298,7 +306,10 @@ fn build_default_constraints(
 }
 
 /// `nodeLabelsMatchSpreadConstraints` (common.go:73-81).
-fn node_labels_match_spread_constraints(node: &Node, constraints: &[Constraint]) -> bool {
+pub(crate) fn node_labels_match_spread_constraints(
+    node: &Node,
+    constraints: &[Constraint],
+) -> bool {
     constraints.iter().all(|c| {
         node.metadata
             .labels
@@ -361,7 +372,7 @@ fn has_untolerated_taint(pod: &Pod, node: &Node) -> bool {
 
 impl Constraint {
     /// `matchNodeInclusionPolicies` (common.go:41-55).
-    fn match_node_inclusion_policies(&self, pod: &Pod, node: &Node) -> bool {
+    pub(crate) fn match_node_inclusion_policies(&self, pod: &Pod, node: &Node) -> bool {
         if self.node_affinity_honor && !required_node_affinity_matches(pod, node) {
             return false;
         }
@@ -392,7 +403,7 @@ pub fn pods_by_node(all_pods: &[Pod]) -> HashMap<&str, Vec<&Pod>> {
 
 /// `countPodsMatchSelector` (common.go:148-163): terminating pods and pods of
 /// another namespace are skipped.
-fn count_pods_match_selector(pods: &[&Pod], selector: &Selector, ns: &str) -> i64 {
+pub(crate) fn count_pods_match_selector(pods: &[&Pod], selector: &Selector, ns: &str) -> i64 {
     if selector.is_everything() {
         // `selector.Empty()`
         return 0;
