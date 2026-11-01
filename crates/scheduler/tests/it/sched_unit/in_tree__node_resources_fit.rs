@@ -293,3 +293,106 @@ async fn native_resources_are_never_ignored() {
     let s = run_with(&ignored(&["cpu"], &["cpu"]), &p, &n).await;
     assert!(s.is_rejected());
 }
+
+/// A pod with container, init-container and pod-level requests, as
+/// `newPodLevelResourcesPod`/`newResourceInitPod` build them (fit_test.go).
+fn shaped_pod(spec: Value) -> Pod {
+    serde_json::from_value(json!({"metadata": {"name": "p", "namespace": "default"}, "spec": spec}))
+        .unwrap()
+}
+
+fn requests(cpu: &str, memory: &str) -> Value {
+    json!({"requests": {"cpu": cpu, "memory": memory}})
+}
+
+fn container(cpu: &str, memory: &str) -> Value {
+    json!({"name": "c", "resources": requests(cpu, memory)})
+}
+
+/// Cases of `TestEnoughRequests` with `podLevelResourcesEnabled` (fit_test.go:
+/// 516-620): `computePodResourceRequest` takes the pod-level request over the
+/// containers' sum for the resources it names (PodLevelResources is on in 1.35).
+#[tokio::test]
+async fn pod_level_resources_fit_and_not_fit() {
+    let n = node(json!({"cpu": "10", "memory": "20", "pods": "32"}));
+    let used = |cpu: &str, mem: &str| vec![pod("e", "n", json!({"cpu": cpu, "memory": mem}))];
+
+    // "both pod-level and container-level resources fit"
+    let both = shaped_pod(json!({
+        "containers": [container("1", "1")], "resources": requests("1", "2")
+    }));
+    assert!(run(&both, &n, &used("5", "5")).await.is_success());
+
+    // "pod-level cpu resource not fit": 7 requested over the pod-level request
+    let cpu = shaped_pod(json!({
+        "containers": [container("1", "1")], "resources": requests("7", "2")
+    }));
+    let s = run(&cpu, &n, &used("5", "5")).await;
+    assert_eq!(s.code(), Code::Unschedulable);
+    assert_eq!(s.reasons(), vec!["Insufficient cpu"]);
+
+    // "pod-level memory resource not fit"
+    let mem = shaped_pod(json!({
+        "containers": [container("1", "1")], "resources": requests("3", "2")
+    }));
+    let s = run(&mem, &n, &used("5", "19")).await;
+    assert_eq!(s.code(), Code::Unschedulable);
+    assert_eq!(s.reasons(), vec!["Insufficient memory"]);
+
+    // "one pod-level cpu resource fits and all init and non-init containers
+    // resources fit": the pod-level memory (2) still does not fit.
+    let init = shaped_pod(json!({
+        "initContainers": [container("1", "1")],
+        "containers": [container("1", "1")],
+        "resources": requests("3", "2")
+    }));
+    let s = run(&init, &n, &used("5", "19")).await;
+    assert_eq!(s.reasons(), vec!["Insufficient memory"]);
+}
+
+/// "pod-level hugepages resource not fit": more than the node's capacity is
+/// UnschedulableAndUnresolvable (fit_test.go:586-596).
+#[tokio::test]
+async fn pod_level_hugepages_beyond_capacity_is_unresolvable() {
+    let n = node(json!({"cpu": "10", "memory": "20", "pods": "32", "hugepages-2Mi": "5"}));
+    let fits = shaped_pod(json!({
+        "containers": [{"name": "c"}],
+        "resources": {"requests": {"cpu": "3", "memory": "2", "hugepages-2Mi": "5"}}
+    }));
+    assert!(run(&fits, &n, &[]).await.is_success());
+    let too_big = shaped_pod(json!({
+        "containers": [{"name": "c"}],
+        "resources": {"requests": {"cpu": "3", "memory": "2", "hugepages-2Mi": "10"}}
+    }));
+    let s = run(&too_big, &n, &[]).await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+    assert_eq!(s.reasons(), vec!["Insufficient hugepages-2Mi"]);
+}
+
+/// Restartable init containers (sidecars) are summed with the containers,
+/// ordinary init containers only raise the maximum (`computePodResourceRequest`
+/// doc, fit.go:256-292; TestSidecarContainers, fit_test.go:925-1000). The
+/// SidecarContainers gate is GA and locked on in 1.35, so the "feature
+/// disabled" PreFilter rejection (fit.go:306-313) cannot apply.
+#[tokio::test]
+async fn sidecar_requests_add_to_the_containers() {
+    let n = node(json!({"cpu": "10", "memory": "20", "pods": "32"}));
+    let one = |c: &str| vec![pod("e", "n", json!({"cpu": c}))];
+    let with_init = |restart: Option<&str>| {
+        let mut init = json!({"name": "i", "resources": {"requests": {"cpu": "1"}}});
+        if let Some(r) = restart {
+            init["restartPolicy"] = json!(r);
+        }
+        shaped_pod(json!({
+            "initContainers": [init],
+            "containers": [{"name": "c", "resources": {"requests": {"cpu": "1"}}}]
+        }))
+    };
+    // Sidecar 1 + container 1 = 2: fits at 8 used, not at 9.
+    let sidecar = with_init(Some("Always"));
+    assert!(run(&sidecar, &n, &one("8")).await.is_success());
+    let s = run(&sidecar, &n, &one("9")).await;
+    assert_eq!(s.reasons(), vec!["Insufficient cpu"]);
+    // An ordinary init container: max(1, 1) = 1, fits at 9 used.
+    assert!(run(&with_init(None), &n, &one("9")).await.is_success());
+}
