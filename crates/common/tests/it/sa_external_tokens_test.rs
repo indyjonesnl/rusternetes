@@ -502,9 +502,7 @@ fn openid_metadata_serves_configured_keys_3684() {
     o.jwks_uri = Some("https://keys.example.com/jwks".to_string());
     let tm = manager(&o);
 
-    let cfg = tm
-        .openid_config_json("https://default/openid/v1/jwks")
-        .unwrap();
+    let cfg = tm.openid_config_json().unwrap().unwrap();
     assert_eq!(cfg["issuer"], ISSUER);
     assert_eq!(cfg["jwks_uri"], "https://keys.example.com/jwks");
     assert_eq!(cfg["response_types_supported"], json!(["id_token"]));
@@ -530,12 +528,55 @@ fn openid_metadata_serves_configured_keys_3684() {
     assert!(keys[1]["x"].is_string() && keys[1]["y"].is_string());
     assert!(keys[1].get("d").is_none());
 
-    // Without --service-account-jwks-uri the caller's default is used.
-    let tm = manager(&opts(&["rsa.pub"]));
-    let cfg = tm
-        .openid_config_json("https://default/openid/v1/jwks")
+    // Without --service-account-jwks-uri it is built from the external address.
+    let tm = manager(&opts(&["rsa.pub"])).with_external_address("10.0.0.1:6443");
+    let cfg = tm.openid_config_json().unwrap().unwrap();
+    assert_eq!(cfg["jwks_uri"], "https://10.0.0.1:6443/openid/v1/jwks");
+}
+
+/// `NewOpenIDMetadataProvider` (`openidmetadata.go:113-179`): the default
+/// `jwks_uri` comes from the external address, and an issuer or address it
+/// cannot use makes it refuse (the endpoints are then not served).
+#[test]
+fn openid_metadata_provider_checks_3725() {
+    let mut o = opts(&["rsa.pub"]);
+    // No external address and no --service-account-jwks-uri.
+    let err = manager(&o).openid_config_json().unwrap_err();
+    assert!(err.contains("empty address"), "{err}");
+    // IPv6 external address, bracketed as JoinHostPort does.
+    let cfg = manager(&o)
+        .with_external_address("[::1]:6443")
+        .openid_config_json()
+        .unwrap()
         .unwrap();
-    assert_eq!(cfg["jwks_uri"], "https://default/openid/v1/jwks");
+    assert_eq!(cfg["jwks_uri"], "https://[::1]:6443/openid/v1/jwks");
+    // An external address that carries more than host:port.
+    let err = manager(&o)
+        .with_external_address("https://host:6443")
+        .openid_config_json()
+        .unwrap_err();
+    assert!(err.contains("could not construct a valid URL"), "{err}");
+    // An explicit jwks uri needs no external address.
+    o.jwks_uri = Some("https://keys.example.com/jwks".to_string());
+    assert!(manager(&o).openid_config_json().unwrap().is_some());
+
+    // The issuer must be https without a query or fragment.
+    for (issuer, want) in [
+        ("http://issuer.example.com", "must use https scheme"),
+        ("https://issuer.example.com?a=b", "may not include a query"),
+        (
+            "https://issuer.example.com#frag",
+            "may not include a fragment",
+        ),
+    ] {
+        let mut o = opts(&["rsa.pub"]);
+        o.issuers = vec![issuer.to_string()];
+        let err = manager(&o)
+            .with_external_address("10.0.0.1:6443")
+            .openid_config_json()
+            .unwrap_err();
+        assert!(err.contains(want), "{issuer}: {err}");
+    }
 }
 
 /// `--service-account-lookup` (authentication.go:226 default true,

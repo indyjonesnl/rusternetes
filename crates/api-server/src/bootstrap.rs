@@ -649,6 +649,19 @@ impl AdvertiseAddress {
     }
 }
 
+/// `Config.ExternalAddress` as `Complete` derives it (`server/config.go:706-721`)
+/// when `--external-hostname` is unset: the public (advertise) address joined
+/// with the secure serving port, `net.JoinHostPort` style (IPv6 bracketed).
+pub fn external_address(advertise: AdvertiseAddress, bind_address: &str) -> Result<String> {
+    let ip = advertise.resolve()?;
+    let port = bind_address
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(6443);
+    Ok(std::net::SocketAddr::new(ip, port).to_string())
+}
+
 /// The single canonical `EndpointSubset` the `kubernetes` Endpoints must hold:
 /// exactly the api-server's own `ip:port` over the `https`/TCP port. This is the
 /// `masterCount == 1` shape of upstream's `masterCountEndpointReconciler`

@@ -1261,6 +1261,22 @@ mod advertise_address_tests {
         assert_eq!(a.resolve().unwrap(), ip("10.1.1.1"));
     }
 
+    /// `Config.Complete` (config.go:706-721): ExternalAddress is the public
+    /// address joined with the secure port, IPv6 bracketed.
+    #[test]
+    fn external_address_joins_the_advertise_address_and_port() {
+        let a = AdvertiseAddress::new(Some(ip("10.2.3.4")), "0.0.0.0:7443");
+        assert_eq!(
+            external_address(a, "0.0.0.0:7443").unwrap(),
+            "10.2.3.4:7443"
+        );
+        let a = AdvertiseAddress::new(None, "[2001:db8::9]:6443");
+        assert_eq!(
+            external_address(a, "[2001:db8::9]:6443").unwrap(),
+            "[2001:db8::9]:6443"
+        );
+    }
+
     /// `endpointSliceFromEndpoints`: IPv6 address -> IPv6 slice; a transition
     /// replaces the slice (`EnsureEndpointSliceFromEndpoints`, :96-104).
     #[tokio::test]
