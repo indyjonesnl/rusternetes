@@ -812,15 +812,15 @@ impl WebhookAuthorizer {
 }
 
 /// A response read in full, whichever client made the call.
-struct WebhookResponse {
-    status: u16,
-    retry_after: Option<String>,
-    body: bytes::Bytes,
+pub(crate) struct WebhookResponse {
+    pub(crate) status: u16,
+    pub(crate) retry_after: Option<String>,
+    pub(crate) body: bytes::Bytes,
 }
 
 /// The webhook's HTTP client: reqwest, or, when the egress selector has a
 /// `controlplane` selection, a client dialing through its `Dialer`.
-enum WebhookHttp {
+pub(crate) enum WebhookHttp {
     Reqwest(reqwest::Client),
     Egress(Box<crate::egress_http::EgressHttpClient>),
 }
@@ -831,7 +831,7 @@ impl WebhookHttp {
     /// `authorizationConfig.CustomDial` (`webhookutil.LoadKubeconfig`'s
     /// `clientConfig.Dial`, util/webhook/webhook.go:157). `Lookup` yielding no
     /// dialer leaves the default transport.
-    fn for_config(config: &WebhookClientConfig) -> anyhow::Result<Self> {
+    pub(crate) fn for_config(config: &WebhookClientConfig) -> anyhow::Result<Self> {
         let dial = crate::egress_selector::egress_selector()
             .and_then(|s| s.lookup(crate::egress_selector::EgressType::ControlPlane));
         match dial {
@@ -840,7 +840,7 @@ impl WebhookHttp {
         }
     }
 
-    async fn post_json<T: Serialize>(
+    pub(crate) async fn post_json<T: Serialize>(
         &self,
         config: &WebhookClientConfig,
         body: &T,
