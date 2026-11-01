@@ -475,6 +475,81 @@ async fn token_review_user_info_matches_upstream_serviceaccount_userinfo() {
     );
 }
 
+/// The `credential-id` extra is derived from the token's own `jti` claim, so
+/// it is the same on every authentication of one token and differs between
+/// tokens.
+///
+/// Upstream: `token.Claims` sets `sc.ID = newUUID()`
+/// (pkg/serviceaccount/claims.go:79-81); the validator returns
+/// `CredentialIDForJTI(public.ID)` (claims.go:279-290);
+/// `CredentialIDForJTI` is `"JTI=" + jti`
+/// (staging/src/k8s.io/apiserver/pkg/authentication/token/jwt/jwt.go:21).
+#[tokio::test]
+async fn token_review_credential_id_is_derived_from_the_token_jti() {
+    use base64::Engine;
+    let (state, _) = spawn_state();
+    let ns = "sa-token-jti";
+    let sa = "e2e-sa-jti";
+    let (status, created) = post_json(
+        state.clone(),
+        &format!("/api/v1/namespaces/{ns}/serviceaccounts"),
+        &json!({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": sa}}),
+    )
+    .await;
+    assert_eq!(status, 201, "create SA: {created}");
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let (status, body) = post_json(
+            state.clone(),
+            &format!("/api/v1/namespaces/{ns}/serviceaccounts/{sa}/token"),
+            &json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "TokenRequest",
+                "metadata": {},
+                "spec": { "audiences": ["https://kubernetes.default.svc"] }
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "TokenRequest must succeed: {body}");
+        let token = body["status"]["token"].as_str().expect("token").to_string();
+        let payload = token.split('.').nth(1).expect("jwt payload");
+        let payload: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        let jti = payload["jti"]
+            .as_str()
+            .expect("token carries a jti")
+            .to_string();
+        assert!(!jti.is_empty());
+
+        // Authenticating the same token twice yields the same credential-id.
+        for _ in 0..2 {
+            let (status, review) = post_json(
+                state.clone(),
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                &json!({
+                    "apiVersion": "authentication.k8s.io/v1",
+                    "kind": "TokenReview",
+                    "metadata": {},
+                    "spec": { "token": token }
+                }),
+            )
+            .await;
+            assert_eq!(status, 201, "TokenReview must succeed: {review}");
+            assert_eq!(
+                review["status"]["user"]["extra"]["authentication.kubernetes.io/credential-id"],
+                json!([format!("JTI={jti}")])
+            );
+        }
+        seen.push(jti);
+    }
+    assert_ne!(seen[0], seen[1], "each token gets its own jti");
+}
+
 /// [sig-auth] ServiceAccounts should mount an API token into pods [Conformance]
 /// — the TokenReview half.
 ///

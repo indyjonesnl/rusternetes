@@ -182,6 +182,7 @@ mod tests {
             pod_uid: None,
             node_name: None,
             node_uid: None,
+            jti: String::new(),
             kubernetes: None,
         };
 
@@ -214,6 +215,7 @@ mod tests {
             pod_uid: None,
             node_name: None,
             node_uid: None,
+            jti: String::new(),
             kubernetes: None,
         };
 
@@ -249,6 +251,7 @@ mod tests {
             pod_uid: None,
             node_name: None,
             node_uid: None,
+            jti: String::new(),
             kubernetes: None,
         };
 
@@ -285,6 +288,7 @@ mod tests {
             pod_uid: Some("pod-uid-456".to_string()),
             node_name: Some("node-1".to_string()),
             node_uid: Some("node-uid-789".to_string()),
+            jti: String::new(),
         };
 
         let token = manager.generate_token(claims).unwrap();
@@ -320,6 +324,7 @@ mod tests {
             pod_uid: Some("pod-uid-abc".to_string()),
             node_name: Some("node-2".to_string()),
             node_uid: Some("node-uid-2".to_string()),
+            jti: String::new(),
         };
 
         let token = manager.generate_token(claims).unwrap();
@@ -389,5 +394,31 @@ mod tests {
             claims.iss.starts_with("https://"),
             "Issuer must start with https://"
         );
+    }
+
+    /// `CredentialIDForJTI` (jwt.go:21): empty for an empty jti.
+    #[test]
+    fn credential_id_for_jti_matches_upstream() {
+        assert_eq!(credential_id_for_jti(""), "");
+        assert_eq!(credential_id_for_jti("abc"), "JTI=abc");
+    }
+
+    /// `ServiceAccountInfo.UserInfo` (util.go:147-151): the credential-id
+    /// extra comes from the token's jti and is absent when it has none.
+    #[test]
+    fn user_info_credential_id_comes_from_the_jti() {
+        let mut claims =
+            ServiceAccountClaims::new("sa".to_string(), "ns".to_string(), "uid".to_string(), 1);
+        assert!(!claims.jti.is_empty(), "minted claims carry a jti");
+        let key = "authentication.kubernetes.io/credential-id";
+        claims.jti = "fixed".to_string();
+        let a = UserInfo::from_service_account_claims(&claims);
+        let b = UserInfo::from_service_account_claims(&claims);
+        assert_eq!(a.extra[key], vec!["JTI=fixed".to_string()]);
+        assert_eq!(a.extra[key], b.extra[key]);
+        claims.jti.clear();
+        assert!(!UserInfo::from_service_account_claims(&claims)
+            .extra
+            .contains_key(key));
     }
 }

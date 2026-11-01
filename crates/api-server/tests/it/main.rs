@@ -327,6 +327,7 @@ mod runtimeclass_router_test;
 mod runtimeclass_servicecidr_update_test;
 mod runtimeclass_store_test;
 mod sa_token_bound_objects_test;
+mod sa_token_issued_credential_id_audit_test;
 mod sar_both_attributes_test;
 mod sar_metadata_must_be_empty_test;
 mod scale_nonnegative_replicas_test;

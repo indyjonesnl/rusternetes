@@ -104,6 +104,7 @@ fn token_with(bound: impl FnOnce(&mut KubernetesClaims)) -> String {
         pod_uid: None,
         node_name: None,
         node_uid: None,
+        jti: String::new(),
     };
     TokenManager::new(SECRET).generate_token(claims).unwrap()
 }

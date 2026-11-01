@@ -535,6 +535,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         pod_uid: None,
         node_name: None,
         node_uid: None,
+        jti: String::new(),
     };
     // The server verifies with a `TokenManager` built from the same secret, so
     // a locally-constructed manager produces an identical, acceptable signature.
