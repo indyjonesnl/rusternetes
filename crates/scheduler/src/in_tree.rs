@@ -6,8 +6,9 @@ use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
     Code, CycleState, FilterPlugin, Handle, NodeInfo, Plugin, PreFilterPlugin, PreFilterResult,
-    Status,
+    SignFragment, SignPlugin, Status,
 };
+use crate::signers;
 use async_trait::async_trait;
 use rusternetes_common::resources::pod::{NodeAffinity, NodeSelector};
 use rusternetes_common::resources::{Node, Pod, Taint};
@@ -56,6 +57,30 @@ pub fn new_pre_filter_plugin(
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
         _ => None,
     }
+}
+
+/// The signer for an in-tree plugin by name, `None` for plugins that cannot
+/// sign pods (not yet plugin objects, or without a `SignPod`).
+pub fn new_sign_plugin(name: &str) -> Option<Arc<dyn SignPlugin>> {
+    match name {
+        names::NODE_UNSCHEDULABLE => Some(Arc::new(NodeUnschedulable)),
+        names::NODE_NAME => Some(Arc::new(NodeName)),
+        names::TAINT_TOLERATION => Some(Arc::new(TaintToleration)),
+        names::NODE_AFFINITY => Some(Arc::new(NodeAffinityPlugin::new(None))),
+        names::NODE_PORTS => Some(Arc::new(NodePorts)),
+        names::NODE_RESOURCES_FIT => Some(Arc::new(NodeResourcesFit)),
+        names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
+        names::POD_TOPOLOGY_SPREAD => Some(Arc::new(PodTopologySpread)),
+        names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
+        _ => None,
+    }
+}
+
+/// A Success status with `fragments`.
+fn signed(fragments: Vec<SignFragment>) -> (Vec<SignFragment>, Status) {
+    (fragments, Status::success())
 }
 
 /// `framework.ErrNotFound`-style failure reading PreFilter state: PreFilter
@@ -1010,5 +1035,163 @@ impl FilterPlugin for DynamicResources {
             }
         }
         Status::success()
+    }
+}
+
+// SignPod of each plugin object (see `fwk::SignPlugin`).
+
+impl SignPlugin for NodeUnschedulable {
+    /// node_unschedulable.go:135-139.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        signed(vec![SignFragment::new(
+            signers::TOLERATIONS_SIGNER_NAME,
+            signers::tolerations_signer(pod),
+        )])
+    }
+}
+
+impl SignPlugin for NodeName {
+    /// node_name.go:72-76.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let name = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_name.as_deref())
+            .unwrap_or("");
+        signed(vec![SignFragment::new(
+            signers::NODE_NAME_SIGNER_NAME,
+            serde_json::json!(name),
+        )])
+    }
+}
+
+impl SignPlugin for TaintToleration {
+    /// taint_toleration.go:62-66.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        signed(vec![SignFragment::new(
+            signers::TOLERATIONS_SIGNER_NAME,
+            signers::tolerations_signer(pod),
+        )])
+    }
+}
+
+impl SignPlugin for NodeAffinityPlugin {
+    /// node_affinity.go:79-88.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let selector = pod.spec.as_ref().and_then(|s| s.node_selector.as_ref());
+        signed(vec![
+            SignFragment::new(
+                signers::NODE_AFFINITY_SIGNER_NAME,
+                signers::node_affinity_signer(pod),
+            ),
+            SignFragment::new(
+                signers::NODE_SELECTOR_SIGNER_NAME,
+                serde_json::to_value(selector).unwrap_or_default(),
+            ),
+        ])
+    }
+}
+
+impl SignPlugin for NodePorts {
+    /// node_ports.go:68-72.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        signed(vec![SignFragment::new(
+            signers::HOST_PORTS_SIGNER_NAME,
+            signers::host_ports_signer(pod),
+        )])
+    }
+}
+
+impl SignPlugin for NodeResourcesFit {
+    /// fit.go:174-185 (`computePodResourceRequest`; the DRA extended
+    /// resource refusal does not apply, that feature is not ported).
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let request: std::collections::BTreeMap<_, _> = crate::advanced::pod_request_amounts(pod)
+            .into_iter()
+            .collect();
+        signed(vec![SignFragment::new(
+            signers::RESOURCES_SIGNER_NAME,
+            serde_json::json!(request),
+        )])
+    }
+}
+
+fn volumes_fragment(pod: &Pod) -> (Vec<SignFragment>, Status) {
+    signed(vec![SignFragment::new(
+        signers::VOLUMES_SIGNER_NAME,
+        signers::volumes_signer(pod),
+    )])
+}
+
+impl SignPlugin for NodeVolumeLimits {
+    /// csi.go:664-668.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        volumes_fragment(pod)
+    }
+}
+
+impl SignPlugin for VolumeBinding {
+    /// volume_binding.go:99-103.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        volumes_fragment(pod)
+    }
+}
+
+impl SignPlugin for DynamicResources {
+    /// dynamicresources.go:202-207.
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let claims = pod.spec.as_ref().and_then(|s| s.resource_claims.as_ref());
+        if claims.is_some_and(|c| !c.is_empty()) {
+            return (
+                Vec::new(),
+                Status::new(
+                    Code::Unschedulable,
+                    vec!["pods with dra resource claims are not signable".to_string()],
+                ),
+            );
+        }
+        signed(Vec::new())
+    }
+}
+
+impl SignPlugin for PodTopologySpread {
+    /// podtopologyspread/plugin.go:93-103 (no default constraints are
+    /// configurable here).
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let constraints = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.topology_spread_constraints.as_ref());
+        if constraints.is_some_and(|c| !c.is_empty()) {
+            return (
+                Vec::new(),
+                Status::new(
+                    Code::Unschedulable,
+                    vec!["pods with topology constraints are not signable".to_string()],
+                ),
+            );
+        }
+        signed(Vec::new())
+    }
+}
+
+impl SignPlugin for InterPodAffinity {
+    /// interpodaffinity/plugin.go:63-79 (`IgnorePreferredTermsOfExistingPods`
+    /// is not configurable here, so the pod's labels are always included).
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status) {
+        let affinity = pod.spec.as_ref().and_then(|s| s.affinity.as_ref());
+        if affinity.is_some_and(|a| a.pod_affinity.is_some() || a.pod_anti_affinity.is_some()) {
+            return (
+                Vec::new(),
+                Status::new(
+                    Code::Unschedulable,
+                    vec!["pods with InterPodAffinity are not signable".to_string()],
+                ),
+            );
+        }
+        signed(vec![SignFragment::new(
+            signers::LABELS_SIGNER_NAME,
+            serde_json::to_value(pod.metadata.labels.as_ref()).unwrap_or_default(),
+        )])
     }
 }

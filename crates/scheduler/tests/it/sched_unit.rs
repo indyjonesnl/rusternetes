@@ -34,6 +34,7 @@ mod resource_events;
 mod scheduler;
 mod scheduler_config;
 mod score;
+mod signers;
 mod volume_assume;
 mod volume_bind;
 mod volume_binding;

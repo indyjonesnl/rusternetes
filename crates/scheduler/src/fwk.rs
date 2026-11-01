@@ -340,3 +340,37 @@ pub trait Handle: Send + Sync {
 pub struct NoHandle;
 
 impl Handle for NoHandle {}
+
+/// `fwk.SignFragment` (`interface.go:625-650`): one keyed part of a pod's
+/// signature. The value must be json-marshallable and comparable across
+/// pods (lists whose order does not matter are sorted); see
+/// [`crate::signers`] for the shared keys and signers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignFragment {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+impl SignFragment {
+    pub fn new(key: &str, value: serde_json::Value) -> Self {
+        Self {
+            key: key.to_string(),
+            value,
+        }
+    }
+}
+
+/// `fwk.PodSignature`: the consolidated signature bytes of a pod.
+pub type PodSignature = Vec<u8>;
+
+/// `fwk.SignPlugin` (`interface.go:661-685`): implemented by plugins that
+/// filter or score pods, to enable batching optimizations. Any two pods with
+/// the same signature get the same feasibility and scoring for the same nodes
+/// in the same state.
+pub trait SignPlugin: Plugin {
+    /// `SignPod`: Success with the fragments to include; Unschedulable when
+    /// the plugin refuses to sign the pod (not eligible for the
+    /// optimization); Error for something unexpected (the framework signs
+    /// nothing and the pod is scheduled without the optimization).
+    fn sign_pod(&self, pod: &Pod) -> (Vec<SignFragment>, Status);
+}
