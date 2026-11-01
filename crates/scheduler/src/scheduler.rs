@@ -944,12 +944,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Try to schedule
-        let (selected, chosen_volumes, diagnosis) = self
+        let (selected, cycle_state, diagnosis) = self
             .select_node_diag_volumes(&pod, &nodes, &all_pods, &priority_classes)
             .await;
-        if let Some(node) = selected {
+        if let (Some(node), Some(cycle_state)) = (selected, cycle_state) {
             if let Err(e) = self
-                .reserve_prebind_bind(pod, &node.metadata.name, chosen_volumes)
+                .reserve_prebind_bind(pod, &node.metadata.name, cycle_state)
                 .await
             {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
@@ -1329,110 +1329,83 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         (picked, diag)
     }
 
-    /// `select_node_diag` that also returns the chosen node's `PodVolumes`
-    /// (`stateData.podVolumesByNode[node]`), which Reserve/PreBind consume.
+    /// `select_node_diag` that also returns the scheduling cycle's
+    /// [`CycleState`], which Reserve/PreBind/Unreserve consume.
     async fn select_node_diag_volumes(
         &self,
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
         priority_classes: &HashMap<String, PriorityClass>,
-    ) -> (Option<Node>, Option<volume_binding::PodVolumes>, Diagnosis) {
+    ) -> (Option<Node>, Option<CycleState>, Diagnosis) {
         let mut diag = Diagnosis::default();
         let picked = self
             .select_node_inner(pod, nodes, all_pods, priority_classes, &mut diag)
             .await;
         match picked {
-            Some((node, vols)) => (Some(node), vols, diag),
+            Some((node, state)) => (Some(node), Some(state), diag),
             None => (None, None, diag),
         }
     }
 
-    /// Reserve -> PreBindPreFlight/PreBind -> Bind for the VolumeBinding plugin,
-    /// in `schedulingCycle`/`bindingCycle` order (schedule_one.go:211 Reserve,
-    /// :327 RunPreBindPlugins, :332 bind; any failure runs Unreserve:
-    /// :213 and `handleBindingCycleError` :368).
+    /// `RunReservePluginsReserve` -> `RunPreBindPreFlights` ->
+    /// `RunPreBindPlugins` -> Bind, in `schedulingCycle`/`bindingCycle` order
+    /// (schedule_one.go:211 Reserve, :282 PreBindPreFlights, :327
+    /// RunPreBindPlugins, :332 bind). Any failure runs
+    /// `RunReservePluginsUnreserve` (:213 and `handleBindingCycleError` :368).
     ///
     /// Deviation: upstream runs the binding cycle in a goroutine
     /// (schedule_one.go:123); here it runs inline in the work-queue worker, so
     /// a pod waiting on its PV controller occupies a worker for up to
-    /// BindTimeoutSeconds.
+    /// BindTimeoutSeconds. Permit is not run (no Permit plugin objects yet).
     async fn reserve_prebind_bind(
         &self,
         pod: Pod,
         node_name: &str,
-        vols: Option<volume_binding::PodVolumes>,
+        mut cycle_state: CycleState,
     ) -> rusternetes_common::Result<()> {
-        use crate::volume_bind::{self as vb, PreBindPreFlight, VolumeBindingState};
         let profile = self
             .profile_for(&pod)
             .map_err(rusternetes_common::Error::Internal)?;
-        let bind_timeout = profile.volume_bind_timeout;
-        // VolumeBinding's Reserve / PreBind run only when the pod's profile
-        // enables the plugin at those extension points (RunReservePluginsReserve
-        // :211, RunPreBindPlugins :327 iterate the profile's plugin lists).
-        let reserve_on = profile
-            .framework
-            .has(ExtensionPoint::Reserve, names::VOLUME_BINDING);
-        let prebind_on = profile
-            .framework
-            .has(ExtensionPoint::PreBind, names::VOLUME_BINDING);
-        let ns = pod
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".into());
-        let mut state = VolumeBindingState::default();
-        if let Some(v) = vols {
-            state.pod_volumes_by_node.insert(node_name.to_string(), v);
-        }
-        let env = vb::DataPlaneBinderEnv {
-            binder: &self.volume_binder,
+        let fw = &profile.framework;
+        let handle = CycleHandle {
             data: &self.data,
-            namespace: ns,
+            binder: &self.volume_binder,
+            bind_timeout: profile.volume_bind_timeout,
+            bind_poll: self.volume_bind_poll,
         };
 
-        // Reserve (volume_binding.go:531-553)
-        if reserve_on {
-            let mut b = self.volume_binder.lock().unwrap_or_else(|e| e.into_inner());
-            if let Err(e) = vb::reserve(&mut b, &mut state, &pod, node_name) {
-                drop(b);
-                // schedule_one.go:213 — Unreserve on a failed Reserve.
-                vb::unreserve(&env, &state, node_name);
-                return Err(rusternetes_common::Error::Internal(format!(
-                    "VolumeBinding Reserve failed: {e}"
-                )));
-            }
+        // Reserve (schedule_one.go:211); Unreserve on a failure (:213).
+        let status = fw
+            .run_reserve_plugins_reserve(&cycle_state, &pod, node_name, &handle)
+            .await;
+        if !status.is_success() {
+            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                .await;
+            return Err(rusternetes_common::Error::Internal(status.message()));
         }
 
-        // PreBindPreFlight + PreBind (volume_binding.go:555-601)
-        let prebind = match vb::pre_bind_preflight(&state, node_name) {
-            _ if !prebind_on => Ok(()),
-            Ok(PreBindPreFlight::Skip) => Ok(()),
-            Ok(PreBindPreFlight::Run) => {
-                vb::pre_bind(
-                    &env,
-                    &mut state,
-                    &pod,
-                    node_name,
-                    bind_timeout,
-                    self.volume_bind_poll,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
-        if let Err(e) = prebind {
-            // handleBindingCycleError (schedule_one.go:368)
-            vb::unreserve(&env, &state, node_name);
-            return Err(rusternetes_common::Error::Internal(format!(
-                "running PreBind plugin \"VolumeBinding\": {e}"
-            )));
+        // PreBindPreFlights (:282) and PreBind (:327); Unreserve on a failure
+        // (`handleBindingCycleError` :368).
+        let status = fw.run_pre_bind_pre_flights(&mut cycle_state, &pod, node_name);
+        if status.code() == crate::fwk::Code::Error || status.is_rejected() {
+            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                .await;
+            return Err(rusternetes_common::Error::Internal(status.message()));
+        }
+        let status = fw
+            .run_pre_bind_plugins(&cycle_state, &pod, node_name, &handle)
+            .await;
+        if !status.is_success() {
+            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                .await;
+            return Err(rusternetes_common::Error::Internal(status.message()));
         }
 
         // Bind (schedule_one.go:332)
-        if let Err(e) = self.bind_pod_to_node(pod, node_name).await {
-            vb::unreserve(&env, &state, node_name);
+        if let Err(e) = self.bind_pod_to_node(pod.clone(), node_name).await {
+            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                .await;
             return Err(e);
         }
         Ok(())
@@ -1445,7 +1418,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         all_pods: &[Pod],
         _priority_classes: &HashMap<String, PriorityClass>,
         diag: &mut Diagnosis,
-    ) -> Option<(Node, Option<volume_binding::PodVolumes>)> {
+    ) -> Option<(Node, CycleState)> {
         // Advanced scheduling algorithm:
         // 1. Filter out unschedulable nodes
         // 2. Check taints and tolerations
@@ -1476,6 +1449,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let handle = CycleHandle {
             data: &self.data,
             binder: &self.volume_binder,
+            bind_timeout: profile.volume_bind_timeout,
+            bind_poll: self.volume_bind_poll,
         };
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
             .run_pre_filter_plugins(&mut cycle_state, pod, nodes, &handle)
@@ -1727,17 +1702,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let best_owned = feasible[chosen].node.metadata.name.clone();
         let best_node_name = &best_owned;
 
-        // `stateData.podVolumesByNode` (volume_binding.go): the VolumeBinding
-        // Filter's per-node result, scored above; `[nodeName]`
-        // (volume_binding.go:537) is carried to Reserve/PreBind for the
-        // chosen node only.
-        let mut pod_volumes_by_node = crate::in_tree::take_pod_volumes_by_node(&cycle_state);
-        let chosen_volumes = pod_volumes_by_node.remove(best_node_name);
+        // The cycle state (the VolumeBinding Filter's per-node result among
+        // it) is carried to Reserve/PreBind/Unreserve.
         nodes
             .iter()
             .find(|n| &n.metadata.name == best_node_name)
             .cloned()
-            .map(|n| (n, chosen_volumes))
+            .map(|n| (n, cycle_state))
     }
 
     fn matches_node_selector(&self, node: &Node, selector: &HashMap<String, String>) -> bool {
@@ -2382,6 +2353,25 @@ fn parse_pod_storage_key(pod_key: &str) -> (&str, &str) {
 struct CycleHandle<'a, S: Storage + Send + Sync + 'static> {
     data: &'a DataPlane<S>,
     binder: &'a std::sync::Mutex<crate::volume_assume::VolumeBinder>,
+    /// `VolumeBindingArgs.BindTimeoutSeconds` and the poll interval of
+    /// `BindPodVolumes`.
+    bind_timeout: Duration,
+    bind_poll: Duration,
+}
+
+impl<S: Storage + Send + Sync + 'static> CycleHandle<'_, S> {
+    /// The binder's view of the cluster for a pod of namespace `ns`.
+    fn binder_env(&self, pod: &Pod) -> crate::volume_bind::DataPlaneBinderEnv<'_, S> {
+        crate::volume_bind::DataPlaneBinderEnv {
+            binder: self.binder,
+            data: self.data,
+            namespace: pod
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2413,6 +2403,43 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
         crate::pod_topology_spread_score::read_default_selector_inputs(self.data, pod)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    fn volume_reserve(
+        &self,
+        state: &mut crate::volume_bind::VolumeBindingState,
+        pod: &Pod,
+        node_name: &str,
+    ) -> Result<(), String> {
+        let mut b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
+        crate::volume_bind::reserve(&mut b, state, pod, node_name)
+    }
+
+    async fn volume_pre_bind(
+        &self,
+        state: &mut crate::volume_bind::VolumeBindingState,
+        pod: &Pod,
+        node_name: &str,
+    ) -> Result<(), String> {
+        let env = self.binder_env(pod);
+        crate::volume_bind::pre_bind(
+            &env,
+            state,
+            pod,
+            node_name,
+            self.bind_timeout,
+            self.bind_poll,
+        )
+        .await
+    }
+
+    fn volume_unreserve(
+        &self,
+        state: &crate::volume_bind::VolumeBindingState,
+        pod: &Pod,
+        node_name: &str,
+    ) {
+        crate::volume_bind::unreserve(&self.binder_env(pod), state, node_name);
     }
 
     async fn list_namespaces(

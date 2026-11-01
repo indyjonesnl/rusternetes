@@ -156,6 +156,7 @@ pub struct CycleState {
     lazy: std::sync::Mutex<HashMap<String, std::sync::Arc<dyn Any + Send + Sync>>>,
     skip_filter_plugins: HashSet<String>,
     skip_score_plugins: HashSet<String>,
+    skip_pre_bind_plugins: HashSet<String>,
 }
 
 impl CycleState {
@@ -210,6 +211,17 @@ impl CycleState {
     /// `GetSkipScorePlugins`.
     pub fn skip_score_plugins(&self) -> &HashSet<String> {
         &self.skip_score_plugins
+    }
+
+    /// `SetSkipPreBindPlugins`: plugins whose PreBind is skipped this cycle
+    /// (their PreBindPreFlight returned Skip).
+    pub fn set_skip_pre_bind_plugins(&mut self, plugins: HashSet<String>) {
+        self.skip_pre_bind_plugins = plugins;
+    }
+
+    /// `GetSkipPreBindPlugins`.
+    pub fn skip_pre_bind_plugins(&self) -> &HashSet<String> {
+        &self.skip_pre_bind_plugins
     }
 }
 
@@ -369,6 +381,39 @@ pub trait Handle: Send + Sync {
         Err("no cluster access".to_string())
     }
 
+    /// `volumeBinder.AssumePodVolumes` through VolumeBinding's `Reserve`
+    /// (volume_binding.go:531-553): assumes the chosen node's `PodVolumes` in
+    /// `state` and records `allBound`.
+    fn volume_reserve(
+        &self,
+        _state: &mut crate::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) -> Result<(), String> {
+        Err("no cluster access".to_string())
+    }
+
+    /// VolumeBinding's `PreBind` (volume_binding.go:570-601):
+    /// `volumeBinder.BindPodVolumes`.
+    async fn volume_pre_bind(
+        &self,
+        _state: &mut crate::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) -> Result<(), String> {
+        Err("no cluster access".to_string())
+    }
+
+    /// VolumeBinding's `Unreserve` (volume_binding.go:603-615):
+    /// `volumeBinder.RevertAssumedPodVolumes`.
+    fn volume_unreserve(
+        &self,
+        _state: &crate::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) {
+    }
+
     /// `nsLister.List` (interpodaffinity/scoring.go PreScore).
     async fn list_namespaces(&self) -> Result<Vec<Namespace>, String> {
         Err("no cluster access".to_string())
@@ -441,6 +486,39 @@ pub trait PreScorePlugin: Plugin {
         nodes: &[&Node],
         all_pods: &[Pod],
         all_nodes: &[Node],
+        handle: &dyn Handle,
+    ) -> Status;
+}
+
+/// `fwk.ReservePlugin`: updates plugin state when a node is chosen for the
+/// pod (`Reserve`) and rolls it back when a later step fails (`Unreserve`).
+#[async_trait]
+pub trait ReservePlugin: Plugin {
+    async fn reserve(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status;
+
+    /// `Unreserve`: must be idempotent and may be called without `Reserve`
+    /// having run.
+    async fn unreserve(&self, state: &CycleState, pod: &Pod, node_name: &str, handle: &dyn Handle);
+}
+
+/// `fwk.PreBindPlugin`: work before the pod is bound.
+#[async_trait]
+pub trait PreBindPlugin: Plugin {
+    /// `PreBindPreFlight`: `Skip` when `pre_bind` has nothing to do for the
+    /// pod, `Success` when it will work, `Error` on failure.
+    fn pre_bind_pre_flight(&self, state: &CycleState, pod: &Pod, node_name: &str) -> Status;
+
+    async fn pre_bind(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
         handle: &dyn Handle,
     ) -> Status;
 }

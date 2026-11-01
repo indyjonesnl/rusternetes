@@ -5,8 +5,9 @@
 use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
-    Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreFilterPlugin,
-    PreFilterResult, PreScorePlugin, ScorePlugin, SignFragment, SignPlugin, Status,
+    Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, Plugin, PreBindPlugin,
+    PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin, SignFragment,
+    SignPlugin, Status,
 };
 use crate::signers;
 use async_trait::async_trait;
@@ -117,6 +118,22 @@ pub fn new_score_plugin(name: &str, args: &FilterPluginArgs<'_>) -> Option<Arc<d
             args.volume_shape
                 .map_or_else(crate::volume_binding::default_shape, <[_]>::to_vec),
         ))),
+        _ => None,
+    }
+}
+
+/// The factory for an in-tree Reserve plugin by name.
+pub fn new_reserve_plugin(name: &str) -> Option<Arc<dyn ReservePlugin>> {
+    match name {
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
+        _ => None,
+    }
+}
+
+/// The factory for an in-tree PreBind plugin by name.
+pub fn new_pre_bind_plugin(name: &str) -> Option<Arc<dyn PreBindPlugin>> {
+    match name {
+        names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         _ => None,
     }
 }
@@ -854,35 +871,35 @@ const VOLUME_BINDING_STATE_KEY: &str = "PreFilterVolumeBinding";
 struct VolumeBindingFilterState {
     snap: crate::volume_binding::VolumeSnapshot,
     claims: crate::volume_binding::PodVolumeClaims,
-    /// `podVolumesByNode`; Filter runs on a shared `&CycleState`, so this is
-    /// behind a lock (upstream's `state.Lock()`).
-    pod_volumes_by_node: std::sync::Mutex<HashMap<String, crate::volume_binding::PodVolumes>>,
+    /// `podVolumesByNode` and `allBound`; Filter and Reserve run on a shared
+    /// `&CycleState`, so this is behind a lock (upstream's `state.Lock()`).
+    bind: std::sync::Mutex<crate::volume_bind::VolumeBindingState>,
 }
 
 /// Forget the per-node results of an earlier pass over the nodes.
 pub fn clear_pod_volumes_by_node(state: &CycleState) {
     if let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) {
-        s.pod_volumes_by_node
+        s.bind
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pod_volumes_by_node
             .clear();
     }
 }
 
 /// `stateData.podVolumesByNode` as the VolumeBinding Filter left it (empty
 /// when the plugin did not run).
-pub fn take_pod_volumes_by_node(
+pub fn pod_volumes_by_node(
     state: &CycleState,
 ) -> HashMap<String, crate::volume_binding::PodVolumes> {
     state
         .read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY)
         .map(|s| {
-            std::mem::take(
-                &mut *s
-                    .pod_volumes_by_node
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
+            s.bind
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pod_volumes_by_node
+                .clone()
         })
         .unwrap_or_default()
 }
@@ -895,7 +912,8 @@ pub fn take_pod_volumes_by_node(
 /// provisionable unbound WaitForFirstConsumer claims, UnschedulableAndUnresolvable
 /// with the binder's reasons otherwise.
 ///
-/// Reserve/PreBind/Score stay in the scheduler (`reserve_prebind_bind`).
+/// Reserve (:531-553), PreBindPreFlight/PreBind (:555-601) and Unreserve
+/// (:603-615) follow below; scoring is [`VolumeBindingScore`].
 pub struct VolumeBinding;
 
 impl Plugin for VolumeBinding {
@@ -936,7 +954,7 @@ impl PreFilterPlugin for VolumeBinding {
                     VolumeBindingFilterState {
                         snap,
                         claims,
-                        pod_volumes_by_node: Default::default(),
+                        bind: Default::default(),
                     },
                 );
                 (None, Status::success())
@@ -959,12 +977,88 @@ impl FilterPlugin for VolumeBinding {
                 reasons.into_iter().map(str::to_string).collect(),
             ),
             Ok((vols, _)) => {
-                s.pod_volumes_by_node
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                let mut b = s.bind.lock().unwrap_or_else(|e| e.into_inner());
+                // `state.hasStaticBindings` is derived from the map by
+                // `pre_score_skip`.
+                b.pod_volumes_by_node
                     .insert(node.metadata.name.clone(), vols);
                 Status::success()
             }
+        }
+    }
+}
+
+/// `volumebinding.VolumeBinding` Reserve, PreBindPreFlight, PreBind and
+/// Unreserve (`volume_binding.go:531-615`), over [`crate::volume_bind`] through
+/// the [`Handle`]'s binder.
+///
+/// Deviation: a pod without PVCs has no VolumeBinding state here (upstream's
+/// PreFilter writes an empty `stateData` before its `Skip`); every hook is
+/// then a no-op, as it is for the empty state.
+#[async_trait]
+impl ReservePlugin for VolumeBinding {
+    /// volume_binding.go Reserve (:531-553).
+    async fn reserve(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return Status::success();
+        };
+        let mut b = s.bind.lock().unwrap_or_else(|e| e.into_inner());
+        match handle.volume_reserve(&mut b, pod, node_name) {
+            Ok(()) => Status::success(),
+            Err(e) => Status::from_error(e),
+        }
+    }
+
+    /// volume_binding.go Unreserve (:603-615).
+    async fn unreserve(&self, state: &CycleState, pod: &Pod, node_name: &str, handle: &dyn Handle) {
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return;
+        };
+        let b = s.bind.lock().unwrap_or_else(|e| e.into_inner());
+        handle.volume_unreserve(&b, pod, node_name);
+    }
+}
+
+#[async_trait]
+impl PreBindPlugin for VolumeBinding {
+    /// volume_binding.go PreBindPreFlight (:555-568).
+    fn pre_bind_pre_flight(&self, state: &CycleState, _pod: &Pod, node_name: &str) -> Status {
+        use crate::volume_bind::PreBindPreFlight;
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return Status::new(Code::Skip, Vec::new());
+        };
+        let b = s.bind.lock().unwrap_or_else(|e| e.into_inner());
+        match crate::volume_bind::pre_bind_preflight(&b, node_name) {
+            Ok(PreBindPreFlight::Skip) => Status::new(Code::Skip, Vec::new()),
+            Ok(PreBindPreFlight::Run) => Status::success(),
+            Err(e) => Status::from_error(e),
+        }
+    }
+
+    /// volume_binding.go PreBind (:570-601). `BindPodVolumes` polls, so it
+    /// runs on a copy of the state that is stored back for `Unreserve`.
+    async fn pre_bind(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
+            return Status::success();
+        };
+        let mut working = s.bind.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let result = handle.volume_pre_bind(&mut working, pod, node_name).await;
+        *s.bind.lock().unwrap_or_else(|e| e.into_inner()) = working;
+        match result {
+            Ok(()) => Status::success(),
+            Err(e) => Status::from_error(e),
         }
     }
 }
@@ -1812,9 +1906,10 @@ impl PreScorePlugin for VolumeBindingScore {
         }
         let skip = match state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) {
             Some(s) => crate::volume_binding::pre_score_skip(
-                &s.pod_volumes_by_node
+                &s.bind
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pod_volumes_by_node,
                 enabled,
             ),
             None => false,
@@ -1837,13 +1932,12 @@ impl ScorePlugin for VolumeBindingScore {
         let Some(s) = state.read::<VolumeBindingFilterState>(VOLUME_BINDING_STATE_KEY) else {
             return (0, Status::success());
         };
-        let by_node = s
-            .pod_volumes_by_node
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let by_node = s.bind.lock().unwrap_or_else(|e| e.into_inner());
         (
             crate::volume_binding::score(
-                by_node.get(&node_info.node().metadata.name),
+                by_node
+                    .pod_volumes_by_node
+                    .get(&node_info.node().metadata.name),
                 &*self.scorer,
                 enabled,
             ),

@@ -8,8 +8,9 @@ use rusternetes_scheduler::fwk::{
     ScorePlugin,
 };
 use rusternetes_scheduler::in_tree::{
-    clear_pod_volumes_by_node, take_pod_volumes_by_node, VolumeBinding, VolumeBindingScore,
+    clear_pod_volumes_by_node, pod_volumes_by_node, VolumeBinding, VolumeBindingScore,
 };
+use rusternetes_scheduler::profile::Profile;
 use rusternetes_scheduler::volume_binding::{default_shape, VolumeSnapshot};
 use serde_json::json;
 
@@ -118,11 +119,11 @@ async fn filter_records_volumes_per_node_and_rejects_on_affinity() {
     assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
     assert!(!s.reasons().is_empty());
 
-    let by_node = take_pod_volumes_by_node(&state);
+    let by_node = pod_volumes_by_node(&state);
     assert_eq!(by_node.keys().collect::<Vec<_>>(), vec!["na"]);
-    // Taking drains it; a later pass starts empty either way.
-    assert!(take_pod_volumes_by_node(&state).is_empty());
+    // A later pass over the nodes starts empty.
     clear_pod_volumes_by_node(&state);
+    assert!(pod_volumes_by_node(&state).is_empty());
 }
 
 #[tokio::test]
@@ -186,4 +187,188 @@ async fn score_is_zero_for_a_node_without_recorded_volumes() {
     let (score, s) = plugin.score(&state, &p, &NodeInfo::new(&n, &pods));
     assert!(s.is_success());
     assert_eq!(score, 0);
+}
+
+/// A handle that records the binder calls VolumeBinding's Reserve, PreBind
+/// and Unreserve make.
+#[derive(Default)]
+struct Binder {
+    snapshot: VolumeSnapshot,
+    reserve_err: Option<String>,
+    all_bound: bool,
+    pre_binds: std::sync::atomic::AtomicUsize,
+    unreserves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Handle for Binder {
+    async fn volume_binding_snapshot(&self, _ns: &str) -> Result<VolumeSnapshot, String> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn volume_reserve(
+        &self,
+        state: &mut rusternetes_scheduler::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) -> Result<(), String> {
+        state.all_bound = self.all_bound;
+        self.reserve_err.clone().map_or(Ok(()), Err)
+    }
+
+    async fn volume_pre_bind(
+        &self,
+        _state: &mut rusternetes_scheduler::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) -> Result<(), String> {
+        self.pre_binds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn volume_unreserve(
+        &self,
+        _state: &rusternetes_scheduler::volume_bind::VolumeBindingState,
+        _pod: &Pod,
+        _node_name: &str,
+    ) {
+        self.unreserves
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn filtered_state(binder: &Binder, p: &Pod) -> CycleState {
+    let mut state = CycleState::new();
+    let (_, s) = VolumeBinding.pre_filter(&mut state, p, &[], binder).await;
+    assert!(s.is_success());
+    let mut a = node("na");
+    a.metadata.labels = Some([("zone".to_string(), "a".to_string())].into());
+    let pods: Vec<Pod> = vec![];
+    assert!(VolumeBinding
+        .filter(&state, p, &NodeInfo::new(&a, &pods))
+        .await
+        .is_success());
+    state
+}
+
+/// `RunReservePluginsReserve` wraps a plugin error as
+/// `running Reserve plugin "<name>": <err>` (framework.go:1623).
+#[tokio::test]
+async fn reserve_failure_is_wrapped_with_the_plugin_name() {
+    let binder = Binder {
+        snapshot: bound_snapshot(),
+        reserve_err: Some("boom".into()),
+        ..Default::default()
+    };
+    let p = pod_with_pvc("c");
+    let state = filtered_state(&binder, &p).await;
+    let fw = Profile::named("default-scheduler").framework;
+    let s = fw
+        .run_reserve_plugins_reserve(&state, &p, "na", &binder)
+        .await;
+    assert_eq!(s.code(), Code::Error);
+    assert_eq!(
+        s.message(),
+        "running Reserve plugin \"VolumeBinding\": boom"
+    );
+    fw.run_reserve_plugins_unreserve(&state, &p, "na", &binder)
+        .await;
+    assert_eq!(
+        binder.unreserves.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+/// `RunPreBindPreFlights` records a Skip (all volumes bound) and
+/// `RunPreBindPlugins` then leaves that plugin out (framework.go:1413-1500).
+#[tokio::test]
+async fn pre_bind_is_skipped_when_every_volume_is_bound() {
+    let binder = Binder {
+        snapshot: bound_snapshot(),
+        all_bound: true,
+        ..Default::default()
+    };
+    let p = pod_with_pvc("c");
+    let mut state = filtered_state(&binder, &p).await;
+    let fw = Profile::named("default-scheduler").framework;
+    assert!(fw
+        .run_reserve_plugins_reserve(&state, &p, "na", &binder)
+        .await
+        .is_success());
+    assert!(fw.run_pre_bind_pre_flights(&mut state, &p, "na").is_skip());
+    assert!(fw
+        .run_pre_bind_plugins(&state, &p, "na", &binder)
+        .await
+        .is_success());
+    assert_eq!(
+        binder.pre_binds.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+/// Not all bound: PreBindPreFlight succeeds and PreBind binds the volumes.
+#[tokio::test]
+async fn pre_bind_runs_when_volumes_are_not_all_bound() {
+    let binder = Binder {
+        snapshot: bound_snapshot(),
+        all_bound: false,
+        ..Default::default()
+    };
+    let p = pod_with_pvc("c");
+    let mut state = filtered_state(&binder, &p).await;
+    let fw = Profile::named("default-scheduler").framework;
+    assert!(fw
+        .run_reserve_plugins_reserve(&state, &p, "na", &binder)
+        .await
+        .is_success());
+    assert!(fw
+        .run_pre_bind_pre_flights(&mut state, &p, "na")
+        .is_success());
+    assert!(fw
+        .run_pre_bind_plugins(&state, &p, "na", &binder)
+        .await
+        .is_success());
+    assert_eq!(
+        binder.pre_binds.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+/// A node Filter never recorded is `errNoPodVolumeForNode` at PreBindPreFlight.
+#[tokio::test]
+async fn pre_bind_pre_flight_errors_for_a_node_without_pod_volumes() {
+    let binder = Binder {
+        snapshot: bound_snapshot(),
+        all_bound: false,
+        ..Default::default()
+    };
+    let p = pod_with_pvc("c");
+    let mut state = filtered_state(&binder, &p).await;
+    let fw = Profile::named("default-scheduler").framework;
+    let s = fw.run_pre_bind_pre_flights(&mut state, &p, "nb");
+    assert_eq!(s.code(), Code::Error);
+    assert!(
+        s.message().contains("no pod volume found for node"),
+        "{}",
+        s.message()
+    );
+}
+
+/// A pod without PVCs has no VolumeBinding state: every hook is a no-op.
+#[tokio::test]
+async fn pods_without_pvcs_pass_through_reserve_and_pre_bind() {
+    let binder = Binder::default();
+    let p = pod(json!([]));
+    let mut state = CycleState::new();
+    let fw = Profile::named("default-scheduler").framework;
+    assert!(fw
+        .run_reserve_plugins_reserve(&state, &p, "na", &binder)
+        .await
+        .is_success());
+    assert!(fw.run_pre_bind_pre_flights(&mut state, &p, "na").is_skip());
+    assert!(fw
+        .run_pre_bind_plugins(&state, &p, "na", &binder)
+        .await
+        .is_success());
 }
