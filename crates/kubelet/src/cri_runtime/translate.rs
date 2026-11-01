@@ -1758,11 +1758,59 @@ pub fn container_config_with_mounts(
             supports_rro,
             image_volumes,
         )?,
+        devices: make_block_volumes(pod, container, host_paths)?,
         labels,
         log_path: format!("{}.log", container.name),
         linux,
         ..Default::default()
     })
+}
+
+/// Raw block devices of one container: port of `makeBlockVolumes`
+/// (`pkg/kubelet/kubelet_pods.go:228-266`) feeding `makeDevices`
+/// (`pkg/kubelet/kuberuntime/kuberuntime_container.go:451`). The host path is
+/// the pod device map symlink (`host_paths[name]`, the mapped volume's path);
+/// permission is `mrw`, or `r` for a read-only claim. As upstream, a symlink
+/// that does not exist is skipped, a relative `devicePath` or a volume that
+/// is not mapped is an error.
+fn make_block_volumes(
+    pod: &Pod,
+    container: &Container,
+    host_paths: &HashMap<String, String>,
+) -> Result<Vec<v1::Device>, String> {
+    let mut devices = Vec::new();
+    for device in container.volume_devices.iter().flatten() {
+        if !device.device_path.starts_with('/') {
+            return Err(format!(
+                "error DevicePath `{}` must be an absolute path",
+                device.device_path
+            ));
+        }
+        let Some(host) = host_paths.get(&device.name) else {
+            return Err(format!(
+                "cannot find volume {:?} to pass into container {:?}",
+                device.name, container.name
+            ));
+        };
+        if std::fs::symlink_metadata(host)
+            .map(|m| !m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let read_only = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.iter().flatten().find(|v| v.name == device.name))
+            .map(crate::volumes::pvc_read_only)
+            .unwrap_or(false);
+        devices.push(v1::Device {
+            host_path: host.clone(),
+            container_path: device.device_path.clone(),
+            permissions: if read_only { "r" } else { "mrw" }.to_string(),
+        });
+    }
+    Ok(devices)
 }
 
 /// Build the Docker-link-style service env a container sees, per upstream

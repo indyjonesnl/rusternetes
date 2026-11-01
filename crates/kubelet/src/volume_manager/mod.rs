@@ -318,6 +318,18 @@ impl VolumeManager {
             };
             if let Some(mounter) = mounted.mounter.as_ref() {
                 paths.insert(outer, mounter.get_path());
+            } else if let Some(mapper) = mounted.block_volume_mapper.as_ref() {
+                // A block volume has a `BlockVolumeMapper` instead of a
+                // mounter (`volume_manager.go:320`); `makeBlockVolumes`
+                // reads its pod device map symlink (`kubelet_pods.go:243`).
+                let (dir, name) = mapper.get_pod_device_map_path();
+                paths.insert(
+                    outer,
+                    std::path::Path::new(&dir)
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
         paths
