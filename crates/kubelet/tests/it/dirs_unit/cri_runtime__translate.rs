@@ -2747,4 +2747,64 @@ mod tests {
         )
         .is_err());
     }
+
+    // makeBlockVolumes (kubelet_pods.go:228): symlink -> CRI Device.
+    #[test]
+    fn volume_devices_become_cri_devices() {
+        use rusternetes_common::resources::pod::VolumeDevice;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dev");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut c = Container {
+            name: "app".to_string(),
+            image: "busybox".to_string(),
+            ..Default::default()
+        };
+        c.volume_devices = Some(vec![VolumeDevice {
+            name: "blk".to_string(),
+            device_path: "/dev/xvda".to_string(),
+        }]);
+        let pod = pod_with(PodSpec {
+            containers: vec![c.clone()],
+            ..Default::default()
+        });
+        let host_paths = HashMap::from([("blk".to_string(), link.to_string_lossy().into_owned())]);
+        let cfg = container_config(
+            &pod,
+            &c,
+            "img",
+            &host_paths,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.devices.len(), 1);
+        assert_eq!(cfg.devices[0].container_path, "/dev/xvda");
+        assert_eq!(cfg.devices[0].host_path, link.to_string_lossy());
+        assert_eq!(cfg.devices[0].permissions, "mrw");
+
+        // Relative devicePath and unmapped volume are errors.
+        let mut bad = c.clone();
+        bad.volume_devices.as_mut().unwrap()[0].device_path = "dev/x".to_string();
+        assert!(container_config(
+            &pod,
+            &bad,
+            "img",
+            &host_paths,
+            &HashMap::new(),
+            &HashMap::new()
+        )
+        .is_err());
+        assert!(container_config(
+            &pod,
+            &c,
+            "img",
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new()
+        )
+        .is_err());
+    }
 }
