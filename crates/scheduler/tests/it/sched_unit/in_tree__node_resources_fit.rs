@@ -211,12 +211,30 @@ async fn nominated_pods_reserve_space_in_the_first_pass_only() {
     assert!(without.is_success());
 }
 
+/// A node with no `status.allocatable` has an allowed pod number of 0, so
+/// even a pod without requests is "Too many pods" (fit.go:649-659), and a
+/// request over the (zero) capacity is unresolvable.
 #[tokio::test]
-async fn node_without_allocatable_is_not_filtered() {
+async fn node_without_allocatable_rejects_every_pod() {
     let n: Node = serde_json::from_value(json!({"metadata": {"name": "n"}})).unwrap();
-    assert!(run(&pod("p", "", json!({"cpu": "100"})), &n, &[])
-        .await
-        .is_success());
+    let s = run(&pod("p", "", json!({})), &n, &[]).await;
+    assert_eq!(s.code(), Code::Unschedulable);
+    assert_eq!(s.reasons(), vec!["Too many pods"]);
+    let s = run(&pod("p", "", json!({"cpu": "100"})), &n, &[]).await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+    assert_eq!(s.reasons(), vec!["Too many pods", "Insufficient cpu"]);
+}
+
+/// A terminating pod still holds its requests and its pod slot until it is
+/// gone (`NodeInfo` keeps it; only terminal pods leave the informer).
+#[tokio::test]
+async fn terminating_pods_count_against_the_node() {
+    let n = node(json!({"cpu": "1", "memory": "20", "pods": "2"}));
+    let mut terminating = pod("e", "n", json!({"cpu": "1"}));
+    terminating.metadata.deletion_timestamp = Some(chrono::Utc::now());
+    let s = run(&pod("p", "", json!({"cpu": "1"})), &n, &[terminating]).await;
+    assert_eq!(s.code(), Code::Unschedulable);
+    assert_eq!(s.reasons(), vec!["Insufficient cpu"]);
 }
 
 fn ignored(resources: &[&str], groups: &[&str]) -> NodeResourcesFit {
