@@ -238,3 +238,45 @@ async fn volume_missing_from_node_status_is_not_attachable() {
     let attached = mounter.asw.get_attached_volume(&name).unwrap();
     assert!(!attached.plugin_is_attachable);
 }
+
+/// `WaitForUnmount` (`volume_manager.go:475-511`): a terminated pod's sync
+/// waits until the reconciler has unmounted its volumes, and reports what is
+/// still mounted when it gives up.
+#[tokio::test]
+async fn wait_for_unmount_waits_for_the_reconciler() {
+    let dir = tempfile::tempdir().unwrap();
+    // Mounted by this kubelet, so the actual state has it `VolumeMounted`
+    // (a reconstructed volume is only uncertain: `PodHasMountedVolumes`).
+    let (mounter, shell) = kubelet(dir.path(), vec![]).await;
+    mounter.create_pod_volumes(&pod("gone")).await.unwrap();
+    assert!(!mounter.asw.get_mounted_volumes().is_empty());
+    shell
+        .desired_state_of_world_populator
+        .set_has_added_pods(true);
+    shell
+        .reconciler
+        .update_reconstructed_from_node_status()
+        .await;
+
+    let err = shell
+        .wait_for_unmount_within(&pod("gone"), std::time::Duration::from_millis(50))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("mounted volumes="), "{err}");
+
+    shell.reconciler.reconcile().await; // unmountVolumes
+    assert!(mounter.asw.get_all_mounted_volumes().is_empty());
+    shell
+        .wait_for_unmount_within(&pod("gone"), std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+}
+
+/// A pod with nothing mounted has nothing to wait for.
+#[tokio::test]
+async fn wait_for_unmount_returns_at_once_without_mounted_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_mounter, shell) = kubelet(dir.path(), vec![]).await;
+    shell.wait_for_unmount(&pod("never")).await.unwrap();
+}

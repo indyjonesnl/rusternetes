@@ -335,6 +335,57 @@ impl VolumeManager {
         paths
     }
 
+    /// Port of `WaitForUnmount` (`volume_manager.go:475-511`): waits for the
+    /// reconciler to unmount every volume of a terminated pod
+    /// (`SyncTerminatedPod`, `kubelet.go:2364`).
+    pub async fn wait_for_unmount(&self, pod: &Pod) -> anyhow::Result<()> {
+        self.wait_for_unmount_within(pod, POD_ATTACH_AND_MOUNT_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::wait_for_unmount`] with the `podAttachAndMountTimeout` given.
+    pub async fn wait_for_unmount_within(
+        &self,
+        pod: &Pod,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let pod_name = crate::volume_plugins::util::get_unique_pod_name(pod);
+        self.desired_state_of_world_populator
+            .reprocess_pod(&pod_name);
+
+        // `wait.PollUntilContextTimeout(.., immediate=true, verifyVolumesUnmountedFunc)`
+        let deadline = tokio::time::Instant::now() + timeout;
+        let failure = loop {
+            // `verifyVolumesUnmountedFunc` (`volume_manager.go:570-577`)
+            let errors = self.desired_state_of_world.pop_pod_errors(&pod_name);
+            if !errors.is_empty() {
+                break errors.join("; ");
+            }
+            if !self
+                .actual_state_of_world
+                .pod_has_mounted_volumes(&pod_name)
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break "context deadline exceeded".to_string();
+            }
+            tokio::time::sleep(POD_ATTACH_AND_MOUNT_RETRY_INTERVAL).await;
+        };
+
+        let mut mounted: Vec<String> = self
+            .actual_state_of_world
+            .get_mounted_volumes_for_pod(&pod_name)
+            .into_iter()
+            .map(|v| v.0.volume_name.0)
+            .collect();
+        if mounted.is_empty() {
+            return Ok(());
+        }
+        mounted.sort();
+        Err(anyhow::anyhow!("mounted volumes={mounted:?}: {failure}"))
+    }
+
     /// Port of `Run` (`volume_manager.go:290-310`): starts the populator
     /// (`go vm.desiredStateOfWorldPopulator.Run(sourcesReady)`) and the
     /// reconciler (`go vm.reconciler.Run(stopCh)`).
