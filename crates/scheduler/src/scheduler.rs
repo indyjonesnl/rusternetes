@@ -241,8 +241,23 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// logged, never propagated — a failed event must not abort a
     /// bind/scheduling decision.
     async fn emit_pod_event(&self, pod: &Pod, event_type: EventType, reason: &str, message: &str) {
+        self.emit_pod_event_from(pod, pod, event_type, reason, message)
+            .await;
+    }
+
+    /// [`Scheduler::emit_pod_event`] about `pod`, recorded by the profile of
+    /// `recorder_pod` (`Eventf(victim, preemptor, ..)` goes through the
+    /// preemptor's profile recorder).
+    async fn emit_pod_event_from(
+        &self,
+        recorder_pod: &Pod,
+        pod: &Pod,
+        event_type: EventType,
+        reason: &str,
+        message: &str,
+    ) {
         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let component = crate::profile::pod_scheduler_name(pod);
+        let component = crate::profile::pod_scheduler_name(recorder_pod);
         // API mode: POST through the data plane's client recorder.
         if let Some(recorder) = self.recorder.as_ref() {
             let involved = ObjectReference {
@@ -991,15 +1006,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 ns,
                 name
             );
-            for victim in &victims {
-                if let Err(e) = self.evict_pod(&pod, victim).await {
-                    error!(
-                        "Failed to evict victim pod {}/{}: {}",
-                        victim.metadata.namespace.as_deref().unwrap_or("default"),
-                        victim.metadata.name,
-                        e
-                    );
-                }
+            // `prepareCandidate` (preemption.go:464-500): a failed eviction
+            // is a scheduling error and nothing is nominated.
+            if let Err(e) = self
+                .prepare_candidate(Some(queue), &pod, &node_name, &victims)
+                .await
+            {
+                error!("Error preempting for pod {}/{}: {}", ns, name, e);
+                return Err(e);
             }
             self.nominate(queue, &pod, &pod_key, &node_name).await;
             // The preemptor stays unschedulable this cycle (PostFilter only
@@ -1192,15 +1206,16 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     );
 
                     // Evict lower-priority pods
-                    for victim in &pods_to_evict {
-                        if let Err(e) = self.evict_pod(&pod, victim).await {
-                            error!(
-                                "Failed to evict pod {}/{}: {}",
-                                victim.metadata.namespace.as_deref().unwrap_or("default"),
-                                victim.metadata.name,
-                                e
-                            );
-                        }
+                    if let Err(e) = self
+                        .prepare_candidate(None, &pod, &node_name, &pods_to_evict)
+                        .await
+                    {
+                        error!(
+                            "Failed to preempt for pod {}/{}: {}",
+                            pod.metadata.namespace.as_deref().unwrap_or("default"),
+                            pod.metadata.name,
+                            e
+                        );
                     }
 
                     // After evicting victims, try to bind the preemptor immediately.
@@ -1996,6 +2011,80 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .map(|c| (c.node_name, c.victims))
     }
 
+    /// `prepareCandidate` (preemption.go:464-500): evict the victims in
+    /// parallel, at most [`PREEMPTION_PARALLELISM`] at a time and giving up on
+    /// the first error (`parallelize.Until` + `errCh.SendErrorWithCancel`),
+    /// then clear the nomination of the lower-priority pods nominated to the
+    /// node, which may no longer fit there (their requeue lets the scheduler
+    /// place them sooner than waiting for the preemption to finish). A failure
+    /// to clear nominations is not critical and only logged. Victims whose
+    /// deletion already started need no API call.
+    ///
+    /// Deviation: this is the synchronous form (`prepareCandidate`), not
+    /// `prepareCandidateAsync`; the victims' deletion is awaited in the cycle.
+    /// Not ported: rejecting a victim that is a waiting pod (needs Permit).
+    pub async fn prepare_candidate(
+        &self,
+        queue: Option<&PriorityQueue>,
+        preemptor: &Pod,
+        node_name: &str,
+        victims: &[Pod],
+    ) -> rusternetes_common::Result<()> {
+        use futures::TryStreamExt;
+        futures::stream::iter(
+            victims
+                .iter()
+                .filter(|v| v.metadata.deletion_timestamp.is_none())
+                .map(Ok::<&Pod, rusternetes_common::Error>),
+        )
+        .try_for_each_concurrent(PREEMPTION_PARALLELISM, |victim| {
+            self.preempt_pod(preemptor, node_name, victim)
+        })
+        .await?;
+
+        let Some(queue) = queue else {
+            return Ok(());
+        };
+        for p in get_lower_priority_nominated_pods(queue, preemptor, node_name) {
+            queue.add_nominated_pod(&p, Some(&NominatingInfo::override_node("")));
+            let ns = p.metadata.namespace.as_deref().unwrap_or("default");
+            let key = format!("{}/{}", ns, p.metadata.name);
+            self.update_pod_status_with_retry(&key, |pod| {
+                if let Some(ref mut status) = pod.status {
+                    status.nominated_node_name = None;
+                }
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    /// `PreemptPod` (preemption.go:177-219): stamp DisruptionTarget and delete
+    /// the victim ([`Scheduler::evict_pod`]), then record the `Preempted` event
+    /// on it. A victim that is already gone is not an error and gets no event.
+    async fn preempt_pod(
+        &self,
+        preemptor: &Pod,
+        node_name: &str,
+        victim: &Pod,
+    ) -> rusternetes_common::Result<()> {
+        if !self.evict_pod(preemptor, victim).await? {
+            return Ok(());
+        }
+        self.emit_pod_event_from(
+            preemptor,
+            victim,
+            EventType::Normal,
+            "Preempted",
+            &format!(
+                "Preempted by pod {} on node {}",
+                preemptor.metadata.uid, node_name
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
     /// Evict a pod by setting its deletionTimestamp (graceful delete).
     /// The kubelet will detect the deletionTimestamp and handle graceful shutdown.
     ///
@@ -2003,7 +2092,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// `util.DeletePod` (`cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, ...)`,
     /// pkg/scheduler/util/utils.go:137-138). Matching on name alone evicted a
     /// same-named pod in every other namespace too (#2477).
-    pub async fn evict_pod(&self, preemptor: &Pod, victim: &Pod) -> rusternetes_common::Result<()> {
+    pub async fn evict_pod(
+        &self,
+        preemptor: &Pod,
+        victim: &Pod,
+    ) -> rusternetes_common::Result<bool> {
         let pod_name = victim.metadata.name.as_str();
         let victim_ns = victim.metadata.namespace.as_deref().unwrap_or("default");
         let all_pods: Vec<Pod> = self.data.list_pods().await?;
@@ -2052,12 +2145,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         pod_name, grace
                     );
                 }
-                return Ok(());
+                return Ok(true);
             }
         }
 
         warn!("Pod {}/{} not found for eviction", victim_ns, pod_name);
-        Ok(())
+        Ok(false)
     }
 
     /// Load all PriorityClasses from storage into a HashMap for fast lookup
@@ -2435,4 +2528,22 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
             .sync_namespace(ns, &snap);
         Ok(snap)
     }
+}
+
+/// `parallelize.DefaultParallelism` (pkg/scheduler/framework/parallelize/parallelism.go:27).
+const PREEMPTION_PARALLELISM: usize = 16;
+
+/// `getLowerPriorityNominatedPods` (preemption.go:746-761): the pods nominated
+/// to `node_name` with a lower priority than `pod`.
+fn get_lower_priority_nominated_pods(
+    queue: &PriorityQueue,
+    pod: &Pod,
+    node_name: &str,
+) -> Vec<Pod> {
+    let priority = pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
+    queue
+        .nominated_pods_for_node(node_name)
+        .into_iter()
+        .filter(|p| p.spec.as_ref().and_then(|s| s.priority).unwrap_or(0) < priority)
+        .collect()
 }
