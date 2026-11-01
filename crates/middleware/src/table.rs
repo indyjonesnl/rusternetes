@@ -344,6 +344,14 @@ const PCR_ANNOTATIONS_DOC: &str = "unverifiedUserAnnotations allow pod authors t
 /// (certificates/v1beta1 types_swagger_doc_generated.go:100).
 const CTB_SIGNER_NAME_DOC: &str = "signerName indicates the associated signer, if any.\n\nIn order to create or update a ClusterTrustBundle that sets signerName, you must have the following cluster-scoped permission: group=certificates.k8s.io resource=signers resourceName=<the signer name> verb=attest.\n\nIf signerName is not empty, then the ClusterTrustBundle object must be named with the signer name as a prefix (translating slashes to colons). For example, for the signer name `example.com/foo`, valid ClusterTrustBundle object names include `example.com:foo:abc` and `example.com:foo:v1`.\n\nIf signerName is empty, then the ClusterTrustBundle object's name must not have such a prefix.\n\nList/watch requests for ClusterTrustBundles can filter on this field using a `spec.signerName=NAME` field selector.";
 
+/// `DeviceTaint` swagger docs (resource/v1 types_swagger_doc_generated.go:319-325,
+/// the `resourceapi` import of printers.go:43).
+const DEVICE_TAINT_KEY_DOC: &str = "The taint key to be applied to a device. Must be a label name.";
+const DEVICE_TAINT_VALUE_DOC: &str =
+    "The taint value corresponding to the taint key. Must be a label value.";
+const DEVICE_TAINT_EFFECT_DOC: &str = "The effect of the taint on claims that do not tolerate the taint and through such claims on the pods using them.\n\nValid effects are None, NoSchedule and NoExecute. PreferNoSchedule as used for nodes is not valid here. More effects may get added in the future. Consumers must treat unknown effects like None.";
+const DEVICE_TAINT_TIME_ADDED_DOC: &str = "TimeAdded represents the time at which the taint was added. Added automatically during create or update if not set.";
+
 fn col(
     name: &str,
     column_type: &str,
@@ -503,6 +511,16 @@ pub fn printer_columns(kind: &str) -> Option<Vec<ColumnDefinition>> {
         "ClusterTrustBundle" => vec![
             col("Name", "string", "name", OBJECT_META_NAME_DOC, 0),
             col("SignerName", "string", "", CTB_SIGNER_NAME_DOC, 0),
+        ],
+        // printers.go:700-713 (`deviceTaintColumnDefinitions`). The filter
+        // criteria are deliberately not printed.
+        "DeviceTaintRule" => vec![
+            col("Name", "string", "name", OBJECT_META_NAME_DOC, 0),
+            col("Key", "string", "", DEVICE_TAINT_KEY_DOC, 0),
+            col("Value", "string", "", DEVICE_TAINT_VALUE_DOC, 0),
+            col("Effect", "string", "", DEVICE_TAINT_EFFECT_DOC, 0),
+            col("TimeAdded", "string", "", DEVICE_TAINT_TIME_ADDED_DOC, 0),
+            col("Age", "string", "", OBJECT_META_CREATION_TIMESTAMP_DOC, 0),
         ],
         // pkg/printers/internalversion/printers.go:426-436
         // (`podCertificateRequestColumnDefinitions`); descriptions are the
@@ -764,6 +782,29 @@ pub fn printer_row_cells(kind: &str, obj: &serde_json::Value) -> Option<Vec<serd
                 } else {
                     signer
                 }),
+            ]
+        }
+        // printers.go:3255-3267 (`printDeviceTaint`): an unset timeAdded is
+        // an empty cell, a set one is `translateTimestampSince`.
+        "DeviceTaintRule" => {
+            let time_added = obj
+                .pointer("/spec/taint/timeAdded")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    humanize_age(
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc)),
+                    )
+                })
+                .unwrap_or_default();
+            vec![
+                Value::String(name),
+                Value::String(str_at(obj, &["spec", "taint", "key"]).unwrap_or_default()),
+                Value::String(str_at(obj, &["spec", "taint", "value"]).unwrap_or_default()),
+                Value::String(str_at(obj, &["spec", "taint", "effect"]).unwrap_or_default()),
+                Value::String(time_added),
+                Value::String(age),
             ]
         }
         // printers.go:2356-2381 (`printPodCertificateRequest`): "Issued",
