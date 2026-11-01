@@ -79,4 +79,17 @@ mod tests {
         assert!(insecure.contains(&"TLS_RSA_WITH_RC4_128_SHA".to_string()));
         assert!(preferred.iter().all(|p| !insecure.contains(p)));
     }
+
+    /// secure_serving.go:177-201: 100 streams unless the flag sets more, 256 KiB
+    /// per stream and frame, and a connection window of stream window times
+    /// stream count.
+    #[test]
+    fn http2_settings_follow_serve() {
+        let k = 256 * 1024;
+        assert_eq!(http2_settings(0), (100, k, k * 100));
+        assert_eq!(http2_settings(-5), (100, k, k * 100));
+        assert_eq!(http2_settings(250), (250, k, k * 250));
+        // The connection window is an int32 upstream; never above its range.
+        assert_eq!(http2_settings(i32::MAX).2, i32::MAX as u32);
+    }
 }

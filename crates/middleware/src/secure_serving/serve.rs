@@ -22,7 +22,7 @@
 //! Deliberate reductions, each tracked in the issue: Go cipher suites that
 //! rustls does not implement (CBC, RC4, 3DES, RSA key exchange) and
 //! `VersionTLS10`/`VersionTLS11` are rejected with an error; SNI certificates,
-//! `--http2-max-streams-per-connection`, `--permit-port-sharing` and
+//! `--permit-port-sharing` and
 //! `--permit-address-sharing` are not offered.
 
 use super::authn::CaContent;
@@ -247,6 +247,8 @@ pub struct SecureServingInfo {
     pub cipher_suites: Vec<SupportedCipherSuite>,
     pub min_tls_version: TlsVersion,
     pub disable_http2: bool,
+    /// `HTTP2MaxStreamsPerConnection`; 0 = [`DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS`].
+    pub http2_max_streams_per_connection: i32,
     /// The union of every client CA (`ClientCA`): the TLS layer requests a
     /// client certificate and lists these as acceptable CAs.
     pub client_cas: Vec<Arc<CaContent>>,
@@ -392,6 +394,33 @@ pub fn build_server_config(info: &SecureServingInfo) -> Result<Arc<rustls::Serve
     Ok(Arc::new(config))
 }
 
+/// At least 99% of serialized resources in surveyed clusters were smaller than
+/// 256kb (`resourceBody99Percentile`, secure_serving.go:177-181).
+const HTTP2_RESOURCE_BODY_99_PERCENTILE: u32 = 256 * 1024;
+/// `http2Options.MaxConcurrentStreams` when the flag is unset
+/// (secure_serving.go:194-197).
+pub const DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// The HTTP/2 settings `SecureServingInfo.Serve` configures
+/// (secure_serving.go:183-201): `(max concurrent streams, per-stream window and
+/// max frame size, per-connection window)`.
+pub fn http2_settings(max_streams_per_connection: i32) -> (u32, u32, u32) {
+    let streams = if max_streams_per_connection > 0 {
+        max_streams_per_connection as u32
+    } else {
+        DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS
+    };
+    (
+        streams,
+        HTTP2_RESOURCE_BODY_99_PERCENTILE,
+        // MaxUploadBufferPerConnection = MaxUploadBufferPerStream * MaxConcurrentStreams;
+        // saturating, as an int32 would overflow upstream well past any sane limit.
+        HTTP2_RESOURCE_BODY_99_PERCENTILE
+            .saturating_mul(streams)
+            .min(i32::MAX as u32),
+    )
+}
+
 /// A TLS acceptor that injects the verified client-cert chain as a
 /// [`crate::PeerCertificates`] request extension (the equivalent of
 /// `req.TLS.PeerCertificates`).
@@ -455,13 +484,24 @@ pub fn serve(handler: Router, info: SecureServingInfo) -> Result<ServerHandle, S
         .set_nonblocking(true)
         .map_err(|e| format!("unable to set the listener non-blocking: {e}"))?;
     let handle = axum_server::Handle::new();
-    let server = axum_server::from_tcp(
+    let mut server = axum_server::from_tcp(
         info.listener
             .try_clone()
             .map_err(|e| format!("unable to clone the listener: {e}"))?,
     )
     .acceptor(PeerCertAcceptor::new(rustls_config.clone()))
     .handle(handle.clone());
+    if !info.disable_http2 {
+        let (streams, stream_window, connection_window) =
+            http2_settings(info.http2_max_streams_per_connection);
+        server
+            .http_builder()
+            .http2()
+            .max_concurrent_streams(streams)
+            .initial_stream_window_size(stream_window)
+            .max_frame_size(stream_window)
+            .initial_connection_window_size(connection_window);
+    }
     let reload_config = rustls_config.clone();
     let task = tokio::spawn(async move {
         let reload = async move {
