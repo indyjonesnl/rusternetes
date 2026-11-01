@@ -389,7 +389,9 @@ fn audit_rotation_options(
 /// `--audit-policy-file` + `--audit-log-path` build the audit pipeline.
 /// Like `WithAudit` (filters/audit.go:42), a missing policy or sink leaves
 /// auditing off.
-async fn install_audit_from_flags(args: &Args) -> Result<()> {
+async fn install_audit_from_flags(
+    args: &Args,
+) -> Result<Vec<std::sync::Arc<rusternetes_api_server::audit_webhook::BufferedBackend>>> {
     if args.audit_log_format != "json" {
         anyhow::bail!(
             "invalid audit log format {:?}: only \"json\" is supported",
@@ -420,7 +422,7 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
                 "no audit policy file provided, no events will be recorded for the log or webhook backend"
             );
         }
-        return Ok(());
+        return Ok(Vec::new());
     };
     let yaml = std::fs::read_to_string(policy_file)
         .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
@@ -440,20 +442,61 @@ async fn install_audit_from_flags(args: &Args) -> Result<()> {
         // `AuditLogOptions.newBackend`: truncate wraps the log backend.
         sinks.push(audit_log_truncate_options(args).wrap_backend(log));
     }
+    let mut buffered = Vec::new();
     if webhook.enabled() {
-        sinks.push(webhook.new_backend()?.0);
+        let (backend, b) = webhook.new_backend()?;
+        sinks.push(backend);
+        buffered.extend(b);
     }
     // `c.AuditBackend = appendBackend(logBackend, dynamicBackend)`.
     let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = match sinks.len() {
         0 => {
             warn!("auditing needs --audit-log-path or --audit-webhook-config-file; it is off");
-            return Ok(());
+            return Ok(Vec::new());
         }
         1 => sinks.remove(0),
         _ => std::sync::Arc::new(rusternetes_api_server::audit_webhook::UnionBackend(sinks)),
     };
     audit::install_audit(audit::AuditConfig { policy, sink });
-    Ok(())
+    Ok(buffered)
+}
+
+/// Flush the buffered audit backends when the process is told to stop.
+///
+/// Upstream runs each backend with the server's stop channel and calls
+/// `Shutdown` once it closes (pkg/server/config.go `AuditBackend.Run` post-start
+/// hook, plugin/pkg/audit/buffered/buffered.go `Run`): buffered events are
+/// sent and in-flight deliveries awaited before the process exits. This
+/// server has no graceful-shutdown path, so SIGTERM/SIGINT flush the backends
+/// and then exit; a second signal exits at once.
+fn spawn_audit_shutdown(
+    buffered: Vec<std::sync::Arc<rusternetes_api_server::audit_webhook::BufferedBackend>>,
+) {
+    if buffered.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
+            return;
+        };
+        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        info!("Shutting down audit backends");
+        let flush = async {
+            for b in &buffered {
+                b.shutdown().await;
+            }
+        };
+        tokio::select! {
+            _ = flush => {}
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        std::process::exit(0);
+    });
 }
 
 /// Apply `--emulated-version`, `--min-compatibility-version` and
@@ -571,7 +614,8 @@ async fn main() -> Result<()> {
         admission::event_rate_limit::install(plugin);
     }
 
-    install_audit_from_flags(&args).await?;
+    let audit_buffered = install_audit_from_flags(&args).await?;
+    spawn_audit_shutdown(audit_buffered);
 
     info!(
         "Starting Rusternetes API Server {}",
