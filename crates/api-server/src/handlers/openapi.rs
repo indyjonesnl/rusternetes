@@ -67,7 +67,9 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
     // Group-level documents (`api`, `apis`, `apis/<group>`): the discovery
     // endpoints' own definitions (kube-openapi handler3 publishes them).
     for key in upstream_group_docs().keys() {
-        paths.insert(key.clone(), path_entry(key));
+        if openapi_path_served(key) {
+            paths.insert(key.clone(), path_entry(key));
+        }
     }
     paths.insert("api/v1".into(), path_entry("api/v1"));
     // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
@@ -85,6 +87,9 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
         ("networking.k8s.io", "v1"),
         ("rbac.authorization.k8s.io", "v1"),
         ("storage.k8s.io", "v1"),
+        // StorageVersionMigration (storage_storagemigration.go:54-70),
+        // dropped below while the StorageVersionMigrator gate is off.
+        ("storagemigration.k8s.io", "v1beta1"),
         ("scheduling.k8s.io", "v1"),
         ("apiextensions.k8s.io", "v1"),
         ("apiregistration.k8s.io", "v1"),
@@ -105,10 +110,10 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
         ("resource.k8s.io", "v1"),
         ("events.k8s.io", "v1"),
     ] {
-        paths.insert(
-            format!("apis/{}/{}", group, version),
-            path_entry(&format!("apis/{}/{}", group, version)),
-        );
+        let key = format!("apis/{}/{}", group, version);
+        if openapi_path_served(&key) {
+            paths.insert(key.clone(), path_entry(&key));
+        }
     }
 
     // Dynamically add CRD group/version paths
@@ -162,6 +167,11 @@ pub async fn get_openapi_spec_path(
     headers: HeaderMap,
     axum::extract::Path(gv_path): axum::extract::Path<String>,
 ) -> Response {
+    // A group version whose storage was never installed has no document.
+    if !openapi_path_served(gv_path.trim_matches('/')) {
+        return axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND);
+    }
+
     // The group-level discovery documents are upstream's verbatim.
     if let Some(doc) = upstream_group_docs().get(gv_path.trim_matches('/')) {
         return openapi_v3_response(&headers, doc);
@@ -468,6 +478,9 @@ pub(crate) fn upstream_v3_schemas(
         ("scheduling.k8s.io", "v1") => {
             include_str!("../../openapi/upstream/v1.35/scheduling.k8s.io__v1.schemas.json")
         }
+        ("storagemigration.k8s.io", "v1beta1") => include_str!(
+            "../../openapi/upstream/v1.35/storagemigration.k8s.io__v1beta1.schemas.json"
+        ),
         ("storage.k8s.io", "v1") => {
             include_str!("../../openapi/upstream/v1.35/storage.k8s.io__v1.schemas.json")
         }
@@ -581,6 +594,21 @@ fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Val
         ))
         .unwrap_or_default()
     })
+}
+
+/// Whether the `/openapi/v3` document at `path` (`apis/<group>[/<version>]`)
+/// is published. `storagemigration.k8s.io/v1beta1` has a single resource,
+/// installed only while the `StorageVersionMigrator` gate is on
+/// (pkg/registry/storagemigration/rest/storage_storagemigration.go:41-43,
+/// :54-70), and upstream drops a group version with no storage, so its
+/// documents go with it (the same gate `discovery` applies).
+fn openapi_path_served(path: &str) -> bool {
+    if path == "apis/storagemigration.k8s.io" || path.starts_with("apis/storagemigration.k8s.io/") {
+        return rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::StorageVersionMigrator,
+        );
+    }
+    true
 }
 
 /// Parse the group and version from an OpenAPI v3 path.
@@ -921,7 +949,25 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
     // `pkg/builder` output published as api/openapi-spec/swagger.json); the
     // stubs only remain for kinds upstream has no definition for.
     for (key, def) in upstream_v2_definitions() {
-        definitions.insert(key.clone(), def.clone());
+        // Definitions of an unserved group version are not published (see
+        // [`openapi_path_served`]).
+        // `DeleteOptions` / `WatchEvent` list every group version: they stay
+        // while any of theirs is served.
+        let gvks = def["x-kubernetes-group-version-kind"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let unserved = !gvks.is_empty()
+            && gvks.iter().all(|g| {
+                !openapi_path_served(&format!(
+                    "apis/{}/{}",
+                    g["group"].as_str().unwrap_or_default(),
+                    g["version"].as_str().unwrap_or_default()
+                ))
+            });
+        if !unserved {
+            definitions.insert(key.clone(), def.clone());
+        }
     }
 
     serde_json::json!({

@@ -44,6 +44,7 @@ GVS = [
     "apis__resource.k8s.io__v1",
     "apis__scheduling.k8s.io__v1",
     "apis__storage.k8s.io__v1",
+    "apis__storagemigration.k8s.io__v1beta1",
 ]
 served = set()
 for gv in GVS:
