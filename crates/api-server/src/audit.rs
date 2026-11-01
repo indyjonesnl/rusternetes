@@ -659,6 +659,76 @@ impl AuditContext {
         g.event.response_object = Some(obj);
     }
 
+    /// `LogRequestObject` (audit/request.go:93-158): below Metadata nothing is
+    /// recorded; the event's ObjectRef is completed from the object where the
+    /// request did not already name those fields; at Request and above the
+    /// object itself becomes `RequestObject`, minus `managedFields` when the
+    /// request's audit config omits them.
+    fn log_request_object(
+        &self,
+        obj: &serde_json::Value,
+        gvr: (&str, &str, &str),
+        subresource: &str,
+    ) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if level_ord(&g.event.level) < 1 {
+            return;
+        }
+        let mut request_object = obj.clone();
+        if g.config.omit_managed_fields {
+            remove_managed_fields(&mut request_object);
+        }
+        let meta = obj.get("metadata");
+        let m = |k: &str| {
+            meta.and_then(|m| m.get(k))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let r = g.event.object_ref.get_or_insert_with(Default::default);
+        if r.namespace.as_deref().unwrap_or("").is_empty() {
+            r.namespace = m("namespace");
+        }
+        if r.name.as_deref().unwrap_or("").is_empty() {
+            r.name = m("name");
+        }
+        if r.uid.as_deref().unwrap_or("").is_empty() {
+            r.uid = m("uid");
+        }
+        if r.resource_version.as_deref().unwrap_or("").is_empty() {
+            r.resource_version = m("resourceVersion");
+        }
+        if r.api_version.as_deref().unwrap_or("").is_empty() {
+            r.api_group = Some(gvr.0.to_string()).filter(|s| !s.is_empty());
+            r.api_version = Some(gvr.1.to_string());
+        }
+        if r.resource.as_deref().unwrap_or("").is_empty() {
+            r.resource = Some(gvr.2.to_string());
+        }
+        if r.subresource.as_deref().unwrap_or("").is_empty() {
+            r.subresource = Some(subresource.to_string()).filter(|s| !s.is_empty());
+        }
+        if level_ord(&g.event.level) < 2 {
+            return;
+        }
+        g.event.request_object = Some(request_object);
+    }
+
+    /// `AuditContext.LogRequestPatch` (context.go:177-184) behind
+    /// `LogRequestPatch`'s level check (request.go:161-168): the patch
+    /// document becomes `RequestObject`.
+    fn log_request_patch(&self, patch: serde_json::Value) {
+        let Ok(mut g) = self.inner.lock() else {
+            return;
+        };
+        if level_ord(&g.event.level) < 2 {
+            return;
+        }
+        g.event.request_object = Some(patch);
+    }
+
     /// `GetEventLevel`.
     pub fn level(&self) -> AuditLevel {
         self.inner
@@ -733,6 +803,47 @@ pub fn log_response_object<B: serde::Serialize>(obj: &B) {
                 "encoding failed of response object (auditID {}): {e}",
                 ac.audit_id()
             ),
+        }
+    });
+}
+
+/// `audit.LogRequestObject(ctx, obj, objGV, gvr, subresource, s)`
+/// (audit/request.go:93-158), called by the create, update and delete
+/// handlers once the body is decoded. A no-op when the request is not audited;
+/// the level is checked before the object is serialized.
+pub fn log_request_object<B: serde::Serialize>(
+    obj: &B,
+    gvr: (&str, &str, &str),
+    subresource: Option<&str>,
+) {
+    let _ = AUDIT_CONTEXT.try_with(|ac| {
+        if ac.level_ord() < 1 {
+            return;
+        }
+        match serde_json::to_value(obj) {
+            Ok(v) => ac.log_request_object(&v, gvr, subresource.unwrap_or("")),
+            Err(e) => error!(
+                "encoding failed of request object (auditID {}): {e}",
+                ac.audit_id()
+            ),
+        }
+    });
+}
+
+/// `audit.LogRequestPatch(ctx, patch)` (audit/request.go:161-168), called by
+/// the patch handler. The document is recorded as JSON; a YAML apply patch is
+/// converted (upstream records the raw bytes as `Unknown` with a JSON content
+/// type, which would not be valid JSON for YAML).
+pub fn log_request_patch(patch: &[u8]) {
+    let _ = AUDIT_CONTEXT.try_with(|ac| {
+        if ac.level_ord() < 2 {
+            return;
+        }
+        let v = serde_json::from_slice::<serde_json::Value>(patch)
+            .ok()
+            .or_else(|| serde_yaml::from_slice::<serde_json::Value>(patch).ok());
+        if let Some(v) = v {
+            ac.log_request_patch(v);
         }
     });
 }
@@ -831,6 +942,7 @@ fn new_audit_context(
         }),
         response_status: None,
         response_object: None,
+        request_object: None,
         request_received_timestamp: received,
         stage_timestamp: received,
         annotations: None,

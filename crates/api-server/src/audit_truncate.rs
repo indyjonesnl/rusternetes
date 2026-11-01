@@ -9,8 +9,7 @@
 //! Deviations: `AuditBackend::log` delivers one event at a time, so the
 //! batch-splitting half of `ProcessEvents` (`MaxBatchSize`) has nothing to
 //! split; the option is kept and validated, as upstream's callers
-//! (`WithAudit`) also hand the backend one event per call. `AuditEvent` has no
-//! `requestObject` field yet, so only `responseObject` is dropped.
+//! (`WithAudit`) also hand the backend one event per call.
 
 use crate::audit_webhook::handle_plugin_error;
 use async_trait::async_trait;
@@ -98,10 +97,11 @@ fn calc_size(event: &AuditEvent) -> Result<i64, String> {
         .map_err(|e| e.to_string())
 }
 
-/// `truncate` (truncate.go:121-136): drop the response object and mark the
-/// event.
+/// `truncate` (truncate.go:121-136): drop the request and response objects
+/// and mark the event.
 fn truncate(event: &AuditEvent) -> AuditEvent {
     let mut e = event.clone();
+    e.request_object = None;
     e.response_object = None;
     e.annotations
         .get_or_insert_with(Default::default)

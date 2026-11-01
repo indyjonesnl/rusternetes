@@ -9,6 +9,7 @@ mod apiservice_registration;
 mod audit;
 mod audit_log_batch;
 mod audit_metrics;
+mod audit_request_object;
 mod audit_truncate;
 mod audit_webhook;
 mod authorization_config;

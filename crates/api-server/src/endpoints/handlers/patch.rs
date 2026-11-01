@@ -85,6 +85,8 @@ pub async fn patch_resource<T: Object>(
 
     let options = checked_patch_options(params, content_type)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
+    // patch.go:133: `audit.LogRequestPatch`, after the options are validated.
+    crate::audit::log_request_patch(body);
 
     // patchResource (patch.go:653-691): pick the mechanism. Apply may create.
     let mechanism = match content_type {

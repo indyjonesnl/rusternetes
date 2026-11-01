@@ -780,6 +780,7 @@ rules:
                     object_ref: None,
                     response_status: None,
                     response_object: None,
+                    request_object: None,
                     request_received_timestamp: Utc::now(),
                     stage_timestamp: Utc::now(),
                     annotations: None,
