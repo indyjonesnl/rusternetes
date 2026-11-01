@@ -507,6 +507,8 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
 
     rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
+    // The audit metrics register at init upstream (audit/metrics.go).
+    rusternetes_api_server::audit_metrics::register_metrics();
     rusternetes_common::dump::install_panic_hook("api-server");
     for msg in args.upstream.ignored_flags() {
         warn!("{msg}");
