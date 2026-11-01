@@ -31,7 +31,7 @@ fn alloc() -> Value {
 async fn run(p: &Pod, n: &Node, existing: &[Pod]) -> Status {
     let mut state = CycleState::new();
     let (result, status) = NodeResourcesFit
-        .pre_filter(&mut state, p, &[], &NoHandle)
+        .pre_filter(&mut state, p, &[], &[], &NoHandle)
         .await;
     assert!(result.is_none() && status.is_success());
     NodeResourcesFit
@@ -174,7 +174,13 @@ async fn nominated_pods_reserve_space_in_the_first_pass_only() {
     nominee.status = Some(serde_json::from_value(json!({"nominatedNodeName": "n"})).unwrap());
     let mut state = CycleState::new();
     let (_, pre, _) = fw
-        .run_pre_filter_plugins(&mut state, &candidate, std::slice::from_ref(&n), &NoHandle)
+        .run_pre_filter_plugins(
+            &mut state,
+            &candidate,
+            std::slice::from_ref(&n),
+            &[],
+            &NoHandle,
+        )
         .await;
     assert!(pre.is_success());
     let all = vec![nominee.clone()];

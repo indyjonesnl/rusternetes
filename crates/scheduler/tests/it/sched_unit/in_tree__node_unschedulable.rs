@@ -76,7 +76,7 @@ async fn framework_dispatches_the_plugin_object_and_names_it() {
     let pods: Vec<Pod> = vec![];
     let mut state = CycleState::new();
     let (_, pre, _) = fw
-        .run_pre_filter_plugins(&mut state, &bare_pod(), &[], &NoHandle)
+        .run_pre_filter_plugins(&mut state, &bare_pod(), &[], &[], &NoHandle)
         .await;
     assert!(pre.is_success());
     let s = fw

@@ -68,6 +68,7 @@ pub fn new_pre_filter_plugin(
         names::NODE_VOLUME_LIMITS => Some(Arc::new(NodeVolumeLimits)),
         names::VOLUME_BINDING => Some(Arc::new(VolumeBinding)),
         names::DYNAMIC_RESOURCES => Some(Arc::new(DynamicResources)),
+        names::INTER_POD_AFFINITY => Some(Arc::new(InterPodAffinity)),
         _ => None,
     }
 }
@@ -390,6 +391,7 @@ impl PreFilterPlugin for NodeAffinityPlugin {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         let spec = pod.spec.as_ref();
@@ -515,6 +517,7 @@ impl PreFilterPlugin for NodePorts {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         let wanted = crate::advanced::collect_host_ports(pod);
@@ -592,6 +595,7 @@ impl PreFilterPlugin for NodeResourcesFit {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         _handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         state.write(
@@ -743,23 +747,23 @@ impl FilterPlugin for PodTopologySpread {
     }
 }
 
-/// `interpodaffinity.ErrReasonAffinityRulesNotMatch` (filtering.go:39).
-pub const ERR_REASON_AFFINITY_RULES_NOT_MATCH: &str = "node(s) didn't match pod affinity rules";
-/// `interpodaffinity.ErrReasonAntiAffinityRulesNotMatch` (filtering.go:41).
-pub const ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH: &str =
-    "node(s) didn't match pod anti-affinity rules";
+pub use crate::inter_pod_affinity_filter::{
+    ERR_REASON_AFFINITY_RULES_NOT_MATCH, ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH,
+    ERR_REASON_EXISTING_ANTI_AFFINITY_RULES_NOT_MATCH,
+};
 
-/// `interpodaffinity.InterPodAffinity` Filter (filtering.go:410-432): required
-/// pod affinity unmet is UnschedulableAndUnresolvable, required pod
-/// anti-affinity violated is Unschedulable.
+/// `preFilterStateKey` of the InterPodAffinity plugin.
+const INTER_POD_AFFINITY_STATE_KEY: &str = "PreFilterInterPodAffinity";
+
+/// `interpodaffinity.InterPodAffinity` PreFilter and Filter
+/// (`plugins/interpodaffinity/filtering.go:277-310`, `:424-432`) over
+/// [`crate::inter_pod_affinity_filter`]: required pod affinity unmet is
+/// UnschedulableAndUnresolvable, required pod anti-affinity violated (the
+/// incoming pod's, or an existing pod's against the incoming pod) is
+/// Unschedulable.
 ///
-/// Deviations: the terms are evaluated per node by
-/// [`crate::advanced::check_pod_affinity`] /
-/// `check_pod_anti_affinity` instead of PreFilter-computed topology counts
-/// (:150-260); existing pods' anti-affinity against the incoming pod
-/// (`ErrReasonExistingAntiAffinityRulesNotMatch`) is not checked; nominated
-/// pods are not counted. PreFilter, namespace selectors' defaulting and
-/// `PreFilterExtensions` are not ported.
+/// Deviation: `PreFilterExtensions` (AddPod/RemovePod) are not ported, so
+/// nominated pods and preemption what-ifs do not update the counts.
 pub struct InterPodAffinity;
 
 impl Plugin for InterPodAffinity {
@@ -769,31 +773,54 @@ impl Plugin for InterPodAffinity {
 }
 
 #[async_trait]
+impl PreFilterPlugin for InterPodAffinity {
+    async fn pre_filter(
+        &self,
+        state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        handle: &dyn Handle,
+    ) -> (Option<PreFilterResult>, Status) {
+        use crate::inter_pod_affinity_filter as ipa;
+        let namespaces = if ipa::needs_namespaces(pod, all_pods) {
+            match handle.list_namespaces().await {
+                Ok(n) => n,
+                Err(e) => return (None, Status::from_error(format!("listing namespaces: {e}"))),
+            }
+        } else {
+            Vec::new()
+        };
+        match ipa::pre_filter(pod, nodes, all_pods, &namespaces) {
+            Ok(Some(s)) => {
+                state.write(INTER_POD_AFFINITY_STATE_KEY, s);
+                (None, Status::success())
+            }
+            Ok(None) => (None, Status::new(Code::Skip, Vec::new())),
+            Err(ipa::PreFilterError::Unresolvable(m)) => (
+                None,
+                Status::new(Code::UnschedulableAndUnresolvable, vec![m]),
+            ),
+            Err(ipa::PreFilterError::Error(m)) => (None, Status::from_error(m)),
+        }
+    }
+}
+
+#[async_trait]
 impl FilterPlugin for InterPodAffinity {
-    async fn filter(&self, _state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
-        if pod.spec.is_none() {
-            return Status::success();
+    async fn filter(&self, state: &CycleState, _pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
+        let Some(s) = state
+            .read::<crate::inter_pod_affinity_filter::PreFilterState>(INTER_POD_AFFINITY_STATE_KEY)
+        else {
+            return missing_state(INTER_POD_AFFINITY_STATE_KEY);
+        };
+        match crate::inter_pod_affinity_filter::filter(s, node_info.node()) {
+            None => Status::success(),
+            Some((reason, true)) => {
+                Status::new(Code::UnschedulableAndUnresolvable, vec![reason.to_string()])
+            }
+            Some((reason, false)) => Status::new(Code::Unschedulable, vec![reason.to_string()]),
         }
-        let (node, pods, nodes) = (
-            node_info.node(),
-            node_info.all_pods(),
-            node_info.all_nodes(),
-        );
-        let (affinity_ok, _) = crate::advanced::check_pod_affinity(node, pod, pods, nodes);
-        if !affinity_ok {
-            return Status::new(
-                Code::UnschedulableAndUnresolvable,
-                vec![ERR_REASON_AFFINITY_RULES_NOT_MATCH.to_string()],
-            );
-        }
-        let (anti_ok, _) = crate::advanced::check_pod_anti_affinity(node, pod, pods, nodes);
-        if !anti_ok {
-            return Status::new(
-                Code::Unschedulable,
-                vec![ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH.to_string()],
-            );
-        }
-        Status::success()
     }
 }
 
@@ -829,6 +856,7 @@ impl PreFilterPlugin for NodeVolumeLimits {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         if !crate::node_volume_limits::CsiLimits::pre_filter(pod) {
@@ -929,6 +957,7 @@ impl PreFilterPlugin for VolumeBinding {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         use crate::volume_binding::{self, PreFilterOutcome};
@@ -1103,6 +1132,7 @@ impl PreFilterPlugin for DynamicResources {
         state: &mut CycleState,
         pod: &Pod,
         _nodes: &[Node],
+        _all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status) {
         let refs = pod

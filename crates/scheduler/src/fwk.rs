@@ -343,6 +343,7 @@ pub trait PreFilterPlugin: Plugin {
         state: &mut CycleState,
         pod: &Pod,
         nodes: &[Node],
+        all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status);
 }

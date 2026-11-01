@@ -1,11 +1,15 @@
 //! InterPodAffinity and PodTopologySpread Filter plugin objects: the codes
 //! and reasons of `interpodaffinity/filtering.go:410-432` and
 //! `podtopologyspread/filtering.go:309-358`.
+use super::listers::EmptyListers;
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Status};
+use rusternetes_scheduler::fwk::{
+    Code, CycleState, FilterPlugin, NodeInfo, PreFilterPlugin, Status,
+};
 use rusternetes_scheduler::in_tree::{
     InterPodAffinity, PodTopologySpread, ERR_REASON_AFFINITY_RULES_NOT_MATCH,
     ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH, ERR_REASON_CONSTRAINTS_NOT_MATCH,
+    ERR_REASON_EXISTING_ANTI_AFFINITY_RULES_NOT_MATCH,
 };
 use serde_json::{json, Value};
 
@@ -22,6 +26,20 @@ fn pod(name: &str, node_name: &str, spec: Value) -> Pod {
         "spec": spec
     }))
     .unwrap()
+}
+
+/// PreFilter then Filter, as the framework runs them: a `Skip` skips Filter.
+async fn run_ipa(p: &Pod, on: &Node, nodes: &[Node], pods: &[Pod]) -> Status {
+    let mut state = CycleState::new();
+    let (_, s) = InterPodAffinity
+        .pre_filter(&mut state, p, nodes, pods, &EmptyListers)
+        .await;
+    if !s.is_success() {
+        return if s.is_skip() { Status::success() } else { s };
+    }
+    InterPodAffinity
+        .filter(&state, p, &NodeInfo::new(on, pods).with_all_nodes(nodes))
+        .await
 }
 
 async fn run(
@@ -53,24 +71,10 @@ async fn required_affinity_unmet_is_unresolvable() {
         "",
         json!({"affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": term()}}}),
     );
-    let s = run(
-        &InterPodAffinity,
-        &p,
-        &nodes[1],
-        &nodes,
-        std::slice::from_ref(&existing),
-    )
-    .await;
+    let s = run_ipa(&p, &nodes[1], &nodes, std::slice::from_ref(&existing)).await;
     assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
     assert_eq!(s.reasons(), vec![ERR_REASON_AFFINITY_RULES_NOT_MATCH]);
-    let s = run(
-        &InterPodAffinity,
-        &p,
-        &nodes[0],
-        &nodes,
-        std::slice::from_ref(&existing),
-    )
-    .await;
+    let s = run_ipa(&p, &nodes[0], &nodes, std::slice::from_ref(&existing)).await;
     assert!(s.is_success());
 }
 
@@ -83,24 +87,10 @@ async fn required_anti_affinity_violated_is_unschedulable() {
         "",
         json!({"affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": term()}}}),
     );
-    let s = run(
-        &InterPodAffinity,
-        &p,
-        &nodes[0],
-        &nodes,
-        std::slice::from_ref(&existing),
-    )
-    .await;
+    let s = run_ipa(&p, &nodes[0], &nodes, std::slice::from_ref(&existing)).await;
     assert_eq!(s.code(), Code::Unschedulable);
     assert_eq!(s.reasons(), vec![ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH]);
-    let s = run(
-        &InterPodAffinity,
-        &p,
-        &nodes[1],
-        &nodes,
-        std::slice::from_ref(&existing),
-    )
-    .await;
+    let s = run_ipa(&p, &nodes[1], &nodes, std::slice::from_ref(&existing)).await;
     assert!(s.is_success());
 }
 
@@ -108,9 +98,7 @@ async fn required_anti_affinity_violated_is_unschedulable() {
 async fn pod_without_affinity_passes() {
     let nodes = vec![node("a", "z1")];
     let p = pod("p", "", json!({}));
-    assert!(run(&InterPodAffinity, &p, &nodes[0], &nodes, &[])
-        .await
-        .is_success());
+    assert!(run_ipa(&p, &nodes[0], &nodes, &[]).await.is_success());
     assert!(run(&PodTopologySpread, &p, &nodes[0], &nodes, &[])
         .await
         .is_success());
@@ -133,4 +121,63 @@ async fn topology_spread_skew_exceeded_is_unschedulable() {
     assert_eq!(s.reasons(), vec![ERR_REASON_CONSTRAINTS_NOT_MATCH]);
     let s = run(&PodTopologySpread, &p, &nodes[1], &nodes, &existing).await;
     assert!(s.is_success());
+}
+
+/// `satisfyExistingPodsAntiAffinity`: an existing pod's required
+/// anti-affinity that matches the incoming pod keeps it out of the topology
+/// (TestSatisfiesExistingPodsAntiAffinity).
+#[tokio::test]
+async fn existing_pods_anti_affinity_is_unschedulable() {
+    let nodes = vec![node("a", "z1"), node("b", "z2")];
+    let existing = pod(
+        "e",
+        "a",
+        json!({"affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": term()}}}),
+    );
+    let p = pod("p", "", json!({}));
+    let s = run_ipa(&p, &nodes[0], &nodes, std::slice::from_ref(&existing)).await;
+    assert_eq!(s.code(), Code::Unschedulable);
+    assert_eq!(
+        s.reasons(),
+        vec![ERR_REASON_EXISTING_ANTI_AFFINITY_RULES_NOT_MATCH]
+    );
+    let s = run_ipa(&p, &nodes[1], &nodes, std::slice::from_ref(&existing)).await;
+    assert!(s.is_success());
+}
+
+/// The first pod of a series with affinity to itself is allowed
+/// (`satisfyPodAffinity` :408-417), but only on a node with the topology key.
+#[tokio::test]
+async fn self_affinity_lets_the_first_pod_in() {
+    let mut keyless = node("c", "x");
+    keyless.metadata.labels = Some(Default::default());
+    let nodes = vec![node("a", "z1"), keyless];
+    let p = pod(
+        "p",
+        "",
+        json!({"affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": term()}}}),
+    );
+    assert!(run_ipa(&p, &nodes[0], &nodes, &[]).await.is_success());
+    let s = run_ipa(&p, &nodes[1], &nodes, &[]).await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+}
+
+/// A pod whose affinity selector cannot be parsed is
+/// UnschedulableAndUnresolvable at PreFilter ("parsing pod: ...").
+#[tokio::test]
+async fn unparsable_selector_fails_pre_filter() {
+    let nodes = vec![node("a", "z1")];
+    let p = pod(
+        "p",
+        "",
+        json!({"affinity": {"podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{
+            "labelSelector": {"matchExpressions": [{"key": "app", "operator": "Bogus"}]},
+            "topologyKey": "zone"
+        }]}}}),
+    );
+    let (_, s) = InterPodAffinity
+        .pre_filter(&mut CycleState::new(), &p, &nodes, &[], &EmptyListers)
+        .await;
+    assert_eq!(s.code(), Code::UnschedulableAndUnresolvable);
+    assert!(s.message().starts_with("parsing pod:"), "{}", s.message());
 }

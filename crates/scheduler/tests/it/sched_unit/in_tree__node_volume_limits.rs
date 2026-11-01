@@ -36,7 +36,7 @@ fn node() -> Node {
 async fn pod_without_pvc_volumes_is_skipped() {
     let p = pod(json!([{"name": "v", "emptyDir": {}}]));
     let (r, s) = NodeVolumeLimits
-        .pre_filter(&mut CycleState::new(), &p, &[], &NoHandle)
+        .pre_filter(&mut CycleState::new(), &p, &[], &[], &NoHandle)
         .await;
     assert!(r.is_none() && s.is_skip());
 }
@@ -49,6 +49,7 @@ async fn snapshot_failure_is_a_pre_filter_error() {
             &mut CycleState::new(),
             &p,
             &[],
+            &[],
             &Listers(Err("boom".into())),
         )
         .await;
@@ -59,6 +60,7 @@ async fn snapshot_failure_is_a_pre_filter_error() {
         .run_pre_filter_plugins(
             &mut CycleState::new(),
             &p,
+            &[],
             &[],
             &Listers(Err("boom".into())),
         )
@@ -75,7 +77,7 @@ async fn missing_pvc_is_unresolvable_on_filter() {
     let p = pod(json!([{"name": "v", "persistentVolumeClaim": {"claimName": "gone"}}]));
     let mut state = CycleState::new();
     let (_, s) = NodeVolumeLimits
-        .pre_filter(&mut state, &p, &[], &Listers(Ok(())))
+        .pre_filter(&mut state, &p, &[], &[], &Listers(Ok(())))
         .await;
     assert!(s.is_success());
     let n = node();

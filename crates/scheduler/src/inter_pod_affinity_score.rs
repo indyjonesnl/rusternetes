@@ -43,27 +43,27 @@ impl Default for Args {
 
 /// `fwk.AffinityTerm`.
 #[derive(Clone, Debug)]
-struct AffinityTerm {
-    namespaces: HashSet<String>,
-    selector: Selector,
-    topology_key: String,
-    namespace_selector: Selector,
+pub(crate) struct AffinityTerm {
+    pub(crate) namespaces: HashSet<String>,
+    pub(crate) selector: Selector,
+    pub(crate) topology_key: String,
+    pub(crate) namespace_selector: Selector,
 }
 
 /// `fwk.WeightedAffinityTerm`.
 #[derive(Clone, Debug)]
-struct WeightedAffinityTerm {
+pub(crate) struct WeightedAffinityTerm {
     term: AffinityTerm,
     weight: i32,
 }
 
-fn pod_namespace(pod: &Pod) -> &str {
+pub(crate) fn pod_namespace(pod: &Pod) -> &str {
     pod.metadata.namespace.as_deref().unwrap_or("default")
 }
 
 impl AffinityTerm {
     /// `newAffinityTerm` + `getNamespacesFromPodAffinityTerm`.
-    fn new(pod: &Pod, term: &PodAffinityTerm) -> Result<Self, String> {
+    pub(crate) fn new(pod: &Pod, term: &PodAffinityTerm) -> Result<Self, String> {
         let selector = label_selector_as_selector(term.label_selector.as_ref())?;
         let mut namespaces = HashSet::new();
         let term_namespaces = term.namespaces.as_deref().unwrap_or(&[]);
@@ -82,7 +82,7 @@ impl AffinityTerm {
     }
 
     /// `AffinityTerm.Matches`.
-    fn matches(&self, pod: &Pod, ns_labels: Option<&HashMap<String, String>>) -> bool {
+    pub(crate) fn matches(&self, pod: &Pod, ns_labels: Option<&HashMap<String, String>>) -> bool {
         if self.namespaces.contains(pod_namespace(pod))
             || self.namespace_selector.matches(ns_labels)
         {
@@ -94,7 +94,7 @@ impl AffinityTerm {
     /// `mergeAffinityTermNamespacesIfNotEmpty` (plugin.go:144-157): the
     /// namespaces selected by a non-empty `NamespaceSelector` are unrolled
     /// into `Namespaces` and the selector becomes `Nothing()`.
-    fn merge_namespaces_if_not_empty(&mut self, namespaces: &[Namespace]) {
+    pub(crate) fn merge_namespaces_if_not_empty(&mut self, namespaces: &[Namespace]) {
         // `labels.Selector.Empty()`: only `Everything()` is empty; `Nothing()`
         // reports false but selects no namespace, so it merges nothing.
         if self.namespace_selector.is_everything() {
@@ -112,12 +112,13 @@ impl AffinityTerm {
 /// The parsed inter-pod affinity terms of a pod (`framework.PodInfo.Update`).
 /// A category whose terms fail to parse is left empty, as upstream leaves the
 /// `PodInfo` field nil and returns the aggregate error.
-#[derive(Default)]
-struct PodInfo {
-    required_affinity_terms: Vec<AffinityTerm>,
+#[derive(Default, Clone)]
+pub(crate) struct PodInfo {
+    pub(crate) required_affinity_terms: Vec<AffinityTerm>,
+    pub(crate) required_anti_affinity_terms: Vec<AffinityTerm>,
     preferred_affinity_terms: Vec<WeightedAffinityTerm>,
     preferred_anti_affinity_terms: Vec<WeightedAffinityTerm>,
-    errors: Vec<String>,
+    pub(crate) errors: Vec<String>,
 }
 
 fn weighted_terms(
@@ -136,7 +137,7 @@ fn weighted_terms(
 }
 
 impl PodInfo {
-    fn new(pod: &Pod) -> Self {
+    pub(crate) fn new(pod: &Pod) -> Self {
         let mut info = PodInfo::default();
         let Some(affinity) = pod.spec.as_ref().and_then(|s| s.affinity.as_ref()) else {
             return info;
@@ -173,19 +174,17 @@ impl PodInfo {
                 Ok(t) => info.preferred_anti_affinity_terms = t,
                 Err(e) => info.errors.push(format!("preferredAntiAffinityTerms: {e}")),
             }
-            // The required anti-affinity terms are parsed upstream
-            // (`requiredAntiAffinityTerms`) so that a bad selector fails
-            // PreScore; they are not otherwise read here.
             let required = a
                 .required_during_scheduling_ignored_during_execution
                 .as_deref()
                 .unwrap_or(&[]);
-            if let Err(e) = required
+            match required
                 .iter()
                 .map(|t| AffinityTerm::new(pod, t))
                 .collect::<Result<Vec<_>, _>>()
             {
-                info.errors.push(format!("requiredAntiAffinityTerms: {e}"));
+                Ok(t) => info.required_anti_affinity_terms = t,
+                Err(e) => info.errors.push(format!("requiredAntiAffinityTerms: {e}")),
             }
         }
         info
@@ -319,7 +318,7 @@ fn process_existing_pod(
     );
 }
 
-fn has_pod_affinity(pod: &Pod) -> bool {
+pub(crate) fn has_pod_affinity(pod: &Pod) -> bool {
     pod.spec
         .as_ref()
         .and_then(|s| s.affinity.as_ref())
