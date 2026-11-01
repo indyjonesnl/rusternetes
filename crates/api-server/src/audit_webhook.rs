@@ -176,6 +176,7 @@ pub trait BatchBackend: Send + Sync {
 /// `audit.HandlePluginError` (pkg/audit/metrics.go): log the failure and the
 /// events it cost.
 pub(crate) fn handle_plugin_error(plugin: &str, err: &str, count: usize) {
+    crate::audit_metrics::count_plugin_error(plugin, count);
     error!("Error in audit plugin '{plugin}' affecting {count} audit events: {err}");
 }
 

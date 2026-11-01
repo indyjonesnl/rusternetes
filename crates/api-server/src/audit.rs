@@ -549,6 +549,8 @@ impl AuditContext {
             g.event.stage = stage;
             g.event.clone()
         };
+        // `ObserveEvent` (context.go:129).
+        crate::audit_metrics::observe_event();
         match self.sink.log(event).await {
             Ok(()) => true,
             Err(e) => {
@@ -862,6 +864,8 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     attrs.user = Some(user_info.clone());
 
     let rac = cfg.policy.evaluate(&attrs);
+    // `audit.ObservePolicyLevel` (filters/audit.go:131).
+    crate::audit_metrics::observe_policy_level(&rac.level);
     if rac.level == AuditLevel::None {
         // "Don't audit."
         return next.run(req).await;
@@ -880,7 +884,8 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     }
 
     if !ac.process_event_stage(AuditStage::RequestReceived).await {
-        // "failed to store audit event" (audit.go:~62)
+        // "failed to store audit event" (audit.go:62)
+        crate::audit_metrics::observe_request_rejected();
         return internal_error("failed to store audit event");
     }
 
@@ -948,6 +953,7 @@ pub async fn with_failed_request_audit(
     };
     attrs.user = Some(user_info.clone());
     let rac = cfg.policy.evaluate(&attrs);
+    crate::audit_metrics::observe_policy_level(&rac.level);
     if rac.level == AuditLevel::None {
         // `!ac.Enabled()` (:118-121).
         return failed;

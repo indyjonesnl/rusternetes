@@ -5,6 +5,7 @@ extern crate self as rusternetes_api_server;
 pub mod abac;
 pub mod admission;
 pub mod audit;
+pub mod audit_metrics;
 pub mod audit_truncate;
 pub mod audit_webhook;
 pub mod authorization_config;
