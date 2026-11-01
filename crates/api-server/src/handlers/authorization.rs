@@ -24,6 +24,12 @@ pub async fn create_subject_access_review(
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut sar): DumpingJson<SubjectAccessReview>,
 ) -> Result<(StatusCode, Json<SubjectAccessReview>)> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &sar,
+        ("authorization.k8s.io", "v1", "subjectaccessreviews"),
+        None,
+    );
     info!("Creating subject access review");
 
     // Check authorization - creating a SubjectAccessReview requires impersonation privileges
@@ -115,6 +121,12 @@ pub async fn create_self_subject_access_review(
     headers: axum::http::HeaderMap,
     DumpingJson(mut ssar): DumpingJson<SelfSubjectAccessReview>,
 ) -> Result<(StatusCode, Json<SelfSubjectAccessReview>)> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &ssar,
+        ("authorization.k8s.io", "v1", "selfsubjectaccessreviews"),
+        None,
+    );
     info!(
         "Creating self subject access review for user: {}",
         auth_ctx.user.username
@@ -212,6 +224,12 @@ pub async fn create_local_subject_access_review(
     Path(namespace): Path<String>,
     DumpingJson(mut lsar): DumpingJson<LocalSubjectAccessReview>,
 ) -> Result<(StatusCode, Json<LocalSubjectAccessReview>)> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &lsar,
+        ("authorization.k8s.io", "v1", "localsubjectaccessreviews"),
+        None,
+    );
     info!(
         "Creating local subject access review in namespace: {}",
         namespace
@@ -315,6 +333,12 @@ pub async fn create_self_subject_rules_review(
     Extension(auth_ctx): Extension<AuthContext>,
     DumpingJson(mut ssrr): DumpingJson<SelfSubjectRulesReview>,
 ) -> Result<(StatusCode, Json<SelfSubjectRulesReview>)> {
+    // create.go:161: `audit.LogRequestObject`, once the body is decoded.
+    crate::audit::log_request_object(
+        &ssrr,
+        ("authorization.k8s.io", "v1", "selfsubjectrulesreviews"),
+        None,
+    );
     info!(
         "Creating self subject rules review for user: {} in namespace: {}",
         auth_ctx.user.username, ssrr.spec.namespace
