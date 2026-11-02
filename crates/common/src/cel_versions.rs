@@ -98,6 +98,9 @@ const STRINGS_V0: &[&str] = &[
     "substring",
     "trim",
     "upperAscii",
+    // Declared at every version (`ext/strings.go:498-534`); only the binding
+    // differs between v0 and v2.
+    "join",
 ];
 
 const STRINGS_V2: &[&str] = &[
@@ -387,6 +390,13 @@ pub fn default_compatibility_version() -> Version {
 /// that resolves in no library of `env`, as the `Detail` of the compilation
 /// error, or `None`. Syntax errors are not reported here.
 pub fn compile_failure(expression: &str, set: &EnvSet, env: EnvType) -> Option<String> {
+    let result = probe_failure(expression, set, env);
+    // Default-off shadow run of the checker port; never changes `result`.
+    crate::cel_checker_shadow::observe(expression, set, env, &result);
+    result
+}
+
+fn probe_failure(expression: &str, set: &EnvSet, env: EnvType) -> Option<String> {
     let source = expression.to_string();
     let program = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         cel::Program::compile(&source)
