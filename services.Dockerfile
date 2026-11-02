@@ -273,6 +273,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-client \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
+        -p rusternetes-cel-checker \
         -p rusternetes-cri \
         -p rusternetes-middleware \
         -p rusternetes-protobuf \

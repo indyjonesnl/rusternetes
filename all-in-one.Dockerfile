@@ -185,6 +185,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-client \
         -p rusternetes-cloud-providers \
         -p rusternetes-common \
+        -p rusternetes-cel-checker \
         -p rusternetes-controller-manager \
         -p rusternetes-cri \
         -p rusternetes-discovery \
