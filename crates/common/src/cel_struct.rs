@@ -1,10 +1,13 @@
 //! CEL struct initializers for MutatingAdmissionPolicy: `Object{}`,
 //! `Object.spec{}` and `JSONPatch{}`.
 //!
-//! The `cel` 0.13 crate parses `Type{field: value}` into `Expr::Struct` but its
-//! interpreter has `Expr::Struct(_) => todo!("Support structs!")`
-//! (`cel-0.13.0/src/objects.rs:1433`) and no type registry, so executing one
-//! panics. Upstream resolves the names through cel-go's type provider:
+//! The `cel` crate parses `Type{field: value}` into `Expr::Struct`. Since 0.15
+//! it can construct struct values from types registered on an `Env`
+//! (`Env::add_type`, `StructType`), but this module was written against 0.13,
+//! whose interpreter had `Expr::Struct(_) => todo!("Support structs!")`, and
+//! still rewrites structs to maps (re-basing it on registered `StructType`s is
+//! tracked in #3440). Upstream resolves the names through cel-go's type
+//! provider:
 //!
 //! * `DynamicTypeResolver.Resolve`
 //!   (`staging/src/k8s.io/apiserver/pkg/cel/mutation/typeresolver.go:32-42`):
@@ -76,6 +79,8 @@ const OBJECT_ITERABLE_FN: &str = "__objectIterable";
 /// dotted name.
 /// Guard replacing the `_?._` optional-select operator ([`opt_select`]).
 const OPT_SELECT_FN: &str = "__optSelect";
+/// Replacement for the stdlib `type` overload (see [`rewrite`]).
+const TYPE_FN: &str = "__type";
 const JSON_PATCH_ESCAPE_KEY_FN: &str = "jsonpatch.escapeKey";
 
 /// A compiled CEL expression whose struct initializers have been rewritten.
@@ -88,10 +93,22 @@ impl CompiledExpression {
     }
 }
 
+/// `Context::add_function` for a name that is known not to be a standard
+/// library overload: cel 0.15 fails with `OverloadConflict` otherwise, which
+/// is a programming error here.
+pub(crate) fn add_function<T: 'static, F>(ctx: &mut Context<'_, '_>, name: &str, f: F)
+where
+    F: cel::extractors::IntoFunction<T> + 'static + Send + Sync,
+{
+    ctx.add_function(name, f)
+        .unwrap_or_else(|e| panic!("cannot declare CEL function {name}: {e}"));
+}
+
 /// A default CEL [`Context`] with the struct-literal guard functions.
-pub fn new_context() -> Context<'static> {
+pub fn new_context() -> Context<'static, 'static> {
     let mut ctx = Context::default();
-    ctx.add_function(
+    add_function(
+        &mut ctx,
         JSON_PATCH_STRING_FN,
         |v: Value| -> Result<Value, ExecutionError> {
             match v {
@@ -108,7 +125,8 @@ pub fn new_context() -> Context<'static> {
     );
     // jsonpatch.go:76-80 `jsonPatchReplacer` ("/" -> "~1", "~" -> "~0"; the
     // replacer is a single pass, so "~" is not re-escaped after "/").
-    ctx.add_function(
+    add_function(
+        &mut ctx,
         JSON_PATCH_ESCAPE_KEY_FN,
         |v: Value| -> Result<Value, ExecutionError> {
             match v {
@@ -130,31 +148,29 @@ pub fn new_context() -> Context<'static> {
             }
         },
     );
-    // `ObjectVal` is not a Sizer (dynamic/objects.go:158-160): the marker key
-    // is not a field. Everything else is the stock `size`.
-    ctx.add_function(
-        "size",
-        |ftx: &cel::FunctionContext, cel::extractors::This(this): cel::extractors::This<Value>| {
-            cel::functions::size(ftx, cel::extractors::This(without_marker(&this)))
+    // `ObjectVal.Type` (dynamic/objects.go:158-160).
+    add_function(
+        &mut ctx,
+        TYPE_FN,
+        |v: Value| -> Result<Value, ExecutionError> {
+            let name = type_name(&v).unwrap_or_else(|| kind(&v));
+            Ok(Value::String(Arc::new(name.to_string())))
         },
     );
-    // `ObjectVal.Type` (dynamic/objects.go:158-160).
-    ctx.add_function("type", |v: Value| -> Result<Value, ExecutionError> {
-        let name = type_name(&v).unwrap_or_else(|| kind(&v));
-        Ok(Value::String(Arc::new(name.to_string())))
-    });
-    ctx.add_function(
+    add_function(
+        &mut ctx,
         OBJECT_ITERABLE_FN,
         |v: Value| -> Result<Value, ExecutionError> { Ok(without_marker(&v)) },
     );
-    ctx.add_function(
+    add_function(
+        &mut ctx,
         OBJECT_FIELD_FN,
         |v: Value| -> Result<Value, ExecutionError> {
             check_string_keys(&v)?;
             Ok(v)
         },
     );
-    ctx.add_function(OPT_SELECT_FN, opt_select);
+    add_function(&mut ctx, OPT_SELECT_FN, opt_select);
     crate::cel_authz_library::register(&mut ctx);
     ctx
 }
@@ -192,7 +208,7 @@ fn opt_select(operand: Value, field: Value) -> Result<Value, ExecutionError> {
     }
     match operand {
         Value::Map(_) => Ok(wrap(lookup(&operand, &field))),
-        _ => Err(ExecutionError::NoSuchOverload),
+        _ => Err(ExecutionError::no_such_overload("_?._", Vec::new())),
     }
 }
 
@@ -390,7 +406,7 @@ pub fn strip_type_markers(v: &Value) -> Value {
 fn str_lit(s: &str) -> IdedExpr {
     IdedExpr {
         id: 0,
-        expr: Expr::Literal(LiteralValue::String(CelString::from(s))),
+        expr: Expr::Literal(LiteralValue::String(CelString::from(s.to_string()))),
     }
 }
 
@@ -440,6 +456,28 @@ fn rewrite(e: &mut IdedExpr, expected: Option<&str>) -> Result<(), String> {
             {
                 c.target = None;
                 c.func_name = JSON_PATCH_ESCAPE_KEY_FN.to_string();
+            }
+            // cel 0.15 refuses to override a standard-library overload with a
+            // `Context` function, so the two overrides of `ObjectVal` are
+            // routed here. `size`: `ObjectVal` is not a Sizer
+            // (dynamic/objects.go:158-160), the marker key is not a field, so
+            // the stock `size` sees the value without it. `type`:
+            // `ObjectVal.Type` is the `Object.<path>` name.
+            if c.func_name == "size" {
+                match (c.target.as_mut(), c.args.len()) {
+                    (Some(t), 0) => {
+                        let inner = std::mem::take(&mut **t);
+                        **t = guard(OBJECT_ITERABLE_FN, inner);
+                    }
+                    (None, 1) => {
+                        let inner = std::mem::take(&mut c.args[0]);
+                        c.args[0] = guard(OBJECT_ITERABLE_FN, inner);
+                    }
+                    _ => {}
+                }
+            }
+            if c.func_name == "type" && c.target.is_none() && c.args.len() == 1 {
+                c.func_name = TYPE_FN.to_string();
             }
             if c.func_name == cel::common::ast::operators::OPT_SELECT
                 && c.target.is_none()
