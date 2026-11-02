@@ -20,6 +20,8 @@
 //! * [`checker`]: `checker/checker.go`, the type-checking pass.
 //! * [`cost`]   : `checker/cost.go`, the static cost estimator, with
 //!   [`overload_ids`] mapping the table's overloads to the cel-go ids it keys on.
+//! * [`library_cost`]: the Kubernetes call-cost estimator
+//!   (`apiserver/pkg/cel/library/cost.go`).
 //! * [`table`]  : `common/stdlib/standard.go` plus the extension and Kubernetes
 //!   library overload declarations of the DRA environment.
 
@@ -29,6 +31,8 @@ pub mod decl;
 pub mod env;
 pub mod environment;
 pub mod errors;
+pub mod ext_cost;
+pub mod library_cost;
 pub mod overload_ids;
 pub mod table;
 pub mod types;

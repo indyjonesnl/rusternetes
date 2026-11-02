@@ -115,6 +115,24 @@ pub fn check_expression(
     env_type: EnvType,
     scope: Option<&SelfScope>,
 ) -> Option<Vec<String>> {
+    run_checker(expression, set, env_type, scope).map(|c| c.errors)
+}
+
+/// A parsed and checked expression.
+struct Checked {
+    expr: cel::common::ast::IdedExpr,
+    ast: checker::CheckedAst,
+    errors: Vec<String>,
+    /// The type `self` has in a scoped check, with its unique name.
+    scoped: Option<DeclType>,
+}
+
+fn run_checker(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: Option<&SelfScope>,
+) -> Option<Checked> {
     let source = expression.to_string();
     // The antlr4rust parser panics on some invalid expressions.
     let parsed =
@@ -139,6 +157,7 @@ pub fn check_expression(
         None => (Arc::new(checker::MapProvider::new()), None),
     };
     let mut env = env_set.env(ct, checker::Container::default(), provider);
+    let scoped_type = scoped.clone();
     match (scope, scoped) {
         (Some(scope), Some(scoped)) => {
             let t = scoped.dtype();
@@ -162,8 +181,13 @@ pub fn check_expression(
             }
         }
     }
-    let (_, errors) = checker::check(&parsed, &mut env, &checker::NoLocations);
-    Some(errors.errors().iter().map(|e| e.message.clone()).collect())
+    let (ast, errors) = checker::check(&parsed, &mut env, &checker::NoLocations);
+    Some(Checked {
+        expr: parsed,
+        ast,
+        errors: errors.errors().iter().map(|e| e.message.clone()).collect(),
+        scoped: scoped_type,
+    })
 }
 
 /// A disagreement between the probe and the checker.
@@ -219,6 +243,61 @@ pub fn observe_scoped(
             probe = ?d.probe,
             checker = ?d.checker,
             "cel checker disagrees with the compile probe"
+        );
+    }
+}
+
+/// The static cost estimate of a CRD rule: `ruleEnv.EstimateCost(ast,
+/// estimator)` of `compilation.go` `compileRule`, with the estimator of
+/// `newCostEstimator(declType)` (the library estimator over the schema size
+/// estimator). `None` when the expression does not parse or does not
+/// type-check.
+pub fn estimate_rule_cost(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: &SelfScope,
+) -> Option<checker::cost::CostEstimate> {
+    let c = run_checker(expression, set, env_type, Some(scope))?;
+    if !c.errors.is_empty() {
+        return None;
+    }
+    let sizes = crate::cel_crd_cost::SchemaSizeEstimator::new(c.scoped?);
+    Some(checker::library_cost::kubernetes_cost(
+        &c.ast,
+        &c.expr,
+        Some(&sizes),
+    ))
+}
+
+/// The hook of the cost check of a CRD rule: in `shadow` mode compares the
+/// static estimate with the heuristic the validation decides with, and logs
+/// when they disagree on whether the rule is over `limit`. Never affects the
+/// heuristic's result.
+pub fn observe_cost(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: &SelfScope,
+    heuristic_cost: u64,
+    limit: u64,
+) {
+    if Mode::current() != Mode::Shadow {
+        return;
+    }
+    let Some(est) = estimate_rule_cost(expression, set, env_type, scope) else {
+        return;
+    };
+    // `validation.go:1280-1287` compares the estimate's `Max` to the limit.
+    if (est.max > limit) != (heuristic_cost > limit) {
+        tracing::warn!(
+            target: "cel_checker_shadow",
+            expression,
+            estimated_min = est.min,
+            estimated_max = est.max,
+            heuristic = heuristic_cost,
+            limit,
+            "cel cost estimate disagrees with the heuristic on exceeding the limit"
         );
     }
 }

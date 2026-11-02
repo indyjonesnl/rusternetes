@@ -110,3 +110,199 @@
 {"req": {"expr": "bool('true') && bool(x)", "vars": {"x": "string"}}, "resp": {"cost": {"max": 3, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
 {"req": {"expr": "x.startsWith(1)", "vars": {"x": "string"}}, "resp": {"errors": ["found no matching overload for 'startsWith' applied to 'string.(int)'"], "ok": false}}
 {"req": {"expr": "matches(x, 'a')", "vars": {"x": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "'ABCDEFGHIJ abcdefghij'.lowerAscii()"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'ABCDEFGHIJ abcdefghij'.lowerAscii() == 'abcdefghij ABCDEFGHIJ'.lowerAscii()"}, "resp": {"cost": {"max": 9, "min": 7}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "'ABCDEFGHIJ abcdefghij'.upperAscii()"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'ABCDEFGHIJ abcdefghij'.upperAscii() == 'abcdefghij ABCDEFGHIJ'.upperAscii()"}, "resp": {"cost": {"max": 9, "min": 7}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "strings.quote('ABCDEFGHIJ abcdefghij')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "strings.quote('ABCDEFGHIJ abcdefghij') == strings.quote('ABCDEFGHIJ abcdefghij')"}, "resp": {"cost": {"max": 11, "min": 7}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "'abc 123 def 123'.replace('123', '456')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.replace('', 'x')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.replace('123', '')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.replace('123', '456', 1)"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.split(' ')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "'abc 123 def 123'.split(' ', 1)"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "'abc 123 def 123'.substring(5)"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.substring(5, 8)"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'  abc 123 def 123  '.trim()"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "['aa', 'bb', 'cc', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].join(' ')"}, "resp": {"cost": {"max": 1844674407370955274, "min": 11}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "['aa', 'bb', 'cc', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].join()"}, "resp": {"cost": {"max": 1844674407370955274, "min": 10}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.find('123')"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc 123 def 123'.findAll('123')"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "'abc 123 def 123'.findAll('123', 1)"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "jsonpatch.escapeKey('abc/def~ abc/def~')"}, "resp": {"errors": ["undeclared reference to 'jsonpatch' (in container '')", "undeclared reference to 'escapeKey' (in container '')"], "ok": false}}
+{"req": {"expr": "[1, 2, 3, 4, 5].isSorted()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].max()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].min()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].sum()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].sort()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].reverse()"}, "resp": {"cost": {"max": 26, "min": 26}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].distinct()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 2, 3, 4, 5].slice(1, 3)"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].isSorted()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].max()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "uint"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].min()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "uint"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].sum()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "uint"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].sort()"}, "resp": {"cost": {"max": 76, "min": 76}, "errors": [], "ok": true, "outputType": "list(uint)"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].reverse()"}, "resp": {"cost": {"max": 31, "min": 31}, "errors": [], "ok": true, "outputType": "list(uint)"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].distinct()"}, "resp": {"cost": {"max": 76, "min": 76}, "errors": [], "ok": true, "outputType": "list(uint)"}}
+{"req": {"expr": "[uint(1), uint(2), uint(3), uint(4), uint(5)].slice(1, 3)"}, "resp": {"cost": {"max": 28, "min": 28}, "errors": [], "ok": true, "outputType": "list(uint)"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].isSorted()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].max()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "double"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].min()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "double"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].sum()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "double"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].sort()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(double)"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].reverse()"}, "resp": {"cost": {"max": 26, "min": 26}, "errors": [], "ok": true, "outputType": "list(double)"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].distinct()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(double)"}}
+{"req": {"expr": "[1.0, 2.0, 3.0, 4.0, 5.0].slice(1, 3)"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "list(double)"}}
+{"req": {"expr": "[false, true, false, true, false].isSorted()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[false, true, false, true, false].max()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[false, true, false, true, false].min()"}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[false, true, false, true, false].sort()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(bool)"}}
+{"req": {"expr": "[false, true, false, true, false].reverse()"}, "resp": {"cost": {"max": 26, "min": 26}, "errors": [], "ok": true, "outputType": "list(bool)"}}
+{"req": {"expr": "[false, true, false, true, false].distinct()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(bool)"}}
+{"req": {"expr": "[false, true, false, true, false].slice(1, 3)"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "list(bool)"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].isSorted()"}, "resp": {"cost": {"max": 9223372036854776335, "min": 15}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].max()"}, "resp": {"cost": {"max": 9223372036854776335, "min": 15}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].min()"}, "resp": {"cost": {"max": 9223372036854776335, "min": 15}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].sort()"}, "resp": {"cost": {"max": 74, "min": 74}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].reverse()"}, "resp": {"cost": {"max": 26, "min": 26}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].distinct()"}, "resp": {"cost": {"max": 71, "min": 71}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].slice(1, 3)"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].isSorted()"}, "resp": {"cost": {"max": 9223372036854776345, "min": 25}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].max()"}, "resp": {"cost": {"max": 9223372036854776345, "min": 25}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].min()"}, "resp": {"cost": {"max": 9223372036854776345, "min": 25}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].sort()"}, "resp": {"cost": {"max": 84, "min": 84}, "errors": [], "ok": true, "outputType": "list(bytes)"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].reverse()"}, "resp": {"cost": {"max": 36, "min": 36}, "errors": [], "ok": true, "outputType": "list(bytes)"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].distinct()"}, "resp": {"cost": {"max": 81, "min": 81}, "errors": [], "ok": true, "outputType": "list(bytes)"}}
+{"req": {"expr": "[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].slice(1, 3)"}, "resp": {"cost": {"max": 33, "min": 33}, "errors": [], "ok": true, "outputType": "list(bytes)"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].isSorted()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].max()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "google.protobuf.Duration"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].min()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "google.protobuf.Duration"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].sum()"}, "resp": {"cost": {"max": 20, "min": 20}, "errors": [], "ok": true, "outputType": "google.protobuf.Duration"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].sort()"}, "resp": {"cost": {"max": 76, "min": 76}, "errors": [], "ok": true, "outputType": "list(google.protobuf.Duration)"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].reverse()"}, "resp": {"cost": {"max": 31, "min": 31}, "errors": [], "ok": true, "outputType": "list(google.protobuf.Duration)"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].distinct()"}, "resp": {"cost": {"max": 76, "min": 76}, "errors": [], "ok": true, "outputType": "list(google.protobuf.Duration)"}}
+{"req": {"expr": "[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].slice(1, 3)"}, "resp": {"cost": {"max": 28, "min": 28}, "errors": [], "ok": true, "outputType": "list(google.protobuf.Duration)"}}
+{"req": {"expr": "[1, 2, 3].indexOf(3)"}, "resp": {"cost": {"max": 13, "min": 13}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "'0123456789'.indexOf('3')"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2, 3].lastIndexOf(3)"}, "resp": {"cost": {"max": 13, "min": 13}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[[1, 2], [3]].flatten()"}, "resp": {"cost": {"max": 43, "min": 43}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "lists.range(10)"}, "resp": {"cost": {"max": 21, "min": 21}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "sets.contains([1, 2, 3], [1, 2])"}, "resp": {"cost": {"max": 27, "min": 27}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "sets.equivalent([1, 2, 3], [1, 2])"}, "resp": {"cost": {"max": 33, "min": 33}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "sets.intersects([1, 2, 3], [1, 2])"}, "resp": {"cost": {"max": 27, "min": 27}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "url('https://kubernetes.io/').getHost()"}, "resp": {"cost": {"max": 4, "min": 4}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "url('https://kubernetes.io/') == url('http://x.b')"}, "resp": {"cost": {"max": 5, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s.lowerAscii()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.upperAscii()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.trim()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.substring(1)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.substring(1, 3)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.charAt(1)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'b')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'bb')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('', 'x')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('abc', 'a')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace(t, 'x')", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910530, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910530, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.split(',')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "s.split(',', 2)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "s.split(',').join('-')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 5534023222112865793, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "l.join()", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "l.join(',')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "strings.quote(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.find('[a-z]+')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.findAll('[a-z]+')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 3}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "s.find(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.indexOf('a')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "s.lastIndexOf(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "s.startsWith(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s.endsWith('x')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s.contains(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s.matches('[a-z]+')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s + t", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "b + b", "vars": {"b": "bytes"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "s == t", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s < t", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "b > b", "vars": {"b": "bytes"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "string(b)", "vars": {"b": "bytes"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "bytes(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "s.size()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "size(l)", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "l + l", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "s in l", "vars": {"l": "list(string)", "s": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l[0]", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "m['a']", "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "m.a", "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'a' in m", "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l.all(x, x.startsWith('a'))", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l.exists(x, x == 'a')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l.map(x, x + 'a')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "l.filter(x, x != 'a')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "l.map(x, x).filter(x, x != 'a')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 23}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "li.sum()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "li.min()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "li.max()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "li.isSorted()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "li.indexOf(3)", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "l.isSorted()", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l.max()", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "lb.min()", "vars": {"lb": "list(bytes)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "l.indexOf(s)", "vars": {"l": "list(string)", "s": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "l.lastIndexOf('x')", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "li.sort()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "l.sort()", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "li.reverse()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "li.distinct()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "li.slice(1, 3)", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 14, "min": 14}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "li.slice(1, 3).size()", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 15, "min": 15}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "ll.flatten()", "vars": {"ll": "list(list(int))"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "sets.contains(li, li)", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "sets.equivalent(li, li)", "vars": {"li": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "sets.intersects(l, l)", "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "ll.map(x, x.sum())", "vars": {"ll": "list(list(int))"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "ll.all(x, x.all(y, y > 0))", "vars": {"ll": "list(list(int))"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "url(s).getHost()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "url(s) == url(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 5534023222112865794, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "url(s).getQuery()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "map(string, list(string))"}}
+{"req": {"expr": "isURL(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "ip(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "net.IP"}}
+{"req": {"expr": "ip(s).family()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "ip.isCanonical(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "isIP(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "ip(s) == ip(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "string(ip(s))", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "ip(s).isLoopback()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "net.CIDR"}}
+{"req": {"expr": "isCIDR(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s).ip()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "net.IP"}}
+{"req": {"expr": "cidr(s).masked()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "net.CIDR"}}
+{"req": {"expr": "cidr(s).prefixLength()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "cidr(s).containsIP(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910534, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s).containsIP(ip(t))", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910534, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s).containsCIDR(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910537, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s).containsCIDR(cidr(t))", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910537, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cidr(s) == cidr(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "string(cidr(s))", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "quantity(s).isInteger()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "quantity(s).sign()", "vars": {"s": "string"}}, "resp": {"errors": ["found no matching overload for 'sign' applied to 'kubernetes.Quantity.()'"], "ok": false}}
+{"req": {"expr": "isQuantity(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "quantity(s) == quantity(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "quantity(s).add(quantity(t))", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "kubernetes.Quantity"}}
+{"req": {"expr": "quantity(s).isGreaterThan(quantity(t))", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "quantity(s).asInteger()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "semver(s).major()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "semver(s) == semver(t)", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "isSemver(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "semver(s).isGreaterThan(semver(t))", "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "format.dns1123Label().validate(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "optional_type(list(string))"}}
+{"req": {"expr": "format.named('dns1123label').value().validate(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 3}, "errors": [], "ok": true, "outputType": "optional_type(list(string))"}}
+{"req": {"expr": "format.dns1123Label() == format.dns1123Label()"}, "resp": {"cost": {"max": 9, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "format.named(s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "optional_type(kubernetes.NamedFormat)"}}
+{"req": {"expr": "has(m.a)", "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "has(m.a) && m.a == 'x'", "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 4, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s == 'x' ? l : l", "vars": {"l": "list(string)", "s": "string"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "(s == 'x' ? l : l).size()", "vars": {"l": "list(string)", "s": "string"}}, "resp": {"cost": {"max": 4, "min": 4}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "dyn(s).size()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "optional.of(s).hasValue()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}

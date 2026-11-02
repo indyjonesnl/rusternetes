@@ -2,9 +2,8 @@
 //! release-1.35 vendors) over the cost estimator of `checker/cost.go`, plus
 //! the overflow-safe estimate arithmetic.
 //!
-//! Not ported: the two cases that install an `OverloadCostEstimate`
-//! (`str concat custom cost estimate`, `bytes list max`), an option this port
-//! does not have.
+//! Not ported: the two cases that install an `OverloadCostEstimate` through the
+//! test-only `list_bytes_max` / `contains_string` overrides.
 
 use cel::parser::Parser;
 use rusternetes_cel_checker::cost::{
@@ -129,7 +128,8 @@ fn estimate(c: &Case) -> CostEstimate {
         &expr,
         &estimator,
         CostOptions {
-            presence_test_has_cost: c.presence_test_has_cost,
+            presence_test_free: !c.presence_test_has_cost,
+            overload_estimators: None,
         },
     )
 }
