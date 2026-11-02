@@ -1375,7 +1375,6 @@ mod cluster_authentication_info_tests {
     }
 }
 
-#[path = "bootstrap_policy_tests.rs"]
 mod bootstrap_policy_tests {
     //! Ported from `plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy_test.go`
     //! (release-1.35): the policy-invariant tests that do not compare against a

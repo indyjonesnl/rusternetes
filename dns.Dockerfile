@@ -21,7 +21,7 @@
 #   docker run --rm -p 53:53/udp -p 53:53/tcp rusternetes-dns:dev \
 #       --etcd-servers http://etcd:2379
 
-FROM rust:1.95 AS builder
+FROM rust:1.99 AS builder
 
 ARG SCCACHE_VERSION=v0.8.2
 # TARGETARCH (amd64 | arm64) is injected by BuildKit; map it to sccache's

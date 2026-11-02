@@ -309,7 +309,6 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
     }
 }
 
-#[path = "crd_structural_tests.rs"]
 mod structural_schema_tests {
     //! Ports of the structural-schema cases of upstream
     //! `TestValidateCustomResourceDefinition` (`validation_test.go:1430-1700`,
@@ -617,7 +616,6 @@ mod structural_schema_tests {
     }
 }
 
-#[path = "crd_selectable_tests.rs"]
 mod selectable_fields_tests {
     //! Ports of upstream `TestSelectableFields` (`validation_test.go:4544`,
     //! release-1.35) plus the structural-schema edge cases of
@@ -803,7 +801,6 @@ mod selectable_fields_tests {
     }
 }
 
-#[path = "crd_defaults_tests.rs"]
 mod defaults_tests {
     //! Ports of the default cases of upstream `TestValidateCustomResourceDefinition`
     //! (`apis/apiextensions/validation/validation_test.go:1780-2260`,
@@ -1232,7 +1229,6 @@ mod defaults_tests {
     }
 }
 
-#[path = "crd_openapi_schema_tests.rs"]
 mod openapi_schema_tests {
     //! Ports of the schema-error cases of upstream
     //! `TestValidateCustomResourceDefinitionValidation` (`validation_test.go:8321`,

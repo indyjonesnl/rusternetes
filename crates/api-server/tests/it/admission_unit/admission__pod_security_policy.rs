@@ -1104,7 +1104,6 @@ mod tests {
     }
 }
 
-#[path = "pod_security_policy_cases.rs"]
 mod cases {
     //! Verbatim case-by-case ports of upstream pod-security-admission per-check
     //! tables (staging/src/k8s.io/pod-security-admission/policy/):
@@ -1913,7 +1912,6 @@ mod cases {
     }
 }
 
-#[path = "pod_security_fixtures.rs"]
 mod fixtures {
     //! Fixture runner: port of upstream pod-security-admission `test/run.go`
     //! (`Run`) and `test/fixtures_test.go` (`TestFixtures`), executed against the
@@ -2225,7 +2223,6 @@ mod fixtures {
     }
 }
 
-#[path = "pod_security_fixture_gen.rs"]
 mod fixture_gen {
     //! Port of upstream pod-security-admission fixture generation:
     //! `test/fixtures.go` (`minimalValidPods` ladder, `registerFixtureGenerator`,

@@ -482,7 +482,6 @@ mod tests {
     }
 }
 
-#[path = "policy_patch_budget_tests.rs"]
 mod budget_tests {
     //! `RuntimeCELCostBudget` enforcement of the MutatingAdmissionPolicy patchers
     //! (#3507): `dispatcher.go:259` passes `celconfig.RuntimeCELCostBudget` to

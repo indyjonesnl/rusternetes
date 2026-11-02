@@ -16,7 +16,6 @@ mod __parent {
     pub use std::sync::Arc;
 }
 
-#[path = "node_authorizer_tests.rs"]
 mod tests {
     //! Ported from `plugin/pkg/auth/authorizer/node/node_authorizer_test.go`:
     //! `TestNodeAuthorizer`, `TestNodeAuthorizerSharedResources` and

@@ -13,7 +13,6 @@ mod __parent {
     };
 }
 
-#[path = "events_tests.rs"]
 mod tests {
     //! Table-driven tests ported from upstream
     //! `pkg/apis/core/validation/events_test.go` (release-1.35).

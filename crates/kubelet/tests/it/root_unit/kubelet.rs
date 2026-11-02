@@ -3195,7 +3195,6 @@ mod tests {
     }
 }
 
-#[path = "kubelet_sync_pod_fake_cri_tests.rs"]
 mod sync_pod_fake_cri_tests {
     //! `Kubelet::sync_pod` concurrency against the in-process fake CRI
     //! (issues #3884, #1115): the `pod_sync_locks` skip-and-retry path, driven

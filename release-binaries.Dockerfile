@@ -21,7 +21,7 @@
 # for a vendored h2, so it is built from its own directory. Its binary is
 # `rhino-server` (rhino/Cargo.toml [[bin]]).
 
-FROM rust:1.95-alpine AS builder
+FROM rust:1.99-alpine AS builder
 
 # Same toolchain set as all-in-one-musl.Dockerfile (ring, bundled SQLite,
 # mimalloc, tonic/prost codegen).

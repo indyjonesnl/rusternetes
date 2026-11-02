@@ -20,7 +20,6 @@ mod __parent {
     pub use tracing::debug;
 }
 
-#[path = "store_tests.rs"]
 mod tests {
     //! Ports of `staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store_test.go`,
     //! using a ConfigMap where upstream uses its `example.Pod` fixture.

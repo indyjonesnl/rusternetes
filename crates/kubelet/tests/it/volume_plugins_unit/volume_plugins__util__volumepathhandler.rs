@@ -154,7 +154,6 @@ mod tests {
     }
 }
 
-#[path = "volumepathhandler_bind_loop_tests.rs"]
 mod bind_mount_and_loop_tests {
     //! Bind-mount mapping (`volume_path_handler.go:111-150`, `:184-214`),
     //! `GetDeviceBindMountRefs` (`:284-300`) and the losetup functions
