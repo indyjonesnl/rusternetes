@@ -4294,6 +4294,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusternetes-cel-checker"
+version = "0.1.0"
+dependencies = [
+ "cel",
+]
+
+[[package]]
 name = "rusternetes-client"
 version = "0.1.0"
 dependencies = [
@@ -4368,6 +4375,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "rusternetes-cel-checker",
  "rustls 0.23.40",
  "rustls-pemfile",
  "schemars 1.2.1",

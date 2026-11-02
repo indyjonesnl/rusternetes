@@ -1,0 +1,17 @@
+[package]
+name = "rusternetes-cel-checker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Port of the cel-go checker (type model, declarations, unification, overload resolution) over the `cel` crate AST"
+
+[lib]
+name = "rusternetes_cel_checker"
+path = "src/lib.rs"
+# Unit tests live in tests/it: a second compilation of the lib as a test
+# target costs as much as the lib itself.
+test = false
+
+[dependencies]
+cel.workspace = true
