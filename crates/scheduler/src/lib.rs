@@ -53,7 +53,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyho
     Ok(())
 }
 
-/// Run the scheduler as an api-server client, reading pod/node/priorityclass
+/// Run the scheduler as an api-server client, reading pod/node/volume
 /// state from informers and writing through the binding/status subresources
 /// and events — no direct storage handle.
 ///

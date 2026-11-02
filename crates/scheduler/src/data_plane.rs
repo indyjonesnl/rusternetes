@@ -110,10 +110,6 @@ fn node_store_key(n: &Node) -> String {
     n.metadata.name.clone()
 }
 
-fn priority_class_store_key(pc: &PriorityClass) -> String {
-    pc.metadata.name.clone()
-}
-
 fn pvc_store_key(p: &PersistentVolumeClaim) -> String {
     format!(
         "{}/{}",
@@ -227,7 +223,6 @@ impl VolumeReflectors {
 /// behind an `Arc` so the run loops and the read paths reference the same store.
 type PodReflector = Arc<Reflector<Pod, fn(&Pod) -> String>>;
 type NodeReflector = Arc<Reflector<Node, fn(&Node) -> String>>;
-type PriorityClassReflector = Arc<Reflector<PriorityClass, fn(&PriorityClass) -> String>>;
 
 impl ApiBackend {
     /// `cc.InformerFactory.WaitForCacheSync` (cmd/kube-scheduler/app/server.go:278):
@@ -237,7 +232,6 @@ impl ApiBackend {
         tokio::join!(
             self.pods.wait_for_cache_sync(),
             self.nodes.wait_for_cache_sync(),
-            self.priority_classes.wait_for_cache_sync(),
             self.volumes.wait_for_cache_sync(),
         );
     }
@@ -249,11 +243,6 @@ pub struct ApiBackend {
     pub(crate) client: Arc<ApiClient>,
     pub(crate) pods: PodReflector,
     pub(crate) nodes: NodeReflector,
-    /// PriorityClasses are reflector-backed (not per-cycle GETs): under heavy
-    /// scheduling load a per-cycle live LIST occasionally came back incomplete,
-    /// collapsing pod priorities to 0 and breaking preemption ordering. A
-    /// local informer store is always complete and current.
-    pub(crate) priority_classes: PriorityClassReflector,
     /// Listers for the NodeVolumeLimits plugin (#3794).
     pub(crate) volumes: VolumeReflectors,
 }
@@ -265,26 +254,17 @@ impl ApiBackend {
         use rusternetes_client::reflector::ApiListWatch;
         let pods_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/pods"));
         let nodes_lw = Arc::new(ApiListWatch::new(Arc::clone(&client), "/api/v1/nodes"));
-        let pc_lw = Arc::new(ApiListWatch::new(
-            Arc::clone(&client),
-            "/apis/scheduling.k8s.io/v1/priorityclasses",
-        ));
         let pods: PodReflector =
             Arc::new(Reflector::new(pods_lw, pod_store_key as fn(&Pod) -> String));
         let nodes: NodeReflector = Arc::new(Reflector::new(
             nodes_lw,
             node_store_key as fn(&Node) -> String,
         ));
-        let priority_classes: PriorityClassReflector = Arc::new(Reflector::new(
-            pc_lw,
-            priority_class_store_key as fn(&PriorityClass) -> String,
-        ));
         let volumes = VolumeReflectors::new(&client);
         Self {
             client,
             pods,
             nodes,
-            priority_classes,
             volumes,
         }
     }
@@ -403,14 +383,20 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
     }
 
     /// List every PriorityClass. Storage: `list(/registry/priorityclasses)`.
-    /// API: GET the collection (priority classes change rarely, so no informer).
+    /// API: always empty. Upstream kube-scheduler has no PriorityClass informer
+    /// and stock `system:kube-scheduler` (plugin/pkg/auth/authorizer/rbac/
+    /// bootstrappolicy/policy.go, `kubeSchedulerRules`) has no `priorityclasses`
+    /// rule: the Priority admission plugin (plugin/pkg/admission/priority/
+    /// admission.go `admitPod`) resolves `spec.priority`/`spec.preemptionPolicy`
+    /// at create time and the scheduler reads only those pod fields
+    /// (`corev1helpers.PodPriority`, `PodEligibleToPreemptOthers`).
     pub async fn list_priority_classes(&self) -> Result<Vec<PriorityClass>> {
         match self {
             DataPlane::Storage(s) => {
                 s.list(&rusternetes_storage::build_prefix("priorityclasses", None))
                     .await
             }
-            DataPlane::Api(a) => Ok(a.priority_classes.store().items()),
+            DataPlane::Api(_) => Ok(Vec::new()),
         }
     }
 
