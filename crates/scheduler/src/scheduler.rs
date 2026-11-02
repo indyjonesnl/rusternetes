@@ -402,10 +402,8 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if let DataPlane::Api(api) = &self.data {
             let pods = Arc::clone(&api.pods);
             let nodes = Arc::clone(&api.nodes);
-            let priority_classes = Arc::clone(&api.priority_classes);
             tokio::spawn(async move { pods.run().await });
             tokio::spawn(async move { nodes.run().await });
-            tokio::spawn(async move { priority_classes.run().await });
             api.volumes.spawn();
             // Upstream starts the informers, then WaitForCacheSync before
             // `sched.Run` (cmd/kube-scheduler/app/server.go:271-285). Pods only

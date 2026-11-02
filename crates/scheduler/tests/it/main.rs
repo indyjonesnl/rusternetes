@@ -20,6 +20,7 @@ mod preemption_test;
 mod preemption_victim_identity_test;
 mod profile_node_scoring;
 mod profile_plugin_sets;
+mod rbac_allowlist_test;
 mod sched_unit;
 mod scheduler_preemption_test;
 mod scheduler_test;
