@@ -15,6 +15,7 @@ pub mod cel_dra;
 pub mod cel_dra_decls;
 pub mod cel_env;
 pub mod cel_struct;
+pub mod cel_checker_shadow;
 pub mod cel_versions;
 pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
