@@ -42,7 +42,7 @@ impl VariableDecl {
 /// field types (`FindStructType`, `FindStructFieldType`) and type identifiers
 /// (`FindIdent`). Enum values (`EnumValue`) are not modelled: no Kubernetes
 /// environment declares protobuf enums.
-pub trait Provider {
+pub trait Provider: Send + Sync {
     /// The struct type named `name`.
     fn find_struct_type(&self, name: &str) -> Option<DType>;
     /// The type of `field` on the struct type `struct_name`.
