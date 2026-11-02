@@ -93,8 +93,10 @@ fn add(t: &mut Table, name: &str, member: bool, args: &str, result: &str) {
         (true, Some((recv, rest))) => format!("{}.{name}({})", recv.name(), names(rest)),
         _ => format!("{name}({})", names(&args)),
     };
+    let cel_id = crate::overload_ids::cel_go_overload_id(name, member, &args);
     t.entry(name.to_string()).or_default().push(Overload {
         id,
+        cel_id,
         member,
         args,
         result: parse_type(result),

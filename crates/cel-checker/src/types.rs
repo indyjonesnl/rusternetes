@@ -123,8 +123,18 @@ pub struct Overload {
     /// synthesizes `<function>(<arg types>)` since no consumer of the
     /// reference map exists yet.
     pub id: String,
+    /// The cel-go overload id (`common/overloads`) when the cost estimator
+    /// has a rule for this overload, see [`crate::overload_ids`].
+    pub cel_id: Option<&'static str>,
     pub member: bool,
     /// Argument types; for a member overload the first is the receiver.
     pub args: Vec<DType>,
     pub result: DType,
+}
+
+impl Overload {
+    /// The id `checker.Cost` sees: the cel-go id where mapped, else [`Self::id`].
+    pub fn cost_id(&self) -> String {
+        self.cel_id.map_or_else(|| self.id.clone(), str::to_string)
+    }
 }
