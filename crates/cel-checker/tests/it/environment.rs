@@ -66,14 +66,17 @@ fn libraries_arrive_at_their_introduced_version() {
 
 #[test]
 fn strings_library_is_replaced_not_added() {
-    // 1.28: ext.Strings(0): charAt exists, join does not.
+    // 1.28: ext.Strings(0): charAt and join exist (join at every version,
+    // ext/strings.go:498-534), strings.quote does not.
     let s = set(28);
     assert!(errors(&s, EnvType::NewExpressions, "'abc'.charAt(1) == 'b'").is_empty());
-    assert!(!errors(&s, EnvType::NewExpressions, "['a'].join()").is_empty());
+    assert!(!errors(&s, EnvType::NewExpressions, "strings.quote('a')").is_empty());
+    assert!(errors(&s, EnvType::NewExpressions, "['a'].join()").is_empty());
     // 1.29: ext.Strings(2).
     let s = set(29);
     assert!(errors(&s, EnvType::NewExpressions, "'abc'.charAt(1) == 'b'").is_empty());
     assert!(errors(&s, EnvType::NewExpressions, "['a', 'b'].join(',') == 'a,b'").is_empty());
+    assert!(errors(&s, EnvType::NewExpressions, "strings.quote('a')").is_empty());
 }
 
 #[test]

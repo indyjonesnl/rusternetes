@@ -1,0 +1,112 @@
+{"req": {"expr": "1 + 2"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "'a' + 'b'"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "1 + 'a'"}, "resp": {"errors": ["found no matching overload for '_+_' applied to '(int, string)'"], "ok": false}}
+{"req": {"expr": "foo"}, "resp": {"errors": ["undeclared reference to 'foo' (in container '')"], "ok": false}}
+{"req": {"expr": "foo()"}, "resp": {"errors": ["undeclared reference to 'foo' (in container '')"], "ok": false}}
+{"req": {"expr": "'s'.foo()"}, "resp": {"errors": ["undeclared reference to 'foo' (in container '')"], "ok": false}}
+{"req": {"expr": "[]"}, "resp": {"cost": {"max": 10, "min": 10}, "errors": [], "ok": true, "outputType": "list(dyn)"}}
+{"req": {"expr": "[1]"}, "resp": {"cost": {"max": 10, "min": 10}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 'a']"}, "resp": {"errors": ["expected type 'int' but found 'string'"], "ok": false}}
+{"req": {"expr": "{}"}, "resp": {"cost": {"max": 30, "min": 30}, "errors": [], "ok": true, "outputType": "map(dyn, dyn)"}}
+{"req": {"expr": "{1: 2u, 2: 3u}"}, "resp": {"cost": {"max": 30, "min": 30}, "errors": [], "ok": true, "outputType": "map(int, uint)"}}
+{"req": {"expr": "{1: 2u, 2u: 3}"}, "resp": {"errors": ["expected type 'int' but found 'uint'", "expected type 'uint' but found 'int'"], "ok": false}}
+{"req": {"expr": "{'a': 1}.a"}, "resp": {"cost": {"max": 31, "min": 31}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[].length"}, "resp": {"errors": ["type 'list(_var0)' does not support field selection"], "ok": false}}
+{"req": {"expr": "1 == 1u"}, "resp": {"errors": ["found no matching overload for '_==_' applied to '(int, uint)'"], "ok": false}}
+{"req": {"expr": "1 < 1.0"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "1 < 1.0", "kubeVersion": "1.27"}, "resp": {"errors": ["found no matching overload for '_<_' applied to '(int, double)'"], "ok": false}}
+{"req": {"expr": "x.all(y, y > 0)", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x.all(y, y)", "vars": {"x": "list(int)"}}, "resp": {"errors": ["expected type 'bool' but found 'int'"], "ok": false}}
+{"req": {"expr": "x.exists(y, y == 'a')", "vars": {"x": "list(int)"}}, "resp": {"errors": ["found no matching overload for '_==_' applied to '(int, string)'"], "ok": false}}
+{"req": {"expr": "x.map(y, double(y))", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(double)"}}
+{"req": {"expr": "x.filter(y, y > 1)", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "x.all(y, y)", "vars": {"x": "bool"}}, "resp": {"errors": ["expression of type 'bool' cannot be range of a comprehension (must be list, map, or dynamic)"], "ok": false}}
+{"req": {"expr": "size(x) == x.size()", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 5, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x.single.bb", "vars": {"x": "map(string, dyn)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "x.y", "vars": {"x": "int"}}, "resp": {"errors": ["type 'int' does not support field selection"], "ok": false}}
+{"req": {"expr": "x.?y", "vars": {"x": "map(string, string)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "optional_type(string)"}}
+{"req": {"expr": "x.?y.z", "vars": {"x": "map(string, map(string, int))"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "optional_type(int)"}}
+{"req": {"expr": "x.y", "vars": {"x": "optional(map(string, string))"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "optional_type(string)"}}
+{"req": {"expr": "{?'k': x.?v}", "vars": {"x": "map(string, string)"}}, "resp": {"cost": {"max": 32, "min": 32}, "errors": [], "ok": true, "outputType": "map(string, string)"}}
+{"req": {"expr": "{?'k': 'v'}"}, "resp": {"errors": ["expected type 'optional_type(string)' but found 'string'"], "ok": false}}
+{"req": {"expr": "[?x.?v, 'w']", "vars": {"x": "map(string, string)"}}, "resp": {"cost": {"max": 12, "min": 12}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "[?'v']"}, "resp": {"errors": ["expected type 'optional_type(string)' but found 'string'"], "ok": false}}
+{"req": {"expr": "optional.of(1).orValue(2)"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "optional.of(1).orValue(2)", "kubeVersion": "1.27"}, "resp": {"errors": ["undeclared reference to 'optional' (in container '')", "undeclared reference to 'of' (in container '')", "undeclared reference to 'orValue' (in container '')"], "ok": false}}
+{"req": {"expr": "x ? 1 : 2", "vars": {"x": "bool"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "x ? 1 : 'a'", "vars": {"x": "bool"}}, "resp": {"errors": ["found no matching overload for '_?_:_' applied to '(bool, int, string)'"], "ok": false}}
+{"req": {"expr": "1 && true"}, "resp": {"errors": ["expected type 'bool' but found 'int'"], "ok": false}}
+{"req": {"expr": "true && x", "vars": {"x": "dyn"}}, "resp": {"cost": {"max": 1, "min": 0}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "!x || y", "vars": {"x": "bool", "y": "bool"}}, "resp": {"cost": {"max": 3, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "1 in [1, 2, 3]"}, "resp": {"cost": {"max": 13, "min": 13}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "'a' in {'a': 1}"}, "resp": {"cost": {"max": 31, "min": 31}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x in y", "vars": {"x": "int", "y": "list(string)"}}, "resp": {"errors": ["found no matching overload for '@in' applied to '(int, list(string))'"], "ok": false}}
+{"req": {"expr": "int('1') + int(2u)"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "string(1) + string(2.0)"}, "resp": {"cost": {"max": 1844674407370955266, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "duration('1s') + duration('2s')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "google.protobuf.Duration"}}
+{"req": {"expr": "timestamp('2020-01-01T00:00:00Z') - duration('1s')"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "google.protobuf.Timestamp"}}
+{"req": {"expr": "timestamp('2020-01-01T00:00:00Z').getFullYear()"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "'abc'.contains('b') && 'abc'.startsWith('a') && 'abc'.endsWith('c')"}, "resp": {"cost": {"max": 3, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "'abc'.matches('a.c')"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "size('abc') + size([1]) + size({1: 2}) + size(b'x')"}, "resp": {"cost": {"max": 47, "min": 47}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "has(x.y)", "vars": {"x": "map(string, int)"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "has(x.y) && x.y > 1", "vars": {"x": "map(string, int)"}}, "resp": {"cost": {"max": 4, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "type(1) == int"}, "resp": {"cost": {"max": 1844674407370955266, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "type(null) == null_type"}, "resp": {"cost": {"max": 1844674407370955266, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "list == type([1])"}, "resp": {"cost": {"max": 1844674407370955276, "min": 13}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "dyn(1) + 'a'"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "x[0] + x[1]", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 5, "min": 5}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "x['a']", "vars": {"x": "list(int)"}}, "resp": {"errors": ["found no matching overload for '_[_]' applied to '(list(int), string)'"], "ok": false}}
+{"req": {"expr": "x[1u]", "vars": {"x": "list(int)"}}, "resp": {"errors": ["found no matching overload for '_[_]' applied to '(list(int), uint)'"], "ok": false}}
+{"req": {"expr": "x['a'] + 1", "vars": {"x": "map(string, int)"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2, 3].isSorted()"}, "resp": {"cost": {"max": 13, "min": 13}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[1, 2, 3].isSorted()", "kubeVersion": "1.20"}, "resp": {"cost": {"max": 13, "min": 13}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[1, 2, 3].sum() + [4].max() + [1].min()"}, "resp": {"cost": {"max": 37, "min": 37}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "['a', 'b'].join(',')"}, "resp": {"cost": {"max": 1844674407370955274, "min": 11}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "['a', 'b'].join(',')", "kubeVersion": "1.28"}, "resp": {"cost": {"max": 1844674407370955274, "min": 11}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc'.charAt(1)"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'a1'.find('[0-9]')"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'a1b2'.findAll('[0-9]')"}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "url('http://a/b?c=d').getQuery()"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "map(string, list(string))"}}
+{"req": {"expr": "isQuantity('1Gi') && quantity('1Gi').isGreaterThan(quantity('1Mi'))"}, "resp": {"cost": {"max": 4, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "isQuantity('1Gi')", "kubeVersion": "1.27"}, "resp": {"errors": ["undeclared reference to 'isQuantity' (in container '')"], "ok": false}}
+{"req": {"expr": "ip('1.2.3.4').family() == 4"}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "ip('1.2.3.4').family() == 4", "kubeVersion": "1.29"}, "resp": {"errors": ["undeclared reference to 'ip' (in container '')", "undeclared reference to 'family' (in container '')"], "ok": false}}
+{"req": {"expr": "cidr('10.0.0.0/8').containsIP('10.1.2.3')"}, "resp": {"cost": {"max": 6, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "isSemver('1.2.3')"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "isSemver('1.2.3')", "kubeVersion": "1.32"}, "resp": {"errors": ["undeclared reference to 'isSemver' (in container '')"], "ok": false}}
+{"req": {"expr": "sets.contains([1, 2], [1])"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "sets.contains([1, 2], [1])", "kubeVersion": "1.28"}, "resp": {"errors": ["undeclared reference to 'sets' (in container '')", "found no matching overload for 'contains' applied to '!error!.(list(int), list(int))'"], "ok": false}}
+{"req": {"expr": "[1, 2, 3].slice(0, 1)"}, "resp": {"cost": {"max": 22, "min": 22}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 2, 3].slice(0, 1)", "kubeVersion": "1.33"}, "resp": {"errors": ["undeclared reference to 'slice' (in container '')"], "ok": false}}
+{"req": {"expr": "[[1], [2]].flatten()"}, "resp": {"cost": {"max": 43, "min": 43}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[3, 1, 2].sort()"}, "resp": {"cost": {"max": 39, "min": 39}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "lists.range(3)"}, "resp": {"cost": {"max": 14, "min": 14}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 1].distinct()"}, "resp": {"cost": {"max": 29, "min": 29}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "[1, 2].reverse()"}, "resp": {"cost": {"max": 23, "min": 23}, "errors": [], "ok": true, "outputType": "list(int)"}}
+{"req": {"expr": "format.dns1123Label().validate('a')"}, "resp": {"cost": {"max": 33, "min": 33}, "errors": [], "ok": true, "outputType": "optional_type(list(string))"}}
+{"req": {"expr": "format.dns1123Label().validate('a')", "kubeVersion": "1.30"}, "resp": {"errors": ["undeclared reference to 'format' (in container '')", "undeclared reference to 'dns1123Label' (in container '')", "undeclared reference to 'validate' (in container '')"], "ok": false}}
+{"req": {"envType": "stored", "expr": "format.dns1123Label().validate('a')", "kubeVersion": "1.30"}, "resp": {"cost": {"max": 33, "min": 33}, "errors": [], "ok": true, "outputType": "optional_type(list(string))"}}
+{"req": {"expr": "'%d'.format([1])"}, "resp": {"cost": {"max": 11, "min": 11}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "strings.quote('a')"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "[1, 2].exists(i, v, i < v)"}, "resp": {"cost": {"max": 25, "min": 19}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "cel.bind(a, 1, a + 1)"}, "resp": {"errors": ["undeclared reference to 'cel' (in container '')", "undeclared reference to 'bind' (in container '')", "undeclared reference to 'a' (in container '')", "undeclared reference to 'a' (in container '')"], "ok": false}}
+{"req": {"expr": "x.single_nested_message.bb", "vars": {"x": "dyn"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "a.b + 1 == a[0]", "vars": {"a": "dyn"}}, "resp": {"cost": {"max": 5, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x == null", "vars": {"x": "int"}}, "resp": {"errors": ["found no matching overload for '_==_' applied to '(int, null)'"], "ok": false}}
+{"req": {"expr": "x == null", "vars": {"x": "string"}}, "resp": {"errors": ["found no matching overload for '_==_' applied to '(string, null)'"], "ok": false}}
+{"req": {"expr": "x == null", "vars": {"x": "timestamp"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x.size() > 0 ? x[0] : 0", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 5, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "[1, 2].map(x, [x, x]).map(x, [x, x])"}, "resp": {"cost": {"max": 128, "min": 128}, "errors": [], "ok": true, "outputType": "list(list(list(int)))"}}
+{"req": {"expr": "{}.map(c, [c, type(c)])"}, "resp": {"errors": ["expected type 'dyn' but found 'type(dyn)'"], "ok": false}}
+{"req": {"expr": "[].map(x, [].map(y, x in y && y in x))"}, "resp": {"errors": ["found no matching overload for '@in' applied to '(list(dyn), dyn)'"], "ok": false}}
+{"req": {"expr": "1 + 2 * 3 - 1 / 2 == 6 % 1"}, "resp": {"cost": {"max": 6, "min": 6}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "1.0 + 2.0 * 3.0 - 1.0 / 2.20202 != 66.6"}, "resp": {"cost": {"max": 5, "min": 5}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "b'abc' + b'def'"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bytes"}}
+{"req": {"expr": "-x", "vars": {"x": "uint"}}, "resp": {"errors": ["found no matching overload for '-_' applied to '(uint)'"], "ok": false}}
+{"req": {"expr": "x.getHours()", "vars": {"x": "duration"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "x.getHours('UTC')", "vars": {"x": "timestamp"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "int(x)", "vars": {"x": "timestamp"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "bool('true') && bool(x)", "vars": {"x": "string"}}, "resp": {"cost": {"max": 3, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "x.startsWith(1)", "vars": {"x": "string"}}, "resp": {"errors": ["found no matching overload for 'startsWith' applied to 'string.(int)'"], "ok": false}}
+{"req": {"expr": "matches(x, 'a')", "vars": {"x": "string"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}

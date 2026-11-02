@@ -3,3 +3,4 @@
 mod checker;
 mod decls;
 mod environment;
+mod goldens;
