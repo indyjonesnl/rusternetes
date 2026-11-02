@@ -15,3 +15,6 @@ test = false
 
 [dependencies]
 cel.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -4344,6 +4344,7 @@ name = "rusternetes-cel-checker"
 version = "0.1.0"
 dependencies = [
  "cel",
+ "serde_json",
 ]
 
 [[package]]

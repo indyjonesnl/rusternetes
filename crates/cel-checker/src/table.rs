@@ -278,14 +278,16 @@ pub fn strings_v0(t: &mut Table) {
     m(t, "substring", "string, int, int", "string");
     m(t, "trim", "string", "string");
     m(t, "upperAscii", "string", "string");
+    // `join` exists at every version with the same declaration; only the
+    // binding differs (`ext/strings.go:498-534`).
+    m(t, "join", "list(string)", "string");
+    m(t, "join", "list(string), string", "string");
 }
 
-/// What `ext.Strings(ext.StringsVersion(2))` adds over version 0: `format`, `strings.quote`, `join` (`ext/strings.go:373-540`).
+/// What `ext.Strings(ext.StringsVersion(2))` adds over version 0: `format` and `strings.quote` (`ext/strings.go:373-540`).
 pub fn strings_v2_additions(t: &mut Table) {
     m(t, "format", "string, list(dyn)", "string");
     g(t, "strings.quote", "string", "string");
-    m(t, "join", "list(string)", "string");
-    m(t, "join", "list(string), string", "string");
 }
 
 /// `ext.Sets()`.

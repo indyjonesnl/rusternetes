@@ -1,0 +1,112 @@
+{"expr":"1 + 2"}
+{"expr":"'a' + 'b'"}
+{"expr":"1 + 'a'"}
+{"expr":"foo"}
+{"expr":"foo()"}
+{"expr":"'s'.foo()"}
+{"expr":"[]"}
+{"expr":"[1]"}
+{"expr":"[1, 'a']"}
+{"expr":"{}"}
+{"expr":"{1: 2u, 2: 3u}"}
+{"expr":"{1: 2u, 2u: 3}"}
+{"expr":"{'a': 1}.a"}
+{"expr":"[].length"}
+{"expr":"1 == 1u"}
+{"expr":"1 < 1.0"}
+{"expr":"1 < 1.0","kubeVersion":"1.27"}
+{"expr":"x.all(y, y > 0)","vars":{"x":"list(int)"}}
+{"expr":"x.all(y, y)","vars":{"x":"list(int)"}}
+{"expr":"x.exists(y, y == 'a')","vars":{"x":"list(int)"}}
+{"expr":"x.map(y, double(y))","vars":{"x":"list(int)"}}
+{"expr":"x.filter(y, y > 1)","vars":{"x":"list(int)"}}
+{"expr":"x.all(y, y)","vars":{"x":"bool"}}
+{"expr":"size(x) == x.size()","vars":{"x":"list(int)"}}
+{"expr":"x.single.bb","vars":{"x":"map(string, dyn)"}}
+{"expr":"x.y","vars":{"x":"int"}}
+{"expr":"x.?y","vars":{"x":"map(string, string)"}}
+{"expr":"x.?y.z","vars":{"x":"map(string, map(string, int))"}}
+{"expr":"x.y","vars":{"x":"optional(map(string, string))"}}
+{"expr":"{?'k': x.?v}","vars":{"x":"map(string, string)"}}
+{"expr":"{?'k': 'v'}"}
+{"expr":"[?x.?v, 'w']","vars":{"x":"map(string, string)"}}
+{"expr":"[?'v']"}
+{"expr":"optional.of(1).orValue(2)"}
+{"expr":"optional.of(1).orValue(2)","kubeVersion":"1.27"}
+{"expr":"x ? 1 : 2","vars":{"x":"bool"}}
+{"expr":"x ? 1 : 'a'","vars":{"x":"bool"}}
+{"expr":"1 && true"}
+{"expr":"true && x","vars":{"x":"dyn"}}
+{"expr":"!x || y","vars":{"x":"bool","y":"bool"}}
+{"expr":"1 in [1, 2, 3]"}
+{"expr":"'a' in {'a': 1}"}
+{"expr":"x in y","vars":{"x":"int","y":"list(string)"}}
+{"expr":"int('1') + int(2u)"}
+{"expr":"string(1) + string(2.0)"}
+{"expr":"duration('1s') + duration('2s')"}
+{"expr":"timestamp('2020-01-01T00:00:00Z') - duration('1s')"}
+{"expr":"timestamp('2020-01-01T00:00:00Z').getFullYear()"}
+{"expr":"'abc'.contains('b') && 'abc'.startsWith('a') && 'abc'.endsWith('c')"}
+{"expr":"'abc'.matches('a.c')"}
+{"expr":"size('abc') + size([1]) + size({1: 2}) + size(b'x')"}
+{"expr":"has(x.y)","vars":{"x":"map(string, int)"}}
+{"expr":"has(x.y) && x.y > 1","vars":{"x":"map(string, int)"}}
+{"expr":"type(1) == int"}
+{"expr":"type(null) == null_type"}
+{"expr":"list == type([1])"}
+{"expr":"dyn(1) + 'a'"}
+{"expr":"x[0] + x[1]","vars":{"x":"list(int)"}}
+{"expr":"x['a']","vars":{"x":"list(int)"}}
+{"expr":"x[1u]","vars":{"x":"list(int)"}}
+{"expr":"x['a'] + 1","vars":{"x":"map(string, int)"}}
+{"expr":"[1, 2, 3].isSorted()"}
+{"expr":"[1, 2, 3].isSorted()","kubeVersion":"1.20"}
+{"expr":"[1, 2, 3].sum() + [4].max() + [1].min()"}
+{"expr":"['a', 'b'].join(',')"}
+{"expr":"['a', 'b'].join(',')","kubeVersion":"1.28"}
+{"expr":"'abc'.charAt(1)"}
+{"expr":"'a1'.find('[0-9]')"}
+{"expr":"'a1b2'.findAll('[0-9]')"}
+{"expr":"url('http://a/b?c=d').getQuery()"}
+{"expr":"isQuantity('1Gi') && quantity('1Gi').isGreaterThan(quantity('1Mi'))"}
+{"expr":"isQuantity('1Gi')","kubeVersion":"1.27"}
+{"expr":"ip('1.2.3.4').family() == 4"}
+{"expr":"ip('1.2.3.4').family() == 4","kubeVersion":"1.29"}
+{"expr":"cidr('10.0.0.0/8').containsIP('10.1.2.3')"}
+{"expr":"isSemver('1.2.3')"}
+{"expr":"isSemver('1.2.3')","kubeVersion":"1.32"}
+{"expr":"sets.contains([1, 2], [1])"}
+{"expr":"sets.contains([1, 2], [1])","kubeVersion":"1.28"}
+{"expr":"[1, 2, 3].slice(0, 1)"}
+{"expr":"[1, 2, 3].slice(0, 1)","kubeVersion":"1.33"}
+{"expr":"[[1], [2]].flatten()"}
+{"expr":"[3, 1, 2].sort()"}
+{"expr":"lists.range(3)"}
+{"expr":"[1, 1].distinct()"}
+{"expr":"[1, 2].reverse()"}
+{"expr":"format.dns1123Label().validate('a')"}
+{"expr":"format.dns1123Label().validate('a')","kubeVersion":"1.30"}
+{"expr":"format.dns1123Label().validate('a')","kubeVersion":"1.30","envType":"stored"}
+{"expr":"'%d'.format([1])"}
+{"expr":"strings.quote('a')"}
+{"expr":"[1, 2].exists(i, v, i < v)"}
+{"expr":"cel.bind(a, 1, a + 1)"}
+{"expr":"x.single_nested_message.bb","vars":{"x":"dyn"}}
+{"expr":"a.b + 1 == a[0]","vars":{"a":"dyn"}}
+{"expr":"x == null","vars":{"x":"int"}}
+{"expr":"x == null","vars":{"x":"string"}}
+{"expr":"x == null","vars":{"x":"timestamp"}}
+{"expr":"x.size() > 0 ? x[0] : 0","vars":{"x":"list(int)"}}
+{"expr":"[1, 2].map(x, [x, x]).map(x, [x, x])"}
+{"expr":"{}.map(c, [c, type(c)])"}
+{"expr":"[].map(x, [].map(y, x in y && y in x))"}
+{"expr":"1 + 2 * 3 - 1 / 2 == 6 % 1"}
+{"expr":"1.0 + 2.0 * 3.0 - 1.0 / 2.20202 != 66.6"}
+{"expr":"b'abc' + b'def'"}
+{"expr":"-x","vars":{"x":"uint"}}
+{"expr":"x.getHours()","vars":{"x":"duration"}}
+{"expr":"x.getHours('UTC')","vars":{"x":"timestamp"}}
+{"expr":"int(x)","vars":{"x":"timestamp"}}
+{"expr":"bool('true') && bool(x)","vars":{"x":"string"}}
+{"expr":"x.startsWith(1)","vars":{"x":"string"}}
+{"expr":"matches(x, 'a')","vars":{"x":"string"}}
