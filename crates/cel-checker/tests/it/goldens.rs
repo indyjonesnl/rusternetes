@@ -10,6 +10,7 @@
 //! Regenerate with `tools/cel-oracle/gen-goldens.sh`.
 
 use cel::parser::Parser;
+use rusternetes_cel_checker::library_cost::kubernetes_cost;
 use rusternetes_cel_checker::{
     check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations, VariableDecl,
     Version,
@@ -24,6 +25,14 @@ use std::sync::Arc;
 /// oracle. Each is a gap to fix, not an expectation: the checker must match
 /// cel-go, and an entry here is removed once the gap closes.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "quantity(s).sign()",
+        "the Quantity type is declared as 'apiserver.cel.Quantity' (the name the DRA environment reports) where the Kubernetes library names it 'kubernetes.Quantity'. Only the message differs",
+    ),
+    (
+        "quantity(s).add(quantity(t))",
+        "the Quantity type is declared as 'apiserver.cel.Quantity' where the Kubernetes library names it 'kubernetes.Quantity'. Only the output type name differs",
+    ),
     (
         "[1, 2].exists(i, v, i < v)",
         "cel 0.15's parser does not expand the two-variable comprehension macros (cel-go parser/macro.go, TwoVarComprehensions), so the call is checked as a plain member call",
@@ -79,8 +88,12 @@ fn parse_type(s: &str) -> DType {
     }
 }
 
-/// What our checker says about a request, in the oracle's response shape.
-fn ours(req: &Value) -> (bool, Vec<String>, Option<String>) {
+/// What our checker says about a request, in the oracle's response shape: the
+/// verdict, the errors, the output type and the estimated cost
+/// (`env.EstimateCost(ast, &library.CostEstimator{})`, no size hints).
+type Ours = (bool, Vec<String>, Option<String>, Option<(u64, u64)>);
+
+fn ours(req: &Value) -> Ours {
     let expr_src = req["expr"].as_str().expect("expr");
     let version = req
         .get("kubeVersion")
@@ -107,13 +120,17 @@ fn ours(req: &Value) -> (bool, Vec<String>, Option<String>) {
     }
     let expr = match Parser::new().enable_optional_syntax(true).parse(expr_src) {
         Ok(e) => e,
-        Err(e) => return (false, vec![e.to_string()], None),
+        Err(e) => return (false, vec![e.to_string()], None, None),
     };
     let (ast, errs) = check(&expr, &mut env, &NoLocations);
     let msgs: Vec<String> = errs.errors().iter().map(|e| e.message.clone()).collect();
     let ok = msgs.is_empty();
     let out = ok.then(|| ast.output_type().map(DType::name)).flatten();
-    (ok, msgs, out)
+    let cost = ok.then(|| {
+        let c = kubernetes_cost(&ast, &expr, None);
+        (c.min, c.max)
+    });
+    (ok, msgs, out, cost)
 }
 
 fn goldens() -> Vec<(Value, Value)> {
@@ -130,15 +147,17 @@ fn goldens() -> Vec<(Value, Value)> {
 /// The oracle prints `cel.Type.String()` (`google.protobuf.Duration`), the
 /// checker prints `FormatCELType` (`duration`).
 fn normalize_output_type(s: &str) -> String {
-    match s {
-        "google.protobuf.Duration" => "duration".into(),
-        "google.protobuf.Timestamp" => "timestamp".into(),
-        other => other.into(),
-    }
+    s.replace("google.protobuf.Duration", "duration")
+        .replace("google.protobuf.Timestamp", "timestamp")
 }
 
-fn describe(ok: bool, errors: &[String], out: &Option<String>) -> String {
-    format!("ok={ok} errors={errors:?} outputType={out:?}")
+fn describe(
+    ok: bool,
+    errors: &[String],
+    out: &Option<String>,
+    cost: &Option<(u64, u64)>,
+) -> String {
+    format!("ok={ok} errors={errors:?} outputType={out:?} cost={cost:?}")
 }
 
 #[test]
@@ -158,13 +177,19 @@ fn checker_matches_goldens() {
             .get("outputType")
             .and_then(Value::as_str)
             .map(normalize_output_type);
-        let (ok, mut errors, out) = ours(&req);
+        let want_cost = resp.get("cost").map(|c| {
+            (
+                c["min"].as_u64().expect("cost.min"),
+                c["max"].as_u64().expect("cost.max"),
+            )
+        });
+        let (ok, mut errors, out, cost) = ours(&req);
         // cel-go reports issues ordered by source position; the checker here
         // has no locations yet, so errors are compared as a sorted set.
         let mut want_errors = want_errors;
         want_errors.sort();
         errors.sort();
-        let same = ok == want_ok && errors == want_errors && out == want_out;
+        let same = ok == want_ok && errors == want_errors && out == want_out && cost == want_cost;
         let key = format!("{expr} @ {req}");
         match (same, known.contains_key(expr)) {
             (true, false) => {}
@@ -174,8 +199,8 @@ fn checker_matches_goldens() {
             (false, true) => {}
             (false, false) => mismatches.push(format!(
                 "{key}\n    oracle: {}\n    ours:   {}",
-                describe(want_ok, &want_errors, &want_out),
-                describe(ok, &errors, &out)
+                describe(want_ok, &want_errors, &want_out, &want_cost),
+                describe(ok, &errors, &out, &cost)
             )),
         }
     }

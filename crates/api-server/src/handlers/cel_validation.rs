@@ -765,6 +765,19 @@ fn compile_schema_rules(
         }
         // validation.go:1280-1287.
         let cost = estimate_cost(rule);
+        // Default-off shadow run of the static cost estimator
+        // (`checker.Cost` with the Kubernetes estimator over the schema's
+        // size estimates); the heuristic keeps deciding.
+        if let Some(scope) = shadow_scope(schema, is_root, raw) {
+            cel_checker_shadow::observe_cost(
+                rule,
+                env_set,
+                pre.rule_env(rule),
+                &scope,
+                cost,
+                DEFAULT_RULE_COST_LIMIT,
+            );
+        }
         if !suppress && cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &rule_field,
@@ -808,6 +821,16 @@ fn compile_schema_rules(
             continue;
         }
         let me_cost = estimate_cost(me);
+        if let Some(scope) = shadow_scope(schema, is_root, raw) {
+            cel_checker_shadow::observe_cost(
+                me,
+                env_set,
+                pre.message_expression_env(me),
+                &scope,
+                me_cost,
+                DEFAULT_RULE_COST_LIMIT,
+            );
+        }
         if !suppress && me_cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &me_field,

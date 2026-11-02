@@ -10,9 +10,7 @@
 //! corresponding change in `interpreter/runtimecost.go`". Runtime cost tracking
 //! is not part of this crate; only the estimate is.
 //!
-//! Not ported: `OverloadCostEstimate` (per-call overrides of the estimator;
-//! Kubernetes does not use it) and `ast.Expr` nil handling, which the Rust AST
-//! cannot express.
+//! `ast.Expr` nil handling is not ported: the Rust AST cannot express it.
 
 use crate::checker::CheckedAst;
 use crate::overload_ids as ids;
@@ -212,8 +210,9 @@ pub struct AstNode<'a> {
     pub path: Vec<String>,
     /// `Type()`.
     pub ty: DType,
-    /// `Expr()`.
-    pub expr: &'a IdedExpr,
+    /// `Expr()`: `None` for a synthesized node (the library estimator's
+    /// `itemsNode`, which has no expression).
+    pub expr: Option<&'a IdedExpr>,
     /// `ComputedSize()`: derived from the expression itself (a literal, an
     /// inline list or map, a concatenation), when it can be.
     pub computed_size: Option<SizeEstimate>,
@@ -257,21 +256,27 @@ impl CostEstimator for NoEstimator {
     }
 }
 
-/// `checker.CostOption`s.
-#[derive(Clone, Copy, Debug)]
-pub struct CostOptions {
-    /// `PresenceTestHasCost`: whether a presence test (`has()`) costs one or
-    /// zero. cel-go defaults to one; the Kubernetes environments set it to
-    /// false (`apiserver/pkg/cel/environment/base.go:77-79`).
-    pub presence_test_has_cost: bool,
-}
+/// `checker.FunctionEstimator`: prices a call of one overload, or `None` to
+/// leave it to the [`CostEstimator`].
+pub type FunctionEstimator = Box<
+    dyn Fn(&dyn CostEstimator, Option<&AstNode<'_>>, &[AstNode<'_>]) -> Option<CallEstimate>
+        + Send
+        + Sync,
+>;
 
-impl Default for CostOptions {
-    fn default() -> Self {
-        Self {
-            presence_test_has_cost: true,
-        }
-    }
+/// `OverloadCostEstimate`s by overload id. When one is registered for an
+/// overload it overrides the cost calculation of the [`CostEstimator`].
+pub type OverloadEstimators = HashMap<String, FunctionEstimator>;
+
+/// `checker.CostOption`s.
+#[derive(Clone, Copy, Default)]
+pub struct CostOptions<'o> {
+    /// `PresenceTestHasCost(false)`: a presence test (`has()`) costs zero.
+    /// cel-go defaults to a cost of one; the Kubernetes environments set it
+    /// to zero (`apiserver/pkg/cel/environment/base.go:77-79`).
+    pub presence_test_free: bool,
+    /// `OverloadCostEstimate`.
+    pub overload_estimators: Option<&'o OverloadEstimators>,
 }
 
 /// `checker.Cost`: estimates the cost of the type-checked expression `root`.
@@ -279,7 +284,7 @@ pub fn cost(
     checked: &CheckedAst,
     root: &IdedExpr,
     estimator: &dyn CostEstimator,
-    opts: CostOptions,
+    opts: CostOptions<'_>,
 ) -> CostEstimate {
     let mut c = Coster {
         checked,
@@ -288,10 +293,11 @@ pub fn cost(
         local_vars: HashMap::new(),
         computed_sizes: HashMap::new(),
         computed_entry_sizes: HashMap::new(),
-        presence_test_cost: if opts.presence_test_has_cost {
-            CostEstimate::fixed(SELECT_AND_IDENT_COST)
-        } else {
+        overload_estimators: opts.overload_estimators,
+        presence_test_cost: if opts.presence_test_free {
             CostEstimate::fixed(0)
+        } else {
+            CostEstimate::fixed(SELECT_AND_IDENT_COST)
         },
     };
     c.cost(root)
@@ -336,6 +342,7 @@ struct LocalVar {
 struct Coster<'a> {
     checked: &'a CheckedAst,
     estimator: &'a dyn CostEstimator,
+    overload_estimators: Option<&'a OverloadEstimators>,
     /// `exprPaths`: expression id to field path.
     expr_paths: HashMap<u64, Vec<String>>,
     /// `localVars`: the stack of variables per name (`cel.bind` and
@@ -531,17 +538,24 @@ impl<'a> Coster<'a> {
             arg_nodes.push(self.new_ast_node(arg));
         }
 
-        let overload_ids = self
-            .checked
-            .ref_map
-            .get(&e.id)
+        let reference = self.checked.ref_map.get(&e.id);
+        let overload_ids = reference
             .map(|r| r.cost_overload_ids.clone())
             .unwrap_or_default();
         if overload_ids.is_empty() {
             return CostEstimate::default();
         }
+        // cel-go's checker rewrites a call of a namespaced function
+        // (`optional.of(x)`, parsed as the member call `of` on `optional`) to
+        // a global call of the resolved name (`checker.go:checkCall`,
+        // `e.SetKindCase(c.NewCall(...))`), so the target does not exist for
+        // the cost, and the estimators see the qualified function name.
+        let function = reference
+            .and_then(|r| r.name.clone())
+            .unwrap_or_else(|| call.func_name.clone());
+        let namespaced = function != call.func_name;
         let mut target_node = None;
-        if let Some(t) = &call.target {
+        if let Some(t) = call.target.as_deref().filter(|_| !namespaced) {
             sum = sum.add(self.cost(t));
             target_node = Some(self.new_ast_node(t));
         }
@@ -555,7 +569,7 @@ impl<'a> Coster<'a> {
         for overload in &overload_ids {
             let oc = self.function_cost(
                 e,
-                &call.func_name,
+                &function,
                 overload,
                 target_node.as_ref(),
                 &arg_nodes,
@@ -774,6 +788,16 @@ impl<'a> Coster<'a> {
             .iter()
             .fold(CostEstimate::default(), |s, c| s.add(*c));
         if let Some(est) = self
+            .overload_estimators
+            .and_then(|m| m.get(overload_id))
+            .and_then(|f| f(self.estimator, target, args))
+        {
+            return CallEstimate {
+                cost: est.cost.add(arg_cost_sum),
+                result_size: est.result_size,
+            };
+        }
+        if let Some(est) = self
             .estimator
             .estimate_call_cost(function, overload_id, target, args)
         {
@@ -897,8 +921,8 @@ impl<'a> Coster<'a> {
                 if args.len() == 3 {
                     let size = unknown(&args[1]).union(unknown(&args[2]));
                     let result_entry = union_entry(
-                        self.compute_entry_size(args[1].expr),
-                        self.compute_entry_size(args[2].expr),
+                        self.node_entry_size(&args[1]),
+                        self.node_entry_size(&args[2]),
                     );
                     self.set_entry_size(e, result_entry);
                     let arg_cost = arg_costs[0].add(arg_costs[1].union(arg_costs[2]));
@@ -913,8 +937,8 @@ impl<'a> Coster<'a> {
                     let lhs_size = unknown(&args[0]);
                     let rhs_size = unknown(&args[1]);
                     let result_size = lhs_size.add(rhs_size);
-                    let rhs_entry = self.compute_entry_size(args[0].expr);
-                    let lhs_entry = self.compute_entry_size(args[1].expr);
+                    let rhs_entry = self.node_entry_size(&args[0]);
+                    let lhs_entry = self.node_entry_size(&args[1]);
                     if let Some(re) = union_entry(rhs_entry, lhs_entry) {
                         self.set_entry_size(e, Some(re));
                     }
@@ -998,7 +1022,7 @@ impl<'a> Coster<'a> {
         AstNode {
             path,
             ty: self.get_type(e),
-            expr: e,
+            expr: Some(e),
             computed_size: self.compute_size(e),
         }
     }
@@ -1034,7 +1058,7 @@ impl<'a> Coster<'a> {
         let node = AstNode {
             path: self.get_path(e),
             ty: ty.clone(),
-            expr: e,
+            expr: Some(e),
             computed_size: None,
         };
         if let Some(s) = self.estimator.estimate_size(&node) {
@@ -1053,6 +1077,12 @@ impl<'a> Coster<'a> {
             }
         }
         None
+    }
+
+    /// `computeEntrySize(node.Expr())`; a node without an expression has no
+    /// entry size.
+    fn node_entry_size(&mut self, n: &AstNode<'_>) -> Option<EntrySizeEstimate> {
+        n.expr.and_then(|e| self.compute_entry_size(e))
     }
 
     fn set_entry_size(&mut self, e: &IdedExpr, size: Option<EntrySizeEstimate>) {

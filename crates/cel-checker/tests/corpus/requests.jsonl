@@ -110,3 +110,199 @@
 {"expr":"bool('true') && bool(x)","vars":{"x":"string"}}
 {"expr":"x.startsWith(1)","vars":{"x":"string"}}
 {"expr":"matches(x, 'a')","vars":{"x":"string"}}
+{"expr":"'ABCDEFGHIJ abcdefghij'.lowerAscii()"}
+{"expr":"'ABCDEFGHIJ abcdefghij'.lowerAscii() == 'abcdefghij ABCDEFGHIJ'.lowerAscii()"}
+{"expr":"'ABCDEFGHIJ abcdefghij'.upperAscii()"}
+{"expr":"'ABCDEFGHIJ abcdefghij'.upperAscii() == 'abcdefghij ABCDEFGHIJ'.upperAscii()"}
+{"expr":"strings.quote('ABCDEFGHIJ abcdefghij')"}
+{"expr":"strings.quote('ABCDEFGHIJ abcdefghij') == strings.quote('ABCDEFGHIJ abcdefghij')"}
+{"expr":"'abc 123 def 123'.replace('123', '456')"}
+{"expr":"'abc 123 def 123'.replace('', 'x')"}
+{"expr":"'abc 123 def 123'.replace('123', '')"}
+{"expr":"'abc 123 def 123'.replace('123', '456', 1)"}
+{"expr":"'abc 123 def 123'.split(' ')"}
+{"expr":"'abc 123 def 123'.split(' ', 1)"}
+{"expr":"'abc 123 def 123'.substring(5)"}
+{"expr":"'abc 123 def 123'.substring(5, 8)"}
+{"expr":"'  abc 123 def 123  '.trim()"}
+{"expr":"['aa', 'bb', 'cc', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].join(' ')"}
+{"expr":"['aa', 'bb', 'cc', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].join()"}
+{"expr":"'abc 123 def 123'.find('123')"}
+{"expr":"'abc 123 def 123'.findAll('123')"}
+{"expr":"'abc 123 def 123'.findAll('123', 1)"}
+{"expr":"jsonpatch.escapeKey('abc/def~ abc/def~')"}
+{"expr":"[1, 2, 3, 4, 5].isSorted()"}
+{"expr":"[1, 2, 3, 4, 5].max()"}
+{"expr":"[1, 2, 3, 4, 5].min()"}
+{"expr":"[1, 2, 3, 4, 5].sum()"}
+{"expr":"[1, 2, 3, 4, 5].sort()"}
+{"expr":"[1, 2, 3, 4, 5].reverse()"}
+{"expr":"[1, 2, 3, 4, 5].distinct()"}
+{"expr":"[1, 2, 3, 4, 5].slice(1, 3)"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].isSorted()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].max()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].min()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].sum()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].sort()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].reverse()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].distinct()"}
+{"expr":"[uint(1), uint(2), uint(3), uint(4), uint(5)].slice(1, 3)"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].isSorted()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].max()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].min()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].sum()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].sort()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].reverse()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].distinct()"}
+{"expr":"[1.0, 2.0, 3.0, 4.0, 5.0].slice(1, 3)"}
+{"expr":"[false, true, false, true, false].isSorted()"}
+{"expr":"[false, true, false, true, false].max()"}
+{"expr":"[false, true, false, true, false].min()"}
+{"expr":"[false, true, false, true, false].sort()"}
+{"expr":"[false, true, false, true, false].reverse()"}
+{"expr":"[false, true, false, true, false].distinct()"}
+{"expr":"[false, true, false, true, false].slice(1, 3)"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].isSorted()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].max()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].min()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].sort()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].reverse()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].distinct()"}
+{"expr":"['012345678901', '012345678901', '012345678901', '012345678901', '012345678901'].slice(1, 3)"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].isSorted()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].max()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].min()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].sort()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].reverse()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].distinct()"}
+{"expr":"[bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901'), bytes('012345678901')].slice(1, 3)"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].isSorted()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].max()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].min()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].sum()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].sort()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].reverse()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].distinct()"}
+{"expr":"[duration('1s'), duration('2s'), duration('3s'), duration('4s'), duration('5s')].slice(1, 3)"}
+{"expr":"[1, 2, 3].indexOf(3)"}
+{"expr":"'0123456789'.indexOf('3')"}
+{"expr":"[1, 2, 3].lastIndexOf(3)"}
+{"expr":"[[1, 2], [3]].flatten()"}
+{"expr":"lists.range(10)"}
+{"expr":"sets.contains([1, 2, 3], [1, 2])"}
+{"expr":"sets.equivalent([1, 2, 3], [1, 2])"}
+{"expr":"sets.intersects([1, 2, 3], [1, 2])"}
+{"expr":"url('https://kubernetes.io/').getHost()"}
+{"expr":"url('https://kubernetes.io/') == url('http://x.b')"}
+{"expr":"s.lowerAscii()","vars":{"s":"string"}}
+{"expr":"s.upperAscii()","vars":{"s":"string"}}
+{"expr":"s.trim()","vars":{"s":"string"}}
+{"expr":"s.substring(1)","vars":{"s":"string"}}
+{"expr":"s.substring(1, 3)","vars":{"s":"string"}}
+{"expr":"s.charAt(1)","vars":{"s":"string"}}
+{"expr":"s.replace('a', 'b')","vars":{"s":"string"}}
+{"expr":"s.replace('a', 'bb')","vars":{"s":"string"}}
+{"expr":"s.replace('', 'x')","vars":{"s":"string"}}
+{"expr":"s.replace('abc', 'a')","vars":{"s":"string"}}
+{"expr":"s.replace(t, 'x')","vars":{"s":"string","t":"string"}}
+{"expr":"s.replace('a', t)","vars":{"s":"string","t":"string"}}
+{"expr":"s.split(',')","vars":{"s":"string"}}
+{"expr":"s.split(',', 2)","vars":{"s":"string"}}
+{"expr":"s.split(',').join('-')","vars":{"s":"string"}}
+{"expr":"l.join()","vars":{"l":"list(string)"}}
+{"expr":"l.join(',')","vars":{"l":"list(string)"}}
+{"expr":"strings.quote(s)","vars":{"s":"string"}}
+{"expr":"s.find('[a-z]+')","vars":{"s":"string"}}
+{"expr":"s.findAll('[a-z]+')","vars":{"s":"string"}}
+{"expr":"s.find(t)","vars":{"s":"string","t":"string"}}
+{"expr":"s.indexOf('a')","vars":{"s":"string"}}
+{"expr":"s.lastIndexOf(t)","vars":{"s":"string","t":"string"}}
+{"expr":"s.startsWith(t)","vars":{"s":"string","t":"string"}}
+{"expr":"s.endsWith('x')","vars":{"s":"string"}}
+{"expr":"s.contains(t)","vars":{"s":"string","t":"string"}}
+{"expr":"s.matches('[a-z]+')","vars":{"s":"string"}}
+{"expr":"s + t","vars":{"s":"string","t":"string"}}
+{"expr":"b + b","vars":{"b":"bytes"}}
+{"expr":"s == t","vars":{"s":"string","t":"string"}}
+{"expr":"s < t","vars":{"s":"string","t":"string"}}
+{"expr":"b > b","vars":{"b":"bytes"}}
+{"expr":"string(b)","vars":{"b":"bytes"}}
+{"expr":"bytes(s)","vars":{"s":"string"}}
+{"expr":"s.size()","vars":{"s":"string"}}
+{"expr":"size(l)","vars":{"l":"list(string)"}}
+{"expr":"l + l","vars":{"l":"list(string)"}}
+{"expr":"s in l","vars":{"s":"string","l":"list(string)"}}
+{"expr":"l[0]","vars":{"l":"list(string)"}}
+{"expr":"m['a']","vars":{"m":"map(string, string)"}}
+{"expr":"m.a","vars":{"m":"map(string, string)"}}
+{"expr":"'a' in m","vars":{"m":"map(string, string)"}}
+{"expr":"l.all(x, x.startsWith('a'))","vars":{"l":"list(string)"}}
+{"expr":"l.exists(x, x == 'a')","vars":{"l":"list(string)"}}
+{"expr":"l.map(x, x + 'a')","vars":{"l":"list(string)"}}
+{"expr":"l.filter(x, x != 'a')","vars":{"l":"list(string)"}}
+{"expr":"l.map(x, x).filter(x, x != 'a')","vars":{"l":"list(string)"}}
+{"expr":"li.sum()","vars":{"li":"list(int)"}}
+{"expr":"li.min()","vars":{"li":"list(int)"}}
+{"expr":"li.max()","vars":{"li":"list(int)"}}
+{"expr":"li.isSorted()","vars":{"li":"list(int)"}}
+{"expr":"li.indexOf(3)","vars":{"li":"list(int)"}}
+{"expr":"l.isSorted()","vars":{"l":"list(string)"}}
+{"expr":"l.max()","vars":{"l":"list(string)"}}
+{"expr":"lb.min()","vars":{"lb":"list(bytes)"}}
+{"expr":"l.indexOf(s)","vars":{"l":"list(string)","s":"string"}}
+{"expr":"l.lastIndexOf('x')","vars":{"l":"list(string)"}}
+{"expr":"li.sort()","vars":{"li":"list(int)"}}
+{"expr":"l.sort()","vars":{"l":"list(string)"}}
+{"expr":"li.reverse()","vars":{"li":"list(int)"}}
+{"expr":"li.distinct()","vars":{"li":"list(int)"}}
+{"expr":"li.slice(1, 3)","vars":{"li":"list(int)"}}
+{"expr":"li.slice(1, 3).size()","vars":{"li":"list(int)"}}
+{"expr":"ll.flatten()","vars":{"ll":"list(list(int))"}}
+{"expr":"sets.contains(li, li)","vars":{"li":"list(int)"}}
+{"expr":"sets.equivalent(li, li)","vars":{"li":"list(int)"}}
+{"expr":"sets.intersects(l, l)","vars":{"l":"list(string)"}}
+{"expr":"ll.map(x, x.sum())","vars":{"ll":"list(list(int))"}}
+{"expr":"ll.all(x, x.all(y, y > 0))","vars":{"ll":"list(list(int))"}}
+{"expr":"url(s).getHost()","vars":{"s":"string"}}
+{"expr":"url(s) == url(t)","vars":{"s":"string","t":"string"}}
+{"expr":"url(s).getQuery()","vars":{"s":"string"}}
+{"expr":"isURL(s)","vars":{"s":"string"}}
+{"expr":"ip(s)","vars":{"s":"string"}}
+{"expr":"ip(s).family()","vars":{"s":"string"}}
+{"expr":"ip.isCanonical(s)","vars":{"s":"string"}}
+{"expr":"isIP(s)","vars":{"s":"string"}}
+{"expr":"ip(s) == ip(t)","vars":{"s":"string","t":"string"}}
+{"expr":"string(ip(s))","vars":{"s":"string"}}
+{"expr":"ip(s).isLoopback()","vars":{"s":"string"}}
+{"expr":"cidr(s)","vars":{"s":"string"}}
+{"expr":"isCIDR(s)","vars":{"s":"string"}}
+{"expr":"cidr(s).ip()","vars":{"s":"string"}}
+{"expr":"cidr(s).masked()","vars":{"s":"string"}}
+{"expr":"cidr(s).prefixLength()","vars":{"s":"string"}}
+{"expr":"cidr(s).containsIP(t)","vars":{"s":"string","t":"string"}}
+{"expr":"cidr(s).containsIP(ip(t))","vars":{"s":"string","t":"string"}}
+{"expr":"cidr(s).containsCIDR(t)","vars":{"s":"string","t":"string"}}
+{"expr":"cidr(s).containsCIDR(cidr(t))","vars":{"s":"string","t":"string"}}
+{"expr":"cidr(s) == cidr(t)","vars":{"s":"string","t":"string"}}
+{"expr":"string(cidr(s))","vars":{"s":"string"}}
+{"expr":"quantity(s).isInteger()","vars":{"s":"string"}}
+{"expr":"quantity(s).sign()","vars":{"s":"string"}}
+{"expr":"isQuantity(s)","vars":{"s":"string"}}
+{"expr":"quantity(s) == quantity(t)","vars":{"s":"string","t":"string"}}
+{"expr":"quantity(s).add(quantity(t))","vars":{"s":"string","t":"string"}}
+{"expr":"quantity(s).isGreaterThan(quantity(t))","vars":{"s":"string","t":"string"}}
+{"expr":"quantity(s).asInteger()","vars":{"s":"string"}}
+{"expr":"semver(s).major()","vars":{"s":"string"}}
+{"expr":"semver(s) == semver(t)","vars":{"s":"string","t":"string"}}
+{"expr":"isSemver(s)","vars":{"s":"string"}}
+{"expr":"semver(s).isGreaterThan(semver(t))","vars":{"s":"string","t":"string"}}
+{"expr":"format.dns1123Label().validate(s)","vars":{"s":"string"}}
+{"expr":"format.named('dns1123label').value().validate(s)","vars":{"s":"string"}}
+{"expr":"format.dns1123Label() == format.dns1123Label()"}
+{"expr":"format.named(s)","vars":{"s":"string"}}
+{"expr":"has(m.a)","vars":{"m":"map(string, string)"}}
+{"expr":"has(m.a) && m.a == 'x'","vars":{"m":"map(string, string)"}}
+{"expr":"s == 'x' ? l : l","vars":{"s":"string","l":"list(string)"}}
+{"expr":"(s == 'x' ? l : l).size()","vars":{"s":"string","l":"list(string)"}}
+{"expr":"dyn(s).size()","vars":{"s":"string"}}
+{"expr":"optional.of(s).hasValue()","vars":{"s":"string"}}

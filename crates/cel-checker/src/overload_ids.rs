@@ -7,8 +7,8 @@
 //! [`crate::Overload::id`]), so the ids `functionCost` reads are mapped here,
 //! from the function name, call style and argument types of the declaration.
 //!
-//! Only the ids `functionCost` and `CostEstimator.EstimateCallCost` use are
-//! mapped (the Kubernetes estimator switches on function names, not ids);
+//! Only the ids `functionCost` and the Kubernetes `EstimateCallCost` use are
+//! mapped (the latter switches on function names, and reads three ids);
 //! every other overload keeps its synthetic id, which `functionCost` prices
 //! as O(1) exactly as it prices a cel-go overload it has no rule for.
 
@@ -49,6 +49,11 @@ pub const STARTS_WITH_STRING: &str = "starts_with_string";
 pub const EXT_FORMAT_STRING: &str = "string_format";
 pub const STRING_TO_BYTES: &str = "string_to_bytes";
 pub const BYTES_TO_STRING: &str = "bytes_to_string";
+/// The Kubernetes library overloads `library.CostEstimator.EstimateCallCost`
+/// reads by id (`library/cidr.go`).
+pub const CIDR_IP: &str = "cidr_ip";
+pub const CIDR_CONTAINS_IP_STRING: &str = "cidr_contains_ip_string";
+pub const CIDR_CONTAINS_CIDR_STRING: &str = "cidr_contains_cidr_string";
 /// `overloads.TimestampToYear`: the one overload id the `checker/cost_test.go`
 /// estimator prices.
 pub const TIMESTAMP_TO_YEAR: &str = "timestamp_to_year";
@@ -100,7 +105,53 @@ pub fn cel_go_overload_id(function: &str, member: bool, args: &[DType]) -> Optio
         "string" if args.len() == 1 && is(&DType::Bytes) => Some(BYTES_TO_STRING),
         "format" if member && is(&DType::Str) => Some(EXT_FORMAT_STRING),
         "strings.quote" => Some(EXT_QUOTE_STRING),
+        "ip" if member && matches!(first, Some(DType::Opaque(n, _)) if n == "net.CIDR") => {
+            Some(CIDR_IP)
+        }
+        "containsIP" if member && args.get(1) == Some(&DType::Str) => Some(CIDR_CONTAINS_IP_STRING),
+        "containsCIDR" if member && args.get(1) == Some(&DType::Str) => {
+            Some(CIDR_CONTAINS_CIDR_STRING)
+        }
+        // `ext/sets.go`, `ext/lists.go` (version 3): the overloads
+        // `ext_cost` overrides.
+        "sets.contains" => Some("list_sets_contains_list"),
+        "sets.equivalent" => Some("list_sets_equivalent_list"),
+        "sets.intersects" => Some("list_sets_intersects_list"),
+        "slice" if member => Some("list_slice"),
+        "flatten" if member && args.len() == 1 => Some("list_flatten"),
+        "flatten" if member => Some("list_flatten_int"),
+        "lists.range" => Some("lists_range"),
+        "reverse" if member && is_list => Some("list_reverse"),
+        "distinct" if member && is_list => Some("list_distinct"),
+        "sort" if member && args.len() == 1 => sort_id(first, "sort"),
+        "@sortByAssociatedKeys" if member => sort_id(args.get(1), "sortByAssociatedKeys"),
         "getFullYear" if member && args == [DType::Timestamp] => Some(TIMESTAMP_TO_YEAR),
         _ => None,
     }
+}
+
+/// `list_<type>_sort` / `list_<type>_sortByAssociatedKeys` of the comparable
+/// element type of the list `t` (`ext/lists.go`).
+fn sort_id(t: Option<&DType>, suffix: &str) -> Option<&'static str> {
+    let DType::List(e) = t? else { return None };
+    let id = match (&**e, suffix) {
+        (DType::Int, "sort") => "list_int_sort",
+        (DType::Uint, "sort") => "list_uint_sort",
+        (DType::Double, "sort") => "list_double_sort",
+        (DType::Bool, "sort") => "list_bool_sort",
+        (DType::Duration, "sort") => "list_google.protobuf.Duration_sort",
+        (DType::Timestamp, "sort") => "list_google.protobuf.Timestamp_sort",
+        (DType::Str, "sort") => "list_string_sort",
+        (DType::Bytes, "sort") => "list_bytes_sort",
+        (DType::Int, _) => "list_int_sortByAssociatedKeys",
+        (DType::Uint, _) => "list_uint_sortByAssociatedKeys",
+        (DType::Double, _) => "list_double_sortByAssociatedKeys",
+        (DType::Bool, _) => "list_bool_sortByAssociatedKeys",
+        (DType::Duration, _) => "list_google.protobuf.Duration_sortByAssociatedKeys",
+        (DType::Timestamp, _) => "list_google.protobuf.Timestamp_sortByAssociatedKeys",
+        (DType::Str, _) => "list_string_sortByAssociatedKeys",
+        (DType::Bytes, _) => "list_bytes_sortByAssociatedKeys",
+        _ => return None,
+    };
+    Some(id)
 }
