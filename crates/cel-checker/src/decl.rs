@@ -3,9 +3,9 @@
 //! `DeclTypeProvider`, `FieldTypeMap`, `MaybeAssignTypeName`) and the identifier
 //! escaping of `k8s.io/apiserver/pkg/cel/escaping.go` (`Escape`).
 //!
-//! Not ported here, because only cost estimation and the interpreter use
-//! them: `MinSerializedSize` / `MaxElements`, enum values and defaults, the
-//! `ref.Val` default values and trait masks.
+//! `MinSerializedSize` / `MaxElements` are carried for the cost estimator.
+//! Not ported, because only the interpreter uses them: enum values and
+//! defaults as values, the `ref.Val` default values and trait masks.
 
 use crate::env::Provider;
 use crate::types::DType;
@@ -69,7 +69,9 @@ pub fn escape(ident: &str) -> Option<String> {
     Some(out)
 }
 
-/// `apiservercel.DeclField`.
+/// `apiservercel.DeclField`. Enum values and defaults are not kept: the static
+/// estimator only needs what `SchemaDeclType` derives from them (the string
+/// enum length and whether a required field has a default), computed there.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeclField {
     pub name: String,
@@ -77,9 +79,9 @@ pub struct DeclField {
     pub required: bool,
 }
 
-/// `apiservercel.DeclType`: the type of an OpenAPI schema node.
+/// What a [`DeclType`] is.
 #[derive(Clone, Debug, PartialEq)]
-pub enum DeclType {
+pub enum DeclKind {
     /// A scalar (`bool`, `int`, `double`, `string`, `bytes`, `timestamp`,
     /// `duration`) or `dyn` (`x-kubernetes-int-or-string`).
     Simple(DType),
@@ -95,30 +97,128 @@ pub enum DeclType {
     },
 }
 
+/// `apiservercel.DeclType`: the type of an OpenAPI schema node, with the size
+/// bounds the cost estimator reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeclType {
+    pub kind: DeclKind,
+    /// `MinSerializedSize`: the smallest number of bytes a value serializes to
+    /// in JSON.
+    pub min_serialized_size: i64,
+    /// `MaxElements`: the most elements of a list / map, or the longest string
+    /// / bytes value (in characters), a request can hold. `-1` where upstream
+    /// leaves it unset (the hand-built types), which `EstimateSize` reads as
+    /// `MaxElements` of 0 for the unset field.
+    pub max_elements: i64,
+}
+
+/// `limits.go`: `MinStringSize`, `MinBoolSize`, `MinNumberSize`, ... .
+pub mod limits {
+    /// `celconfig.MaxRequestSizeBytes`.
+    pub const MAX_REQUEST_SIZE_BYTES: i64 = 3 * 1024 * 1024;
+    pub const MAX_DURATION_SIZE_JSON: i64 = 32;
+    pub const MAX_DATETIME_SIZE_JSON: i64 = 32;
+    pub const MIN_DURATION_SIZE_JSON: i64 = 3;
+    pub const JSON_DATE_SIZE: i64 = 12;
+    pub const MIN_DATETIME_SIZE_JSON: i64 = 21;
+    pub const MIN_STRING_SIZE: i64 = 2;
+    pub const MIN_BOOL_SIZE: i64 = 4;
+    pub const MIN_NUMBER_SIZE: i64 = 1;
+}
+
 impl DeclType {
-    /// `NewObjectType`.
+    /// `NewSimpleTypeWithMinSize`.
+    pub fn simple_with_min_size(t: DType, min_serialized_size: i64) -> DeclType {
+        DeclType {
+            kind: DeclKind::Simple(t),
+            min_serialized_size,
+            max_elements: 0,
+        }
+    }
+
+    /// The package-level simple types of `types.go` (`BoolType`, `IntType`,
+    /// `StringType`, `DynType`, ...) with their `MinSerializedSize`.
+    pub fn simple(t: DType) -> DeclType {
+        let min = match &t {
+            DType::Bool => limits::MIN_BOOL_SIZE,
+            DType::Bytes | DType::Str => limits::MIN_STRING_SIZE,
+            DType::Double | DType::Int | DType::Uint => limits::MIN_NUMBER_SIZE,
+            DType::Duration => limits::MIN_DURATION_SIZE_JSON,
+            DType::Timestamp => limits::MIN_DATETIME_SIZE_JSON,
+            DType::Null => 4,
+            _ => 1,
+        };
+        DeclType::simple_with_min_size(t, min)
+    }
+
+    /// `NewListType`: a list is always at least `[]`.
+    pub fn list(elem: DeclType, max_items: i64) -> DeclType {
+        DeclType {
+            kind: DeclKind::List(Box::new(elem)),
+            min_serialized_size: 2,
+            max_elements: max_items,
+        }
+    }
+
+    /// `NewMapType(StringType, elem, maxProperties)`: a map is always at least
+    /// `{}`.
+    pub fn map(elem: DeclType, max_properties: i64) -> DeclType {
+        DeclType {
+            kind: DeclKind::Map(Box::new(elem)),
+            min_serialized_size: 2,
+            max_elements: max_properties,
+        }
+    }
+
+    /// `NewObjectType`: at least `{}`; the caller raises `min_serialized_size`
+    /// for the required properties it adds.
     pub fn object(name: &str, fields: BTreeMap<String, DeclField>) -> DeclType {
-        DeclType::Object {
-            name: name.to_string(),
-            fields,
+        DeclType {
+            kind: DeclKind::Object {
+                name: name.to_string(),
+                fields,
+            },
+            min_serialized_size: 2,
+            max_elements: 0,
         }
     }
 
     /// `DeclType.CelType`.
     pub fn dtype(&self) -> DType {
-        match self {
-            DeclType::Simple(t) => t.clone(),
-            DeclType::List(e) => DType::List(Box::new(e.dtype())),
-            DeclType::Map(e) => DType::Map(Box::new(DType::Str), Box::new(e.dtype())),
-            DeclType::Object { name, .. } => DType::Struct(name.clone()),
+        match &self.kind {
+            DeclKind::Simple(t) => t.clone(),
+            DeclKind::List(e) => DType::List(Box::new(e.dtype())),
+            DeclKind::Map(e) => DType::Map(Box::new(DType::Str), Box::new(e.dtype())),
+            DeclKind::Object { name, .. } => DType::Struct(name.clone()),
+        }
+    }
+
+    /// `ElemType` of a list or map.
+    pub fn elem_type(&self) -> Option<&DeclType> {
+        match &self.kind {
+            DeclKind::List(e) | DeclKind::Map(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// `KeyType`: `string` for a map.
+    pub fn key_type(&self) -> Option<DeclType> {
+        matches!(self.kind, DeclKind::Map(_)).then(|| DeclType::simple(DType::Str))
+    }
+
+    /// `Fields` of an object.
+    pub fn fields(&self) -> Option<&BTreeMap<String, DeclField>> {
+        match &self.kind {
+            DeclKind::Object { fields, .. } => Some(fields),
+            _ => None,
         }
     }
 
     /// `DeclType.MaybeAssignTypeName`: gives every `"object"` below this type a
     /// unique, path-derived name.
     pub fn maybe_assign_type_name(&self, name: &str) -> DeclType {
-        match self {
-            DeclType::Object { name: own, fields } => {
+        let kind = match &self.kind {
+            DeclKind::Object { name: own, fields } => {
                 let name = if own != "object" { own.as_str() } else { name };
                 let fields = fields
                     .iter()
@@ -134,24 +234,29 @@ impl DeclType {
                         )
                     })
                     .collect();
-                DeclType::Object {
+                DeclKind::Object {
                     name: name.to_string(),
                     fields,
                 }
             }
-            DeclType::Map(e) => {
-                DeclType::Map(Box::new(e.maybe_assign_type_name(&format!("{name}.@elem"))))
+            DeclKind::Map(e) => {
+                DeclKind::Map(Box::new(e.maybe_assign_type_name(&format!("{name}.@elem"))))
             }
-            DeclType::List(e) => {
-                DeclType::List(Box::new(e.maybe_assign_type_name(&format!("{name}.@idx"))))
+            DeclKind::List(e) => {
+                DeclKind::List(Box::new(e.maybe_assign_type_name(&format!("{name}.@idx"))))
             }
-            simple => simple.clone(),
+            DeclKind::Simple(_) => return self.clone(),
+        };
+        DeclType {
+            kind,
+            min_serialized_size: self.min_serialized_size,
+            max_elements: self.max_elements,
         }
     }
 
     fn type_name(&self) -> Option<&str> {
-        match self {
-            DeclType::Object { name, .. } => Some(name),
+        match &self.kind {
+            DeclKind::Object { name, .. } => Some(name),
             _ => None,
         }
     }
@@ -159,8 +264,8 @@ impl DeclType {
 
 /// `FieldTypeMap` / `buildDeclTypes`: every named object type below `t`.
 fn field_type_map(path: &str, t: &DeclType) -> HashMap<String, DeclType> {
-    let path = match t {
-        DeclType::Object { name, .. } if name != "object" => name.as_str(),
+    let path = match t.type_name() {
+        Some(name) if name != "object" => name,
         _ => path,
     };
     let mut out = HashMap::new();
@@ -169,22 +274,22 @@ fn field_type_map(path: &str, t: &DeclType) -> HashMap<String, DeclType> {
 }
 
 fn build_decl_types(path: &str, t: &DeclType, out: &mut HashMap<String, DeclType>) {
-    match t {
-        DeclType::Object { name, fields } => {
+    match &t.kind {
+        DeclKind::Object { name, fields } => {
             out.insert(name.clone(), t.clone());
             for (n, f) in fields {
                 build_decl_types(&format!("{path}.{n}"), &f.ty, out);
             }
         }
-        DeclType::Map(e) => {
+        DeclKind::Map(e) => {
             build_decl_types(&format!("{path}.@elem"), e, out);
             out.insert(path.to_string(), t.clone());
         }
-        DeclType::List(e) => {
+        DeclKind::List(e) => {
             build_decl_types(&format!("{path}.@idx"), e, out);
             out.insert(path.to_string(), t.clone());
         }
-        DeclType::Simple(_) => {}
+        DeclKind::Simple(_) => {}
     }
 }
 
@@ -246,7 +351,7 @@ impl Provider for DeclTypeProvider {
         let Some(st) = self.registered.get(struct_name) else {
             return self.fallback.find_struct_field_type(struct_name, field);
         };
-        if let DeclType::Object { fields, .. } = st {
+        if let DeclKind::Object { fields, .. } = &st.kind {
             let mut found = fields.get(field);
             if self.recognize_keyword_as_field_name
                 && found.is_none()
@@ -259,7 +364,7 @@ impl Provider for DeclTypeProvider {
             }
         }
         // This could be a dynamic map.
-        if let DeclType::Map(e) = st {
+        if let DeclKind::Map(e) = &st.kind {
             return Some(e.dtype());
         }
         None

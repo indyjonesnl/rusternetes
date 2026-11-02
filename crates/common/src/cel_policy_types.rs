@@ -34,11 +34,11 @@ fn field(name: &str, ty: DeclType, required: bool) -> (String, DeclField) {
 }
 
 fn string() -> DeclType {
-    DeclType::Simple(DType::Str)
+    DeclType::simple(DType::Str)
 }
 
 fn list_of(t: DeclType) -> DeclType {
-    DeclType::List(Box::new(t))
+    DeclType::list(t, -1)
 }
 
 /// `BuildRequestType` (`plugin/cel/compile.go:48-89`).
@@ -68,7 +68,7 @@ pub fn request_type() -> DeclType {
             field("username", string(), false),
             field("uid", string(), false),
             field("groups", list_of(string()), false),
-            field("extra", DeclType::Map(Box::new(list_of(string()))), false),
+            field("extra", DeclType::map(list_of(string()), -1), false),
         ],
     );
     obj(
@@ -84,8 +84,8 @@ pub fn request_type() -> DeclType {
             field("namespace", string(), false),
             field("operation", string(), true),
             field("userInfo", user_info, true),
-            field("dryRun", DeclType::Simple(DType::Bool), false),
-            field("options", DeclType::Simple(DType::Dyn), false),
+            field("dryRun", DeclType::simple(DType::Bool), false),
+            field("options", DeclType::simple(DType::Dyn), false),
         ],
     )
 }
@@ -95,9 +95,9 @@ pub fn namespace_type() -> DeclType {
     let obj = |name: &str, fields: Vec<(String, DeclField)>| {
         DeclType::object(name, fields.into_iter().collect())
     };
-    let ts = || DeclType::Simple(DType::Timestamp);
-    let int = || DeclType::Simple(DType::Int);
-    let str_map = || DeclType::Map(Box::new(string()));
+    let ts = || DeclType::simple(DType::Timestamp);
+    let int = || DeclType::simple(DType::Int);
+    let str_map = || DeclType::map(string(), -1);
     let spec = obj(
         "kubernetes.NamespaceSpec",
         vec![field("finalizers", list_of(string()), true)],
@@ -151,7 +151,7 @@ pub fn namespace_type() -> DeclType {
 /// scalar, list or map (structs, optionals, errors) is `dyn`.
 pub fn convert_output_type(t: Option<&DType>) -> DeclType {
     let Some(t) = t else {
-        return DeclType::Simple(DType::Dyn);
+        return DeclType::simple(DType::Dyn);
     };
     match t {
         DType::Any
@@ -163,16 +163,14 @@ pub fn convert_output_type(t: Option<&DType>) -> DeclType {
         | DType::Null
         | DType::Str
         | DType::Timestamp
-        | DType::Uint => DeclType::Simple(t.clone()),
+        | DType::Uint => DeclType::simple(t.clone()),
         DType::List(e) => list_of(convert_output_type(Some(e))),
-        DType::Map(k, v) if **k == DType::Str => {
-            DeclType::Map(Box::new(convert_output_type(Some(v))))
-        }
-        DType::Map(k, v) => DeclType::Simple(DType::Map(
+        DType::Map(k, v) if **k == DType::Str => DeclType::map(convert_output_type(Some(v)), -1),
+        DType::Map(k, v) => DeclType::simple(DType::Map(
             k.clone(),
             Box::new(convert_output_type(Some(v)).dtype()),
         )),
-        _ => DeclType::Simple(DType::Dyn),
+        _ => DeclType::simple(DType::Dyn),
     }
 }
 

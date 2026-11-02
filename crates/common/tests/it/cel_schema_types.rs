@@ -1,7 +1,6 @@
 //! `common.SchemaDeclType` (schemas.go) over `JSONSchemaProps`, and the typed
 //! CRD rule environment of the shadow checker run.
 
-use rusternetes_cel_checker::decl::DeclType;
 use rusternetes_cel_checker::DType;
 use rusternetes_common::cel_checker_shadow::{check_expression, SelfScope};
 use rusternetes_common::cel_schema_types::schema_decl_type;
@@ -64,12 +63,8 @@ fn widget() -> JSONSchemaProps {
 fn scalar_and_format_types() {
     let w = widget();
     let spec = schema_decl_type(&w, true).unwrap();
-    let DeclType::Object { fields, .. } = spec else {
-        panic!()
-    };
-    let DeclType::Object { fields, .. } = &fields["spec"].ty else {
-        panic!()
-    };
+    let fields = spec.fields().unwrap();
+    let fields = fields["spec"].ty.fields().unwrap();
     let t = |n: &str| fields[n].ty.dtype();
     assert_eq!(t("size"), DType::Int);
     assert_eq!(t("ratio"), DType::Double);
@@ -174,4 +169,123 @@ fn old_self_follows_the_version_and_optional_old_self() {
     assert!(!errors_at(spec, false, "oldSelf.hasValue()", 35, false).is_empty());
     // `oldSelf` is introduced at 1.24.
     assert!(!errors_at(spec, false, "oldSelf.size == 1", 23, false).is_empty());
+}
+
+/// `(min_serialized_size, max_elements)` of the schema's declaration.
+fn sizes(v: serde_json::Value) -> (i64, i64) {
+    let t = schema_decl_type(&schema(v), false).expect("exposed");
+    (t.min_serialized_size, t.max_elements)
+}
+
+#[test]
+fn string_sizes() {
+    // MaxRequestSizeBytes (3 MiB) minus the quotes.
+    assert_eq!(sizes(json!({"type": "string"})), (2, 3145726));
+    // maxLength counts code points, up to 4 bytes each.
+    assert_eq!(sizes(json!({"type": "string", "maxLength": 10})), (2, 40));
+    assert_eq!(sizes(json!({"type": "string", "maxLength": -3})), (2, 0));
+    // The longest enum value, when there is no maxLength.
+    assert_eq!(
+        sizes(json!({"type": "string", "enum": ["a", "bcd"]})),
+        (2, 3)
+    );
+    assert_eq!(
+        sizes(json!({"type": "string", "maxLength": 1, "enum": ["bcd"]})),
+        (2, 4)
+    );
+}
+
+#[test]
+fn string_format_sizes() {
+    assert_eq!(
+        sizes(json!({"type": "string", "format": "byte"})),
+        (2, 3145726)
+    );
+    assert_eq!(
+        sizes(json!({"type": "string", "format": "byte", "maxLength": 5})),
+        (2, 5)
+    );
+    assert_eq!(
+        sizes(json!({"type": "string", "format": "duration"})),
+        (3, 32)
+    );
+    assert_eq!(sizes(json!({"type": "string", "format": "date"})), (12, 12));
+    assert_eq!(
+        sizes(json!({"type": "string", "format": "date-time"})),
+        (21, 32)
+    );
+}
+
+#[test]
+fn int_or_string_sizes() {
+    assert_eq!(
+        sizes(json!({"x-kubernetes-int-or-string": true})),
+        (1, 3145726)
+    );
+    assert_eq!(
+        sizes(json!({"x-kubernetes-int-or-string": true, "maxLength": 3})),
+        (1, 12)
+    );
+}
+
+#[test]
+fn scalar_min_sizes() {
+    assert_eq!(sizes(json!({"type": "boolean"})).0, 4);
+    assert_eq!(sizes(json!({"type": "integer"})).0, 1);
+    assert_eq!(sizes(json!({"type": "number"})).0, 1);
+}
+
+#[test]
+fn list_and_map_sizes() {
+    let items = json!({"type": "string"});
+    // (3145728 - 2) / (min size 2 + 1)
+    assert_eq!(
+        sizes(json!({"type": "array", "items": items})),
+        (2, 1048575)
+    );
+    assert_eq!(
+        sizes(json!({"type": "array", "items": items, "maxItems": 7})),
+        (2, 7)
+    );
+    assert_eq!(
+        sizes(json!({"type": "array", "items": items, "maxItems": -1})),
+        (2, 0)
+    );
+    // (3145728 - 2) / (min size 2 + 6)
+    assert_eq!(
+        sizes(json!({"type": "object", "additionalProperties": items})),
+        (2, 393215)
+    );
+    assert_eq!(
+        sizes(json!({"type": "object", "additionalProperties": items, "maxProperties": 4})),
+        (2, 4)
+    );
+}
+
+#[test]
+fn object_min_size_counts_required_properties_without_defaults() {
+    // 2 for {}, plus per required property: len(name) + min size + 4.
+    assert_eq!(
+        sizes(json!({
+            "type": "object",
+            "required": ["name", "n"],
+            "properties": {
+                "name": {"type": "string"},
+                "n": {"type": "integer"},
+                "optional": {"type": "string"}
+            }
+        }))
+        .0,
+        2 + (4 + 2 + 4) + (1 + 1 + 4)
+    );
+    // Defaults are filled in server-side, so they do not count.
+    assert_eq!(
+        sizes(json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string", "default": "x"}}
+        }))
+        .0,
+        2
+    );
 }

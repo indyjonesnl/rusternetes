@@ -15,7 +15,7 @@ fn set() -> EnvSet {
 
 fn ctx(variables: &[(&str, &str)]) -> PolicyTypeContext {
     PolicyTypeContext {
-        object: DeclType::Simple(DType::Dyn),
+        object: DeclType::simple(DType::Dyn),
         params: ParamsType::None,
         variables: variables
             .iter()

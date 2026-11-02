@@ -60,22 +60,16 @@ fn field(name: &str, ty: DeclType) -> (String, DeclField) {
 fn root() -> DeclType {
     let item = DeclType::object(
         "object",
-        BTreeMap::from([field("name", DeclType::Simple(DType::Str))]),
+        BTreeMap::from([field("name", DeclType::simple(DType::Str))]),
     );
     let spec = DeclType::object(
         "object",
         BTreeMap::from([
-            field("replicas", DeclType::Simple(DType::Int)),
-            field(
-                "tags",
-                DeclType::List(Box::new(DeclType::Simple(DType::Str))),
-            ),
-            field(
-                "labels",
-                DeclType::Map(Box::new(DeclType::Simple(DType::Str))),
-            ),
-            field("items", DeclType::List(Box::new(item))),
-            field("__in__", DeclType::Simple(DType::Bool)),
+            field("replicas", DeclType::simple(DType::Int)),
+            field("tags", DeclType::list(DeclType::simple(DType::Str), -1)),
+            field("labels", DeclType::map(DeclType::simple(DType::Str), -1)),
+            field("items", DeclType::list(item, -1)),
+            field("__in__", DeclType::simple(DType::Bool)),
         ]),
     );
     DeclType::object("object", BTreeMap::from([field("spec", spec)]))
@@ -105,16 +99,12 @@ fn errors(src: &str, minor: u32) -> Vec<String> {
 fn unique_type_names_follow_the_path() {
     let scoped = root().maybe_assign_type_name("selfType0");
     assert_eq!(scoped.dtype(), DType::Struct("selfType0".into()));
-    let DeclType::Object { fields, .. } = &scoped else {
-        panic!()
-    };
+    let fields = scoped.fields().unwrap();
     assert_eq!(
         fields["spec"].ty.dtype(),
         DType::Struct("selfType0.spec".into())
     );
-    let DeclType::Object { fields, .. } = &fields["spec"].ty else {
-        panic!()
-    };
+    let fields = fields["spec"].ty.fields().unwrap();
     assert_eq!(
         fields["items"].ty.dtype(),
         DType::List(Box::new(DType::Struct("selfType0.spec.items.@idx".into())))
