@@ -13,7 +13,6 @@ mod cel;
 mod cel_authz;
 mod cel_cost;
 mod cel_dra;
-mod cel_dra_decls;
 mod cel_env;
 mod cel_versions;
 mod cloud_provider;

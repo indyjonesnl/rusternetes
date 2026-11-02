@@ -1,0 +1,26 @@
+//! A port of the cel-go checker (`vendor/github.com/google/cel-go/checker`,
+//! `common/types`, `common/decls`, `common/stdlib`) over the AST of the `cel`
+//! crate, which has no checker of its own (tracking issue #3440).
+//!
+//! The `cel` parser already is a port of cel-go's: every `IdedExpr` node has a
+//! unique id, macros are expanded, and the operator names are cel-go's, so the
+//! checker's `typeMap` / `referenceMap` can key on node ids. This crate
+//! therefore depends only on `cel`, never on `rusternetes-common`, so editing
+//! the checker does not rebuild `common` and its dependants.
+//!
+//! Layout (one module per cel-go concern):
+//!
+//! * [`types`]  : `common/types/types.go`, the type model and its formatting
+//!   (`checker/format.go`).
+//! * [`unify`]  : `checker/types.go` + `checker/mapping.go`, assignability with
+//!   type-parameter substitution, and `checker.resolveOverload`.
+//! * [`table`]  : `common/stdlib/standard.go` plus the extension and Kubernetes
+//!   library overload declarations of the DRA environment.
+
+pub mod table;
+pub mod types;
+pub mod unify;
+
+pub use table::{is_macro, lookup, table};
+pub use types::{DType, Overload};
+pub use unify::{format_signature, is_assignable, resolve, Resolution};

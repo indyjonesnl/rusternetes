@@ -50,6 +50,7 @@ etcd-client.workspace = true
 sha2 = "0.10.9"
 reqwest = { workspace = true }
 cel.workspace = true
+rusternetes-cel-checker = { path = "../cel-checker" }
 prost.workspace = true
 prost-types.workspace = true
 # PodCertificateRequest proof-of-possession verification (upstream
