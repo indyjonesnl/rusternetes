@@ -24,6 +24,10 @@ pub struct Reference {
     pub name: Option<String>,
     /// The matching overload ids of a function reference.
     pub overload_ids: Vec<String>,
+    /// The ids `checker.Cost` switches on: the cel-go overload id where the
+    /// declaration maps to one ([`crate::overload_ids`]), else the same as
+    /// `overload_ids`.
+    pub cost_overload_ids: Vec<String>,
 }
 
 /// The checked AST: `ast.CheckedAST` without the AST itself.
@@ -226,6 +230,7 @@ impl Checker<'_> {
             Reference {
                 name: None,
                 overload_ids: vec!["select_optional_field".into()],
+                cost_overload_ids: vec!["select_optional_field".into()],
             },
         );
     }
@@ -372,6 +377,7 @@ impl Checker<'_> {
                 let r = Reference {
                     name: Some(f.name.clone()),
                     overload_ids: vec![o.id.clone()],
+                    cost_overload_ids: vec![o.cost_id()],
                 };
                 let mut failed = false;
                 for (i, at) in arg_types.iter().enumerate() {
@@ -406,9 +412,13 @@ impl Checker<'_> {
                         checked = Some(Reference {
                             name: Some(f.name.clone()),
                             overload_ids: vec![o.id.clone()],
+                            cost_overload_ids: vec![o.cost_id()],
                         })
                     }
-                    Some(r) => r.overload_ids.push(o.id.clone()),
+                    Some(r) => {
+                        r.overload_ids.push(o.id.clone());
+                        r.cost_overload_ids.push(o.cost_id());
+                    }
                 }
                 // First matching overload determines the result type.
                 let fn_result = substitute(&self.mappings, &cand_result, false);
@@ -691,6 +701,7 @@ impl Reference {
         Reference {
             name: Some(name.to_string()),
             overload_ids: vec![],
+            cost_overload_ids: vec![],
         }
     }
 }

@@ -18,14 +18,18 @@
 //!   resolution of `common/containers`.
 //! * [`errors`] : `checker/errors.go` messages and `common/errors.go`.
 //! * [`checker`]: `checker/checker.go`, the type-checking pass.
+//! * [`cost`]   : `checker/cost.go`, the static cost estimator, with
+//!   [`overload_ids`] mapping the table's overloads to the cel-go ids it keys on.
 //! * [`table`]  : `common/stdlib/standard.go` plus the extension and Kubernetes
 //!   library overload declarations of the DRA environment.
 
 pub mod checker;
+pub mod cost;
 pub mod decl;
 pub mod env;
 pub mod environment;
 pub mod errors;
+pub mod overload_ids;
 pub mod table;
 pub mod types;
 pub mod unify;
