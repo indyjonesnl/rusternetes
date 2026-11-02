@@ -113,6 +113,7 @@ COPY rusternetes/crates/rusternetes/Cargo.toml        ./rusternetes/crates/ruste
 COPY rusternetes/crates/scheduler/Cargo.toml          ./rusternetes/crates/scheduler/Cargo.toml
 COPY rusternetes/crates/storage/Cargo.toml            ./rusternetes/crates/storage/Cargo.toml
 COPY rusternetes/crates/streamproxy/Cargo.toml        ./rusternetes/crates/streamproxy/Cargo.toml
+COPY rusternetes/crates/cel-checker/Cargo.toml        ./rusternetes/crates/cel-checker/Cargo.toml
 COPY rusternetes/crates/csi/Cargo.toml        ./rusternetes/crates/csi/Cargo.toml
 COPY rusternetes/crates/test_support/Cargo.toml       ./rusternetes/crates/test_support/Cargo.toml
 
@@ -141,7 +142,7 @@ COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
+    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -210,6 +211,7 @@ COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
 COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
 COPY rusternetes/crates/client/src               ./crates/client/src
 COPY rusternetes/crates/common/src               ./crates/common/src
+COPY rusternetes/crates/cel-checker/src               ./crates/cel-checker/src
 COPY rusternetes/crates/common/tests             ./crates/common/tests
 COPY rusternetes/crates/controller-core/src      ./crates/controller-core/src
 COPY rusternetes/crates/controller-manager/src   ./crates/controller-manager/src

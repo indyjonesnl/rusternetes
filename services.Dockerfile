@@ -190,6 +190,7 @@ COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
+COPY crates/cel-checker/Cargo.toml        crates/cel-checker/Cargo.toml
 COPY crates/csi/Cargo.toml        crates/csi/Cargo.toml
 COPY crates/test_support/Cargo.toml       crates/test_support/Cargo.toml
 
@@ -219,7 +220,7 @@ COPY crates/kubelet/proto        crates/kubelet/proto
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy csi test_support; do \
+    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -306,6 +307,7 @@ COPY crates/middleware/src           crates/middleware/src
 COPY crates/protobuf/src             crates/protobuf/src
 COPY crates/client/src               crates/client/src
 COPY crates/common/src               crates/common/src
+COPY crates/cel-checker/src               crates/cel-checker/src
 COPY crates/common/tests             crates/common/tests
 COPY crates/controller-core/src      crates/controller-core/src
 COPY crates/controller-manager/src   crates/controller-manager/src
