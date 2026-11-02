@@ -71,13 +71,15 @@ mod tests {
             ("(a.b)", 12),
             ("{1: 2}", 10),
             ("1.5 + 2e-3", 14),
-            ("!!a", 12),
             ("a.b.c", 13),
             ("a.f(1, 2)", 13),
             ("\"s,\".size()", 19),
         ] {
             assert_eq!(col(arg), want, "{arg}");
         }
+        // An even run of `!` collapses to its operand (parser.go
+        // VisitLogicalNot:548-550), so `!!a` is the plain identifier `a`.
+        assert_eq!(invalid("cel.bind(!!a, 1, true)"), None);
     }
 
     #[test]

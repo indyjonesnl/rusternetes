@@ -269,7 +269,7 @@ impl ResourceCheckVal {
 }
 
 fn no_such_overload() -> ExecutionError {
-    ExecutionError::NoSuchOverload
+    ExecutionError::no_such_overload("authz", Vec::new())
 }
 
 fn fail(function: &str, msg: &str) -> ExecutionError {
@@ -291,20 +291,25 @@ type R = Result<Value, ExecutionError>;
 
 /// Register the receiver functions of both libraries
 /// (`authzLibraryDecls`, `authzSelectorsLibraryDecls`).
-pub fn register(ctx: &mut Context<'_>) {
+pub fn register(ctx: &mut Context<'_, '_>) {
     // authorizerPath (:372-388)
-    ctx.add_function("path", |This(this): This<Value>, path: Arc<String>| -> R {
-        let a = downcast::<AuthorizerVal>(&this).ok_or_else(no_such_overload)?;
-        if blank(&path) {
-            return Err(fail("path", "path must not be empty"));
-        }
-        Ok(opaque(PathCheckVal {
-            authorizer: a.clone(),
-            path: path.to_string(),
-        }))
-    });
+    crate::cel_struct::add_function(
+        ctx,
+        "path",
+        |This(this): This<Value>, path: Arc<String>| -> R {
+            let a = downcast::<AuthorizerVal>(&this).ok_or_else(no_such_overload)?;
+            if blank(&path) {
+                return Err(fail("path", "path must not be empty"));
+            }
+            Ok(opaque(PathCheckVal {
+                authorizer: a.clone(),
+                path: path.to_string(),
+            }))
+        },
+    );
     // authorizerGroup (:390-402)
-    ctx.add_function(
+    crate::cel_struct::add_function(
+        ctx,
         "group",
         |This(this): This<Value>, group: Arc<String>| -> R {
             let a = downcast::<AuthorizerVal>(&this).ok_or_else(no_such_overload)?;
@@ -315,7 +320,8 @@ pub fn register(ctx: &mut Context<'_>) {
         },
     );
     // authorizerServiceAccount (:404-432)
-    ctx.add_function(
+    crate::cel_struct::add_function(
+        ctx,
         "serviceAccount",
         |This(this): This<Value>, namespace: Arc<String>, name: Arc<String>| -> R {
             let a = downcast::<AuthorizerVal>(&this).ok_or_else(no_such_overload)?;
@@ -343,7 +349,8 @@ pub fn register(ctx: &mut Context<'_>) {
         },
     );
     // groupCheckResource (:434-449)
-    ctx.add_function(
+    crate::cel_struct::add_function(
+        ctx,
         "resource",
         |This(this): This<Value>, resource: Arc<String>| -> R {
             let g = downcast::<GroupCheckVal>(&this).ok_or_else(no_such_overload)?;
@@ -365,12 +372,16 @@ pub fn register(ctx: &mut Context<'_>) {
     // LabelSelector (:451-529, :467-497).
     macro_rules! resource_setter {
         ($fn_name:literal, $field:ident) => {
-            ctx.add_function($fn_name, |This(this): This<Value>, arg: Arc<String>| -> R {
-                let r = downcast::<ResourceCheckVal>(&this).ok_or_else(no_such_overload)?;
-                let mut result = r.clone();
-                result.$field = arg.to_string();
-                Ok(opaque(result))
-            });
+            crate::cel_struct::add_function(
+                ctx,
+                $fn_name,
+                |This(this): This<Value>, arg: Arc<String>| -> R {
+                    let r = downcast::<ResourceCheckVal>(&this).ok_or_else(no_such_overload)?;
+                    let mut result = r.clone();
+                    result.$field = arg.to_string();
+                    Ok(opaque(result))
+                },
+            );
         };
     }
     resource_setter!("subresource", subresource);
@@ -379,27 +390,31 @@ pub fn register(ctx: &mut Context<'_>) {
     resource_setter!("fieldSelector", field_selector);
     resource_setter!("labelSelector", label_selector);
     // pathCheckCheck / resourceCheckCheck (:531-557)
-    ctx.add_function("check", |This(this): This<Value>, verb: Arc<String>| -> R {
-        if let Some(p) = downcast::<PathCheckVal>(&this) {
-            return Ok(p.authorize(&verb));
-        }
-        let r = downcast::<ResourceCheckVal>(&this).ok_or_else(no_such_overload)?;
-        Ok(r.authorize(&verb))
-    });
+    crate::cel_struct::add_function(
+        ctx,
+        "check",
+        |This(this): This<Value>, verb: Arc<String>| -> R {
+            if let Some(p) = downcast::<PathCheckVal>(&this) {
+                return Ok(p.authorize(&verb));
+            }
+            let r = downcast::<ResourceCheckVal>(&this).ok_or_else(no_such_overload)?;
+            Ok(r.authorize(&verb))
+        },
+    );
     // decisionErrored / Error / Allowed / Reason (:559-596)
-    ctx.add_function("errored", |This(this): This<Value>| -> R {
+    crate::cel_struct::add_function(ctx, "errored", |This(this): This<Value>| -> R {
         let d = downcast::<DecisionVal>(&this).ok_or_else(no_such_overload)?;
         Ok(Value::Bool(d.err.is_some()))
     });
-    ctx.add_function("error", |This(this): This<Value>| -> R {
+    crate::cel_struct::add_function(ctx, "error", |This(this): This<Value>| -> R {
         let d = downcast::<DecisionVal>(&this).ok_or_else(no_such_overload)?;
         Ok(Value::String(Arc::new(d.err.clone().unwrap_or_default())))
     });
-    ctx.add_function("allowed", |This(this): This<Value>| -> R {
+    crate::cel_struct::add_function(ctx, "allowed", |This(this): This<Value>| -> R {
         let d = downcast::<DecisionVal>(&this).ok_or_else(no_such_overload)?;
         Ok(Value::Bool(d.allowed))
     });
-    ctx.add_function("reason", |This(this): This<Value>| -> R {
+    crate::cel_struct::add_function(ctx, "reason", |This(this): This<Value>| -> R {
         let d = downcast::<DecisionVal>(&this).ok_or_else(no_such_overload)?;
         Ok(Value::String(Arc::new(d.reason.clone())))
     });

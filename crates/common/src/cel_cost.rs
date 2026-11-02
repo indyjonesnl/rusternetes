@@ -6,7 +6,7 @@
 //! `staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/activation.go`
 //! (`evaluationActivation.Evaluate`).
 //!
-//! The `cel` 0.13 crate has no cost-tracking or evaluation-observer hook
+//! The `cel` crate (0.13 and 0.15) has no cost-tracking or evaluation-observer hook
 //! (`Program::execute` is `Value::resolve` with no callbacks), so cel-go's
 //! `ObservableInterpretable` cannot be ported as an observer. The same costs are
 //! produced by [`eval_with_cost`], which walks the expression itself and lets the
@@ -171,7 +171,10 @@ fn resolve_aliased(ctx: &Context, vals: &[Value], e: &IdedExpr) -> R {
 fn expect_bool(v: R) -> Result<bool, CostEvalError> {
     match v? {
         Value::Bool(b) => Ok(b),
-        _ => Err(CostEvalError::Exec(ExecutionError::NoSuchOverload)),
+        _ => Err(CostEvalError::Exec(ExecutionError::no_such_overload(
+            "cost",
+            Vec::new(),
+        ))),
     }
 }
 
@@ -402,7 +405,10 @@ impl Tracker {
             (Err(_), Some(r)) if r == or => Ok(Value::Bool(or)),
             _ => Err(left
                 .err()
-                .unwrap_or(CostEvalError::Exec(ExecutionError::NoSuchOverload))),
+                .unwrap_or(CostEvalError::Exec(ExecutionError::no_such_overload(
+                    "cost",
+                    Vec::new(),
+                )))),
         }
     }
 
@@ -481,7 +487,12 @@ impl Tracker {
         let items: Vec<Value> = match &range {
             Value::List(l) => l.iter().cloned().collect(),
             Value::Map(m) => m.map.keys().map(key_value).collect(),
-            _ => return Err(CostEvalError::Exec(ExecutionError::NoSuchOverload)),
+            _ => {
+                return Err(CostEvalError::Exec(ExecutionError::no_such_overload(
+                    "cost",
+                    Vec::new(),
+                )))
+            }
         };
         let mut inner = ctx.new_inner_scope();
         inner.add_variable_from_value(c.accu_var.clone(), accu_init);
