@@ -189,14 +189,31 @@ impl Env {
 
     /// An environment declaring the standard type identifiers
     /// (`stdlib.Types()`) and every function of [`table`] (the standard
-    /// library plus the extension and Kubernetes libraries; splitting it per
-    /// library with versions is a later slice of #3440).
+    /// library plus the extension and Kubernetes libraries at their newest
+    /// version, the environment of a DRA device selector). Versioned
+    /// environments are built by [`crate::environment::EnvSet`].
     pub fn with_default_declarations(
         container: Container,
         provider: Arc<dyn Provider>,
         opts: Options,
     ) -> Self {
         let mut env = Self::new(container, provider, opts);
+        env.add_std_types();
+        env.add_optional_type_ident();
+        let mut names: Vec<&String> = table::table().keys().collect();
+        names.sort();
+        for name in names {
+            let f = FunctionDecl {
+                name: name.clone(),
+                overloads: table::table()[name].clone(),
+            };
+            env.add_function(f).ok();
+        }
+        env
+    }
+
+    /// `stdlib.Types()`: the type identifiers `int`, `list`, `type`, ...
+    pub fn add_std_types(&mut self) {
         let any_list = DType::List(Box::new(DType::Param("A".into())));
         let any_map = DType::Map(
             Box::new(DType::Param("A".into())),
@@ -226,25 +243,32 @@ impl Env {
             if d.name == "timestamp" {
                 d.name = "google.protobuf.Timestamp".into();
             }
-            env.add_ident(d).ok();
+            self.add_ident(d).ok();
         }
-        // `cel.OptionalTypes()`: the `optional_type` type identifier
-        // (`cel/library.go` `Variable(OptionalType.TypeName(), ...)`).
-        env.add_ident(VariableDecl::type_variable(DType::Opaque(
+    }
+
+    /// `cel.OptionalTypes()`: the `optional_type` type identifier
+    /// (`cel/library.go` `Variable(OptionalType.TypeName(), ...)`).
+    pub fn add_optional_type_ident(&mut self) {
+        self.add_ident(VariableDecl::type_variable(DType::Opaque(
             "optional_type".into(),
             vec![],
         )))
         .ok();
-        let mut names: Vec<&String> = table::table().keys().collect();
+    }
+
+    /// Declare the functions one library builds (`cel.Lib` /
+    /// `cel.Function`): overloads of an already declared function are
+    /// merged, as `Env.AddFunctions` does.
+    pub fn add_library(&mut self, build: fn(&mut table::Table)) {
+        let mut t = table::Table::new();
+        build(&mut t);
+        let mut names: Vec<String> = t.keys().cloned().collect();
         names.sort();
         for name in names {
-            let f = FunctionDecl {
-                name: name.clone(),
-                overloads: table::table()[name].clone(),
-            };
-            env.add_function(f).ok();
+            let overloads = t.remove(&name).unwrap_or_default();
+            self.add_function(FunctionDecl { name, overloads }).ok();
         }
-        env
     }
 
     pub fn container(&self) -> &Container {
