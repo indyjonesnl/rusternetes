@@ -598,7 +598,7 @@ fn upstream_group_docs() -> &'static serde_json::Map<String, serde_json::Value> 
 /// publishes, with their transitive `$ref` closure (release-1.35
 /// `api/openapi-spec/swagger.json`, vendored by
 /// `scripts/sync-upstream-openapi.sh`).
-fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
+pub(crate) fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
     use std::sync::OnceLock;
     static DEFS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
     DEFS.get_or_init(|| {

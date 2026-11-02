@@ -24,4 +24,5 @@ pub mod mutatingadmissionpolicy;
 pub mod mutatingadmissionpolicybinding;
 pub mod validatingadmissionpolicy;
 pub mod validatingadmissionpolicybinding;
+pub mod vap_typechecking;
 pub mod webhookconfiguration;

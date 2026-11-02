@@ -234,6 +234,8 @@ pub fn validate_in(
     );
     errs.extend(validate_validating_admission_policy(obj));
     errs.extend(message_expression_errors(obj, preexisting, env_set));
+    // Default-off shadow run of the typed checker; never changes `errs`.
+    super::vap_typechecking::observe(obj, env_set);
     errs
 }
 

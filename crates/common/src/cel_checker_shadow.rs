@@ -67,6 +67,28 @@ const DYN_VARIABLES: &[&str] = &[
     "device",
 ];
 
+/// The checker's `EnvSet` for the probe's `EnvSet` and environment type: the
+/// same compatibility version, `AuthorizeWithSelectors` from the feature gate
+/// as `base.go` `baseOpts` reads it.
+pub(crate) fn checker_env_set(
+    set: &EnvSet,
+    env_type: EnvType,
+) -> (checker::EnvSet, checker::EnvType) {
+    let version = set.compatibility_version();
+    let features = checker::Features {
+        authorize_with_selectors: feature_gates::enabled(Feature::AuthorizeWithSelectors),
+    };
+    let env_set = checker::EnvSet::must_base_env_set(
+        checker::Version::major_minor(version.major, version.minor),
+        &features,
+    );
+    let ct = match env_type {
+        EnvType::StoredExpressions => checker::EnvType::StoredExpressions,
+        EnvType::NewExpressions => checker::EnvType::NewExpressions,
+    };
+    (env_set, ct)
+}
+
 /// The scope of a CRD rule: the type `self` (and `oldSelf`) has.
 #[derive(Clone, Debug)]
 pub struct SelfScope {
@@ -100,19 +122,8 @@ pub fn check_expression(
             .ok()?
             .ok()?;
     let version = set.compatibility_version();
-    let features = checker::Features {
-        authorize_with_selectors: feature_gates::enabled(Feature::AuthorizeWithSelectors),
-    };
-    let env_set = checker::EnvSet::must_base_env_set(
-        checker::Version::major_minor(version.major, version.minor),
-        &features,
-    );
+    let (env_set, ct) = checker_env_set(set, env_type);
     let stored = env_type == EnvType::StoredExpressions;
-    let ct = if stored {
-        checker::EnvType::StoredExpressions
-    } else {
-        checker::EnvType::NewExpressions
-    };
     let (provider, scoped): (Arc<dyn checker::Provider>, Option<DeclType>) = match scope {
         Some(scope) => {
             let scoped = scope.decl.maybe_assign_type_name(&unique_self_type_name());

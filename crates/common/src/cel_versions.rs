@@ -396,7 +396,7 @@ pub fn compile_failure(expression: &str, set: &EnvSet, env: EnvType) -> Option<S
     result
 }
 
-fn probe_failure(expression: &str, set: &EnvSet, env: EnvType) -> Option<String> {
+pub fn probe_failure(expression: &str, set: &EnvSet, env: EnvType) -> Option<String> {
     let source = expression.to_string();
     let program = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         cel::Program::compile(&source)

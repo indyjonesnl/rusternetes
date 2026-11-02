@@ -11,6 +11,8 @@
 //! reintroduces a separate binary, which is what this layout avoids.
 mod authz_rbac_node;
 mod cel_checker_shadow;
+mod cel_openapi_resolver;
+mod cel_policy_types;
 mod cel_schema_types;
 mod cel_struct_literals_test;
 mod common_unit;

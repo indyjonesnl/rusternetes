@@ -217,6 +217,22 @@ impl DeclTypeProvider {
     }
 }
 
+impl DeclTypeProvider {
+    /// Makes the fields of the registered object type `name` resolvable
+    /// without registering the types below them.
+    ///
+    /// Upstream's `variables` composition type (`composition.go`
+    /// `NewCompositionEnv` / `AddField`) is registered with no fields and gets
+    /// them added later, through the pointer the provider shares: field
+    /// lookups see them, but the name registry (`allTypesForDecl`, computed
+    /// once) never holds `variables.<name>`. Registering those names would
+    /// make `variables.x` resolve as a type identifier.
+    pub fn with_late_fields(mut self, name: &str, t: DeclType) -> Self {
+        self.registered.insert(name.to_string(), t);
+        self
+    }
+}
+
 impl Provider for DeclTypeProvider {
     fn find_struct_type(&self, name: &str) -> Option<DType> {
         match self.registered.get(name) {
