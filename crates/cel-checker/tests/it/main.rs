@@ -2,3 +2,4 @@
 //! `tests/it/<name>.rs` plus a `mod <name>;` line below.
 mod checker;
 mod decls;
+mod environment;

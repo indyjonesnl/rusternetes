@@ -115,45 +115,49 @@ const COMPARABLE: [&str; 8] = [
 ];
 const SUMMABLE: [&str; 4] = ["int", "uint", "double", "duration"];
 
-fn build() -> Table {
-    let mut t = Table::new();
-    let g = |t: &mut Table, n: &str, a: &str, r: &str| add(t, n, false, a, r);
-    let m = |t: &mut Table, n: &str, a: &str, r: &str| add(t, n, true, a, r);
+fn g(t: &mut Table, n: &str, a: &str, r: &str) {
+    add(t, n, false, a, r)
+}
 
-    // --- cel-go standard library (common/stdlib/standard.go) -------------
-    g(&mut t, "_?_:_", "bool, A, A", "A");
-    g(&mut t, "_&&_", "bool, bool", "bool");
-    g(&mut t, "_||_", "bool, bool", "bool");
-    g(&mut t, "!_", "bool", "bool");
-    g(&mut t, "@not_strictly_false", "bool", "bool");
-    g(&mut t, "_==_", "A, A", "bool");
-    g(&mut t, "_!=_", "A, A", "bool");
+fn m(t: &mut Table, n: &str, a: &str, r: &str) {
+    add(t, n, true, a, r)
+}
 
-    g(&mut t, "_+_", "bytes, bytes", "bytes");
-    g(&mut t, "_+_", "double, double", "double");
-    g(&mut t, "_+_", "duration, duration", "duration");
-    g(&mut t, "_+_", "duration, timestamp", "timestamp");
-    g(&mut t, "_+_", "timestamp, duration", "timestamp");
-    g(&mut t, "_+_", "int, int", "int");
-    g(&mut t, "_+_", "list(A), list(A)", "list(A)");
-    g(&mut t, "_+_", "string, string", "string");
-    g(&mut t, "_+_", "uint, uint", "uint");
-    g(&mut t, "_/_", "double, double", "double");
-    g(&mut t, "_/_", "int, int", "int");
-    g(&mut t, "_/_", "uint, uint", "uint");
-    g(&mut t, "_%_", "int, int", "int");
-    g(&mut t, "_%_", "uint, uint", "uint");
-    g(&mut t, "_*_", "double, double", "double");
-    g(&mut t, "_*_", "int, int", "int");
-    g(&mut t, "_*_", "uint, uint", "uint");
-    g(&mut t, "-_", "double", "double");
-    g(&mut t, "-_", "int", "int");
-    g(&mut t, "_-_", "double, double", "double");
-    g(&mut t, "_-_", "duration, duration", "duration");
-    g(&mut t, "_-_", "int, int", "int");
-    g(&mut t, "_-_", "timestamp, duration", "timestamp");
-    g(&mut t, "_-_", "timestamp, timestamp", "duration");
-    g(&mut t, "_-_", "uint, uint", "uint");
+/// `stdlib.Functions()` (`common/stdlib/standard.go`).
+pub fn stdlib(t: &mut Table) {
+    g(t, "_?_:_", "bool, A, A", "A");
+    g(t, "_&&_", "bool, bool", "bool");
+    g(t, "_||_", "bool, bool", "bool");
+    g(t, "!_", "bool", "bool");
+    g(t, "@not_strictly_false", "bool", "bool");
+    g(t, "_==_", "A, A", "bool");
+    g(t, "_!=_", "A, A", "bool");
+
+    g(t, "_+_", "bytes, bytes", "bytes");
+    g(t, "_+_", "double, double", "double");
+    g(t, "_+_", "duration, duration", "duration");
+    g(t, "_+_", "duration, timestamp", "timestamp");
+    g(t, "_+_", "timestamp, duration", "timestamp");
+    g(t, "_+_", "int, int", "int");
+    g(t, "_+_", "list(A), list(A)", "list(A)");
+    g(t, "_+_", "string, string", "string");
+    g(t, "_+_", "uint, uint", "uint");
+    g(t, "_/_", "double, double", "double");
+    g(t, "_/_", "int, int", "int");
+    g(t, "_/_", "uint, uint", "uint");
+    g(t, "_%_", "int, int", "int");
+    g(t, "_%_", "uint, uint", "uint");
+    g(t, "_*_", "double, double", "double");
+    g(t, "_*_", "int, int", "int");
+    g(t, "_*_", "uint, uint", "uint");
+    g(t, "-_", "double", "double");
+    g(t, "-_", "int", "int");
+    g(t, "_-_", "double, double", "double");
+    g(t, "_-_", "duration, duration", "duration");
+    g(t, "_-_", "int, int", "int");
+    g(t, "_-_", "timestamp, duration", "timestamp");
+    g(t, "_-_", "timestamp, timestamp", "duration");
+    g(t, "_-_", "uint, uint", "uint");
 
     for op in ["_<_", "_<=_", "_>_", "_>=_"] {
         for pair in [
@@ -172,16 +176,16 @@ fn build() -> Table {
             "timestamp, timestamp",
             "duration, duration",
         ] {
-            g(&mut t, op, pair, "bool");
+            g(t, op, pair, "bool");
         }
     }
 
     // `_[_]` is resolved by the selector type pass itself (it needs the
     // container's element type); it is declared here for `LookupFunction`.
-    g(&mut t, "_[_]", "list(A), int", "A");
-    g(&mut t, "_[_]", "map(A, B), A", "B");
-    g(&mut t, "@in", "A, list(A)", "bool");
-    g(&mut t, "@in", "A, map(A, B)", "bool");
+    g(t, "_[_]", "list(A), int", "A");
+    g(t, "_[_]", "map(A, B), A", "B");
+    g(t, "@in", "A, list(A)", "bool");
+    g(t, "@in", "A, map(A, B)", "bool");
 
     for (a, r) in [
         ("bytes", "int"),
@@ -189,12 +193,12 @@ fn build() -> Table {
         ("map(A, B)", "int"),
         ("string", "int"),
     ] {
-        g(&mut t, "size", a, r);
-        m(&mut t, "size", a, r);
+        g(t, "size", a, r);
+        m(t, "size", a, r);
     }
 
-    g(&mut t, "type", "A", "type(A)");
-    g(&mut t, "dyn", "A", "dyn");
+    g(t, "type", "A", "type(A)");
+    g(t, "dyn", "A", "dyn");
     for (f, from, to) in [
         ("bool", "bool", "bool"),
         ("bool", "string", "bool"),
@@ -229,14 +233,14 @@ fn build() -> Table {
         ("uint", "int", "uint"),
         ("uint", "string", "uint"),
     ] {
-        g(&mut t, f, from, to);
+        g(t, f, from, to);
     }
 
     for f in ["contains", "endsWith", "startsWith"] {
-        m(&mut t, f, "string, string", "bool");
+        m(t, f, "string, string", "bool");
     }
-    g(&mut t, "matches", "string, string", "bool");
-    m(&mut t, "matches", "string, string", "bool");
+    g(t, "matches", "string, string", "bool");
+    m(t, "matches", "string, string", "bool");
 
     for (f, dur) in [
         ("getFullYear", false),
@@ -250,69 +254,83 @@ fn build() -> Table {
         ("getSeconds", true),
         ("getMilliseconds", true),
     ] {
-        m(&mut t, f, "timestamp", "int");
-        m(&mut t, f, "timestamp, string", "int");
+        m(t, f, "timestamp", "int");
+        m(t, f, "timestamp, string", "int");
         if dur {
-            m(&mut t, f, "duration", "int");
+            m(t, f, "duration", "int");
         }
     }
+}
 
-    // --- ext.Strings(2) (ext/strings.go:373-540) --------------------------
-    m(&mut t, "charAt", "string, int", "string");
-    m(&mut t, "indexOf", "string, string", "int");
-    m(&mut t, "indexOf", "string, string, int", "int");
-    m(&mut t, "lastIndexOf", "string, string", "int");
-    m(&mut t, "lastIndexOf", "string, string, int", "int");
-    m(&mut t, "lowerAscii", "string", "string");
-    m(&mut t, "replace", "string, string, string", "string");
-    m(&mut t, "replace", "string, string, string, int", "string");
-    m(&mut t, "split", "string, string", "list(string)");
-    m(&mut t, "split", "string, string, int", "list(string)");
-    m(&mut t, "substring", "string, int", "string");
-    m(&mut t, "substring", "string, int, int", "string");
-    m(&mut t, "trim", "string", "string");
-    m(&mut t, "upperAscii", "string", "string");
-    m(&mut t, "format", "string, list(dyn)", "string");
-    g(&mut t, "strings.quote", "string", "string");
-    m(&mut t, "join", "list(string)", "string");
-    m(&mut t, "join", "list(string), string", "string");
+/// `ext.Strings(ext.StringsVersion(0))`.
+pub fn strings_v0(t: &mut Table) {
+    m(t, "charAt", "string, int", "string");
+    m(t, "indexOf", "string, string", "int");
+    m(t, "indexOf", "string, string, int", "int");
+    m(t, "lastIndexOf", "string, string", "int");
+    m(t, "lastIndexOf", "string, string, int", "int");
+    m(t, "lowerAscii", "string", "string");
+    m(t, "replace", "string, string, string", "string");
+    m(t, "replace", "string, string, string, int", "string");
+    m(t, "split", "string, string", "list(string)");
+    m(t, "split", "string, string, int", "list(string)");
+    m(t, "substring", "string, int", "string");
+    m(t, "substring", "string, int, int", "string");
+    m(t, "trim", "string", "string");
+    m(t, "upperAscii", "string", "string");
+}
 
-    // --- ext.Sets (ext/sets.go:112-119) -----------------------------------
+/// What `ext.Strings(ext.StringsVersion(2))` adds over version 0: `format`, `strings.quote`, `join` (`ext/strings.go:373-540`).
+pub fn strings_v2_additions(t: &mut Table) {
+    m(t, "format", "string, list(dyn)", "string");
+    g(t, "strings.quote", "string", "string");
+    m(t, "join", "list(string)", "string");
+    m(t, "join", "list(string), string", "string");
+}
+
+/// `ext.Sets()`.
+pub fn sets(t: &mut Table) {
     for f in ["sets.contains", "sets.equivalent", "sets.intersects"] {
-        g(&mut t, f, "list(T), list(T)", "bool");
+        g(t, f, "list(T), list(T)", "bool");
     }
+}
 
-    // --- ext.Lists(3) (ext/lists.go:197-345) ------------------------------
-    m(&mut t, "slice", "list(T), int, int", "list(T)");
-    m(&mut t, "flatten", "list(list(T))", "list(T)");
-    m(&mut t, "flatten", "list(dyn), int", "list(dyn)");
+/// `ext.Lists(ext.ListsVersion(3))`.
+pub fn ext_lists(t: &mut Table) {
+    m(t, "slice", "list(T), int, int", "list(T)");
+    m(t, "flatten", "list(list(T))", "list(T)");
+    m(t, "flatten", "list(dyn), int", "list(dyn)");
     for c in COMPARABLE {
-        m(&mut t, "sort", &format!("list({c})"), &format!("list({c})"));
+        m(t, "sort", &format!("list({c})"), &format!("list({c})"));
         m(
-            &mut t,
+            t,
             "@sortByAssociatedKeys",
             &format!("list(T), list({c})"),
             "list(T)",
         );
     }
-    g(&mut t, "lists.range", "int", "list(int)");
-    m(&mut t, "reverse", "list(T)", "list(T)");
-    m(&mut t, "distinct", "list(T)", "list(T)");
+    g(t, "lists.range", "int", "list(int)");
+    m(t, "reverse", "list(T)", "list(T)");
+    m(t, "distinct", "list(T)", "list(T)");
+}
 
-    // --- Kubernetes Lists (apiserver/pkg/cel/library/lists.go:138-176) ----
+/// `library.Lists`.
+pub fn k8s_lists(t: &mut Table) {
     for c in COMPARABLE {
-        m(&mut t, "isSorted", &format!("list({c})"), "bool");
-        m(&mut t, "max", &format!("list({c})"), c);
-        m(&mut t, "min", &format!("list({c})"), c);
+        m(t, "isSorted", &format!("list({c})"), "bool");
+        m(t, "max", &format!("list({c})"), c);
+        m(t, "min", &format!("list({c})"), c);
     }
     for c in SUMMABLE {
-        m(&mut t, "sum", &format!("list({c})"), c);
+        m(t, "sum", &format!("list({c})"), c);
     }
-    m(&mut t, "indexOf", "list(A), A", "int");
-    m(&mut t, "lastIndexOf", "list(A), A", "int");
+    m(t, "indexOf", "list(A), A", "int");
+    m(t, "lastIndexOf", "list(A), A", "int");
+}
 
-    // --- Kubernetes URLs / Regex -------------------------------------------
-    g(&mut t, "url", "string", "s:kubernetes.URL");
+/// `library.URLs`.
+pub fn urls(t: &mut Table) {
+    g(t, "url", "string", "s:kubernetes.URL");
     for f in [
         "getScheme",
         "getHost",
@@ -320,39 +338,47 @@ fn build() -> Table {
         "getPort",
         "getEscapedPath",
     ] {
-        m(&mut t, f, "s:kubernetes.URL", "string");
+        m(t, f, "s:kubernetes.URL", "string");
     }
     m(
-        &mut t,
+        t,
         "getQuery",
         "s:kubernetes.URL",
         "map(string, list(string))",
     );
-    g(&mut t, "isURL", "string", "bool");
-    m(&mut t, "find", "string, string", "string");
-    m(&mut t, "findAll", "string, string", "list(string)");
-    m(&mut t, "findAll", "string, string, int", "list(string)");
+    g(t, "isURL", "string", "bool");
+}
 
-    // --- Kubernetes Quantity (library/quantity.go:156-190) ------------------
+/// `library.Regex`.
+pub fn regex(t: &mut Table) {
+    m(t, "find", "string, string", "string");
+    m(t, "findAll", "string, string", "list(string)");
+    m(t, "findAll", "string, string, int", "list(string)");
+}
+
+/// `library.Quantity`.
+pub fn quantity(t: &mut Table) {
     const Q: &str = "s:apiserver.cel.Quantity";
-    g(&mut t, "quantity", "string", Q);
-    g(&mut t, "isQuantity", "string", "bool");
-    g(&mut t, "sign", Q, "int");
-    m(&mut t, "isGreaterThan", &format!("{Q}, {Q}"), "bool");
-    m(&mut t, "isLessThan", &format!("{Q}, {Q}"), "bool");
-    m(&mut t, "compareTo", &format!("{Q}, {Q}"), "int");
-    m(&mut t, "asApproximateFloat", Q, "double");
-    m(&mut t, "asInteger", Q, "int");
-    m(&mut t, "isInteger", Q, "bool");
-    m(&mut t, "add", &format!("{Q}, {Q}"), Q);
-    m(&mut t, "add", &format!("{Q}, int"), Q);
-    m(&mut t, "sub", &format!("{Q}, {Q}"), Q);
-    m(&mut t, "sub", &format!("{Q}, int"), Q);
+    g(t, "quantity", "string", Q);
+    g(t, "isQuantity", "string", "bool");
+    g(t, "sign", Q, "int");
+    m(t, "isGreaterThan", &format!("{Q}, {Q}"), "bool");
+    m(t, "isLessThan", &format!("{Q}, {Q}"), "bool");
+    m(t, "compareTo", &format!("{Q}, {Q}"), "int");
+    m(t, "asApproximateFloat", Q, "double");
+    m(t, "asInteger", Q, "int");
+    m(t, "isInteger", Q, "bool");
+    m(t, "add", &format!("{Q}, {Q}"), Q);
+    m(t, "add", &format!("{Q}, int"), Q);
+    m(t, "sub", &format!("{Q}, {Q}"), Q);
+    m(t, "sub", &format!("{Q}, int"), Q);
+}
 
-    // --- Kubernetes IP / CIDR (library/ip.go:147-188, cidr.go:124-160) ------
-    g(&mut t, "ip", "string", "o:net.IP");
-    m(&mut t, "family", "o:net.IP", "int");
-    g(&mut t, "ip.isCanonical", "string", "bool");
+/// `library.IP`.
+pub fn ip(t: &mut Table) {
+    g(t, "ip", "string", "o:net.IP");
+    m(t, "family", "o:net.IP", "int");
+    g(t, "ip.isCanonical", "string", "bool");
     for f in [
         "isUnspecified",
         "isLoopback",
@@ -360,43 +386,51 @@ fn build() -> Table {
         "isLinkLocalUnicast",
         "isGlobalUnicast",
     ] {
-        m(&mut t, f, "o:net.IP", "bool");
+        m(t, f, "o:net.IP", "bool");
     }
-    g(&mut t, "isIP", "string", "bool");
-    g(&mut t, "string", "o:net.IP", "string");
-    g(&mut t, "cidr", "string", "o:net.CIDR");
-    m(&mut t, "containsIP", "o:net.CIDR, string", "bool");
-    m(&mut t, "containsIP", "o:net.CIDR, o:net.IP", "bool");
-    m(&mut t, "containsCIDR", "o:net.CIDR, string", "bool");
-    m(&mut t, "containsCIDR", "o:net.CIDR, o:net.CIDR", "bool");
-    m(&mut t, "ip", "o:net.CIDR", "o:net.IP");
-    m(&mut t, "prefixLength", "o:net.CIDR", "int");
-    m(&mut t, "masked", "o:net.CIDR", "o:net.CIDR");
-    g(&mut t, "isCIDR", "string", "bool");
-    g(&mut t, "string", "o:net.CIDR", "string");
+    g(t, "isIP", "string", "bool");
+    g(t, "string", "o:net.IP", "string");
+}
 
-    // --- Kubernetes Semver (library/semverlib.go:135-162) -------------------
+/// `library.CIDR`.
+pub fn cidr(t: &mut Table) {
+    g(t, "cidr", "string", "o:net.CIDR");
+    m(t, "containsIP", "o:net.CIDR, string", "bool");
+    m(t, "containsIP", "o:net.CIDR, o:net.IP", "bool");
+    m(t, "containsCIDR", "o:net.CIDR, string", "bool");
+    m(t, "containsCIDR", "o:net.CIDR, o:net.CIDR", "bool");
+    m(t, "ip", "o:net.CIDR", "o:net.IP");
+    m(t, "prefixLength", "o:net.CIDR", "int");
+    m(t, "masked", "o:net.CIDR", "o:net.CIDR");
+    g(t, "isCIDR", "string", "bool");
+    g(t, "string", "o:net.CIDR", "string");
+}
+
+/// `library.SemverLib(library.SemverVersion(1))`.
+pub fn semver(t: &mut Table) {
     const S: &str = "s:kubernetes.Semver";
-    g(&mut t, "semver", "string", S);
-    g(&mut t, "semver", "string, bool", S);
-    g(&mut t, "isSemver", "string", "bool");
-    g(&mut t, "isSemver", "string, bool", "bool");
-    m(&mut t, "isGreaterThan", &format!("{S}, {S}"), "bool");
-    m(&mut t, "isLessThan", &format!("{S}, {S}"), "bool");
-    m(&mut t, "compareTo", &format!("{S}, {S}"), "int");
+    g(t, "semver", "string", S);
+    g(t, "semver", "string, bool", S);
+    g(t, "isSemver", "string", "bool");
+    g(t, "isSemver", "string, bool", "bool");
+    m(t, "isGreaterThan", &format!("{S}, {S}"), "bool");
+    m(t, "isLessThan", &format!("{S}, {S}"), "bool");
+    m(t, "compareTo", &format!("{S}, {S}"), "int");
     for f in ["major", "minor", "patch"] {
-        m(&mut t, f, S, "int");
+        m(t, f, S, "int");
     }
+}
 
-    // --- Kubernetes Format (library/format.go:142-262) ----------------------
+/// `library.Format`.
+pub fn format(t: &mut Table) {
     const F: &str = "s:kubernetes.NamedFormat";
     m(
-        &mut t,
+        t,
         "validate",
         &format!("{F}, string"),
         "optional(list(string))",
     );
-    g(&mut t, "format.named", "string", &format!("optional({F})"));
+    g(t, "format.named", "string", &format!("optional({F})"));
     for f in [
         "dns1123Label",
         "dns1123Subdomain",
@@ -412,49 +446,84 @@ fn build() -> Table {
         "date",
         "datetime",
     ] {
-        g(&mut t, &format!("format.{f}"), "", F);
+        g(t, &format!("format.{f}"), "", F);
     }
+}
 
-    // --- Kubernetes Authz / AuthzSelectors (library/authz.go:252-363) -------
+/// `library.Authz`.
+pub fn authz(t: &mut Table) {
     const A: &str = "s:kubernetes.authorization.Authorizer";
     const P: &str = "s:kubernetes.authorization.PathCheck";
     const GC: &str = "s:kubernetes.authorization.GroupCheck";
     const R: &str = "s:kubernetes.authorization.ResourceCheck";
     const D: &str = "s:kubernetes.authorization.Decision";
-    m(&mut t, "path", &format!("{A}, string"), P);
-    m(&mut t, "group", &format!("{A}, string"), GC);
-    m(&mut t, "serviceAccount", &format!("{A}, string, string"), A);
-    m(&mut t, "resource", &format!("{GC}, string"), R);
-    m(&mut t, "subresource", &format!("{R}, string"), R);
-    m(&mut t, "namespace", &format!("{R}, string"), R);
-    m(&mut t, "name", &format!("{R}, string"), R);
-    m(&mut t, "check", &format!("{P}, string"), D);
-    m(&mut t, "check", &format!("{R}, string"), D);
-    m(&mut t, "errored", D, "bool");
-    m(&mut t, "error", D, "string");
-    m(&mut t, "allowed", D, "bool");
-    m(&mut t, "reason", D, "string");
-    m(&mut t, "fieldSelector", &format!("{R}, string"), R);
-    m(&mut t, "labelSelector", &format!("{R}, string"), R);
+    m(t, "path", &format!("{A}, string"), P);
+    m(t, "group", &format!("{A}, string"), GC);
+    m(t, "serviceAccount", &format!("{A}, string, string"), A);
+    m(t, "resource", &format!("{GC}, string"), R);
+    m(t, "subresource", &format!("{R}, string"), R);
+    m(t, "namespace", &format!("{R}, string"), R);
+    m(t, "name", &format!("{R}, string"), R);
+    m(t, "check", &format!("{P}, string"), D);
+    m(t, "check", &format!("{R}, string"), D);
+    m(t, "errored", D, "bool");
+    m(t, "error", D, "string");
+    m(t, "allowed", D, "bool");
+    m(t, "reason", D, "string");
+}
 
-    // --- cel.OptionalTypes() (cel/library.go:411-620) ------------------------
-    g(&mut t, "optional.of", "V", "optional(V)");
-    g(&mut t, "optional.ofNonZeroValue", "V", "optional(V)");
-    g(&mut t, "optional.none", "", "optional(V)");
-    m(&mut t, "value", "optional(V)", "V");
-    m(&mut t, "hasValue", "optional(V)", "bool");
-    m(&mut t, "or", "optional(V), optional(V)", "optional(V)");
-    m(&mut t, "orValue", "optional(V), V", "V");
-    m(&mut t, "last", "list(V)", "optional(V)");
-    m(&mut t, "first", "list(V)", "optional(V)");
-    g(&mut t, "optional.unwrap", "list(optional(V))", "list(V)");
-    m(&mut t, "unwrapOpt", "list(optional(V))", "list(V)");
-    g(&mut t, "_?._", "dyn, string", "optional(V)");
-    g(&mut t, "_[?_]", "list(V), int", "optional(V)");
-    g(&mut t, "_[?_]", "optional(list(V)), int", "optional(V)");
-    g(&mut t, "_[?_]", "map(K, V), K", "optional(V)");
-    g(&mut t, "_[?_]", "optional(map(K, V)), K", "optional(V)");
+/// `library.AuthzSelectors`.
+pub fn authz_selectors(t: &mut Table) {
+    const R: &str = "s:kubernetes.authorization.ResourceCheck";
+    m(t, "fieldSelector", &format!("{R}, string"), R);
+    m(t, "labelSelector", &format!("{R}, string"), R);
+}
 
+/// `cel.OptionalTypes()`.
+pub fn optional(t: &mut Table) {
+    g(t, "optional.of", "V", "optional(V)");
+    g(t, "optional.ofNonZeroValue", "V", "optional(V)");
+    g(t, "optional.none", "", "optional(V)");
+    m(t, "value", "optional(V)", "V");
+    m(t, "hasValue", "optional(V)", "bool");
+    m(t, "or", "optional(V), optional(V)", "optional(V)");
+    m(t, "orValue", "optional(V), V", "V");
+    m(t, "last", "list(V)", "optional(V)");
+    m(t, "first", "list(V)", "optional(V)");
+    g(t, "optional.unwrap", "list(optional(V))", "list(V)");
+    m(t, "unwrapOpt", "list(optional(V))", "list(V)");
+    g(t, "_?._", "dyn, string", "optional(V)");
+    g(t, "_[?_]", "list(V), int", "optional(V)");
+    g(t, "_[?_]", "optional(list(V)), int", "optional(V)");
+    g(t, "_[?_]", "map(K, V), K", "optional(V)");
+    g(t, "_[?_]", "optional(map(K, V)), K", "optional(V)");
+}
+
+/// Every library's declarations at their newest version: the environment of a
+/// DRA device selector (`environment.MustBaseEnvSet` at the newest version,
+/// plus authz selectors).
+fn build() -> Table {
+    let mut t = Table::new();
+    for f in [
+        stdlib,
+        strings_v0,
+        strings_v2_additions,
+        sets,
+        ext_lists,
+        k8s_lists,
+        urls,
+        regex,
+        quantity,
+        ip,
+        cidr,
+        semver,
+        format,
+        authz,
+        authz_selectors,
+        optional,
+    ] {
+        f(&mut t);
+    }
     t
 }
 

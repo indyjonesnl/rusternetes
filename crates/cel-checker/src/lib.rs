@@ -23,6 +23,7 @@
 
 pub mod checker;
 pub mod env;
+pub mod environment;
 pub mod errors;
 pub mod table;
 pub mod types;
@@ -32,6 +33,7 @@ pub use checker::{check, CheckedAst, Reference};
 pub use env::{
     Container, EmptyProvider, Env, FunctionDecl, MapProvider, Options, Provider, VariableDecl,
 };
+pub use environment::{EnvSet, EnvType, Features, Version};
 pub use errors::{CheckError, Errors, Location, Locator, NoLocations};
 pub use table::{is_macro, lookup, table};
 pub use types::{DType, Overload};
