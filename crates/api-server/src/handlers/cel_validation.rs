@@ -33,6 +33,7 @@ use rusternetes_common::resources::{
 };
 use rusternetes_common::schema_validation::PathSeg;
 use rusternetes_common::validation::field::{Error as FieldError, Path};
+use rusternetes_common::{cel_checker_shadow, cel_schema_types};
 use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
 use std::collections::HashSet;
 
@@ -511,6 +512,7 @@ pub fn validate_crd_schema_rules(
     let mut errs = Vec::new();
     compile_schema_rules(
         schema,
+        true,
         fld_path,
         env_set,
         pre,
@@ -518,6 +520,24 @@ pub fn validate_crd_schema_rules(
         &mut errs,
     );
     errs
+}
+
+/// The type scope of a rule on `schema` for the shadow checker run, or `None`
+/// when shadowing is off or the schema is not exposed to CEL (upstream's
+/// "failed to convert to declType for CEL validation rules").
+fn shadow_scope(
+    schema: &JSONSchemaProps,
+    is_root: bool,
+    rule: &serde_json::Value,
+) -> Option<cel_checker_shadow::SelfScope> {
+    if cel_checker_shadow::Mode::current() != cel_checker_shadow::Mode::Shadow {
+        return None;
+    }
+    let embedded = schema.x_kubernetes_embedded_resource == Some(true);
+    Some(cel_checker_shadow::SelfScope {
+        decl: cel_schema_types::schema_decl_type(schema, is_root || embedded)?,
+        optional_old_self: rule.get("optionalOldSelf").and_then(|v| v.as_bool()) == Some(true),
+    })
 }
 
 /// The recursion of `ValidateCustomResourceDefinitionOpenAPISchema`
@@ -531,6 +551,7 @@ pub fn validate_crd_schema_rules(
 /// is skipped for the node then (:1264-1268).
 fn compile_schema_rules(
     schema: &JSONSchemaProps,
+    is_root: bool,
     fld_path: &Path,
     env_set: &EnvSet,
     pre: &PreexistingExpressions,
@@ -541,6 +562,7 @@ fn compile_schema_rules(
     if let Some(JSONSchemaPropsOrBool::Schema(child)) = schema.additional_properties.as_deref() {
         schema_errors |= compile_schema_rules(
             child,
+            false,
             &fld_path.child("additionalProperties"),
             env_set,
             pre,
@@ -554,6 +576,7 @@ fn compile_schema_rules(
         for name in names {
             schema_errors |= compile_schema_rules(
                 &properties[name],
+                false,
                 &fld_path.child("properties").key(name.clone()),
                 env_set,
                 pre,
@@ -564,13 +587,21 @@ fn compile_schema_rules(
     }
     match schema.items.as_deref() {
         Some(JSONSchemaPropsOrArray::Schema(i)) => {
-            schema_errors |=
-                compile_schema_rules(i, &fld_path.child("items"), env_set, pre, suppress, errs);
+            schema_errors |= compile_schema_rules(
+                i,
+                false,
+                &fld_path.child("items"),
+                env_set,
+                pre,
+                suppress,
+                errs,
+            );
         }
         Some(JSONSchemaPropsOrArray::Schemas(list)) => {
             for (i, item) in list.iter().enumerate() {
                 schema_errors |= compile_schema_rules(
                     item,
+                    false,
                     &fld_path.child("items").index(i),
                     env_set,
                     pre,
@@ -716,6 +747,17 @@ fn compile_schema_rules(
                     format!("x-kubernetes-validations rule refers to unknown property: {prop}")
                 })
             });
+        // Default-off shadow run of the schema-typed checker (`self` typed by
+        // the node's `SchemaDeclType`); never changes `failure`.
+        if let Some(scope) = shadow_scope(schema, is_root, raw) {
+            cel_checker_shadow::observe_scoped(
+                rule,
+                env_set,
+                pre.rule_env(rule),
+                &failure,
+                Some(&scope),
+            );
+        }
         if let Some(detail) = failure {
             errs.push(FieldError::invalid(&rule_field, raw.clone(), detail));
             // compileRule returns before the messageExpression (:242-246).
@@ -752,6 +794,15 @@ fn compile_schema_rules(
                     .err()
                     .map(|e| format!("messageExpression compilation failed: {e}"))
             });
+        if let Some(scope) = shadow_scope(schema, is_root, raw) {
+            cel_checker_shadow::observe_scoped(
+                me,
+                env_set,
+                pre.message_expression_env(me),
+                &me_failure,
+                Some(&scope),
+            );
+        }
         if let Some(detail) = me_failure {
             errs.push(FieldError::invalid(&me_field, raw.clone(), detail));
             continue;

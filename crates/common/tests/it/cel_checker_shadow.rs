@@ -23,18 +23,20 @@ fn mode_defaults_to_off() {
 fn checker_verdict_follows_the_environment() {
     let new = EnvType::NewExpressions;
     assert_eq!(
-        check_expression("object.a + 1 > 2", &set(35), new),
+        check_expression("object.a + 1 > 2", &set(35), new, None),
         Some(vec![])
     );
     // isIP arrives in 1.30, and stored expressions always have it.
     let src = "isIP('1.2.3.4')";
-    assert!(!check_expression(src, &set(29), new).unwrap().is_empty());
+    assert!(!check_expression(src, &set(29), new, None)
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        check_expression(src, &set(29), EnvType::StoredExpressions),
+        check_expression(src, &set(29), EnvType::StoredExpressions, None),
         Some(vec![])
     );
     // Syntax errors are not the comparison's concern.
-    assert_eq!(check_expression("1 +", &set(35), new), None);
+    assert_eq!(check_expression("1 +", &set(35), new, None), None);
 }
 
 #[test]
@@ -50,7 +52,11 @@ fn probe_and_checker_agree_on_library_gating() {
         for env in [EnvType::NewExpressions, EnvType::StoredExpressions] {
             let s = set(minor);
             let probe = compile_failure(src, &s, env);
-            assert_eq!(divergence(src, &s, env, &probe), None, "{src} at 1.{minor}");
+            assert_eq!(
+                divergence(src, &s, env, &probe, None),
+                None,
+                "{src} at 1.{minor}"
+            );
         }
     }
 }
@@ -59,7 +65,7 @@ fn probe_and_checker_agree_on_library_gating() {
 fn a_disagreement_is_reported() {
     let s = set(35);
     // The probe says fine; the checker rejects the overload.
-    let d = divergence("1 + 'a'", &s, EnvType::NewExpressions, &None).unwrap();
+    let d = divergence("1 + 'a'", &s, EnvType::NewExpressions, &None, None).unwrap();
     assert_eq!(d.probe, None);
     assert_eq!(d.checker.len(), 1);
 }

@@ -22,6 +22,7 @@
 //!   library overload declarations of the DRA environment.
 
 pub mod checker;
+pub mod decl;
 pub mod env;
 pub mod environment;
 pub mod errors;

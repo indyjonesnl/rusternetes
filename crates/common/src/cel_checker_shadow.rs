@@ -22,6 +22,9 @@ use crate::cel_versions::{EnvSet, EnvType};
 use crate::feature_gates::{self, Feature};
 use cel::parser::Parser;
 use rusternetes_cel_checker as checker;
+use rusternetes_cel_checker::decl::{DeclType, DeclTypeProvider};
+use rusternetes_cel_checker::DType;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Environment variable selecting the mode.
@@ -64,10 +67,32 @@ const DYN_VARIABLES: &[&str] = &[
     "device",
 ];
 
+/// The scope of a CRD rule: the type `self` (and `oldSelf`) has.
+#[derive(Clone, Debug)]
+pub struct SelfScope {
+    pub decl: DeclType,
+    /// `optionalOldSelf`: `oldSelf` is `optional_type(T)`.
+    pub optional_old_self: bool,
+}
+
+/// `generateUniqueSelfTypeName` (`compilation.go`).
+fn unique_self_type_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("selfType{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// The checker's verdict for `expression`: its error messages (empty when the
 /// expression type-checks), or `None` when the expression does not parse
-/// (syntax errors are not this comparison's concern).
-pub fn check_expression(expression: &str, set: &EnvSet, env_type: EnvType) -> Option<Vec<String>> {
+/// (syntax errors are not this comparison's concern). With `scope` the
+/// environment is the CRD rule environment (`self` / `oldSelf` typed by the
+/// schema, no other variables; `compilation.go` `prepareEnvSet`), otherwise
+/// the variables of [`DYN_VARIABLES`] are `dyn`.
+pub fn check_expression(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: Option<&SelfScope>,
+) -> Option<Vec<String>> {
     let source = expression.to_string();
     // The antlr4rust parser panics on some invalid expressions.
     let parsed =
@@ -82,18 +107,49 @@ pub fn check_expression(expression: &str, set: &EnvSet, env_type: EnvType) -> Op
         checker::Version::major_minor(version.major, version.minor),
         &features,
     );
-    let ct = match env_type {
-        EnvType::NewExpressions => checker::EnvType::NewExpressions,
-        EnvType::StoredExpressions => checker::EnvType::StoredExpressions,
+    let stored = env_type == EnvType::StoredExpressions;
+    let ct = if stored {
+        checker::EnvType::StoredExpressions
+    } else {
+        checker::EnvType::NewExpressions
     };
-    let mut env = env_set.env(
-        ct,
-        checker::Container::default(),
-        Arc::new(checker::MapProvider::new()),
-    );
-    for name in DYN_VARIABLES {
-        env.add_ident(checker::VariableDecl::new(*name, checker::DType::Dyn))
-            .ok();
+    let (provider, scoped): (Arc<dyn checker::Provider>, Option<DeclType>) = match scope {
+        Some(scope) => {
+            let scoped = scope.decl.maybe_assign_type_name(&unique_self_type_name());
+            // `environment.go:268-272`: keywords as field names from 1.31.
+            let keywords = stored || (version.major, version.minor) >= (1, 31);
+            let provider = DeclTypeProvider::new(
+                std::slice::from_ref(&scoped),
+                Arc::new(checker::MapProvider::new()),
+                keywords,
+            );
+            (Arc::new(provider), Some(scoped))
+        }
+        None => (Arc::new(checker::MapProvider::new()), None),
+    };
+    let mut env = env_set.env(ct, checker::Container::default(), provider);
+    match (scope, scoped) {
+        (Some(scope), Some(scoped)) => {
+            let t = scoped.dtype();
+            env.add_ident(checker::VariableDecl::new("self", t.clone()))
+                .ok();
+            // `oldSelf` is introduced at 1.24 (`compilation.go:prepareEnvSet`).
+            if stored || (version.major, version.minor) >= (1, 24) {
+                let old = if scope.optional_old_self {
+                    DType::optional(t)
+                } else {
+                    t
+                };
+                env.add_ident(checker::VariableDecl::new("oldSelf", old))
+                    .ok();
+            }
+        }
+        _ => {
+            for name in DYN_VARIABLES {
+                env.add_ident(checker::VariableDecl::new(*name, DType::Dyn))
+                    .ok();
+            }
+        }
     }
     let (_, errors) = checker::check(&parsed, &mut env, &checker::NoLocations);
     Some(errors.errors().iter().map(|e| e.message.clone()).collect())
@@ -116,8 +172,9 @@ pub fn divergence(
     set: &EnvSet,
     env_type: EnvType,
     probe: &Option<String>,
+    scope: Option<&SelfScope>,
 ) -> Option<Divergence> {
-    let checker = check_expression(expression, set, env_type)?;
+    let checker = check_expression(expression, set, env_type, scope)?;
     (probe.is_some() != !checker.is_empty()).then(|| Divergence {
         probe: probe.clone(),
         checker,
@@ -127,14 +184,26 @@ pub fn divergence(
 /// The hook called by the probe: in `shadow` mode logs a divergence. Never
 /// affects the probe's result.
 pub fn observe(expression: &str, set: &EnvSet, env_type: EnvType, probe: &Option<String>) {
+    observe_scoped(expression, set, env_type, probe, None);
+}
+
+/// [`observe`] for a CRD rule, with `self` / `oldSelf` typed by the schema.
+pub fn observe_scoped(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    probe: &Option<String>,
+    scope: Option<&SelfScope>,
+) {
     if Mode::current() != Mode::Shadow {
         return;
     }
-    if let Some(d) = divergence(expression, set, env_type, probe) {
+    if let Some(d) = divergence(expression, set, env_type, probe, scope) {
         tracing::warn!(
             target: "cel_checker_shadow",
             expression,
             env_type = ?env_type,
+            typed = scope.is_some(),
             version = ?set.compatibility_version(),
             probe = ?d.probe,
             checker = ?d.checker,
