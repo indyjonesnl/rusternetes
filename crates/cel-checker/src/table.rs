@@ -87,9 +87,16 @@ fn split_top(s: &str) -> Vec<&str> {
 pub type Table = HashMap<String, Vec<Overload>>;
 
 fn add(t: &mut Table, name: &str, member: bool, args: &str, result: &str) {
+    let args: Vec<DType> = split_top(args).iter().map(|a| parse_type(a)).collect();
+    let names = |a: &[DType]| a.iter().map(DType::name).collect::<Vec<_>>().join(",");
+    let id = match (member, args.split_first()) {
+        (true, Some((recv, rest))) => format!("{}.{name}({})", recv.name(), names(rest)),
+        _ => format!("{name}({})", names(&args)),
+    };
     t.entry(name.to_string()).or_default().push(Overload {
+        id,
         member,
-        args: split_top(args).iter().map(|a| parse_type(a)).collect(),
+        args,
         result: parse_type(result),
     });
 }

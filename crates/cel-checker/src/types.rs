@@ -4,6 +4,9 @@
 /// `types.Type`: the kinds the declarations and the selector type pass use.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DType {
+    /// `types.ErrorType`: the type recorded for an expression that failed to
+    /// check, so that checking can make forward progress.
+    Error,
     Bool,
     Int,
     Uint,
@@ -34,9 +37,33 @@ impl DType {
         matches!(self, DType::Dyn | DType::Any)
     }
 
+    /// `isError`.
+    pub fn is_error(&self) -> bool {
+        matches!(self, DType::Error)
+    }
+
+    /// `isDynOrError`.
+    pub fn is_dyn_or_error(&self) -> bool {
+        self.is_dyn() || self.is_error()
+    }
+
+    /// `maybeUnwrapOptional`: the parameter of `optional_type(T)`, if any.
+    pub fn maybe_unwrap_optional(&self) -> (&DType, bool) {
+        match self {
+            DType::Opaque(n, ps) if n == "optional_type" && ps.len() == 1 => (&ps[0], true),
+            other => (other, false),
+        }
+    }
+
+    /// `types.NewOptionalType`.
+    pub fn optional(t: DType) -> DType {
+        DType::Opaque("optional_type".into(), vec![t])
+    }
+
     /// `checker/format.go` `FormatCELType`.
     pub fn name(&self) -> String {
         match self {
+            DType::Error => "!error!".into(),
             DType::Bool => "bool".into(),
             DType::Int => "int".into(),
             DType::Uint => "uint".into(),
@@ -90,8 +117,12 @@ impl DType {
 }
 
 /// One `decls.OverloadDecl`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Overload {
+    /// Overload id. cel-go uses hand-written ids (`add_int64`); this port
+    /// synthesizes `<function>(<arg types>)` since no consumer of the
+    /// reference map exists yet.
+    pub id: String,
     pub member: bool,
     /// Argument types; for a member overload the first is the receiver.
     pub args: Vec<DType>,

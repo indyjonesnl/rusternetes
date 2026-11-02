@@ -14,13 +14,25 @@
 //!   (`checker/format.go`).
 //! * [`unify`]  : `checker/types.go` + `checker/mapping.go`, assignability with
 //!   type-parameter substitution, and `checker.resolveOverload`.
+//! * [`env`]    : `checker/env.go`, `scopes.go`, `options.go` and the container
+//!   resolution of `common/containers`.
+//! * [`errors`] : `checker/errors.go` messages and `common/errors.go`.
+//! * [`checker`]: `checker/checker.go`, the type-checking pass.
 //! * [`table`]  : `common/stdlib/standard.go` plus the extension and Kubernetes
 //!   library overload declarations of the DRA environment.
 
+pub mod checker;
+pub mod env;
+pub mod errors;
 pub mod table;
 pub mod types;
 pub mod unify;
 
+pub use checker::{check, CheckedAst, Reference};
+pub use env::{
+    Container, EmptyProvider, Env, FunctionDecl, MapProvider, Options, Provider, VariableDecl,
+};
+pub use errors::{CheckError, Errors, Location, Locator, NoLocations};
 pub use table::{is_macro, lookup, table};
 pub use types::{DType, Overload};
 pub use unify::{format_signature, is_assignable, resolve, Resolution};
