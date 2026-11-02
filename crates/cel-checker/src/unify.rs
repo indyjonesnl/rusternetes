@@ -5,7 +5,8 @@
 use crate::types::{DType, Overload};
 use std::collections::HashMap;
 
-type Mapping = HashMap<String, DType>;
+/// `checker.mapping`: type-parameter name to its substitution.
+pub type Mapping = HashMap<String, DType>;
 
 fn find(m: &Mapping, t: &DType) -> Option<DType> {
     match t {
@@ -85,7 +86,7 @@ fn equal_or_less_specific(t1: &DType, t2: &DType) -> bool {
 }
 
 /// `mostGeneral`.
-fn most_general(t1: &DType, t2: &DType) -> DType {
+pub fn most_general(t1: &DType, t2: &DType) -> DType {
     if equal_or_less_specific(t1, t2) {
         t1.clone()
     } else {
@@ -154,7 +155,7 @@ fn assignable(m: &mut Mapping, t1: &DType, t2: &DType) -> bool {
         let (valid, _) = valid_substitution(m, t2, t1);
         return valid;
     }
-    if t1.is_dyn() || t2.is_dyn() {
+    if t1.is_dyn_or_error() || t2.is_dyn_or_error() {
         return true;
     }
     if matches!(t1, DType::Null) {
@@ -184,6 +185,23 @@ fn assignable(m: &mut Mapping, t1: &DType, t2: &DType) -> bool {
     }
 }
 
+/// `checker.isAssignable` on a checker's mapping: on success the mapping
+/// holds the new substitutions, on failure it is left unchanged.
+pub fn is_assignable_in(m: &mut Mapping, t1: &DType, t2: &DType) -> bool {
+    let mut copy = m.clone();
+    if assignable(&mut copy, t1, t2) {
+        *m = copy;
+        true
+    } else {
+        false
+    }
+}
+
+/// `checker.isAssignableList` (see [`is_assignable_in`]).
+pub fn is_assignable_list_in(m: &mut Mapping, l1: &[DType], l2: &[DType]) -> bool {
+    assignable_list(m, l1, l2)
+}
+
 /// `internalIsAssignableList` on a copy of the mapping, committing it only on
 /// success (`isAssignableList`).
 fn assignable_list(m: &mut Mapping, l1: &[DType], l2: &[DType]) -> bool {
@@ -204,7 +222,7 @@ fn assignable_list(m: &mut Mapping, l1: &[DType], l2: &[DType]) -> bool {
 }
 
 /// `checker.substitute` with `typeParamToDyn`.
-fn substitute(m: &Mapping, t: &DType, param_to_dyn: bool) -> DType {
+pub fn substitute(m: &Mapping, t: &DType, param_to_dyn: bool) -> DType {
     if let Some(sub) = find(m, t) {
         return substitute(m, &sub, param_to_dyn);
     }
