@@ -4,8 +4,8 @@
 
 use rusternetes_cel_checker::DType;
 use rusternetes_common::cel_policy_types::{
-    check_policy_expression, convert_output_type, namespace_type, request_type, DeclType,
-    ParamsType, PolicyTypeContext,
+    check_policy_expression, check_policy_expression_with, convert_output_type, namespace_type,
+    request_type, CheckOptions, DeclType, ParamsType, PolicyTypeContext,
 };
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 
@@ -95,4 +95,27 @@ fn unparsable_expressions_are_not_checked() {
         check_policy_expression(&set(), EnvType::StoredExpressions, &ctx(&[]), true, "1 +"),
         None
     );
+}
+
+/// `compile.go:186`: `"compilation failed: "+issues.String()`, the errors
+/// with `line:column`, the source line and an indicator
+/// (`common/errors.go` `ToDisplayString`).
+#[test]
+fn errors_are_located_in_the_source() {
+    let check = |src: &str| {
+        check_policy_expression_with(
+            &set(),
+            EnvType::StoredExpressions,
+            &ctx(&[]),
+            &CheckOptions::default(),
+            src,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        check("object.a ||\n  bar").display,
+        "ERROR: <input>:2:3: undeclared reference to 'bar' (in container '')\n |   bar\n | ..^"
+    );
+    let ok = check("object.a");
+    assert!(ok.errors.is_empty() && ok.display.is_empty());
 }

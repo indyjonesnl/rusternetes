@@ -90,6 +90,18 @@ pub fn check_mutation_expression(
     env_type: EnvType,
     e: &PolicyExpression<'_>,
 ) -> Option<Vec<String>> {
+    check_mutation_located(set, env_type, e).map(|(errors, _)| errors)
+}
+
+/// [`check_mutation_expression`] with the errors as `Issues.String()`
+/// renders them (`line:column`, source line, indicator); the output type
+/// mismatch is not an issue of the checker, so it has no location
+/// (`compile.go:186-203`).
+pub fn check_mutation_located(
+    set: &EnvSet,
+    env_type: EnvType,
+    e: &PolicyExpression<'_>,
+) -> Option<(Vec<String>, String)> {
     let ctx = PolicyTypeContext {
         // `cel.Variable(ObjectVarName, cel.DynType)` (`compile.go:254-255`).
         object: DeclType::simple(DType::Dyn),
@@ -106,19 +118,24 @@ pub fn check_mutation_expression(
         request_resource_authorizer: true,
         no_variables: e.no_variables,
     };
-    let PolicyCheck { mut errors, output } =
-        check_policy_expression_with(set, env_type, &ctx, &opts, e.expression)?;
+    let PolicyCheck {
+        mut errors,
+        mut display,
+        output,
+    } = check_policy_expression_with(set, env_type, &ctx, &opts, e.expression)?;
     if errors.is_empty() {
         let output = output.unwrap_or(DType::Dyn);
         if !output_matches(e.expected, &output) {
-            errors.push(format!(
+            let msg = format!(
                 "must evaluate to {} but got {}",
                 expected_name(e.expected),
                 output.name()
-            ));
+            );
+            display = msg.clone();
+            errors.push(msg);
         }
     }
-    Some(errors)
+    Some((errors, display))
 }
 
 /// A disagreement between the checker and the compile probe: `probe` is the
@@ -149,6 +166,9 @@ pub fn observe_expression(
         return;
     }
     if let Some(checker) = mutation_divergence(set, env_type, e, probe) {
+        let located = check_mutation_located(set, env_type, e)
+            .map(|(_, d)| d)
+            .unwrap_or_default();
         tracing::warn!(
             target: "cel_checker_shadow",
             policy,
@@ -156,6 +176,7 @@ pub fn observe_expression(
             expression = e.expression,
             probe = ?probe,
             checker = ?checker,
+            checker_display = %located,
             "cel checker disagrees with the compile probe"
         );
     }

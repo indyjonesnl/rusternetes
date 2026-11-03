@@ -12,8 +12,8 @@
 use cel::parser::Parser;
 use rusternetes_cel_checker::library_cost::kubernetes_cost;
 use rusternetes_cel_checker::{
-    check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations,
-    PatchTypeProvider, Provider, VariableDecl, Version,
+    check, Container, DType, EnvSet, EnvType, Features, MapProvider, PatchTypeProvider, Provider,
+    SourceLocator, VariableDecl, Version,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -25,6 +25,10 @@ use std::sync::Arc;
 /// oracle. Each is a gap to fix, not an expectation: the checker must match
 /// cel-go, and an entry here is removed once the gap closes.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "[1, 'a'].map(x,\n  x + undeclared)",
+        "found by the location comparison, not a location issue: with a heterogeneous list as the range and an undeclared name in the body we also report \"expected type 'int' but found 'string'\" at the range, which cel-go does not. The cause has not been investigated",
+    ),
     (
         "[1, 2].exists(i, v, i < v)",
         "cel 0.15's parser does not expand the two-variable comprehension macros (cel-go parser/macro.go, TwoVarComprehensions), so the call is checked as a plain member call",
@@ -83,7 +87,19 @@ fn parse_type(s: &str) -> DType {
 /// What our checker says about a request, in the oracle's response shape: the
 /// verdict, the errors, the output type and the estimated cost
 /// (`env.EstimateCost(ast, &library.CostEstimator{})`, no size hints).
-type Ours = (bool, Vec<String>, Option<String>, Option<(u64, u64)>);
+type Ours = (
+    bool,
+    Vec<String>,
+    Option<String>,
+    Option<(u64, u64)>,
+    Option<Located>,
+);
+
+/// Where the issues are: `(message, line, column)` per issue (`common.Error`
+/// `Location`, 1-based line, 0-based column) and `Issues.String()`. `None`
+/// for an expression the parser rejects (the parse errors are the `cel`
+/// crate's, not the checker's).
+type Located = (Vec<(String, usize, usize)>, String);
 
 fn ours(req: &Value) -> Ours {
     let expr_src = req["expr"].as_str().expect("expr");
@@ -133,19 +149,34 @@ fn ours(req: &Value) -> Ours {
             other => panic!("unknown library {other:?}"),
         }
     }
-    let expr = match Parser::new().enable_optional_syntax(true).parse(expr_src) {
-        Ok(e) => e,
-        Err(e) => return (false, vec![e.to_string()], None, None),
+    let parsed = Parser::new()
+        .enable_optional_syntax(true)
+        .parse_with_source_info(expr_src);
+    let (expr, info) = match parsed {
+        Ok(p) => p,
+        Err(e) => return (false, vec![e.to_string()], None, None, None),
     };
-    let (ast, errs) = check(&expr, &mut env, &NoLocations);
+    let locator = SourceLocator::new(&info, expr_src);
+    let (ast, errs) = check(&expr, &mut env, &locator);
     let msgs: Vec<String> = errs.errors().iter().map(|e| e.message.clone()).collect();
+    let located = (!msgs.is_empty()).then(|| {
+        let locs = errs
+            .errors()
+            .iter()
+            .map(|e| {
+                let l = e.location.expect("every checker issue has a location");
+                (e.message.clone(), l.line, l.column)
+            })
+            .collect();
+        (locs, errs.to_display_string(Some(expr_src)))
+    });
     let ok = msgs.is_empty();
     let out = ok.then(|| ast.output_type().map(DType::name)).flatten();
     let cost = ok.then(|| {
         let c = kubernetes_cost(&ast, &expr, None);
         (c.min, c.max)
     });
-    (ok, msgs, out, cost)
+    (ok, msgs, out, cost, located)
 }
 
 fn goldens() -> Vec<(Value, Value)> {
@@ -179,6 +210,7 @@ fn describe(
 fn checker_matches_goldens() {
     let known: BTreeMap<&str, &str> = KNOWN_DIVERGENCES.iter().copied().collect();
     let mut mismatches = Vec::new();
+    let mut located_cases = 0;
     for (req, resp) in goldens() {
         let expr = req["expr"].as_str().unwrap();
         let want_ok = resp["ok"].as_bool().unwrap();
@@ -198,13 +230,36 @@ fn checker_matches_goldens() {
                 c["max"].as_u64().expect("cost.max"),
             )
         });
-        let (ok, mut errors, out, cost) = ours(&req);
-        // cel-go reports issues ordered by source position; the checker here
-        // has no locations yet, so errors are compared as a sorted set.
+        let (ok, mut errors, out, cost, located) = ours(&req);
+        // `Issues.Errors()` is the reporting order, which both sides keep, but
+        // the checkers walk in different orders on some inputs: compare the
+        // messages as a sorted set, then each issue with its location, then
+        // the rendered `Issues.String()` (sorted by location).
         let mut want_errors = want_errors;
         want_errors.sort();
         errors.sort();
-        let same = ok == want_ok && errors == want_errors && out == want_out && cost == want_cost;
+        let mut same =
+            ok == want_ok && errors == want_errors && out == want_out && cost == want_cost;
+        if let (Some((locs, display)), Some(want_locs)) = (&located, resp.get("locations")) {
+            let mut want_locs: Vec<(String, usize, usize)> = resp["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(want_locs.as_array().unwrap())
+                .map(|(m, l)| {
+                    (
+                        m.as_str().unwrap().to_string(),
+                        l["line"].as_u64().unwrap() as usize,
+                        l["column"].as_u64().unwrap() as usize,
+                    )
+                })
+                .collect();
+            located_cases += 1;
+            let mut locs = locs.clone();
+            want_locs.sort();
+            locs.sort();
+            same &= locs == want_locs && Some(display.as_str()) == resp["display"].as_str();
+        }
         let key = format!("{expr} @ {req}");
         match (same, known.contains_key(expr)) {
             (true, false) => {}
@@ -214,11 +269,25 @@ fn checker_matches_goldens() {
             (false, true) => {}
             (false, false) => mismatches.push(format!(
                 "{key}\n    oracle: {}\n    ours:   {}",
-                describe(want_ok, &want_errors, &want_out, &want_cost),
+                describe(want_ok, &want_errors, &want_out, &want_cost)
+                    + &resp
+                        .get("locations")
+                        .map(|l| format!(
+                            " locations={l}\n{}",
+                            resp["display"].as_str().unwrap_or("")
+                        ))
+                        .unwrap_or_default(),
                 describe(ok, &errors, &out, &cost)
+                    + &located
+                        .map(|(l, d)| format!(" locations={l:?}\n{d}"))
+                        .unwrap_or_default()
             )),
         }
     }
+    assert!(
+        located_cases > 20,
+        "only {located_cases} cases compared locations"
+    );
     assert!(
         mismatches.is_empty(),
         "{} divergences from the oracle:\n{}",

@@ -16,6 +16,10 @@
 //	           "libs": ["jsonpatch"],               // extra libraries
 //	           "patchTypes": true}                  // Object / JSONPatch types
 //	response: {"ok": true, "errors": [], "outputType": "bool",
+//	           // on failure, parallel to "errors": the common.Location of each
+//	           // issue (1-based line, 0-based column) and Issues.String()
+//	           "locations": [{"line": 1, "column": 0}],
+//	           "display": "ERROR: <input>:1:1: ...",
 //	           "cost": {"min": 1, "max": 2},
 //	           "evalResult": {"type": "bool", "value": "true"}}
 //
@@ -56,6 +60,12 @@ type cost struct {
 	Max uint64 `json:"max"`
 }
 
+// location is `common.Location`: 1-based line, 0-based column.
+type location struct {
+	Line   int `json:"line"`
+	Column int `json:"column"`
+}
+
 type evalResult struct {
 	Type  string `json:"type"`
 	Value string `json:"value"`
@@ -64,6 +74,8 @@ type evalResult struct {
 type response struct {
 	OK         bool        `json:"ok"`
 	Errors     []string    `json:"errors"`
+	Locations  []location  `json:"locations,omitempty"`
+	Display    string      `json:"display,omitempty"`
 	OutputType string      `json:"outputType,omitempty"`
 	Cost       *cost       `json:"cost,omitempty"`
 	EvalResult *evalResult `json:"evalResult,omitempty"`
@@ -142,10 +154,13 @@ func handle(req request) (resp response) {
 	ast, iss := env.Compile(req.Expr)
 	if iss != nil && iss.Err() != nil {
 		var msgs []string
+		var locs []location
 		for _, e := range iss.Errors() {
 			msgs = append(msgs, e.Message)
+			locs = append(locs, location{Line: e.Location.Line(), Column: e.Location.Column()})
 		}
-		return response{Errors: msgs}
+		// Issues.String() sorts the errors in place, so it comes last.
+		return response{Errors: msgs, Locations: locs, Display: iss.String()}
 	}
 	resp = response{OK: true, OutputType: ast.OutputType().String()}
 	est, err := env.EstimateCost(ast, &library.CostEstimator{})

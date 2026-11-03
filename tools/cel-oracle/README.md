@@ -26,4 +26,6 @@ Normal test runs compare the Rust checker with the checked-in goldens
 fixed yet are listed, with reasons, in `KNOWN_DIVERGENCES` in
 `crates/cel-checker/tests/it/goldens.rs`.
 
-Protocol: one JSON object per line, see the header of `main.go`.
+Protocol: one JSON object per line, see the header of `main.go`. A failed
+compile also returns the `common.Location` of each issue (`locations`, parallel
+to `errors`) and `Issues.String()` (`display`); the golden test compares them.
