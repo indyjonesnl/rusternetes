@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use rusternetes_common::cel_mutation_types::{observe_expression, PolicyExpression};
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 use rusternetes_common::resources::admission_webhook::MatchCondition;
 use rusternetes_common::resources::{MutatingWebhookConfiguration, ValidatingWebhookConfiguration};
@@ -68,19 +69,34 @@ pub fn match_condition_compile_errors_in<'a>(
             } else {
                 EnvType::NewExpressions
             };
-            if let Some(detail) = compile_failure(expression)
+            let probe = compile_failure(expression)
                 .or_else(|| output_type_failure(expression, ExpectedOutput::Bool))
-                .or_else(|| cel_versions::compile_failure(expression, env_set, env_type))
-            {
-                errs.push(Error::invalid(
-                    &Path::new("webhooks")
-                        .index(i)
-                        .child("matchConditions")
-                        .index(j)
-                        .child("expression"),
-                    expression.to_string(),
-                    detail,
-                ));
+                .or_else(|| cel_versions::compile_failure(expression, env_set, env_type));
+            let path = Path::new("webhooks")
+                .index(i)
+                .child("matchConditions")
+                .index(j)
+                .child("expression");
+            // Default-off shadow run of the checker with the output type check
+            // (`matchconditions/matcher.go:49` `ReturnTypes()` is bool).
+            observe_expression(
+                "webhookconfiguration",
+                &path.to_string(),
+                env_set,
+                env_type,
+                &PolicyExpression {
+                    expression,
+                    has_params: false,
+                    has_authorizer: true,
+                    has_patch_types: false,
+                    expected: ExpectedOutput::Bool,
+                    variables: &[],
+                    no_variables: true,
+                },
+                &probe,
+            );
+            if let Some(detail) = probe {
+                errs.push(Error::invalid(&path, expression.to_string(), detail));
             }
         }
     }
