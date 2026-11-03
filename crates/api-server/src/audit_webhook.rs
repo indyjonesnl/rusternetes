@@ -18,7 +18,7 @@
 
 use crate::authorization_webhook::WebhookClientConfig;
 use async_trait::async_trait;
-use rusternetes_common::audit::{AuditBackend, AuditEvent};
+use rusternetes_common::audit::{AuditBackend, AuditEvent, ResponseStatus, UserInfo};
 use rusternetes_common::wait::Backoff;
 use serde::Serialize;
 use std::sync::Arc;
@@ -202,8 +202,11 @@ impl BatchBackend for LogDelegate {
     async fn process_events(&self, events: Vec<AuditEvent>) -> bool {
         let mut success = true;
         for ev in events {
+            // `log` consumes the event; keep the part `EventString` reads
+            // (never the request/response objects) for the error path.
+            let summary = event_summary(&ev);
             if let Err(e) = self.0.log(ev).await {
-                handle_plugin_error(LOG_PLUGIN_NAME, &e, 1);
+                handle_plugin_error(LOG_PLUGIN_NAME, &e, &[&summary]);
                 success = false;
             }
         }
@@ -214,11 +217,46 @@ impl BatchBackend for LogDelegate {
     }
 }
 
+/// A copy of `ev` without its request/response objects and annotations:
+/// everything `EventString` reads, none of the bulk.
+fn event_summary(ev: &AuditEvent) -> AuditEvent {
+    AuditEvent {
+        api_version: ev.api_version.clone(),
+        kind: ev.kind.clone(),
+        level: ev.level.clone(),
+        impersonated_user: ev.impersonated_user.clone(),
+        audit_id: ev.audit_id.clone(),
+        stage: ev.stage.clone(),
+        request_uri: ev.request_uri.clone(),
+        verb: ev.verb.clone(),
+        user: UserInfo {
+            extra: None,
+            ..ev.user.clone()
+        },
+        user_agent: ev.user_agent.clone(),
+        source_ips: ev.source_ips.clone(),
+        object_ref: ev.object_ref.clone(),
+        response_status: ev.response_status.as_ref().map(|s| ResponseStatus {
+            details: None,
+            ..s.clone()
+        }),
+        response_object: None,
+        request_object: None,
+        request_received_timestamp: ev.request_received_timestamp,
+        stage_timestamp: ev.stage_timestamp,
+        annotations: None,
+    }
+}
+
 /// `audit.HandlePluginError` (pkg/audit/metrics.go): log the failure and the
-/// events it cost.
-pub(crate) fn handle_plugin_error(plugin: &str, err: &str, count: usize) {
-    crate::audit_metrics::count_plugin_error(plugin, count);
-    error!("Error in audit plugin '{plugin}' affecting {count} audit events: {err}");
+/// events it cost: count them, then log the error and each impacted event
+/// (`EventString`, see [`crate::audit_format`]) at error level.
+pub(crate) fn handle_plugin_error(plugin: &str, err: &str, impacted: &[&AuditEvent]) {
+    crate::audit_metrics::count_plugin_error(plugin, impacted.len());
+    error!(
+        "{}",
+        crate::audit_format::plugin_error_message(plugin, err, impacted)
+    );
 }
 
 /// A delegate used directly, as `--audit-webhook-mode=blocking-strict` does
@@ -372,7 +410,8 @@ impl BatchBackend for WebhookBackend {
         match self.try_process_events(&events).await {
             Ok(()) => true,
             Err(e) => {
-                handle_plugin_error(WEBHOOK_PLUGIN_NAME, &e, events.len());
+                let impacted: Vec<&AuditEvent> = events.iter().collect();
+                handle_plugin_error(WEBHOOK_PLUGIN_NAME, &e, &impacted);
                 false
             }
         }
@@ -600,15 +639,15 @@ impl AuditBackend for BufferedBackend {
     /// reports it, and still answers true.
     async fn log(&self, event: AuditEvent) -> Result<(), String> {
         let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let err = match tx {
-            None => "audit backend shut down",
+        let (err, event) = match tx {
+            None => ("audit backend shut down", event),
             Some(tx) => match tx.try_send(event) {
                 Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => "audit buffer queue blocked",
-                Err(mpsc::error::TrySendError::Closed(_)) => "audit backend shut down",
+                Err(mpsc::error::TrySendError::Full(ev)) => ("audit buffer queue blocked", ev),
+                Err(mpsc::error::TrySendError::Closed(ev)) => ("audit backend shut down", ev),
             },
         };
-        handle_plugin_error(BUFFERED_PLUGIN_NAME, err, 1);
+        handle_plugin_error(BUFFERED_PLUGIN_NAME, err, &[&event]);
         Ok(())
     }
     async fn flush(&self) -> Result<(), String> {
