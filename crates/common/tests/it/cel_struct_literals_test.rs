@@ -196,8 +196,11 @@ fn object_is_not_equal_to_a_plain_map() {
 /// (json_patch.go:162-173) and ApplyConfiguration root (smd.go:99-102).
 #[test]
 fn type_names_are_checked_on_the_evaluated_result() {
-    use rusternetes_common::cel_struct::{compile, execute_checked, new_context, TypeCheck};
-    let run = |src: &str, mode| execute_checked(&compile(src).unwrap(), &new_context(), mode);
+    use rusternetes_common::cel_struct::{compile, execute_checked, new_context_for, TypeCheck};
+    let run = |src: &str, mode| {
+        let c = compile(src).unwrap();
+        execute_checked(&c, &new_context_for(&c), mode)
+    };
     let ok = run(
         r#"[JSONPatch{op: "add", path: "/spec", value: Object{a: Object.a{}}}]"#,
         TypeCheck::JsonPatchValues,
@@ -236,4 +239,74 @@ fn object_has_its_own_type_and_no_marker_field() {
         json!(true)
     );
     assert_eq!(eval("Object{a: 1}.map(k, k)").unwrap(), json!(["a"]));
+}
+
+/// The structs are native values registered per expression
+/// (`Env::add_type` of a `StructType`): optional initializers, `in`, the
+/// JSONPatch type and `type()` of the real struct type.
+#[test]
+fn registered_struct_types_behave_like_the_map_rewrite() {
+    // `?field:` omits an absent optional (the 0.15 evaluator ignores the flag).
+    assert_eq!(
+        eval("Object{?a: optional.none(), ?b: optional.of(2), c: 3}").unwrap(),
+        json!({"b": 2, "c": 3})
+    );
+    assert_eq!(eval("Object{?a: object.?missing}").unwrap(), json!({}));
+    // `in` takes the fields of an Object.
+    assert_eq!(eval("'a' in Object{a: 1}").unwrap(), json!(true));
+    assert_eq!(eval("'b' in Object{a: 1}").unwrap(), json!(false));
+    // Field select, presence and optional select on a struct.
+    assert_eq!(eval("Object{a: Object.a{b: 1}}.a.b").unwrap(), json!(1));
+    assert_eq!(eval("has(Object{a: 1}.a)").unwrap(), json!(true));
+    assert_eq!(eval("has(Object{a: 1}.b)").unwrap(), json!(false));
+    assert_eq!(eval("Object{a: 1}.?a.hasValue()").unwrap(), json!(true));
+    assert_eq!(eval("Object{a: 1}.?b.hasValue()").unwrap(), json!(false));
+    // A JSONPatch is its own type, never a plain map or an Object.
+    assert_eq!(
+        eval(r#"JSONPatch{op: "add"} == {"op": "add"}"#).unwrap(),
+        json!(false)
+    );
+    assert_eq!(
+        eval(r#"JSONPatch{op: "add"} == JSONPatch{op: "add"}"#).unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        eval("type(JSONPatch{}) == type(Object{})").unwrap(),
+        json!(false)
+    );
+}
+
+/// A struct value bound into a later evaluation (a VAP variable) keeps its
+/// type.
+#[test]
+fn struct_values_keep_their_type_when_bound_into_another_evaluation() {
+    let mut ev = CELEvaluator::new();
+    let ctx = CELContext::for_admission(&json!({}), None, None).unwrap();
+    let v = ev.evaluate_to_value_raw("Object.a{x: 1}", &ctx).unwrap();
+    let mut ctx2 = CELContext::new();
+    ctx2.add_variable("v".to_string(), v);
+    let eval2 =
+        |ev: &mut CELEvaluator, e: &str| ev.evaluate_to_value(e, &ctx2).unwrap().json().unwrap();
+    assert_eq!(eval2(&mut ev, "v == Object.a{x: 1}"), json!(true));
+    assert_eq!(eval2(&mut ev, "v == Object.b{x: 1}"), json!(false));
+}
+
+/// The costed evaluator walks the field values of a struct and charges
+/// `StructCreateBaseCost` (`interpreter/runtimecost.go` `InterpretableConstructor`).
+#[test]
+fn struct_construction_is_costed() {
+    use rusternetes_common::cel_cost::{CostOptions, STRUCT_CREATE_BASE_COST};
+    let mut ev = CELEvaluator::new();
+    let ctx = CELContext::for_admission(&json!({"spec": {"replicas": 2}}), None, None).unwrap();
+    let mut cost = |expr: &str| {
+        let (r, cost) = ev.evaluate_with_cost(expr, &ctx, CostOptions::default());
+        assert!(r.is_ok(), "{expr}: {r:?}");
+        cost
+    };
+    let empty = cost("Object{}");
+    assert_eq!(empty, STRUCT_CREATE_BASE_COST);
+    let one = cost("Object{a: object.spec.replicas}");
+    assert!(one > empty, "{one} vs {empty}");
+    let two = cost("Object{a: object.spec.replicas, b: object.spec.replicas}");
+    assert_eq!(two - empty, 2 * (one - empty));
 }

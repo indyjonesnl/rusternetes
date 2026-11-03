@@ -27,7 +27,8 @@ impl CELEvaluator {
     }
 
     /// Compile (or fetch from the cache) `expression`. `Object{}` /
-    /// `JSONPatch{}` initializers are rewritten to maps; see [`cel_struct`].
+    /// `JSONPatch{}` initializers are checked and their struct types
+    /// collected; see [`cel_struct`].
     fn compiled(&mut self, expression: &str) -> Result<&CompiledExpression> {
         if !self.program_cache.contains_key(expression) {
             let prog = cel_struct::compile(expression)
@@ -50,7 +51,7 @@ impl CELEvaluator {
         let program = self.compiled(expression)?;
 
         // Create CEL context
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
 
         // Add variables to context
         for (key, value) in &context.variables {
@@ -77,7 +78,7 @@ impl CELEvaluator {
         let program = self.compiled(expression)?;
 
         // Create CEL context
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
 
         // Add variables to context
         for (key, value) in &context.variables {
@@ -103,7 +104,7 @@ impl CELEvaluator {
     pub fn evaluate_to_value(&mut self, expression: &str, context: &CELContext) -> Result<Value> {
         let program = self.compiled(expression)?;
 
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
@@ -112,15 +113,15 @@ impl CELEvaluator {
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
-    /// Like [`Self::evaluate_to_value`] but keeps the `Object{}` type
-    /// markers, for values that are bound into another evaluation.
+    /// Like [`Self::evaluate_to_value`] but keeps the struct values (with
+    /// their type names), for values that are bound into another evaluation.
     pub fn evaluate_to_value_raw(
         &mut self,
         expression: &str,
         context: &CELContext,
     ) -> Result<Value> {
         let program = self.compiled(expression)?;
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
@@ -144,8 +145,8 @@ impl CELEvaluator {
         (r.map(|v| cel_struct::strip_type_markers(&v)), cost)
     }
 
-    /// [`Self::evaluate_with_cost`] keeping the `Object{}` type markers (for
-    /// values bound into another evaluation, or checked by the caller).
+    /// [`Self::evaluate_with_cost`] keeping the struct values (for values
+    /// bound into another evaluation, or checked by the caller).
     pub fn evaluate_with_cost_raw(
         &mut self,
         expression: &str,
@@ -166,7 +167,7 @@ impl CELEvaluator {
                 )
             }
         };
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
@@ -183,7 +184,7 @@ impl CELEvaluator {
         mode: cel_struct::TypeCheck,
     ) -> Result<Value> {
         let program = self.compiled(expression)?;
-        let mut cel_context = cel_struct::new_context();
+        let mut cel_context = cel_struct::new_context_for(program);
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }

@@ -23,7 +23,7 @@
 
 use cel::common::ast::{
     operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedEntryExpr, IdedExpr, ListExpr,
-    LiteralValue, MapEntryExpr, MapExpr, SelectExpr,
+    LiteralValue, MapEntryExpr, MapExpr, SelectExpr, StructExpr, StructFieldExpr,
 };
 use cel::objects::Key;
 use cel::{Context, ExecutionError, Value};
@@ -65,9 +65,6 @@ pub const COST_LIMIT_EXCEEDED_MESSAGE: &str = "operation cancelled: actual cost 
 /// `activation.go:150`: the detail of the out-of-budget `cel.Error`.
 pub const OUT_OF_BUDGET_DETAIL: &str =
     "validation failed due to running out of cost budget, no further validation rules will be run";
-
-/// Reserved map key `cel_struct` stamps on an `Object{}` (a struct in cel-go).
-const STRUCT_TYPE_KEY: &str = "\u{1}objectType";
 
 /// Why a costed evaluation stopped.
 #[derive(Debug)]
@@ -215,15 +212,13 @@ fn is_type_conversion(f: &str) -> bool {
 /// (`interpreter/decorators.go:107-124`): a literal, a list or map whose
 /// elements are all constants (`maybeBuildListLiteral`, `maybeBuildMapLiteral`)
 /// and a type conversion of a constant (`maybeOptimizeConstUnary`). A struct
-/// (`Object{}` rewritten to a map with the type marker) is never folded.
+/// (`Object{}`) is never folded.
 fn is_const(e: &IdedExpr) -> bool {
     match &e.expr {
         Expr::Literal(_) => true,
         Expr::List(l) => l.elements.iter().all(is_const),
         Expr::Map(m) => m.entries.iter().all(|en| match &en.expr {
-            EntryExpr::MapEntry(me) => {
-                !is_struct_marker(&me.key) && is_const(&me.key) && is_const(&me.value)
-            }
+            EntryExpr::MapEntry(me) => is_const(&me.key) && is_const(&me.value),
             EntryExpr::StructField(_) => false,
         }),
         Expr::Call(c) => {
@@ -234,10 +229,6 @@ fn is_const(e: &IdedExpr) -> bool {
         }
         _ => false,
     }
-}
-
-fn is_struct_marker(key: &IdedExpr) -> bool {
-    matches!(&key.expr, Expr::Literal(LiteralValue::String(s)) if s.inner() == STRUCT_TYPE_KEY)
 }
 
 /// `maybeOptimizeSetMembership` (`decorators.go:222-291`): `x in <constant
@@ -300,7 +291,8 @@ impl Tracker {
             Expr::List(l) => self.walk_list(e, l, ctx),
             Expr::Map(m) => self.walk_map(e, m, ctx),
             Expr::Comprehension(c) => self.walk_comprehension(c, ctx),
-            Expr::Literal(_) | Expr::Struct(_) | Expr::Unspecified => resolve(ctx, e),
+            Expr::Struct(st) => self.walk_struct(e, st, ctx),
+            Expr::Literal(_) | Expr::Unspecified => resolve(ctx, e),
         }
     }
 
@@ -445,17 +437,14 @@ impl Tracker {
         resolve_aliased(ctx, &vals, &out)
     }
 
-    /// `InterpretableConstructor`: `MapCreateBaseCost`, or `StructCreateBaseCost`
-    /// for what `cel_struct` rewrote from `Object{}`.
+    /// `InterpretableConstructor`: `MapCreateBaseCost`.
     fn walk_map(&mut self, e: &IdedExpr, m: &MapExpr, ctx: &Context) -> R {
         let mut vals = Vec::new();
         let mut entries = Vec::with_capacity(m.entries.len());
-        let mut is_struct = false;
         for en in &m.entries {
             let EntryExpr::MapEntry(me) = &en.expr else {
                 return resolve(ctx, e);
             };
-            is_struct |= is_struct_marker(&me.key);
             let k = vals.len();
             vals.push(self.walk(&me.key, ctx)?);
             vals.push(self.walk(&me.value, ctx)?);
@@ -468,13 +457,39 @@ impl Tracker {
                 }),
             });
         }
-        self.add(if is_struct {
-            STRUCT_CREATE_BASE_COST
-        } else {
-            MAP_CREATE_BASE_COST
-        })?;
+        self.add(MAP_CREATE_BASE_COST)?;
         let mut out = e.clone();
         out.expr = Expr::Map(MapExpr { entries });
+        resolve_aliased(ctx, &vals, &out)
+    }
+
+    /// `InterpretableConstructor`: `StructCreateBaseCost` (`Object{}` /
+    /// `JSONPatch{}`). The field values are walked here so the stock
+    /// interpreter does not evaluate them unobserved.
+    fn walk_struct(&mut self, e: &IdedExpr, s: &StructExpr, ctx: &Context) -> R {
+        let mut vals = Vec::new();
+        let mut entries = Vec::with_capacity(s.entries.len());
+        for en in &s.entries {
+            let EntryExpr::StructField(f) = &en.expr else {
+                return resolve(ctx, e);
+            };
+            let k = vals.len();
+            vals.push(self.walk(&f.value, ctx)?);
+            entries.push(IdedEntryExpr {
+                id: en.id,
+                expr: EntryExpr::StructField(StructFieldExpr {
+                    field: f.field.clone(),
+                    value: alias(k),
+                    optional: f.optional,
+                }),
+            });
+        }
+        self.add(STRUCT_CREATE_BASE_COST)?;
+        let mut out = e.clone();
+        out.expr = Expr::Struct(StructExpr {
+            type_name: s.type_name.clone(),
+            entries,
+        });
         resolve_aliased(ctx, &vals, &out)
     }
 
