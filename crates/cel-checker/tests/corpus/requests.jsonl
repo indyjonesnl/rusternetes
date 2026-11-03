@@ -306,3 +306,11 @@
 {"expr":"(s == 'x' ? l : l).size()","vars":{"s":"string","l":"list(string)"}}
 {"expr":"dyn(s).size()","vars":{"s":"string"}}
 {"expr":"optional.of(s).hasValue()","vars":{"s":"string"}}
+{"expr": "jsonpatch.escapeKey(s)", "libs": ["jsonpatch"], "vars": {"s": "string"}}
+{"expr": "jsonpatch.escapeKey('a/b~c')", "libs": ["jsonpatch"]}
+{"expr": "'/metadata/labels/' + jsonpatch.escapeKey(s)", "libs": ["jsonpatch"], "vars": {"s": "string"}}
+{"expr": "jsonpatch.escapeKey(s) == jsonpatch.escapeKey(t)", "libs": ["jsonpatch"], "vars": {"s": "string", "t": "string"}}
+{"expr": "l.map(k, jsonpatch.escapeKey(k))", "libs": ["jsonpatch"], "vars": {"l": "list(string)"}}
+{"expr": "m.all(k, jsonpatch.escapeKey(k).size() > 1)", "libs": ["jsonpatch"], "vars": {"m": "map(string, string)"}}
+{"expr": "jsonpatch.escapeKey(1)", "libs": ["jsonpatch"]}
+{"expr": "jsonpatch.escapeKey(s)", "vars": {"s": "string"}}

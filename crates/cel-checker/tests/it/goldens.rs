@@ -118,6 +118,17 @@ fn ours(req: &Value) -> Ours {
             .unwrap();
         }
     }
+    for lib in req
+        .get("libs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match lib.as_str() {
+            Some("jsonpatch") => env.add_library(rusternetes_cel_checker::table::jsonpatch),
+            other => panic!("unknown library {other:?}"),
+        }
+    }
     let expr = match Parser::new().enable_optional_syntax(true).parse(expr_src) {
         Ok(e) => e,
         Err(e) => return (false, vec![e.to_string()], None, None),
