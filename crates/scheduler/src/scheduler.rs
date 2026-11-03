@@ -193,6 +193,12 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     pub cache: crate::cache::SchedulerCache,
     /// Binding cycles running as tasks (see `async_binding`).
     pub bindings: Arc<crate::async_binding::InFlightBindings>,
+    /// Storage mode only: the informers behind NodeVolumeLimits' listers
+    /// (csi.go `pvLister`, `pvcLister`, `scLister`, `vaLister`,
+    /// `csiDriverLister`, CSINode), started by [`Scheduler::run`]. Unset while
+    /// a cycle is driven directly, where the listers fall back to an
+    /// in-process list. API mode keeps its reflectors in the `DataPlane`.
+    pub(crate) storage_volumes: std::sync::OnceLock<Arc<crate::data_plane::VolumeReflectors>>,
 }
 
 /// See [`Scheduler::before_preempt_pod`].
@@ -222,6 +228,7 @@ impl Scheduler<StorageBackend> {
             before_preempt_pod: std::sync::Mutex::new(None),
             cache: crate::cache::SchedulerCache::default(),
             bindings: Arc::default(),
+            storage_volumes: std::sync::OnceLock::new(),
         }
     }
 }
@@ -257,6 +264,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             before_preempt_pod: std::sync::Mutex::new(None),
             cache: crate::cache::SchedulerCache::default(),
             bindings: Arc::default(),
+            storage_volumes: std::sync::OnceLock::new(),
         }
     }
 
@@ -555,6 +563,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             DataPlane::Storage(s) => Arc::clone(s),
             DataPlane::Api(_) => unreachable!("API mode handled above"),
         };
+        // The informer factory's Start + WaitForCacheSync for the volume
+        // listers (cmd/kube-scheduler/app/server.go:271-285), over the
+        // in-process store.
+        {
+            let volumes = Arc::new(crate::data_plane::VolumeReflectors::for_storage(&storage));
+            volumes.spawn();
+            volumes.wait_for_cache_sync().await;
+            let _ = self.storage_volumes.set(volumes);
+        }
         loop {
             self.resync(&queue, &mut seen).await;
 
@@ -1640,6 +1657,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             binder: &self.volume_binder,
             bind_timeout: profile.volume_bind_timeout,
             bind_poll: self.volume_bind_poll,
+            volumes: self.storage_volumes.get().map(|v| v.as_ref()),
         };
 
         // `assume` (schedule_one.go:955-975): record the pod on the node
@@ -1705,6 +1723,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             binder: &self.volume_binder,
             bind_timeout: profile.volume_bind_timeout,
             bind_poll: self.volume_bind_poll,
+            volumes: self.storage_volumes.get().map(|v| v.as_ref()),
         };
 
         // PreBindPreFlights (:282) and PreBind (:327).
@@ -1771,6 +1790,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 binder: &self.volume_binder,
                 bind_timeout: profile.volume_bind_timeout,
                 bind_poll: self.volume_bind_poll,
+                volumes: self.storage_volumes.get().map(|v| v.as_ref()),
             };
             profile
                 .framework
@@ -1955,6 +1975,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             binder: &self.volume_binder,
             bind_timeout: profile.volume_bind_timeout,
             bind_poll: self.volume_bind_poll,
+            volumes: self.storage_volumes.get().map(|v| v.as_ref()),
         };
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
             .run_pre_filter_plugins(cycle_state, pod, nodes, all_pods, &handle)
@@ -2466,6 +2487,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             binder: &self.volume_binder,
             bind_timeout: profile_ref.volume_bind_timeout,
             bind_poll: self.volume_bind_poll,
+            volumes: self.storage_volumes.get().map(|v| v.as_ref()),
         };
         let mut non_violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
         let mut violating: Vec<crate::advanced::PreemptionCandidate> = Vec::new();
@@ -3183,6 +3205,8 @@ struct CycleHandle<'a, S: Storage + Send + Sync + 'static> {
     /// `BindPodVolumes`.
     bind_timeout: Duration,
     bind_poll: Duration,
+    /// Storage mode's volume informers, once running.
+    volumes: Option<&'a crate::data_plane::VolumeReflectors>,
 }
 
 impl<S: Storage + Send + Sync + 'static> CycleHandle<'_, S> {
@@ -3227,6 +3251,10 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
     async fn node_volume_limits_snapshot(
         &self,
     ) -> Result<crate::node_volume_limits::NodeVolumeLimitsSnapshot, String> {
+        // `Filter` reads the informer caches, never the API (csi.go).
+        if let Some(v) = self.volumes {
+            return Ok(v.snapshot());
+        }
         self.data
             .list_node_volume_limits_snapshot()
             .await
