@@ -17,7 +17,8 @@ use crate::handlers::openapi::upstream_v2_definitions;
 use rusternetes_common::cel_checker_shadow::Mode;
 use rusternetes_common::cel_openapi_resolver::{DefinitionsSchemaResolver, Gvk, ResolveError};
 use rusternetes_common::cel_policy_types::{
-    check_policy_expression, DeclType, ParamsType, PolicyTypeContext,
+    check_policy_expression_with, CheckOptions, DeclType, ParamsType, PolicyCheck,
+    PolicyTypeContext,
 };
 use rusternetes_common::cel_schema_types::schema_decl_type;
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
@@ -196,6 +197,10 @@ pub struct TypedDivergence {
     pub probe: Option<String>,
     /// The typed checker's errors for this GVK.
     pub checker: Vec<String>,
+    /// The checker's errors as `Errors.ToDisplayString` renders them, with
+    /// `line:column` and the source snippet (empty when it accepted). Our log
+    /// format: upstream's type checker reports only the messages.
+    pub display: String,
 }
 
 /// Type checks every expression of `obj` for every matched GVK and returns
@@ -234,13 +239,22 @@ pub fn typed_divergences(obj: &ValidatingAdmissionPolicy, set: &EnvSet) -> Vec<T
         };
         for e in &exprs {
             // `StoredExpressions`: the type checker compiles in the stored env.
-            let Some(checker) = check_policy_expression(
+            let opts = CheckOptions {
+                has_authorizer: e.has_authorizer,
+                ..CheckOptions::default()
+            };
+            let Some(PolicyCheck {
+                errors: checker,
+                display,
+                ..
+            }) = check_policy_expression_with(
                 set,
                 EnvType::StoredExpressions,
                 &ctx,
-                e.has_authorizer,
+                &opts,
                 e.expression,
-            ) else {
+            )
+            else {
                 continue;
             };
             let probe = cel_versions::probe_failure(e.expression, set, EnvType::StoredExpressions);
@@ -250,6 +264,7 @@ pub fn typed_divergences(obj: &ValidatingAdmissionPolicy, set: &EnvSet) -> Vec<T
                     field: e.field.clone(),
                     probe,
                     checker,
+                    display,
                 });
             }
         }
@@ -271,6 +286,7 @@ pub fn observe(obj: &ValidatingAdmissionPolicy, set: &EnvSet) {
             field = %d.field,
             probe = ?d.probe,
             checker = ?d.checker,
+            checker_display = %d.display,
             "typed cel checker disagrees with the compile probe"
         );
     }

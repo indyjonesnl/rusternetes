@@ -26,7 +26,7 @@ use std::sync::Arc;
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
         "[1, 2].sortBy(1, x)",
-        "the sortBy macro is the cel crate's (`extensions::lists`, which reuses its `map` expander): its error is 'argument must be a simple name', cel-go's sortByMacro (ext/lists.go) says 'argument is not an identifier'. Only the message differs; the location matches",
+        "the sortBy macro is the cel crate's (`extensions::lists`, which reuses its `map` expander): its error is 'argument must be a simple name', cel-go's sortByMacro (ext/lists.go) says 'argument is not an identifier'. Only the message differs; the location matches. Not fixed: the message comes from the crate's `map_macro_expander` (`pub(crate)`), so replacing the macro would mean re-implementing the `map` comprehension expansion here, more than a small function",
     ),
 ];
 
