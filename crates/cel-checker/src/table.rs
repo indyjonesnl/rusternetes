@@ -369,7 +369,7 @@ pub fn regex(t: &mut Table) {
 
 /// `library.Quantity`.
 pub fn quantity(t: &mut Table) {
-    const Q: &str = "s:apiserver.cel.Quantity";
+    const Q: &str = "s:kubernetes.Quantity";
     g(t, "quantity", "string", Q);
     g(t, "isQuantity", "string", "bool");
     g(t, "sign", Q, "int");
