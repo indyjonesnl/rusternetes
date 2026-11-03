@@ -314,3 +314,20 @@
 {"expr": "m.all(k, jsonpatch.escapeKey(k).size() > 1)", "libs": ["jsonpatch"], "vars": {"m": "map(string, string)"}}
 {"expr": "jsonpatch.escapeKey(1)", "libs": ["jsonpatch"]}
 {"expr": "jsonpatch.escapeKey(s)", "vars": {"s": "string"}}
+{"expr": "Object{}", "patchTypes": true}
+{"expr": "Object{a: 1}", "patchTypes": true}
+{"expr": "Object{a: s}", "patchTypes": true, "vars": {"s": "string"}}
+{"expr": "Object{a: 1, b: s, c: [1, 2]}", "patchTypes": true, "vars": {"s": "string"}}
+{"expr": "Object{spec: Object.spec{replicas: 3}}", "patchTypes": true}
+{"expr": "Object{spec: Object.spec{template: Object.spec.template{containers: [Object.spec.template.containers.item{name: s}]}}}", "patchTypes": true, "vars": {"s": "string"}}
+{"expr": "Object{a: 1}.a", "patchTypes": true}
+{"expr": "Object{} == Object{}", "patchTypes": true}
+{"expr": "JSONPatch{op: 'add', path: '/a', value: 1}", "patchTypes": true}
+{"expr": "JSONPatch{op: 'remove', path: s}", "patchTypes": true, "vars": {"s": "string"}}
+{"expr": "JSONPatch{op: 'add', path: '/spec/' + jsonpatch.escapeKey(s), value: Object{a: 1}}", "patchTypes": true, "vars": {"s": "string"}}
+{"expr": "[JSONPatch{op: 'add', path: '/a', value: 1}, JSONPatch{op: 'remove', path: '/b'}]", "patchTypes": true}
+{"expr": "l.map(k, JSONPatch{op: 'remove', path: '/x/' + k})", "patchTypes": true, "vars": {"l": "list(string)"}}
+{"expr": "true ? JSONPatch{op: 'add', path: '/a', value: 1} : JSONPatch{op: 'remove', path: '/a'}", "patchTypes": true}
+{"expr": "Object{?a: optional.of(1)}", "patchTypes": true}
+{"expr": "JSONPatch{op: 1}", "patchTypes": true}
+{"expr": "Invalid{}", "patchTypes": true}

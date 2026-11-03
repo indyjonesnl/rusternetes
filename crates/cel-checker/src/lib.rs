@@ -40,7 +40,8 @@ pub mod unify;
 
 pub use checker::{check, CheckedAst, Reference};
 pub use env::{
-    Container, EmptyProvider, Env, FunctionDecl, MapProvider, Options, Provider, VariableDecl,
+    Container, EmptyProvider, Env, FunctionDecl, MapProvider, Options, PatchTypeProvider, Provider,
+    VariableDecl,
 };
 pub use environment::{EnvSet, EnvType, Features, Version};
 pub use errors::{CheckError, Errors, Location, Locator, NoLocations};
