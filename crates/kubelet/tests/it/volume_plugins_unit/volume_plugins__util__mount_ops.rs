@@ -18,7 +18,7 @@ mod tests {
             dev_minor: minor,
         }
     }
-    const ROOT: u64 = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    const ROOT: u64 = STATX_ATTR_MOUNT_ROOT;
 
     // mount_linux.go:468-477: MOUNT_ROOT supported and set => mount point,
     // parent never statted.

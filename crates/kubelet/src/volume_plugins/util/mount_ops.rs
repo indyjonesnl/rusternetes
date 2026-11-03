@@ -786,22 +786,58 @@ pub fn statfs_flags(path: &str) -> io::Result<u64> {
     Ok(s.f_flag as u64)
 }
 
-const ROOT_ATTR: u64 = libc::STATX_ATTR_MOUNT_ROOT as u64;
+/// `STATX_ATTR_MOUNT_ROOT` (linux/stat.h). Declared here, not taken from the
+/// `libc` crate: `libc` does not expose `statx` or its constants for musl.
+pub const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
+/// `AT_STATX_DONT_SYNC` (linux/fcntl.h); see [`STATX_ATTR_MOUNT_ROOT`].
+const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+
+const ROOT_ATTR: u64 = STATX_ATTR_MOUNT_ROOT;
+
+/// `struct statx` (linux/stat.h, stable kernel ABI, 256 bytes). Only the
+/// fields through `stx_dev_minor` are named; the rest is opaque padding.
+#[repr(C)]
+struct RawStatx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    _spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    /// atime, btime, ctime, mtime (`struct statx_timestamp`, 16 bytes each).
+    _timestamps: [u64; 8],
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    _rest: [u64; 14],
+}
+const _: () = assert!(std::mem::size_of::<RawStatx>() == 256);
 
 /// `statx` (`mount_linux.go:430-441`): `AT_FDCWD`, `AT_STATX_DONT_SYNC`,
 /// mask 0; `ENOSYS` becomes `errStatxNotSupport`.
 fn statx(file: &str) -> Result<StatxInfo, StatxError> {
     let c = std::ffi::CString::new(file)
         .map_err(|_| StatxError::Io(io::Error::from_raw_os_error(libc::EINVAL)))?;
-    let mut st: libc::statx = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is NUL-terminated and `st` is a valid out-pointer.
+    // SAFETY: all-zero is a valid `RawStatx` (plain integers).
+    let mut st: RawStatx = unsafe { std::mem::zeroed() };
+    // Raw syscall, as `unix.Statx` does in Go (golang.org/x/sys/unix): the
+    // `libc` crate has no `statx` wrapper for musl.
+    // SAFETY: `c` is NUL-terminated and `st` is a valid 256-byte out-pointer.
     let rc = unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             libc::AT_FDCWD,
             c.as_ptr(),
-            libc::AT_STATX_DONT_SYNC,
-            0,
-            &mut st,
+            AT_STATX_DONT_SYNC,
+            0 as libc::c_uint,
+            &mut st as *mut RawStatx,
         )
     };
     if rc != 0 {
