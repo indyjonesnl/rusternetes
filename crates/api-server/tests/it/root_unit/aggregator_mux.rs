@@ -159,4 +159,86 @@ mod tests {
         h.set_service_available();
         assert_eq!(h.decide(), ProxyDecision::Error("boom".into()));
     }
+
+    fn names(groups: &[Value]) -> Vec<String> {
+        groups
+            .iter()
+            .map(|g| g["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// handler_apis_test.go `TestAPIs` "empty" / "v1 only": no APIServices
+    /// add nothing after the built-in `apiregistration.k8s.io` group.
+    #[test]
+    fn apis_handler_empty() {
+        assert!(apis_handler_groups(&[]).is_empty());
+    }
+
+    /// `TestAPIs` "simple add": foo (GroupPriorityMinimum 11) before bar (10);
+    /// entries are bare `APIGroup`s.
+    #[test]
+    fn apis_handler_simple_add() {
+        let groups = apis_handler_groups(&[svc("v1.bar", 10, 0, true), svc("v1.foo", 11, 0, true)]);
+        assert_eq!(
+            groups,
+            vec![
+                json!({"name": "foo", "versions": [{"groupVersion": "foo/v1", "version": "v1"}],
+                       "preferredVersion": {"groupVersion": "foo/v1", "version": "v1"}}),
+                json!({"name": "bar", "versions": [{"groupVersion": "bar/v1", "version": "v1"}],
+                       "preferredVersion": {"groupVersion": "bar/v1", "version": "v1"}}),
+            ]
+        );
+    }
+
+    /// `TestAPIs` "sorting": groups by priority (foo 20, bar 11), versions by
+    /// version priority within a group (foo: v2 15 > v1 10; bar: v2 > v1 by
+    /// kube-aware version).
+    #[test]
+    fn apis_handler_sorting() {
+        let groups = apis_handler_groups(&[
+            svc("v1.foo", 20, 10, true),
+            svc("v2.bar", 11, 0, true),
+            svc("v2.foo", 1, 15, true),
+            svc("v1.bar", 11, 0, true),
+        ]);
+        assert_eq!(names(&groups), ["foo", "bar"]);
+        assert_eq!(groups[0]["preferredVersion"]["groupVersion"], "foo/v2");
+        assert_eq!(groups[0]["versions"][1]["groupVersion"], "foo/v1");
+        assert_eq!(groups[1]["preferredVersion"]["groupVersion"], "bar/v2");
+        assert_eq!(groups[1]["versions"][1]["groupVersion"], "bar/v1");
+    }
+
+    /// `TestAPIs` "unavailable service": still listed.
+    #[test]
+    fn apis_handler_lists_unavailable_service() {
+        let groups = apis_handler_groups(&[svc("v1.foo", 11, 0, false)]);
+        assert_eq!(names(&groups), ["foo"]);
+    }
+
+    /// `apisHandler.ServeHTTP`: "skip the legacy group" (empty `Spec.Group`).
+    #[test]
+    fn apis_handler_skips_legacy_group() {
+        let mut legacy = svc("v1.x", 18000, 1, true);
+        legacy.metadata.name = "v1.".into();
+        legacy.spec.group = String::new();
+        let groups = apis_handler_groups(&[legacy, svc("v1.foo", 1, 0, true)]);
+        assert_eq!(names(&groups), ["foo"]);
+    }
+
+    /// The manager hands `apisHandler` the APIServices its mounted handlers
+    /// hold: added ones appear (updated in place), removed ones vanish.
+    #[test]
+    fn manager_api_services_follow_add_update_remove() {
+        use rusternetes_api_server::apiservice_registration::APIHandlerManager;
+        let m = AggregatorHandlerManager::new(None);
+        assert!(m.api_services().is_empty());
+        m.add_api_service(&svc("v1.foo", 1, 0, false)).unwrap();
+        m.add_api_service(&svc("v1.foo", 1, 0, true)).unwrap();
+        m.add_api_service(&svc("v1.bar", 2, 0, true)).unwrap();
+        let services = m.api_services();
+        assert_eq!(services.len(), 2);
+        assert_eq!(names(&apis_handler_groups(&services)), ["bar", "foo"]);
+        m.remove_api_service("v1.bar");
+        assert_eq!(names(&apis_handler_groups(&m.api_services())), ["foo"]);
+    }
 }
