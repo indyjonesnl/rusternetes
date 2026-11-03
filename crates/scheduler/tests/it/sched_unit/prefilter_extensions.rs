@@ -8,7 +8,9 @@
 //! `TestPreFilterStateRemovePod` (podtopologyspread/filtering_test.go).
 use super::listers::EmptyListers;
 use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::default_preemption::select_victims_on_node;
+use rusternetes_scheduler::default_preemption::{
+    select_victims_on_node, select_victims_on_node_with_state,
+};
 use rusternetes_scheduler::fwk::{
     Code, CycleState, NoHandle, NodeInfo, PreFilterExtensions, PreFilterPlugin,
 };
@@ -698,4 +700,56 @@ async fn dry_run_removes_and_re_adds_pods_in_the_pod_topology_spread_state() {
     names.sort();
     // Removing one of the two leaves 1 + 1 - 0 = 2 > 1, so both go.
     assert_eq!(names, vec!["s1", "s2"]);
+}
+
+/// `DryRunPreemption` hands each node a clone of the cycle's state: the dry
+/// run over a successful PreFilter's state selects the same victims as the
+/// one that runs PreFilter itself, and leaves the cycle's state untouched.
+#[tokio::test]
+async fn dry_run_on_a_clone_of_the_cycle_state_matches_and_does_not_mutate_it() {
+    let nodes = pts_nodes(&[("node-a", "zone1"), ("node-b", "zone2")]);
+    let preemptor = pod(
+        "p",
+        "default",
+        "",
+        json!({"foo": ""}),
+        json!({"priority": 100, "topologySpreadConstraints": [spread("zone")]}),
+    );
+    let mk = |name: &str, labels: Value| {
+        let mut x = pod(name, "default", "node-a", labels, json!({}));
+        x.spec.as_mut().unwrap().priority = Some(1);
+        x
+    };
+    let pods = vec![
+        mk("s1", json!({"foo": ""})),
+        mk("s2", json!({"foo": ""})),
+        mk("bystander", json!({"bar": ""})),
+    ];
+    let fw = Profile::named("default-scheduler").framework;
+    let mut cycle = CycleState::new();
+    let (_, s, _) = fw
+        .run_pre_filter_plugins(&mut cycle, &preemptor, &nodes, &pods, &NoHandle)
+        .await;
+    assert!(s.is_success());
+    let before = pts_of(&cycle);
+
+    let with = select_victims_on_node_with_state(
+        &fw,
+        &NoHandle,
+        Some(&cycle),
+        &preemptor,
+        &nodes[0],
+        &pods,
+        &nodes,
+        &[],
+    )
+    .await;
+    let without =
+        select_victims_on_node(&fw, &NoHandle, &preemptor, &nodes[0], &pods, &nodes, &[]).await;
+    let (mut a, mut b) = (victim_names(with), victim_names(without));
+    a.sort();
+    b.sort();
+    assert_eq!(a, vec!["s1", "s2"]);
+    assert_eq!(a, b);
+    assert_eq!(pts_of(&cycle), before, "the dry run patched a clone");
 }

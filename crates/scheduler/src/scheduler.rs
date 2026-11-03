@@ -1008,16 +1008,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
 
         // Try to schedule
-        let (selected, cycle_state, diagnosis) = self
-            .select_node_diag_volumes(
+        // The cycle's state outlives a failed cycle: PostFilter's dry run
+        // clones it per node.
+        let mut cycle_state = CycleState::new();
+        let mut diagnosis = Diagnosis::default();
+        let selected = self
+            .select_node_in_state(
+                &mut cycle_state,
                 &pod,
                 &nodes,
                 &all_pods,
                 &priority_classes,
+                &mut diagnosis,
                 Some(queue.scheduling_cycle()),
             )
             .await;
-        if let (Some(node), Some(cycle_state)) = (selected, cycle_state) {
+        if let Some(node) = selected {
             if let Err(e) = self
                 .reserve_prebind_bind(pod, &node.metadata.name, cycle_state)
                 .await
@@ -1040,8 +1046,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             self.clear_nominated_node(queue, &pod, &pod_key).await;
             return Err(rusternetes_common::Error::Internal(msg));
         } else {
+            // A rejected PreFilter leaves no usable state; the dry run then
+            // runs PreFilter itself, as before.
+            let prefilter_ok = diagnosis.pre_filter_msg.is_empty();
             let outcome = self
-                .post_filter(
+                .post_filter_with_state(
+                    prefilter_ok.then_some(&cycle_state),
                     &pod,
                     &nodes,
                     &all_pods,
@@ -1569,10 +1579,38 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
-        _priority_classes: &HashMap<String, PriorityClass>,
+        priority_classes: &HashMap<String, PriorityClass>,
         diag: &mut Diagnosis,
         cycle_count: Option<i64>,
     ) -> Option<(Node, CycleState)> {
+        let mut cycle_state = CycleState::new();
+        let node = self
+            .select_node_in_state(
+                &mut cycle_state,
+                pod,
+                nodes,
+                all_pods,
+                priority_classes,
+                diag,
+                cycle_count,
+            )
+            .await?;
+        Some((node, cycle_state))
+    }
+
+    /// [`Scheduler::select_node_cycle`] over a caller-owned [`CycleState`],
+    /// which keeps the PreFilter results whether or not a node was found.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn select_node_in_state(
+        &self,
+        cycle_state: &mut CycleState,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        _priority_classes: &HashMap<String, PriorityClass>,
+        diag: &mut Diagnosis,
+        cycle_count: Option<i64>,
+    ) -> Option<Node> {
         // Advanced scheduling algorithm:
         // 1. Filter out unschedulable nodes
         // 2. Check taints and tolerations
@@ -1599,7 +1637,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // status' message, any other failure is a scheduling error, and the
         // plugins that restricted the nodes are recorded as unschedulable
         // plugins either way (`diagnosis.UnschedulablePlugins`).
-        let mut cycle_state = CycleState::new();
         let handle = CycleHandle {
             data: &self.data,
             binder: &self.volume_binder,
@@ -1607,7 +1644,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             bind_poll: self.volume_bind_poll,
         };
         let (pre_filter_result, pre_filter_status, plugins_with_nodes) = fw
-            .run_pre_filter_plugins(&mut cycle_state, pod, nodes, all_pods, &handle)
+            .run_pre_filter_plugins(cycle_state, pod, nodes, all_pods, &handle)
             .await;
         diag.unschedulable_plugins
             .extend(plugins_with_nodes.iter().cloned());
@@ -1677,7 +1714,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let (node_hint, signature) = match batch_cycle {
             Some(cycle) => {
                 let (hint, signature) = fw
-                    .get_node_hint(pod, &cycle_state, cycle, nodes, all_pods)
+                    .get_node_hint(pod, cycle_state, cycle, nodes, all_pods)
                     .await;
                 (hint.unwrap_or_default(), signature)
             }
@@ -1713,7 +1750,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         ));
         for (order, to_find, full_search) in passes {
             feasible.clear();
-            crate::in_tree::clear_pod_volumes_by_node(&cycle_state);
+            crate::in_tree::clear_pod_volumes_by_node(cycle_state);
             let mut processed_nodes = 0usize;
             for &ix in &order {
                 let node = &nodes[ix];
@@ -1725,7 +1762,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     // still inline below.
                     let status = fw
                         .run_filter_plugins_with_nominated_pods(
-                            &cycle_state,
+                            cycle_state,
                             pod,
                             node,
                             all_pods,
@@ -1824,7 +1861,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 let feasible_nodes: Vec<&Node> = feasible.iter().map(|e| e.node).collect();
                 let status = fw
                     .run_pre_score_plugins(
-                        &mut cycle_state,
+                        cycle_state,
                         pod,
                         &feasible_nodes,
                         all_pods,
@@ -1836,15 +1873,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     diag.scheduling_error = Some(status.message());
                     return None;
                 }
-                let ran: Vec<crate::score::PluginScores> =
-                    match fw.run_score_plugins(&cycle_state, pod, &feasible_nodes, all_pods, nodes)
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            diag.scheduling_error = Some(e);
-                            return None;
-                        }
-                    };
+                let ran: Vec<crate::score::PluginScores> = match fw.run_score_plugins(
+                    cycle_state,
+                    pod,
+                    &feasible_nodes,
+                    all_pods,
+                    nodes,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        diag.scheduling_error = Some(e);
+                        return None;
+                    }
+                };
                 match crate::score::total_scores(&ran, n) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1881,7 +1922,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .iter()
             .find(|n| &n.metadata.name == best_node_name)
             .cloned()
-            .map(|n| (n, cycle_state))
     }
 
     /// `updatePod` with `NominatingInfo{ModeOverride, node}` (schedule_one.go:
@@ -1960,6 +2000,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// what to do with the pod's `nominatedNodeName` when there are none.
     pub async fn post_filter(
         &self,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+        pdbs: &[rusternetes_common::resources::PodDisruptionBudget],
+        diagnosis: &Diagnosis,
+    ) -> PostFilterOutcome {
+        self.post_filter_with_state(
+            None,
+            pod,
+            nodes,
+            all_pods,
+            priority_classes,
+            pdbs,
+            diagnosis,
+        )
+        .await
+    }
+
+    /// [`Scheduler::post_filter`] with the failed cycle's `CycleState`
+    /// (`RunPostFilterPlugins(ctx, state, pod, filteredNodeStatusMap)`,
+    /// schedule_one.go:170): `SelectVictimsOnNode` works on a clone of it per
+    /// node (`DryRunPreemption`), instead of running PreFilter again. Pass
+    /// only the state of a cycle whose PreFilter succeeded; `None` makes the
+    /// dry run run PreFilter itself.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn post_filter_with_state(
+        &self,
+        cycle_state: Option<&CycleState>,
         pod: &Pod,
         nodes: &[Node],
         all_pods: &[Pod],
@@ -2092,8 +2161,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // `SelectVictimsOnNode` over the Filter plugin objects
             // (default_preemption.go:207-307), with the PDB-violating victims
             // reprieved first.
-            let selected = crate::default_preemption::select_victims_on_node(
-                fw, &handle, pod, node, all_pods, nodes, pdbs,
+            let selected = crate::default_preemption::select_victims_on_node_with_state(
+                fw,
+                &handle,
+                cycle_state,
+                pod,
+                node,
+                all_pods,
+                nodes,
+                pdbs,
             )
             .await;
             if let Ok(crate::default_preemption::NodeVictims {
