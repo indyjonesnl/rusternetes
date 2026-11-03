@@ -8,11 +8,12 @@
 //! :375-387, `satisfyPodAffinity` :390-420, `Filter` :424-432) and
 //! `plugin.go` (`mergeAffinityTermNamespacesIfNotEmpty` :144-157).
 //!
-//! Deviation: `PreFilterExtensions` (`AddPod`/`RemovePod`, :312-342) are not
-//! ported, so nominated pods and preemption what-ifs do not update the
-//! counts (the legacy per-node helpers did not count them either).
+//! `Clone` (:59-72), `updateWithPod` (:74-85) and the `topologyToMatchedTermCount`
+//! updaters (:111-142) back `PreFilterExtensions` `AddPod`/`RemovePod`
+//! (:312-342), which the preemption dry run and nominated pods use.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rusternetes_common::resources::{Namespace, Node, Pod};
 
@@ -32,15 +33,87 @@ pub const ERR_REASON_ANTI_AFFINITY_RULES_NOT_MATCH: &str =
 type Counts = HashMap<(String, String), i64>;
 
 /// `preFilterState` (filtering.go:48-60).
-#[derive(Debug)]
+///
+/// `Clone` (:59-72) copies the three count maps and shares the rest, which
+/// never changes after PreFilter.
+#[derive(Debug, Clone)]
 pub struct PreFilterState {
     existing_anti_affinity_counts: Counts,
     affinity_counts: Counts,
     anti_affinity_counts: Counts,
-    required_affinity_terms: Vec<AffinityTerm>,
-    required_anti_affinity_terms: Vec<AffinityTerm>,
+    required_affinity_terms: Arc<Vec<AffinityTerm>>,
+    required_anti_affinity_terms: Arc<Vec<AffinityTerm>>,
     /// The incoming pod, for the self-affinity exception (`state.podInfo.GetPod()`).
-    pod: Pod,
+    pod: Arc<Pod>,
+    /// `state.namespaceLabels`: the incoming pod's namespace labels.
+    namespace_labels: Arc<HashMap<String, String>>,
+}
+
+/// A deterministic copy of a `topologyToMatchedTermCount`, for inspection.
+pub type CountsSnapshot = std::collections::BTreeMap<(String, String), i64>;
+
+impl PreFilterState {
+    /// `(existingAntiAffinityCounts, affinityCounts, antiAffinityCounts)`.
+    pub fn counts(&self) -> (CountsSnapshot, CountsSnapshot, CountsSnapshot) {
+        let snap = |m: &Counts| m.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        (
+            snap(&self.existing_anti_affinity_counts),
+            snap(&self.affinity_counts),
+            snap(&self.anti_affinity_counts),
+        )
+    }
+
+    /// `updateWithPod` (filtering.go:74-85): fold the (anti)affinity matches
+    /// of `p` placed on `node` into the counts, `multiplier` being 1 to add the
+    /// pod and -1 to remove it.
+    pub fn update_with_pod(&mut self, p: &Pod, node: &Node, multiplier: i64) {
+        let info = PodInfo::new(p);
+        for t in &info.required_anti_affinity_terms {
+            if t.matches(&self.pod, Some(&self.namespace_labels)) {
+                update(
+                    &mut self.existing_anti_affinity_counts,
+                    node,
+                    &t.topology_key,
+                    multiplier,
+                );
+            }
+        }
+        if pod_matches_all_affinity_terms(&self.required_affinity_terms, p) {
+            for t in self.required_affinity_terms.iter() {
+                update(&mut self.affinity_counts, node, &t.topology_key, multiplier);
+            }
+        }
+        // The incoming pod's terms have the namespaceSelector merged into the
+        // namespaces, so the updated pod's namespace labels are not looked up.
+        for t in self.required_anti_affinity_terms.iter() {
+            if t.matches(p, None) {
+                update(
+                    &mut self.anti_affinity_counts,
+                    node,
+                    &t.topology_key,
+                    multiplier,
+                );
+            }
+        }
+    }
+}
+
+/// `topologyToMatchedTermCount.update` (filtering.go:111-120): the entry is
+/// deleted when it falls back to zero.
+fn update(m: &mut Counts, node: &Node, topology_key: &str, value: i64) {
+    if let Some(tv) = node
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(topology_key))
+    {
+        let pair = (topology_key.to_string(), tv.clone());
+        let c = m.entry(pair.clone()).or_default();
+        *c += value;
+        if *c == 0 {
+            m.remove(&pair);
+        }
+    }
 }
 
 /// `PreFilter`'s outcome: `Skip` (`Ok(None)`), or the status of a failure.
@@ -156,9 +229,10 @@ pub fn pre_filter(
         existing_anti_affinity_counts,
         affinity_counts,
         anti_affinity_counts,
-        required_affinity_terms: info.required_affinity_terms,
-        required_anti_affinity_terms: info.required_anti_affinity_terms,
-        pod: pod.clone(),
+        required_affinity_terms: Arc::new(info.required_affinity_terms),
+        required_anti_affinity_terms: Arc::new(info.required_anti_affinity_terms),
+        pod: Arc::new(pod.clone()),
+        namespace_labels: Arc::new(ns_labels),
     }))
 }
 
@@ -242,7 +316,7 @@ fn satisfy_existing_pods_anti_affinity(state: &PreFilterState, node: &Node) -> b
 /// `satisfyPodAntiAffinity` (filtering.go:375-387).
 fn satisfy_pod_anti_affinity(state: &PreFilterState, node: &Node) -> bool {
     if !state.anti_affinity_counts.is_empty() {
-        for term in &state.required_anti_affinity_terms {
+        for term in state.required_anti_affinity_terms.iter() {
             if let Some(tv) = node
                 .metadata
                 .labels
@@ -267,7 +341,7 @@ fn satisfy_pod_anti_affinity(state: &PreFilterState, node: &Node) -> bool {
 /// `satisfyPodAffinity` (filtering.go:390-420).
 fn satisfy_pod_affinity(state: &PreFilterState, node: &Node) -> bool {
     let mut pods_exist = true;
-    for term in &state.required_affinity_terms {
+    for term in state.required_affinity_terms.iter() {
         match node
             .metadata
             .labels

@@ -29,6 +29,7 @@ mod inter_pod_affinity_score;
 mod listers;
 mod node_volume_limits;
 mod pod_topology_spread_score;
+mod prefilter_extensions;
 mod profile;
 mod queue__csi_hints;
 mod queue__dra_hints;

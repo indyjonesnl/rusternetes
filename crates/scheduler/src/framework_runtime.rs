@@ -1161,12 +1161,70 @@ impl Framework {
         Status::success()
     }
 
+    /// `RunPreFilterExtensionAddPod` (framework.go:944-977): `AddPod` of every
+    /// PreFilter plugin that has extensions and was not skipped. The first
+    /// status that is not Success ends the run, wrapped as
+    /// `running AddPod on PreFilter plugin "<name>": <err>`.
+    pub fn run_pre_filter_extension_add_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_add: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        self.run_pre_filter_extension(state, "AddPod", |ext, state| {
+            ext.add_pod(state, pod_to_schedule, pod_to_add, node_info)
+        })
+    }
+
+    /// `RunPreFilterExtensionRemovePod` (framework.go:992-1025): as
+    /// [`Framework::run_pre_filter_extension_add_pod`] for `RemovePod`.
+    pub fn run_pre_filter_extension_remove_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_remove: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        self.run_pre_filter_extension(state, "RemovePod", |ext, state| {
+            ext.remove_pod(state, pod_to_schedule, pod_to_remove, node_info)
+        })
+    }
+
+    fn run_pre_filter_extension(
+        &self,
+        state: &mut CycleState,
+        operation: &str,
+        call: impl Fn(&dyn crate::fwk::PreFilterExtensions, &mut CycleState) -> Status,
+    ) -> Status {
+        for pl in &self.pre_filter_plugin_objects.0 {
+            let Some(ext) = pl.pre_filter_extensions() else {
+                continue;
+            };
+            if state.skip_filter_plugins().contains(pl.name()) {
+                continue;
+            }
+            let status = call(ext, state);
+            if !status.is_success() {
+                return Status::from_error(format!(
+                    "running {operation} on PreFilter plugin {:?}: {}",
+                    pl.name(),
+                    status.as_error().unwrap_or_default()
+                ));
+            }
+        }
+        Status::success()
+    }
+
     /// `RunFilterPluginsWithNominatedPods` (framework.go:1145-1190): the
     /// filters run twice when the node has nominated pods of greater or equal
     /// priority. First with those pods added to the node (so the pod yields to
     /// them), and, if that passes, again without them (some filters, such as
     /// inter-pod affinity, may not pass without the nominated pods).
-    /// `nominated` is `addGENominatedPods`'s selection.
+    /// `nominated` is `addGENominatedPods`'s selection; the pods are also
+    /// added to a clone of `state` through the PreFilter extensions
+    /// (`addGENominatedPods`, framework.go:1192-1220), so that plugins with
+    /// PreFilter state (InterPodAffinity, PodTopologySpread) count them.
     pub async fn run_filter_plugins_with_nominated_pods(
         &self,
         state: &CycleState,
@@ -1177,10 +1235,26 @@ impl Framework {
         nominated: Vec<&Pod>,
     ) -> Status {
         let pods_added = !nominated.is_empty();
+        // `stateOut := state.Clone()`, then `RunPreFilterExtensionAddPod` for
+        // each nominated pod; an error status aborts (`AsStatus(err)`).
+        let mut with_nominated = None;
+        if pods_added {
+            let mut out = state.clone();
+            for nominee in &nominated {
+                let info = NodeInfo::new(node, all_pods).with_all_nodes(all_nodes);
+                let s = self.run_pre_filter_extension_add_pod(&mut out, pod, nominee, &info);
+                if !s.is_success() {
+                    return s;
+                }
+            }
+            with_nominated = Some(out);
+        }
         let info = NodeInfo::new(node, all_pods)
             .with_all_nodes(all_nodes)
             .with_added_pods(nominated);
-        let status = self.run_filter_plugins(state, pod, &info).await;
+        let status = self
+            .run_filter_plugins(with_nominated.as_ref().unwrap_or(state), pod, &info)
+            .await;
         if !status.is_success() && !status.is_rejected() {
             return status;
         }

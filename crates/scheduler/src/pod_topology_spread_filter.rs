@@ -7,11 +7,11 @@
 //! (`getConstraints` :273-294).
 //!
 //! `NodeInclusionPolicyInPodTopologySpread` and `MatchLabelKeysInPodTopologySpread`
-//! are GA and always on. Deviation: `PreFilterExtensions` (`AddPod`/`RemovePod`,
-//! :186-243) are not ported, so nominated pods and preemption what-ifs do not
-//! update the counts.
+//! are GA and always on. `Clone` (:71-88) and `updateWithPod` (:215-243) back
+//! `PreFilterExtensions` `AddPod`/`RemovePod` (:186-213).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rusternetes_common::resources::{Node, Pod};
 use rusternetes_common::types::Selector;
@@ -69,9 +69,12 @@ impl CriticalPaths {
 }
 
 /// `preFilterState` (filtering.go:39-56).
-#[derive(Debug)]
+///
+/// `Clone` (:71-88) shares the constraints, which never change, and copies
+/// the critical paths and the match counts.
+#[derive(Debug, Clone)]
 pub struct PreFilterState {
-    constraints: Vec<Constraint>,
+    constraints: Arc<Vec<Constraint>>,
     /// Indexed by constraint.
     critical_paths: Vec<CriticalPaths>,
     /// Indexed by constraint: topology value -> number of matching pods.
@@ -79,6 +82,57 @@ pub struct PreFilterState {
 }
 
 impl PreFilterState {
+    /// `TpValueToMatchNum`, per constraint, for inspection.
+    pub fn tp_value_to_match_num(&self) -> Vec<std::collections::BTreeMap<String, i64>> {
+        self.tp_value_to_match_num
+            .iter()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .collect()
+    }
+
+    /// `CriticalPaths`, per constraint, for inspection.
+    pub fn critical_paths(&self) -> Vec<[(String, i64); 2]> {
+        self.critical_paths.iter().map(|c| c.0.clone()).collect()
+    }
+
+    /// `updateWithPod` (filtering.go:215-243): count `updated_pod` placed on
+    /// (`delta` 1) or removed from (`delta` -1) `node` for the constraints of
+    /// `preemptor`.
+    pub fn update_with_pod(&mut self, updated_pod: &Pod, preemptor: &Pod, node: &Node, delta: i64) {
+        let ns = |p: &Pod| {
+            p.metadata
+                .namespace
+                .as_deref()
+                .unwrap_or("default")
+                .to_string()
+        };
+        if ns(updated_pod) != ns(preemptor) {
+            return;
+        }
+        if !node_labels_match_spread_constraints(node, &self.constraints) {
+            return;
+        }
+        for (i, c) in self.constraints.iter().enumerate() {
+            if !c.selector.matches(updated_pod.metadata.labels.as_ref()) {
+                continue;
+            }
+            if !c.match_node_inclusion_policies(preemptor, node) {
+                continue;
+            }
+            let v = node
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(&c.topology_key))
+                .cloned()
+                .unwrap_or_default();
+            let n = self.tp_value_to_match_num[i].entry(v.clone()).or_default();
+            *n += delta;
+            let n = *n;
+            self.critical_paths[i].update(&v, n);
+        }
+    }
+
     /// `minMatchNum` (filtering.go:58-72): the global minimum, 0 when fewer
     /// than `minDomains` eligible domains exist.
     fn min_match_num(&self, constraint_id: usize, min_domains: i32) -> i64 {
@@ -165,7 +219,7 @@ pub fn pre_filter(
         })
         .collect();
     Ok(Some(PreFilterState {
-        constraints,
+        constraints: Arc::new(constraints),
         critical_paths,
         tp_value_to_match_num,
     }))
