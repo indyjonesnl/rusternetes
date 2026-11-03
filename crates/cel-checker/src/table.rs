@@ -339,6 +339,13 @@ pub fn k8s_lists(t: &mut Table) {
     m(t, "lastIndexOf", "list(A), A", "int");
 }
 
+/// `ext.TwoVarComprehensions()` (`ext/comprehensions.go` `CompileOptions`):
+/// `cel.@mapInsert`, which `transformMap` / `transformMapEntry` expand to.
+pub fn two_var_comprehensions(t: &mut Table) {
+    g(t, "cel.@mapInsert", "map(K, V), K, V", "map(K, V)");
+    g(t, "cel.@mapInsert", "map(K, V), map(K, V)", "map(K, V)");
+}
+
 /// `library.URLs`.
 pub fn urls(t: &mut Table) {
     g(t, "url", "string", "s:kubernetes.URL");

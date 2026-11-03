@@ -9,7 +9,6 @@
 //!
 //! Regenerate with `tools/cel-oracle/gen-goldens.sh`.
 
-use cel::parser::Parser;
 use rusternetes_cel_checker::library_cost::kubernetes_cost;
 use rusternetes_cel_checker::{
     check, Container, DType, EnvSet, EnvType, Features, MapProvider, PatchTypeProvider, Provider,
@@ -30,8 +29,8 @@ const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
         "found by the location comparison, not a location issue: with a heterogeneous list as the range and an undeclared name in the body we also report \"expected type 'int' but found 'string'\" at the range, which cel-go does not. The cause has not been investigated",
     ),
     (
-        "[1, 2].exists(i, v, i < v)",
-        "cel 0.15's parser does not expand the two-variable comprehension macros (cel-go parser/macro.go, TwoVarComprehensions), so the call is checked as a plain member call",
+        "[1, 2].sortBy(1, x)",
+        "the sortBy macro is the cel crate's (`extensions::lists`, which reuses its `map` expander): its error is 'argument must be a simple name', cel-go's sortByMacro (ext/lists.go) says 'argument is not an identifier'. Only the message differs; the location matches",
     ),
     (
         "{}.map(c, [c, type(c)])",
@@ -149,12 +148,22 @@ fn ours(req: &Value) -> Ours {
             other => panic!("unknown library {other:?}"),
         }
     }
-    let parsed = Parser::new()
-        .enable_optional_syntax(true)
-        .parse_with_source_info(expr_src);
+    let parsed = set.parser(env_type).parse_with_source_info(expr_src);
     let (expr, info) = match parsed {
         Ok(p) => p,
-        Err(e) => return (false, vec![e.to_string()], None, None, None),
+        Err(e) => {
+            // The parse errors (a macro's included) are located by the `cel`
+            // parser: 1-based line and column, where cel-go's column is
+            // 0-based. The rendering differs in the snippet, so only the
+            // messages and locations are compared.
+            let locs = e
+                .errors
+                .iter()
+                .map(|x| (x.msg.clone(), x.pos.0 as usize, (x.pos.1 - 1) as usize))
+                .collect();
+            let msgs = e.errors.iter().map(|x| x.msg.clone()).collect();
+            return (false, msgs, None, None, Some((locs, String::new())));
+        }
     };
     let locator = SourceLocator::new(&info, expr_src);
     let (ast, errs) = check(&expr, &mut env, &locator);
@@ -258,7 +267,8 @@ fn checker_matches_goldens() {
             let mut locs = locs.clone();
             want_locs.sort();
             locs.sort();
-            same &= locs == want_locs && Some(display.as_str()) == resp["display"].as_str();
+            same &= locs == want_locs
+                && (display.is_empty() || Some(display.as_str()) == resp["display"].as_str());
         }
         let key = format!("{expr} @ {req}");
         match (same, known.contains_key(expr)) {

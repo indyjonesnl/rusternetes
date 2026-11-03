@@ -13,7 +13,6 @@
 
 use crate::cel_checker_shadow::checker_env_set;
 use crate::cel_versions::{EnvSet, EnvType};
-use cel::parser::Parser;
 use rusternetes_cel_checker as checker;
 pub use rusternetes_cel_checker::decl::DeclType;
 use rusternetes_cel_checker::decl::{DeclField, DeclTypeProvider};
@@ -217,16 +216,13 @@ impl PolicyTypeContext {
 /// errors (`SourceInfo.GetStartLocation`).
 type Parsed = (cel::common::ast::IdedExpr, cel::common::ast::SourceInfo);
 
-fn parse(expression: &str) -> Option<Parsed> {
+fn parse(set: &EnvSet, env_type: EnvType, expression: &str) -> Option<Parsed> {
     let source = expression.to_string();
+    let (env_set, ct) = checker_env_set(set, env_type);
     // The antlr4rust parser panics on some invalid expressions.
-    std::panic::catch_unwind(|| {
-        Parser::new()
-            .enable_optional_syntax(true)
-            .parse_with_source_info(&source)
-    })
-    .ok()?
-    .ok()
+    std::panic::catch_unwind(|| env_set.parser(ct).parse_with_source_info(&source))
+        .ok()?
+        .ok()
 }
 
 /// Which of the optional declarations of the environment an expression is
@@ -288,7 +284,7 @@ pub fn check_policy_expression_with(
     opts: &CheckOptions,
     expression: &str,
 ) -> Option<PolicyCheck> {
-    let parsed = parse(expression)?;
+    let parsed = parse(set, env_type, expression)?;
     let mut fields: BTreeMap<String, DeclField> = BTreeMap::new();
     // `CompileAndStoreVariables` compiles the variables with the plain
     // options, never with the patch types (`compilePolicy`,
@@ -299,7 +295,7 @@ pub fn check_policy_expression_with(
     };
     for (name, expr) in &ctx.variables {
         // The output type of a variable that does not compile is `nil`: `dyn`.
-        let out = parse(expr).and_then(|p| {
+        let out = parse(set, env_type, expr).and_then(|p| {
             let (ast, errs, _) = run(set, env_type, ctx, &variable_opts, &fields, &p, expr);
             errs.is_empty()
                 .then(|| ast.and_then(|a| a.output_type().cloned()))?

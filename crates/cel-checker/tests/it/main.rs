@@ -7,3 +7,4 @@ mod decls;
 mod environment;
 mod goldens;
 mod locations;
+mod parser;
