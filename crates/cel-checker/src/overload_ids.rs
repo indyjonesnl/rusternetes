@@ -105,6 +105,7 @@ pub fn cel_go_overload_id(function: &str, member: bool, args: &[DType]) -> Optio
         "string" if args.len() == 1 && is(&DType::Bytes) => Some(BYTES_TO_STRING),
         "format" if member && is(&DType::Str) => Some(EXT_FORMAT_STRING),
         "strings.quote" => Some(EXT_QUOTE_STRING),
+        "jsonpatch.escapeKey" => Some("string_jsonpatch_escapeKey_string"),
         "ip" if member && matches!(first, Some(DType::Opaque(n, _)) if n == "net.CIDR") => {
             Some(CIDR_IP)
         }

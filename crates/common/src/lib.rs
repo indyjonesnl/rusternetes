@@ -16,6 +16,7 @@ pub mod cel_crd_cost;
 pub mod cel_dra;
 pub mod cel_dra_decls;
 pub mod cel_env;
+pub mod cel_mutation_types;
 pub mod cel_openapi_resolver;
 pub mod cel_policy_types;
 pub mod cel_schema_types;

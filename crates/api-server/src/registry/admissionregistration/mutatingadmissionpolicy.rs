@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+use rusternetes_common::cel_mutation_types::{observe_mutation, MutationExpression};
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 use rusternetes_common::resources::mutating_admission_policy::PatchType;
 use rusternetes_common::resources::MutatingAdmissionPolicy;
@@ -62,6 +63,7 @@ pub fn validate(obj: &MutatingAdmissionPolicy) -> ErrorList {
 /// `validateApplyConfiguration`, `validateJSONPatch`, `validateVariable`,
 /// validation.go:999-1032, :1100-1112, :1455-1498).
 fn compile_error(
+    policy: &Policy<'_>,
     expression: &str,
     env: &MutationEnv,
     expected: ExpectedOutput,
@@ -72,9 +74,37 @@ fn compile_error(
     // The checker's declarations first, then the library versions of the
     // environment the expression compiles in (`CompileCELExpression` in
     // `envType`, compile.go:166-229).
-    mutation_env_failure(expression, env, expected)
-        .or_else(|| cel_versions::compile_failure(expression, env_set, env_type))
-        .map(|detail| FieldError::invalid(fld_path, expression.to_string(), detail))
+    let probe = mutation_env_failure(expression, env, expected)
+        .or_else(|| cel_versions::compile_failure(expression, env_set, env_type));
+    // Default-off shadow run of the typed checker; never changes the result.
+    observe_mutation(
+        policy.name,
+        &fld_path.to_string(),
+        env_set,
+        env_type,
+        &MutationExpression {
+            expression,
+            has_params: env.has_params,
+            has_authorizer: env.has_authorizer,
+            has_patch_types: env.has_patch_types,
+            expected,
+            variables: if env.variables.is_some() {
+                policy.variables
+            } else {
+                &[]
+            },
+            no_variables: env.variables.is_none(),
+        },
+        &probe,
+    );
+    probe.map(|detail| FieldError::invalid(fld_path, expression.to_string(), detail))
+}
+
+/// What the shadow checker needs to know about the policy being compiled.
+struct Policy<'a> {
+    name: &'a str,
+    /// `spec.variables` as `(name, expression)`.
+    variables: &'a [(String, String)],
 }
 
 /// The CEL compile half of `validateMutatingAdmissionPolicySpec`
@@ -120,6 +150,16 @@ pub fn compile_errors_in(
     };
     let spec_path = Path::new("spec");
     let has_params = spec.param_kind.is_some();
+    let shadow_variables: Vec<(String, String)> = spec
+        .variables
+        .iter()
+        .flatten()
+        .map(|v| (v.name.clone(), v.expression.clone()))
+        .collect();
+    let policy = Policy {
+        name: &obj.metadata.name,
+        variables: &shadow_variables,
+    };
     if !ignore_match_conditions {
         // `validateMatchConditionsExpression` (:1100-1112): the stateless
         // compiler, so no `variables` and no patch types.
@@ -142,6 +182,7 @@ pub fn compile_errors_in(
                     EnvType::NewExpressions
                 };
                 errs.extend(compile_error(
+                    &policy,
                     expression,
                     &env,
                     ExpectedOutput::Bool,
@@ -171,6 +212,7 @@ pub fn compile_errors_in(
         if !v.expression.trim().is_empty() {
             let path = spec_path.child("variables").index(i).child("expression");
             errs.extend(compile_error(
+                &policy,
                 &v.expression,
                 &variable_env,
                 ExpectedOutput::Any,
@@ -221,6 +263,7 @@ pub fn compile_errors_in(
                     EnvType::NewExpressions
                 };
                 errs.extend(compile_error(
+                    &policy,
                     trimmed,
                     &mutation_env,
                     expected,

@@ -221,6 +221,32 @@ fn parse(expression: &str) -> Option<cel::common::ast::IdedExpr> {
         .ok()
 }
 
+/// Which of the optional declarations of the environment an expression is
+/// checked in: `plugincel.OptionalVariableDeclarations` (`compile.go:139-143`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckOptions {
+    /// `HasAuthorizer`: `authorizer` is declared.
+    pub has_authorizer: bool,
+    /// `HasPatchTypes`: the `Object` / `JSONPatch` types and the `jsonpatch`
+    /// library (`hasPatchTypes`, `compile.go:293-300`).
+    pub has_patch_types: bool,
+    /// `createEnvForOpts` also declares `authorizer.requestResource`
+    /// (`compile.go:257-262`); the VAP type checker's `buildEnvSet`
+    /// (`typechecking.go:419-423`) does not.
+    pub request_resource_authorizer: bool,
+    /// The stateless compiler `validateMatchConditionsExpression` uses has no
+    /// `variables` (`validation.go:1108`).
+    pub no_variables: bool,
+}
+
+/// The verdict of one check: the checker's errors and, when it type-checks,
+/// the output type of the expression (`ast.OutputType()`).
+#[derive(Clone, Debug, Default)]
+pub struct PolicyCheck {
+    pub errors: Vec<String>,
+    pub output: Option<DType>,
+}
+
 /// `buildEnvSet` plus the `variables` composition for one expression, then the
 /// check: `variables` have the fields of the variables compiled before it
 /// (`CompileAndStoreVariable`), typed by their output.
@@ -234,12 +260,35 @@ pub fn check_policy_expression(
     has_authorizer: bool,
     expression: &str,
 ) -> Option<Vec<String>> {
+    let opts = CheckOptions {
+        has_authorizer,
+        ..CheckOptions::default()
+    };
+    check_policy_expression_with(set, env_type, ctx, &opts, expression).map(|c| c.errors)
+}
+
+/// [`check_policy_expression`] with the full set of declarations, and the
+/// output type of the expression.
+pub fn check_policy_expression_with(
+    set: &EnvSet,
+    env_type: EnvType,
+    ctx: &PolicyTypeContext,
+    opts: &CheckOptions,
+    expression: &str,
+) -> Option<PolicyCheck> {
     let parsed = parse(expression)?;
     let mut fields: BTreeMap<String, DeclField> = BTreeMap::new();
+    // `CompileAndStoreVariables` compiles the variables with the plain
+    // options, never with the patch types (`compilePolicy`,
+    // `mutating/compilation.go:36-46`).
+    let variable_opts = CheckOptions {
+        has_patch_types: false,
+        ..*opts
+    };
     for (name, expr) in &ctx.variables {
         // The output type of a variable that does not compile is `nil`: `dyn`.
         let out = parse(expr).and_then(|p| {
-            let (ast, errs) = run(set, env_type, ctx, has_authorizer, &fields, &p);
+            let (ast, errs) = run(set, env_type, ctx, &variable_opts, &fields, &p);
             errs.is_empty()
                 .then(|| ast.and_then(|a| a.output_type().cloned()))?
         });
@@ -252,8 +301,12 @@ pub fn check_policy_expression(
             },
         );
     }
-    let (_, errs) = run(set, env_type, ctx, has_authorizer, &fields, &parsed);
-    Some(errs)
+    let (ast, errors) = run(set, env_type, ctx, opts, &fields, &parsed);
+    let output = errors
+        .is_empty()
+        .then(|| ast.and_then(|a| a.output_type().cloned()))
+        .flatten();
+    Some(PolicyCheck { errors, output })
 }
 
 /// One check in the environment with the given `variables` fields.
@@ -261,7 +314,7 @@ fn run(
     set: &EnvSet,
     env_type: EnvType,
     ctx: &PolicyTypeContext,
-    has_authorizer: bool,
+    opts: &CheckOptions,
     variable_fields: &BTreeMap<String, DeclField>,
     parsed: &cel::common::ast::IdedExpr,
 ) -> (Option<checker::CheckedAst>, Vec<String>) {
@@ -282,7 +335,14 @@ fn run(
     if let ParamsType::Typed(p) = &ctx.params {
         roots.push(p.clone());
     }
-    let provider = DeclTypeProvider::new(&roots, Arc::new(checker::MapProvider::new()), keywords)
+    // `common.ResolverEnvOption(&mutation.DynamicTypeResolver{})` resolves the
+    // names the registered types do not.
+    let fallback: Arc<dyn checker::Provider> = if opts.has_patch_types {
+        Arc::new(PatchTypeProvider)
+    } else {
+        Arc::new(checker::MapProvider::new())
+    };
+    let provider = DeclTypeProvider::new(&roots, fallback, keywords)
         .with_late_fields("variables", variables.clone());
     let mut env = env_set.env(ct, checker::Container::default(), Arc::new(provider));
     let mut declare = |name: &str, t: DType| {
@@ -292,19 +352,61 @@ fn run(
     declare("request", request.dtype());
     declare("object", ctx.object.dtype());
     declare("oldObject", ctx.object.dtype());
-    declare("variables", variables.dtype());
+    if !opts.no_variables {
+        declare("variables", variables.dtype());
+    }
     match &ctx.params {
         ParamsType::None => {}
         ParamsType::Dyn => declare("params", DType::Dyn),
         ParamsType::Typed(p) => declare("params", p.dtype()),
     }
-    if has_authorizer {
+    if opts.has_authorizer {
         declare(
             "authorizer",
             DType::Struct("kubernetes.authorization.Authorizer".into()),
         );
+        if opts.request_resource_authorizer {
+            declare(
+                "authorizer.requestResource",
+                DType::Struct("kubernetes.authorization.ResourceCheck".into()),
+            );
+        }
+    }
+    if opts.has_patch_types {
+        env.add_library(checker::table::jsonpatch);
     }
     let (ast, errors) = checker::check(parsed, &mut env, &checker::NoLocations);
     let msgs = errors.errors().iter().map(|e| e.message.clone()).collect();
     (Some(ast), msgs)
+}
+
+/// `mutation.DynamicTypeResolver` (`cel/mutation/typeresolver.go:32-42`):
+/// `JSONPatch` (`JSONPatchType.Field`, `mutation/jsonpatch.go:100-112`: `op`,
+/// `path` and `from` are strings, `value` is `dyn`) and `Object` /
+/// `Object.<path>` (`dynamic.ObjectType.Field`, `dynamic/objects.go:58-75`:
+/// every field is `dyn`) resolve; nothing else does. A `JSONPatch` field that
+/// is not one of the four is an undefined field here; upstream's `Field`
+/// answers with a nil type and the construction fails at evaluation
+/// (`JSONPatchType.Val`: `unexpected JSONPatchType field`).
+pub struct PatchTypeProvider;
+
+impl checker::Provider for PatchTypeProvider {
+    fn find_struct_type(&self, name: &str) -> Option<DType> {
+        let is_object = name == "Object"
+            || name
+                .strip_prefix("Object.")
+                .is_some_and(|rest| !rest.is_empty());
+        (name == "JSONPatch" || is_object).then(|| DType::Struct(name.to_string()))
+    }
+
+    fn find_struct_field_type(&self, struct_name: &str, field: &str) -> Option<DType> {
+        match struct_name {
+            "JSONPatch" => match field {
+                "op" | "path" | "from" => Some(DType::Str),
+                "value" => Some(DType::Dyn),
+                _ => None,
+            },
+            _ => self.find_struct_type(struct_name).map(|_| DType::Dyn),
+        }
+    }
 }

@@ -286,6 +286,13 @@ pub fn strings_v0(t: &mut Table) {
     m(t, "join", "list(string), string", "string");
 }
 
+/// The Kubernetes `JSONPatch` library (`apiserver/pkg/cel/library/jsonpatch.go:46-52`):
+/// `jsonpatch.escapeKey(string) string`, enabled with the patch types of a
+/// MutatingAdmissionPolicy (`plugin/cel/compile.go` `hasPatchTypes`).
+pub fn jsonpatch(t: &mut Table) {
+    g(t, "jsonpatch.escapeKey", "string", "string");
+}
+
 /// What `ext.Strings(ext.StringsVersion(2))` adds over version 0: `format` and `strings.quote` (`ext/strings.go:373-540`).
 pub fn strings_v2_additions(t: &mut Table) {
     m(t, "format", "string, list(dyn)", "string");
