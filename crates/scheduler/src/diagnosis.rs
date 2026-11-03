@@ -19,6 +19,10 @@ pub struct Diagnosis {
     /// the `QueuedPodInfo` in `handleSchedulingFailure` so the scheduling
     /// queue only re-evaluates the pod on events those plugins registered.
     pub unschedulable_plugins: std::collections::HashSet<String>,
+    /// `Diagnosis.PendingPlugins` (`types.go:768`): plugins that returned
+    /// Pending, a status that is also a rejection. Copied onto the
+    /// `QueuedPodInfo` in `handleSchedulingFailure` (schedule_one.go:1065).
+    pub pending_plugins: std::collections::HashSet<String>,
     /// A plugin returned `Error` (not a rejection): `findNodesThatPassFilters`
     /// (schedule_one.go:664-668) cancels the search and `schedulePod` returns
     /// this error instead of a `FitError`, so the cycle is a scheduling
@@ -39,14 +43,19 @@ impl Diagnosis {
         self.node_reasons.extend(reasons);
     }
 
-    /// `Diagnosis.AddPluginStatus` (`types.go:787-801`) for a rejected
-    /// (Unschedulable / UnschedulableAndUnresolvable) status from `plugin`.
-    /// Rusternetes has no Pending status, so `PendingPlugins` is not modelled.
-    pub fn add_plugin_status(&mut self, plugin: &str) {
-        if plugin.is_empty() {
+    /// `Diagnosis.AddPluginStatus` (`types.go:787-801`): a rejected status
+    /// (Unschedulable, UnschedulableAndUnresolvable or Pending) records its
+    /// plugin as unschedulable, and a Pending one as pending as well.
+    pub fn add_plugin_status(&mut self, sts: &crate::fwk::Status) {
+        if sts.plugin().is_empty() {
             return;
         }
-        self.unschedulable_plugins.insert(plugin.to_string());
+        if sts.is_rejected() {
+            self.unschedulable_plugins.insert(sts.plugin().to_string());
+        }
+        if sts.code() == crate::fwk::Code::Pending {
+            self.pending_plugins.insert(sts.plugin().to_string());
+        }
     }
 
     /// `NodeToStatus.Set`.

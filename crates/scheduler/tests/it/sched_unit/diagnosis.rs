@@ -62,4 +62,30 @@ mod tests {
         d.absent_nodes_code = Some(Code::Unschedulable);
         assert_eq!(d.node_code("m"), Code::Unschedulable);
     }
+
+    /// `Diagnosis.AddPluginStatus` (types.go:787-801): a rejection is an
+    /// unschedulable plugin, a Pending status is both unschedulable (it is
+    /// rejected) and pending; no plugin name, or a non-rejection, records
+    /// nothing.
+    #[test]
+    fn add_plugin_status_records_pending_plugins() {
+        use rusternetes_scheduler::fwk::{Code, Status};
+        let status = |code: Code, plugin: &str| {
+            let mut s = Status::new(code, vec!["why".to_string()]);
+            s.set_plugin(plugin);
+            s
+        };
+        let mut d = Diagnosis::default();
+        d.add_plugin_status(&status(Code::Unschedulable, "A"));
+        d.add_plugin_status(&status(Code::UnschedulableAndUnresolvable, "B"));
+        d.add_plugin_status(&status(Code::Pending, "C"));
+        d.add_plugin_status(&status(Code::Pending, ""));
+        d.add_plugin_status(&status(Code::Success, "D"));
+        d.add_plugin_status(&status(Code::Error, "E"));
+        let set = |v: &[&str]| -> std::collections::HashSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(d.unschedulable_plugins, set(&["A", "B", "C"]));
+        assert_eq!(d.pending_plugins, set(&["C"]));
+    }
 }

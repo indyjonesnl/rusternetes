@@ -33,7 +33,10 @@ pub enum ScheduleOutcome {
     /// (`Diagnosis.UnschedulablePlugins`). Empty when the failure was not a
     /// fit error (e.g. no nodes registered), which the queue treats as an
     /// error and backs off.
-    Unschedulable(std::collections::HashSet<String>),
+    Unschedulable(
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ),
 }
 
 /// Last-seen pods (by `ns/name`) and nodes (by name): the `oldObj` the
@@ -839,9 +842,11 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     queue.delete_nominated_pod_if_exists(&p_info.pod);
                     queue.done(&p_info.pod.metadata.uid)
                 }
-                Ok(ScheduleOutcome::Unschedulable(plugins)) => {
-                    // FitError: inject UnschedulablePlugins into the PodInfo.
+                Ok(ScheduleOutcome::Unschedulable(plugins, pending)) => {
+                    // FitError: inject UnschedulablePlugins and PendingPlugins
+                    // into the PodInfo (schedule_one.go:1064-1065).
                     p_info.unschedulable_plugins = plugins;
+                    p_info.pending_plugins = pending;
                     self.handle_scheduling_failure(&queue, p_info).await;
                 }
                 Err(e) => {
@@ -966,7 +971,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // `ScheduleResult{nominatingInfo: clearNominatedNode}`
             // (schedule_one.go:155-157).
             self.clear_nominated_node(queue, &pod, &pod_key).await;
-            return Ok(ScheduleOutcome::Unschedulable(Default::default()));
+            return Ok(ScheduleOutcome::Unschedulable(
+                Default::default(),
+                Default::default(),
+            ));
         }
         let priority_classes = self.load_priority_classes().await?;
         // Preemption needs these; a failure to list them must not stop
@@ -1079,6 +1087,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // nominates); the victims' Pod/Delete events requeue it.
                 return Ok(ScheduleOutcome::Unschedulable(
                     diagnosis.unschedulable_plugins,
+                    diagnosis.pending_plugins,
                 ));
             } else {
                 // No node fits and preemption can't help — surface FailedScheduling.
@@ -1109,6 +1118,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 }
                 return Ok(ScheduleOutcome::Unschedulable(
                     diagnosis.unschedulable_plugins,
+                    diagnosis.pending_plugins,
                 ));
             }
         }
@@ -1617,7 +1627,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // `SetAbsentNodesStatus` (schedule_one.go:495): every node gets the
             // PreFilter status so preemption handles them alike.
             diag.absent_nodes_code = Some(pre_filter_status.code());
-            diag.add_plugin_status(pre_filter_status.plugin());
+            diag.add_plugin_status(&pre_filter_status);
             return None;
         }
         // `findNodesThatPassFilters` (schedule_one.go:624-708): visit the nodes
@@ -1726,7 +1736,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     if !status.is_success() {
                         if status.is_rejected() {
                             diag.add_node_reasons(status.reasons());
-                            diag.add_plugin_status(status.plugin());
+                            diag.add_plugin_status(&status);
                             diag.set_node_code(&node.metadata.name, status.code());
                         } else {
                             // `findNodesThatPassFilters` (schedule_one.go:664-668):
