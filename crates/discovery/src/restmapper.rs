@@ -1228,6 +1228,88 @@ pub fn is_builtin_group(group: &str) -> bool {
             .any(|(g, _)| *g == group)
 }
 
+/// One entry of `metav1.APIResourceList.APIResources` as a discovery client
+/// returns it for a group-version: what the storage version migrator reads
+/// (`Name`, `Namespaced`, `Verbs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedResource {
+    pub name: String,
+    pub namespaced: bool,
+    pub verbs: Vec<String>,
+}
+
+/// `DiscoveryInterface.ServerResourcesForGroupVersion` over what this server
+/// serves: the built-in resources of `group`/`version` plus the established
+/// `crds`. `None` is the 404 a client gets for a group-version that is not
+/// served (`apierrors.IsNotFound`). Top-level resources only; the custom
+/// resource verbs are the fixed set apiextensions publishes
+/// (`customresource_discovery.go`).
+pub fn served_resources_for_group_version(
+    group: &str,
+    version: &str,
+    crds: &[serde_json::Value],
+) -> Option<Vec<ServedResource>> {
+    let mut out: Vec<ServedResource> =
+        super::get_aggregated_resources_for_group_uncategorized(group, version)
+            .iter()
+            .filter_map(|r| {
+                Some(ServedResource {
+                    name: r["resource"].as_str()?.to_string(),
+                    namespaced: r["scope"].as_str() == Some("Namespaced"),
+                    verbs: r["verbs"]
+                        .as_array()
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|s| s.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+    for crd in crds.iter().filter(|c| super::crd_established(c)) {
+        if crd.pointer("/spec/group").and_then(|v| v.as_str()) != Some(group) {
+            continue;
+        }
+        let serves_version = crd
+            .pointer("/spec/versions")
+            .and_then(|v| v.as_array())
+            .is_some_and(|vs| {
+                vs.iter().any(|v| {
+                    v.get("name").and_then(|n| n.as_str()) == Some(version)
+                        && v.get("served").and_then(|s| s.as_bool()).unwrap_or(false)
+                })
+            });
+        let Some(plural) = crd.pointer("/spec/names/plural").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !serves_version {
+            continue;
+        }
+        out.push(ServedResource {
+            name: plural.to_string(),
+            namespaced: crd.pointer("/spec/scope").and_then(|v| v.as_str()) != Some("Cluster"),
+            verbs: [
+                "create",
+                "delete",
+                "deletecollection",
+                "get",
+                "list",
+                "patch",
+                "update",
+                "watch",
+            ]
+            .map(String::from)
+            .to_vec(),
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
