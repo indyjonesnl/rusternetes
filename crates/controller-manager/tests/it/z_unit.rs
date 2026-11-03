@@ -28,6 +28,7 @@ mod controllers__resource_quota;
 mod controllers__resourceclaim;
 mod controllers__selinux_warning;
 mod controllers__selinux_warning__cache;
+mod controllers__selinux_warning__events;
 mod controllers__selinux_warning__metrics;
 mod controllers__selinux_warning__translator;
 mod controllers__service;
