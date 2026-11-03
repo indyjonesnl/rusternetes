@@ -12,7 +12,8 @@
 //	           "vars": {"name": "list(int)"},       // declared variable types
 //	           "values": {"name": [1, 2]},          // optional, enables evaluation
 //	           "kubeVersion": "1.35",               // default 1.35
-//	           "envType": "new" | "stored"}         // default "new"
+//	           "envType": "new" | "stored",         // default "new"
+//	           "libs": ["jsonpatch"]}               // extra libraries
 //	response: {"ok": true, "errors": [], "outputType": "bool",
 //	           "cost": {"min": 1, "max": 2},
 //	           "evalResult": {"type": "bool", "value": "true"}}
@@ -43,6 +44,7 @@ type request struct {
 	Values      map[string]json.RawMessage `json:"values"`
 	KubeVersion string                     `json:"kubeVersion"`
 	EnvType     string                     `json:"envType"`
+	Libs        []string                   `json:"libs"`
 }
 
 type cost struct {
@@ -114,6 +116,15 @@ func handle(req request) (resp response) {
 			return response{Errors: []string{fmt.Sprintf("variable %s: %v", name, err)}}
 		}
 		opts = append(opts, cel.Variable(name, t))
+	}
+	for _, lib := range req.Libs {
+		switch lib {
+		case "jsonpatch":
+			// `hasPatchTypes` of plugin/cel/compile.go.
+			opts = append(opts, library.JSONPatch())
+		default:
+			return response{Errors: []string{"unknown library " + lib}}
+		}
 	}
 	env, err := base.Extend(opts...)
 	if err != nil {

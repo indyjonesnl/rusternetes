@@ -306,3 +306,11 @@
 {"req": {"expr": "(s == 'x' ? l : l).size()", "vars": {"l": "list(string)", "s": "string"}}, "resp": {"cost": {"max": 4, "min": 4}, "errors": [], "ok": true, "outputType": "int"}}
 {"req": {"expr": "dyn(s).size()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
 {"req": {"expr": "optional.of(s).hasValue()", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "jsonpatch.escapeKey(s)", "libs": ["jsonpatch"], "vars": {"s": "string"}}, "resp": {"cost": {"max": 1844674407370955265, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "jsonpatch.escapeKey('a/b~c')", "libs": ["jsonpatch"]}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'/metadata/labels/' + jsonpatch.escapeKey(s)", "libs": ["jsonpatch"], "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "jsonpatch.escapeKey(s) == jsonpatch.escapeKey(t)", "libs": ["jsonpatch"], "vars": {"s": "string", "t": "string"}}, "resp": {"cost": {"max": 5534023222112865794, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "l.map(k, jsonpatch.escapeKey(k))", "libs": ["jsonpatch"], "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "m.all(k, jsonpatch.escapeKey(k).size() > 1)", "libs": ["jsonpatch"], "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "jsonpatch.escapeKey(1)", "libs": ["jsonpatch"]}, "resp": {"errors": ["found no matching overload for 'jsonpatch.escapeKey' applied to '(int)'"], "ok": false}}
+{"req": {"expr": "jsonpatch.escapeKey(s)", "vars": {"s": "string"}}, "resp": {"errors": ["undeclared reference to 'jsonpatch' (in container '')", "undeclared reference to 'escapeKey' (in container '')"], "ok": false}}
