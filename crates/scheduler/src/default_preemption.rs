@@ -14,10 +14,12 @@
 //! `AddPod`/`RemovePod` (`removePod`/`addPod`, :213-230), as upstream does,
 //! instead of being recomputed for every fit check.
 //!
-//! Deviation: upstream's `PostFilter` receives the cycle's `CycleState` and
-//! `SelectVictimsOnNode` works on a clone per node. The cycle's state is not
-//! handed to PostFilter here, so PreFilter runs once per candidate node on the
-//! full snapshot (the state upstream's clone starts from).
+//! `SelectVictimsOnNode` works on a clone of the scheduling cycle's
+//! `CycleState` per node (`DryRunPreemption`, preemption.go:~790
+//! `stateCopy := state.Clone()`): [`select_victims_on_node_with_state`].
+//! [`select_victims_on_node`] without a state runs PreFilter itself, on the
+//! full snapshot, which yields the same state; it is for callers that have no
+//! cycle (tests, `try_preempt`).
 
 use std::collections::HashSet;
 
@@ -139,6 +141,24 @@ pub async fn select_victims_on_node(
     all_nodes: &[Node],
     pdbs: &[PodDisruptionBudget],
 ) -> Result<NodeVictims, Status> {
+    select_victims_on_node_with_state(fw, handle, None, pod, node, all_pods, all_nodes, pdbs).await
+}
+
+/// [`select_victims_on_node`] on a clone of the scheduling cycle's
+/// `cycle_state` (the state of a successful PreFilter over `all_pods`), as
+/// `DryRunPreemption` hands `state.Clone()` to each node. `None` runs
+/// PreFilter here instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn select_victims_on_node_with_state(
+    fw: &Framework,
+    handle: &dyn Handle,
+    cycle_state: Option<&CycleState>,
+    pod: &Pod,
+    node: &Node,
+    all_pods: &[Pod],
+    all_nodes: &[Node],
+    pdbs: &[PodDisruptionBudget],
+) -> Result<NodeVictims, Status> {
     let node_name = node.metadata.name.as_str();
     let preemptor_priority = pod_priority(pod);
     // `nodeInfo.GetPods()` holds the pods that still occupy the node; terminal
@@ -160,14 +180,20 @@ pub async fn select_victims_on_node(
 
     // The node as the removed pods leave it: `nodeInfo.RemovePod/AddPodInfo`
     // for the pod list the Filters read, and the PreFilter extensions for the
-    // plugin state. PreFilter runs once, on the full snapshot.
-    let mut state = CycleState::new();
-    let (_, status, _) = fw
-        .run_pre_filter_plugins(&mut state, pod, all_nodes, all_pods, handle)
-        .await;
-    if !status.is_success() {
-        return Err(status);
-    }
+    // plugin state, which starts as the cycle's (full snapshot) state.
+    let mut state = match cycle_state {
+        Some(s) => s.clone(),
+        None => {
+            let mut state = CycleState::new();
+            let (_, status, _) = fw
+                .run_pre_filter_plugins(&mut state, pod, all_nodes, all_pods, handle)
+                .await;
+            if !status.is_success() {
+                return Err(status);
+            }
+            state
+        }
+    };
     let view_without = |removed: &HashSet<String>| -> Vec<Pod> {
         all_pods
             .iter()
