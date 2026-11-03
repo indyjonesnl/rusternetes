@@ -223,6 +223,31 @@ pub fn convert_to_discovery_api_group(api_services: &[APIService]) -> Option<Val
     }))
 }
 
+/// The aggregated groups `apisHandler.ServeHTTP` appends to its
+/// `APIGroupList` (handler_apis.go): `SortedByGroupAndVersion` over every
+/// APIService, skipping "the legacy group" (empty `Spec.Group`), each group
+/// through `convertToDiscoveryAPIGroup`. Entries are bare `APIGroup`s (no
+/// `kind`/`apiVersion`), as members of a list are.
+///
+/// `apisHandler` additionally puts `apiregistration.k8s.io` first
+/// (`discoveryGroup`); that group is built in to this server's discovery
+/// document, so it is not produced here.
+pub fn apis_handler_groups(api_services: &[APIService]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for group_servers in sorted_by_group_and_version(api_services) {
+        if group_servers[0].spec.group.is_empty() {
+            continue;
+        }
+        let owned: Vec<APIService> = group_servers.into_iter().cloned().collect();
+        if let Some(Value::Object(mut g)) = convert_to_discovery_api_group(&owned) {
+            g.remove("kind");
+            g.remove("apiVersion");
+            out.push(Value::Object(g));
+        }
+    }
+    out
+}
+
 /// What `apiGroupHandler.ServeHTTP` does.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiGroupResponse {

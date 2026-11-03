@@ -797,6 +797,13 @@ impl AggregatorHandlerManager {
         Some(serve_api_group(group, &services))
     }
 
+    /// The APIServices the mounted handlers were last updated with: what
+    /// `apisHandler`'s `lister.List(labels.Everything())` sees.
+    pub fn api_services(&self) -> Vec<APIService> {
+        let st = self.state.lock().unwrap();
+        st.proxy_handlers.values().map(|(_, a)| a.clone()).collect()
+    }
+
     pub fn handled_group_versions(&self) -> BTreeMap<String, BTreeSet<String>> {
         self.state
             .lock()

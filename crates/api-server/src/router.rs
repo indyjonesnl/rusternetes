@@ -41,7 +41,7 @@ async fn api_groups_with_aggregated_resources(
         .map(|ct| ct.contains("APIGroupDiscoveryList"))
         .unwrap_or(false);
     if !is_aggregated {
-        return resp;
+        return apis_handler_group_list(resp).await;
     }
 
     let (parts, body) = resp.into_parts();
@@ -128,6 +128,62 @@ async fn api_groups_with_aggregated_resources(
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     }
     let new_bytes = serde_json::to_vec(&doc).unwrap_or_else(|_| bytes.to_vec());
+    Response::from_parts(parts, axum::body::Body::from(new_bytes))
+}
+
+/// `apisHandler.ServeHTTP` (kube-aggregator `handler_apis.go`) for the legacy
+/// `APIGroupList` document.
+///
+/// Upstream registers `apisHandler` on `/apis` behind
+/// `WrapAggregatedDiscoveryToHandler`: a request that negotiates
+/// `apidiscovery.k8s.io` is answered from the aggregated-discovery manager (the
+/// branch above, which is left alone), every other request falls through to
+/// `apisHandler`, which lists APIServices, runs `SortedByGroupAndVersion` and
+/// appends each group via `convertToDiscoveryAPIGroup`.
+///
+/// The built-in and CRD groups come from `get_api_groups`; the groups of
+/// APIServices that proxy to an extension apiserver (`spec.service` set) are
+/// rebuilt here from the registration controller's mounted handlers
+/// ([`crate::aggregator_mux::apis_handler_groups`]), replacing the
+/// storage-ordered approximation the storage-only discovery crate emits, and
+/// are appended in upstream's order. Local APIServices (`spec.service` unset)
+/// describe built-in groups that discovery already carries. Without an
+/// installed registration controller the response is returned unchanged.
+async fn apis_handler_group_list(resp: Response) -> Response {
+    let Some(mgr) = crate::aggregator_mux::active_handler_manager() else {
+        return resp;
+    };
+    let services = mgr.api_services();
+    let remote: std::collections::HashSet<String> = services
+        .iter()
+        .filter(|a| a.spec.service.is_some() && !a.spec.group.is_empty())
+        .map(|a| a.spec.group.clone())
+        .collect();
+    if remote.is_empty() {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    let Some(groups) = doc.get_mut("groups").and_then(|g| g.as_array_mut()) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    groups.retain(|g| {
+        g.get("name")
+            .and_then(|n| n.as_str())
+            .is_none_or(|n| !remote.contains(n))
+    });
+    let remote_services: Vec<_> = services
+        .into_iter()
+        .filter(|a| remote.contains(&a.spec.group))
+        .collect();
+    groups.extend(crate::aggregator_mux::apis_handler_groups(&remote_services));
+    let new_bytes = serde_json::to_vec(&doc).unwrap_or_else(|_| bytes.to_vec());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     Response::from_parts(parts, axum::body::Body::from(new_bytes))
 }
 
