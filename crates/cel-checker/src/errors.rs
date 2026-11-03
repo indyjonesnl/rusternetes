@@ -11,9 +11,11 @@ pub struct Location {
     pub column: usize,
 }
 
-/// Where an expression id sits in the source: `SourceInfo.GetStartLocation`.
-/// The `cel` crate exposes this from 0.15 (`Program::source_info`); until
-/// then checks run without locations.
+/// Where an expression id sits in the source: `SourceInfo.GetStartLocation`
+/// (`common/ast/ast.go`). [`SourceLocator`] answers it from the `SourceInfo`
+/// of a parse (`Program::source_info`, or `Parser::parse_with_source_info`
+/// for an expression parsed without a `Program`); [`NoLocations`] is for
+/// checks that have none.
 pub trait Locator {
     fn location(&self, id: u64) -> Option<Location>;
 }
@@ -24,6 +26,40 @@ pub struct NoLocations;
 impl Locator for NoLocations {
     fn location(&self, _: u64) -> Option<Location> {
         None
+    }
+}
+
+/// A [`Locator`] over the `SourceInfo` the `cel` crate keeps for a parse
+/// (0.15: `Program::source_info`): `SourceInfo.GetStartLocation`, which is
+/// `GetLocationByOffset(GetOffsetRange(id).Start)`, or `common.NoLocation`
+/// for an id without an offset.
+///
+/// cel-go counts characters; the `cel` parser records byte offsets, so the
+/// offset is converted through `source`, which must be the text that was
+/// parsed.
+pub struct SourceLocator<'a> {
+    info: &'a cel::common::ast::SourceInfo,
+    source: &'a str,
+}
+
+impl<'a> SourceLocator<'a> {
+    pub fn new(info: &'a cel::common::ast::SourceInfo, source: &'a str) -> Self {
+        Self { info, source }
+    }
+}
+
+impl Locator for SourceLocator<'_> {
+    fn location(&self, id: u64) -> Option<Location> {
+        let (start, _) = self.info.offset_for(id)?;
+        let bytes = self.source.as_bytes();
+        let prefix = String::from_utf8_lossy(&bytes[..(start as usize).min(bytes.len())]);
+        // `LineOffsets` are the offsets just after each newline.
+        let line = 1 + prefix.matches('\n').count();
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .map_or(0, |last| last.chars().count());
+        Some(Location { line, column })
     }
 }
 
@@ -95,9 +131,17 @@ impl Errors {
 
     /// `Errors.ToDisplayString`: the errors, one per line group.
     pub fn to_display_string(&self, source: Option<&str>) -> String {
-        let mut parts: Vec<String> = self
-            .errors
-            .iter()
+        // `Errors.ToDisplayString` sorts by line, then column, keeping the
+        // reporting order otherwise; no location is `common.NoLocation`
+        // (-1, -1).
+        let key = |e: &CheckError| {
+            e.location
+                .map_or((-1, -1), |l| (l.line as i64, l.column as i64))
+        };
+        let mut sorted: Vec<&CheckError> = self.errors.iter().collect();
+        sorted.sort_by_key(|e| key(e));
+        let mut parts: Vec<String> = sorted
+            .into_iter()
             .map(|e| e.to_display_string(source))
             .collect();
         if self.num_errors > MAX_ERRORS {

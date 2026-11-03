@@ -123,6 +123,8 @@ struct Checked {
     expr: cel::common::ast::IdedExpr,
     ast: checker::CheckedAst,
     errors: Vec<String>,
+    /// `Errors.ToDisplayString` with `line:column` and the source snippet.
+    display: String,
     /// The type `self` has in a scoped check, with its unique name.
     scoped: Option<DeclType>,
 }
@@ -135,10 +137,13 @@ fn run_checker(
 ) -> Option<Checked> {
     let source = expression.to_string();
     // The antlr4rust parser panics on some invalid expressions.
-    let parsed =
-        std::panic::catch_unwind(|| Parser::new().enable_optional_syntax(true).parse(&source))
-            .ok()?
-            .ok()?;
+    let (parsed, source_info) = std::panic::catch_unwind(|| {
+        Parser::new()
+            .enable_optional_syntax(true)
+            .parse_with_source_info(&source)
+    })
+    .ok()?
+    .ok()?;
     let version = set.compatibility_version();
     let (env_set, ct) = checker_env_set(set, env_type);
     let stored = env_type == EnvType::StoredExpressions;
@@ -181,11 +186,13 @@ fn run_checker(
             }
         }
     }
-    let (ast, errors) = checker::check(&parsed, &mut env, &checker::NoLocations);
+    let locator = checker::SourceLocator::new(&source_info, &source);
+    let (ast, errors) = checker::check(&parsed, &mut env, &locator);
     Some(Checked {
         expr: parsed,
         ast,
         errors: errors.errors().iter().map(|e| e.message.clone()).collect(),
+        display: errors.to_display_string(Some(&source)),
         scoped: scoped_type,
     })
 }
@@ -197,6 +204,9 @@ pub struct Divergence {
     pub probe: Option<String>,
     /// The checker's error messages, empty when it accepted the expression.
     pub checker: Vec<String>,
+    /// The checker's errors as `Errors.ToDisplayString` renders them, with
+    /// `line:column` and the source snippet (empty when it accepted).
+    pub display: String,
 }
 
 /// Compares the probe's result with the checker's verdict. `None` when they
@@ -209,10 +219,11 @@ pub fn divergence(
     probe: &Option<String>,
     scope: Option<&SelfScope>,
 ) -> Option<Divergence> {
-    let checker = check_expression(expression, set, env_type, scope)?;
-    (probe.is_some() != !checker.is_empty()).then(|| Divergence {
+    let c = run_checker(expression, set, env_type, scope)?;
+    (probe.is_some() != !c.errors.is_empty()).then(|| Divergence {
         probe: probe.clone(),
-        checker,
+        checker: c.errors,
+        display: c.display,
     })
 }
 
@@ -242,6 +253,7 @@ pub fn observe_scoped(
             version = ?set.compatibility_version(),
             probe = ?d.probe,
             checker = ?d.checker,
+            checker_display = %d.display,
             "cel checker disagrees with the compile probe"
         );
     }

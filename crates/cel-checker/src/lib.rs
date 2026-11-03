@@ -44,7 +44,7 @@ pub use env::{
     VariableDecl,
 };
 pub use environment::{EnvSet, EnvType, Features, Version};
-pub use errors::{CheckError, Errors, Location, Locator, NoLocations};
+pub use errors::{CheckError, Errors, Location, Locator, NoLocations, SourceLocator};
 pub use table::{is_macro, lookup, table};
 pub use types::{DType, Overload};
 pub use unify::{format_signature, is_assignable, resolve, Resolution};

@@ -6,3 +6,4 @@ mod decl;
 mod decls;
 mod environment;
 mod goldens;
+mod locations;
