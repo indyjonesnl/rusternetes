@@ -314,3 +314,20 @@
 {"req": {"expr": "m.all(k, jsonpatch.escapeKey(k).size() > 1)", "libs": ["jsonpatch"], "vars": {"m": "map(string, string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
 {"req": {"expr": "jsonpatch.escapeKey(1)", "libs": ["jsonpatch"]}, "resp": {"errors": ["found no matching overload for 'jsonpatch.escapeKey' applied to '(int)'"], "ok": false}}
 {"req": {"expr": "jsonpatch.escapeKey(s)", "vars": {"s": "string"}}, "resp": {"errors": ["undeclared reference to 'jsonpatch' (in container '')", "undeclared reference to 'escapeKey' (in container '')"], "ok": false}}
+{"req": {"expr": "Object{}", "patchTypes": true}, "resp": {"cost": {"max": 40, "min": 40}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{a: 1}", "patchTypes": true}, "resp": {"cost": {"max": 40, "min": 40}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{a: s}", "patchTypes": true, "vars": {"s": "string"}}, "resp": {"cost": {"max": 41, "min": 41}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{a: 1, b: s, c: [1, 2]}", "patchTypes": true, "vars": {"s": "string"}}, "resp": {"cost": {"max": 51, "min": 51}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{spec: Object.spec{replicas: 3}}", "patchTypes": true}, "resp": {"cost": {"max": 80, "min": 80}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{spec: Object.spec{template: Object.spec.template{containers: [Object.spec.template.containers.item{name: s}]}}}", "patchTypes": true, "vars": {"s": "string"}}, "resp": {"cost": {"max": 171, "min": 171}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "Object{a: 1}.a", "patchTypes": true}, "resp": {"cost": {"max": 41, "min": 41}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "Object{} == Object{}", "patchTypes": true}, "resp": {"cost": {"max": 1844674407370955344, "min": 81}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "JSONPatch{op: 'add', path: '/a', value: 1}", "patchTypes": true}, "resp": {"cost": {"max": 40, "min": 40}, "errors": [], "ok": true, "outputType": "JSONPatch"}}
+{"req": {"expr": "JSONPatch{op: 'remove', path: s}", "patchTypes": true, "vars": {"s": "string"}}, "resp": {"cost": {"max": 41, "min": 41}, "errors": [], "ok": true, "outputType": "JSONPatch"}}
+{"req": {"expr": "JSONPatch{op: 'add', path: '/spec/' + jsonpatch.escapeKey(s), value: Object{a: 1}}", "patchTypes": true, "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910609, "min": 82}, "errors": [], "ok": true, "outputType": "JSONPatch"}}
+{"req": {"expr": "[JSONPatch{op: 'add', path: '/a', value: 1}, JSONPatch{op: 'remove', path: '/b'}]", "patchTypes": true}, "resp": {"cost": {"max": 90, "min": 90}, "errors": [], "ok": true, "outputType": "list(JSONPatch)"}}
+{"req": {"expr": "l.map(k, JSONPatch{op: 'remove', path: '/x/' + k})", "patchTypes": true, "vars": {"l": "list(string)"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 12}, "errors": [], "ok": true, "outputType": "list(JSONPatch)"}}
+{"req": {"expr": "true ? JSONPatch{op: 'add', path: '/a', value: 1} : JSONPatch{op: 'remove', path: '/a'}", "patchTypes": true}, "resp": {"cost": {"max": 40, "min": 40}, "errors": [], "ok": true, "outputType": "JSONPatch"}}
+{"req": {"expr": "Object{?a: optional.of(1)}", "patchTypes": true}, "resp": {"cost": {"max": 41, "min": 41}, "errors": [], "ok": true, "outputType": "Object"}}
+{"req": {"expr": "JSONPatch{op: 1}", "patchTypes": true}, "resp": {"errors": ["expected type of field 'op' is 'string' but provided type is 'int'"], "ok": false}}
+{"req": {"expr": "Invalid{}", "patchTypes": true}, "resp": {"errors": ["undeclared reference to 'Invalid' (in container '')"], "ok": false}}

@@ -13,7 +13,8 @@
 //	           "values": {"name": [1, 2]},          // optional, enables evaluation
 //	           "kubeVersion": "1.35",               // default 1.35
 //	           "envType": "new" | "stored",         // default "new"
-//	           "libs": ["jsonpatch"]}               // extra libraries
+//	           "libs": ["jsonpatch"],               // extra libraries
+//	           "patchTypes": true}                  // Object / JSONPatch types
 //	response: {"ok": true, "errors": [], "outputType": "bool",
 //	           "cost": {"min": 1, "max": 2},
 //	           "evalResult": {"type": "bool", "value": "true"}}
@@ -34,8 +35,10 @@ import (
 	"github.com/google/cel-go/checker"
 
 	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apiserver/pkg/cel/common"
 	"k8s.io/apiserver/pkg/cel/environment"
 	"k8s.io/apiserver/pkg/cel/library"
+	"k8s.io/apiserver/pkg/cel/mutation"
 )
 
 type request struct {
@@ -45,6 +48,7 @@ type request struct {
 	KubeVersion string                     `json:"kubeVersion"`
 	EnvType     string                     `json:"envType"`
 	Libs        []string                   `json:"libs"`
+	PatchTypes  bool                       `json:"patchTypes"`
 }
 
 type cost struct {
@@ -116,6 +120,11 @@ func handle(req request) (resp response) {
 			return response{Errors: []string{fmt.Sprintf("variable %s: %v", name, err)}}
 		}
 		opts = append(opts, cel.Variable(name, t))
+	}
+	if req.PatchTypes {
+		// `hasPatchTypes` of plugin/cel/compile.go: the Object / JSONPatch
+		// type resolver and the jsonpatch library.
+		opts = append(opts, common.ResolverEnvOption(&mutation.DynamicTypeResolver{}), library.JSONPatch())
 	}
 	for _, lib := range req.Libs {
 		switch lib {

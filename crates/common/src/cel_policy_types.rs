@@ -338,7 +338,7 @@ fn run(
     // `common.ResolverEnvOption(&mutation.DynamicTypeResolver{})` resolves the
     // names the registered types do not.
     let fallback: Arc<dyn checker::Provider> = if opts.has_patch_types {
-        Arc::new(PatchTypeProvider)
+        Arc::new(checker::PatchTypeProvider)
     } else {
         Arc::new(checker::MapProvider::new())
     };
@@ -378,35 +378,4 @@ fn run(
     let (ast, errors) = checker::check(parsed, &mut env, &checker::NoLocations);
     let msgs = errors.errors().iter().map(|e| e.message.clone()).collect();
     (Some(ast), msgs)
-}
-
-/// `mutation.DynamicTypeResolver` (`cel/mutation/typeresolver.go:32-42`):
-/// `JSONPatch` (`JSONPatchType.Field`, `mutation/jsonpatch.go:100-112`: `op`,
-/// `path` and `from` are strings, `value` is `dyn`) and `Object` /
-/// `Object.<path>` (`dynamic.ObjectType.Field`, `dynamic/objects.go:58-75`:
-/// every field is `dyn`) resolve; nothing else does. A `JSONPatch` field that
-/// is not one of the four is an undefined field here; upstream's `Field`
-/// answers with a nil type and the construction fails at evaluation
-/// (`JSONPatchType.Val`: `unexpected JSONPatchType field`).
-pub struct PatchTypeProvider;
-
-impl checker::Provider for PatchTypeProvider {
-    fn find_struct_type(&self, name: &str) -> Option<DType> {
-        let is_object = name == "Object"
-            || name
-                .strip_prefix("Object.")
-                .is_some_and(|rest| !rest.is_empty());
-        (name == "JSONPatch" || is_object).then(|| DType::Struct(name.to_string()))
-    }
-
-    fn find_struct_field_type(&self, struct_name: &str, field: &str) -> Option<DType> {
-        match struct_name {
-            "JSONPatch" => match field {
-                "op" | "path" | "from" => Some(DType::Str),
-                "value" => Some(DType::Dyn),
-                _ => None,
-            },
-            _ => self.find_struct_type(struct_name).map(|_| DType::Dyn),
-        }
-    }
 }

@@ -12,8 +12,8 @@
 use cel::parser::Parser;
 use rusternetes_cel_checker::library_cost::kubernetes_cost;
 use rusternetes_cel_checker::{
-    check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations, VariableDecl,
-    Version,
+    check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations,
+    PatchTypeProvider, Provider, VariableDecl, Version,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -108,7 +108,19 @@ fn ours(req: &Value) -> Ours {
         Some("stored") => EnvType::StoredExpressions,
         _ => EnvType::NewExpressions,
     };
-    let mut env = set.env(env_type, Container::default(), Arc::new(MapProvider::new()));
+    let patch_types = req
+        .get("patchTypes")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let provider: Arc<dyn Provider> = if patch_types {
+        Arc::new(PatchTypeProvider)
+    } else {
+        Arc::new(MapProvider::new())
+    };
+    let mut env = set.env(env_type, Container::default(), provider);
+    if patch_types {
+        env.add_library(rusternetes_cel_checker::table::jsonpatch);
+    }
     if let Some(vars) = req.get("vars").and_then(Value::as_object) {
         for (n, t) in vars {
             env.add_ident(VariableDecl::new(
