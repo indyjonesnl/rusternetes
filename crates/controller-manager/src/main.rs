@@ -1827,10 +1827,11 @@ async fn main() -> Result<()> {
 
     // Start the pod garbage collector (`newPodGarbageCollectorController`,
     // cmd/kube-controller-manager/app/core.go:564-576).
-    let podgc = Arc::new(controllers::podgc::PodGcController::new(
-        storage.clone(),
-        args.terminated_pod_gc_threshold,
-    ));
+    // `storage` is the direct backend here (API mode takes `run_with_api`).
+    let podgc = Arc::new(
+        controllers::podgc::PodGcController::new(storage.clone(), args.terminated_pod_gc_threshold)
+            .with_direct_storage(),
+    );
     spawn_controller!("PodGC controller", leader_elector, {
         let controller = podgc.clone();
         async move {

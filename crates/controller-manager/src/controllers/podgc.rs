@@ -65,6 +65,10 @@ pub struct PodGcController<S: Storage> {
     /// Test seam standing in for the fake clientset's recorded actions.
     pub patched: Mutex<Vec<(String, rusternetes_common::resources::PodStatus)>>,
     pub deleted: Mutex<Vec<String>>,
+    /// The controller talks to the storage backend directly (no api-server in
+    /// the path), so the pod DELETE has to be emulated; see
+    /// [`Self::with_direct_storage`].
+    pub direct_storage: bool,
 }
 
 impl<S: Storage + 'static> PodGcController<S> {
@@ -94,7 +98,24 @@ impl<S: Storage + 'static> PodGcController<S> {
             node_queue: Mutex::new(HashMap::new()),
             patched: Mutex::new(Vec::new()),
             deleted: Mutex::new(Vec::new()),
+            direct_storage: false,
         }
+    }
+
+    /// Mark the storage as a direct backend (etcd / sqlite / redis / memory),
+    /// i.e. the standalone controller-manager without `--kubeconfig`. There
+    /// `Storage::delete` is a hard delete that ignores finalizers, whereas
+    /// upstream's `Pods(ns).Delete(..., NewDeleteOptions(0))`
+    /// (`gc_controller.go:365`) goes through the apiserver's pod delete
+    /// strategy, which keeps a pod that still has finalizers and only stamps
+    /// `deletionTimestamp` with `deletionGracePeriodSeconds: 0`
+    /// (`pkg/registry/core/pod/strategy.go:CheckGracefulDelete`,
+    /// `registry/generic/registry/store.go:updateForGracefulDeletionAndFinalizers`).
+    /// `ApiStorage::delete` already sends that very DELETE, so it keeps the
+    /// default (`false`).
+    pub fn with_direct_storage(mut self) -> Self {
+        self.direct_storage = true;
+        self
     }
 
     /// `Run` (gc_controller.go:94-115): `wait.UntilWithContext(ctx, gcc.gc,
@@ -374,7 +395,40 @@ impl<S: Storage + 'static> PodGcController<S> {
         }
         self.deleted.lock().unwrap().push(pod.metadata.name.clone());
         // `NewDeleteOptions(0)`: gracePeriodSeconds=0, i.e. remove now.
-        self.storage.delete(&key).await?;
+        if self.direct_storage {
+            self.delete_grace_zero_direct(&key).await
+        } else {
+            self.storage.delete(&key).await?;
+            Ok(())
+        }
+    }
+
+    /// The apiserver's grace-0 pod delete for a direct storage backend: a pod
+    /// holding finalizers is not removed, it is marked as deleting
+    /// (`deletionTimestamp`, `deletionGracePeriodSeconds: 0`) and whoever owns
+    /// the finalizers removes the object; any other pod is removed at once.
+    async fn delete_grace_zero_direct(&self, key: &str) -> Result<()> {
+        let mut current: Pod = self.storage.get(key).await?;
+        let has_finalizers = current
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|f| !f.is_empty());
+        if !has_finalizers {
+            self.storage.delete(key).await?;
+            return Ok(());
+        }
+        if current.metadata.deletion_timestamp.is_some()
+            && current.metadata.deletion_grace_period_seconds == Some(0)
+        {
+            return Ok(()); // already deleting with no grace
+        }
+        current
+            .metadata
+            .deletion_timestamp
+            .get_or_insert_with(Utc::now);
+        current.metadata.deletion_grace_period_seconds = Some(0);
+        self.storage.update(key, &current).await?;
         Ok(())
     }
 

@@ -644,4 +644,62 @@ mod tests {
             .await
             .is_ok());
     }
+
+    fn with_finalizer(mut p: Pod) -> Pod {
+        p.metadata.finalizers = Some(vec!["example.com/hold".into()]);
+        p
+    }
+
+    // The apiserver's grace-0 pod delete, emulated for a direct backend: a pod
+    // with finalizers is kept and marked as deleting, not removed.
+    #[tokio::test]
+    async fn direct_storage_keeps_finalizer_pod_and_stamps_deletion() {
+        let storage = Arc::new(MemoryStorage::new());
+        let p = with_finalizer(pod_json("fin-ns", "p", "gone", Some("Failed"), 1, false));
+        seed(&storage, std::slice::from_ref(&p), &[]).await;
+        let gcc = controller(&storage, -1).with_direct_storage();
+        gcc.mark_failed_and_delete_pod(&p).await.unwrap();
+        let got: Pod = storage
+            .get(&build_key("pods", Some("fin-ns"), "p"))
+            .await
+            .unwrap();
+        assert!(got.metadata.deletion_timestamp.is_some());
+        assert_eq!(got.metadata.deletion_grace_period_seconds, Some(0));
+        assert_eq!(
+            got.metadata.finalizers,
+            Some(vec!["example.com/hold".to_string()])
+        );
+        // A second pass is a no-op, not an error.
+        gcc.mark_failed_and_delete_pod(&got).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_storage_removes_pod_without_finalizers() {
+        let storage = Arc::new(MemoryStorage::new());
+        let p = pod_json("nofin-ns", "p", "gone", Some("Failed"), 1, false);
+        seed(&storage, std::slice::from_ref(&p), &[]).await;
+        let gcc = controller(&storage, -1).with_direct_storage();
+        gcc.mark_failed_and_delete_pod(&p).await.unwrap();
+        assert!(storage
+            .get::<Pod>(&build_key("pods", Some("nofin-ns"), "p"))
+            .await
+            .is_err());
+    }
+
+    // Without `with_direct_storage` (ApiStorage: its DELETE is the apiserver's
+    // own grace-0 delete) the controller issues a plain `Storage::delete`
+    // and does not emulate anything itself.
+    #[tokio::test]
+    async fn default_path_issues_plain_delete() {
+        let storage = Arc::new(MemoryStorage::new());
+        let p = with_finalizer(pod_json("api-ns", "p", "gone", Some("Failed"), 1, false));
+        seed(&storage, std::slice::from_ref(&p), &[]).await;
+        let gcc = controller(&storage, -1);
+        assert!(!gcc.direct_storage);
+        gcc.mark_failed_and_delete_pod(&p).await.unwrap();
+        assert!(storage
+            .get::<Pod>(&build_key("pods", Some("api-ns"), "p"))
+            .await
+            .is_err());
+    }
 }
