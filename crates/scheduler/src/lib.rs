@@ -1,4 +1,5 @@
 pub mod advanced;
+pub mod async_binding;
 pub mod async_preemption;
 pub mod batch;
 pub mod cache;

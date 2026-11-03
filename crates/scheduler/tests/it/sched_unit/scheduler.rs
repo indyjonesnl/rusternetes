@@ -2279,4 +2279,240 @@ mod tests {
         assert!(queue.pods_in_backoff_q().is_empty());
         assert!(queue.pods_in_active_q().is_empty());
     }
+
+    // -----------------------------------------------------------------
+    // The binding cycle as its own task (schedule_one.go:123-134)
+    // -----------------------------------------------------------------
+
+    fn pod_requesting(name: &str, cpu: &str) -> Pod {
+        let mut p = make_pending_pod(name, "default");
+        p.spec.as_mut().unwrap().containers[0].resources =
+            Some(serde_json::from_value(serde_json::json!({"requests": {"cpu": cpu}})).unwrap());
+        p
+    }
+
+    fn running(scheduler: Scheduler<MemoryStorage>) -> Arc<Scheduler<MemoryStorage>> {
+        let s = Arc::new(scheduler);
+        s.weak_self.set(Arc::downgrade(&s)).unwrap();
+        s
+    }
+
+    async fn next(queue: &Arc<PriorityQueue>, pod: Pod) -> QueuedPodInfo {
+        queue.add(pod);
+        queue.pop().await.unwrap()
+    }
+
+    /// While pod-1's binding task has not run, the next cycle must already
+    /// count pod-1 on the node (`assume`, schedule_one.go:955), or both 3-CPU
+    /// pods would be placed on a 4-CPU node.
+    #[tokio::test]
+    async fn assumed_pod_is_counted_by_the_next_cycle_before_it_is_bound() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        for n in ["pod-1", "pod-2"] {
+            storage
+                .create(
+                    &format!("/registry/pods/default/{n}"),
+                    &pod_requesting(n, "3"),
+                )
+                .await
+                .unwrap();
+        }
+        let scheduler = running(Scheduler::new_with_name(
+            storage.clone(),
+            1,
+            "default-scheduler".to_string(),
+        ));
+        let queue = test_queue();
+
+        let pod1: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        let p1 = next(&queue, pod1).await;
+        let outcome = scheduler
+            .try_schedule_pod(&queue, "pods/default/pod-1")
+            .await
+            .unwrap();
+        let ScheduleOutcome::Assumed(assumed) = outcome else {
+            panic!("a running scheduler hands the binding to a task: {outcome:?}");
+        };
+        // Assumed, not bound: storage has no node yet.
+        let stored: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        assert!(stored.spec.unwrap().node_name.is_none());
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+        assert_eq!(scheduler.cache.pods_on_node("node-1").len(), 1);
+
+        // The next cycle does not fit pod-2 next to the assumed pod-1.
+        let pod2: Pod = storage.get("/registry/pods/default/pod-2").await.unwrap();
+        let _p2 = next(&queue, pod2).await;
+        let outcome = scheduler
+            .try_schedule_pod(&queue, "pods/default/pod-2")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ScheduleOutcome::Unschedulable(..)),
+            "got {outcome:?}"
+        );
+
+        // The binding task binds pod-1 and frees the in-flight record
+        // (`Done` after Permit, schedule_one.go:324).
+        assert!(queue
+            .in_flight_pods()
+            .iter()
+            .any(|p| p.metadata.name == "pod-1"));
+        scheduler.spawn_binding_cycle(&queue, p1, *assumed);
+        scheduler.bindings.wait_idle().await;
+        let stored: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        assert_eq!(stored.spec.unwrap().node_name.as_deref(), Some("node-1"));
+        assert!(queue
+            .in_flight_pods()
+            .iter()
+            .all(|p| p.metadata.name != "pod-1"));
+        // Still assumed until the watch confirms it; the node stays full.
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+    }
+
+    /// `handleBindingCycleError` (schedule_one.go:349-382): a failed PreBind
+    /// unreserves, forgets the assumed pod and requeues the pod with backoff.
+    #[tokio::test]
+    async fn binding_task_failure_forgets_the_pod_and_requeues_it() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut scheduler =
+            Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
+        scheduler
+            .profiles
+            .get_mut("default-scheduler")
+            .unwrap()
+            .volume_bind_timeout = Duration::from_millis(200);
+        scheduler.volume_bind_poll = Duration::from_millis(20);
+        let scheduler = running(scheduler);
+        wffc_fixture(&storage).await;
+        let queue = test_queue();
+
+        let pod: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        let p = next(&queue, pod).await;
+        let outcome = scheduler
+            .try_schedule_pod(&queue, "pods/default/wffc-pod")
+            .await
+            .unwrap();
+        let ScheduleOutcome::Assumed(assumed) = outcome else {
+            panic!("expected Assumed, got {outcome:?}");
+        };
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+
+        scheduler.spawn_binding_cycle(&queue, p, *assumed);
+        scheduler.bindings.wait_idle().await;
+
+        assert_eq!(scheduler.cache.pod_count(), 0, "ForgetPod");
+        let stored: Pod = storage
+            .get("/registry/pods/default/wffc-pod")
+            .await
+            .unwrap();
+        assert!(stored.spec.unwrap().node_name.is_none());
+        assert!(queue.in_flight_pods().is_empty(), "Done bookkeeping");
+        // An error, not a FitError: backoff, not the unschedulable pool.
+        assert_eq!(queue.pods_in_backoff_q().len(), 1);
+    }
+
+    /// `handleAssumedPodDeletion` (eventhandlers.go:255-291) and the assumed
+    /// branch of `updatePodInSchedulingQueue` (:318-327): an update event for
+    /// an assumed pod does not touch the queue, and one that starts its
+    /// deletion releases its assumed resources at once.
+    #[tokio::test]
+    async fn deleting_an_assumed_pod_forgets_it() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/pods/default/pod-1",
+                &pod_requesting("pod-1", "1"),
+            )
+            .await
+            .unwrap();
+        let scheduler = running(Scheduler::new_with_name(
+            storage.clone(),
+            1,
+            "default-scheduler".to_string(),
+        ));
+        let queue = test_queue();
+        let mut seen = SeenObjects::default();
+        // The informer saw the pod unassigned, and it was popped.
+        scheduler.resync(&queue, &mut seen).await;
+        let p = queue.pop().await.unwrap();
+        let outcome = scheduler
+            .try_schedule_pod(&queue, "pods/default/pod-1")
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ScheduleOutcome::Assumed(_)));
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+
+        // An unrelated update does not requeue the in-flight pod ...
+        let mut stored: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        stored
+            .metadata
+            .labels
+            .get_or_insert_with(HashMap::new)
+            .insert("a".into(), "b".into());
+        storage
+            .update("/registry/pods/default/pod-1", &stored)
+            .await
+            .unwrap();
+        scheduler.resync(&queue, &mut seen).await;
+        assert!(queue.pods_in_active_q().is_empty());
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+
+        // ... but one that starts its deletion forgets it.
+        let mut stored: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        stored.metadata.deletion_timestamp = Some(Utc::now());
+        storage
+            .update("/registry/pods/default/pod-1", &stored)
+            .await
+            .unwrap();
+        scheduler.resync(&queue, &mut seen).await;
+        assert_eq!(scheduler.cache.pod_count(), 0);
+        let _ = p;
+    }
+
+    /// A second cycle for a pod that is still assumed must not assume it
+    /// twice ("This is most probably result of a BUG in retrying logic").
+    #[tokio::test]
+    async fn a_pod_cannot_be_assumed_twice() {
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/nodes/node-1", &make_node("node-1"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/pods/default/pod-1",
+                &pod_requesting("pod-1", "1"),
+            )
+            .await
+            .unwrap();
+        let scheduler = running(Scheduler::new_with_name(
+            storage.clone(),
+            1,
+            "default-scheduler".to_string(),
+        ));
+        let queue = test_queue();
+        let pod: Pod = storage.get("/registry/pods/default/pod-1").await.unwrap();
+        let _ = next(&queue, pod).await;
+        let first = scheduler
+            .try_schedule_pod(&queue, "pods/default/pod-1")
+            .await
+            .unwrap();
+        assert!(matches!(first, ScheduleOutcome::Assumed(_)));
+        let second = scheduler
+            .try_schedule_pod(&queue, "pods/default/pod-1")
+            .await;
+        assert!(second.is_err(), "AssumePod must fail the second cycle");
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+    }
 }

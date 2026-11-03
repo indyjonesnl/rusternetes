@@ -336,6 +336,16 @@ impl SchedulerCache {
         v
     }
 
+    /// The assumed pods, as assumed (with their chosen node): the cache's
+    /// contribution to a scheduling cycle's view of the nodes.
+    pub fn assumed_pods(&self) -> Vec<Pod> {
+        let g = self.lock();
+        g.assumed_pods
+            .iter()
+            .filter_map(|k| g.pod_states.get(k).map(|s| s.pod.clone()))
+            .collect()
+    }
+
     /// `PodCount` (cache.go:356-367).
     pub fn pod_count(&self) -> usize {
         self.lock().pod_states.len()

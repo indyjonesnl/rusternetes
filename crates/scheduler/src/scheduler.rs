@@ -24,9 +24,51 @@ use crate::queue::{
 use crate::volume_binding;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// A pod that finished its scheduling cycle (`schedulingCycle`,
+/// schedule_one.go:195-262): assumed in the cache and Reserved on `node_name`,
+/// ready for its binding cycle.
+pub struct AssumedPod {
+    /// The pod as the cycle read it (no `spec.nodeName`).
+    pub pod: Pod,
+    pub node_name: String,
+    pub cycle_state: CycleState,
+}
+
+impl std::fmt::Debug for AssumedPod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssumedPod")
+            .field("pod", &self.pod.metadata.name)
+            .field("node_name", &self.node_name)
+            .finish()
+    }
+}
+
+/// Why a binding cycle failed, for `handleBindingCycleError`.
+#[derive(Debug)]
+pub struct BindingFailure {
+    pub error: rusternetes_common::Error,
+    /// `status.IsRejected()`: decides whether the AssignedPodDelete move
+    /// happens before or after the failure handler (schedule_one.go:356-368).
+    pub rejected: bool,
+}
+
+impl BindingFailure {
+    fn error(msg: String) -> Self {
+        Self {
+            error: rusternetes_common::Error::Internal(msg),
+            rejected: false,
+        }
+    }
+}
+
 /// Outcome of one scheduling cycle for `handleSchedulingFailure`.
 #[derive(Debug)]
 pub enum ScheduleOutcome {
+    /// Assumed and Reserved; the caller runs the binding cycle as a task
+    /// (`go func() { bindingCycle .. }()`, schedule_one.go:123). Only returned
+    /// when the scheduler is running (`weak_self` set); a cycle driven
+    /// directly binds inline and returns `Done`.
+    Assumed(Box<AssumedPod>),
     /// Bound, or nothing to do (deleted / already assigned / not ours).
     Done,
     /// `FitError`: no node fit; the plugins that rejected the pod
@@ -149,6 +191,8 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     pub before_preempt_pod: std::sync::Mutex<Option<PreemptPodObserver>>,
     /// `Scheduler.Cache` (scheduler.go): the assumed-pod state machine.
     pub cache: crate::cache::SchedulerCache,
+    /// Binding cycles running as tasks (see `async_binding`).
+    pub bindings: Arc<crate::async_binding::InFlightBindings>,
 }
 
 /// See [`Scheduler::before_preempt_pod`].
@@ -177,6 +221,7 @@ impl Scheduler<StorageBackend> {
             weak_self: std::sync::OnceLock::new(),
             before_preempt_pod: std::sync::Mutex::new(None),
             cache: crate::cache::SchedulerCache::default(),
+            bindings: Arc::default(),
         }
     }
 }
@@ -211,6 +256,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             weak_self: std::sync::OnceLock::new(),
             before_preempt_pod: std::sync::Mutex::new(None),
             cache: crate::cache::SchedulerCache::default(),
+            bindings: Arc::default(),
         }
     }
 
@@ -264,6 +310,30 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 let status = pod.status.get_or_insert_with(Default::default);
                 if status.nominated_node_name.is_none() {
                     status.nominated_node_name = Some(node.clone());
+                }
+            }
+        }
+    }
+
+    /// The scheduler cache's half of the node snapshot (`UpdateSnapshot`,
+    /// cache.go:194): a pod assumed on a node whose binding the pod list does
+    /// not show yet is counted there, so a cycle that starts while a binding
+    /// task is still running does not hand the same room out twice. A pod the
+    /// list already shows assigned is left alone (the watch event confirms
+    /// the cache entry), and `current` (the pod being scheduled) never counts
+    /// against itself.
+    fn apply_assumed_pods(&self, current: &Pod, all_pods: &mut [Pod]) {
+        let assumed = self.cache.assumed_pods();
+        if assumed.is_empty() {
+            return;
+        }
+        for pod in all_pods.iter_mut() {
+            if pod.metadata.uid == current.metadata.uid || assigned_pod(pod) {
+                continue;
+            }
+            if let Some(a) = assumed.iter().find(|a| a.metadata.uid == pod.metadata.uid) {
+                if let Some(spec) = pod.spec.as_mut() {
+                    spec.node_name = a.spec.as_ref().and_then(|s| s.node_name.clone());
                 }
             }
         }
@@ -639,14 +709,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         }
     }
 
-    /// `updatePodInSchedulingQueue` (eventhandlers.go:297-340), minus the
-    /// assumed-pod branch (Rusternetes binds synchronously, so a pod is never
-    /// assumed while unassigned in the informer).
+    /// `updatePodInSchedulingQueue` (eventhandlers.go:297-340).
     fn update_pod_in_scheduling_queue(&self, queue: &PriorityQueue, old_pod: &Pod, new_pod: &Pod) {
         // Bypass update event that carries identical objects; otherwise, a
         // duplicated Pod may go through scheduling and cause unexpected
         // behavior (see #96071).
         if old_pod.metadata.resource_version == new_pod.metadata.resource_version {
+            return;
+        }
+        // An assumed pod is in its binding cycle, not in the queue: "we can't
+        // update such pod in any structure directly" (:318-327).
+        if self.cache.is_assumed_pod(new_pod).unwrap_or(false) {
+            if new_pod.metadata.deletion_timestamp.is_some()
+                && old_pod.metadata.deletion_timestamp.is_none()
+            {
+                self.handle_assumed_pod_deletion(queue, new_pod);
+            }
             return;
         }
         debug!(pod = %pod_key(new_pod), "Update event for unscheduled pod");
@@ -665,6 +743,30 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 Some(&pre_check),
             );
         }
+    }
+
+    /// `handleAssumedPodDeletion` (eventhandlers.go:255-291): the deletion of
+    /// an assumed pod starts. Its assumed resources are released at once,
+    /// "PreBinding/Binding will continue, but is eventually expected to fail
+    /// as the pod does not exist in the kube-apiserver anymore". There is no
+    /// Permit, so there is no waiting pod to reject (`RejectWaitingPod`): the
+    /// pod is always forgotten here.
+    fn handle_assumed_pod_deletion(&self, queue: &PriorityQueue, pod: &Pod) {
+        // "We must operate on the pod from the scheduler's cache, not the one
+        // from the event."
+        let Ok(assumed) = self.cache.get_pod(pod) else {
+            debug!(pod = %pod_key(pod), "Assumed pod was already forgotten");
+            return;
+        };
+        if let Err(e) = self.cache.forget_pod(&assumed) {
+            error!(error = %e, pod = %pod_key(pod), "Scheduler cache ForgetPod failed");
+        }
+        queue.move_all_to_active_or_backoff_queue(
+            &EVENT_ASSIGNED_POD_DELETE,
+            Some(Arc::new(assumed)),
+            None,
+            None,
+        );
     }
 
     /// `deletePodFromSchedulingQueue` (eventhandlers.go:346-377).
@@ -858,6 +960,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     queue.delete_nominated_pod_if_exists(&p_info.pod);
                     queue.done(&p_info.pod.metadata.uid)
                 }
+                Ok(ScheduleOutcome::Assumed(assumed)) => {
+                    // `Done` is called by the binding cycle itself
+                    // (schedule_one.go:324), not here.
+                    match self.weak_self.get().and_then(std::sync::Weak::upgrade) {
+                        Some(this) => this.spawn_binding_cycle(&queue, p_info, *assumed),
+                        None => {
+                            // The scheduler is being dropped: bind inline.
+                            queue.done(&p_info.pod.metadata.uid);
+                            if let Err(f) = self.binding_cycle(&assumed).await {
+                                error!("Failed to bind pod {}: {}", key, f.error);
+                                self.abort_assumed(&assumed).await;
+                            }
+                        }
+                    }
+                }
                 Ok(ScheduleOutcome::Unschedulable(plugins, pending)) => {
                     // FitError: inject UnschedulablePlugins and PendingPlugins
                     // into the PodInfo (schedule_one.go:1064-1065).
@@ -1010,6 +1127,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // Overlay in-memory preemption nominations so the space reservation in
         // select_node sees a just-nominated preemptor before its /status write
         // propagates back through the informer (prevents the live-lock).
+        self.apply_assumed_pods(&pod, &mut all_pods);
         self.apply_nominations(queue, &mut all_pods);
 
         // Same in-memory priority resolution for the candidate being scheduled.
@@ -1040,14 +1158,22 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             )
             .await;
         if let Some(node) = selected {
-            if let Err(e) = self
-                .reserve_prebind_bind(pod, &node.metadata.name, cycle_state)
-                .await
-            {
-                error!("Failed to bind pod {}/{} to node: {}", ns, name, e);
+            let async_binding = self.weak_self.get().is_some_and(|w| w.strong_count() > 0);
+            let assumed = self
+                .assume_and_reserve(queue, pod, &node.metadata.name, cycle_state, async_binding)
+                .await?;
+            if async_binding {
+                // The worker runs `bindingCycle` as a task and frees itself
+                // for the next pod (schedule_one.go:123).
+                return Ok(ScheduleOutcome::Assumed(Box::new(assumed)));
+            }
+            // Driven directly (no running scheduler): bind inline.
+            if let Err(f) = self.binding_cycle(&assumed).await {
+                error!("Failed to bind pod {}/{} to node: {}", ns, name, f.error);
+                self.abort_assumed(&assumed).await;
                 // Return the error so the work queue retries with backoff
                 // (handleBindingCycleError re-queues the pod upstream).
-                return Err(e);
+                return Err(f.error);
             }
         } else if let Some(msg) = diagnosis.scheduling_error.clone() {
             // `schedulePod` returned a non-FitError error: `ScheduleOne`
@@ -1497,44 +1623,14 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// (schedule_one.go:123); here it runs inline in the work-queue worker, so
     /// a pod waiting on its PV controller occupies a worker for up to
     /// BindTimeoutSeconds. Permit is not run (no Permit plugin objects yet).
-    async fn reserve_prebind_bind(
+    async fn assume_and_reserve(
         &self,
+        queue: &PriorityQueue,
         pod: Pod,
         node_name: &str,
         cycle_state: CycleState,
-    ) -> rusternetes_common::Result<()> {
-        // `assume` (schedule_one.go:955-975): record the pod on the node
-        // before Reserve. An error is upstream's scheduling failure; here it
-        // is only logged (the cache is not consumed yet, so assuming is
-        // bookkeeping and must not stop a pod from scheduling).
-        let mut assumed = pod.clone();
-        if let Some(spec) = assumed.spec.as_mut() {
-            spec.node_name = Some(node_name.to_string());
-        }
-        let assumed_ok = match self.cache.assume_pod(&assumed) {
-            Ok(()) => true,
-            Err(e) => {
-                error!(error = %e, "Scheduler cache AssumePod failed");
-                false
-            }
-        };
-        let result = self.run_binding_cycle(pod, node_name, cycle_state).await;
-        if result.is_err() && assumed_ok {
-            // `ForgetPod` on every failure after assume (schedule_one.go:214,
-            // :238, :369).
-            if let Err(e) = self.cache.forget_pod(&assumed) {
-                error!(error = %e, "Scheduler cache ForgetPod failed");
-            }
-        }
-        result
-    }
-
-    async fn run_binding_cycle(
-        &self,
-        pod: Pod,
-        node_name: &str,
-        mut cycle_state: CycleState,
-    ) -> rusternetes_common::Result<()> {
+        strict_assume: bool,
+    ) -> rusternetes_common::Result<AssumedPod> {
         let profile = self
             .profile_for(&pod)
             .map_err(rusternetes_common::Error::Internal)?;
@@ -1546,73 +1642,233 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             bind_poll: self.volume_bind_poll,
         };
 
-        // Reserve (schedule_one.go:211); Unreserve on a failure (:213).
+        // `assume` (schedule_one.go:955-975): record the pod on the node
+        // before Reserve, so the next cycle already counts it. An error is
+        // upstream's scheduling failure ("most probably a BUG in retrying
+        // logic"; the pod is requeued). Deviation: a direct (inline) cycle
+        // only logs it, because it never leaves a pod assumed.
+        let assumed = Self::with_node(&pod, node_name);
+        let assumed_ok = match self.cache.assume_pod(&assumed) {
+            Ok(()) => true,
+            Err(e) => {
+                error!(error = %e, "Scheduler cache AssumePod failed");
+                if strict_assume {
+                    return Err(rusternetes_common::Error::Internal(e));
+                }
+                false
+            }
+        };
+        // "if "assumed" is a nominated pod, we should remove it from
+        // internal cache" (:969-972).
+        queue.delete_nominated_pod_if_exists(&pod);
+
+        // Reserve (schedule_one.go:211); Unreserve and ForgetPod on a failure
+        // (:213-216).
         let status = fw
             .run_reserve_plugins_reserve(&cycle_state, &pod, node_name, &handle)
             .await;
         if !status.is_success() {
             fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
                 .await;
+            if assumed_ok {
+                if let Err(e) = self.cache.forget_pod(&assumed) {
+                    error!(error = %e, "Scheduler cache ForgetPod failed");
+                }
+            }
             return Err(rusternetes_common::Error::Internal(status.message()));
         }
+        Ok(AssumedPod {
+            pod,
+            node_name: node_name.to_string(),
+            cycle_state,
+        })
+    }
 
-        // PreBindPreFlights (:282) and PreBind (:327); Unreserve on a failure
-        // (`handleBindingCycleError` :368).
+    fn with_node(pod: &Pod, node_name: &str) -> Pod {
+        let mut p = pod.clone();
+        if let Some(spec) = p.spec.as_mut() {
+            spec.node_name = Some(node_name.to_string());
+        }
+        p
+    }
+
+    /// `bindingCycle` (schedule_one.go:269-343) from PreBindPreFlights on:
+    /// PreBind, then `bind` (`RunBindPlugins` + `finishBinding`). The caller
+    /// unreserves and forgets on `Err` (`handleBindingCycleError`).
+    async fn binding_cycle(&self, a: &AssumedPod) -> Result<(), BindingFailure> {
+        let (pod, node_name) = (&a.pod, a.node_name.as_str());
+        let mut cycle_state = a.cycle_state.clone();
+        let profile = self.profile_for(pod).map_err(BindingFailure::error)?;
+        let fw = &profile.framework;
+        let handle = CycleHandle {
+            data: &self.data,
+            binder: &self.volume_binder,
+            bind_timeout: profile.volume_bind_timeout,
+            bind_poll: self.volume_bind_poll,
+        };
+
+        // PreBindPreFlights (:282) and PreBind (:327).
         // The PreFlights, and the nomination they trigger, run only under
         // `NominatedNodeNameForExpectation` (bindingCycle, schedule_one.go:281-299).
         if gate_enabled("NominatedNodeNameForExpectation") {
-            let status = fw.run_pre_bind_pre_flights(&mut cycle_state, &pod, node_name);
+            let status = fw.run_pre_bind_pre_flights(&mut cycle_state, pod, node_name);
             // "Unschedulable status is not supported in PreBindPreFlight and
             // hence we regard it as an error."
             if status.code() == crate::fwk::Code::Error || status.is_rejected() {
-                fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
-                    .await;
-                return Err(rusternetes_common::Error::Internal(status.message()));
+                return Err(BindingFailure::error(status.message()));
             }
             // "Add NominatedNodeName to tell the external components (e.g.,
             // the cluster autoscaler) that the pod is about to be bound to the
             // node. We only do this when any of WaitOnPermit or PreBind will
             // work": there is no Permit plugin object yet, so only PreBind.
             if status.is_success() {
-                self.nominate_for_expectation(&pod, node_name).await;
+                self.nominate_for_expectation(pod, node_name).await;
             }
         }
         let status = fw
-            .run_pre_bind_plugins(&cycle_state, &pod, node_name, &handle)
+            .run_pre_bind_plugins(&cycle_state, pod, node_name, &handle)
             .await;
         if !status.is_success() {
-            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
-                .await;
-            return Err(rusternetes_common::Error::Internal(status.message()));
+            return Err(BindingFailure {
+                error: rusternetes_common::Error::Internal(status.message()),
+                rejected: status.is_rejected(),
+            });
         }
 
         // `bind` (schedule_one.go:978-990): `RunBindPlugins`, then
         // `finishBinding`. Anything but Success is a binding failure
         // (:332 `!status.IsSuccess()`), a Skip from every plugin included.
         let status = fw
-            .run_bind_plugins(&cycle_state, &pod, node_name, &handle)
+            .run_bind_plugins(&cycle_state, pod, node_name, &handle)
             .await;
         // `finishBinding` (schedule_one.go:1011) runs whatever the status;
         // it is a no-op once the pod was forgotten.
-        let mut finished = pod.clone();
-        if let Some(spec) = finished.spec.as_mut() {
-            spec.node_name = Some(node_name.to_string());
-        }
-        if let Err(e) = self.cache.finish_binding(&finished) {
+        if let Err(e) = self.cache.finish_binding(&Self::with_node(pod, node_name)) {
             error!(error = %e, "Scheduler cache FinishBinding failed");
         }
         if !status.is_success() {
-            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
-                .await;
             let msg = if status.is_skip() {
                 "no Bind plugin bound the pod".to_string()
             } else {
                 status.message()
             };
-            return Err(rusternetes_common::Error::Internal(msg));
+            return Err(BindingFailure {
+                error: rusternetes_common::Error::Internal(msg),
+                rejected: status.is_rejected(),
+            });
         }
-        self.finish_binding(&pod, node_name).await;
+        self.finish_binding(pod, node_name).await;
         Ok(())
+    }
+
+    /// The cleanup of `handleBindingCycleError` (schedule_one.go:349-368)
+    /// before the failure handler: Unreserve, ForgetPod. Returns whether the
+    /// pod was forgotten (so its resources were released).
+    async fn abort_assumed(&self, a: &AssumedPod) -> bool {
+        if let Ok(profile) = self.profile_for(&a.pod) {
+            let handle = CycleHandle {
+                data: &self.data,
+                binder: &self.volume_binder,
+                bind_timeout: profile.volume_bind_timeout,
+                bind_poll: self.volume_bind_poll,
+            };
+            profile
+                .framework
+                .run_reserve_plugins_unreserve(&a.cycle_state, &a.pod, &a.node_name, &handle)
+                .await;
+        }
+        match self
+            .cache
+            .forget_pod(&Self::with_node(&a.pod, &a.node_name))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                error!(error = %e, "scheduler cache ForgetPod failed");
+                false
+            }
+        }
+    }
+
+    /// `go func() { bindingCycle ... handleBindingCycleError }()`
+    /// (schedule_one.go:123-134). Reuses `weak_self` like the async
+    /// preemption (`prepare_candidate_async`).
+    pub fn spawn_binding_cycle(
+        self: &Arc<Self>,
+        queue: &Arc<PriorityQueue>,
+        p_info: QueuedPodInfo,
+        assumed: AssumedPod,
+    ) {
+        let this = Arc::clone(self);
+        let queue = Arc::clone(queue);
+        let guard = self.bindings.start();
+        tokio::spawn(async move {
+            let _guard = guard;
+            this.run_binding_task(&queue, p_info, assumed).await;
+        });
+    }
+
+    async fn run_binding_task(
+        &self,
+        queue: &Arc<PriorityQueue>,
+        p_info: QueuedPodInfo,
+        assumed: AssumedPod,
+    ) {
+        // "Any failures after this point cannot lead to the Pod being
+        // considered unschedulable ... We can call Done() here because we can
+        // free the cluster events stored in the scheduling queue sooner"
+        // (bindingCycle, schedule_one.go:316-324). No Permit runs, so this is
+        // the start of the cycle.
+        queue.done(&p_info.pod.metadata.uid);
+        let Err(failure) = self.binding_cycle(&assumed).await else {
+            return;
+        };
+        self.handle_binding_cycle_error(queue, p_info, &assumed, failure)
+            .await;
+    }
+
+    /// `handleBindingCycleError` (schedule_one.go:349-382).
+    async fn handle_binding_cycle_error(
+        &self,
+        queue: &Arc<PriorityQueue>,
+        mut p_info: QueuedPodInfo,
+        assumed: &AssumedPod,
+        failure: BindingFailure,
+    ) {
+        error!(
+            "Failed to bind pod {} to node {}: {}",
+            pod_key(&assumed.pod),
+            assumed.node_name,
+            failure.error
+        );
+        let forgotten = self.abort_assumed(assumed).await;
+        let assumed_pod = Self::with_node(&assumed.pod, &assumed.node_name);
+        let uid = assumed.pod.metadata.uid.clone();
+        // "Forget"ing an assumed Pod in the binding cycle "should be treated
+        // as a PodDelete event, as the assumed Pod had occupied a certain
+        // amount of resources in scheduler cache. Avoid moving the assumed
+        // Pod itself as it's always Unschedulable. It's intentional to
+        // "defer" this operation; otherwise MoveAllToActiveOrBackoffQueue()
+        // would add this event to in-flight events and thus move the assumed
+        // pod to backoffQ anyways".
+        let mv = |pre_check: Option<&dyn Fn(&Pod) -> bool>| {
+            queue.move_all_to_active_or_backoff_queue(
+                &EVENT_ASSIGNED_POD_DELETE,
+                Some(Arc::new(assumed_pod.clone())),
+                None,
+                pre_check,
+            );
+        };
+        let not_self = move |p: &Pod| p.metadata.uid != uid;
+        if forgotten && !failure.rejected {
+            mv(None);
+        }
+        // `FailureHandler` (`handleSchedulingFailure`): not a FitError, so no
+        // plugins are recorded and the pod backs off.
+        p_info.unschedulable_plugins.clear();
+        self.handle_scheduling_failure(queue, p_info).await;
+        if forgotten && failure.rejected {
+            mv(Some(&not_self));
+        }
     }
 
     pub async fn select_node_inner(

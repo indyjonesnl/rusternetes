@@ -256,6 +256,35 @@ mod tests {
     }
 
     #[test]
+    fn assumed_pods_lists_only_assumed_ones() {
+        let c = SchedulerCache::default();
+        c.add_pod(&pod("added", "node", 0)).unwrap();
+        c.assume_pod(&pod("a", "node", 0)).unwrap();
+        let got: Vec<String> = c
+            .assumed_pods()
+            .into_iter()
+            .map(|p| p.metadata.name)
+            .collect();
+        assert_eq!(got, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn in_flight_bindings_wait_idle() {
+        use rusternetes_scheduler::async_binding::InFlightBindings;
+        let b = std::sync::Arc::new(InFlightBindings::default());
+        b.wait_idle().await;
+        let g = b.start();
+        assert_eq!(b.running(), 1);
+        let b2 = b.clone();
+        let waiter = tokio::spawn(async move { b2.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(g);
+        waiter.await.unwrap();
+        assert_eq!(b.running(), 0);
+    }
+
+    #[test]
     fn finish_binding_of_a_forgotten_pod_is_a_no_op() {
         let c = SchedulerCache::new(Duration::from_secs(10));
         let p = pod("test", "node", 0);
