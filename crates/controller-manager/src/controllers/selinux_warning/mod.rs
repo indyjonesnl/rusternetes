@@ -574,6 +574,54 @@ pub fn feature_gates_enabled() -> bool {
     false
 }
 
+/// `updatePod` (`selinux_warning_controller.go:190-213`): a pod update is only
+/// queued when its phase changed to `Failed` or `Succeeded` (the kubelet then
+/// unmounts the volumes and the cache entry has to go). The relevant spec
+/// fields are immutable, so every other update is a no-op.
+pub fn pod_update_enqueues(old: Option<&Phase>, new: Option<&Phase>) -> bool {
+    if old == new {
+        return false;
+    }
+    matches!(new, Some(Phase::Failed | Phase::Succeeded))
+}
+
+/// `updatePVC` (`:227-240`): only when `spec.volumeName` changed (the PVC was
+/// just bound). `""` and absent are the same value in Go.
+pub fn pvc_update_enqueues(old_volume_name: Option<&str>, new_volume_name: Option<&str>) -> bool {
+    old_volume_name.unwrap_or("") != new_volume_name.unwrap_or("")
+}
+
+/// `addPVC` (`:215-225`): unbound PVCs are ignored.
+pub fn pvc_add_enqueues(volume_name: Option<&str>) -> bool {
+    !volume_name.unwrap_or("").is_empty()
+}
+
+/// `addPV` (`:242-257`). `claim_uid` is `None` for a nil `spec.claimRef`,
+/// else the claimRef's UID (`""` when absent): unbound PVs and PVs with an
+/// incomplete binding are ignored.
+pub fn pv_add_enqueues(claim_uid: Option<&str>) -> bool {
+    claim_uid.is_some_and(|u| !u.is_empty())
+}
+
+/// `updatePV` (`:259-283`): only when the PV was just bound or re-bound,
+/// i.e. the new claimRef is complete and the old one is nil or has another
+/// UID. Arguments as in [`pv_add_enqueues`].
+pub fn pv_update_enqueues(old_claim_uid: Option<&str>, new_claim_uid: Option<&str>) -> bool {
+    pv_add_enqueues(new_claim_uid) && (old_claim_uid.is_none() || old_claim_uid != new_claim_uid)
+}
+
+/// What the previous watch event of an object told us, so an update can be
+/// compared with the object it replaces the way an informer's
+/// `UpdateFunc(oldObj, newObj)` does. Kept compact: only the fields the
+/// predicates above read.
+#[derive(Default)]
+struct SeenState {
+    pod_phase: HashMap<String, Option<Phase>>,
+    pvc_volume_name: HashMap<String, String>,
+    /// `None` = nil claimRef, else the claimRef UID.
+    pv_claim_uid: HashMap<String, Option<String>>,
+}
+
 /// `Controller`.
 pub struct SELinuxWarningController<S: Storage> {
     storage: Arc<S>,
@@ -590,6 +638,8 @@ pub struct SELinuxWarningController<S: Storage> {
     /// The `spec.seLinuxMount` last seen per CSIDriver, to tell what an
     /// update changed (upstream compares the informer's old and new object).
     known_csi_drivers: Mutex<HashMap<String, bool>>,
+    /// Old-object state for the pod, PVC and PV update predicates.
+    seen: Mutex<SeenState>,
 }
 
 impl<S: Storage + 'static> SELinuxWarningController<S> {
@@ -607,6 +657,7 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
             se_linux_translator: ControllerSELinuxTranslator,
             label_cache,
             known_csi_drivers: Mutex::new(HashMap::new()),
+            seen: Mutex::new(SeenState::default()),
         }
     }
 
@@ -654,6 +705,133 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
                 });
             if uses {
                 self.enqueue_pod(queue, &Self::object_name(&pod)).await;
+            }
+        }
+    }
+
+    fn claim_uid(pv: &PersistentVolume) -> Option<String> {
+        pv.spec
+            .claim_ref
+            .as_ref()
+            .map(|c| c.uid.clone().unwrap_or_default())
+    }
+
+    /// The pod arm of `Run`'s informer handlers: `enqueuePod` on add and
+    /// delete, `updatePod` on update (an object already seen is an update).
+    pub async fn on_pod_event(&self, queue: &WorkQueue, ev: &WatchEvent) {
+        let k = extract_key(ev);
+        let parts: Vec<&str> = k.splitn(3, '/').collect();
+        let [_, ns, name] = parts.as_slice() else {
+            return;
+        };
+        let key = ObjectName::new(*ns, *name);
+        let qkey = Self::pod_queue_key(&key);
+        let enqueue = match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                let Ok(pod) = serde_json::from_str::<Pod>(v) else {
+                    return;
+                };
+                let new = pod.status.as_ref().and_then(|s| s.phase.clone());
+                let old = self
+                    .seen
+                    .lock()
+                    .expect("seen state poisoned")
+                    .pod_phase
+                    .insert(qkey, new.clone());
+                match old {
+                    None => true,
+                    Some(old) => pod_update_enqueues(old.as_ref(), new.as_ref()),
+                }
+            }
+            WatchEvent::Deleted(..) => {
+                self.seen
+                    .lock()
+                    .expect("seen state poisoned")
+                    .pod_phase
+                    .remove(&qkey);
+                true
+            }
+        };
+        if enqueue {
+            self.enqueue_pod(queue, &key).await;
+        }
+    }
+
+    /// `addPVC` / `updatePVC`.
+    pub async fn on_pvc_event(&self, queue: &WorkQueue, ev: &WatchEvent) {
+        match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                let Ok(pvc) = serde_json::from_str::<PersistentVolumeClaim>(v) else {
+                    return;
+                };
+                let ns = pvc.metadata.namespace.clone().unwrap_or_default();
+                let new = pvc.spec.volume_name.clone().unwrap_or_default();
+                let old = self
+                    .seen
+                    .lock()
+                    .expect("seen state poisoned")
+                    .pvc_volume_name
+                    .insert(format!("{ns}/{}", pvc.metadata.name), new.clone());
+                let enqueue = match old {
+                    None => pvc_add_enqueues(Some(&new)),
+                    Some(old) => pvc_update_enqueues(Some(&old), Some(&new)),
+                };
+                if enqueue {
+                    self.enqueue_all_pods_for_pvc(queue, &ns, &pvc.metadata.name)
+                        .await;
+                }
+            }
+            WatchEvent::Deleted(..) => {
+                let k = extract_key(ev);
+                let parts: Vec<&str> = k.splitn(3, '/').collect();
+                if let [_, ns, name] = parts.as_slice() {
+                    self.seen
+                        .lock()
+                        .expect("seen state poisoned")
+                        .pvc_volume_name
+                        .remove(&format!("{ns}/{name}"));
+                }
+            }
+        }
+    }
+
+    /// `addPV` / `updatePV`.
+    pub async fn on_pv_event(&self, queue: &WorkQueue, ev: &WatchEvent) {
+        match ev {
+            WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                let Ok(pv) = serde_json::from_str::<PersistentVolume>(v) else {
+                    return;
+                };
+                let new = Self::claim_uid(&pv);
+                let old = self
+                    .seen
+                    .lock()
+                    .expect("seen state poisoned")
+                    .pv_claim_uid
+                    .insert(pv.metadata.name.clone(), new.clone());
+                let enqueue = match old {
+                    None => pv_add_enqueues(new.as_deref()),
+                    Some(old) => pv_update_enqueues(old.as_deref(), new.as_deref()),
+                };
+                if enqueue {
+                    if let Some(cr) = pv.spec.claim_ref.as_ref() {
+                        self.enqueue_all_pods_for_pvc(
+                            queue,
+                            cr.namespace.as_deref().unwrap_or(""),
+                            cr.name.as_deref().unwrap_or(""),
+                        )
+                        .await;
+                    }
+                }
+            }
+            WatchEvent::Deleted(..) => {
+                let k = extract_key(ev);
+                let name = k.rsplit('/').next().unwrap_or("");
+                self.seen
+                    .lock()
+                    .expect("seen state poisoned")
+                    .pv_claim_uid
+                    .remove(name);
             }
         }
     }
@@ -714,10 +892,48 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
         match self.storage.list::<Pod>(&build_prefix("pods", None)).await {
             Ok(pods) => {
                 for pod in pods {
-                    self.enqueue_pod(queue, &Self::object_name(&pod)).await;
+                    let name = Self::object_name(&pod);
+                    self.seen
+                        .lock()
+                        .expect("seen state poisoned")
+                        .pod_phase
+                        .insert(
+                            Self::pod_queue_key(&name),
+                            pod.status.as_ref().and_then(|s| s.phase.clone()),
+                        );
+                    self.enqueue_pod(queue, &name).await;
                 }
             }
             Err(e) => error!("SELinux warning: failed to list pods: {e}"),
+        }
+        // The old objects for the PVC and PV update predicates. Nothing is
+        // queued for them here: every pod was queued above.
+        if let Ok(pvcs) = self
+            .storage
+            .list::<PersistentVolumeClaim>(&build_prefix("persistentvolumeclaims", None))
+            .await
+        {
+            let mut seen = self.seen.lock().expect("seen state poisoned");
+            for pvc in pvcs {
+                let key = format!(
+                    "{}/{}",
+                    pvc.metadata.namespace.clone().unwrap_or_default(),
+                    pvc.metadata.name
+                );
+                seen.pvc_volume_name
+                    .insert(key, pvc.spec.volume_name.clone().unwrap_or_default());
+            }
+        }
+        if let Ok(pvs) = self
+            .storage
+            .list::<PersistentVolume>(&build_prefix("persistentvolumes", None))
+            .await
+        {
+            let mut seen = self.seen.lock().expect("seen state poisoned");
+            for pv in pvs {
+                seen.pv_claim_uid
+                    .insert(pv.metadata.name.clone(), Self::claim_uid(&pv));
+            }
         }
         match self
             .storage
@@ -788,46 +1004,15 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
             loop {
                 tokio::select! {
                     ev = pods.next() => match ev {
-                        // enqueuePod (add, delete) / updatePod
-                        Some(Ok(ev)) => {
-                            // "pods/<ns>/<name>"
-                            let k = extract_key(&ev);
-                            let parts: Vec<&str> = k.splitn(3, '/').collect();
-                            if let [_, ns, name] = parts.as_slice() {
-                                self.enqueue_pod(&queue, &ObjectName::new(*ns, *name)).await;
-                            }
-                        }
+                        Some(Ok(ev)) => self.on_pod_event(&queue, &ev).await,
                         _ => break,
                     },
                     ev = pvcs.next() => match ev {
-                        Some(Ok(WatchEvent::Added(_, v) | WatchEvent::Modified(_, v))) => {
-                            // addPVC / updatePVC: ignore unbound PVCs.
-                            if let Ok(pvc) = serde_json::from_str::<PersistentVolumeClaim>(&v) {
-                                if pvc.spec.volume_name.as_deref().is_some_and(|n| !n.is_empty()) {
-                                    let ns = pvc.metadata.namespace.clone().unwrap_or_default();
-                                    self.enqueue_all_pods_for_pvc(&queue, &ns, &pvc.metadata.name).await;
-                                }
-                            }
-                        }
-                        Some(Ok(WatchEvent::Deleted(..))) => {}
+                        Some(Ok(ev)) => self.on_pvc_event(&queue, &ev).await,
                         _ => break,
                     },
                     ev = pvs.next() => match ev {
-                        Some(Ok(WatchEvent::Added(_, v) | WatchEvent::Modified(_, v))) => {
-                            // addPV / updatePV: only PVs with a complete binding.
-                            if let Ok(pv) = serde_json::from_str::<PersistentVolume>(&v) {
-                                if let Some(cr) = pv.spec.claim_ref.as_ref() {
-                                    if cr.uid.as_deref().is_some_and(|u| !u.is_empty()) {
-                                        self.enqueue_all_pods_for_pvc(
-                                            &queue,
-                                            cr.namespace.as_deref().unwrap_or(""),
-                                            cr.name.as_deref().unwrap_or(""),
-                                        ).await;
-                                    }
-                                }
-                            }
-                        }
-                        Some(Ok(WatchEvent::Deleted(..))) => {}
+                        Some(Ok(ev)) => self.on_pv_event(&queue, &ev).await,
                         _ => break,
                     },
                     ev = drivers.next() => match ev {
