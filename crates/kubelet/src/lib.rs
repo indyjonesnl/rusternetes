@@ -31,6 +31,7 @@ pub mod runtime;
 pub mod runtime_state;
 pub mod server;
 pub mod server_auth;
+pub mod server_cri_metrics;
 pub mod server_debug;
 pub mod server_logs;
 pub mod server_metrics;

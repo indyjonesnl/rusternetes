@@ -7,8 +7,8 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rusternetes_kubelet::{
     config, credentialprovider_plugin, eviction, image_gc, kubelet, node_ip, pluginmanager, server,
-    server_auth, server_debug, server_logs, server_metrics_endpoints, server_resource_metrics,
-    serving_tls, streaming_server, volume_plugins,
+    server_auth, server_cri_metrics, server_debug, server_logs, server_metrics_endpoints,
+    server_resource_metrics, serving_tls, streaming_server, volume_plugins,
 };
 
 use anyhow::{Context, Result};
@@ -789,6 +789,14 @@ async fn main() -> Result<()> {
                     .runtime
                     .cri_client(),
             )))
+            .merge(server_cri_metrics::router(Some(
+                server_state
+                    .kubelet
+                    .as_ref()
+                    .expect("kubelet")
+                    .runtime
+                    .cri_client(),
+            )))
             .merge(server::auth_not_required_router(server_state.clone()));
         // server.go:315-325 `InstallAuthRequiredHandlers` /
         // `InstallDebuggingDisabledHandlers`: the debugging handlers (and
@@ -863,6 +871,7 @@ async fn main() -> Result<()> {
         let registered: Vec<String> = ["/metrics"]
             .into_iter()
             .chain(server_metrics_endpoints::PATHS)
+            .chain(server_cri_metrics::PATHS)
             .chain(server_resource_metrics::PATHS)
             .chain([server_logs::LOGS_PATH])
             .map(String::from)

@@ -203,7 +203,7 @@ impl<'a> Families<'a> {
     }
 }
 
-fn escape_label(v: &str) -> String {
+pub(crate) fn escape_label(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('"', "\\\"")
