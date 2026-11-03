@@ -548,6 +548,10 @@ mod tests {
             p.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-2")
         );
+        // `assume` (schedule_one.go:955) and `FinishBinding` (:1011): the
+        // bound pod stays assumed until the informer's Add event confirms it.
+        assert_eq!(scheduler.cache.assumed_count(), 1);
+        assert_eq!(scheduler.cache.pods_on_node("node-2").len(), 1);
     }
 
     /// A PreBind failure (BindTimeoutSeconds elapsed without the PV controller
@@ -570,6 +574,13 @@ mod tests {
             .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
             .await;
         assert!(r.is_err(), "PreBind timeout must surface as an error");
+        // `ForgetPod` after a binding failure (schedule_one.go:369).
+        assert_eq!(
+            scheduler.cache.pod_count(),
+            0,
+            "failed binding is forgotten"
+        );
+        assert_eq!(scheduler.cache.assumed_count(), 0);
         let p: Pod = storage
             .get("/registry/pods/default/wffc-pod")
             .await
