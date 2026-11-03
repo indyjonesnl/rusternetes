@@ -1927,7 +1927,7 @@ mod tests {
             .await
             .unwrap()
         {
-            ScheduleOutcome::Unschedulable(plugins) => assert_eq!(
+            ScheduleOutcome::Unschedulable(plugins, _) => assert_eq!(
                 plugins,
                 std::collections::HashSet::from([names::NODE_RESOURCES_FIT.to_string()])
             ),
