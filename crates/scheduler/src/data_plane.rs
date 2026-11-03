@@ -145,6 +145,88 @@ has_meta!(
     VolumeAttachment
 );
 
+/// [`ListWatch`](rusternetes_client::reflector::ListWatch) over a
+/// [`Storage`] prefix: the storage-mode counterpart of `ApiListWatch`, so the
+/// scheduler's volume informers are the same `Reflector` in both modes.
+///
+/// Follows the ordering of `resource_events::run_storage_feed`: "watch first,
+/// then list: events between the two are replayed from the stream" (applying
+/// an event twice is idempotent in the store). The watch opened by `list` is
+/// handed to the next `watch` call; a watch that ends (storage watches never
+/// end gracefully) fails the next `watch` so the reflector re-lists, which is
+/// client-go's `ListAndWatch` restart.
+pub struct StorageListWatch<S: Storage + Send + Sync + 'static> {
+    storage: Arc<S>,
+    prefix: String,
+    pending: std::sync::Mutex<Option<rusternetes_storage::WatchStream>>,
+}
+
+impl<S: Storage + Send + Sync + 'static> StorageListWatch<S> {
+    pub fn new(storage: Arc<S>, prefix: String) -> Self {
+        Self {
+            storage,
+            prefix,
+            pending: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, T> rusternetes_client::reflector::ListWatch<T> for StorageListWatch<S>
+where
+    S: Storage + Send + Sync + 'static,
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    async fn list(&self) -> anyhow::Result<(Vec<T>, String)> {
+        let watch = self
+            .storage
+            .watch(&self.prefix)
+            .await
+            .map_err(|e| anyhow::anyhow!("watch {} failed: {e}", self.prefix))?;
+        let items = self
+            .storage
+            .list::<T>(&self.prefix)
+            .await
+            .map_err(|e| anyhow::anyhow!("list {} failed: {e}", self.prefix))?;
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(watch);
+        Ok((items, "0".to_string()))
+    }
+
+    async fn watch<'a>(
+        &'a self,
+        _rv: Option<String>,
+    ) -> anyhow::Result<futures::stream::BoxStream<'a, rusternetes_client::reflector::WatchItem<T>>>
+    {
+        use futures::StreamExt;
+        use rusternetes_client::watch::WatchEvent as Ev;
+        use rusternetes_storage::WatchEvent as StoreEv;
+        let stream = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("watch {} closed; re-listing", self.prefix))?;
+        Ok(stream
+            .map(|item| {
+                let ev = item.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let (raw, wrap): (String, fn(T) -> Ev<T>) = match ev {
+                    StoreEv::Added(_, v) => (v, Ev::Added),
+                    StoreEv::Modified(_, v) => (v, Ev::Modified),
+                    // The previous value, which is what the store removes.
+                    StoreEv::Deleted(_, v) => (v, Ev::Deleted),
+                };
+                let value: serde_json::Value = serde_json::from_str(&raw)?;
+                let rv = value
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let obj: T = serde_json::from_value(value)?;
+                Ok((wrap(obj), rv))
+            })
+            .boxed())
+    }
+}
+
 /// Informers behind the NodeVolumeLimits plugin's listers (csi.go:
 /// `pvLister`, `pvcLister`, `scLister`, `vaLister`, `csiDriverLister`, and the
 /// `csiNodeLister` the shared informer factory provides). Upstream builds all of
@@ -161,6 +243,61 @@ pub(crate) struct VolumeReflectors {
 }
 
 impl VolumeReflectors {
+    /// Storage mode (all-in-one): the same six informers over the in-process
+    /// store, via [`StorageListWatch`]. client-go builds one shared informer
+    /// factory for every backend the scheduler runs against; storage mode has
+    /// no api-server, so the list+watch source is the store itself.
+    pub(crate) fn for_storage<S: Storage + Send + Sync + 'static>(storage: &Arc<S>) -> Self {
+        use rusternetes_storage::build_prefix;
+        fn cluster<S, T>(storage: &Arc<S>, resource: &str) -> ClusterReflector<T>
+        where
+            S: Storage + Send + Sync + 'static,
+            T: HasMeta
+                + Clone
+                + Send
+                + Sync
+                + serde::Serialize
+                + serde::de::DeserializeOwned
+                + 'static,
+        {
+            let lw = Arc::new(StorageListWatch::new(
+                Arc::clone(storage),
+                build_prefix(resource, None),
+            ));
+            Arc::new(Reflector::new(
+                lw,
+                cluster_store_key::<T> as fn(&T) -> String,
+            ))
+        }
+        Self {
+            pvcs: Arc::new(Reflector::new(
+                Arc::new(StorageListWatch::new(
+                    Arc::clone(storage),
+                    build_prefix("persistentvolumeclaims", None),
+                )),
+                pvc_store_key as fn(&PersistentVolumeClaim) -> String,
+            )),
+            pvs: cluster(storage, "persistentvolumes"),
+            classes: cluster(storage, "storageclasses"),
+            csi_drivers: cluster(storage, "csidrivers"),
+            csi_nodes: cluster(storage, "csinodes"),
+            volume_attachments: cluster(storage, "volumeattachments"),
+        }
+    }
+
+    /// The listers' current contents (what `Filter` reads from the informer
+    /// caches, csi.go `pvLister.Get` etc.).
+    pub(crate) fn snapshot(&self) -> NodeVolumeLimitsSnapshot {
+        NodeVolumeLimitsSnapshot {
+            pvcs: self.pvcs.store().items(),
+            pvs: self.pvs.store().items(),
+            classes: self.classes.store().items(),
+            csi_drivers: self.csi_drivers.store().items(),
+            csi_nodes: self.csi_nodes.store().items(),
+            volume_attachments: self.volume_attachments.store().items(),
+        }
+    }
+
     fn new(client: &Arc<ApiClient>) -> Self {
         use rusternetes_client::reflector::ApiListWatch;
         fn cluster<T>(client: &Arc<ApiClient>, path: &str) -> ClusterReflector<T>
@@ -207,7 +344,7 @@ impl VolumeReflectors {
         );
     }
 
-    async fn wait_for_cache_sync(&self) {
+    pub(crate) async fn wait_for_cache_sync(&self) {
         tokio::join!(
             self.pvcs.wait_for_cache_sync(),
             self.pvs.wait_for_cache_sync(),
@@ -493,17 +630,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                     volume_attachments: s.list(&build_prefix("volumeattachments", None)).await?,
                 })
             }
-            DataPlane::Api(a) => {
-                let v = &a.volumes;
-                Ok(NodeVolumeLimitsSnapshot {
-                    pvcs: v.pvcs.store().items(),
-                    pvs: v.pvs.store().items(),
-                    classes: v.classes.store().items(),
-                    csi_drivers: v.csi_drivers.store().items(),
-                    csi_nodes: v.csi_nodes.store().items(),
-                    volume_attachments: v.volume_attachments.store().items(),
-                })
-            }
+            DataPlane::Api(a) => Ok(a.volumes.snapshot()),
         }
     }
 

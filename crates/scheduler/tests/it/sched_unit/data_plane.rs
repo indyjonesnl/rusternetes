@@ -73,4 +73,76 @@ mod tests {
             Error::Internal(_)
         ));
     }
+
+    fn pv(name: &str) -> PersistentVolume {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": name},
+            "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"]}
+        }))
+        .unwrap()
+    }
+
+    async fn until(mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    /// The storage-mode informer (`StorageListWatch` under a `Reflector`):
+    /// the initial list fills the store and syncs, later creates, updates and
+    /// deletes reach it from the watch, so `Filter` never lists
+    /// (csi.go listers over a shared informer factory).
+    #[tokio::test]
+    async fn storage_informer_follows_the_store() {
+        use rusternetes_storage::{build_prefix, MemoryStorage};
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/persistentvolumes/pv-a", &pv("pv-a"))
+            .await
+            .unwrap();
+        let lw = Arc::new(StorageListWatch::new(
+            storage.clone(),
+            build_prefix("persistentvolumes", None),
+        ));
+        let r = Arc::new(Reflector::new(
+            lw,
+            (|p: &PersistentVolume| p.metadata.name.clone()) as fn(&PersistentVolume) -> String,
+        ));
+        let runner = r.clone();
+        let task = tokio::spawn(async move { runner.run().await });
+        r.wait_for_cache_sync().await;
+        assert_eq!(r.store().len(), 1);
+
+        storage
+            .create("/registry/persistentvolumes/pv-b", &pv("pv-b"))
+            .await
+            .unwrap();
+        until(|| r.store().get("pv-b").is_some()).await;
+
+        let mut b = pv("pv-b");
+        b.metadata.labels = Some([("k".to_string(), "v".to_string())].into());
+        storage
+            .update("/registry/persistentvolumes/pv-b", &b)
+            .await
+            .unwrap();
+        until(|| {
+            r.store()
+                .get("pv-b")
+                .is_some_and(|p| p.metadata.labels.is_some())
+        })
+        .await;
+
+        storage
+            .delete("/registry/persistentvolumes/pv-a")
+            .await
+            .unwrap();
+        until(|| r.store().get("pv-a").is_none()).await;
+        assert_eq!(r.store().len(), 1);
+        task.abort();
+    }
 }
