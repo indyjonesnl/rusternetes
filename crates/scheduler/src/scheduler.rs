@@ -10,6 +10,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::advanced::parse_resource_quantity;
+use crate::async_preemption::{async_preemption_enabled, AsyncPreemption};
 use crate::data_plane::{ApiBackend, DataPlane};
 use crate::diagnosis::{fit_error_message, Diagnosis};
 use crate::framework_runtime::{names, ExtensionPoint};
@@ -131,7 +132,22 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// Test override of `getOffsetRand` (default_preemption.go:185-189, a
     /// package variable upstream tests replace); `usize::MAX` = random.
     pub preemption_offset_override: AtomicUsize,
+    /// The `Evaluator`'s `preempting` / `lastVictimsPendingPreemption` state
+    /// (preemption.go:136-144), consulted by DefaultPreemption's PreEnqueue.
+    pub preemption: Arc<AsyncPreemption>,
+    /// This scheduler as an `Arc`, set by [`Scheduler::run`], so a scheduling
+    /// cycle can hand the preemption to a task that outlives it
+    /// (`go func() { .. }()`, preemption.go:569). Unset when a cycle is driven
+    /// directly (tests): the victims are then evicted in the cycle.
+    pub weak_self: std::sync::OnceLock<std::sync::Weak<Self>>,
+    /// Observes each `PreemptPod` call just before it is made; the upstream
+    /// tests replace `ev.PreemptPod` to do the same
+    /// (`TestPrepareCandidateAsyncSetsPreemptingSets`).
+    pub before_preempt_pod: std::sync::Mutex<Option<PreemptPodObserver>>,
 }
+
+/// See [`Scheduler::before_preempt_pod`].
+pub type PreemptPodObserver = Arc<dyn Fn(&Pod) + Send + Sync>;
 
 impl Scheduler<StorageBackend> {
     /// Construct an api-server-backed scheduler (in-cluster static pod mode)
@@ -152,6 +168,9 @@ impl Scheduler<StorageBackend> {
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
             next_start_node_index: AtomicUsize::new(0),
             preemption_offset_override: AtomicUsize::new(usize::MAX),
+            preemption: AsyncPreemption::new(),
+            weak_self: std::sync::OnceLock::new(),
+            before_preempt_pod: std::sync::Mutex::new(None),
         }
     }
 }
@@ -182,6 +201,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             volume_bind_poll: crate::volume_bind::BIND_POLL_INTERVAL,
             next_start_node_index: AtomicUsize::new(0),
             preemption_offset_override: AtomicUsize::new(usize::MAX),
+            preemption: AsyncPreemption::new(),
+            weak_self: std::sync::OnceLock::new(),
+            before_preempt_pod: std::sync::Mutex::new(None),
         }
     }
 
@@ -345,6 +367,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         use futures::StreamExt;
 
+        let _ = self.weak_self.set(Arc::downgrade(&self));
         info!(
             "Scheduler profiles {:?} started (watch-based, resync every {:?})",
             self.profiles.names(),
@@ -368,8 +391,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 // `WithPreEnqueuePluginMap` (scheduler.go:388-414): gated pods
                 // stay out of activeQ.
                 pre_enqueue_plugin_map:
-                    crate::queue::scheduling_gates::build_pre_enqueue_plugin_map(
+                    crate::queue::scheduling_gates::build_pre_enqueue_plugin_map_with_preemption(
                         self.profiles.profiles(),
+                        Some(&self.preemption),
                     ),
                 // Upstream default (5m): pods rejected by the volume plugins
                 // are requeued by the PV/PVC/StorageClass/CSI* events fed by
@@ -542,6 +566,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// (`newPodInformer`, scheduler.go:651-656), so a pod turning
     /// Succeeded/Failed is seen as a delete.
     fn on_pod_event(&self, queue: &PriorityQueue, seen: &mut SeenObjects, pod: Pod) {
+        // Before anything is requeued on this event, so PreEnqueue sees a last
+        // victim's deletion (see `async_preemption` module docs).
+        self.preemption.observe_pod(&pod, false);
         if is_terminal_pod(&pod) {
             self.on_pod_deleted(queue, seen, &pod);
             return;
@@ -560,6 +587,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// `deletePod` (eventhandlers.go:184-227).
     fn on_pod_deleted(&self, queue: &PriorityQueue, seen: &mut SeenObjects, pod: &Pod) {
+        self.preemption.observe_pod(pod, true);
         if seen.pods.remove(&pod_key(pod)).is_none() {
             // Never seen (e.g. already terminal at first sight): nothing to undo.
             return;
@@ -879,7 +907,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// K8s schedules one pod per cycle in scheduleOne().
     pub async fn try_schedule_pod(
         &self,
-        queue: &PriorityQueue,
+        queue: &Arc<PriorityQueue>,
         key: &str,
     ) -> rusternetes_common::Result<ScheduleOutcome> {
         let parts: Vec<&str> = key.splitn(3, '/').collect();
@@ -1028,12 +1056,21 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                     ns,
                     name
                 );
-                // `prepareCandidate` (preemption.go:464-500): a failed eviction
-                // is a scheduling error and nothing is nominated.
-                if let Err(e) = self
+                // `if ev.enableAsyncPreemption { prepareCandidateAsync .. }
+                // else { prepareCandidate .. }` (preemption.go:330-338). Async
+                // needs this scheduler as an `Arc` to hand to the task, which
+                // only `run` provides.
+                let async_self = async_preemption_enabled()
+                    .then(|| self.weak_self.get().and_then(std::sync::Weak::upgrade))
+                    .flatten();
+                if let Some(this) = async_self {
+                    this.prepare_candidate_async(queue, &pod, node_name, victims);
+                } else if let Err(e) = self
                     .prepare_candidate(Some(queue), &pod, node_name, victims)
                     .await
                 {
+                    // `prepareCandidate` (preemption.go:464-500): a failed
+                    // eviction is a scheduling error and nothing is nominated.
                     error!("Error preempting for pod {}/{}: {}", ns, name, e);
                     return Err(e);
                 }
@@ -2123,8 +2160,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// to clear nominations is not critical and only logged. Victims whose
     /// deletion already started need no API call.
     ///
-    /// Deviation: this is the synchronous form (`prepareCandidate`), not
-    /// `prepareCandidateAsync`; the victims' deletion is awaited in the cycle.
+    /// This is the synchronous form, used when `SchedulerAsyncPreemption` is
+    /// off or the cycle is driven without [`Scheduler::run`]; the victims'
+    /// deletion is awaited in the cycle. The default is
+    /// [`Scheduler::prepare_candidate_async`].
     /// Not ported: rejecting a victim that is a waiting pod (needs Permit).
     pub async fn prepare_candidate(
         &self,
@@ -2148,6 +2187,132 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let Some(queue) = queue else {
             return Ok(());
         };
+        self.clear_lower_priority_nominations(queue, preemptor, node_name)
+            .await;
+        Ok(())
+    }
+
+    /// `prepareCandidateAsync` (preemption.go:534-632, KEP-4832): hand the
+    /// preemption to a task that outlives the scheduling cycle, and return.
+    ///
+    /// - Victims already terminating need no API call; with none left there is
+    ///   nothing to do and nothing is marked.
+    /// - The preemptor's UID is in `preempting` from before the task starts
+    ///   until it ends; DefaultPreemption's PreEnqueue keeps the pod out of the
+    ///   queue meanwhile ([`AsyncPreemption`]).
+    /// - The task first clears the nomination of the lower-priority pods
+    ///   nominated to the node, then evicts every victim but the last, at most
+    ///   [`PREEMPTION_PARALLELISM`] at a time and giving up on the first error,
+    ///   then registers the last victim in `lastVictimsPendingPreemption` and
+    ///   evicts it. The pod leaves `preempting` only after that last deletion
+    ///   was issued, so its removal event is never ignored.
+    /// - Any error while doing so requeues the preemptor with `Activate`.
+    ///
+    /// Deviations: the task has no cancellable context of its own (dropping
+    /// the eviction futures on the first error is the cancellation); failures
+    /// to clear a nomination are only logged by the status writer, so they do
+    /// not trigger the `Activate`; the preemption metrics are not recorded.
+    pub fn prepare_candidate_async(
+        self: &Arc<Self>,
+        queue: &Arc<PriorityQueue>,
+        preemptor: &Pod,
+        node_name: &str,
+        victims: &[Pod],
+    ) {
+        let victim_pods: Vec<Pod> = victims
+            .iter()
+            .filter(|v| v.metadata.deletion_timestamp.is_none())
+            .cloned()
+            .collect();
+        if victim_pods.is_empty() {
+            return;
+        }
+        let uid = crate::advanced::pod_key(preemptor);
+        self.preemption.start(&uid);
+        let this = Arc::clone(self);
+        let queue = Arc::clone(queue);
+        let preemptor = preemptor.clone();
+        let node_name = node_name.to_string();
+        tokio::spawn(async move {
+            // A panic must not leave the pod in `preempting` forever.
+            struct Finish(Arc<AsyncPreemption>, String);
+            impl Drop for Finish {
+                fn drop(&mut self) {
+                    self.0.finish(&self.1);
+                }
+            }
+            let _finish = Finish(Arc::clone(&this.preemption), uid.clone());
+            let mut failed = false;
+            debug!(
+                "Start the preemption asynchronously for {} on {} ({} victims to delete)",
+                pod_key(&preemptor),
+                node_name,
+                victim_pods.len()
+            );
+
+            this.clear_lower_priority_nominations(&queue, &preemptor, &node_name)
+                .await;
+
+            let (last, rest) = victim_pods.split_last().expect("checked non-empty");
+            if !rest.is_empty() {
+                use futures::TryStreamExt;
+                // We can evict all victims in parallel, but the last one.
+                if let Err(e) = futures::stream::iter(rest.iter().map(Ok::<&Pod, _>))
+                    .try_for_each_concurrent(PREEMPTION_PARALLELISM, |victim| {
+                        this.preempt_victim(&preemptor, &node_name, victim)
+                    })
+                    .await
+                {
+                    error!("Error occurred during async preemption: {}", e);
+                    failed = true;
+                }
+            }
+
+            this.preemption.set_last_victim(&uid, last);
+            if let Err(e) = this.preempt_victim(&preemptor, &node_name, last).await {
+                error!("Error occurred during async preemption: {}", e);
+                failed = true;
+            }
+
+            this.preemption.finish(&uid);
+            debug!(
+                "Async Preemption finished completely for {} on {} (failed: {})",
+                pod_key(&preemptor),
+                node_name,
+                failed
+            );
+            if failed {
+                // When an API call isn't successful, the Pod may get stuck in
+                // the unschedulable pod pool in the worst case. So, move it to
+                // the activeQ.
+                queue.activate(std::slice::from_ref(&preemptor));
+            }
+        });
+    }
+
+    /// `PreemptPod` as `prepareCandidateAsync` calls it: the test observer
+    /// ([`Scheduler::before_preempt_pod`]), then [`Scheduler::preempt_pod`].
+    async fn preempt_victim(
+        &self,
+        preemptor: &Pod,
+        node_name: &str,
+        victim: &Pod,
+    ) -> rusternetes_common::Result<()> {
+        let observer = self.before_preempt_pod.lock().unwrap().clone();
+        if let Some(observe) = observer {
+            observe(victim);
+        }
+        self.preempt_pod(preemptor, node_name, victim).await
+    }
+
+    /// The `getLowerPriorityNominatedPods` + `clearNominatedNodeName` half of
+    /// `prepareCandidate` / `prepareCandidateAsync` (preemption.go:480-497).
+    async fn clear_lower_priority_nominations(
+        &self,
+        queue: &PriorityQueue,
+        preemptor: &Pod,
+        node_name: &str,
+    ) {
         for p in get_lower_priority_nominated_pods(queue, preemptor, node_name) {
             queue.add_nominated_pod(&p, Some(&NominatingInfo::override_node("")));
             let ns = p.metadata.namespace.as_deref().unwrap_or("default");
@@ -2159,7 +2324,6 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             })
             .await;
         }
-        Ok(())
     }
 
     /// `PreemptPod` (preemption.go:177-219): stamp DisruptionTarget and delete

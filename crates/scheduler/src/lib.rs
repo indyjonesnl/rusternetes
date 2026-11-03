@@ -1,4 +1,5 @@
 pub mod advanced;
+pub mod async_preemption;
 pub mod batch;
 pub mod data_plane;
 pub mod default_preemption;
