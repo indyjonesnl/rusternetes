@@ -68,13 +68,18 @@ async fn run(rules: &str, impersonate: bool) -> Vec<AuditEvent> {
                 next.run(req).await
             },
         ));
-    app.oneshot(
-        axum::http::Request::get("/api/v1/namespaces/ns/configmaps/cm")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let resp = app
+        .oneshot(
+            axum::http::Request::get("/api/v1/namespaces/ns/configmaps/cm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // ResponseComplete is written when the body ends.
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let ev = cap.0.lock().await;
     ev.clone()
 }

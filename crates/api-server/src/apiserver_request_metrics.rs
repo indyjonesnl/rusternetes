@@ -700,9 +700,9 @@ pub fn request_meta(req: &axum::extract::Request) -> RequestMeta {
 /// authentication and audit (server/config.go:1084), so both can read/write
 /// them; `instrument_request` reuses the instance.
 ///
-/// The Go filter also wraps the ResponseWriter in `writeLatencyTracker`
-/// (response-write tracking); that part is not ported (axum bodies stream
-/// outside the handler chain) and is tracked as a follow-up.
+/// The Go filter also wraps the ResponseWriter in `writeLatencyTracker`;
+/// the equivalent here is the response body wrapper in `audit::with_audit`,
+/// since axum writes bodies after the handler chain returns.
 pub async fn with_latency_trackers_filter(
     req: axum::extract::Request,
     next: axum::middleware::Next,

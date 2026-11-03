@@ -587,6 +587,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+        // ResponseComplete is written when the body ends.
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let events = sink.0.lock().await;
         let ann = events
             .iter()

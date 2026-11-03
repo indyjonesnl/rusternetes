@@ -8,9 +8,11 @@
 //! `WithAuthentication` filter; every non-zero tracker feeds
 //! `AuditAnnotationsFromLatencyTrackers`. Storage (every etcd/rhino round
 //! trip), list-item decode, response transform and response serialization are
-//! wired at their call sites. Response-write is not (axum writes the body
-//! after the handler chain returns; tracked as a follow-up). Authorization is
-//! retained per request (max) and is not subtracted by `MonitorRequest` from
+//! wired at their call sites. Response-write is accumulated by the audit
+//! filter's body wrapper (`writeLatencyTracker.Write`,
+//! webhook_duration.go:60-75): the time the connection takes between frames.
+//! Authorization is retained per request (max) and is not subtracted by
+//! `MonitorRequest` from
 //! the SLI latency.
 
 use std::future::Future;

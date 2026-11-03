@@ -370,6 +370,10 @@ rules:
             .unwrap();
         assert_eq!(resp.status(), 200);
         let id = resp.headers()["Audit-ID"].to_str().unwrap().to_string();
+        // ResponseComplete is written when the body ends.
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let ev = cap.0.lock().await;
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].stage, AuditStage::RequestReceived);
@@ -408,7 +412,10 @@ rules:
                 "authentication.k8s.io/legacy-token".to_string(),
                 "system:serviceaccount:ns:sa".to_string(),
             )]));
-        app(cfg).oneshot(req).await.unwrap();
+        let resp = app(cfg).oneshot(req).await.unwrap();
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let ev = cap.0.lock().await;
         assert_eq!(
             ev[0].annotations.as_ref().unwrap()["authentication.k8s.io/legacy-token"],
@@ -447,12 +454,16 @@ rules:
                 rusternetes_api_server::apiserver_request_metrics::with_latency_trackers_filter,
             ));
         for n in ["fast", "slow"] {
-            app.clone()
+            let resp = app
+                .clone()
                 .oneshot(
                     axum::http::Request::get(format!("/api/v1/namespaces/ns/secrets/{n}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
+                .await
+                .unwrap();
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
         }
@@ -476,6 +487,21 @@ rules:
         policy: Policy,
         route: axum::routing::MethodRouter,
     ) -> (Response, Vec<AuditEvent>) {
+        let (resp, cap) = run_policy_app_raw(policy, route).await;
+        // ResponseComplete is written when the body ends: read it, then hand
+        // the caller an equivalent buffered response.
+        let (parts, body) = resp.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let resp = Response::from_parts(parts, Body::from(bytes));
+        let ev = cap.0.lock().await.clone();
+        (resp, ev)
+    }
+
+    /// The response as `with_audit` returned it, body unread, and the sink.
+    async fn run_policy_app_raw(
+        policy: Policy,
+        route: axum::routing::MethodRouter,
+    ) -> (Response, Arc<Capture>) {
         let cap = Arc::new(Capture(Default::default()));
         let cfg = Arc::new(AuditConfig {
             policy,
@@ -486,7 +512,10 @@ rules:
             .layer(axum::middleware::from_fn(move |req, next| {
                 let cfg = cfg.clone();
                 async move { with_audit(cfg, req, next).await }
-            }));
+            }))
+            .layer(axum::middleware::from_fn(
+                rusternetes_api_server::apiserver_request_metrics::with_latency_trackers_filter,
+            ));
         let resp = app
             .oneshot(
                 axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
@@ -495,8 +524,7 @@ rules:
             )
             .await
             .unwrap();
-        let ev = cap.0.lock().await.clone();
-        (resp, ev)
+        (resp, cap)
     }
 
     fn pod_json() -> serde_json::Value {
@@ -697,25 +725,129 @@ rules:
         assert!(last.response_object.is_some());
     }
 
+    fn complete_events(ev: &[AuditEvent]) -> Vec<&AuditEvent> {
+        ev.iter()
+            .filter(|e| e.stage == AuditStage::ResponseComplete)
+            .collect()
+    }
+
+    /// filters/audit.go:79-107: ResponseComplete is written after the handler
+    /// (and so every response write) returned. Here that is the end of the
+    /// body: no event while the body is unread, exactly one once it ends, and
+    /// dropping the finished body writes no second one.
+    #[tokio::test]
+    async fn response_complete_is_written_when_the_body_ends() {
+        let (resp, cap) =
+            run_policy_app_raw(level_policy("Metadata", false), get(|| async { "ok" })).await;
+        assert!(complete_events(&cap.0.lock().await).is_empty());
+        let (_, body) = resp.into_parts();
+        axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        tokio::task::yield_now().await;
+        let ev = cap.0.lock().await;
+        assert_eq!(complete_events(&ev).len(), 1);
+        let stages: Vec<_> = ev.iter().map(|e| e.stage.clone()).collect();
+        assert_eq!(
+            stages,
+            vec![AuditStage::RequestReceived, AuditStage::ResponseComplete]
+        );
+    }
+
+    /// A body with no data (HEAD, 204) completes without being polled.
+    #[tokio::test]
+    async fn empty_body_completes_immediately() {
+        let (_resp, cap) = run_policy_app_raw(
+            level_policy("Metadata", false),
+            get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .await;
+        assert_eq!(complete_events(&cap.0.lock().await).len(), 1);
+    }
+
+    /// A client that goes away before the body ends: `ServeHTTP` returns on
+    /// the failed write and the deferred func still runs, once.
+    #[tokio::test]
+    async fn dropped_body_still_completes_once() {
+        let (resp, cap) = run_policy_app_raw(
+            level_policy("Metadata", false),
+            get(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+                tx.send(Ok(b"chunk".to_vec())).await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    drop(tx);
+                });
+                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+            }),
+        )
+        .await;
+        use futures::StreamExt;
+        let mut s = resp.into_body().into_data_stream();
+        assert!(s.next().await.is_some());
+        assert!(complete_events(&cap.0.lock().await).is_empty());
+        drop(s);
+        for _ in 0..50 {
+            if !complete_events(&cap.0.lock().await).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(complete_events(&cap.0.lock().await).len(), 1);
+    }
+
+    /// `writeLatencyTracker.Write` (webhook_duration.go:60-75) is measured
+    /// before `writeLatencyToAnnotation`: a slow client shows up as
+    /// `apiserver.latency.k8s.io/response-write` on the event.
+    #[tokio::test]
+    async fn slow_body_consumer_adds_response_write_annotation() {
+        let (resp, cap) = run_policy_app_raw(
+            level_policy("Metadata", false),
+            get(|| async {
+                let s = futures::stream::iter(vec![
+                    Ok::<_, std::io::Error>(b"a".to_vec()),
+                    Ok(b"b".to_vec()),
+                ]);
+                Body::from_stream(s)
+            }),
+        )
+        .await;
+        use futures::StreamExt;
+        let mut s = resp.into_body().into_data_stream();
+        while s.next().await.is_some() {
+            // The "socket" takes 600ms to accept each frame.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let ev = cap.0.lock().await;
+        let done = complete_events(&ev);
+        assert_eq!(done.len(), 1);
+        let a = done[0].annotations.as_ref().expect("latency annotations");
+        let w = &a["apiserver.latency.k8s.io/response-write"];
+        assert!(w.ends_with("ms"), "{w}");
+        assert!(a.contains_key("apiserver.latency.k8s.io/total"));
+    }
+
     /// A streamed (watch-style) body must not be buffered: the first chunk
     /// reaches the client while the stream is still open.
     #[tokio::test]
     async fn streamed_success_body_is_not_buffered() {
-        let (resp, _ev) = run_status_app(get(|| async {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
-            tx.send(Ok(b"{\"type\":\"ADDED\"}\n".to_vec()))
-                .await
-                .unwrap();
-            // Keep the stream open for the response's lifetime.
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                drop(tx);
-            });
-            (
-                [("content-type", "application/json")],
-                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
-            )
-        }))
+        let (resp, _cap) = run_policy_app_raw(
+            level_policy("Metadata", false),
+            get(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(1);
+                tx.send(Ok(b"{\"type\":\"ADDED\"}\n".to_vec()))
+                    .await
+                    .unwrap();
+                // Keep the stream open for the response's lifetime.
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    drop(tx);
+                });
+                (
+                    [("content-type", "application/json")],
+                    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                )
+            }),
+        )
         .await;
         use futures::StreamExt;
         let mut s = resp.into_body().into_data_stream();
@@ -744,12 +876,15 @@ rules:
         assert!(r.headers().get("Audit-ID").is_none());
         assert!(cap.0.lock().await.is_empty());
         // omitStages RequestReceived: only ResponseComplete.
-        app(cfg)
+        let resp = app(cfg)
             .oneshot(
                 axum::http::Request::get("/api/v1/namespaces/ns/secrets/s")
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let ev = cap.0.lock().await;
