@@ -7,6 +7,7 @@ mod apiserver_identity;
 mod apiserver_request_metrics;
 mod apiservice_registration;
 mod audit;
+mod audit_format;
 mod audit_impersonation;
 mod audit_log_batch;
 mod audit_metrics;

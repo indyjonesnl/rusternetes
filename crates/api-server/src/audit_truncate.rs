@@ -131,14 +131,14 @@ impl AuditBackend for TruncateBackend {
         }
         match size {
             Err(e) => {
-                handle_plugin_error(TRUNCATE_PLUGIN_NAME, &e, 1);
+                handle_plugin_error(TRUNCATE_PLUGIN_NAME, &e, &[&event]);
                 Ok(())
             }
             Ok(s) if s > self.config.max_event_size => {
                 handle_plugin_error(
                     TRUNCATE_PLUGIN_NAME,
                     "event is too large even after truncating",
-                    1,
+                    &[&event],
                 );
                 Ok(())
             }
