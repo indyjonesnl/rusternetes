@@ -1,7 +1,15 @@
-//! Shadow type check of the CEL expressions of a MutatingAdmissionPolicy
-//! (`RUSTERNETES_CEL_CHECKER=shadow`, default off).
+//! Shadow type check of the CEL expressions compiled by the admission
+//! compiler `plugin/cel/compile.go`, with the output type check of
+//! `CompileCELExpression` (`RUSTERNETES_CEL_CHECKER=shadow`, default off).
+//! It covers a MutatingAdmissionPolicy (below), and the expressions of a
+//! ValidatingAdmissionPolicy (`validations` bool, `messageExpression` string,
+//! `auditAnnotations` string or null, `variables` any: `validating/
+//! interface.go:46,60,74`, `message.go:34`) and the webhook / policy
+//! `matchConditions` (bool, `matchconditions/matcher.go:49`), which compile in
+//! the same environments without the patch types. The module is named after
+//! the first user.
 //!
-//! The environment is the one the admission compiler builds, release-1.35:
+//! The MutatingAdmissionPolicy environment is the one the admission compiler builds, release-1.35:
 //! `compilePolicy` (`plugin/policy/mutating/compilation.go:35-81`) compiles
 //! `variables` with the plain options, `matchConditions` with the plain
 //! options too and every patch expression with `HasPatchTypes`; the
@@ -31,7 +39,7 @@ use rusternetes_cel_checker::DType;
 /// One expression of a MutatingAdmissionPolicy and the environment it is
 /// compiled in.
 #[derive(Clone, Debug)]
-pub struct MutationExpression<'a> {
+pub struct PolicyExpression<'a> {
     pub expression: &'a str,
     /// `HasParams`: `spec.paramKind != nil`.
     pub has_params: bool,
@@ -80,7 +88,7 @@ fn expected_name(expected: ExpectedOutput) -> &'static str {
 pub fn check_mutation_expression(
     set: &EnvSet,
     env_type: EnvType,
-    e: &MutationExpression<'_>,
+    e: &PolicyExpression<'_>,
 ) -> Option<Vec<String>> {
     let ctx = PolicyTypeContext {
         // `cel.Variable(ObjectVarName, cel.DynType)` (`compile.go:254-255`).
@@ -119,7 +127,7 @@ pub fn check_mutation_expression(
 pub fn mutation_divergence(
     set: &EnvSet,
     env_type: EnvType,
-    e: &MutationExpression<'_>,
+    e: &PolicyExpression<'_>,
     probe: &Option<String>,
 ) -> Option<Vec<String>> {
     let checker = check_mutation_expression(set, env_type, e)?;
@@ -129,12 +137,12 @@ pub fn mutation_divergence(
 /// The hook of the MutatingAdmissionPolicy validation: in `shadow` mode logs
 /// when the checker and the compile probe disagree about `field`. Never
 /// affects validation.
-pub fn observe_mutation(
+pub fn observe_expression(
     policy: &str,
     field: &str,
     set: &EnvSet,
     env_type: EnvType,
-    e: &MutationExpression<'_>,
+    e: &PolicyExpression<'_>,
     probe: &Option<String>,
 ) {
     if crate::cel_checker_shadow::Mode::current() != crate::cel_checker_shadow::Mode::Shadow {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
-use rusternetes_common::cel_mutation_types::{observe_mutation, MutationExpression};
+use rusternetes_common::cel_mutation_types::{observe_expression, PolicyExpression};
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 use rusternetes_common::resources::mutating_admission_policy::PatchType;
 use rusternetes_common::resources::MutatingAdmissionPolicy;
@@ -77,12 +77,12 @@ fn compile_error(
     let probe = mutation_env_failure(expression, env, expected)
         .or_else(|| cel_versions::compile_failure(expression, env_set, env_type));
     // Default-off shadow run of the typed checker; never changes the result.
-    observe_mutation(
+    observe_expression(
         policy.name,
         &fld_path.to_string(),
         env_set,
         env_type,
-        &MutationExpression {
+        &PolicyExpression {
             expression,
             has_params: env.has_params,
             has_authorizer: env.has_authorizer,

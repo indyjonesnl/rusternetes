@@ -8,7 +8,10 @@ use rusternetes_common::authz::Authorizer;
 use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
 use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
 
-use rusternetes_common::resources::validating_admission_policy::ValidatingAdmissionPolicyStatus;
+use rusternetes_common::cel_mutation_types::{observe_expression, PolicyExpression};
+use rusternetes_common::resources::validating_admission_policy::{
+    ValidatingAdmissionPolicySpec, ValidatingAdmissionPolicyStatus,
+};
 use rusternetes_common::resources::ValidatingAdmissionPolicy;
 use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
@@ -70,6 +73,22 @@ fn spec_json(obj: &ValidatingAdmissionPolicy) -> Option<serde_json::Value> {
 /// `:1114`, `:1143`), keyed by the untrimmed expression. Upstream replicated:
 /// `validateVariable` keys on `validationExpressions` (:1012), there being no
 /// set of variable expressions.
+/// What the shadow checker needs to know about the policy being compiled.
+struct Shadow<'a> {
+    policy: &'a str,
+    /// The non-blank `spec.variables` as `(name, expression)`, in order.
+    variables: Vec<(String, String)>,
+}
+
+fn shadow_variables(spec: &ValidatingAdmissionPolicySpec) -> Vec<(String, String)> {
+    spec.variables
+        .iter()
+        .flatten()
+        .filter(|v| !v.name.trim().is_empty())
+        .map(|v| (v.name.clone(), v.expression.clone()))
+        .collect()
+}
+
 fn message_expression_errors(
     obj: &ValidatingAdmissionPolicy,
     preexisting: &PreexistingExpressions,
@@ -78,6 +97,7 @@ fn message_expression_errors(
     #[allow(clippy::too_many_arguments)]
     fn push(
         errs: &mut ErrorList,
+        shadow: &Shadow<'_>,
         path: Path,
         value: &str,
         compiled: &str,
@@ -85,10 +105,30 @@ fn message_expression_errors(
         expected: ExpectedOutput,
         stored: &std::collections::HashSet<String>,
         env_set: &EnvSet,
+        visible_variables: usize,
     ) {
-        if let Some(detail) = mutation_env_failure(compiled, env, expected).or_else(|| {
-            cel_versions::compile_failure(compiled, env_set, env_type_of(stored, value))
-        }) {
+        let env_type = env_type_of(stored, value);
+        let probe = mutation_env_failure(compiled, env, expected)
+            .or_else(|| cel_versions::compile_failure(compiled, env_set, env_type));
+        // Default-off shadow run of the checker with the output type check
+        // (`ReturnTypes()`); never changes the result.
+        observe_expression(
+            shadow.policy,
+            &path.to_string(),
+            env_set,
+            env_type,
+            &PolicyExpression {
+                expression: compiled,
+                has_params: env.has_params,
+                has_authorizer: env.has_authorizer,
+                has_patch_types: false,
+                expected,
+                variables: &shadow.variables[..visible_variables],
+                no_variables: env.variables.is_none(),
+            },
+            &probe,
+        );
+        if let Some(detail) = probe {
             errs.push(FieldError::invalid(&path, value.to_string(), detail));
         }
     }
@@ -98,6 +138,10 @@ fn message_expression_errors(
     };
     let has_params = spec.param_kind.is_some();
     let has_variables = spec.variables.as_ref().is_some_and(|v| !v.is_empty());
+    let shadow = Shadow {
+        policy: &obj.metadata.name,
+        variables: shadow_variables(spec),
+    };
     let all_names: std::collections::BTreeSet<String> = spec
         .variables
         .iter()
@@ -117,6 +161,7 @@ fn message_expression_errors(
             };
             push(
                 &mut errs,
+                &shadow,
                 Path::new("spec")
                     .child("variables")
                     .index(i)
@@ -127,6 +172,7 @@ fn message_expression_errors(
                 ExpectedOutput::Any,
                 &preexisting.validation_expressions,
                 env_set,
+                seen.len(),
             );
         }
         if !v.name.trim().is_empty() {
@@ -145,6 +191,7 @@ fn message_expression_errors(
         if !v.expression.trim().is_empty() {
             push(
                 &mut errs,
+                &shadow,
                 base.child("expression"),
                 &v.expression,
                 &v.expression,
@@ -152,12 +199,14 @@ fn message_expression_errors(
                 ExpectedOutput::Bool,
                 &preexisting.validation_expressions,
                 env_set,
+                shadow.variables.len(),
             );
         }
         if let Some(expression) = v.message_expression.as_deref() {
             if !expression.trim().is_empty() {
                 push(
                     &mut errs,
+                    &shadow,
                     base.child("messageExpression"),
                     expression,
                     expression,
@@ -165,6 +214,7 @@ fn message_expression_errors(
                     ExpectedOutput::String,
                     &preexisting.validation_message_expressions,
                     env_set,
+                    shadow.variables.len(),
                 );
             }
         }
@@ -178,6 +228,7 @@ fn message_expression_errors(
         }
         push(
             &mut errs,
+            &shadow,
             Path::new("spec")
                 .child("auditAnnotations")
                 .index(i)
@@ -188,6 +239,7 @@ fn message_expression_errors(
             ExpectedOutput::StringOrNull,
             &preexisting.audit_annotation_values_expressions,
             env_set,
+            shadow.variables.len(),
         );
     }
     errs
@@ -289,13 +341,29 @@ pub fn compile_errors_in(
         // `validateMatchConditionsExpression` (:1100-1104), keyed by the trimmed
         // expression `validateMatchCondition` passes (:988-991).
         let env_type = env_type_of(&preexisting.match_condition_expressions, expression);
-        if let Some(detail) = mutation_env_failure(expression, &env, ExpectedOutput::Bool)
-            .or_else(|| cel_versions::compile_failure(expression, env_set, env_type))
-        {
-            let path = Path::new("spec")
-                .child("matchConditions")
-                .index(i)
-                .child("expression");
+        let probe = mutation_env_failure(expression, &env, ExpectedOutput::Bool)
+            .or_else(|| cel_versions::compile_failure(expression, env_set, env_type));
+        let path = Path::new("spec")
+            .child("matchConditions")
+            .index(i)
+            .child("expression");
+        observe_expression(
+            &obj.metadata.name,
+            &path.to_string(),
+            env_set,
+            env_type,
+            &PolicyExpression {
+                expression,
+                has_params: env.has_params,
+                has_authorizer: true,
+                has_patch_types: false,
+                expected: ExpectedOutput::Bool,
+                variables: &[],
+                no_variables: true,
+            },
+            &probe,
+        );
+        if let Some(detail) = probe {
             errs.push(FieldError::invalid(&path, expression.to_string(), detail));
         }
     }

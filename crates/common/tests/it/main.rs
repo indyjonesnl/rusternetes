@@ -14,6 +14,7 @@ mod cel_checker_shadow;
 mod cel_crd_cost;
 mod cel_mutation_types;
 mod cel_openapi_resolver;
+mod cel_output_types;
 mod cel_policy_types;
 mod cel_schema_types;
 mod cel_struct_literals_test;

@@ -247,6 +247,69 @@ pub fn observe_scoped(
     }
 }
 
+/// [`check_expression`] for a CRD rule (`expected` `Bool`) or messageExpression
+/// (`String`) with the output type check of `compileRule`
+/// (`apiextensions-apiserver/.../schema/cel/compilation.go:217-219`:
+/// `ast.OutputType() != cel.BoolType` is `cel expression must evaluate to a
+/// bool`; `:260-262`: `!= cel.StringType` is `messageExpression must evaluate
+/// to a string`). The comparison is exact, so a `dyn` output (a schema-less
+/// field, an `x-kubernetes-int-or-string`) does not match.
+pub fn check_rule_output(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: Option<&SelfScope>,
+    expected: crate::cel_env::ExpectedOutput,
+) -> Option<Vec<String>> {
+    use crate::cel_env::ExpectedOutput;
+    let c = run_checker(expression, set, env_type, scope)?;
+    let mut errors = c.errors;
+    if errors.is_empty() {
+        let output = c.ast.output_type().cloned().unwrap_or(DType::Dyn);
+        match expected {
+            ExpectedOutput::Bool if output != DType::Bool => {
+                errors.push("cel expression must evaluate to a bool".to_string());
+            }
+            ExpectedOutput::String if output != DType::Str => {
+                errors.push("messageExpression must evaluate to a string".to_string());
+            }
+            _ => {}
+        }
+    }
+    Some(errors)
+}
+
+/// [`observe_scoped`] with the output type check of [`check_rule_output`]: the
+/// probe does not infer types, so a rule such as `self.x` that is not a bool
+/// is where the two are expected to differ. Never affects the probe's result.
+pub fn observe_rule_output(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    probe: &Option<String>,
+    scope: &SelfScope,
+    expected: crate::cel_env::ExpectedOutput,
+) {
+    if Mode::current() != Mode::Shadow {
+        return;
+    }
+    let Some(checker) = check_rule_output(expression, set, env_type, Some(scope), expected) else {
+        return;
+    };
+    if probe.is_some() != !checker.is_empty() {
+        tracing::warn!(
+            target: "cel_checker_shadow",
+            expression,
+            env_type = ?env_type,
+            typed = true,
+            version = ?set.compatibility_version(),
+            probe = ?probe,
+            checker = ?checker,
+            "cel checker disagrees with the compile probe"
+        );
+    }
+}
+
 /// The static cost estimate of a CRD rule: `ruleEnv.EstimateCost(ast,
 /// estimator)` of `compilation.go` `compileRule`, with the estimator of
 /// `newCostEstimator(declType)` (the library estimator over the schema size

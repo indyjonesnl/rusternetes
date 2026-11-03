@@ -6,7 +6,7 @@
 
 use rusternetes_common::cel_env::ExpectedOutput;
 use rusternetes_common::cel_mutation_types::{
-    check_mutation_expression, mutation_divergence, MutationExpression,
+    check_mutation_expression, mutation_divergence, PolicyExpression,
 };
 use rusternetes_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
 
@@ -14,8 +14,8 @@ fn set() -> EnvSet {
     EnvSet::must_base_env_set(default_compatibility_version())
 }
 
-fn expr<'a>(src: &'a str, expected: ExpectedOutput) -> MutationExpression<'a> {
-    MutationExpression {
+fn expr<'a>(src: &'a str, expected: ExpectedOutput) -> PolicyExpression<'a> {
+    PolicyExpression {
         expression: src,
         has_params: false,
         has_authorizer: true,
@@ -26,7 +26,7 @@ fn expr<'a>(src: &'a str, expected: ExpectedOutput) -> MutationExpression<'a> {
     }
 }
 
-fn errors_in(e: &MutationExpression<'_>) -> Vec<String> {
+fn errors_in(e: &PolicyExpression<'_>) -> Vec<String> {
     check_mutation_expression(&set(), EnvType::StoredExpressions, e).expect("parses")
 }
 

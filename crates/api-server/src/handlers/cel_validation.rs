@@ -26,6 +26,7 @@ use rusternetes_common::cel_cost::{
     CostEvalError, CostOptions, MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES,
     RUNTIME_CEL_COST_BUDGET,
 };
+use rusternetes_common::cel_env::ExpectedOutput;
 use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
 use rusternetes_common::resources::{
     CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
@@ -750,12 +751,13 @@ fn compile_schema_rules(
         // Default-off shadow run of the schema-typed checker (`self` typed by
         // the node's `SchemaDeclType`); never changes `failure`.
         if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_scoped(
+            cel_checker_shadow::observe_rule_output(
                 rule,
                 env_set,
                 pre.rule_env(rule),
                 &failure,
-                Some(&scope),
+                &scope,
+                ExpectedOutput::Bool,
             );
         }
         if let Some(detail) = failure {
@@ -808,12 +810,13 @@ fn compile_schema_rules(
                     .map(|e| format!("messageExpression compilation failed: {e}"))
             });
         if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_scoped(
+            cel_checker_shadow::observe_rule_output(
                 me,
                 env_set,
                 pre.message_expression_env(me),
                 &me_failure,
-                Some(&scope),
+                &scope,
+                ExpectedOutput::String,
             );
         }
         if let Some(detail) = me_failure {
