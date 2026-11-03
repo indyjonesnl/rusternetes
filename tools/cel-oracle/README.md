@@ -14,7 +14,8 @@ the real thing.
 # build (set GOTOOLCHAIN=go1.25.x if the system Go is older than the checkout needs)
 K8S_SRC=/path/to/kubernetes tools/cel-oracle/build.sh /tmp/celoracle
 
-# regenerate crates/cel-checker/tests/corpus/goldens.jsonl from requests.jsonl
+# regenerate crates/cel-checker/tests/corpus/goldens.jsonl from requests.jsonl,
+# and crates/common/tests/corpus/crd_goldens.jsonl from crd_requests.jsonl
 CEL_ORACLE=/tmp/celoracle tools/cel-oracle/gen-goldens.sh
 
 # check that the checked-in goldens are what the oracle says today
@@ -25,6 +26,12 @@ Normal test runs compare the Rust checker with the checked-in goldens
 (`goldens::checker_matches_goldens`) and need no Go. Divergences that are not
 fixed yet are listed, with reasons, in `KNOWN_DIVERGENCES` in
 `crates/cel-checker/tests/it/goldens.rs`.
+
+A request with a `schema` (a structural OpenAPI v3 schema) is a CRD rule: the
+oracle compiles `expr` as its `x-kubernetes-validations` rule with
+apiextensions-apiserver `schema/cel` `Compile` and returns `maxCost` and
+`maxCardinality`. `cel_crd_cost_goldens::crd_rule_costs_match_the_oracle` in
+`crates/common` compares them with `cel_schema_types` / `cel_crd_cost`.
 
 Protocol: one JSON object per line, see the header of `main.go`. A failed
 compile also returns the `common.Location` of each issue (`locations`, parallel

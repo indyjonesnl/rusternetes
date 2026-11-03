@@ -14,7 +14,12 @@
 //	           "kubeVersion": "1.35",               // default 1.35
 //	           "envType": "new" | "stored",         // default "new"
 //	           "libs": ["jsonpatch"],               // extra libraries
-//	           "patchTypes": true}                  // Object / JSONPatch types
+//	           "patchTypes": true,                  // Object / JSONPatch types
+//	           "schema": {"type": "string", "maxLength": 3}}
+//	           // a CRD rule: "expr" is an x-kubernetes-validations rule of the
+//	           // structural schema (an OpenAPI v3 JSONSchemaProps), compiled by
+//	           // apiextensions-apiserver schema/cel Compile with the schema's
+//	           // DeclType and size estimator
 //	response: {"ok": true, "errors": [], "outputType": "bool",
 //	           // on failure, parallel to "errors": the common.Location of each
 //	           // issue (1-based line, 0-based column) and Issues.String()
@@ -22,6 +27,8 @@
 //	           "display": "ERROR: <input>:1:1: ...",
 //	           "cost": {"min": 1, "max": 2},
 //	           "evalResult": {"type": "bool", "value": "true"}}
+//	crd rule response (schema set): {"ok": true, "errors": [],
+//	           "maxCost": 12, "maxCardinality": 500000}
 //
 // Type syntax: bool int uint double string bytes dyn null timestamp duration,
 // list(T), map(K, V), optional(T).
@@ -38,7 +45,13 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker"
 
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	celschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel/model"
 	"k8s.io/apimachinery/pkg/util/version"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	"k8s.io/apiserver/pkg/cel/common"
 	"k8s.io/apiserver/pkg/cel/environment"
 	"k8s.io/apiserver/pkg/cel/library"
@@ -53,6 +66,7 @@ type request struct {
 	EnvType     string                     `json:"envType"`
 	Libs        []string                   `json:"libs"`
 	PatchTypes  bool                       `json:"patchTypes"`
+	Schema      json.RawMessage            `json:"schema"`
 }
 
 type cost struct {
@@ -79,6 +93,9 @@ type response struct {
 	OutputType string      `json:"outputType,omitempty"`
 	Cost       *cost       `json:"cost,omitempty"`
 	EvalResult *evalResult `json:"evalResult,omitempty"`
+	// MaxCost and MaxCardinality of a CRD rule (`CompilationResult`).
+	MaxCost        *uint64 `json:"maxCost,omitempty"`
+	MaxCardinality *uint64 `json:"maxCardinality,omitempty"`
 }
 
 func main() {
@@ -116,6 +133,9 @@ func handle(req request) (resp response) {
 	ver, err := parseVersion(req.KubeVersion)
 	if err != nil {
 		return response{Errors: []string{err.Error()}}
+	}
+	if len(req.Schema) > 0 {
+		return handleSchema(req, ver)
 	}
 	envType := environment.NewExpressions
 	if req.EnvType == "stored" {
@@ -290,3 +310,39 @@ func splitArgs(s string) ([]string, error) {
 }
 
 var _ = checker.UnknownCostEstimate
+
+// handleSchema compiles `req.Expr` as an `x-kubernetes-validations` rule of the
+// structural schema `req.Schema`, as the CRD validation does
+// (`apiextensions-apiserver/pkg/apiserver/schema/cel` `Compile`: the schema's
+// `DeclType`, `compileRule`, and the `sizeEstimator` cost estimate).
+func handleSchema(req request, ver *version.Version) response {
+	var props apiextensionsv1.JSONSchemaProps
+	if err := json.Unmarshal(req.Schema, &props); err != nil {
+		return response{Errors: []string{"bad schema: " + err.Error()}}
+	}
+	props.XValidations = apiextensionsv1.ValidationRules{{Rule: req.Expr}}
+	var internal apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&props, &internal, nil); err != nil {
+		return response{Errors: []string{"bad schema: " + err.Error()}}
+	}
+	s, err := structuralschema.NewStructural(&internal)
+	if err != nil {
+		return response{Errors: []string{"bad schema: " + err.Error()}}
+	}
+	loader := celschema.NewExpressionsEnvLoader()
+	if req.EnvType == "stored" {
+		loader = celschema.StoredExpressionsEnvLoader()
+	}
+	results, err := celschema.Compile(s, model.SchemaDeclType(s, false), celconfig.PerCallLimit, environment.MustBaseEnvSet(ver), loader)
+	if err != nil {
+		return response{Errors: []string{err.Error()}}
+	}
+	if len(results) != 1 {
+		return response{Errors: []string{"no compilation result"}}
+	}
+	r := results[0]
+	if r.Error != nil {
+		return response{Errors: []string{r.Error.Detail}}
+	}
+	return response{OK: true, MaxCost: &r.MaxCost, MaxCardinality: &r.MaxCardinality}
+}

@@ -383,3 +383,40 @@
 {"expr": "x", "vars": {"x": "list(dyn)"}}
 {"expr": "[x, [1]]", "vars": {"x": "list(dyn)"}}
 {"expr": "[x, [1]]", "vars": {"x": "list(int)"}}
+{"expr": "a.b.c", "vars": {"a.b.c": "int"}}
+{"expr": "a.b.c + 1", "vars": {"a.b.c": "int"}}
+{"expr": "a.b.c", "vars": {"a.b": "map(string, int)"}}
+{"expr": "a.b.c", "vars": {"a": "map(string, map(string, int))"}}
+{"expr": "a.b.c", "vars": {"a": "map(string, dyn)"}}
+{"expr": "a.b.c", "vars": {"a": "dyn"}}
+{"expr": "a.b.c", "vars": {"a.b": "dyn"}}
+{"expr": "a.b.c", "vars": {"a.b.c": "string", "a": "map(string, int)"}}
+{"expr": "a.b.c", "vars": {"a.b": "map(string, int)", "a": "map(string, map(string, string))"}}
+{"expr": "has(a.b.c)", "vars": {"a.b": "map(string, int)"}}
+{"expr": "a.b.size()", "vars": {"a.b": "list(int)"}}
+{"expr": "a.b.c.size()", "vars": {"a.b.c": "list(int)"}}
+{"expr": "a.b.c.d", "vars": {"a.b.c": "int"}}
+{"expr": "a.b.c", "vars": {"a.b": "int"}}
+{"expr": "x.y.z.all(i, i > 0)", "vars": {"x.y": "map(string, list(int))"}}
+{"expr": "[a.b.c, a.b.d]", "vars": {"a.b": "map(string, string)"}}
+{"expr": "a.b == 'x' && a.c == 'y'", "vars": {"a.b": "string", "a.c": "string"}}
+{"expr": "s.replace('a', 'b')", "vars": {"s": "string"}}
+{"expr": "s.replace('a', 'b', 2)", "vars": {"s": "string"}}
+{"expr": "s.replace('a', 'b', -1)", "vars": {"s": "string"}}
+{"expr": "s.replace('a', 'b', 0)", "vars": {"s": "string"}}
+{"expr": "s.replace('', 'b')", "vars": {"s": "string"}}
+{"expr": "s.replace('a', '')", "vars": {"s": "string"}}
+{"expr": "s.replace('', '', 5)", "vars": {"s": "string"}}
+{"expr": "s.replace('abc', 'defgh', 9223372036854775807)", "vars": {"s": "string"}}
+{"expr": "s.replace(s, s, 9223372036854775807)", "vars": {"s": "string"}}
+{"expr": "s.replace(s, s)", "vars": {"s": "string"}}
+{"expr": "s.replace(s, s, 3)", "vars": {"s": "string"}}
+{"expr": "s.replace('x', s, -9223372036854775807)", "vars": {"s": "string"}}
+{"expr": "'abc'.replace('b', 'c')"}
+{"expr": "'abc'.replace('b', 'c', 1)"}
+{"expr": "'abc'.replace('', 'c', 100)"}
+{"expr": "'abc'.replace('', 'c', 1.5)"}
+{"expr": "s.replace('a', 'b', 1u)", "vars": {"s": "string"}}
+{"expr": "s.replace('a', 'b', 2.0)", "vars": {"s": "string"}}
+{"expr": "s.replace(s.replace(s, s), s)", "vars": {"s": "string"}}
+{"expr": "s.replace('a', 'b').replace('c', 'd', 3)", "vars": {"s": "string"}}
