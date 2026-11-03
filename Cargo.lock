@@ -4486,6 +4486,7 @@ dependencies = [
  "rusternetes-common",
  "rusternetes-controller-core",
  "rusternetes-csi",
+ "rusternetes-discovery",
  "rusternetes-middleware",
  "rusternetes-storage",
  "rustls 0.23.40",

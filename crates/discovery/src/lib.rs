@@ -10,6 +10,7 @@ pub mod deferred_restmapper;
 pub mod deleted_kinds;
 pub mod kube_version;
 pub mod restmapper;
+pub mod vap_typechecking;
 
 /// Version information (`apimachinery/pkg/version.Info`).
 pub use rusternetes_common::compatibility::VersionInfo;

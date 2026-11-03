@@ -1926,6 +1926,28 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Start the ValidatingAdmissionPolicy status controller
+    // (`newValidatingAdmissionPolicyStatusController`,
+    // cmd/kube-controller-manager/app/validatingadmissionpolicystatus.go:41-77):
+    // no feature gate, enabled by default.
+    {
+        let vap_status = Arc::new(controllers::vap_status::VapStatusController::new(
+            storage.clone(),
+        ));
+        spawn_controller!(
+            "ValidatingAdmissionPolicy status controller",
+            leader_elector,
+            {
+                let controller = vap_status.clone();
+                async move {
+                    if let Err(e) = controller.run().await {
+                        tracing::error!("ValidatingAdmissionPolicy status controller error: {}", e);
+                    }
+                }
+            }
+        );
+    }
+
     // Start Namespace controller (watch-based). Hand it the CA cert so it can
     // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
     // same dir the metrics/cert paths use above).
