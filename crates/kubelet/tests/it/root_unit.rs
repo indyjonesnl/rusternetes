@@ -27,6 +27,7 @@ mod runtime;
 mod runtime_state;
 mod server;
 mod server_auth;
+mod server_cri_metrics;
 mod server_debug;
 mod server_logs;
 mod server_metrics;
