@@ -34,6 +34,7 @@ pub mod errors;
 pub mod ext_cost;
 pub mod library_cost;
 pub mod overload_ids;
+pub mod parser;
 pub mod table;
 pub mod types;
 pub mod unify;

@@ -20,7 +20,6 @@
 
 use crate::cel_versions::{EnvSet, EnvType};
 use crate::feature_gates::{self, Feature};
-use cel::parser::Parser;
 use rusternetes_cel_checker as checker;
 use rusternetes_cel_checker::decl::{DeclType, DeclTypeProvider};
 use rusternetes_cel_checker::DType;
@@ -137,15 +136,12 @@ fn run_checker(
 ) -> Option<Checked> {
     let source = expression.to_string();
     // The antlr4rust parser panics on some invalid expressions.
-    let (parsed, source_info) = std::panic::catch_unwind(|| {
-        Parser::new()
-            .enable_optional_syntax(true)
-            .parse_with_source_info(&source)
-    })
-    .ok()?
-    .ok()?;
     let version = set.compatibility_version();
     let (env_set, ct) = checker_env_set(set, env_type);
+    let (parsed, source_info) =
+        std::panic::catch_unwind(|| env_set.parser(ct).parse_with_source_info(&source))
+            .ok()?
+            .ok()?;
     let stored = env_type == EnvType::StoredExpressions;
     let (provider, scoped): (Arc<dyn checker::Provider>, Option<DeclType>) = match scope {
         Some(scope) => {

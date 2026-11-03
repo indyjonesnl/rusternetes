@@ -338,3 +338,30 @@
 {"expr": "[1, 2].map(x,\n  x + undeclared)"}
 {"expr": "[1, 'a'].map(x, x)"}
 {"expr": "[1, 'a'].map(x,\n  x + undeclared)"}
+{"expr": "[1, 3, 2].sortBy(x, -x)"}
+{"expr": "[1, 3, 2].sortBy(x, -x)", "kubeVersion": "1.33"}
+{"expr": "[1, 3, 2].sortBy(x, -x)", "kubeVersion": "1.33", "envType": "stored"}
+{"expr": "['b', 'a'].sortBy(x, 1)"}
+{"expr": "[1, 2].sortBy(x, [x])"}
+{"expr": "[1, 2].sortBy(1, x)"}
+{"expr": "[[1], [2]].sortBy(x, x[0])"}
+{"expr": "[1, 2].exists(i, v, i < v)"}
+{"expr": "[1, 2].exists(i, v, i < v)", "kubeVersion": "1.31"}
+{"expr": "[1, 2].exists(i, v, i < v)", "kubeVersion": "1.31", "envType": "stored"}
+{"expr": "[1, 2].all(i, v, v > i)"}
+{"expr": "{'a': 1}.all(k, v, v > 0 && k != '')"}
+{"expr": "[1, 2].existsOne(i, v, v == i)"}
+{"expr": "[1, 2].exists_one(i, v, v == i)"}
+{"expr": "[1, 2].exists(i, i, true)"}
+{"expr": "[1, 2].exists(1, v, true)"}
+{"expr": "[1, 2].all(i, v, v)"}
+{"expr": "[1, 2].transformList(i, v, v + i)"}
+{"expr": "[1, 2].transformList(i, v, v > 1, string(v))"}
+{"expr": "{'a': 1}.transformList(k, v, k + string(v))"}
+{"expr": "[1, 2].transformMap(i, v, v + 1)"}
+{"expr": "[1, 2].transformMap(i, v, v > 1, string(v))"}
+{"expr": "{'a': 1}.transformMap(k, v, v + 1)"}
+{"expr": "{'a': 1}.transformMapEntry(k, v, {v: k})"}
+{"expr": "[1, 2].transformMapEntry(i, v, v > 1, {string(v): i})"}
+{"expr": "[1, 2].transformList(i, v, undeclared)"}
+{"expr": "[1, 2].transformMap(i, v, 1, 2, 3)"}

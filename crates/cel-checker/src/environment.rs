@@ -60,6 +60,8 @@ pub struct VersionedOptions {
     pub optional_types: bool,
     /// `ext.TwoVarComprehensions()` (macros only, declares no function).
     pub two_var_comprehensions: bool,
+    /// `ext.Lists(..)`'s `sortBy` macro.
+    pub sort_by_macro: bool,
     /// The function libraries the options install.
     pub libraries: &'static [Library],
 }
@@ -79,6 +81,7 @@ const NONE: VersionedOptions = VersionedOptions {
     cross_type_numeric_comparisons: false,
     optional_types: false,
     two_var_comprehensions: false,
+    sort_by_macro: false,
     libraries: &[],
 };
 
@@ -140,6 +143,7 @@ pub static BASE_OPTS: &[VersionedOptions] = &[
     VersionedOptions {
         introduced: v(32),
         two_var_comprehensions: true,
+        libraries: &[table::two_var_comprehensions],
         ..NONE
     },
     VersionedOptions {
@@ -149,6 +153,7 @@ pub static BASE_OPTS: &[VersionedOptions] = &[
     },
     VersionedOptions {
         introduced: v(34),
+        sort_by_macro: true,
         libraries: &[table::ext_lists],
         ..NONE
     },
@@ -251,5 +256,10 @@ impl EnvSet {
     /// (`ext.TwoVarComprehensions`).
     pub fn two_var_comprehensions(&self, t: EnvType) -> bool {
         self.opts(t).iter().any(|o| o.two_var_comprehensions)
+    }
+
+    /// Whether the `sortBy` macro is enabled (`ext.Lists`).
+    pub fn sort_by_macro(&self, t: EnvType) -> bool {
+        self.opts(t).iter().any(|o| o.sort_by_macro)
     }
 }
