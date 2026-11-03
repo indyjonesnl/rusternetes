@@ -331,3 +331,10 @@
 {"expr": "Object{?a: optional.of(1)}", "patchTypes": true}
 {"expr": "JSONPatch{op: 1}", "patchTypes": true}
 {"expr": "Invalid{}", "patchTypes": true}
+{"expr": "foo ||\n  bar"}
+{"expr": "'é' + 1"}
+{"expr": "1 +\n\t'a'"}
+{"expr": "'日本語' + 1 + foo"}
+{"expr": "[1, 2].map(x,\n  x + undeclared)"}
+{"expr": "[1, 'a'].map(x, x)"}
+{"expr": "[1, 'a'].map(x,\n  x + undeclared)"}

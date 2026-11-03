@@ -213,12 +213,20 @@ impl PolicyTypeContext {
     }
 }
 
-fn parse(expression: &str) -> Option<cel::common::ast::IdedExpr> {
+/// The parsed expression with its `SourceInfo`, which locates the checker's
+/// errors (`SourceInfo.GetStartLocation`).
+type Parsed = (cel::common::ast::IdedExpr, cel::common::ast::SourceInfo);
+
+fn parse(expression: &str) -> Option<Parsed> {
     let source = expression.to_string();
     // The antlr4rust parser panics on some invalid expressions.
-    std::panic::catch_unwind(|| Parser::new().enable_optional_syntax(true).parse(&source))
-        .ok()?
-        .ok()
+    std::panic::catch_unwind(|| {
+        Parser::new()
+            .enable_optional_syntax(true)
+            .parse_with_source_info(&source)
+    })
+    .ok()?
+    .ok()
 }
 
 /// Which of the optional declarations of the environment an expression is
@@ -244,6 +252,10 @@ pub struct CheckOptions {
 #[derive(Clone, Debug, Default)]
 pub struct PolicyCheck {
     pub errors: Vec<String>,
+    /// The errors as `Errors.ToDisplayString` renders them: `line:column`,
+    /// the source line and an indicator (`compile.go:186`,
+    /// `"compilation failed: "+issues.String()`). Empty when it type-checks.
+    pub display: String,
     pub output: Option<DType>,
 }
 
@@ -288,7 +300,7 @@ pub fn check_policy_expression_with(
     for (name, expr) in &ctx.variables {
         // The output type of a variable that does not compile is `nil`: `dyn`.
         let out = parse(expr).and_then(|p| {
-            let (ast, errs) = run(set, env_type, ctx, &variable_opts, &fields, &p);
+            let (ast, errs, _) = run(set, env_type, ctx, &variable_opts, &fields, &p, expr);
             errs.is_empty()
                 .then(|| ast.and_then(|a| a.output_type().cloned()))?
         });
@@ -301,12 +313,16 @@ pub fn check_policy_expression_with(
             },
         );
     }
-    let (ast, errors) = run(set, env_type, ctx, opts, &fields, &parsed);
+    let (ast, errors, display) = run(set, env_type, ctx, opts, &fields, &parsed, expression);
     let output = errors
         .is_empty()
         .then(|| ast.and_then(|a| a.output_type().cloned()))
         .flatten();
-    Some(PolicyCheck { errors, output })
+    Some(PolicyCheck {
+        errors,
+        display,
+        output,
+    })
 }
 
 /// One check in the environment with the given `variables` fields.
@@ -316,8 +332,9 @@ fn run(
     ctx: &PolicyTypeContext,
     opts: &CheckOptions,
     variable_fields: &BTreeMap<String, DeclField>,
-    parsed: &cel::common::ast::IdedExpr,
-) -> (Option<checker::CheckedAst>, Vec<String>) {
+    (parsed, source_info): &Parsed,
+    source: &str,
+) -> (Option<checker::CheckedAst>, Vec<String>, String) {
     let (env_set, ct) = checker_env_set(set, env_type);
     let version = set.compatibility_version();
     let keywords =
@@ -375,7 +392,8 @@ fn run(
     if opts.has_patch_types {
         env.add_library(checker::table::jsonpatch);
     }
-    let (ast, errors) = checker::check(parsed, &mut env, &checker::NoLocations);
+    let locator = checker::SourceLocator::new(source_info, source);
+    let (ast, errors) = checker::check(parsed, &mut env, &locator);
     let msgs = errors.errors().iter().map(|e| e.message.clone()).collect();
-    (Some(ast), msgs)
+    (Some(ast), msgs, errors.to_display_string(Some(source)))
 }
