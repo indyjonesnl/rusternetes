@@ -84,6 +84,23 @@ fn a_type_error_is_found_where_the_untyped_probe_accepts() {
 }
 
 #[test]
+fn a_divergence_carries_the_located_checker_errors() {
+    let p = deployments(json!({"validations": [
+        {"expression": "object.spec.replicasX > 0"},
+    ]}));
+    let d = typed_divergences(&p, &set());
+    assert_eq!(d.len(), 1, "{d:?}");
+    // `Errors.ToDisplayString`: `line:column`, then the source with a caret.
+    assert!(
+        d[0].display
+            .starts_with("ERROR: <input>:1:12: undefined field 'replicasX'\n"),
+        "{}",
+        d[0].display
+    );
+    assert!(d[0].display.contains("object.spec.replicasX > 0"));
+}
+
+#[test]
 fn old_object_request_namespace_and_authorizer_are_declared() {
     let p = deployments(json!({"validations": [
         {"expression": "oldObject.metadata.name == object.metadata.name"},
