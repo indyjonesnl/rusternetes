@@ -7,6 +7,7 @@
 //! lives in [`super::hints`].
 
 use super::scheduling_queue::{PreEnqueuePlugin, PreEnqueuePluginMap};
+use crate::async_preemption::{AsyncPreemption, DefaultPreemptionPreEnqueue};
 use crate::framework_runtime::{names, ExtensionPoint};
 use crate::profile::Profile;
 use rusternetes_common::resources::Pod;
@@ -44,6 +45,16 @@ impl PreEnqueuePlugin for SchedulingGates {
 pub fn build_pre_enqueue_plugin_map<'a>(
     profiles: impl IntoIterator<Item = &'a Profile>,
 ) -> PreEnqueuePluginMap {
+    build_pre_enqueue_plugin_map_with_preemption(profiles, None)
+}
+
+/// [`build_pre_enqueue_plugin_map`] that also instantiates DefaultPreemption's
+/// PreEnqueue (default_preemption.go:134-144) over the shared async-preemption
+/// state. Without `preemption` that plugin is skipped.
+pub fn build_pre_enqueue_plugin_map_with_preemption<'a>(
+    profiles: impl IntoIterator<Item = &'a Profile>,
+    preemption: Option<&Arc<AsyncPreemption>>,
+) -> PreEnqueuePluginMap {
     let mut map = PreEnqueuePluginMap::new();
     for p in profiles {
         let plugins: Vec<Arc<dyn PreEnqueuePlugin>> = p
@@ -54,6 +65,10 @@ pub fn build_pre_enqueue_plugin_map<'a>(
                 names::SCHEDULING_GATES => {
                     Some(Arc::new(SchedulingGates) as Arc<dyn PreEnqueuePlugin>)
                 }
+                names::DEFAULT_PREEMPTION => preemption.map(|state| {
+                    Arc::new(DefaultPreemptionPreEnqueue::new(Arc::clone(state)))
+                        as Arc<dyn PreEnqueuePlugin>
+                }),
                 _ => None,
             })
             .collect();
