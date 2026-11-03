@@ -89,15 +89,15 @@ pub enum SelectorCompilation {
 pub fn compile_selector(expression: &str) -> SelectorCompilation {
     let source = expression.to_string();
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cel::parser::Parser::new().parse(&source)
+        cel::Program::compile(&source)
     }));
-    let Ok(Ok(root)) = parsed else {
+    let Ok(Ok(program)) = parsed else {
         return SelectorCompilation::Ok { max_cost: 0 };
     };
 
-    let mut checker = Checker::new(expression);
+    let mut checker = Checker::new(expression, program.source_info());
     let mut scope: Vec<(String, Ty)> = Vec::new();
-    let out = checker.infer(&root, &mut scope);
+    let out = checker.infer(program.expression(), &mut scope);
     if let Some(msg) = checker.errors_display() {
         return SelectorCompilation::Invalid(format!("compilation failed: {msg}"));
     }
@@ -109,7 +109,7 @@ pub fn compile_selector(expression: &str) -> SelectorCompilation {
     }
 
     let mut coster = Coster::new(&checker.types);
-    let cost = coster.cost(&root);
+    let cost = coster.cost(program.expression());
     SelectorCompilation::Ok { max_cost: cost.max }
 }
 
@@ -712,15 +712,15 @@ struct Checker<'a> {
     /// `(line, column, rendered)` of every reported error, `common.Errors`.
     errors: Vec<(usize, usize, String)>,
     types: HashMap<u64, Ty>,
-    /// Token offsets of every expression ID, see [`source_info_for`].
-    source_info: Option<std::sync::Arc<cel::common::ast::SourceInfo>>,
+    /// Token offsets of every expression ID (`Program::source_info`).
+    source_info: &'a cel::common::ast::SourceInfo,
 }
 
 impl<'a> Checker<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new(source: &'a str, source_info: &'a cel::common::ast::SourceInfo) -> Self {
         let (brackets, dots) = operator_offsets(source);
         Self {
-            source_info: source_info_for(source),
+            source_info,
             source,
             brackets,
             dots,
@@ -1065,7 +1065,7 @@ impl Checker<'_> {
     /// The character offset of the token of expression `id`
     /// (`common.Source.OffsetLocation(sourceInfo.GetStartOffset(id))`).
     fn id_offset(&self, id: u64) -> Option<usize> {
-        let (start, _) = self.source_info.as_ref()?.offset_for(id)?;
+        let (start, _) = self.source_info.offset_for(id)?;
         // The parser counts bytes; every other offset here counts characters.
         let bytes = self.source.as_bytes();
         let start = (start as usize).min(bytes.len());
@@ -1136,20 +1136,6 @@ impl Checker<'_> {
                 ),
             );
         }
-    }
-}
-
-/// The parser keeps the offset of every expression ID in its `SourceInfo`
-/// but drops it when the parse succeeds, so the expression is parsed once
-/// more with a trailing `)` that makes the parse fail: the identifiers the
-/// parser hands out are the same, and the error carries the `SourceInfo`.
-fn source_info_for(source: &str) -> Option<std::sync::Arc<cel::common::ast::SourceInfo>> {
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cel::parser::Parser::new().parse(&format!("{source}\n)"))
-    }));
-    match r {
-        Ok(Err(e)) => e.errors.first()?.source_info.clone(),
-        _ => None,
     }
 }
 
