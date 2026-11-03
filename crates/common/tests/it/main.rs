@@ -12,6 +12,7 @@
 mod authz_rbac_node;
 mod cel_checker_shadow;
 mod cel_crd_cost;
+mod cel_crd_cost_goldens;
 mod cel_mutation_types;
 mod cel_openapi_resolver;
 mod cel_output_types;

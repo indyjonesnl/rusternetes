@@ -1,0 +1,139 @@
+{"expr": "self == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.startsWith('a')", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.endsWith('a')", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.contains('a')", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.size() > 3", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.matches('^a+$')", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self + self == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.replace('a', 'b') == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.replace('a', 'b', 2) == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.replace(self, self) == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.lowerAscii() == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.split(',').size() > 1", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.trim() == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.indexOf('a') > 0", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.substring(1) == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.upperAscii() == self.lowerAscii()", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.format([self]) == 'x'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.charAt(0) == 'a'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.reverse() == 'a'", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self == 'x'", "schema": {"type": "string"}}
+{"expr": "self.startsWith('a')", "schema": {"type": "string"}}
+{"expr": "self.size() > 3", "schema": {"type": "string"}}
+{"expr": "self.matches('^a+$')", "schema": {"type": "string"}}
+{"expr": "self + self == 'x'", "schema": {"type": "string"}}
+{"expr": "self.replace('a', 'b') == 'x'", "schema": {"type": "string"}}
+{"expr": "self.replace(self, self, 100) == 'x'", "schema": {"type": "string"}}
+{"expr": "self.split(',').size() > 1", "schema": {"type": "string"}}
+{"expr": "self.lowerAscii() == 'x'", "schema": {"type": "string"}}
+{"expr": "self.indexOf('a') > 0", "schema": {"type": "string"}}
+{"expr": "self.all(x, x.size() > 1)", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.exists(x, x == 'a')", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.map(x, x + 'a').size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.filter(x, x == 'a').size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.size() > 2", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.join(',') == 'x'", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.all(x, x.matches('a'))", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.exists_one(x, x == 'b')", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.map(x, x.replace('a', 'b')).size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.sort().size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.sortBy(x, x).size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.distinct().size() > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.all(x, self.exists(y, x == y))", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.indexOf('a') > 0", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.isSorted()", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.exists(x, self.exists(y, self.exists(z, x == y + z)))", "schema": {"items": {"maxLength": 3, "type": "string"}, "maxItems": 5, "type": "array"}}
+{"expr": "self.all(x, x > 0)", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.exists(x, x == 1)", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.sum() > 3", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.max() > 3", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.size() > 0", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.all(x, self.all(y, x != y))", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.map(x, x * 2).size() > 0", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.sort().size() > 0", "schema": {"items": {"type": "integer"}, "type": "array"}}
+{"expr": "self.all(x, x.size() > 1)", "schema": {"items": {"type": "string"}, "type": "array"}}
+{"expr": "self.join(',') == 'x'", "schema": {"items": {"type": "string"}, "type": "array"}}
+{"expr": "self.exists(x, x.matches('a'))", "schema": {"items": {"type": "string"}, "type": "array"}}
+{"expr": "self.map(x, x + x).size() > 0", "schema": {"items": {"type": "string"}, "type": "array"}}
+{"expr": "self.all(x, x.replace('a', 'b') == 'c')", "schema": {"items": {"type": "string"}, "type": "array"}}
+{"expr": "self.all(r, r.all(v, v > 0))", "schema": {"items": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "maxItems": 4, "type": "array"}}
+{"expr": "self.exists(r, r.exists(v, v == 1))", "schema": {"items": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "maxItems": 4, "type": "array"}}
+{"expr": "self.size() > 1", "schema": {"items": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "maxItems": 4, "type": "array"}}
+{"expr": "self.all(r, r.size() > 1)", "schema": {"items": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "maxItems": 4, "type": "array"}}
+{"expr": "self.map(r, r.size()).sum() > 0", "schema": {"items": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "maxItems": 4, "type": "array"}}
+{"expr": "self.all(r, r.all(v, v > 0))", "schema": {"items": {"items": {"type": "integer"}, "type": "array"}, "type": "array"}}
+{"expr": "self.all(r, r.size() > 1)", "schema": {"items": {"items": {"type": "integer"}, "type": "array"}, "type": "array"}}
+{"expr": "self.exists(r, r.exists(v, v == 1))", "schema": {"items": {"items": {"type": "integer"}, "type": "array"}, "type": "array"}}
+{"expr": "self.a == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.a.size() > 1", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.b.all(x, x > 0)", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.all(k, self.c[k] == 'a')", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.size() > 0", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.d == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.d.size() > 0", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.e.f > 1", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "has(self.a) && self.a == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.b.size() > 1 && self.a.size() > 1", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.exists(k, k == 'a')", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.map(k, k).size() > 0", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.a.replace('a', self.d) == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.a + self.d == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.d.matches('^a+$')", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.all(k, k.size() > 1)", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c.all(k, self.c[k].size() > 1)", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.c['a'] == 'x'", "schema": {"properties": {"a": {"maxLength": 4, "type": "string"}, "b": {"items": {"type": "integer"}, "maxItems": 3, "type": "array"}, "c": {"additionalProperties": {"maxLength": 2, "type": "string"}, "maxProperties": 7, "type": "object"}, "d": {"type": "string"}, "e": {"properties": {"f": {"type": "integer"}}, "type": "object"}}, "type": "object"}}
+{"expr": "self.all(k, self[k] == 'a')", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self.size() > 0", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self.exists(k, k.startsWith('a'))", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self.all(k, self[k].size() > 1)", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self['a'] == 'b'", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self.map(k, k).size() > 0", "schema": {"additionalProperties": {"type": "string"}, "type": "object"}}
+{"expr": "self.all(k, self[k] > 0)", "schema": {"additionalProperties": {"type": "integer"}, "maxProperties": 3, "type": "object"}}
+{"expr": "self.size() > 0", "schema": {"additionalProperties": {"type": "integer"}, "maxProperties": 3, "type": "object"}}
+{"expr": "self.exists(k, self[k] == 1)", "schema": {"additionalProperties": {"type": "integer"}, "maxProperties": 3, "type": "object"}}
+{"expr": "self.all(k, k.size() > 2)", "schema": {"additionalProperties": {"type": "integer"}, "maxProperties": 3, "type": "object"}}
+{"expr": "self == 1", "schema": {"x-kubernetes-int-or-string": true}}
+{"expr": "self == 'a'", "schema": {"x-kubernetes-int-or-string": true}}
+{"expr": "self.size() > 1", "schema": {"x-kubernetes-int-or-string": true}}
+{"expr": "self == 'a'", "schema": {"maxLength": 5, "x-kubernetes-int-or-string": true}}
+{"expr": "self == 'a'", "schema": {"enum": ["a", "bcd", "ef"], "type": "string"}}
+{"expr": "self.size() > 1", "schema": {"enum": ["a", "bcd", "ef"], "type": "string"}}
+{"expr": "self.startsWith('a')", "schema": {"enum": ["a", "bcd", "ef"], "type": "string"}}
+{"expr": "self + self == 'x'", "schema": {"enum": ["a", "bcd", "ef"], "type": "string"}}
+{"expr": "self.size() > 1", "schema": {"format": "byte", "maxLength": 8, "type": "string"}}
+{"expr": "self == b'a'", "schema": {"format": "byte", "maxLength": 8, "type": "string"}}
+{"expr": "self.all(o, o.name.size() > 1)", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.exists(o, o.name == 'a')", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.all(o, o.n > 1)", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.map(o, o.name).size() > 0", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.all(o, self.exists(p, o.name == p.name))", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.map(o, o.name).all(n, n.startsWith('a'))", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"maxLength": 20, "type": "string"}}, "type": "object"}, "maxItems": 10, "type": "array"}}
+{"expr": "self.all(o, o.name.size() > 1)", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"type": "string"}}, "type": "object"}, "type": "array"}}
+{"expr": "self.exists(o, o.name == 'a')", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"type": "string"}}, "type": "object"}, "type": "array"}}
+{"expr": "self.all(o, self.exists(p, o.name == p.name))", "schema": {"items": {"properties": {"n": {"type": "integer"}, "name": {"type": "string"}}, "type": "object"}, "type": "array"}}
+{"expr": "self.replace('a', 'b') == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.replace('a', 'b', 10) == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.replace(self, self) == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.replace(self, self, 9223372036854775807) == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.matches('a')", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.startsWith('a')", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self + self == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.split(',').size() > 0", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.lowerAscii() == 'x'", "schema": {"maxLength": 1000000, "type": "string"}}
+{"expr": "self.all(x, x.matches('a'))", "schema": {"items": {"maxLength": 1000, "type": "string"}, "maxItems": 1000000, "type": "array"}}
+{"expr": "self.all(x, x.replace('a', 'b') == 'c')", "schema": {"items": {"maxLength": 1000, "type": "string"}, "maxItems": 1000000, "type": "array"}}
+{"expr": "self.exists(x, self.exists(y, x == y))", "schema": {"items": {"maxLength": 1000, "type": "string"}, "maxItems": 1000000, "type": "array"}}
+{"expr": "self.map(x, x + x).size() > 0", "schema": {"items": {"maxLength": 1000, "type": "string"}, "maxItems": 1000000, "type": "array"}}
+{"expr": "self.join(',') == 'x'", "schema": {"items": {"maxLength": 1000, "type": "string"}, "maxItems": 1000000, "type": "array"}}
+{"expr": "self.all(x, x > 0)", "schema": {"items": {"type": "integer"}, "maxItems": 4611686018427387904, "type": "array"}}
+{"expr": "self.all(x, self.all(y, x != y))", "schema": {"items": {"type": "integer"}, "maxItems": 4611686018427387904, "type": "array"}}
+{"expr": "self.size() > 0", "schema": {"items": {"type": "integer"}, "maxItems": 4611686018427387904, "type": "array"}}
+{"expr": "self.replace('a', 'b') == 'x'", "schema": {"maxLength": 9223372036854775807, "type": "string"}}
+{"expr": "self == 'x'", "schema": {"maxLength": 9223372036854775807, "type": "string"}}
+{"expr": "self + self == 'x'", "schema": {"maxLength": 9223372036854775807, "type": "string"}}
+{"expr": "self.replace(self, self, 100) == 'x'", "schema": {"maxLength": 9223372036854775807, "type": "string"}}
+{"expr": "self == 'x'", "kubeVersion": "1.30", "schema": {"type": "string"}}
+{"envType": "stored", "expr": "self == 'x'", "schema": {"type": "string"}}
+{"expr": "self.sortBy(x, x) == 1", "schema": {"maxLength": 10, "type": "string"}}
+{"expr": "self.size()", "schema": {"maxLength": 10, "type": "string"}}

@@ -108,8 +108,13 @@ fn estimate_max_additional_properties_from_min_size(min_size: i64) -> i64 {
 
 /// `estimateMaxElementsFromMaxLength`: `maxLength` is in code points, and one
 /// can take up to 4 bytes. Only called with `max_length` set.
+///
+/// Go's `int64` multiplication wraps, so a `maxLength` above `i64::MAX / 4`
+/// yields a negative count that `sizeEstimator.EstimateSize` converts with
+/// `uint64(...)` (a huge size). Saturating here would diverge from the
+/// oracle's cost (`cel_crd_cost_goldens`).
 fn estimate_max_elements_from_max_length(s: &JSONSchemaProps) -> i64 {
-    zero_if_negative(s.max_length.unwrap_or(0)).saturating_mul(4)
+    zero_if_negative(s.max_length.unwrap_or(0)).wrapping_mul(4)
 }
 
 /// `SchemaDeclType`: the declaration of `s`, or `None` when the schema must

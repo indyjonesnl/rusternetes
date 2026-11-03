@@ -383,3 +383,40 @@
 {"req": {"expr": "x", "vars": {"x": "list(dyn)"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "list(dyn)"}}
 {"req": {"expr": "[x, [1]]", "vars": {"x": "list(dyn)"}}, "resp": {"display": "ERROR: <input>:1:5: expected type 'list(dyn)' but found 'list(int)'\n | [x, [1]]\n | ....^", "errors": ["expected type 'list(dyn)' but found 'list(int)'"], "locations": [{"column": 4, "line": 1}], "ok": false}}
 {"req": {"expr": "[x, [1]]", "vars": {"x": "list(int)"}}, "resp": {"cost": {"max": 21, "min": 21}, "errors": [], "ok": true, "outputType": "list(list(int))"}}
+{"req": {"expr": "a.b.c", "vars": {"a.b.c": "int"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c + 1", "vars": {"a.b.c": "int"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c", "vars": {"a.b": "map(string, int)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c", "vars": {"a": "map(string, map(string, int))"}}, "resp": {"cost": {"max": 3, "min": 3}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c", "vars": {"a": "map(string, dyn)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "a.b.c", "vars": {"a": "dyn"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "a.b.c", "vars": {"a.b": "dyn"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "dyn"}}
+{"req": {"expr": "a.b.c", "vars": {"a": "map(string, int)", "a.b.c": "string"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "a.b.c", "vars": {"a": "map(string, map(string, string))", "a.b": "map(string, int)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "has(a.b.c)", "vars": {"a.b": "map(string, int)"}}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "a.b.size()", "vars": {"a.b": "list(int)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c.size()", "vars": {"a.b.c": "list(int)"}}, "resp": {"cost": {"max": 2, "min": 2}, "errors": [], "ok": true, "outputType": "int"}}
+{"req": {"expr": "a.b.c.d", "vars": {"a.b.c": "int"}}, "resp": {"display": "ERROR: <input>:1:6: type 'int' does not support field selection\n | a.b.c.d\n | .....^", "errors": ["type 'int' does not support field selection"], "locations": [{"column": 5, "line": 1}], "ok": false}}
+{"req": {"expr": "a.b.c", "vars": {"a.b": "int"}}, "resp": {"display": "ERROR: <input>:1:4: type 'int' does not support field selection\n | a.b.c\n | ...^", "errors": ["type 'int' does not support field selection"], "locations": [{"column": 3, "line": 1}], "ok": false}}
+{"req": {"expr": "x.y.z.all(i, i > 0)", "vars": {"x.y": "map(string, list(int))"}}, "resp": {"cost": {"max": 18446744073709551615, "min": 3}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "[a.b.c, a.b.d]", "vars": {"a.b": "map(string, string)"}}, "resp": {"cost": {"max": 14, "min": 14}, "errors": [], "ok": true, "outputType": "list(string)"}}
+{"req": {"expr": "a.b == 'x' && a.c == 'y'", "vars": {"a.b": "string", "a.c": "string"}}, "resp": {"cost": {"max": 4, "min": 2}, "errors": [], "ok": true, "outputType": "bool"}}
+{"req": {"expr": "s.replace('a', 'b')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'b', 2)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'b', -1)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'b', 0)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('', 'b')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', '')", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('', '', 5)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('abc', 'defgh', 9223372036854775807)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910529, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace(s, s, 9223372036854775807)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace(s, s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace(s, s, 3)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910531, "min": 3}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('x', s, -9223372036854775807)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 3689348814741910530, "min": 2}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc'.replace('b', 'c')"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc'.replace('b', 'c', 1)"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc'.replace('', 'c', 100)"}, "resp": {"cost": {"max": 1, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "'abc'.replace('', 'c', 1.5)"}, "resp": {"display": "ERROR: <input>:1:14: found no matching overload for 'replace' applied to 'string.(string, string, double)'\n | 'abc'.replace('', 'c', 1.5)\n | .............^", "errors": ["found no matching overload for 'replace' applied to 'string.(string, string, double)'"], "locations": [{"column": 13, "line": 1}], "ok": false}}
+{"req": {"expr": "s.replace('a', 'b', 1u)", "vars": {"s": "string"}}, "resp": {"display": "ERROR: <input>:1:10: found no matching overload for 'replace' applied to 'string.(string, string, uint)'\n | s.replace('a', 'b', 1u)\n | .........^", "errors": ["found no matching overload for 'replace' applied to 'string.(string, string, uint)'"], "locations": [{"column": 9, "line": 1}], "ok": false}}
+{"req": {"expr": "s.replace('a', 'b', 2.0)", "vars": {"s": "string"}}, "resp": {"display": "ERROR: <input>:1:10: found no matching overload for 'replace' applied to 'string.(string, string, double)'\n | s.replace('a', 'b', 2.0)\n | .........^", "errors": ["found no matching overload for 'replace' applied to 'string.(string, string, double)'"], "locations": [{"column": 9, "line": 1}], "ok": false}}
+{"req": {"expr": "s.replace(s.replace(s, s), s)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 7378697629483821061, "min": 5}, "errors": [], "ok": true, "outputType": "string"}}
+{"req": {"expr": "s.replace('a', 'b').replace('c', 'd', 3)", "vars": {"s": "string"}}, "resp": {"cost": {"max": 7378697629483821057, "min": 1}, "errors": [], "ok": true, "outputType": "string"}}
