@@ -6003,33 +6003,16 @@ impl Kubelet {
     /// Liveness-restart status write, followed by the host-IP block of
     /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040).
     pub async fn apply_liveness_restart_status(&self, new_pod: &mut Pod) {
-        if let Some(ref mut status) = new_pod.status {
-            status.phase = Some(Phase::Running);
-            status.message = Some("Liveness probe failed".to_string());
-            status.reason = Some("Restarting".to_string());
-        } else {
-            // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
-            let (host_ip, host_ips) = self.host_ip_fields();
-            new_pod.status = Some(crate::pod_status::generate_api_pod_status(
-                new_pod,
-                crate::pod_status::ApiPodStatusInput {
-                    phase: Phase::Running,
-                    message: Some("Liveness probe failed".to_string()),
-                    reason: Some("Restarting".to_string()),
-                    host_ip,
-                    host_ips,
-                    pod_ip: None,
-                    pod_ips: None,
-                    conditions: Vec::new(),
-                    container_statuses: None,
-                    init_container_statuses: None,
-                    ephemeral_container_statuses: None,
-                    qos_class: None,
-                    start_time: chrono::Utc::now(),
-                    should_evict: None,
-                },
-            ));
-        }
+        // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs.
+        let input = crate::pod_status::ApiPodStatusInput::from_prior(
+            new_pod,
+            Phase::Running,
+            Some("Restarting".to_string()),
+            Some("Liveness probe failed".to_string()),
+            self.host_ip_fields(),
+            chrono::Utc::now(),
+        );
+        new_pod.status = Some(crate::pod_status::generate_api_pod_status(new_pod, input));
         self.apply_host_ips_to_pod(new_pod).await;
     }
 
@@ -6478,11 +6461,17 @@ impl Kubelet {
 
         let original = new_pod.clone();
 
-        let mut status = new_pod.status.take().unwrap_or_default();
-        status.phase = Some(phase);
-        status.reason = reason.map(|s| s.to_string());
-        status.message = message.map(|s| s.to_string());
-        new_pod.status = Some(status);
+        // generateAPIPodStatus (kubelet_pods.go:1889), see pod_status.rs:
+        // observed fields carry over, phase/reason/message are the override.
+        let input = crate::pod_status::ApiPodStatusInput::from_prior(
+            &new_pod,
+            phase,
+            reason.map(|s| s.to_string()),
+            message.map(|s| s.to_string()),
+            self.host_ip_fields(),
+            chrono::Utc::now(),
+        );
+        new_pod.status = Some(crate::pod_status::generate_api_pod_status(&new_pod, input));
 
         // Gate the write so a no-op call doesn't emit a MODIFIED watch event.
         if !pod_status_equal(&original, &new_pod) {
