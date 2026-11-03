@@ -10,12 +10,14 @@
 //! victims one by one (PDB-violating ones first, each group from the most
 //! important down), keeping a pod only if the preemptor still fits with it back.
 //!
-//! Deviations:
-//! - Upstream keeps one `CycleState` and patches it through
-//!   `PreFilterExtensions.AddPod`/`RemovePod`. Those are not ported yet
-//!   (`CycleState` is not clonable), so every fit check here runs PreFilter
-//!   again on the snapshot without the removed pods, which yields the state the
-//!   extensions would have produced.
+//! The PreFilter state is patched through `PreFilterExtensions`
+//! `AddPod`/`RemovePod` (`removePod`/`addPod`, :213-230), as upstream does,
+//! instead of being recomputed for every fit check.
+//!
+//! Deviation: upstream's `PostFilter` receives the cycle's `CycleState` and
+//! `SelectVictimsOnNode` works on a clone per node. The cycle's state is not
+//! handed to PostFilter here, so PreFilter runs once per candidate node on the
+//! full snapshot (the state upstream's clone starts from).
 
 use std::collections::HashSet;
 
@@ -24,7 +26,7 @@ use rusternetes_common::types::label_selector_as_selector;
 
 use crate::advanced::pod_key;
 use crate::framework_runtime::Framework;
-use crate::fwk::{Code, CycleState, Handle, Status};
+use crate::fwk::{Code, CycleState, Handle, NodeInfo, Status};
 
 /// `corev1helpers.PodPriority`.
 fn pod_priority(pod: &Pod) -> i32 {
@@ -156,33 +158,52 @@ pub async fn select_victims_on_node(
         ));
     }
 
-    // `RunFilterPluginsWithNominatedPods` on the node as the removed pods
-    // leave it (`removePod`/`addPod` plus the PreFilter extensions upstream).
-    let fits = |removed: &HashSet<String>| {
-        let view: Vec<Pod> = all_pods
+    // The node as the removed pods leave it: `nodeInfo.RemovePod/AddPodInfo`
+    // for the pod list the Filters read, and the PreFilter extensions for the
+    // plugin state. PreFilter runs once, on the full snapshot.
+    let mut state = CycleState::new();
+    let (_, status, _) = fw
+        .run_pre_filter_plugins(&mut state, pod, all_nodes, all_pods, handle)
+        .await;
+    if !status.is_success() {
+        return Err(status);
+    }
+    let view_without = |removed: &HashSet<String>| -> Vec<Pod> {
+        all_pods
             .iter()
             .filter(|p| !removed.contains(&pod_key(p)))
             .cloned()
-            .collect();
-        async move {
-            let mut state = CycleState::new();
-            let (_, status, _) = fw
-                .run_pre_filter_plugins(&mut state, pod, all_nodes, &view, handle)
-                .await;
-            if !status.is_success() {
-                return status;
-            }
-            let nominated = nominated_pods_for_node(pod, &view, node_name);
-            fw.run_filter_plugins_with_nominated_pods(
-                &state, pod, node, &view, all_nodes, nominated,
-            )
-            .await
-        }
+            .collect()
     };
+    // `RunFilterPluginsWithNominatedPods` over that node.
+    async fn fits(
+        fw: &Framework,
+        state: &CycleState,
+        pod: &Pod,
+        node: &Node,
+        view: &[Pod],
+        all_nodes: &[Node],
+    ) -> Status {
+        let nominated = nominated_pods_for_node(pod, view, &node.metadata.name);
+        fw.run_filter_plugins_with_nominated_pods(state, pod, node, view, all_nodes, nominated)
+            .await
+    }
 
     // First remove every eligible pod; without them the preemptor must fit.
     let mut removed: HashSet<String> = potential.iter().map(|p| pod_key(p)).collect();
-    let status = fits(&removed).await;
+    let mut view = view_without(&removed);
+    for p in &potential {
+        let status = fw.run_pre_filter_extension_remove_pod(
+            &mut state,
+            pod,
+            p,
+            &NodeInfo::new(node, &view).with_all_nodes(all_nodes),
+        );
+        if !status.is_success() {
+            return Err(status);
+        }
+    }
+    let status = fits(fw, &state, pod, node, &view, all_nodes).await;
     if !status.is_success() {
         return Err(status);
     }
@@ -199,11 +220,25 @@ pub async fn select_victims_on_node(
     for (group, counts_violation) in [(&violating, true), (&non_violating, false)] {
         for p in group {
             let key = pod_key(p);
+            // `addPod`: back on the node, and in the PreFilter state.
             removed.remove(&key);
-            let status = fits(&removed).await;
+            view = view_without(&removed);
+            let info = NodeInfo::new(node, &view).with_all_nodes(all_nodes);
+            let status = fw.run_pre_filter_extension_add_pod(&mut state, pod, p, &info);
+            if !status.is_success() {
+                return Err(status);
+            }
+            let status = fits(fw, &state, pod, node, &view, all_nodes).await;
             // `fits := status.IsSuccess()`: any other status keeps the pod a victim.
             if !status.is_success() {
+                // `removePod`
                 removed.insert(key);
+                view = view_without(&removed);
+                let info = NodeInfo::new(node, &view).with_all_nodes(all_nodes);
+                let status = fw.run_pre_filter_extension_remove_pod(&mut state, pod, p, &info);
+                if !status.is_success() {
+                    return Err(status);
+                }
                 victims.push(p);
                 if counts_violation {
                     num_violating += 1;

@@ -149,14 +149,60 @@ impl Status {
     }
 }
 
+/// `fwk.StateData` (`cycle_state.go`): plugin data that can be copied for the
+/// what-if passes of preemption and nominated pods (`Clone() StateData`).
+pub trait StateData: Any + Send + Sync {
+    fn clone_state(&self) -> Box<dyn StateData>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: Clone + Any + Send + Sync> StateData for T {
+    fn clone_state(&self) -> Box<dyn StateData> {
+        Box::new(self.clone())
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// `fwk.CycleState`: per-scheduling-cycle plugin data (`cycle_state.go`).
+///
+/// [`CycleState::clone`] is `CycleState.Clone`: data written with
+/// [`CycleState::write_cloneable`] is deep-copied (its `Clone()`), data written
+/// with [`CycleState::write`] is shared between the copies, as the many
+/// upstream `Clone()` implementations that `return s` do.
 #[derive(Default)]
 pub struct CycleState {
-    storage: HashMap<String, Box<dyn Any + Send + Sync>>,
+    storage: HashMap<String, std::sync::Arc<dyn Any + Send + Sync>>,
+    cloneable: HashMap<String, Box<dyn StateData>>,
     lazy: std::sync::Mutex<HashMap<String, std::sync::Arc<dyn Any + Send + Sync>>>,
     skip_filter_plugins: HashSet<String>,
     skip_score_plugins: HashSet<String>,
     skip_pre_bind_plugins: HashSet<String>,
+}
+
+impl Clone for CycleState {
+    /// `CycleState.Clone` (`cycle_state.go`).
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            cloneable: self
+                .cloneable
+                .iter()
+                .map(|(k, v)| (k.clone(), (**v).clone_state()))
+                .collect(),
+            lazy: std::sync::Mutex::new(
+                self.lazy.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            ),
+            skip_filter_plugins: self.skip_filter_plugins.clone(),
+            skip_score_plugins: self.skip_score_plugins.clone(),
+            skip_pre_bind_plugins: self.skip_pre_bind_plugins.clone(),
+        }
+    }
 }
 
 impl CycleState {
@@ -164,14 +210,34 @@ impl CycleState {
         Self::default()
     }
 
-    /// `Write`.
+    /// `Write`, for data whose `Clone()` returns itself (shared by clones).
     pub fn write<T: Any + Send + Sync>(&mut self, key: &str, value: T) {
-        self.storage.insert(key.to_string(), Box::new(value));
+        self.cloneable.remove(key);
+        self.storage
+            .insert(key.to_string(), std::sync::Arc::new(value));
+    }
+
+    /// `Write`, for data with a deep `Clone()`; clones of the state get their
+    /// own copy, which [`CycleState::read_mut`] can then patch.
+    pub fn write_cloneable<T: Clone + Any + Send + Sync>(&mut self, key: &str, value: T) {
+        self.storage.remove(key);
+        self.cloneable.insert(key.to_string(), Box::new(value));
     }
 
     /// `Read`: `None` is upstream's `ErrNotFound`.
     pub fn read<T: Any + Send + Sync>(&self, key: &str) -> Option<&T> {
+        if let Some(v) = self.cloneable.get(key) {
+            return (**v).as_any().downcast_ref::<T>();
+        }
         self.storage.get(key).and_then(|v| v.downcast_ref::<T>())
+    }
+
+    /// `Read` of data written with [`CycleState::write_cloneable`], to patch
+    /// it in place (upstream mutates the pointer it reads).
+    pub fn read_mut<T: Any + Send + Sync>(&mut self, key: &str) -> Option<&mut T> {
+        self.cloneable
+            .get_mut(key)
+            .and_then(|v| (**v).as_any_mut().downcast_mut::<T>())
     }
 
     /// A value computed on first use and shared for the rest of the cycle, for
@@ -346,6 +412,37 @@ pub trait PreFilterPlugin: Plugin {
         all_pods: &[Pod],
         handle: &dyn Handle,
     ) -> (Option<PreFilterResult>, Status);
+
+    /// `PreFilterExtensions`: `None` when the plugin has no incremental
+    /// updates of its state.
+    fn pre_filter_extensions(&self) -> Option<&dyn PreFilterExtensions> {
+        None
+    }
+}
+
+/// `fwk.PreFilterExtensions` (`interface.go`): incremental updates of a
+/// plugin's PreFilter state, for the what-if passes of preemption's
+/// `SelectVictimsOnNode` and of nominated pods (`addGENominatedPods`).
+/// Only `node_info.node()` is meaningful: the pod is added to / removed from
+/// that node.
+pub trait PreFilterExtensions: Send + Sync {
+    /// `AddPod`: `pod_to_add` is added to `node_info`'s node.
+    fn add_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_add: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status;
+
+    /// `RemovePod`: `pod_to_remove` is removed from `node_info`'s node.
+    fn remove_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_remove: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status;
 }
 
 /// The slice of `framework.Handle` the plugin objects use: access to cluster

@@ -6,8 +6,8 @@ use crate::advanced::toleration_matches_taint;
 use crate::framework_runtime::names;
 use crate::fwk::{
     BindPlugin, ClaimWriteError, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore,
-    Plugin, PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin,
-    ScorePlugin, SignFragment, SignPlugin, Status,
+    Plugin, PreBindPlugin, PreFilterExtensions, PreFilterPlugin, PreFilterResult, PreScorePlugin,
+    ReservePlugin, ScorePlugin, SignFragment, SignPlugin, Status,
 };
 use crate::signers;
 use async_trait::async_trait;
@@ -808,8 +808,8 @@ impl Plugin for PodTopologySpread {
 /// constraint is Unschedulable, a node missing a constraint's topology label
 /// UnschedulableAndUnresolvable.
 ///
-/// Deviation: `PreFilterExtensions` (AddPod/RemovePod) are not ported, so
-/// nominated pods and preemption what-ifs do not update the counts.
+/// `PreFilterExtensions` (`filtering.go:186-213`) patch the counts for the
+/// preemption dry run and nominated pods.
 #[derive(Default)]
 pub struct PodTopologySpreadFilter {
     pub args: crate::pod_topology_spread_score::Args,
@@ -850,12 +850,60 @@ impl PreFilterPlugin for PodTopologySpreadFilter {
             default_selector.as_ref(),
         ) {
             Ok(Some(s)) => {
-                state.write(POD_TOPOLOGY_SPREAD_STATE_KEY, s);
+                state.write_cloneable(POD_TOPOLOGY_SPREAD_STATE_KEY, s);
                 (None, Status::success())
             }
             Ok(None) => (None, Status::new(Code::Skip, Vec::new())),
             Err(e) => (None, Status::from_error(e)),
         }
+    }
+
+    fn pre_filter_extensions(&self) -> Option<&dyn PreFilterExtensions> {
+        Some(self)
+    }
+}
+
+/// Patches the PodTopologySpread state: `getPreFilterState` +
+/// `updateWithPod` (`filtering.go:186-213`).
+fn update_pts_state(
+    state: &mut CycleState,
+    pod_to_schedule: &Pod,
+    pod: &Pod,
+    node_info: &NodeInfo<'_>,
+    delta: i64,
+) -> Status {
+    match state.read_mut::<crate::pod_topology_spread_filter::PreFilterState>(
+        POD_TOPOLOGY_SPREAD_STATE_KEY,
+    ) {
+        Some(s) => {
+            s.update_with_pod(pod, pod_to_schedule, node_info.node(), delta);
+            Status::success()
+        }
+        None => Status::from_error(format!(
+            "reading {POD_TOPOLOGY_SPREAD_STATE_KEY:?} from cycleState: not found"
+        )),
+    }
+}
+
+impl PreFilterExtensions for PodTopologySpreadFilter {
+    fn add_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_add: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        update_pts_state(state, pod_to_schedule, pod_to_add, node_info, 1)
+    }
+
+    fn remove_pod(
+        &self,
+        state: &mut CycleState,
+        pod_to_schedule: &Pod,
+        pod_to_remove: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        update_pts_state(state, pod_to_schedule, pod_to_remove, node_info, -1)
     }
 }
 
@@ -892,8 +940,8 @@ const INTER_POD_AFFINITY_STATE_KEY: &str = "PreFilterInterPodAffinity";
 /// incoming pod's, or an existing pod's against the incoming pod) is
 /// Unschedulable.
 ///
-/// Deviation: `PreFilterExtensions` (AddPod/RemovePod) are not ported, so
-/// nominated pods and preemption what-ifs do not update the counts.
+/// `PreFilterExtensions` (`filtering.go:312-342`) patch the counts for the
+/// preemption dry run and nominated pods.
 pub struct InterPodAffinity;
 
 impl Plugin for InterPodAffinity {
@@ -923,7 +971,7 @@ impl PreFilterPlugin for InterPodAffinity {
         };
         match ipa::pre_filter(pod, nodes, all_pods, &namespaces) {
             Ok(Some(s)) => {
-                state.write(INTER_POD_AFFINITY_STATE_KEY, s);
+                state.write_cloneable(INTER_POD_AFFINITY_STATE_KEY, s);
                 (None, Status::success())
             }
             Ok(None) => (None, Status::new(Code::Skip, Vec::new())),
@@ -933,6 +981,52 @@ impl PreFilterPlugin for InterPodAffinity {
             ),
             Err(ipa::PreFilterError::Error(m)) => (None, Status::from_error(m)),
         }
+    }
+
+    fn pre_filter_extensions(&self) -> Option<&dyn PreFilterExtensions> {
+        Some(self)
+    }
+}
+
+/// `getPreFilterState` + `updateWithPod` (`filtering.go:312-342`).
+fn update_ipa_state(
+    state: &mut CycleState,
+    pod: &Pod,
+    node_info: &NodeInfo<'_>,
+    multiplier: i64,
+) -> Status {
+    match state
+        .read_mut::<crate::inter_pod_affinity_filter::PreFilterState>(INTER_POD_AFFINITY_STATE_KEY)
+    {
+        Some(s) => {
+            s.update_with_pod(pod, node_info.node(), multiplier);
+            Status::success()
+        }
+        None => Status::from_error(format!(
+            "error reading {INTER_POD_AFFINITY_STATE_KEY:?} from cycleState: not found"
+        )),
+    }
+}
+
+impl PreFilterExtensions for InterPodAffinity {
+    fn add_pod(
+        &self,
+        state: &mut CycleState,
+        _pod_to_schedule: &Pod,
+        pod_to_add: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        update_ipa_state(state, pod_to_add, node_info, 1)
+    }
+
+    fn remove_pod(
+        &self,
+        state: &mut CycleState,
+        _pod_to_schedule: &Pod,
+        pod_to_remove: &Pod,
+        node_info: &NodeInfo<'_>,
+    ) -> Status {
+        update_ipa_state(state, pod_to_remove, node_info, -1)
     }
 }
 
