@@ -173,6 +173,12 @@ pub struct Options {
     /// `HomogeneousAggregateLiterals`: a list/map literal with mixed element
     /// types is an error instead of `list(dyn)`.
     pub homogeneous_aggregate_literals: bool,
+    /// `cel.HomogeneousAggregateLiterals()`: since cel-go 0.2x an AST
+    /// validator run after a clean type check (`validator.rs`), not a checker
+    /// option; the checker joins mixed element types to `dyn`.
+    pub validate_homogeneous_literals: bool,
+    /// `HomogeneousAggregateLiteralExemptFunctions`.
+    pub homogeneous_exempt_functions: Vec<String>,
     /// `CrossTypeNumericComparisons`.
     pub cross_type_numeric_comparisons: bool,
 }
@@ -191,6 +197,7 @@ pub struct Env {
     provider: Arc<dyn Provider>,
     scopes: Vec<Group>,
     pub(crate) homogeneous_literals: bool,
+    pub(crate) homogeneous_validator: Option<crate::validator::HomogeneousConfig>,
     cross_type_numeric: bool,
 }
 
@@ -214,6 +221,11 @@ impl Env {
             provider,
             scopes: vec![Group::default()],
             homogeneous_literals: opts.homogeneous_aggregate_literals,
+            homogeneous_validator: opts.validate_homogeneous_literals.then(|| {
+                crate::validator::HomogeneousConfig {
+                    exempt_functions: opts.homogeneous_exempt_functions.clone(),
+                }
+            }),
             cross_type_numeric: opts.cross_type_numeric_comparisons,
         }
     }

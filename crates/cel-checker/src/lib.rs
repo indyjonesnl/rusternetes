@@ -38,6 +38,7 @@ pub mod parser;
 pub mod table;
 pub mod types;
 pub mod unify;
+pub mod validator;
 
 pub use checker::{check, CheckedAst, Reference};
 pub use env::{

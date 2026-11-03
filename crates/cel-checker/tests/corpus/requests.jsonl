@@ -365,3 +365,21 @@
 {"expr": "[1, 2].transformMapEntry(i, v, v > 1, {string(v): i})"}
 {"expr": "[1, 2].transformList(i, v, undeclared)"}
 {"expr": "[1, 2].transformMap(i, v, 1, 2, 3)"}
+{"expr": "'%s %d'.format(['a', 1])"}
+{"expr": "'%s %d'.format(['a', 1])", "kubeVersion": "1.28"}
+{"expr": "[1, 'a', undeclared]"}
+{"expr": "{1: 'a', 2: 3}"}
+{"expr": "{1: 'a', 'b': 'c'}"}
+{"expr": "{1: 'a', 'b': 3}"}
+{"expr": "[[1], ['a']]"}
+{"expr": "[1, dyn('a')]"}
+{"expr": "[?optional.of(1), 'a']"}
+{"expr": "[?optional.of(1), 2]"}
+{"expr": "{?1: optional.of('a'), 2: 'b'}"}
+{"expr": "[1, 2].map(x, [x, 'a'])"}
+{"expr": "[[], [1]]"}
+{"expr": "[{}, {1: 2}]"}
+{"expr": "[1, 'a'] == [1] || [2, 'b'] == [2]"}
+{"expr": "x", "vars": {"x": "list(dyn)"}}
+{"expr": "[x, [1]]", "vars": {"x": "list(dyn)"}}
+{"expr": "[x, [1]]", "vars": {"x": "list(int)"}}
