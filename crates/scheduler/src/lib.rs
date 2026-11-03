@@ -1,6 +1,7 @@
 pub mod advanced;
 pub mod async_preemption;
 pub mod batch;
+pub mod cache;
 pub mod data_plane;
 pub mod default_preemption;
 pub mod diagnosis;

@@ -4,6 +4,7 @@ mod advanced;
 mod async_preemption;
 mod batch;
 mod bind_plugins;
+mod cache;
 mod data_plane;
 mod default_preemption;
 mod diagnosis;

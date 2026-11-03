@@ -147,6 +147,8 @@ pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
     /// tests replace `ev.PreemptPod` to do the same
     /// (`TestPrepareCandidateAsyncSetsPreemptingSets`).
     pub before_preempt_pod: std::sync::Mutex<Option<PreemptPodObserver>>,
+    /// `Scheduler.Cache` (scheduler.go): the assumed-pod state machine.
+    pub cache: crate::cache::SchedulerCache,
 }
 
 /// See [`Scheduler::before_preempt_pod`].
@@ -174,6 +176,7 @@ impl Scheduler<StorageBackend> {
             preemption: AsyncPreemption::new(),
             weak_self: std::sync::OnceLock::new(),
             before_preempt_pod: std::sync::Mutex::new(None),
+            cache: crate::cache::SchedulerCache::default(),
         }
     }
 }
@@ -207,6 +210,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             preemption: AsyncPreemption::new(),
             weak_self: std::sync::OnceLock::new(),
             before_preempt_pod: std::sync::Mutex::new(None),
+            cache: crate::cache::SchedulerCache::default(),
         }
     }
 
@@ -592,7 +596,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     fn on_pod_deleted(&self, queue: &PriorityQueue, seen: &mut SeenObjects, pod: &Pod) {
         self.preemption.observe_pod(pod, true);
         if seen.pods.remove(&pod_key(pod)).is_none() {
-            // Never seen (e.g. already terminal at first sight): nothing to undo.
+            // Never seen (e.g. already terminal at first sight): nothing to
+            // undo, except an assumed pod the watch never reported, which
+            // would otherwise stay in the cache (ttl 0 never expires it).
+            let _ = self.cache.remove_pod(pod);
             return;
         }
         if assigned_pod(pod) {
@@ -693,6 +700,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// (the node snapshot is rebuilt from the lister every cycle).
     fn add_assigned_pod_to_cache(&self, queue: &PriorityQueue, pod: &Pod) {
         debug!(pod = %pod_key(pod), "Add event for scheduled pod");
+        if let Err(e) = self.cache.add_pod(pod) {
+            error!(error = %e, pod = %pod_key(pod), "Scheduler cache AddPod failed");
+        }
         queue.move_all_to_active_or_backoff_queue(
             &EVENT_ASSIGNED_POD_ADD,
             None,
@@ -704,6 +714,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// `updateAssignedPodInCache` (eventhandlers.go:412-453).
     fn update_assigned_pod_in_cache(&self, queue: &PriorityQueue, old_pod: &Pod, new_pod: &Pod) {
         debug!(pod = %pod_key(old_pod), "Update event for scheduled pod");
+        if let Err(e) = self.cache.update_pod(old_pod, new_pod) {
+            error!(error = %e, pod = %pod_key(old_pod), "Scheduler cache UpdatePod failed");
+        }
         let old: Arc<EventObject> = Arc::new(old_pod.clone());
         let new: Arc<EventObject> = Arc::new(new_pod.clone());
         for evt in pod_scheduling_properties_change(new_pod, old_pod) {
@@ -719,6 +732,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// `deleteAssignedPodFromCache` (eventhandlers.go:455-467).
     fn delete_assigned_pod_from_cache(&self, queue: &PriorityQueue, pod: &Pod) {
         debug!(pod = %pod_key(pod), "Delete event for scheduled pod");
+        if let Err(e) = self.cache.remove_pod(pod) {
+            error!(error = %e, pod = %pod_key(pod), "Scheduler cache RemovePod failed");
+        }
         queue.move_all_to_active_or_backoff_queue(
             &EVENT_ASSIGNED_POD_DELETE,
             Some(Arc::new(pod.clone())),
@@ -1485,6 +1501,38 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         &self,
         pod: Pod,
         node_name: &str,
+        cycle_state: CycleState,
+    ) -> rusternetes_common::Result<()> {
+        // `assume` (schedule_one.go:955-975): record the pod on the node
+        // before Reserve. An error is upstream's scheduling failure; here it
+        // is only logged (the cache is not consumed yet, so assuming is
+        // bookkeeping and must not stop a pod from scheduling).
+        let mut assumed = pod.clone();
+        if let Some(spec) = assumed.spec.as_mut() {
+            spec.node_name = Some(node_name.to_string());
+        }
+        let assumed_ok = match self.cache.assume_pod(&assumed) {
+            Ok(()) => true,
+            Err(e) => {
+                error!(error = %e, "Scheduler cache AssumePod failed");
+                false
+            }
+        };
+        let result = self.run_binding_cycle(pod, node_name, cycle_state).await;
+        if result.is_err() && assumed_ok {
+            // `ForgetPod` on every failure after assume (schedule_one.go:214,
+            // :238, :369).
+            if let Err(e) = self.cache.forget_pod(&assumed) {
+                error!(error = %e, "Scheduler cache ForgetPod failed");
+            }
+        }
+        result
+    }
+
+    async fn run_binding_cycle(
+        &self,
+        pod: Pod,
+        node_name: &str,
         mut cycle_state: CycleState,
     ) -> rusternetes_common::Result<()> {
         let profile = self
@@ -1544,6 +1592,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         let status = fw
             .run_bind_plugins(&cycle_state, &pod, node_name, &handle)
             .await;
+        // `finishBinding` (schedule_one.go:1011) runs whatever the status;
+        // it is a no-op once the pod was forgotten.
+        let mut finished = pod.clone();
+        if let Some(spec) = finished.spec.as_mut() {
+            spec.node_name = Some(node_name.to_string());
+        }
+        if let Err(e) = self.cache.finish_binding(&finished) {
+            error!(error = %e, "Scheduler cache FinishBinding failed");
+        }
         if !status.is_success() {
             fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
                 .await;
