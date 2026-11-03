@@ -742,7 +742,6 @@ mod tests {
     }
 }
 
-#[path = "policy_match_conditions_budget_tests.rs"]
 mod budget_tests {
     //! `RuntimeCELCostBudgetMatchConditions` enforcement of the matchConditions
     //! matcher (#3313): `matcher.go:82-85` passes

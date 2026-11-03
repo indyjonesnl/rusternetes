@@ -22,7 +22,6 @@ mod __parent {
     pub use tracing::{debug, error, info, warn};
 }
 
-#[path = "volume_snapshot_tests.rs"]
 mod tests {
     use super::__parent::*;
     use rusternetes_common::resources::volume::{VolumeSnapshotSource, VolumeSnapshotSpec};

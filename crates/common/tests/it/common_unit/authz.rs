@@ -585,7 +585,6 @@ mod tests {
     }
 }
 
-#[path = "authz/allow_reason_tests.rs"]
 mod allow_reason_tests {
     //! Cases from rbac/rbac_test.go:147-269, validation/rule_test.go (appliesTo),
     //! authorization/union/union_test.go, with reason text asserted from the sources.

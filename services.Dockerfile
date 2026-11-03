@@ -87,7 +87,7 @@ RUN npm run build
 # a Wednesday `docker compose build` after a Tuesday Rust release
 # pays the full ~25 min uncached cost. Bump this pin in a deliberate
 # PR when the toolchain genuinely needs to move; do not chase nightly.
-FROM rust:1.95 AS cargo-builder
+FROM rust:1.99 AS cargo-builder
 
 # sccache wraps rustc so identical (crate, source, flags) compilations
 # hit the BuildKit cache mount below instead of re-running rustc.

@@ -47,7 +47,7 @@ RUN npm run build
 # both compose stacks share the same rustc and the BuildKit
 # /app/target cache stays valid. See the comment in
 # services.Dockerfile for the rationale.
-FROM rust:1.95 AS builder
+FROM rust:1.99 AS builder
 
 # sccache wraps rustc so identical (crate, source, flags) compilations
 # hit the BuildKit cache mount below. Shares cache id `sccache-rusternetes`

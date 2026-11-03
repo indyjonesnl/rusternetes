@@ -414,7 +414,7 @@ impl Storage for MemoryStorage {
         if self.conflict_update_count.load(Ordering::SeqCst) > 0 {
             let prev =
                 self.conflict_update_count
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                         if v > 0 {
                             Some(v - 1)
                         } else {

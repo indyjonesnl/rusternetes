@@ -33,7 +33,6 @@ mod __parent {
     pub use tracing::{debug, error, info, warn};
 }
 
-#[path = "device_taint_eviction_tests.rs"]
 mod tests {
     //! Cases ported from `pkg/controller/devicetainteviction/
     //! device_taint_eviction_test.go` (kubernetes release-1.35): `TestController`

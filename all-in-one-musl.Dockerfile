@@ -30,7 +30,7 @@
 #    <arch>-unknown-linux-musl (x86_64 or aarch64, whichever the runner is) and
 #    links crt-static by default → a fully static binary with no extra
 #    target/flag plumbing. ──────────────────────────────────────────────────
-FROM rust:1.95-alpine AS builder
+FROM rust:1.99-alpine AS builder
 
 # C toolchain + deps that build native code:
 #   build-base/musl-dev  — gcc + musl headers for ring, bundled SQLite, mimalloc
