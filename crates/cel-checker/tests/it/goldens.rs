@@ -26,14 +26,6 @@ use std::sync::Arc;
 /// cel-go, and an entry here is removed once the gap closes.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
-        "quantity(s).sign()",
-        "the Quantity type is declared as 'apiserver.cel.Quantity' (the name the DRA environment reports) where the Kubernetes library names it 'kubernetes.Quantity'. Only the message differs",
-    ),
-    (
-        "quantity(s).add(quantity(t))",
-        "the Quantity type is declared as 'apiserver.cel.Quantity' where the Kubernetes library names it 'kubernetes.Quantity'. Only the output type name differs",
-    ),
-    (
         "[1, 2].exists(i, v, i < v)",
         "cel 0.15's parser does not expand the two-variable comprehension macros (cel-go parser/macro.go, TwoVarComprehensions), so the call is checked as a plain member call",
     ),

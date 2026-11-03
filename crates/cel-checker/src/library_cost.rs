@@ -37,7 +37,7 @@ const SELECTOR_LENGTH_TO_REQUIREMENT_COUNT: f64 = 0.5;
 /// `costPerRequirement`: a struct and a values slice.
 const COST_PER_REQUIREMENT: f64 = (LIST_CREATE_BASE_COST + STRUCT_CREATE_BASE_COST) as f64;
 
-const QUANTITY: &str = "apiserver.cel.Quantity";
+const QUANTITY: &str = "kubernetes.Quantity";
 const SEMVER: &str = "kubernetes.Semver";
 const FORMAT: &str = "kubernetes.NamedFormat";
 const URL: &str = "kubernetes.URL";

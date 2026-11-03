@@ -99,7 +99,7 @@ mod tests {
             invalid("1.5 > 0.5 && ['['].exists(x, x == '[') && device.capacity[1].a == 1").unwrap();
         assert!(d.contains("<input>:1:"), "{d}");
         assert!(
-            d.contains("'(map(string, map(string, apiserver.cel.Quantity)), int)'"),
+            d.contains("'(map(string, map(string, kubernetes.Quantity)), int)'"),
             "{d}"
         );
         assert!(d.ends_with("^"), "{d}");
