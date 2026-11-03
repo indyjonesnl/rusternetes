@@ -54,6 +54,9 @@ pub struct VersionedOptions {
     pub feature_enabled: Option<fn(&Features) -> bool>,
     /// `cel.HomogeneousAggregateLiterals()`.
     pub homogeneous_aggregate_literals: bool,
+    /// `ext.Strings(StringsVersion(1+))` adds the `format` validator, which
+    /// exempts the literals under `format` from the homogeneity check.
+    pub string_format_validator: bool,
     /// `cel.CrossTypeNumericComparisons(true)`.
     pub cross_type_numeric_comparisons: bool,
     /// `cel.OptionalTypes()`: the optional library and `optional_type`.
@@ -78,6 +81,7 @@ const NONE: VersionedOptions = VersionedOptions {
     removed: None,
     feature_enabled: None,
     homogeneous_aggregate_literals: false,
+    string_format_validator: false,
     cross_type_numeric_comparisons: false,
     optional_types: false,
     two_var_comprehensions: false,
@@ -116,6 +120,7 @@ pub static BASE_OPTS: &[VersionedOptions] = &[
     },
     VersionedOptions {
         introduced: v(29),
+        string_format_validator: true,
         libraries: &[table::strings_v0, table::strings_v2_additions],
         ..NONE
     },
@@ -230,9 +235,15 @@ impl EnvSet {
             container,
             provider,
             Options {
-                homogeneous_aggregate_literals: opts
+                homogeneous_aggregate_literals: false,
+                validate_homogeneous_literals: opts
                     .iter()
                     .any(|o| o.homogeneous_aggregate_literals),
+                homogeneous_exempt_functions: if opts.iter().any(|o| o.string_format_validator) {
+                    vec!["format".to_string()]
+                } else {
+                    vec![]
+                },
                 cross_type_numeric_comparisons: opts
                     .iter()
                     .any(|o| o.cross_type_numeric_comparisons),

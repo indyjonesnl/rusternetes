@@ -62,14 +62,25 @@ pub fn check(expr: &IdedExpr, env: &mut Env, locator: &dyn Locator) -> (CheckedA
     for t in c.type_map.values_mut() {
         *t = substitute(&mappings, t, true);
     }
-    (
-        CheckedAst {
-            root: expr.id,
-            type_map: c.type_map,
-            ref_map: c.ref_map,
-        },
-        c.errors,
-    )
+    let checked = CheckedAst {
+        root: expr.id,
+        type_map: c.type_map,
+        ref_map: c.ref_map,
+    };
+    let mut errors = c.errors;
+    // `Env.Check` applies the validators only to a result without errors.
+    if errors.is_empty() {
+        if let Some(config) = &c.env.homogeneous_validator {
+            crate::validator::validate_homogeneous_literals(
+                expr,
+                &checked,
+                config,
+                locator,
+                &mut errors,
+            );
+        }
+    }
+    (checked, errors)
 }
 
 struct Checker<'a> {

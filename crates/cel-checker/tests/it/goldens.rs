@@ -25,16 +25,8 @@ use std::sync::Arc;
 /// cel-go, and an entry here is removed once the gap closes.
 const KNOWN_DIVERGENCES: &[(&str, &str)] = &[
     (
-        "[1, 'a'].map(x,\n  x + undeclared)",
-        "found by the location comparison, not a location issue: with a heterogeneous list as the range and an undeclared name in the body we also report \"expected type 'int' but found 'string'\" at the range, which cel-go does not. The cause has not been investigated",
-    ),
-    (
         "[1, 2].sortBy(1, x)",
         "the sortBy macro is the cel crate's (`extensions::lists`, which reuses its `map` expander): its error is 'argument must be a simple name', cel-go's sortByMacro (ext/lists.go) says 'argument is not an identifier'. Only the message differs; the location matches",
-    ),
-    (
-        "{}.map(c, [c, type(c)])",
-        "cel-go reports the element types of the rejected heterogeneous list as 'dyn' / 'type(dyn)'; we report the unbound type parameters '_var0' / 'type(_var0)'. Only the message differs",
     ),
 ];
 
