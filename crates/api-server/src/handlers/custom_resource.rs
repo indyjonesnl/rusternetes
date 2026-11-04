@@ -160,12 +160,28 @@ fn scope(
     }
 }
 
-fn strict_mode(params: &HashMap<String, String>, patch: bool) -> StrictMode {
+/// Which strict verdict a `fieldValidation=Strict` request gets.
+///
+/// Only a server-side apply reports the typed conversion's
+/// `.path: field not declared in schema` (fieldmanager's `Apply`,
+/// patch.go:500-543; test/e2e/apimachinery/field_validation.go:458-461,
+/// :607-610). Every other PATCH type (JSON, merge, strategic) strict-decodes
+/// the patched object (patch.go:331-363, :750-783) and so reports the
+/// `StrictDecodingError` of the pruner's paths, as a create does.
+fn strict_mode(params: &HashMap<String, String>, apply_patch: bool) -> StrictMode {
     match params.get("fieldValidation").map(String::as_str) {
-        Some("Strict") if patch => StrictMode::Patch,
+        Some("Strict") if apply_patch => StrictMode::Patch,
         Some("Strict") => StrictMode::Write,
         _ => StrictMode::Off,
     }
+}
+
+/// Whether a PATCH content type is server-side apply (`types.ApplyPatchType`).
+fn is_apply_patch(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim() == "application/apply-patch+yaml")
 }
 
 /// The patch type of a PATCH. The content-type middleware moves a JSON patch
@@ -593,7 +609,13 @@ pub async fn patch_custom_resource(
     let crd = serving_crd(&state, &group, &version, &plural, None).await?;
     endpoints::patch_resource(
         &state,
-        &scope(&state, &crd, &version, None, strict_mode(&params, true)),
+        &scope(
+            &state,
+            &crd,
+            &version,
+            None,
+            strict_mode(&params, is_apply_patch(&content_type)),
+        ),
         &auth_ctx.user,
         namespace.as_deref(),
         &name,
@@ -627,7 +649,7 @@ pub async fn patch_custom_resource_status(
             &crd,
             &version,
             Some("status"),
-            strict_mode(&params, true),
+            strict_mode(&params, is_apply_patch(&content_type)),
         ),
         &auth_ctx.user,
         namespace.as_deref(),
