@@ -549,3 +549,113 @@ async fn forward_to_aggregator_returns_503_when_backend_down() {
         "expected 503 when aggregator backend is unreachable"
     );
 }
+
+// ----- egress selector `Cluster` dial (#3466) --------------------------------
+
+/// A konnectivity-like proxier: records the address asked for and tunnels to
+/// the real local backend.
+struct ClusterTunnel {
+    target: String,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+struct ClusterProxier {
+    target: String,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait::async_trait]
+impl rusternetes_api_server::egress_selector::ProxyServerConnector for ClusterTunnel {
+    async fn connect(
+        &self,
+    ) -> Result<Box<dyn rusternetes_api_server::egress_selector::Proxier>, String> {
+        Ok(Box::new(ClusterProxier {
+            target: self.target.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+}
+#[async_trait::async_trait]
+impl rusternetes_api_server::egress_selector::Proxier for ClusterProxier {
+    async fn proxy(
+        &self,
+        addr: &str,
+    ) -> Result<rusternetes_api_server::egress_selector::Conn, String> {
+        self.seen.lock().unwrap().push(addr.to_string());
+        let c = tokio::net::TcpStream::connect(&self.target)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(c))
+    }
+}
+
+/// handler_proxy.go:230 `DialHolder: r.proxyTransportDial`: with a `Cluster`
+/// dialer the aggregated request is dialed through it (the endpoint address is
+/// what the proxy is asked for), and the response is relayed unchanged.
+#[tokio::test]
+async fn forward_to_aggregator_dials_through_cluster_dialer() {
+    let route = axum::Router::new().fallback(
+        |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+            let user = headers
+                .get("x-remote-user")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            axum::http::Response::builder()
+                .status(202)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(format!(
+                    "{{\"path\":\"{}\",\"user\":\"{}\"}}",
+                    uri.path(),
+                    user
+                )))
+                .unwrap()
+        },
+    );
+    let (addr, _h) = rusternetes_test_support::mock_http::serve_graceful_handle(
+        route,
+        std::future::pending::<()>(),
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialer = rusternetes_api_server::egress_selector::DialerCreator {
+        connector: Some(Arc::new(ClusterTunnel {
+            target: addr.to_string(),
+            seen: seen.clone(),
+        })),
+        direct: false,
+        options: rusternetes_api_server::egress_selector::MetricsOptions {
+            transport: "tcp".into(),
+            protocol: "HTTPConnect".into(),
+        },
+    }
+    .create_dialer();
+
+    // An address nothing listens on: reachable only through the tunnel.
+    let target = AggregatorTarget {
+        host: "10.254.254.1".to_string(),
+        port: 8443,
+        insecure_skip_tls_verify: true,
+        ca_bundle: None,
+        scheme: "http",
+        server_name: None,
+    };
+    let auth = test_user("alice", &[], &[]);
+    let resp = rusternetes_api_server::handlers::aggregator::forward_to_aggregator_with_dialer(
+        &target,
+        &auth,
+        Method::GET,
+        "/apis/wardle.example.com/v1alpha1/flunders",
+        &HeaderMap::new(),
+        Vec::new(),
+        Some(dialer),
+    )
+    .await;
+
+    assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert!(body.contains("/apis/wardle.example.com/v1alpha1/flunders"));
+    assert!(body.contains("\"user\":\"alice\""));
+    assert_eq!(*seen.lock().unwrap(), vec!["10.254.254.1:8443".to_string()]);
+}
