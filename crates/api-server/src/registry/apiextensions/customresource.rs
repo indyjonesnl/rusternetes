@@ -276,8 +276,9 @@ fn validate_scale(cr: &CustomResource, scale: &CustomResourceSubresourceScale) -
 }
 
 /// The `fieldValidation=Strict` checks of the bespoke handlers, run against
-/// the object before it is pruned. `Patch` reports an unknown top-level field
-/// the way the patch path always has.
+/// the object before it is pruned. `Patch` is a server-side apply, which
+/// reports the typed conversion's `field not declared in schema`; JSON, merge
+/// and strategic merge patches use `Write`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrictMode {
     Off,
