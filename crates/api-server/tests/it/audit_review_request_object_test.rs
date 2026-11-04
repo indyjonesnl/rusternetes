@@ -63,6 +63,9 @@ async fn pod_binding_and_eviction_record_their_request_object() {
     ];
     for (path, body, sub) in cases {
         let _ = api.post(path, &body).await;
+        // A response body dropped unread (a 404 an outer layer replaced)
+        // writes ResponseComplete from a spawned task: let it run.
+        tokio::task::yield_now().await;
         let events = cap.0.lock().await;
         let ev = events
             .iter()

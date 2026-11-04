@@ -50,7 +50,7 @@ async fn serve(level: &str, ok_sink: bool) -> u16 {
         .unwrap(),
         sink: Arc::new(Sink(ok_sink)),
     });
-    Router::new()
+    let resp = Router::new()
         .route("/api/v1/namespaces/ns/secrets/s", get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(move |req, next| {
             let cfg = cfg.clone();
@@ -62,9 +62,13 @@ async fn serve(level: &str, ok_sink: bool) -> u16 {
                 .unwrap(),
         )
         .await
-        .unwrap()
-        .status()
-        .as_u16()
+        .unwrap();
+    let code = resp.status().as_u16();
+    // ResponseComplete is written when the body ends.
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    code
 }
 
 #[test]

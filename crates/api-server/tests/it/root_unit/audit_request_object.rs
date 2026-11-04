@@ -58,7 +58,12 @@ async fn run(policy_rules: &str, uri: &str, patch: bool) -> AuditEvent {
             let cfg = cfg.clone();
             async move { with_audit(cfg, req, next).await }
         }));
-    app.oneshot(axum::http::Request::post(uri).body(Body::empty()).unwrap())
+    let resp = app
+        .oneshot(axum::http::Request::post(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    // ResponseComplete is written when the body ends.
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let ev = cap.0.lock().await;

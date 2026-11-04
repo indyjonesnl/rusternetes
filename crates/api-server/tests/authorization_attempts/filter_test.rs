@@ -425,6 +425,8 @@ async fn allow_passes_through_and_annotates() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // ResponseComplete is written when the body ends.
+    body_string(resp).await;
     assert_eq!(h.handler_calls.load(Ordering::SeqCst), 1);
     let a = annotations(&h).await;
     assert_eq!(a["authorization.k8s.io/decision"], "allow");
@@ -453,6 +455,8 @@ async fn allow_with_error_annotates_reason_and_records_allowed() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // ResponseComplete is written when the body ends.
+    body_string(resp).await;
     assert_eq!(h.handler_calls.load(Ordering::SeqCst), 1);
     let a = annotations(&h).await;
     assert_eq!(a["authorization.k8s.io/decision"], "allow");
@@ -515,6 +519,8 @@ async fn no_opinion_is_forbidden() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // ResponseComplete is written when the body ends.
+    body_string(resp).await;
     assert_eq!(h.handler_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         annotations(&h).await["authorization.k8s.io/decision"],

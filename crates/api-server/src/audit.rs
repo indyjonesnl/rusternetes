@@ -17,6 +17,7 @@
 //! backend lives in `audit_webhook.rs`.
 
 use axum::{
+    body::Body,
     extract::Request,
     http::{HeaderValue, Method},
     middleware::Next,
@@ -562,7 +563,10 @@ impl AuditContext {
 
     /// `writeLatencyToAnnotation` (filters/audit.go:150-174): past 500ms,
     /// record each non-zero layer latency plus the request total.
-    fn write_latency_to_annotation(&self) {
+    fn write_latency_to_annotation(
+        &self,
+        trackers: Option<&rusternetes_common::latency_trackers::LatencyTrackers>,
+    ) {
         const THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
         let received = match self.inner.lock() {
             Ok(g) => g.event.request_received_timestamp,
@@ -572,12 +576,11 @@ impl AuditContext {
         if latency <= THRESHOLD {
             return;
         }
-        let mut layer =
-            match rusternetes_common::latency_trackers::audit_annotations_from_latency_trackers() {
-                Some(l) if !l.is_empty() => l,
-                // "latency tracking is not enabled for this request"
-                _ => return,
-            };
+        let mut layer = match trackers.map(rusternetes_common::latency_trackers::annotations_from) {
+            Some(l) if !l.is_empty() => l,
+            // "latency tracking is not enabled for this request"
+            _ => return,
+        };
         layer.push((
             "apiserver.latency.k8s.io/total".to_string(),
             rusternetes_common::go_duration::format_go_duration(latency.as_nanos() as i64),
@@ -1066,11 +1069,145 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     if long_running {
         ac.process_event_stage(AuditStage::ResponseStarted).await;
     }
-    // `writeLatencyToAnnotation` runs in `WithAudit`'s deferred func, which is
-    // the audit filter's own context: the trackers are the outer filter's.
-    ac.write_latency_to_annotation();
+    // The trackers are the outer filter's; capture them now because the body
+    // is polled (and the event finalised) outside this task-local scope.
+    let trackers = rusternetes_common::latency_trackers::latency_trackers_from_context();
+    // Watch/proxy are long-running: ResponseComplete is written when the
+    // handler returns, as before. An empty body (HEAD, 204) has no write to
+    // wait for and completes at once.
+    if long_running || http_body::Body::is_end_stream(resp.body()) {
+        finish_audit(&ac, trackers.as_deref()).await;
+        return resp;
+    }
+    // Upstream runs `writeLatencyToAnnotation` + ResponseComplete in the
+    // deferred func after `ServeHTTP` returned, i.e. after every
+    // `writeLatencyTracker.Write` (filters/audit.go:79-107,
+    // webhook_duration.go:60-75). axum writes the body after the handler
+    // chain, so the event is finalised when the body ends, errors or is
+    // dropped.
+    resp.map(|body| {
+        Body::new(AuditBody {
+            inner: body,
+            fin: Some(Finalizer {
+                ac,
+                trackers,
+                last_frame: None,
+            }),
+            pending: None,
+            fut: None,
+        })
+    })
+}
+
+/// The body of `WithAudit`'s deferred func: `writeLatencyToAnnotation` then
+/// the ResponseComplete event.
+async fn finish_audit(
+    ac: &AuditContext,
+    trackers: Option<&rusternetes_common::latency_trackers::LatencyTrackers>,
+) {
+    ac.write_latency_to_annotation(trackers);
     ac.process_event_stage(AuditStage::ResponseComplete).await;
-    resp
+}
+
+struct Finalizer {
+    ac: Arc<AuditContext>,
+    trackers: Option<Arc<rusternetes_common::latency_trackers::LatencyTrackers>>,
+    /// When the previous frame was handed to the connection; the time until
+    /// the next poll (or the drop) is the connection's write of it, the
+    /// `writeLatencyTracker.Write` interval.
+    last_frame: Option<std::time::Instant>,
+}
+
+impl Finalizer {
+    fn account_write(&mut self) {
+        if let (Some(t), Some(at)) = (&self.trackers, self.last_frame.take()) {
+            t.response_write.track_duration(at.elapsed());
+        }
+    }
+
+    async fn run(mut self) {
+        self.account_write();
+        finish_audit(&self.ac, self.trackers.as_deref()).await;
+    }
+}
+
+type BodyItem = Option<Result<http_body::Frame<axum::body::Bytes>, axum::Error>>;
+
+/// Response body that finalises the audit event exactly once: when the stream
+/// ends or errors, or on drop (client abort).
+struct AuditBody {
+    inner: Body,
+    fin: Option<Finalizer>,
+    /// The terminal poll result, held while the event is being written.
+    pending: Option<BodyItem>,
+    fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+}
+
+impl http_body::Body for AuditBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<BodyItem> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.fut.is_none() {
+            if let Some(f) = this.fin.as_mut() {
+                f.account_write();
+            }
+            let item = match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(f) = this.fin.as_mut() {
+                        f.last_frame = Some(std::time::Instant::now());
+                    }
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                Poll::Ready(other) => other,
+            };
+            match this.fin.take() {
+                Some(f) => {
+                    this.pending = Some(item);
+                    this.fut = Some(Box::pin(f.run()));
+                }
+                None => return Poll::Ready(item),
+            }
+        }
+        if let Some(fut) = this.fut.as_mut() {
+            if fut.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.fut = None;
+        }
+        Poll::Ready(this.pending.take().unwrap_or(None))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Hold the end open until the event is written.
+        self.fin.is_none()
+            && self.fut.is_none()
+            && self.pending.is_none()
+            && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for AuditBody {
+    fn drop(&mut self) {
+        // Dropped before the end (client abort): `ServeHTTP` returned on the
+        // failed write, so the deferred func still runs. Exactly once: the
+        // finalizer is taken at the terminal poll.
+        if let Some(f) = self.fin.take() {
+            if let Ok(h) = tokio::runtime::Handle::try_current() {
+                h.spawn(f.run());
+            }
+        }
+    }
 }
 
 /// `withFailedRequestAudit` (request_deadline.go:106-133) against the
