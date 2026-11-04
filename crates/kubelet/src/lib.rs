@@ -15,6 +15,7 @@ pub mod go_selinux_label;
 pub mod host_port;
 pub mod image_gc;
 pub mod image_gc_cri;
+pub mod image_manager;
 pub mod kubelet;
 pub mod labels;
 pub mod lifecycle;

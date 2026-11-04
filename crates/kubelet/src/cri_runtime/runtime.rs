@@ -744,8 +744,34 @@ impl CriContainerRuntime {
         event_ctx: Option<(&Pod, &str)>,
         sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<String> {
+        use crate::image_manager::{self as im, ImageErrorKind, ImageManagerError};
+        use rusternetes_common::resources::EventType;
         let policy = pull_policy.unwrap_or("IfNotPresent");
         let mut cri = self.cri.clone();
+        // `logIt` (`image_manager.go:131-137`): an event only when the caller
+        // has an object reference; otherwise upstream just logs.
+        let log_it = |etype: EventType, reason: &'static str, msg: String| async move {
+            match event_ctx {
+                Some((p, c)) => {
+                    let container = (!c.is_empty()).then_some(c);
+                    self.emit_event(p, container, reason, etype, &msg).await;
+                }
+                None => tracing::info!(image, reason, "{msg}"),
+            }
+        };
+        // `applyDefaultImageTag` (`image_manager.go:168-174`).
+        let tagged = match im::apply_default_image_tag(image) {
+            Ok(t) => t,
+            Err(e) => {
+                let message = im::failed_default_tag_message(image, &e);
+                log_it(EventType::Warning, "InspectFailed", message.clone()).await;
+                return Err(ImageManagerError {
+                    kind: ImageErrorKind::InvalidImageName,
+                    message,
+                }
+                .into());
+            }
+        };
         // `EnsureImageExists` (`images/image_manager.go:194`): the pod runtime
         // handler goes in the ImageSpec of both ImageStatus and PullImage.
         let handler = self.pod_runtime_handler(event_ctx.map(|(p, _)| p)).await?;
@@ -755,23 +781,98 @@ impl CriContainerRuntime {
         let annotations = event_ctx
             .and_then(|(p, _)| p.metadata.annotations.clone())
             .unwrap_or_default();
-        let spec = rusternetes_cri::to_runtime_api_image_spec(image, &handler, &annotations);
+        let spec = rusternetes_cri::to_runtime_api_image_spec(&tagged, &handler, &annotations);
 
+        // `imagePullPrecheck` (`image_manager.go:108-129`).
         if policy != "Always" {
-            let present = cri.image_status_spec(spec.clone(), false).await?;
-            if let Some(present) = present {
+            let present = match cri.image_status_spec(spec.clone(), false).await {
+                Ok(p) => p,
+                Err(e) => {
+                    // The Go code formats the (empty) imageRef, not the image.
+                    let message = im::failed_to_inspect_message("", &pull_err_message(e));
+                    log_it(EventType::Warning, "InspectFailed", message.clone()).await;
+                    return Err(ImageManagerError {
+                        kind: ImageErrorKind::ImageInspect,
+                        message,
+                    }
+                    .into());
+                }
+            };
+            if let Some(present) = present.filter(|p| !p.id.is_empty()) {
+                // `EnsureImageExists` with `KubeletEnsureSecretPulledImages`
+                // off (`image_manager.go:241-249`).
+                log_it(
+                    EventType::Normal,
+                    "Pulled",
+                    im::already_present_message(image),
+                )
+                .await;
                 return Ok(present.id);
             }
             if policy == "Never" {
-                // Absent and pulling disallowed. The typed error lets the
-                // kubelet report `ErrImageNeverPull` via reason_from_anyhow.
+                // `imageNotPresentOnNeverPolicyError` (`image_manager.go:155`).
+                log_it(
+                    EventType::Warning,
+                    "ErrImageNeverPull",
+                    im::never_pull_message(image),
+                )
+                .await;
+                // The typed error lets the kubelet report `ErrImageNeverPull`
+                // via reason_from_anyhow.
                 return Err(anyhow::Error::new(crate::lifecycle::ImageNeverPullError {
                     image: image.to_string(),
                 }));
             }
         }
-        self.pull_image(&mut cri, spec, event_ctx.map(|(p, _)| p), sandbox_cfg)
+        // `pullImage` (`image_manager.go:300-359`).
+        log_it(
+            EventType::Normal,
+            "Pulling",
+            format!("Pulling image {image:?}"),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let image_ref = match self
+            .pull_image(
+                &mut cri,
+                spec.clone(),
+                event_ctx.map(|(p, _)| p),
+                sandbox_cfg,
+            )
             .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log_it(
+                    EventType::Warning,
+                    "Failed",
+                    format!("Failed to pull image {image:?}: {e}"),
+                )
+                .await;
+                let (message, kind) = im::eval_cri_pull_err(image, &e.to_string());
+                return Err(ImageManagerError { kind, message }.into());
+            }
+        };
+        // `puller.go:58-61`: best-effort `GetImageSize` (an `ImageStatus`).
+        let size = if image_ref.is_empty() {
+            0
+        } else {
+            cri.image_status_spec(spec, false)
+                .await
+                .ok()
+                .flatten()
+                .map_or(0, |i| i.size)
+        };
+        let took = im::go_duration_string(started.elapsed());
+        log_it(
+            EventType::Normal,
+            "Pulled",
+            format!(
+                "Successfully pulled image {image:?} in {took} ({took} including waiting). Image size: {size} bytes."
+            ),
+        )
+        .await;
+        Ok(image_ref)
     }
 
     /// Port of `getPullSecretsForPod` (`kubelet_pods.go:1070-1095`): the
@@ -844,7 +945,10 @@ impl CriContainerRuntime {
         )
         .await?;
         if creds.is_empty() {
-            return Ok(cri.pull_image_spec(spec, sandbox_cfg.cloned()).await?);
+            return cri
+                .pull_image_spec(spec, sandbox_cfg.cloned())
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", pull_err_message(e)));
         }
         let mut errs = Vec::new();
         for c in creds {
@@ -858,7 +962,7 @@ impl CriContainerRuntime {
                 .await
             {
                 Ok(r) => return Ok(r),
-                Err(e) => errs.push(e.to_string()),
+                Err(e) => errs.push(pull_err_message(e)),
             }
         }
         // `utilerrors.NewAggregate`: a lone error is its own message.
@@ -3262,6 +3366,15 @@ pub fn exec_probe_passed(exit_code: Option<i32>) -> bool {
 pub type ImageVolumePulls =
     std::collections::HashMap<String, std::result::Result<v1::ImageSpec, Arc<anyhow::Error>>>;
 
+/// The error text upstream sees from `remoteImageService.PullImage`/`ImageStatus`:
+/// the gRPC status message without the code (`cri-client/pkg/remote_image.go:208-211`).
+fn pull_err_message(e: rusternetes_cri::CriError) -> String {
+    match e {
+        rusternetes_cri::CriError::Rpc { source, .. } => source.message().to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Port of `toKubeContainerImageVolumes` (`kuberuntime_manager.go:1778-1810`):
 /// the image volumes of one container's `volumeMounts`. A volume the
 /// container does not mount is left out; if any mounted volume failed to
@@ -3286,9 +3399,14 @@ pub fn to_kube_container_image_volumes(
                 // `anyhow::Error` is not `Clone`: rebuild it, keeping the typed
                 // `ErrImageNeverPull` the kubelet maps to a waiting reason.
                 last_err = Some(
-                    match e.downcast_ref::<crate::lifecycle::ImageNeverPullError>() {
-                        Some(never) => anyhow::Error::new(never.clone()),
-                        None => anyhow::anyhow!("{e:#}"),
+                    if let Some(never) = e.downcast_ref::<crate::lifecycle::ImageNeverPullError>() {
+                        anyhow::Error::new(never.clone())
+                    } else if let Some(img) =
+                        e.downcast_ref::<crate::image_manager::ImageManagerError>()
+                    {
+                        anyhow::Error::new(img.clone())
+                    } else {
+                        anyhow::anyhow!("{e:#}")
                     },
                 );
             }

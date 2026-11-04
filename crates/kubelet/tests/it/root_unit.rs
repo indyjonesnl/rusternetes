@@ -13,6 +13,7 @@ mod go_selinux_label;
 mod host_port;
 mod image_gc;
 mod image_gc_cri;
+mod image_manager;
 mod kubelet;
 mod labels;
 mod lifecycle;
