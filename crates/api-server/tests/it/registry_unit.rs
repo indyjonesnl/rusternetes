@@ -11,6 +11,7 @@ mod registry__apiextensions__controllers;
 mod registry__apiextensions__customresource;
 mod registry__apiextensions__customresourcedefinition;
 mod registry__apiextensions__finalizer_queue;
+mod registry__apiextensions__tableconvertor;
 mod registry__apiregistration__apiservice;
 mod registry__apiserverinternal__storageversion;
 mod registry__apps__controllerrevision;

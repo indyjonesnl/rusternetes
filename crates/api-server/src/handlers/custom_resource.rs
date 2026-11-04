@@ -17,6 +17,7 @@ use crate::registry::apiextensions::customresource::{
     new_scale_rest, CustomResourceRest, StrictMode,
 };
 use crate::{middleware::AuthContext, state::ApiServerState};
+use axum::response::IntoResponse;
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -240,11 +241,12 @@ pub async fn get_custom_resource(
         Option<String>,
         String,
     )>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response> {
     info!("Getting custom resource {group}/{version}/{plural}: {name}");
     let crd = serving_crd(&state, &group, &version, &plural, None).await?;
-    endpoints::get_resource(
+    let resp = endpoints::get_resource(
         &state,
         &scope(&state, &crd, &version, None, StrictMode::Off),
         &auth_ctx.user,
@@ -252,7 +254,72 @@ pub async fn get_custom_resource(
         &name,
         &params,
     )
-    .await
+    .await?;
+    if !requests_table(&headers) {
+        return Ok(resp);
+    }
+    table_response(&crd, &version, &params, resp).await
+}
+
+/// Whether the request negotiated `as=Table` — the only case the CRD's
+/// printer columns matter. Every other Accept keeps the pre-existing path.
+fn requests_table(headers: &axum::http::HeaderMap) -> bool {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok());
+    crate::handlers::table::wants_table(accept)
+}
+
+/// `tableconvertor.New(getColumnsForVersion(crd, version))` +
+/// `ConvertToTable` (customresource_handler.go:843-851) applied to a
+/// successful JSON response. A response that is not a 200 JSON document (an
+/// error Status, a non-JSON encoding) is passed through untouched. The
+/// middleware passes a body that is already a Table through verbatim.
+async fn table_response(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    params: &HashMap<String, String>,
+    resp: Response,
+) -> Result<Response> {
+    use crate::registry::apiextensions::tableconvertor::{columns_for_version, TableConvertor};
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if resp.status() != axum::http::StatusCode::OK || !is_json {
+        return Ok(resp);
+    }
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(bytes)));
+    };
+    let Some(columns) = columns_for_version(crd, version) else {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(bytes)));
+    };
+    // An unparsable printer column is logged and the convertor built so far is
+    // served (customresource_handler.go:848-851).
+    let (convertor, err) = TableConvertor::new(&columns);
+    if let Some(err) = err {
+        debug!(
+            "The CRD for {} has an invalid printer specification, falling back to default printing: {err}",
+            crd.spec.names.kind
+        );
+    }
+    let no_headers = params
+        .get("noHeaders")
+        .is_some_and(|v| rusternetes_common::query::k8s_query_bool(v));
+    let table = convertor.convert_to_table(&value, no_headers);
+    let mut out = Json(table).into_response();
+    for (k, v) in parts.headers.iter() {
+        if k != axum::http::header::CONTENT_TYPE && k != axum::http::header::CONTENT_LENGTH {
+            out.headers_mut().append(k.clone(), v.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// List custom resource instances
@@ -260,8 +327,9 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<Json<List<CustomResource>>> {
+) -> Result<Response> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
     // Find the CRD for this resource type
@@ -356,7 +424,11 @@ pub async fn list_custom_resources(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &list.items)
             .await,
     );
-    Ok(crate::audit::json_response(list))
+    if requests_table(&headers) {
+        let resp = crate::audit::json_response(list).into_response();
+        return table_response(&crd, &version, &params, resp).await;
+    }
+    Ok(crate::audit::json_response(list).into_response())
 }
 
 /// DELETE on a custom-resource collection (`deletecollection`).
