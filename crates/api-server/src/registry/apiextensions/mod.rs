@@ -6,3 +6,4 @@ pub mod controllers;
 pub mod customresource;
 pub mod customresourcedefinition;
 pub mod finalizer_queue;
+pub mod tableconvertor;

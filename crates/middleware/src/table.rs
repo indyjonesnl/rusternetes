@@ -327,10 +327,10 @@ pub fn normalize_kind(kind: &str) -> &str {
 }
 
 /// `ObjectMeta` swagger doc for `name`.
-const OBJECT_META_NAME_DOC: &str = "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names";
+pub const OBJECT_META_NAME_DOC: &str = "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names";
 
 /// `ObjectMeta` swagger doc for `creationTimestamp`.
-const OBJECT_META_CREATION_TIMESTAMP_DOC: &str = "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata";
+pub const OBJECT_META_CREATION_TIMESTAMP_DOC: &str = "CreationTimestamp is a timestamp representing the server time when this object was created. It is not guaranteed to be set in happens-before order across separate operations. Clients may not set this value. It is represented in RFC3339 form and is in UTC.\n\nPopulated by the system. Read-only. Null for lists. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata";
 
 /// `PodCertificateRequestSpec` swagger doc for `signerName`
 /// (certificates/v1beta1 types_swagger_doc_generated.go:131).

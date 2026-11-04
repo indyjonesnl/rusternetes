@@ -661,6 +661,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    req.headers().clone(),
                     axum::extract::Query(query_params),
                 )
                 .await
@@ -685,6 +686,7 @@ async fn custom_resource_fallback(
                     namespace.map(|s| s.to_string()),
                     name.to_string(),
                 )),
+                req.headers().clone(),
                 axum::extract::Query(
                     uri.query()
                         .map(|q| {
