@@ -27,6 +27,7 @@ pub mod policy_plugin;
 pub mod policy_registry;
 pub mod policy_source;
 pub mod resourcequota;
+pub mod runtime_class;
 pub mod storage_object_in_use_protection;
 
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection

@@ -182,6 +182,37 @@ impl Admission<'_> {
         )
     }
 
+    /// `prepareObjects` (runtimeclass/admission.go:142-164): the pod's
+    /// RuntimeClass, `None` when it names none. A class that does not exist
+    /// is `NewForbidden`; any other lookup error is returned as is. The
+    /// informer-then-live-client fallback of upstream is one storage read.
+    async fn runtime_class_for(
+        &self,
+        pod: &Pod,
+    ) -> Result<Option<rusternetes_common::resources::RuntimeClass>> {
+        let Some(name) = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.runtime_class_name.as_deref())
+        else {
+            return Ok(None);
+        };
+        let key = rusternetes_storage::build_key("runtimeclasses", None, name);
+        match self
+            .state
+            .storage
+            .get::<rusternetes_common::resources::RuntimeClass>(&key)
+            .await
+        {
+            Ok(rc) => Ok(Some(rc)),
+            Err(Error::NotFound(_)) => Err(self.forbidden(
+                &pod.metadata.name,
+                crate::admission::runtime_class::not_found(name),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
     /// One in-tree plugin as `NewFromPlugins` runs it
     /// (apiserver/pkg/admission/plugins.go:142-144): skipped when it is not in
     /// the enabled set, or when the chain would not call it for this
@@ -415,42 +446,18 @@ impl Admission<'_> {
         })
         .await?;
 
-        // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go):
-        // the class must exist, and its overhead is set on the pod.
+        // RuntimeClass.Admit (plugin/pkg/admission/runtimeclass/admission.go:
+        // 95-114): the class must exist, then `setOverhead` and
+        // `setScheduling`. CREATE only, no subresource.
         self.plugin("RuntimeClass", op, ADMIT, async {
-            let (Some(pod), Some(_), true) = (pod.as_mut(), namespace, create) else {
+            let (Some(pod), true) = (pod.as_mut(), self.is_core("pods")) else {
                 return Ok(());
             };
+            let rc = self.runtime_class_for(pod).await?;
             let name = pod.metadata.name.clone();
-            let runtime_class = pod
-                .spec
-                .as_ref()
-                .and_then(|s| s.runtime_class_name.clone())
-                .filter(|n| !n.is_empty());
-            if let Some(rc_name) = runtime_class {
-                let rc_key = rusternetes_storage::build_key("runtimeclasses", None, &rc_name);
-                let Ok(rc) = storage.get::<serde_json::Value>(&rc_key).await else {
-                    return Err(self.forbidden(
-                        &name,
-                        format!("pod {name} references non-existent RuntimeClass \"{rc_name}\""),
-                    ));
-                };
-                let overhead: std::collections::HashMap<String, String> = rc
-                    .pointer("/overhead/podFixed")
-                    .and_then(|o| o.as_object())
-                    .map(|o| {
-                        o.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if !overhead.is_empty() {
-                    if let Some(spec) = pod.spec.as_mut() {
-                        spec.overhead = Some(overhead);
-                    }
-                }
-            }
-            Ok(())
+            crate::admission::runtime_class::set_overhead(pod, rc.as_ref())
+                .and_then(|()| crate::admission::runtime_class::set_scheduling(pod, rc.as_ref()))
+                .map_err(|e| self.forbidden(&name, e))
         })
         .await?;
 
@@ -593,6 +600,18 @@ impl Admission<'_> {
                 Ok(())
             },
         )
+        .await?;
+        // RuntimeClass.Validate (runtimeclass/admission.go:117-133): the pod's
+        // overhead must match the class's. CREATE only, no subresource.
+        self.plugin("RuntimeClass", op, VALIDATE, async {
+            let (Some(obj), true) = (obj, self.is_core("pods")) else {
+                return Ok(());
+            };
+            let pod: Pod = recast_obj(obj)?;
+            let rc = self.runtime_class_for(&pod).await?;
+            crate::admission::runtime_class::validate_overhead(&pod, rc.as_ref())
+                .map_err(|e| self.forbidden(&pod.metadata.name, e))
+        })
         .await?;
         // `approval` is CertificateApproval's, `status` CertificateSigning's.
         let approval = self.subresource == Some("approval");

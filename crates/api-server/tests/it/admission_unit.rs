@@ -29,4 +29,5 @@ mod admission__policy_plugin;
 mod admission__policy_registry;
 mod admission__policy_source;
 mod admission__resourcequota;
+mod admission__runtime_class;
 mod admission__storage_object_in_use_protection;
