@@ -22,6 +22,12 @@ refs="$(grep -rhE 'registry\.k8s\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+' \
 # Control-plane images from the vanilla-swap tooling are not mirrored.
 refs="$(echo "$refs" | sed 's#^registry\.k8s\.io/##' | grep -vE '^kube-(apiserver|controller-manager|scheduler|proxy):' | sort -u)"
 
+# Everything side-loaded must also be mirrored.
+while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    grep -qxF "$ref" <<<"$listed" || { echo "ci/mirror/sideload.txt: $ref is not in $LIST" >&2; exit 1; }
+done < <(sed 's/#.*//' ci/mirror/sideload.txt | tr -d ' \t' | grep -v '^$')
+
 missing=0
 while IFS= read -r ref; do
     [ -n "$ref" ] || continue

@@ -514,10 +514,11 @@ args_of() { rm -f "$TMP/hydro-args"; run_cli --target sig-node --kubeconfig "$KC
 a="$(args_of im1 --image-source mirror)"
 echo "$a" | grep -q -- '--conformance-image ghcr.io/indyjonesnl/rusternetes/mirror/conformance:v1.35.0' \
   && echo "$a" | grep -q -- "--test-repo-list $REPO_ROOT/ci/mirror/e2e-repo-list.yaml" \
-  && ok "--image-source mirror => ghcr conformance image + --test-repo-list" || bad "mirror args: $a"
+  && echo "$a" | grep -q -- '--busybox-image ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/busybox:1.36.1-1' \
+  && ok "--image-source mirror => ghcr conformance image + --test-repo-list + --busybox-image" || bad "mirror args: $a"
 
 a="$(args_of im2 --image-source upstream)"
-echo "$a" | grep -q -- '--conformance-image registry.k8s.io/conformance:v1.35.0' && ! echo "$a" | grep -q -- '--test-repo-list' \
+echo "$a" | grep -q -- '--conformance-image registry.k8s.io/conformance:v1.35.0' && ! echo "$a" | grep -q -- '--test-repo-list' && ! echo "$a" | grep -q -- '--busybox-image' \
   && ok "--image-source upstream => registry.k8s.io image, no repo list" || bad "upstream args: $a"
 
 a="$(args_of im3 --image-source mirror --conformance-image example.test/c:1)"
@@ -553,6 +554,7 @@ export STUB_LOG="$TMP/stub.log"; : > "$STUB_LOG"
 CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && grep -q "^pull --quiet $SLC\$" "$STUB_LOG" \
   && grep -q "^pull --quiet ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/agnhost:2.59\$" "$STUB_LOG" \
+  && grep -q "^pull --quiet ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/busybox:1.36.1-1\$" "$STUB_LOG" \
   && grep -qE "^exec -i rusternetes-containerd ctr -n k8s.io images import -" "$STUB_LOG" \
   && grep -qE "^exec -i rusternetes-containerd2 ctr -n k8s.io images import -" "$STUB_LOG" \
   && ok "sideload: mirror pulls + imports into every containerd" || bad "sideload mirror log: $(tr '\n' '|' < "$STUB_LOG")"

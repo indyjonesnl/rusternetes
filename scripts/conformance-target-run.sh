@@ -450,6 +450,9 @@ if [ "$IMAGE_SOURCE" = auto ]; then
 fi
 if [ "$IMAGE_SOURCE" = mirror ]; then
     REPO_LIST_ARGS=(--test-repo-list "$REPO_ROOT/ci/mirror/e2e-repo-list.yaml")
+    # Hydrophone's own output container is not covered by the repo list
+    # (pkg/types/config.go DefaultBusyboxImage, v0.7.0); redirect it explicitly.
+    REPO_LIST_ARGS+=(--busybox-image "$MIRROR_PREFIX/e2e-test-images/busybox:1.36.1-1")
     if [ "$CONFORMANCE_IMAGE_EXPLICIT" -eq 0 ]; then
         CONFORMANCE_IMAGE="$MIRROR_PREFIX/${CONFORMANCE_IMAGE#registry.k8s.io/}"
     fi
