@@ -387,6 +387,7 @@ impl Strategy {
         self.prune_non_nullable_nulls(cr);
         apply_schema_defaults(&self.crd, &self.version, cr);
         prune_custom_resource(&self.crd, &self.version, cr);
+        omit_empty_root_meta_fields(cr);
     }
 
     /// What `schemaCoercingConverter` does to an object converted to the
@@ -401,6 +402,7 @@ impl Strategy {
         }
         self.prune_non_nullable_nulls(cr);
         prune_custom_resource(&self.crd, &self.version, cr);
+        omit_empty_root_meta_fields(cr);
     }
 
     /// `structuraldefaulting.PruneNonNullableNullsWithoutDefaults(u.Object,
@@ -907,6 +909,20 @@ impl RestUpdateStrategy<CustomResource> for StatusStrategy {
 }
 
 struct Noop;
+
+/// `schemaobjectmeta.SetObjectMeta` (schema/objectmeta/objectmeta.go) writes
+/// the typed `ObjectMeta` back over `u.Object["metadata"]` at the end of
+/// `unstructuredSchemaCoercer.apply` (customresource_handler.go:1464-1470).
+/// The typed struct's `omitempty` tags mean a request that sent
+/// `metadata.namespace: ""` — as `crd_watch.go`'s `NewNoxuInstance` does for a
+/// cluster-scoped CRD — has the empty field gone from the object the create
+/// returns, and so equal (`apiequality.Semantic.DeepEqual`, watch.go:428) to
+/// the watch event decoded from storage.
+fn omit_empty_root_meta_fields(cr: &mut CustomResource) {
+    if cr.metadata.namespace.as_deref() == Some("") {
+        cr.metadata.namespace = None;
+    }
+}
 
 /// The root-`metadata` half of what the storage codec does to an object it
 /// reads: `unstructuredSchemaCoercer.apply` runs
