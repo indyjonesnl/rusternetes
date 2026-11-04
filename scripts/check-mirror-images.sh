@@ -41,8 +41,10 @@ if [ "${1:-}" = "--list-images" ]; then
     img="registry.k8s.io/$conf"
     docker pull -q "$mirror" >/dev/null 2>&1 && img="$mirror"
     echo "listing images from $img"
+    # node-perf/* images are multi-GB and node-performance-only (not conformance);
+    # they are intentionally not mirrored, so they are skipped here.
     actual="$(docker run --rm --entrypoint e2e.test "$img" --list-images \
-        | grep -E '^registry\.k8s\.io/' | sed 's#^registry\.k8s\.io/##' | sort -u)"
+        | grep -E '^registry\.k8s\.io/' | grep -v '^registry\.k8s\.io/e2e-test-images/node-perf/' | sed 's#^registry\.k8s\.io/##' | sort -u)"
     [ -n "$actual" ] || { echo "e2e.test --list-images produced nothing" >&2; exit 1; }
     drift=0
     while IFS= read -r ref; do

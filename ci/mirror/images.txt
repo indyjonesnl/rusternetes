@@ -12,7 +12,9 @@
 # Source: `e2e.test --list-images` in registry.k8s.io/conformance:v1.35.0 (every
 # registry.k8s.io entry; the gcr.io private-registry and invalid.registry.k8s.io
 # entries are not mirrorable), plus the conformance image itself and pause:3.10
-# (vanilla-swap). Regenerate on a conformance tag bump.
+# (vanilla-swap). Regenerate on a conformance tag bump. The three
+# e2e-test-images/node-perf/* images are deliberately NOT mirrored: multi-GB and
+# used only by node performance tests, not conformance.
 
 build-image/distroless-iptables:v0.8.6
 cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver:v1.4.0
@@ -28,9 +30,6 @@ e2e-test-images/kitten:1.7
 e2e-test-images/nautilus:1.7
 e2e-test-images/nginx:1.14-4
 e2e-test-images/nginx:1.15-4
-e2e-test-images/node-perf/npb-ep:1.2
-e2e-test-images/node-perf/npb-is:1.2
-e2e-test-images/node-perf/tf-wide-deep:1.3
 e2e-test-images/nonewprivs:1.3
 e2e-test-images/nonroot:1.4
 e2e-test-images/perl:5.26
