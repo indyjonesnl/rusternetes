@@ -248,11 +248,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
         // No kubelet config file here: `EnableDebuggingHandlers` defaults to
         // true; the exec/attach/run handlers are not part of this binary.
-        let registered: Vec<String> = ["/metrics", "/configz"]
+        // Only `Container.Handle`d paths are registered (see
+        // `server::registered_handle_paths`); this binary serves /metrics,
+        // /healthz and /configz of those.
+        let registered: Vec<String> = ["/healthz", "/metrics", "/configz"]
             .into_iter()
-            .chain(server::READ_ONLY_PATHS)
-            .chain([server::RUNNING_PODS_ROUTE])
-            .chain([server_logs::LOGS_PATH])
             .map(String::from)
             .collect();
         let app = server::install_statusz(app, registered);

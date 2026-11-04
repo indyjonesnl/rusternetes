@@ -501,13 +501,6 @@ pub fn server_bucket_options(enable_debugging_handlers: bool) -> ServerBucketOpt
     }
 }
 
-/// Paths [`auth_not_required_router`] registers (the route templates, as
-/// go-restful's `RegisteredHandlePaths()` reports them).
-pub const READ_ONLY_PATHS: [&str; 3] = ["/pods", "/healthz", "/stats/summary"];
-
-/// `/runningpods/` as [`running_pods_router`] registers it.
-pub const RUNNING_PODS_ROUTE: &str = "/runningpods/";
-
 /// `authorizer.AttributesRecord` (as populated by `GetRequestAttributes`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RequestAttributes {
@@ -607,18 +600,6 @@ pub fn get_request_attributes(
         .collect()
 }
 
-/// Route templates [`crate::streaming_server`] handlers are mounted at in the
-/// kubelet binary (main.rs).
-pub const STREAMING_PATHS: [&str; 7] = [
-    "/exec/:namespace/:pod/:container",
-    "/exec/:namespace/:pod/:uid/:container",
-    "/attach/:namespace/:pod/:container",
-    "/attach/:namespace/:pod/:uid/:container",
-    "/portForward/:namespace/:pod",
-    "/portForward/:namespace/:pod/:uid",
-    "/containerLogs/:namespace/:pod/:container",
-];
-
 /// The path prefixes `InstallDebuggingDisabledHandlers` (server.go:633-651)
 /// answers: `"/run/", "/exec/", "/attach/", "/portForward/", "/containerLogs/",
 /// runningPodsPath, pprofBasePath, logsPath`. `/logs/` is registered by the
@@ -665,40 +646,52 @@ pub fn install_debugging_disabled_handlers(router: Router) -> Router {
     router
 }
 
-/// `RegisteredHandlePaths()` contribution of the debugging handlers: when
-/// enabled, `InstallAuthRequiredHandlers`' runningpods/run/checkpoint web
-/// services (exec/attach/portForward/containerLogs are [`STREAMING_PATHS`]);
-/// when disabled, [`DEBUGGING_DISABLED_PATHS`]. Also the `/debug/pprof` and
-/// `/debug/flags/v` registrations of `NewServer` (server.go:322-323): `pprofBasePath` is
-/// `Handle`d when profiling is disabled and registered as the restful
-/// `/debug/pprof/{subpath:*}` route when enabled; `debugFlagPath` is always
-/// `Handle`d (disabled or enabled) under `EnableDebuggingHandlers`.
-pub fn debugging_registered_paths(
+/// `RegisteredHandlePaths()` (server.go:146-165) of this kubelet's router.
+///
+/// Upstream's `filteringContainer.Handle` records only the paths given to
+/// `Container.Handle`; go-restful `WebService`s (`/pods`, `/stats/`, `/run`,
+/// `/exec`, `/attach`, `/portForward`, `/containerLogs`, `/runningpods/`,
+/// `/checkpoint/`, the enabled `/logs/` and `/debug/pprof/`) are not recorded
+/// (server_test.go `TestStatusz` expects exactly `/configz /debug /healthz
+/// /metrics`). `installStatusZ` (server.go:393-398) hands this list to
+/// `statusz.WithListedPaths`. Only paths this kubelet really serves are listed
+/// (so no `/healthz/<check>` sub-paths, no `/flagz`), in upstream's
+/// registration order:
+///
+/// * `InstallAuthNotRequiredHandlers`: `/healthz`, `/metrics/slis`,
+///   `/metrics`, `/metrics/cadvisor`, `/metrics/resource`, `/metrics/probes`.
+/// * `enable_debugging_handlers`: `InstallAuthRequiredHandlers`' `/configz`;
+///   `InstallSystemLogHandler`'s `/logs/` only when
+///   `enable_system_log_handler` is off; `InstallProfilingHandler`'s
+///   `/debug/pprof/` only when `enable_profiling_handler` is off;
+///   `InstallDebugFlagsHandler`'s `/debug/flags/v` (both branches).
+/// * otherwise `InstallDebuggingDisabledHandlers` (server.go:633-651):
+///   [`DEBUGGING_DISABLED_PATHS`] and `/logs/`.
+pub fn registered_handle_paths(
     enable_debugging_handlers: bool,
-    run_and_checkpoint: bool,
-    checkpoint_enabled: bool,
-    profiling_enabled: bool,
+    enable_system_log_handler: bool,
+    enable_profiling_handler: bool,
 ) -> Vec<String> {
-    let mut paths: Vec<&str> = Vec::new();
-    if !enable_debugging_handlers {
-        paths.extend(DEBUGGING_DISABLED_PATHS);
-    } else {
-        paths.push("/runningpods/");
-        paths.push(if profiling_enabled {
-            "/debug/pprof/{subpath:*}"
-        } else {
-            "/debug/pprof/"
-        });
-        paths.push("/debug/flags/v");
-        if run_and_checkpoint {
-            paths.extend([
-                "/run/:namespace/:pod/:container",
-                "/run/:namespace/:pod/:uid/:container",
-            ]);
-            if checkpoint_enabled {
-                paths.push("/checkpoint/:namespace/:pod/:container");
-            }
+    let mut paths: Vec<&str> = vec![
+        "/healthz",
+        "/metrics/slis",
+        "/metrics",
+        "/metrics/cadvisor",
+        "/metrics/resource",
+        "/metrics/probes",
+    ];
+    if enable_debugging_handlers {
+        paths.push("/configz");
+        if !enable_system_log_handler {
+            paths.push("/logs/");
         }
+        if !enable_profiling_handler {
+            paths.push("/debug/pprof/");
+        }
+        paths.push("/debug/flags/v");
+    } else {
+        paths.extend(DEBUGGING_DISABLED_PATHS);
+        paths.push("/logs/");
     }
     paths.into_iter().map(String::from).collect()
 }
