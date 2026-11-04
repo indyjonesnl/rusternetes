@@ -3474,4 +3474,95 @@ mod sync_pod_fake_cri_tests {
             assert_eq!(status.pod_ip.as_deref(), Some("192.168.192.168"));
         });
     }
+    /// Run a pod to Running, then set `deletionTimestamp` in storage and return
+    /// the updated pod (the object the kubelet is handed on its next sync).
+    async fn start_then_delete(t: &TestKubelet, p: &Pod) -> Pod {
+        t.kubelet.sync_pod(p).await.unwrap();
+        let key = "/registry/pods/default/web-0";
+        let mut cur: Pod = t.storage.get(key).await.unwrap();
+        cur.metadata.deletion_timestamp = Some(chrono::Utc::now());
+        cur.metadata.deletion_grace_period_seconds = Some(0);
+        t.storage.update(key, &cur).await.unwrap();
+        t.storage.get(key).await.unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminating_pod_stops_containers_then_tears_down_the_sandbox() {
+        // Upstream SyncTerminatingPod (`kubelet.go:2398`) -> killPod: containers
+        // are stopped (StopContainer), then the sandbox is stopped.
+        //
+        // Deliberate divergence, pinned here: upstream leaves the stopped
+        // sandbox/containers for container GC (`kuberuntime_gc.go`); rusternetes
+        // `stop_pod_for` also issues RemovePodSandbox (which drops the sandbox's
+        // containers in the runtime). No standalone RemoveContainer is sent.
+        run(|| async {
+            let t = new_test_kubelet().await;
+            let p = pod("default", "web-0", "uid-1");
+            store(&t, &p).await;
+            let deleted = start_then_delete(&t, &p).await;
+            t.kubelet.sync_pod(&deleted).await.unwrap();
+            let called = t.fake.called();
+            assert!(count(&t.fake, "StopContainer") >= 1, "{called:?}");
+            assert_eq!(count(&t.fake, "StopPodSandbox"), 1, "{called:?}");
+            assert_eq!(count(&t.fake, "RemoveContainer"), 0, "{called:?}");
+            assert!(t.fake.sandboxes().is_empty(), "{called:?}");
+            assert!(t.fake.containers().is_empty(), "{called:?}");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminating_pod_stops_containers_before_the_sandbox() {
+        // Ordering contract of killPod (`kuberuntime_manager.go`
+        // `killPodWithSyncResult`): containers are stopped before the sandbox.
+        run(|| async {
+            let t = new_test_kubelet().await;
+            let p = pod("default", "web-0", "uid-1");
+            store(&t, &p).await;
+            let deleted = start_then_delete(&t, &p).await;
+            t.kubelet.sync_pod(&deleted).await.unwrap();
+            let called = t.fake.called();
+            let last_stop_container = called.iter().rposition(|c| c == "StopContainer");
+            let first_stop_sandbox = called.iter().position(|c| c == "StopPodSandbox");
+            if let (Some(c), Some(s)) = (last_stop_container, first_stop_sandbox) {
+                assert!(
+                    c < s,
+                    "StopContainer must precede StopPodSandbox: {called:?}"
+                );
+            }
+            assert!(last_stop_container.is_some(), "{called:?}");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminated_pod_is_finalized_once_and_resync_is_idempotent() {
+        // Upstream TestTerminalPhaseTransition / SyncTerminatedPod: once
+        // terminated, further syncs do not re-stop containers.
+        run(|| async {
+            let t = new_test_kubelet().await;
+            let p = pod("default", "web-0", "uid-1");
+            store(&t, &p).await;
+            let deleted = start_then_delete(&t, &p).await;
+            for _ in 0..3 {
+                t.kubelet.sync_pod(&deleted).await.unwrap();
+            }
+            let stops_after_three = count(&t.fake, "StopContainer");
+            t.kubelet.sync_pod(&deleted).await.unwrap();
+            assert_eq!(
+                count(&t.fake, "StopContainer"),
+                stops_after_three,
+                "{:?}",
+                t.fake.called()
+            );
+            assert!(
+                t.storage
+                    .get::<Pod>("/registry/pods/default/web-0")
+                    .await
+                    .is_err(),
+                "finalizer-free deleted pod must be removed from storage"
+            );
+        });
+    }
 }
