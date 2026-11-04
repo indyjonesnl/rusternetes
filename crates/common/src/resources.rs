@@ -93,7 +93,6 @@ pub use coordination::{Lease, LeaseSpec};
 pub use crd::{
     // Structural-schema pruning helpers (used by admission-webhook and api-server handlers)
     prune_custom_resource,
-    prune_custom_resource_value,
     prune_value_against_schema,
     ConversionStrategyType,
     CustomResource,
