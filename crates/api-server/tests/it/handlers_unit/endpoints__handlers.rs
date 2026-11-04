@@ -398,6 +398,11 @@ mod tests {
 
         async fn user_creates_plain_pod(username: &str) -> rusternetes_common::Result<Pod> {
             let state = state();
+            rusternetes_test_support::harness::seed_default_service_account(
+                &*state.storage,
+                "default",
+            )
+            .await;
             let kind = GroupVersionKind {
                 group: String::new(),
                 version: "v1".into(),

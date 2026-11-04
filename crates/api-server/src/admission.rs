@@ -28,12 +28,13 @@ pub mod policy_registry;
 pub mod policy_source;
 pub mod resourcequota;
 pub mod runtime_class;
+pub mod service_account;
 pub mod storage_object_in_use_protection;
 
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
 use rusternetes_common::{
     quantity::{parse_resource_value, Quantity},
-    resources::{LimitRange, Pod, ServiceAccount},
+    resources::{LimitRange, Pod},
     types::ResourceRequirements,
 };
 use rusternetes_storage::Storage;
@@ -551,95 +552,64 @@ fn get_default_class(
     rusternetes_common::resources::volume::get_default_class(classes)
 }
 
-/// ServiceAccount admission controller - injects service account token volumes into pods
-/// This is a built-in admission controller that:
-/// 1. Sets serviceAccountName to "default" if not specified
-/// 2. Injects a volume for the service account token secret
-/// 3. Mounts the token at /var/run/secrets/kubernetes.io/serviceaccount/ in all containers
+/// `Plugin.Admit` of the ServiceAccount plugin on a pod CREATE
+/// (plugin/pkg/admission/serviceaccount/admission.go:138-176), after
+/// `shouldIgnore`:
+/// 1. a mirror pod is not mutated, only validated (:150-153);
+/// 2. `serviceAccountName` defaults to `default` (:156-158);
+/// 3. the ServiceAccount must exist, else an error (:160-163);
+/// 4. the token volume is mounted when `shouldAutomount` (:164-166);
+/// 5. the ServiceAccount's imagePullSecrets are copied when the pod has none
+///    (:167-172).
+///
+/// `Err` carries the message for `NewForbidden`. `Validate` runs separately
+/// in the validating phase ([`service_account::validate`]).
 pub async fn inject_service_account_token<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
     pod: &mut Pod,
-) -> anyhow::Result<()> {
-    let spec = match &mut pod.spec {
-        Some(spec) => spec,
-        None => return Ok(()), // No spec, nothing to inject
-    };
+) -> Result<(), String> {
+    if service_account::is_mirror_pod(pod) {
+        return service_account::validate_mirror_pod(pod);
+    }
+    let pod_name = pod.metadata.name.clone();
+    // Upstream's `Spec` is not optional, so a pod with none is an empty spec.
+    let spec = pod.spec.get_or_insert_with(Default::default);
 
-    // Set service account name to "default" if not specified
-    let sa_name = spec
+    if spec
         .service_account_name
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+        .as_deref()
+        .is_none_or(|s| s.is_empty())
+    {
+        spec.service_account_name = Some(service_account::DEFAULT_SERVICE_ACCOUNT_NAME.to_string());
+    }
+    let sa_name = spec.service_account_name.clone().unwrap_or_default();
 
-    if spec.service_account_name.is_none() {
-        info!(
-            "Setting default service account for pod {}/{}",
-            namespace, pod.metadata.name
-        );
-        spec.service_account_name = Some(sa_name.clone());
+    let service_account = service_account::get_service_account(storage, namespace, &sa_name)
+        .await
+        .map_err(|e| format!("error looking up service account {namespace}/{sa_name}: {e}"))?;
+
+    // shouldAutomount, on the pod as it stands.
+    let automount = spec
+        .automount_service_account_token
+        .or(service_account.automount_service_account_token)
+        .unwrap_or(true);
+    if automount {
+        // Shared with the controller-manager so controller-created pods
+        // (ReplicaSet/StatefulSet/etc.), which write pods straight to storage
+        // and bypass this HTTP admission path, get the same volume.
+        rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
     }
 
-    // Look up the ServiceAccount once: we need both its automount setting and
-    // its imagePullSecrets list below.
-    let sa_key = format!("/registry/serviceaccounts/{}/{}", namespace, sa_name);
-    let service_account = match storage.get::<ServiceAccount>(&sa_key).await {
-        Ok(sa) => Some(sa),
-        Err(_) => {
-            warn!(
-                "Service account {}/{} does not exist, but proceeding with token injection",
-                namespace, sa_name
-            );
-            None
-        }
-    };
-    let sa_automount = service_account
-        .as_ref()
-        .and_then(|sa| sa.automount_service_account_token);
-
-    // Propagate the ServiceAccount's imagePullSecrets onto the pod (semantics
-    // documented on the shared helper: pod list wins, regardless of automount).
     let copied = rusternetes_common::serviceaccount::propagate_image_pull_secrets(
         spec,
-        service_account
-            .as_ref()
-            .and_then(|sa| sa.image_pull_secrets.as_deref()),
+        service_account.image_pull_secrets.as_deref(),
     );
     if copied > 0 {
         info!(
-            "Propagated {} imagePullSecret(s) from SA {}/{} to pod {}",
-            copied, namespace, sa_name, pod.metadata.name
+            "Propagated {copied} imagePullSecret(s) from SA {namespace}/{sa_name} to pod {pod_name}"
         );
     }
-
-    // Determine whether to mount the SA token.
-    // Pod-level setting takes precedence over SA-level.
-    let pod_automount = spec.automount_service_account_token;
-    let should_mount = match pod_automount {
-        Some(false) => false,                 // Pod explicitly disabled
-        Some(true) => true,                   // Pod explicitly enabled
-        None => sa_automount.unwrap_or(true), // Use SA setting, default true
-    };
-
-    if !should_mount {
-        info!(
-            "Skipping service account token injection for pod {}/{} - automountServiceAccountToken is false",
-            namespace, pod.metadata.name
-        );
-        return Ok(());
-    }
-
-    // Inject the projected kube-api-access volume (token + ca.crt + namespace)
-    // and mount it into every container. Shared with the controller-manager so
-    // controller-created pods (ReplicaSet/StatefulSet/etc.) get the same volume
-    // — they write pods straight to storage and bypass this HTTP admission path.
-    rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
-
-    info!(
-        "Service account token injection complete for pod {}/{} using SA {}",
-        namespace, pod.metadata.name, sa_name
-    );
-
     Ok(())
 }
 

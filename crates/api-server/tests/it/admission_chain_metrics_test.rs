@@ -373,6 +373,8 @@ async fn rejecting_plugin_is_observed_as_rejected() {
         resource: "pods".into(),
     };
     let admission = cm_admission(&state, &kind, &resource, &user);
+    rusternetes_test_support::harness::seed_default_service_account(&*state.storage, "default")
+        .await;
     let pod: rusternetes_common::resources::Pod = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": "p", "namespace": "default"},
@@ -420,6 +422,11 @@ fn pod_chain_fits_a_small_stack() {
                         )
                         .await
                         .unwrap();
+                    rusternetes_test_support::harness::seed_default_service_account(
+                        &*state.storage,
+                        "default",
+                    )
+                    .await;
                     let kind = GroupVersionKind {
                         group: String::new(),
                         version: "v1".into(),

@@ -102,23 +102,34 @@ fn sa_token_volume() -> Volume {
 }
 
 /// Inject the `kube-api-access` projected volume into `spec` and mount it
-/// read-only into every container and init container. Idempotent: a volume or
-/// mount that is already present (by name / mount path) is left untouched.
+/// read-only into every container and init container. Idempotent.
+///
+/// Port of `Plugin.mountServiceAccountToken`
+/// (plugin/pkg/admission/serviceaccount/admission.go:416-480): an existing
+/// volume named `kube-api-access-*` is reused (its name is the mount's); a
+/// container already mounting `DefaultAPITokenMountPath` is left alone; and
+/// the volume is added only when some container needed the mount.
+/// Deviation: a fresh volume is named `kube-api-access` rather than
+/// `GenerateName("kube-api-access-")`, as other components address it by that
+/// name.
 ///
 /// Callers are responsible for the `automountServiceAccountToken` decision —
 /// only call this when the token should be mounted.
 pub fn add_kube_api_access_volume(spec: &mut PodSpec) {
-    match &mut spec.volumes {
-        Some(volumes) => {
-            if !volumes.iter().any(|v| v.name == SA_TOKEN_VOLUME_NAME) {
-                volumes.push(sa_token_volume());
-            }
-        }
-        None => spec.volumes = Some(vec![sa_token_volume()]),
-    }
+    let existing = spec
+        .volumes
+        .iter()
+        .flatten()
+        .find(|v| {
+            v.name == SA_TOKEN_VOLUME_NAME
+                || v.name.starts_with(&format!("{SA_TOKEN_VOLUME_NAME}-"))
+        })
+        .map(|v| v.name.clone());
+    let has_token_volume = existing.is_some();
+    let volume_name = existing.unwrap_or_else(|| SA_TOKEN_VOLUME_NAME.to_string());
 
     let mount = VolumeMount {
-        name: SA_TOKEN_VOLUME_NAME.to_string(),
+        name: volume_name,
         mount_path: SA_TOKEN_MOUNT_PATH.to_string(),
         read_only: Some(true),
         sub_path: None,
@@ -127,22 +138,39 @@ pub fn add_kube_api_access_volume(spec: &mut PodSpec) {
         recursive_read_only: None,
     };
 
-    let add_mount = |mounts: &mut Option<Vec<VolumeMount>>| match mounts {
-        Some(list) => {
-            if !list.iter().any(|m| m.mount_path == SA_TOKEN_MOUNT_PATH) {
-                list.push(mount.clone());
+    // Returns whether the mount was added.
+    let add_mount = |mounts: &mut Option<Vec<VolumeMount>>| -> bool {
+        match mounts {
+            Some(list) => {
+                if list.iter().any(|m| m.mount_path == SA_TOKEN_MOUNT_PATH) {
+                    false
+                } else {
+                    list.push(mount.clone());
+                    true
+                }
+            }
+            None => {
+                *mounts = Some(vec![mount.clone()]);
+                true
             }
         }
-        None => *mounts = Some(vec![mount.clone()]),
     };
 
-    for container in &mut spec.containers {
-        add_mount(&mut container.volume_mounts);
-    }
+    let mut needs_token_volume = false;
+    // Upstream: init containers first, then containers.
     if let Some(init_containers) = &mut spec.init_containers {
         for container in init_containers {
-            add_mount(&mut container.volume_mounts);
+            needs_token_volume |= add_mount(&mut container.volume_mounts);
         }
+    }
+    for container in &mut spec.containers {
+        needs_token_volume |= add_mount(&mut container.volume_mounts);
+    }
+
+    if !has_token_volume && needs_token_volume {
+        spec.volumes
+            .get_or_insert_with(Vec::new)
+            .push(sa_token_volume());
     }
 }
 

@@ -102,6 +102,32 @@ impl TestApiServer {
         });
     }
 
+    /// The ServiceAccount admission plugin refuses a pod whose service
+    /// account does not exist (`Admit`, serviceaccount/admission.go:160-163),
+    /// and upstream's ServiceAccount controller creates `default` in every
+    /// namespace. No controller runs here, so a write of a pod seeds that
+    /// account, once; it never touches one that exists.
+    fn seed_default_service_account_for(&self, method: &str, uri: &str) {
+        let post = method.eq_ignore_ascii_case("POST");
+        // A PUT or PATCH (server-side apply) of a missing pod creates it.
+        let write =
+            post || method.eq_ignore_ascii_case("PUT") || method.eq_ignore_ascii_case("PATCH");
+        if !write {
+            return;
+        }
+        let path = uri.split('?').next().unwrap_or(uri);
+        let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let want = if post { 5 } else { 6 };
+        if segs.len() != want || segs[0] != "api" || segs[2] != "namespaces" || segs[4] != "pods" {
+            return;
+        }
+        let storage = self.storage.clone();
+        let ns = segs[3].to_string();
+        futures::FutureExt::now_or_never(async move {
+            seed_default_service_account(&*storage, &ns).await;
+        });
+    }
+
     /// Low-level request primitive — returns status, raw body bytes, and the
     /// body parsed as JSON (`Value::Null` if it isn't JSON). Mirrors the
     /// `send`/`read_body` helpers duplicated across `crates/api-server/tests/`.
@@ -168,6 +194,7 @@ impl TestApiServer {
         body: Option<Vec<u8>>,
     ) -> axum::response::Response {
         self.seed_namespace_for(method, uri);
+        self.seed_default_service_account_for(method, uri);
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
@@ -195,6 +222,7 @@ impl TestApiServer {
         body: Option<Vec<u8>>,
     ) -> (StatusCode, HeaderMap, Vec<u8>, Value) {
         self.seed_namespace_for(method, uri);
+        self.seed_default_service_account_for(method, uri);
         let mut builder = Request::builder().method(method).uri(uri);
         for (k, v) in headers {
             builder = builder.header(*k, *v);
@@ -445,6 +473,23 @@ impl TestApiServerBuilder {
         .expect("the initial NodePort repair on MemoryStorage completes without waiting")
         .expect("the initial NodePort repair succeeds");
         TestApiServer::from_parts(mem, state, !self.strict_namespaces)
+    }
+}
+
+/// Create the `default` ServiceAccount of `namespace` unless it exists: what
+/// upstream's ServiceAccount controller does for every namespace, which the
+/// ServiceAccount admission plugin relies on (serviceaccount/admission.go:160-163).
+pub async fn seed_default_service_account<S: rusternetes_storage::Storage>(
+    storage: &S,
+    namespace: &str,
+) {
+    let key = rusternetes_storage::build_key("serviceaccounts", Some(namespace), "default");
+    let sa = serde_json::json!({
+        "apiVersion": "v1", "kind": "ServiceAccount",
+        "metadata": {"name": "default", "namespace": namespace},
+    });
+    if storage.get::<Value>(&key).await.is_err() {
+        let _ = storage.create(&key, &sa).await;
     }
 }
 

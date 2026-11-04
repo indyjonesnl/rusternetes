@@ -90,6 +90,9 @@ async fn seed(state: &TestApiServer, pod: &Pod) {
                 }),
             )
             .await;
+        // ServiceAccount.Validate on `ephemeralcontainers` looks the pod's
+        // service account up (admission.go:379-395).
+        rusternetes_test_support::harness::seed_default_service_account(&*state.storage, ns).await;
     }
     let key = build_key(
         "pods",
