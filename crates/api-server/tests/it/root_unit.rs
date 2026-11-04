@@ -45,6 +45,7 @@ mod legacy_token_tracking;
 mod lib;
 mod max_in_flight;
 mod openapi;
+mod openapiv3_aggregator;
 mod post_start_hooks;
 mod prometheus_client;
 mod request_header_authentication;

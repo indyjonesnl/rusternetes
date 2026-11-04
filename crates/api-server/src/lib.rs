@@ -56,6 +56,7 @@ pub mod handlers;
 pub mod max_in_flight_filter;
 pub use rusternetes_middleware as middleware;
 pub mod openapi;
+pub mod openapiv3_aggregator;
 pub mod patch;
 pub mod peer_cert_acceptor;
 pub mod post_start_hooks;
