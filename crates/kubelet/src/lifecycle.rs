@@ -328,6 +328,11 @@ pub fn reason_from_anyhow(err: &anyhow::Error) -> Option<&'static str> {
     if err.downcast_ref::<ImageNeverPullError>().is_some() {
         return Some("ErrImageNeverPull");
     }
+    // `EnsureImageExists` sentinels (`images/types.go`): the kubelet uses
+    // `err.Error()` as the waiting reason.
+    if let Some(e) = err.downcast_ref::<crate::image_manager::ImageManagerError>() {
+        return Some(e.kind.as_str());
+    }
     container_reason_from_error_message(&err.to_string())
 }
 

@@ -52,6 +52,11 @@ struct FakeState {
     /// the part of upstream's embedded `ContainerStatus` that `v1::Container`
     /// (the list item) does not carry.
     container_times: HashMap<String, (i64, i64)>,
+    /// Upstream `FakeImageService.InjectError` for `ImageStatus`: the gRPC
+    /// status message every `ImageStatus` fails with.
+    image_status_error: Option<String>,
+    /// Upstream `FakeImageService.InjectError` for `PullImage`.
+    pull_error: Option<String>,
 }
 
 impl FakeState {
@@ -111,6 +116,29 @@ impl FakeCri {
                 .collect(),
             ..Default::default()
         });
+    }
+
+    /// Seed an image the runtime already holds (`FakeImageService.Images`).
+    pub fn add_image(&self, name: &str) {
+        self.state.lock().unwrap().images.insert(
+            name.to_string(),
+            v1::Image {
+                id: name.to_string(),
+                repo_tags: vec![name.to_string()],
+                size: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Make every `ImageStatus` fail with this status message.
+    pub fn fail_image_status(&self, message: &str) {
+        self.state.lock().unwrap().image_status_error = Some(message.to_string());
+    }
+
+    /// Make every `PullImage` fail with this status message.
+    pub fn fail_pull_image(&self, message: &str) {
+        self.state.lock().unwrap().pull_error = Some(message.to_string());
     }
 
     /// RPC names received so far, in order (upstream `Called`).
@@ -519,6 +547,9 @@ impl ImageService for FakeCri {
         let spec = request.into_inner().image.unwrap_or_default();
         let mut st = self.state.lock().unwrap();
         st.record("ImageStatus");
+        if let Some(m) = st.image_status_error.clone() {
+            return Err(Status::unknown(m));
+        }
         Ok(Response::new(v1::ImageStatusResponse {
             image: st.images.get(&spec.image).cloned(),
             ..Default::default()
@@ -533,6 +564,9 @@ impl ImageService for FakeCri {
         let spec = req.image.unwrap_or_default();
         let mut st = self.state.lock().unwrap();
         st.record("PullImage");
+        if let Some(m) = st.pull_error.clone() {
+            return Err(Status::unknown(m));
+        }
         st.pull_auths.push(req.auth);
         st.pull_sandbox_configs.push(req.sandbox_config);
         let id = spec.image.clone();
