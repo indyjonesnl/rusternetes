@@ -43,6 +43,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+      - name: Check list against the conformance image's e2e image list
+        run: scripts/check-mirror-images.sh --list-images
       - name: Mirror images
         run: scripts/mirror-images.sh | tee "$RUNNER_TEMP/mirror.log"
       - name: Summary
