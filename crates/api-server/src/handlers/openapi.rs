@@ -59,8 +59,23 @@ fn wants_v3_protobuf(headers: &HeaderMap) -> bool {
 /// kicks in on the per-group-version sub-documents.
 /// K8s ref: staging/src/k8s.io/client-go/openapi3/root.go
 pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Response {
-    // Return the root document that lists all available OpenAPI paths
-    // In real K8s, this returns {"paths": {"/apis/apps/v1": {...}, ...}}
+    let mut paths = local_root_paths(&state).await;
+    merge_aggregated_root_paths(&mut paths);
+
+    let root = serde_json::json!({"paths": paths});
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&root).unwrap_or_default()))
+        .unwrap()
+}
+
+/// The group-versions this server's own `/openapi/v3` root lists (built-in
+/// groups plus served CRD versions), before aggregated APIServices join it.
+async fn local_root_paths(
+    state: &Arc<ApiServerState>,
+) -> serde_json::Map<String, serde_json::Value> {
+    // In real K8s, this is {"paths": {"apis/apps/v1": {...}, ...}}
     let mut paths = serde_json::Map::new();
     let path_entry =
         |gv: &str| serde_json::json!({"serverRelativeURL": format!("/openapi/v3/{}", gv)});
@@ -155,12 +170,78 @@ pub async fn get_openapi_spec(State(state): State<Arc<ApiServerState>>) -> Respo
         }
     }
 
-    let root = serde_json::json!({"paths": paths});
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&root).unwrap_or_default()))
-        .unwrap()
+    paths
+}
+
+/// `specProxier.getOpenAPIV3Root`'s merge: the discovery paths the
+/// `apiservice-openapiv3-controller` downloaded from the aggregated servers
+/// join the root document, each keeping the `serverRelativeURL` (with its
+/// content hash) the aggregated server published. A key the local document
+/// already lists keeps the local entry.
+/// K8s ref: kube-aggregator/pkg/controllers/openapiv3/aggregator/aggregator.go
+pub fn merge_aggregated_root_paths(paths: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(mgr) = crate::aggregator_mux::active_handler_manager() else {
+        return;
+    };
+    let Some(controller) = mgr.openapi_v3_controller() else {
+        return;
+    };
+    for (key, gv) in controller.spec_proxier.get_open_api_v3_root().paths {
+        paths
+            .entry(key)
+            .or_insert_with(|| serde_json::json!({"serverRelativeURL": gv.server_relative_url}));
+    }
+}
+
+/// `specProxier.handleGroupVersion`: a group-version listed in the discovery
+/// of an aggregated APIService is served by that APIService's `proxyHandler`
+/// (the request, with its query string, is forwarded as the caller). `None`
+/// when no aggregated APIService lists it, or the local root already does.
+/// K8s ref: kube-aggregator/pkg/controllers/openapiv3/aggregator/aggregator.go
+async fn serve_aggregated_group_version(
+    state: &Arc<ApiServerState>,
+    key: &str,
+    request: &axum::http::request::Parts,
+) -> Option<Response> {
+    let mgr = crate::aggregator_mux::active_handler_manager()?;
+    let controller = mgr.openapi_v3_controller()?;
+    let (handler, group, version) = controller.spec_proxier.group_version_handler(key)?;
+    let auth_ctx = request
+        .extensions
+        .get::<crate::middleware::AuthContext>()?
+        .clone();
+    // The local documents win a collision (module docs of
+    // `openapiv3_aggregator`).
+    if local_root_paths(state).await.contains_key(key) {
+        return None;
+    }
+    let target = match crate::handlers::aggregator::resolve_aggregator_target_for_handler(
+        state.storage.as_ref(),
+        &group,
+        &version,
+        &handler,
+    )
+    .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(resp) => return Some(resp),
+    };
+    let path_and_query = match request.uri.query() {
+        Some(q) => format!("{}?{}", request.uri.path(), q),
+        None => request.uri.path().to_string(),
+    };
+    Some(
+        crate::handlers::aggregator::forward_to_aggregator(
+            &target,
+            &auth_ctx,
+            axum::http::Method::GET,
+            &path_and_query,
+            &request.headers,
+            Vec::new(),
+        )
+        .await,
+    )
 }
 
 /// GET /openapi/v3/*path
@@ -176,7 +257,15 @@ pub async fn get_openapi_spec_path(
     State(state): State<Arc<ApiServerState>>,
     headers: HeaderMap,
     axum::extract::Path(gv_path): axum::extract::Path<String>,
+    request: axum::extract::Request,
 ) -> Response {
+    // A group version an aggregated APIService publishes is proxied to it.
+    let (request, _body) = request.into_parts();
+    if let Some(resp) =
+        serve_aggregated_group_version(&state, gv_path.trim_matches('/'), &request).await
+    {
+        return resp;
+    }
     // A group version whose storage was never installed has no document.
     if !openapi_path_served(gv_path.trim_matches('/')) {
         return axum::response::IntoResponse::into_response(StatusCode::NOT_FOUND);

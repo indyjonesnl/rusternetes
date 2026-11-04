@@ -32,10 +32,11 @@
 //!   instead of reading the APIService from storage. "Mounting" is insertion,
 //!   `Unregister` is removal. The per-group handler's lister is the set of
 //!   APIServices the registration controller has processed (the informer
-//!   cache's equivalent here). Still open: the openapi / openapiv3
-//!   aggregation controllers' `AddAPIService`/`UpdateAPIService`/
-//!   `RemoveAPIService` calls, and the `/api` proxy path of the legacy `v1.`
-//!   APIService (the built-in `/api` routes serve it).
+//!   cache's equivalent here). The openapiv3 aggregation controller's
+//!   `AddAPIService`/`UpdateAPIService`/`RemoveAPIService` calls are made
+//!   ([`crate::openapiv3_aggregator`]). Still open: the OpenAPI v2
+//!   aggregation controller's calls, and the `/api` proxy path of the legacy
+//!   `v1.` APIService (the built-in `/api` routes serve it).
 //! - The `http.Handler` of an APIService is an [`AggregatorHandler`]
 //!   (production: [`crate::aggregated_discovery::ProxyDiscoveryHandler`]).
 //! - The merged document ([`MergedDiscovery`], process-global via
@@ -61,6 +62,9 @@ use crate::aggregator_mux::{
 };
 use crate::autoregister::{APIServiceClient, StorageAPIServiceClient};
 use crate::crdregistration::WorkQueue;
+use crate::openapiv3_aggregator::{
+    register_openapiv3_hook_with, AggregationController, Downloader, ProxySpecServer, SpecProxier,
+};
 use crate::post_start_hooks::{spawn_hook_with, PostStartHooks};
 use crate::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
 
@@ -754,6 +758,8 @@ struct AggregatorState {
 pub struct AggregatorHandlerManager {
     state: Mutex<AggregatorState>,
     discovery_aggregation_controller: Option<Arc<DiscoveryManager>>,
+    /// `openAPIV3AggregationController` (nil when OpenAPI v3 is off).
+    openapi_v3_aggregation_controller: Option<Arc<AggregationController>>,
 }
 
 impl AggregatorHandlerManager {
@@ -761,7 +767,19 @@ impl AggregatorHandlerManager {
         Self {
             state: Mutex::new(AggregatorState::default()),
             discovery_aggregation_controller,
+            openapi_v3_aggregation_controller: None,
         }
+    }
+
+    /// Set `openAPIV3AggregationController` (PrepareRun, apiserver.go:511).
+    pub fn with_openapi_v3_controller(mut self, controller: Arc<AggregationController>) -> Self {
+        self.openapi_v3_aggregation_controller = Some(controller);
+        self
+    }
+
+    /// `openAPIV3AggregationController`, read by `/openapi/v3`.
+    pub fn openapi_v3_controller(&self) -> Option<&Arc<AggregationController>> {
+        self.openapi_v3_aggregation_controller.as_ref()
     }
 
     pub fn registered(&self) -> BTreeSet<String> {
@@ -823,6 +841,9 @@ impl APIHandlerManager for AggregatorHandlerManager {
         if let Some((handler, stored)) = st.proxy_handlers.get_mut(&api_service.metadata.name) {
             handler.update_api_service(api_service);
             *stored = api_service.clone();
+            if let Some(c) = &self.openapi_v3_aggregation_controller {
+                c.update_api_service(handler.clone(), api_service);
+            }
             // "Forward calls to discovery manager to update discovery document"
             if let Some(dm) = &self.discovery_aggregation_controller {
                 dm.add_api_service(api_service);
@@ -832,6 +853,9 @@ impl APIHandlerManager for AggregatorHandlerManager {
         // "register the proxy handler"
         let handler = Arc::new(ProxyHandler::new());
         handler.update_api_service(api_service);
+        if let Some(c) = &self.openapi_v3_aggregation_controller {
+            c.add_api_service(handler.clone(), api_service);
+        }
         if let Some(dm) = &self.discovery_aggregation_controller {
             dm.add_api_service(api_service);
         }
@@ -860,6 +884,9 @@ impl APIHandlerManager for AggregatorHandlerManager {
         let (group, version) = api_service_name_to_group_version(api_service_name);
         let mut st = self.state.lock().unwrap();
         st.proxy_handlers.remove(api_service_name);
+        if let Some(c) = &self.openapi_v3_aggregation_controller {
+            c.remove_api_service(api_service_name);
+        }
         let Some(versions) = st.handled_group_versions.get_mut(&group) else {
             return;
         };
@@ -943,7 +970,16 @@ pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>
         merged_discovery().clone(),
         Arc::new(ProxyDiscoveryHandler::new(storage.clone())),
     );
-    let manager = Arc::new(AggregatorHandlerManager::new(Some(discovery.clone())));
+    // `openapiv3aggregator.BuildAndRegisterAggregator` +
+    // `NewAggregationController` (PrepareRun, apiserver.go:500-512).
+    let openapi_v3 = AggregationController::new(Arc::new(SpecProxier::new(
+        Downloader::new(),
+        Arc::new(ProxySpecServer::new(storage.clone())),
+    )));
+    let manager = Arc::new(
+        AggregatorHandlerManager::new(Some(discovery.clone()))
+            .with_openapi_v3_controller(openapi_v3.clone()),
+    );
     // The request path's "mux": from here on aggregated requests are routed by
     // the handlers this controller installs.
     install_handler_manager(manager.clone());
@@ -959,6 +995,11 @@ pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>
     });
     let c = controller.clone();
     tokio::spawn(async move { spawn_apiservice_event_handlers(storage, c).await });
+    register_openapiv3_hook_with(
+        crate::post_start_hooks::global(),
+        openapi_v3,
+        stop_rx.clone(),
+    );
     register_apiservice_hooks_with(
         crate::post_start_hooks::global(),
         controller,
