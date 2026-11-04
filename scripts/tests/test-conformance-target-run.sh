@@ -190,6 +190,8 @@ export GITHUB_OUTPUT
 # default here and test the gate itself explicitly at the end of the file —
 # silencing it without covering it would leave the new wiring untested.
 export SKIP_PREFLIGHT=1
+# Never touch a real container runtime from these tests (sideload has its own cases below).
+export SIDELOAD_IMAGES=0
 
 run_cli() { : > "$GITHUB_OUTPUT"; bash "$RUNNER" "$@"; }
 gho() { grep -E "^$1=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-; }
@@ -529,6 +531,45 @@ echo "$a" | grep -q -- '--conformance-image registry.k8s.io/conformance:v1.35.0'
 
 set +e; run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$REC" --image-source bogus >/dev/null 2>&1; rc=$?; set -e
 [ "$rc" -eq 2 ] && ok "bad --image-source => exit 2" || bad "bad --image-source rc=$rc"
+
+# ---- side-loading (scripts/sideload-images.sh) with a stub container runtime ----
+SL="$REPO_ROOT/scripts/sideload-images.sh"
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+cat > "$STUBBIN/fakert" <<'EOF2'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+case "$1" in
+  ps) printf 'rusternetes-containerd\nrusternetes-containerd2\nother\n' ;;
+  pull) case "$3" in *"$STUB_FAIL"*) [ -n "${STUB_FAIL:-}" ] && exit 1 ;; esac ;;
+  save) echo tar ;;
+  exec) cat >/dev/null ;;
+esac
+exit 0
+EOF2
+chmod +x "$STUBBIN/fakert"
+SLC="ghcr.io/indyjonesnl/rusternetes/mirror/conformance:v1.35.0"
+export PULL_BACKOFF=0
+export STUB_LOG="$TMP/stub.log"; : > "$STUB_LOG"
+CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && grep -q "^pull --quiet $SLC\$" "$STUB_LOG" \
+  && grep -q "^pull --quiet ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/agnhost:2.59\$" "$STUB_LOG" \
+  && grep -qE "^exec -i rusternetes-containerd ctr -n k8s.io images import -" "$STUB_LOG" \
+  && grep -qE "^exec -i rusternetes-containerd2 ctr -n k8s.io images import -" "$STUB_LOG" \
+  && ok "sideload: mirror pulls + imports into every containerd" || bad "sideload mirror log: $(tr '\n' '|' < "$STUB_LOG")"
+grep -qE "^save .*registry.k8s.io/pause:3.10.1" "$STUB_LOG" \
+  && ok "sideload: sandbox image is saved under the containerd-pinned name" || bad "sideload sandbox name missing"
+
+# mirror pull failing falls back to registry.k8s.io and tags the mirror name; never fails
+: > "$STUB_LOG"
+STUB_FAIL="rusternetes/mirror" CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && grep -q "^pull --quiet registry.k8s.io/conformance:v1.35.0\$" "$STUB_LOG" \
+  && grep -q "^tag registry.k8s.io/conformance:v1.35.0 $SLC\$" "$STUB_LOG" \
+  && ok "sideload: mirror failure falls back to upstream, retagged as requested" || bad "sideload fallback: $(tr '\n' '|' < "$STUB_LOG" | head -c 400)"
+
+# everything failing still exits 0 and imports nothing
+: > "$STUB_LOG"
+STUB_FAIL="/" PULL_RETRIES=1 CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source upstream >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q "^exec" "$STUB_LOG" && ok "sideload: total pull failure => exit 0, no import" || bad "sideload total failure rc=$rc"
 
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi

@@ -488,6 +488,14 @@ else
         || die "cluster preflight failed — fix the conditions above or pass --skip-preflight"
 fi
 
+# Side-load the conformance image, sandbox image and core e2e images into every
+# node's containerd via the host daemon (scripts/sideload-images.sh): the cluster's
+# own containerd can time out on registry TLS while the host pulls fine. Best
+# effort, never fails the run; SIDELOAD_IMAGES=0 disables it.
+if [ "${SIDELOAD_IMAGES:-1}" != "0" ] && [ -x "$SCRIPT_DIR/sideload-images.sh" ]; then
+    "$SCRIPT_DIR/sideload-images.sh" --image-source "$IMAGE_SOURCE" --conformance-image "$CONFORMANCE_IMAGE" || true
+fi
+
 # Clear any leftover conformance namespace before deploying (hydrophone refuses
 # to deploy into an existing one) — same self-containment as conformance-tags-run.sh.
 "$HYDROPHONE_BIN" --cleanup --kubeconfig "$KUBECONFIG_PATH" >/dev/null 2>&1 || true

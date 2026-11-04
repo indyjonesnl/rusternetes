@@ -1,0 +1,21 @@
+# Images side-loaded into every node's containerd before a conformance run
+# (scripts/sideload-images.sh), one "<path>:<tag>" per line, relative to
+# registry.k8s.io and a subset of images.txt. The runner's own docker daemon pulls
+# them (with retries) and they are imported into each containerd image store, so
+# the cluster's containerd does not have to reach a registry for them
+# (imagePullPolicy IfNotPresent: kubelet pkg/kubelet/images/helpers.go
+# shouldPullImage). Not everything is worth it, so this is the set pods use at
+# suite start or in most specs (test/utils/image/manifest.go, release-1.35):
+#   pause:3.10.1  the sandbox image (also pinned in deploy/containerd/config.toml)
+#                 plus e2e's GetPauseImageName
+#   agnhost       the default test workload image (most specs)
+#   busybox       the default shell/command image (Job/pod fixtures)
+#   nginx         the Nginx / NginxNew images (service, rc, deployment specs)
+#   jessie-dnsutils  DNS specs
+# Everything else in images.txt is still pulled in-cluster on demand.
+pause:3.10.1
+e2e-test-images/agnhost:2.59
+e2e-test-images/busybox:1.37.0-1
+e2e-test-images/nginx:1.14-4
+e2e-test-images/nginx:1.15-4
+e2e-test-images/jessie-dnsutils:1.7

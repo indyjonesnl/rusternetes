@@ -22,6 +22,7 @@ on:
       - 'scripts/conformance-target-run.sh'
       - 'scripts/conformance-suite-run.sh'
       - 'scripts/resolve-image-source.sh'
+      - 'scripts/sideload-images.sh'
       - 'ci/mirror/**'
       - 'scripts/conformance-targets-discover.sh'
       - 'scripts/gen-target-workflows.sh'
