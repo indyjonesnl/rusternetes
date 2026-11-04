@@ -31,4 +31,23 @@ while IFS= read -r ref; do
     fi
 done <<<"$refs"
 [ "$missing" -eq 0 ] && echo "mirror list covers every registry.k8s.io reference ($(echo "$refs" | grep -c .) refs)"
-exit "$missing"
+[ "$missing" -eq 0 ] || exit 1
+
+# --list-images: also compare against what the pinned conformance image's e2e
+# binary will actually pull (the authoritative set; manifest.go alone drifts).
+if [ "${1:-}" = "--list-images" ]; then
+    conf="$(grep -E '^conformance:' "$LIST" | head -1)"
+    mirror="ghcr.io/indyjonesnl/rusternetes/mirror/$conf"
+    img="registry.k8s.io/$conf"
+    docker pull -q "$mirror" >/dev/null 2>&1 && img="$mirror"
+    echo "listing images from $img"
+    actual="$(docker run --rm --entrypoint e2e.test "$img" --list-images \
+        | grep -E '^registry\.k8s\.io/' | sed 's#^registry\.k8s\.io/##' | sort -u)"
+    [ -n "$actual" ] || { echo "e2e.test --list-images produced nothing" >&2; exit 1; }
+    drift=0
+    while IFS= read -r ref; do
+        grep -qxF "$ref" <<<"$listed" || { echo "e2e pulls registry.k8s.io/$ref, not in $LIST" >&2; drift=1; }
+    done <<<"$actual"
+    [ "$drift" -eq 0 ] && echo "mirror list covers all $(echo "$actual" | grep -c .) images from e2e.test --list-images"
+    exit "$drift"
+fi
