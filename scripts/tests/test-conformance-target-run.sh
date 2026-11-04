@@ -498,5 +498,37 @@ EOF
   fi
 fi
 
+# ---- image source: mirror vs registry.k8s.io ----
+REC="$TMP/rec-hydrophone"
+cat > "$REC" <<EOF2
+#!/usr/bin/env bash
+[ "\${1:-}" = "--cleanup" ] && exit 0
+printf '%s\n' "\$*" > "$TMP/hydro-args"
+FAKE_MODE=pass exec "$FAKE" "\$@"
+EOF2
+chmod +x "$REC"
+args_of() { rm -f "$TMP/hydro-args"; run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$REC" --output-dir "$TMP/$1" "${@:2}" >/dev/null 2>&1 || true; cat "$TMP/hydro-args" 2>/dev/null; }
+
+a="$(args_of im1 --image-source mirror)"
+echo "$a" | grep -q -- '--conformance-image ghcr.io/indyjonesnl/rusternetes/mirror/conformance:v1.35.0' \
+  && echo "$a" | grep -q -- "--test-repo-list $REPO_ROOT/ci/mirror/e2e-repo-list.yaml" \
+  && ok "--image-source mirror => ghcr conformance image + --test-repo-list" || bad "mirror args: $a"
+
+a="$(args_of im2 --image-source upstream)"
+echo "$a" | grep -q -- '--conformance-image registry.k8s.io/conformance:v1.35.0' && ! echo "$a" | grep -q -- '--test-repo-list' \
+  && ok "--image-source upstream => registry.k8s.io image, no repo list" || bad "upstream args: $a"
+
+a="$(args_of im3 --image-source mirror --conformance-image example.test/c:1)"
+echo "$a" | grep -q -- '--conformance-image example.test/c:1' && echo "$a" | grep -q -- '--test-repo-list' \
+  && ok "explicit --conformance-image is kept under a mirror run" || bad "explicit image args: $a"
+
+# auto with an unreachable mirror must fall back to upstream, never fail the run
+a="$(MIRROR_PREFIX=127.0.0.1:1/none args_of im4)"
+echo "$a" | grep -q -- '--conformance-image registry.k8s.io/conformance:v1.35.0' && ! echo "$a" | grep -q -- '--test-repo-list' \
+  && ok "auto + unreachable mirror => upstream fallback" || bad "auto fallback args: $a"
+
+set +e; run_cli --target sig-node --kubeconfig "$KC" --hydrophone "$REC" --image-source bogus >/dev/null 2>&1; rc=$?; set -e
+[ "$rc" -eq 2 ] && ok "bad --image-source => exit 2" || bad "bad --image-source rc=$rc"
+
 echo
 if [ "$failcnt" -eq 0 ]; then echo "PASS: conformance-target-run ($pass checks)"; else echo "FAILED: $failcnt of $((pass + failcnt))" >&2; exit 1; fi

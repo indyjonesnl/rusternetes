@@ -1,0 +1,20 @@
+# e2e image-registry override pointing the registry.k8s.io-hosted test images at
+# the ghcr.io mirror (ci/mirror/images.txt). Passed to hydrophone as
+# --test-repo-list, which mounts it into the conformance pod and sets
+# KUBE_TEST_REPO_LIST (hydrophone pkg/conformance/deploy.go); e2e.test reads it in
+# test/utils/image/manifest.go (readRepoList / RegistryList, kubernetes
+# release-1.35). Mirror path = ghcr.io/indyjonesnl/rusternetes/mirror/<path
+# under registry.k8s.io>, so each key keeps its upstream suffix.
+#
+# Redirected: promoterE2eRegistry, buildImageRegistry, gcEtcdRegistry,
+# gcRegistry, sigStorageRegistry, cloudProviderGcpRegistry.
+# NOT redirected (left at the upstream defaults, so they are omitted): the
+# private authenticated-registry and invalid-registry images, which tests use to
+# exercise pull failures / credentials and are not mirrorable, and
+# dockerLibraryRegistry (docker.io/library).
+promoterE2eRegistry: ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images
+buildImageRegistry: ghcr.io/indyjonesnl/rusternetes/mirror/build-image
+gcEtcdRegistry: ghcr.io/indyjonesnl/rusternetes/mirror
+gcRegistry: ghcr.io/indyjonesnl/rusternetes/mirror
+sigStorageRegistry: ghcr.io/indyjonesnl/rusternetes/mirror/sig-storage
+cloudProviderGcpRegistry: ghcr.io/indyjonesnl/rusternetes/mirror/cloud-provider-gcp

@@ -66,7 +66,7 @@
 # Flags: --targets --skip-targets --order --reverse --output-dir
 #        --stop-on-infra-failure and the pass-throughs --kubeconfig
 #        --partition-timeout and the pass-throughs --kubeconfig
-#        --conformance-image --hydrophone --parallel --skip --skip-preflight
+#        --conformance-image --image-source --hydrophone --parallel --skip --skip-preflight
 #        --preflight-arg -h|--help
 set -euo pipefail
 IFS=$'\n\t'
@@ -202,7 +202,7 @@ while [[ $# -gt 0 ]]; do
             [[ "$2" =~ ^[0-9]+$ ]] || die "--partition-timeout must be whole seconds, got '$2'"
             PARTITION_TIMEOUT="$2"; shift 2 ;;
         # Pass-throughs, forwarded verbatim to every partition.
-        --kubeconfig|--conformance-image|--hydrophone|--parallel|--skip|--preflight-arg)
+        --kubeconfig|--conformance-image|--image-source|--hydrophone|--parallel|--skip|--preflight-arg)
             [[ $# -ge 2 ]] || die "$1 requires a value"; PASSTHRU+=("$1" "$2"); shift 2 ;;
         --skip-preflight) PASSTHRU+=("$1"); shift ;;
         -h|--help) sed -nE '/^# /,/^$/ s/^# ?//p' "${BASH_SOURCE[0]}" | head -52; exit 0 ;;
