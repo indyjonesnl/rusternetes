@@ -79,6 +79,7 @@ pub mod ttl_controller;
 pub mod typed_workqueue;
 pub mod uid_precondition_double;
 pub mod vac_protection;
+pub mod vap_status;
 pub mod volume_data_source_validator;
 pub mod volume_expansion;
 pub mod volume_snapshot;

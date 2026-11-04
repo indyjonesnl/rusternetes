@@ -599,14 +599,8 @@ fn upstream_group_docs() -> &'static serde_json::Map<String, serde_json::Value> 
 /// `api/openapi-spec/swagger.json`, vendored by
 /// `scripts/sync-upstream-openapi.sh`).
 pub(crate) fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
-    use std::sync::OnceLock;
-    static DEFS: OnceLock<serde_json::Map<String, serde_json::Value>> = OnceLock::new();
-    DEFS.get_or_init(|| {
-        serde_json::from_str(include_str!(
-            "../../openapi/upstream/v1.35/v2.definitions.json"
-        ))
-        .unwrap_or_default()
-    })
+    // One embedded copy, shared with the VAP type checker.
+    rusternetes_discovery::vap_typechecking::upstream_v2_definitions()
 }
 
 /// Whether the `/openapi/v3` document at `path` (`apis/<group>[/<version>]`)

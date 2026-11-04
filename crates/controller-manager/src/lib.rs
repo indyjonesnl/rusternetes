@@ -640,6 +640,17 @@ where
         }));
     }
 
+    // `newValidatingAdmissionPolicyStatusController`
+    // (cmd/kube-controller-manager/app/validatingadmissionpolicystatus.go:41-77):
+    // no feature gate, enabled by default.
+    let s = storage_for("ValidatingAdmissionPolicyStatus");
+    handles.push(tokio::spawn(async move {
+        let c = Arc::new(controllers::vap_status::VapStatusController::new(s));
+        if let Err(e) = c.run().await {
+            error!("ValidatingAdmissionPolicy status controller error: {}", e);
+        }
+    }));
+
     let s = storage_for("Namespace");
     let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {

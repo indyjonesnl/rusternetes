@@ -26,6 +26,8 @@ rusternetes-client = { path = "../client" }
 rusternetes-middleware = { path = "../middleware" }
 rusternetes-csi = { path = "../csi" }
 rusternetes-controller-core = { path = "../controller-core" }
+# `validatingadmissionpolicy-status`: the VAP type checker (typechecking.go port).
+rusternetes-discovery = { path = "../discovery" }
 # gRPC status codes for the CSI provisioner (`isInfeasibleError`).
 tonic.workspace = true
 rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
