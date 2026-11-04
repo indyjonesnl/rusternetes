@@ -291,8 +291,14 @@ elif ! command -v "$CONTAINER_RT" >/dev/null 2>&1; then
     pass "$CONTAINER_RT not available — skipping image-pull assertion"
 else
     pull_budget=$(( PER_CHECK_TIMEOUT * 2 ))
-    if timeout "$pull_budget" "$CONTAINER_RT" pull -q "$SANDBOX_IMAGE" >/dev/null 2>&1; then
-        pass "pulled $SANDBOX_IMAGE (upstream registry path works end to end)"
+    # The cluster's containerd pulls registry.k8s.io images from the ghcr.io
+    # mirror first (deploy/containerd/certs.d, ci/mirror/images.txt), so try the
+    # mirror copy before the upstream one; either proves a real pull works.
+    MIRROR_SANDBOX_IMAGE="ghcr.io/indyjonesnl/rusternetes/mirror/${SANDBOX_IMAGE#registry.k8s.io/}"
+    if timeout "$pull_budget" "$CONTAINER_RT" pull -q "$MIRROR_SANDBOX_IMAGE" >/dev/null 2>&1; then
+        pass "pulled $MIRROR_SANDBOX_IMAGE (ghcr.io mirror of $SANDBOX_IMAGE)"
+    elif timeout "$pull_budget" "$CONTAINER_RT" pull -q "$SANDBOX_IMAGE" >/dev/null 2>&1; then
+        pass "pulled $SANDBOX_IMAGE (upstream registry path works end to end; mirror copy not pullable)"
     else
         fail "cannot pull $SANDBOX_IMAGE — registry.k8s.io redirects blobs to pkg.dev; a 401 from the front door does not mean pulls work"
     fi

@@ -13,6 +13,10 @@ disabled_plugins = []
   address = "/run/containerd/containerd.sock"
 
 [plugins.'io.containerd.cri.v1.images']
+  # Per-registry mirror/fallback config (certs.d/<registry>/hosts.toml); used to
+  # pull registry.k8s.io images from the ghcr.io mirror first.
+  [plugins.'io.containerd.cri.v1.images'.registry]
+    config_path = '/etc/containerd/certs.d'
   [plugins.'io.containerd.cri.v1.images'.pinned_images]
     sandbox = 'registry.k8s.io/pause:3.10.1'
 

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fail when CI or its scripts reference a registry.k8s.io image that is not in
+# ci/mirror/images.txt (the list scripts/mirror-images.sh copies to ghcr.io), so
+# a version bump cannot silently bypass the mirror.
+#
+# Scope: scripts/*.sh, ci/, deploy/, compose*.yml, .github/. Excluded: scripts/k0s-diff
+# (manual diffing tooling), conformance-single-test.sh (unpinned
+# local hydrophone fallback), vanilla-swap guard fixtures, comment lines, and this check's own list.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+LIST=ci/mirror/images.txt
+listed="$(sed 's/#.*//' "$LIST" | tr -d ' \t' | grep -v '^$' | sort -u)"
+
+refs="$(grep -rhE 'registry\.k8s\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+' \
+    --include='*.sh' --include='*.yml' --include='*.yaml' --include='*.toml' \
+    scripts ci deploy compose*.yml .github 2>/dev/null \
+    --exclude-dir=k0s-diff --exclude=vanilla-swap-guard-test.sh \
+    --exclude=mirror-images.yml --exclude=conformance-single-test.sh \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -oE 'registry\.k8s\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+' || true)"
+# Control-plane images from the vanilla-swap tooling are not mirrored.
+refs="$(echo "$refs" | sed 's#^registry\.k8s\.io/##' | grep -vE '^kube-(apiserver|controller-manager|scheduler|proxy):' | sort -u)"
+
+missing=0
+while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    if ! grep -qxF "$ref" <<<"$listed"; then
+        echo "not in $LIST: registry.k8s.io/$ref" >&2
+        missing=1
+    fi
+done <<<"$refs"
+[ "$missing" -eq 0 ] && echo "mirror list covers every registry.k8s.io reference ($(echo "$refs" | grep -c .) refs)"
+exit "$missing"

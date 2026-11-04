@@ -1,0 +1,56 @@
+name: Mirror e2e images
+
+# Copy the pinned registry.k8s.io images CI depends on (ci/mirror/images.txt) to
+# ghcr.io/indyjonesnl/rusternetes/mirror/<path>. The cluster's containerd pulls
+# from that mirror first and falls back to registry.k8s.io
+# (deploy/containerd/certs.d/registry.k8s.io/hosts.toml). Tags are pinned and
+# the copy is a registry-to-registry manifest-list copy, so mirror digests equal
+# upstream digests. Re-running is a no-op for images already up to date.
+#
+# One-time: each new package under .../rusternetes/mirror/* must be set to
+# public in the GitHub package settings so containerd can pull anonymously.
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ci/mirror/images.txt'
+      - 'scripts/mirror-images.sh'
+      - '.github/workflows/mirror-images.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-images
+  cancel-in-progress: false
+
+env:
+  BUILDKIT_PROGRESS: plain
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+      - name: Mirror images
+        run: scripts/mirror-images.sh | tee "$RUNNER_TEMP/mirror.log"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Mirrored images (path, source digest)'
+            echo '```'
+            grep -E '^(ok|copy) ' "$RUNNER_TEMP/mirror.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

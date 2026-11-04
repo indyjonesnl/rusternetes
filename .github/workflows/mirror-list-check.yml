@@ -1,0 +1,22 @@
+name: Mirror list check
+
+# Every registry.k8s.io image referenced by CI must be in ci/mirror/images.txt.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'ci/**'
+      - 'deploy/**'
+      - 'compose*.yml'
+      - '.github/**'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-mirror-images.sh
