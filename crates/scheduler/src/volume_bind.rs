@@ -359,6 +359,8 @@ pub fn reserve(
 pub struct DataPlaneBinderEnv<'a, S: rusternetes_storage::Storage + Send + Sync + 'static> {
     pub binder: &'a std::sync::Mutex<VolumeBinder>,
     pub data: &'a DataPlane<S>,
+    /// Storage mode's running volume informers (API mode owns its own).
+    pub(crate) volumes: Option<&'a crate::data_plane::VolumeReflectors>,
     /// Namespace of the pod being bound (scopes the PVC listing).
     pub namespace: String,
 }
@@ -415,7 +417,11 @@ impl<S: rusternetes_storage::Storage + Send + Sync + 'static> BinderEnv
         self.data.get_csi_node(name).await
     }
     async fn refresh(&self) {
-        match self.data.list_volume_snapshot(&self.namespace).await {
+        match self
+            .data
+            .volume_snapshot(self.volumes, &self.namespace)
+            .await
+        {
             Ok(snap) => {
                 let mut b = self.binder.lock().unwrap_or_else(|e| e.into_inner());
                 b.sync_namespace(&self.namespace, &snap);

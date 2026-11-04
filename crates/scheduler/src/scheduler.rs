@@ -3215,6 +3215,7 @@ impl<S: Storage + Send + Sync + 'static> CycleHandle<'_, S> {
         crate::volume_bind::DataPlaneBinderEnv {
             binder: self.binder,
             data: self.data,
+            volumes: self.volumes,
             namespace: pod
                 .metadata
                 .namespace
@@ -3339,7 +3340,7 @@ impl<S: Storage + Send + Sync + 'static> crate::fwk::Handle for CycleHandle<'_, 
     ) -> Result<volume_binding::VolumeSnapshot, String> {
         let snap = self
             .data
-            .list_volume_snapshot(ns)
+            .volume_snapshot(self.volumes, ns)
             .await
             .map_err(|e| e.to_string())?;
         // Feed the assume caches (the informer feed upstream).

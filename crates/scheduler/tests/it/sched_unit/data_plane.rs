@@ -145,4 +145,82 @@ mod tests {
         assert_eq!(r.store().len(), 1);
         task.abort();
     }
+
+    fn pvc(ns: &str, name: &str) -> PersistentVolumeClaim {
+        serde_json::from_value(json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {"accessModes": ["ReadWriteOnce"],
+                     "resources": {"requests": {"storage": "1Gi"}}}
+        }))
+        .unwrap()
+    }
+
+    fn capacity(ns: &str, name: &str) -> rusternetes_common::resources::CSIStorageCapacity {
+        serde_json::from_value(json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSIStorageCapacity",
+            "metadata": {"name": name, "namespace": ns},
+            "storageClassName": "fast", "capacity": "10Gi"
+        }))
+        .unwrap()
+    }
+
+    /// VolumeBinding's listers (binder.go `pvcCache`, `csiStorageCapacityLister`
+    /// over the shared informer factory): the snapshot for a namespace holds
+    /// that namespace's PVCs only, every namespace's CSIStorageCapacity (the
+    /// lister is `List(labels.Everything())`, binder.go:1002), and follows the
+    /// store without a per-cycle list.
+    #[tokio::test]
+    async fn volume_binding_snapshot_reads_informer_stores() {
+        use rusternetes_storage::MemoryStorage;
+        let storage = Arc::new(MemoryStorage::new());
+        storage
+            .create("/registry/persistentvolumeclaims/a/c1", &pvc("a", "c1"))
+            .await
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumeclaims/b/c2", &pvc("b", "c2"))
+            .await
+            .unwrap();
+        storage
+            .create("/registry/persistentvolumes/pv-a", &pv("pv-a"))
+            .await
+            .unwrap();
+        storage
+            .create(
+                "/registry/csistoragecapacities/a/cap-a",
+                &capacity("a", "cap-a"),
+            )
+            .await
+            .unwrap();
+        let volumes = VolumeReflectors::for_storage(&storage);
+        volumes.spawn();
+        volumes.wait_for_cache_sync().await;
+
+        let snap = volumes.volume_snapshot("a");
+        assert_eq!(snap.pvcs.len(), 1);
+        assert_eq!(snap.pvcs[0].metadata.name, "c1");
+        assert_eq!(snap.pvs.len(), 1);
+        assert_eq!(snap.csi_capacities.len(), 1);
+
+        // A capacity in another namespace is visible to every pod's cycle.
+        storage
+            .create(
+                "/registry/csistoragecapacities/b/cap-b",
+                &capacity("b", "cap-b"),
+            )
+            .await
+            .unwrap();
+        until(|| volumes.volume_snapshot("a").csi_capacities.len() == 2).await;
+
+        storage
+            .delete("/registry/csistoragecapacities/a/cap-a")
+            .await
+            .unwrap();
+        until(|| volumes.volume_snapshot("a").csi_capacities.len() == 1).await;
+        assert_eq!(
+            volumes.volume_snapshot("a").csi_capacities[0].metadata.name,
+            "cap-b"
+        );
+    }
 }

@@ -41,8 +41,8 @@ use rusternetes_client::events::ClientEventRecorder;
 use rusternetes_client::http::{ApiClient, GetError};
 use rusternetes_client::reflector::Reflector;
 use rusternetes_common::resources::{
-    CSIDriver, CSINode, EventType, Node, PersistentVolume, PersistentVolumeClaim, Pod,
-    PodDisruptionBudget, PriorityClass, StorageClass, VolumeAttachment,
+    CSIDriver, CSINode, CSIStorageCapacity, EventType, Node, PersistentVolume,
+    PersistentVolumeClaim, Pod, PodDisruptionBudget, PriorityClass, StorageClass, VolumeAttachment,
 };
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::{build_key, Storage};
@@ -115,6 +115,15 @@ fn pvc_store_key(p: &PersistentVolumeClaim) -> String {
         "{}/{}",
         p.metadata.namespace.as_deref().unwrap_or("default"),
         p.metadata.name
+    )
+}
+
+/// Key for the namespaced CSIStorageCapacity informer (`MetaNamespaceKeyFunc`).
+fn capacity_store_key(c: &CSIStorageCapacity) -> String {
+    format!(
+        "{}/{}",
+        c.metadata.namespace.as_deref().unwrap_or("default"),
+        c.metadata.name
     )
 }
 
@@ -227,19 +236,30 @@ where
     }
 }
 
-/// Informers behind the NodeVolumeLimits plugin's listers (csi.go:
+/// Informers behind the NodeVolumeLimits and VolumeBinding plugins' listers.
+///
+/// NodeVolumeLimits (csi.go:
 /// `pvLister`, `pvcLister`, `scLister`, `vaLister`, `csiDriverLister`, and the
 /// `csiNodeLister` the shared informer factory provides). Upstream builds all of
 /// them from one `informerFactory` (scheduler.go `NewInformerFactory` / `New`)
 /// so `Filter` never touches the API server.
+///
+/// VolumeBinding (binder.go `NewVolumeBinder`: `pvcInformer`,
+/// `storageClassInformer`, `csiNodeInformer`, `CapacityCheck.CSIDriverInformer`,
+/// `CapacityCheck.CSIStorageCapacityInformer`) reads the same shared informers,
+/// plus the CSIStorageCapacity one (`csiStorageCapacityLister.List`,
+/// binder.go:1002), instead of listing per cycle.
 type ClusterReflector<T> = Arc<Reflector<T, fn(&T) -> String>>;
-pub(crate) struct VolumeReflectors {
+pub struct VolumeReflectors {
     pub(crate) pvcs: ClusterReflector<PersistentVolumeClaim>,
     pub(crate) pvs: ClusterReflector<PersistentVolume>,
     pub(crate) classes: ClusterReflector<StorageClass>,
     pub(crate) csi_drivers: ClusterReflector<CSIDriver>,
     pub(crate) csi_nodes: ClusterReflector<CSINode>,
     pub(crate) volume_attachments: ClusterReflector<VolumeAttachment>,
+    /// `informerFactory.Storage().V1().CSIStorageCapacities()` (volumebinding.go
+    /// `New`). Namespaced, read across all namespaces.
+    pub(crate) csi_capacities: ClusterReflector<CSIStorageCapacity>,
 }
 
 impl VolumeReflectors {
@@ -247,7 +267,7 @@ impl VolumeReflectors {
     /// store, via [`StorageListWatch`]. client-go builds one shared informer
     /// factory for every backend the scheduler runs against; storage mode has
     /// no api-server, so the list+watch source is the store itself.
-    pub(crate) fn for_storage<S: Storage + Send + Sync + 'static>(storage: &Arc<S>) -> Self {
+    pub fn for_storage<S: Storage + Send + Sync + 'static>(storage: &Arc<S>) -> Self {
         use rusternetes_storage::build_prefix;
         fn cluster<S, T>(storage: &Arc<S>, resource: &str) -> ClusterReflector<T>
         where
@@ -282,12 +302,19 @@ impl VolumeReflectors {
             csi_drivers: cluster(storage, "csidrivers"),
             csi_nodes: cluster(storage, "csinodes"),
             volume_attachments: cluster(storage, "volumeattachments"),
+            csi_capacities: Arc::new(Reflector::new(
+                Arc::new(StorageListWatch::new(
+                    Arc::clone(storage),
+                    build_prefix("csistoragecapacities", None),
+                )),
+                capacity_store_key as fn(&CSIStorageCapacity) -> String,
+            )),
         }
     }
 
     /// The listers' current contents (what `Filter` reads from the informer
     /// caches, csi.go `pvLister.Get` etc.).
-    pub(crate) fn snapshot(&self) -> NodeVolumeLimitsSnapshot {
+    pub fn snapshot(&self) -> NodeVolumeLimitsSnapshot {
         NodeVolumeLimitsSnapshot {
             pvcs: self.pvcs.store().items(),
             pvs: self.pvs.store().items(),
@@ -295,6 +322,26 @@ impl VolumeReflectors {
             csi_drivers: self.csi_drivers.store().items(),
             csi_nodes: self.csi_nodes.store().items(),
             volume_attachments: self.volume_attachments.store().items(),
+        }
+    }
+
+    /// The VolumeBinding plugin's listers for a pod of namespace `ns`
+    /// (binder.go: `pvcCache`/`classLister`/`csiNodeLister`/`csiDriverLister`/
+    /// `csiStorageCapacityLister`): PVCs are the namespace's, the rest global.
+    pub fn volume_snapshot(&self, ns: &str) -> VolumeSnapshot {
+        VolumeSnapshot {
+            pvcs: self
+                .pvcs
+                .store()
+                .items()
+                .into_iter()
+                .filter(|c| c.metadata.namespace.as_deref().unwrap_or("default") == ns)
+                .collect(),
+            pvs: self.pvs.store().items(),
+            classes: self.classes.store().items(),
+            csi_drivers: self.csi_drivers.store().items(),
+            csi_capacities: self.csi_capacities.store().items(),
+            csi_nodes: self.csi_nodes.store().items(),
         }
     }
 
@@ -323,11 +370,18 @@ impl VolumeReflectors {
             csi_drivers: cluster(client, "/apis/storage.k8s.io/v1/csidrivers"),
             csi_nodes: cluster(client, "/apis/storage.k8s.io/v1/csinodes"),
             volume_attachments: cluster(client, "/apis/storage.k8s.io/v1/volumeattachments"),
+            csi_capacities: Arc::new(Reflector::new(
+                Arc::new(ApiListWatch::new(
+                    Arc::clone(client),
+                    "/apis/storage.k8s.io/v1/csistoragecapacities",
+                )),
+                capacity_store_key as fn(&CSIStorageCapacity) -> String,
+            )),
         }
     }
 
     /// Start every reflector's list+watch loop (informerFactory.Start).
-    pub(crate) fn spawn(&self) {
+    pub fn spawn(&self) {
         macro_rules! go {
             ($($f:ident),*) => {$({
                 let r = Arc::clone(&self.$f);
@@ -340,11 +394,12 @@ impl VolumeReflectors {
             classes,
             csi_drivers,
             csi_nodes,
-            volume_attachments
+            volume_attachments,
+            csi_capacities
         );
     }
 
-    pub(crate) async fn wait_for_cache_sync(&self) {
+    pub async fn wait_for_cache_sync(&self) {
         tokio::join!(
             self.pvcs.wait_for_cache_sync(),
             self.pvs.wait_for_cache_sync(),
@@ -352,6 +407,7 @@ impl VolumeReflectors {
             self.csi_drivers.wait_for_cache_sync(),
             self.csi_nodes.wait_for_cache_sync(),
             self.volume_attachments.wait_for_cache_sync(),
+            self.csi_capacities.wait_for_cache_sync(),
         );
     }
 }
@@ -565,6 +621,11 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
     /// Snapshot of the volume objects the VolumeBinding plugin reads for `ns`
     /// (upstream: the PVC/PV/StorageClass/CSIDriver/CSIStorageCapacity
     /// listers). Only called for pods that reference a PVC.
+    ///
+    /// API mode reads the informer stores (#3794). Storage mode lists the
+    /// store; the scheduler reads its [`VolumeReflectors`] instead through
+    /// [`Self::volume_snapshot`] once they are running, so this is the
+    /// fallback for a data plane without them.
     pub async fn list_volume_snapshot(&self, ns: &str) -> Result<VolumeSnapshot> {
         match self {
             DataPlane::Storage(s) => {
@@ -580,33 +641,21 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
                     csi_nodes: s.list(&build_prefix("csinodes", None)).await?,
                 })
             }
-            DataPlane::Api(a) => {
-                let c = &a.client;
-                let pvc_path = format!("/api/v1/namespaces/{ns}/persistentvolumeclaims");
-                Ok(VolumeSnapshot {
-                    pvcs: c.get_list(&pvc_path).await.map_err(get_err_to_common)?,
-                    pvs: c
-                        .get_list("/api/v1/persistentvolumes")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    classes: c
-                        .get_list("/apis/storage.k8s.io/v1/storageclasses")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    csi_drivers: c
-                        .get_list("/apis/storage.k8s.io/v1/csidrivers")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    csi_capacities: c
-                        .get_list("/apis/storage.k8s.io/v1/csistoragecapacities")
-                        .await
-                        .map_err(get_err_to_common)?,
-                    csi_nodes: c
-                        .get_list("/apis/storage.k8s.io/v1/csinodes")
-                        .await
-                        .map_err(get_err_to_common)?,
-                })
-            }
+            DataPlane::Api(a) => Ok(a.volumes.volume_snapshot(ns)),
+        }
+    }
+
+    /// The VolumeBinding listers for `ns`, from the running informers when
+    /// there are any (`volumes`, storage mode; API mode owns its own) and
+    /// otherwise as [`Self::list_volume_snapshot`].
+    pub(crate) async fn volume_snapshot(
+        &self,
+        volumes: Option<&VolumeReflectors>,
+        ns: &str,
+    ) -> Result<VolumeSnapshot> {
+        match volumes {
+            Some(v) => Ok(v.volume_snapshot(ns)),
+            None => self.list_volume_snapshot(ns).await,
         }
     }
 
