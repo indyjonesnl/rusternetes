@@ -29,6 +29,7 @@ RUN mkdir -p /opt/cni/bin \
 RUN ln -sf "$(command -v crun)" /usr/local/sbin/runc
 
 COPY deploy/containerd/config.toml /etc/containerd/config.toml
+COPY deploy/containerd/certs.d /etc/containerd/certs.d
 COPY deploy/containerd/cni/10-rusternetes.conflist /etc/cni/net.d/10-rusternetes.conflist
 COPY deploy/containerd/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
