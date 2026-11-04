@@ -149,7 +149,7 @@ mod tests {
         .unwrap();
         // AlwaysDeny is default-off.
         run_pod(
-            &["ServiceAccount"],
+            &["DefaultTolerationSeconds"],
             None,
             pod(json!([{"name":"c","image":"i"}])),
             None,

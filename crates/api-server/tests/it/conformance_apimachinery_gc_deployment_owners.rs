@@ -220,6 +220,9 @@ async fn gc_deletes_rs_created_by_deployment_when_not_orphaning() {
     let served = serve().await;
     let api = &served.api;
     let ns = "gc-delete-rs";
+    // The controllers' pods need the account upstream's ServiceAccount controller
+    // creates (ServiceAccount admission, admission.go:160-163).
+    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let deploys = format!("/apis/apps/v1/namespaces/{ns}/deployments");
     let rss = format!("/apis/apps/v1/namespaces/{ns}/replicasets");
 
@@ -276,6 +279,9 @@ async fn gc_orphans_rs_created_by_deployment_when_propagation_is_orphan() {
     let served = serve().await;
     let api = &served.api;
     let ns = "gc-orphan-rs";
+    // The controllers' pods need the account upstream's ServiceAccount controller
+    // creates (ServiceAccount admission, admission.go:160-163).
+    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let deploys = format!("/apis/apps/v1/namespaces/{ns}/deployments");
     let rss = format!("/apis/apps/v1/namespaces/{ns}/replicasets");
 
@@ -365,6 +371,9 @@ async fn gc_keeps_dependents_with_a_valid_owner_during_foreground_delete() {
     let served = serve().await;
     let api = &served.api;
     let ns = "gc-valid-and-pending";
+    // The controllers' pods need the account upstream's ServiceAccount controller
+    // creates (ServiceAccount admission, admission.go:160-163).
+    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let rcs = format!("/api/v1/namespaces/{ns}/replicationcontrollers");
     let pods = format!("/api/v1/namespaces/{ns}/pods");
 
@@ -499,6 +508,9 @@ async fn gc_is_not_blocked_by_dependency_circle() {
     let served = serve().await;
     let api = &served.api;
     let ns = "gc-circle";
+    // The controllers' pods need the account upstream's ServiceAccount controller
+    // creates (ServiceAccount admission, admission.go:160-163).
+    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let pods = format!("/api/v1/namespaces/{ns}/pods");
 
     // Create pod1, pod2, pod3 (:829-840).

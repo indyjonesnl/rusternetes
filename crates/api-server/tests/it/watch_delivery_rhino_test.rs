@@ -215,6 +215,8 @@ async fn run_case(case: &Case) -> Vec<String> {
                 &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":NS}}),
             )
             .await;
+        // ServiceAccount admission needs the account the SA controller makes.
+        rusternetes_test_support::harness::seed_default_service_account(&*state.storage, NS).await;
     }
 
     // Open the watch and start collecting (ADDED, MODIFIED, DELETED = 3).
@@ -533,7 +535,7 @@ async fn rhino_sqlite_watchlist_never_loses_concurrent_default_sa() {
 #[tokio::test]
 async fn pod_status_patch_container_statuses_visible_on_rhino_reads() {
     let (state, db_path) = make_sqlite_state().await;
-    let router = build_router(state, None);
+    let router = build_router(state.clone(), None);
     let (s, b) = send(
         &router,
         Method::POST,
@@ -542,6 +544,8 @@ async fn pod_status_patch_container_statuses_visible_on_rhino_reads() {
     )
     .await;
     assert!(s.is_success() || s == StatusCode::CONFLICT, "{s} {b}");
+    rusternetes_test_support::harness::seed_default_service_account(&*state.storage, "default")
+        .await;
     let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},
         "spec":{"nodeName":"n","containers":[{"name":"c","image":"busybox"}]}});
     let (s, b) = send(

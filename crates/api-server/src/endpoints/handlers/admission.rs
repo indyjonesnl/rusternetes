@@ -364,17 +364,14 @@ impl Admission<'_> {
         })
         .await?;
 
-        // ServiceAccount.Admit: a failure to inject does not fail the pod.
+        // ServiceAccount.Admit (serviceaccount/admission.go:138-176): CREATE
+        // of a pod; a missing ServiceAccount is `NewForbidden`.
         self.plugin("ServiceAccount", op, ADMIT, async {
             if let (Some(pod), Some(namespace), true) = (pod.as_mut(), namespace, create) {
                 let name = pod.metadata.name.clone();
-                if let Err(e) =
-                    crate::admission::inject_service_account_token(storage, namespace, pod).await
-                {
-                    tracing::warn!(
-                        "Error injecting service account token for pod {namespace}/{name}: {e}"
-                    );
-                }
+                crate::admission::inject_service_account_token(storage, namespace, pod)
+                    .await
+                    .map_err(|e| self.forbidden(&name, e))?;
             }
             Ok(())
         })
@@ -747,7 +744,49 @@ impl Admission<'_> {
                 Err(e) => Err(self.forbidden(&pvc.metadata.name, e)),
             }
         })
+        .await?;
+        // ServiceAccount.Validate (serviceaccount/admission.go:178-236); it
+        // follows LimitRanger in `AllOrderedPlugins`.
+        self.plugin("ServiceAccount", op, VALIDATE, async {
+            self.validate_service_account(op, obj).await
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// `Plugin.Validate` of ServiceAccount (admission.go:178-236) for core
+    /// `pods` on CREATE or UPDATE of `ephemeralcontainers`
+    /// (`shouldIgnore`, :238-252).
+    async fn validate_service_account(
+        &self,
+        op: &Operation,
+        obj: Option<&dyn AdmissionObject>,
+    ) -> Result<()> {
+        use crate::admission::service_account::{self, ValidateError};
+        let Some(obj) = obj else {
+            return Ok(());
+        };
+        if service_account::should_ignore(
+            &self.resource.group,
+            &self.resource.resource,
+            self.subresource,
+        ) {
+            return Ok(());
+        }
+        let pod: Pod = recast_obj(obj)?;
+        service_account::validate(
+            &self.state.storage,
+            *op == Operation::Create,
+            *op == Operation::Update,
+            self.subresource,
+            self.namespace.unwrap_or(""),
+            &pod,
+        )
         .await
+        .map_err(|e| match e {
+            ValidateError::Forbidden(m) => self.forbidden(&pod.metadata.name, m),
+            ValidateError::Plain(m) => Error::Internal(m),
+        })
     }
 
     /// The validating half of the small in-tree plugins of
