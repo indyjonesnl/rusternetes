@@ -113,7 +113,7 @@ jobs:
               for attempt in 1 2 3; do
                   # `continue 2` skips to the next image on success, so falling
                   # out of the inner loop means all three attempts failed.
-                  docker pull "$image" && continue 2
+                  docker pull --quiet "$image" >/dev/null && continue 2
                   echo "pull of $image failed (attempt $attempt); retrying"
                   sleep 10
               done

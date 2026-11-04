@@ -19,6 +19,9 @@ on:
     - cron: '17 4 * * 1'
 
 env:
+  # One line per build step instead of an in-place redraw; the redraw becomes
+  # thousands of lines in a non-TTY job log.
+  BUILDKIT_PROGRESS: plain
   IMAGE: ghcr.io/indyjonesnl/rusternetes-arc-runner
 
 jobs:

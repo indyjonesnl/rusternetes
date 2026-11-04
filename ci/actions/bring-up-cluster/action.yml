@@ -189,7 +189,9 @@ runs:
           # leg) pass an empty image-tag, which skips this branch entirely and
           # builds from source — which is what you want anyway when the point
           # of the run is to exercise this ref's storage code.
-          if docker compose -f "$COMPOSE_STACK" -f compose.ghcr.yml --profile build pull; then
+          # --progress quiet: the default TTY-less renderer prints one line per
+          # layer per tick ("Extracting 3 s" x thousands). Errors still print.
+          if docker compose --progress quiet -f "$COMPOSE_STACK" -f compose.ghcr.yml --profile build pull; then
             # The kube-scheduler / kube-controller-manager static pods and the
             # rusternetes-dns Deployment run INSIDE the containerd CRI service
             # (54bd2ee7, 2026-06-17), not as docker containers. containerd keeps
