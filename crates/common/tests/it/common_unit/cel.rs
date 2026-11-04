@@ -262,6 +262,43 @@ mod tests {
         assert!(eval_with("optional.ofNonZeroValue(2).hasValue()", &ctx));
     }
 
+    /// Optional equality (#3897 item 3): `optional.ofNonZeroValue(0)` is the
+    /// empty optional, so it equals `optional.none()` (cel-go `types.Optional.Equal`).
+    #[test]
+    fn optional_equality() {
+        let ctx = CELContext::new();
+        assert!(eval_with(
+            "optional.ofNonZeroValue(0) == optional.none()",
+            &ctx
+        ));
+        assert!(eval_with("optional.none() == optional.none()", &ctx));
+        assert!(eval_with("optional.of(1) == optional.of(1)", &ctx));
+        assert!(!eval_with("optional.of(1) == optional.none()", &ctx));
+        assert!(eval_with("optional.of(1) != optional.of(2)", &ctx));
+    }
+
+    /// `optMap` / `optFlatMap` receiver macros (`cel-go/cel/library.go`
+    /// `optMap`, `optFlatMap`; #3897 item 3).
+    #[test]
+    fn opt_map_and_opt_flat_map() {
+        let ctx = CELContext::new();
+        for e in [
+            "optional.of(1).optMap(x, x + 1) == optional.of(2)",
+            "optional.none().optMap(x, x + 1) == optional.none()",
+            "optional.of(1).optFlatMap(x, optional.of(x + 1)) == optional.of(2)",
+            "optional.of(1).optFlatMap(x, optional.none()) == optional.none()",
+            "optional.of(1).optMap(x, x + 1).value() == 2",
+            "{'a': 1}.?a.optMap(v, v * 3).orValue(0) == 3",
+            "{'a': 1}.?b.optMap(v, v * 3).orValue(0) == 0",
+        ] {
+            assert!(eval_with(e, &ctx), "{e}");
+        }
+        // A non-identifier variable is a macro error.
+        assert!(CELEvaluator::new()
+            .evaluate("optional.of(1).optMap(1 + 1, 2)", &ctx)
+            .is_err());
+    }
+
     #[test]
     fn optional_syntax_field_and_index_select() {
         let mut ctx = CELContext::new();

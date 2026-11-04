@@ -54,7 +54,6 @@ use cel::common::ast::{CallExpr, EntryExpr, Expr, IdedExpr, LiteralValue};
 use cel::common::types::{CelString, CelStruct, Type};
 use cel::common::value::{CowVal, Val};
 use cel::objects::{Key, OptionalValue};
-use cel::parser::Parser;
 use cel::{Context, Env, ExecutionError, StructType, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -345,14 +344,16 @@ fn check_string_keys(v: &Value) -> Result<(), ExecutionError> {
 /// it constructs. Never panics.
 pub fn compile(source: &str) -> Result<CompiledExpression, String> {
     // The antlr4rust parser panics on some invalid expressions.
-    // `enable_optional_syntax`: cel-go `OptionalTypes()` is in the base env
-    // (apiserver `pkg/cel/environment/base.go:99-101`), so `.?field` and
-    // `[?index]` parse.
-    let mut expr = catch_unwind(AssertUnwindSafe(|| {
-        Parser::new().enable_optional_syntax(true).parse(source)
-    }))
-    .map_err(|_| format!("invalid CEL expression '{source}'"))?
-    .map_err(|e| e.to_string())?;
+    // `OptionalTypes()` is in the base env (apiserver
+    // `pkg/cel/environment/base.go:99-101`): `.?field` and `[?index]` parse,
+    // and the `optMap` / `optFlatMap` receiver macros expand
+    // (`cel-go/cel/library.go` `optMap`, `optFlatMap`). `Env::stdlib().parser()`
+    // carries the standard macros plus the optional library's, with the
+    // optional syntax on; a bare `Parser::new()` has no `optMap`/`optFlatMap`,
+    // so `o.optMap(x, x + 1)` failed with "Undeclared reference to 'x'".
+    let mut expr = catch_unwind(AssertUnwindSafe(|| Env::stdlib().parser().parse(source)))
+        .map_err(|_| format!("invalid CEL expression '{source}'"))?
+        .map_err(|e| e.to_string())?;
     let mut struct_types = BTreeSet::new();
     rewrite(&mut expr, None, &mut struct_types)?;
     Ok(CompiledExpression { expr, struct_types })
