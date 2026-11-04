@@ -472,23 +472,44 @@ mod debugging_handlers_tests {
         assert_eq!(call(&app, Method::GET, "/configz").await.0, 404);
     }
 
+    // server_test.go:TestStatusz: debug handlers on => `/configz /debug
+    // /healthz /metrics`; web services (/pods, /run, /exec, /logs/ when
+    // enabled, ...) are not `RegisteredHandlePaths`.
     #[test]
-    fn registered_paths_follow_the_gate() {
-        let on = debugging_registered_paths(true, true, true, true);
-        assert!(on.contains(&"/runningpods/".to_string()));
-        assert!(on.contains(&"/run/:namespace/:pod/:container".to_string()));
-        assert!(on.contains(&"/checkpoint/:namespace/:pod/:container".to_string()));
-        assert!(!debugging_registered_paths(true, true, false, true)
-            .iter()
-            .any(|p| p.starts_with("/checkpoint")));
-        assert!(on.contains(&"/debug/pprof/{subpath:*}".to_string()));
-        assert!(on.contains(&"/debug/flags/v".to_string()));
-        let no_prof = debugging_registered_paths(true, true, true, false);
-        assert!(no_prof.contains(&"/debug/pprof/".to_string()));
-        let off = debugging_registered_paths(false, true, true, true);
-        assert!(!off.contains(&"/debug/flags/v".to_string()));
-        assert_eq!(off.len(), DEBUGGING_DISABLED_PATHS.len());
-        assert!(off.contains(&"/debug/pprof/".to_string()));
+    fn registered_paths_default_aggregate() {
+        let paths = registered_handle_paths(true, true, true);
+        assert_eq!(
+            rusternetes_common::statusz::aggregate_paths(&paths),
+            vec!["/configz", "/debug", "/healthz", "/metrics"]
+        );
+        for ws in ["/pods", "/stats/summary", "/runningpods/", "/logs/"] {
+            assert!(!paths.contains(&ws.to_string()), "{ws}");
+        }
+        assert!(paths.contains(&"/debug/flags/v".to_string()));
+        assert!(!paths.contains(&"/debug/pprof/".to_string()));
+        assert!(paths.contains(&"/metrics/cadvisor".to_string()));
+    }
+
+    // server.go:InstallSystemLogHandler / InstallProfilingHandler: the
+    // disabled-endpoint `Handle`s are registered only when switched off.
+    #[test]
+    fn registered_paths_follow_the_gates() {
+        let p = registered_handle_paths(true, false, false);
+        assert!(p.contains(&"/logs/".to_string()));
+        assert!(p.contains(&"/debug/pprof/".to_string()));
+    }
+
+    // server.go:InstallDebuggingDisabledHandlers: eight prefixes, no
+    // /configz and no /debug/flags/v.
+    #[test]
+    fn registered_paths_debugging_disabled() {
+        let p = registered_handle_paths(false, true, true);
+        for want in DEBUGGING_DISABLED_PATHS.into_iter().chain(["/logs/"]) {
+            assert!(p.contains(&want.to_string()), "{want}");
+        }
+        assert!(!p.contains(&"/configz".to_string()));
+        assert!(!p.contains(&"/debug/flags/v".to_string()));
+        assert!(p.contains(&"/healthz".to_string()));
     }
 
     // auth.go GetRequestAttributes: `/run` and `/checkpoint` map to the

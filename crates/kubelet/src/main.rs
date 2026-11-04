@@ -868,33 +868,11 @@ async fn main() -> Result<()> {
             std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
         );
         // server.go:328 `installStatusZ()`: last, over the routes registered so far.
-        let registered: Vec<String> = ["/metrics"]
-            .into_iter()
-            .chain(server_metrics_endpoints::PATHS)
-            .chain(server_cri_metrics::PATHS)
-            .chain(server_resource_metrics::PATHS)
-            .chain([server_logs::LOGS_PATH])
-            .map(String::from)
-            .chain(
-                enable_debugging_handlers
-                    .then_some("/configz")
-                    .map(String::from),
-            )
-            .chain(
-                enable_debugging_handlers
-                    .then_some(server::STREAMING_PATHS)
-                    .into_iter()
-                    .flatten()
-                    .map(String::from),
-            )
-            .chain(server::READ_ONLY_PATHS.map(String::from))
-            .chain(server::debugging_registered_paths(
-                enable_debugging_handlers,
-                true,
-                checkpoint_enabled,
-                enable_profiling_handler,
-            ))
-            .collect();
+        let registered = server::registered_handle_paths(
+            enable_debugging_handlers,
+            enable_system_log_handler,
+            enable_profiling_handler,
+        );
         let app = server::install_statusz(app, registered);
         // server.go:312-314 `InstallAuthFilter`: wraps every route registered
         // above (and /statusz).
