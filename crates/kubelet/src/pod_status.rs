@@ -80,6 +80,50 @@ pub fn active_deadline_should_evict(
     })
 }
 
+impl ApiPodStatusInput {
+    /// Input for a phase transition that has no fresh runtime observation
+    /// (liveness restart, kubelet-side failure): every observed field is the
+    /// pod's last published value, so only `phase`/`reason`/`message` change.
+    /// Stands in for upstream's `convertStatusToAPIStatus` over an unchanged
+    /// runtime snapshot (kubelet_pods.go:1895-1904). `reason`/`message` of
+    /// `None` fall through to the generator's preservation rule.
+    pub fn from_prior(
+        pod: &Pod,
+        phase: Phase,
+        reason: Option<String>,
+        message: Option<String>,
+        (host_ip, host_ips): (Option<String>, Option<Vec<HostIP>>),
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let prior = pod.status.as_ref();
+        Self {
+            phase,
+            message,
+            reason,
+            host_ip: prior.and_then(|s| s.host_ip.clone()).or(host_ip),
+            host_ips: prior.and_then(|s| s.host_i_ps.clone()).or(host_ips),
+            pod_ip: prior.and_then(|s| s.pod_ip.clone()),
+            pod_ips: prior.and_then(|s| s.pod_i_ps.clone()),
+            conditions: prior
+                .and_then(|s| s.conditions.as_ref())
+                .map(|cs| {
+                    cs.iter()
+                        .filter(|c| pod_condition_by_kubelet(&c.condition_type))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            container_statuses: prior.and_then(|s| s.container_statuses.clone()),
+            init_container_statuses: prior.and_then(|s| s.init_container_statuses.clone()),
+            ephemeral_container_statuses: prior
+                .and_then(|s| s.ephemeral_container_statuses.clone()),
+            qos_class: prior.and_then(|s| s.qos_class.clone()),
+            start_time: prior.and_then(|s| s.start_time).unwrap_or(now),
+            should_evict: None,
+        }
+    }
+}
+
 /// Port of the pure part of `generateAPIPodStatus`
 /// (pkg/kubelet/kubelet_pods.go:1889). The host-IP block is applied by the
 /// caller via `Kubelet::apply_host_ips_to_pod`.
@@ -157,6 +201,7 @@ pub fn generate_api_pod_status(pod: &Pod, input: ApiPodStatusInput) -> PodStatus
         message,
         reason,
         resize: prior.and_then(|s| s.resize.clone()),
+        allocated_resources: prior.and_then(|s| s.allocated_resources.clone()),
         resource_claim_statuses: prior.and_then(|s| s.resource_claim_statuses.clone()),
         nominated_node_name: prior.and_then(|s| s.nominated_node_name.clone()),
         host_ip: input.host_ip,
