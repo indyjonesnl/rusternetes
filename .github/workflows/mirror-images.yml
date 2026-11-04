@@ -1,9 +1,9 @@
 name: Mirror e2e images
 
 # Copy the pinned registry.k8s.io images CI depends on (ci/mirror/images.txt) to
-# ghcr.io/indyjonesnl/rusternetes/mirror/<path>. The cluster's containerd pulls
-# from that mirror first and falls back to registry.k8s.io
-# (deploy/containerd/certs.d/registry.k8s.io/hosts.toml). Tags are pinned and
+# ghcr.io/indyjonesnl/rusternetes/mirror/<path>. Conformance runs use the
+# copies explicitly (scripts/conformance-target-run.sh, ci/mirror/e2e-repo-list.yaml)
+# and fall back to registry.k8s.io when the mirror is incomplete. Tags are pinned and
 # the copy is a registry-to-registry manifest-list copy, so mirror digests equal
 # upstream digests. Re-running is a no-op for images already up to date.
 #

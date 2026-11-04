@@ -2,10 +2,11 @@
 # ghcr.io/indyjonesnl/rusternetes/mirror/<path> by .github/workflows/mirror-images.yml.
 # One "<path>:<tag>" per line, <path> relative to registry.k8s.io, tag pinned.
 #
-# The cluster's containerd resolves registry.k8s.io through
-# deploy/containerd/certs.d/registry.k8s.io/hosts.toml, trying the mirror first
-# and falling back to registry.k8s.io, so an image missing here only costs a
-# slower pull. scripts/check-mirror-images.sh keeps this list in step with every
+# Conformance runs use these copies explicitly: scripts/conformance-target-run.sh
+# passes the mirror conformance image and ci/mirror/e2e-repo-list.yaml
+# (hydrophone --test-repo-list) when scripts/resolve-image-source.sh finds every
+# image here pullable anonymously, and uses registry.k8s.io otherwise. There is no
+# containerd-level mirror. scripts/check-mirror-images.sh keeps this list in step with every
 # registry.k8s.io reference CI uses, and with `e2e.test --list-images` of the
 # pinned conformance image (run by the mirror workflow before copying).
 #

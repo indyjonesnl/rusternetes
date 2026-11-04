@@ -22,6 +22,12 @@ refs="$(grep -rhE 'registry\.k8s\.io/[a-z0-9._/-]+:[A-Za-z0-9._-]+' \
 # Control-plane images from the vanilla-swap tooling are not mirrored.
 refs="$(echo "$refs" | sed 's#^registry\.k8s\.io/##' | grep -vE '^kube-(apiserver|controller-manager|scheduler|proxy):' | sort -u)"
 
+# Everything side-loaded must also be mirrored.
+while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    grep -qxF "$ref" <<<"$listed" || { echo "ci/mirror/sideload.txt: $ref is not in $LIST" >&2; exit 1; }
+done < <(sed 's/#.*//' ci/mirror/sideload.txt | tr -d ' \t' | grep -v '^$')
+
 missing=0
 while IFS= read -r ref; do
     [ -n "$ref" ] || continue
@@ -47,8 +53,17 @@ if [ "${1:-}" = "--list-images" ]; then
         | grep -E '^registry\.k8s\.io/' | grep -v '^registry\.k8s\.io/e2e-test-images/node-perf/' | sed 's#^registry\.k8s\.io/##' | sort -u)"
     [ -n "$actual" ] || { echo "e2e.test --list-images produced nothing" >&2; exit 1; }
     drift=0
+    REPO_LIST=ci/mirror/e2e-repo-list.yaml
     while IFS= read -r ref; do
         grep -qxF "$ref" <<<"$listed" || { echo "e2e pulls registry.k8s.io/$ref, not in $LIST" >&2; drift=1; }
+        # The registry map must redirect this image's registry to the mirror path
+        # (manifest.go replaceRegistryInImageURLWithList matches on registry+user).
+        # (an image name may itself contain a slash, e.g. e2e-test-images/volume/nfs).
+        mapped=0
+        while IFS= read -r v; do
+            case "ghcr.io/indyjonesnl/rusternetes/mirror/$ref" in "$v"/*) mapped=1 ;; esac
+        done < <(sed -nE 's/^[A-Za-z0-9]+Registry: *//p' "$REPO_LIST")
+        [ "$mapped" -eq 1 ] || { echo "$REPO_LIST maps no registry covering $ref" >&2; drift=1; }
     done <<<"$actual"
     [ "$drift" -eq 0 ] && echo "mirror list covers all $(echo "$actual" | grep -c .) images from e2e.test --list-images"
     exit "$drift"

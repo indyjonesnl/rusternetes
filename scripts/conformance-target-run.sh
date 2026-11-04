@@ -23,7 +23,12 @@
 # Usage:
 #   bash scripts/conformance-target-run.sh --target sig-node [flags]
 #
-# Flags: --target --focus --skip --parallel --kubeconfig --conformance-image
+# Image source: by default the conformance image and every e2e test image come
+#   from the ghcr.io mirror (ci/mirror/images.txt) when scripts/resolve-image-source.sh
+#   finds it complete, else from registry.k8s.io. --image-source mirror|upstream|auto
+#   (env IMAGE_SOURCE) forces it. Mirror runs pass hydrophone --test-repo-list
+#   ci/mirror/e2e-repo-list.yaml; an explicit --conformance-image is never replaced.
+# Flags: --target --focus --skip --parallel --kubeconfig --conformance-image --image-source
 #        --output-dir --hydrophone --skip-preflight --preflight-arg -h|--help
 #        --skip-preflight  Skip the cluster health gate (conformance-preflight.sh);
 #                          results then describe the cluster, not the code (#1777)
@@ -389,6 +394,9 @@ stop_hydrophone_at_done() {
 TARGET=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
+CONFORMANCE_IMAGE_EXPLICIT=0
+IMAGE_SOURCE="${IMAGE_SOURCE:-auto}"
+MIRROR_PREFIX="${MIRROR_PREFIX:-ghcr.io/indyjonesnl/rusternetes/mirror}"
 OUTPUT_DIR=""; HYDROPHONE_BIN=""; PARALLEL=2
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 # Extra flags handed to conformance-preflight.sh. The gate's defaults describe
@@ -406,7 +414,8 @@ while [[ $# -gt 0 ]]; do
         --focus) [[ $# -ge 2 ]] || die "--focus requires a value"; FOCUS="$2"; FOCUS_OVERRIDDEN=1; shift 2 ;;
         --skip) [[ $# -ge 2 ]] || die "--skip requires a value"; SKIP="$2"; shift 2 ;;
         --kubeconfig) [[ $# -ge 2 ]] || die "--kubeconfig requires a value"; KUBECONFIG_PATH="$2"; shift 2 ;;
-        --conformance-image) [[ $# -ge 2 ]] || die "--conformance-image requires a value"; CONFORMANCE_IMAGE="$2"; shift 2 ;;
+        --conformance-image) [[ $# -ge 2 ]] || die "--conformance-image requires a value"; CONFORMANCE_IMAGE="$2"; CONFORMANCE_IMAGE_EXPLICIT=1; shift 2 ;;
+        --image-source) [[ $# -ge 2 ]] || die "--image-source requires a value"; IMAGE_SOURCE="$2"; shift 2 ;;
         --output-dir) [[ $# -ge 2 ]] || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --hydrophone) [[ $# -ge 2 ]] || die "--hydrophone requires a value"; HYDROPHONE_BIN="$2"; shift 2 ;;
         --parallel) [[ $# -ge 2 ]] || die "--parallel requires a value"; PARALLEL="$2"; shift 2 ;;
@@ -428,6 +437,27 @@ entry=$(jq -c --arg t "$TARGET" '.[] | select(.name == $t)' "$MANIFEST")
 
 [ -f "$KUBECONFIG_PATH" ] || die "kubeconfig not found: $KUBECONFIG_PATH"
 
+# Image source (mirror vs registry.k8s.io). The mirror is an optimisation and
+# must never fail a run: "auto" probes it and falls back to upstream. A mirror run
+# pulls the conformance image from the mirror and hands hydrophone a repo list so
+# e2e.test (KUBE_TEST_REPO_LIST, test/utils/image/manifest.go) redirects the test
+# images; see ci/mirror/e2e-repo-list.yaml for exactly which registries move.
+case "$IMAGE_SOURCE" in auto|mirror|upstream) ;; *) die "--image-source must be auto|mirror|upstream, got '$IMAGE_SOURCE'" ;; esac
+REPO_LIST_ARGS=()
+if [ "$IMAGE_SOURCE" = auto ]; then
+    IMAGE_SOURCE="$("$SCRIPT_DIR/resolve-image-source.sh" || true)"
+    [ "$IMAGE_SOURCE" = mirror ] || IMAGE_SOURCE=upstream
+fi
+if [ "$IMAGE_SOURCE" = mirror ]; then
+    REPO_LIST_ARGS=(--test-repo-list "$REPO_ROOT/ci/mirror/e2e-repo-list.yaml")
+    # Hydrophone's own output container is not covered by the repo list
+    # (pkg/types/config.go DefaultBusyboxImage, v0.7.0); redirect it explicitly.
+    REPO_LIST_ARGS+=(--busybox-image "$MIRROR_PREFIX/e2e-test-images/busybox:1.36.1-1")
+    if [ "$CONFORMANCE_IMAGE_EXPLICIT" -eq 0 ]; then
+        CONFORMANCE_IMAGE="$MIRROR_PREFIX/${CONFORMANCE_IMAGE#registry.k8s.io/}"
+    fi
+fi
+
 if [ -z "$HYDROPHONE_BIN" ]; then
     command -v hydrophone >/dev/null 2>&1 || die "hydrophone not on PATH; pass --hydrophone"
     HYDROPHONE_BIN="$(command -v hydrophone)"
@@ -443,6 +473,7 @@ echo "[conformance-target-run] target=$TARGET focused=$FOCUS_OVERRIDDEN"
 echo "  focus : $FOCUS"
 echo "  skip  : $SKIP"
 echo "  image : $CONFORMANCE_IMAGE"
+echo "  images: $IMAGE_SOURCE${REPO_LIST_ARGS[*]:+ (${REPO_LIST_ARGS[*]})}"
 
 # Cluster preflight: refuse to produce a failure list that describes a broken
 # cluster instead of the code under test (#1777). Same gate, same exit-code class
@@ -458,6 +489,14 @@ else
     echo "  preflight : $PREFLIGHT_BIN $(IFS=' '; echo "${PREFLIGHT_ARGS[*]:-}")"
     "$PREFLIGHT_BIN" --kubeconfig "$KUBECONFIG_PATH" ${PREFLIGHT_ARGS[@]+"${PREFLIGHT_ARGS[@]}"} \
         || die "cluster preflight failed — fix the conditions above or pass --skip-preflight"
+fi
+
+# Side-load the conformance image, sandbox image and core e2e images into every
+# node's containerd via the host daemon (scripts/sideload-images.sh): the cluster's
+# own containerd can time out on registry TLS while the host pulls fine. Best
+# effort, never fails the run; SIDELOAD_IMAGES=0 disables it.
+if [ "${SIDELOAD_IMAGES:-1}" != "0" ] && [ -x "$SCRIPT_DIR/sideload-images.sh" ]; then
+    "$SCRIPT_DIR/sideload-images.sh" --image-source "$IMAGE_SOURCE" --conformance-image "$CONFORMANCE_IMAGE" || true
 fi
 
 # Clear any leftover conformance namespace before deploying (hydrophone refuses
@@ -485,7 +524,8 @@ hydro_cmd=("$HYDROPHONE_BIN"
     --parallel "$PARALLEL"
     --output-dir "$OUTPUT_DIR"
     --kubeconfig "$KUBECONFIG_PATH"
-    --conformance-image "$CONFORMANCE_IMAGE")
+    --conformance-image "$CONFORMANCE_IMAGE"
+    ${REPO_LIST_ARGS[@]+"${REPO_LIST_ARGS[@]}"})
 if [ "$HYDROPHONE_TIMEOUT" = "0" ]; then
     hydro_bound=()   # explicit opt-out
 else
