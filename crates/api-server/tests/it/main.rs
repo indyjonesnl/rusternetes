@@ -132,6 +132,7 @@ mod custom_resource_null_spec_test;
 mod custom_resource_scope_mismatch_test;
 mod custom_resource_store_test;
 mod custom_resource_table_test;
+mod custom_resource_webhook_pruning_test;
 mod daemonset_generic_store_test;
 mod daemonset_handler_test;
 mod decode_missing_field_test;
