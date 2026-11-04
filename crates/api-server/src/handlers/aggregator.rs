@@ -468,6 +468,35 @@ pub async fn forward_to_aggregator(
     request_headers: &HeaderMap,
     body_bytes: Vec<u8>,
 ) -> Response {
+    // NewWithDelegate (kube-aggregator/pkg/apiserver/apiserver.go:235-246):
+    // with an egress selector, `Lookup(Cluster)` is the proxy's dialer; a
+    // selector with no Cluster selection leaves the default dialer.
+    let dialer = crate::egress_selector::egress_selector()
+        .and_then(|s| s.lookup(crate::egress_selector::EgressType::Cluster));
+    forward_to_aggregator_with_dialer(
+        target,
+        auth_ctx,
+        method,
+        path_and_query,
+        request_headers,
+        body_bytes,
+        dialer,
+    )
+    .await
+}
+
+/// [`forward_to_aggregator`] with the proxy transport's dialer already
+/// selected (`proxyTransportDial`, handler_proxy.go:230 `DialHolder`).
+/// `None` is the default dial.
+pub async fn forward_to_aggregator_with_dialer(
+    target: &AggregatorTarget,
+    auth_ctx: &AuthContext,
+    method: Method,
+    path_and_query: &str,
+    request_headers: &HeaderMap,
+    body_bytes: Vec<u8>,
+    dialer: Option<crate::egress_selector::Dialer>,
+) -> Response {
     // The URL host (and thus TLS SNI + cert verification name) is the service
     // DNS name when set; we then pin DNS resolution of that name to the backend
     // pod IP via `resolve()`. This lets us connect to a reachable pod IP while
@@ -481,6 +510,19 @@ pub async fn forward_to_aggregator(
         "API aggregation proxy: {} {} -> {} (connect {}:{})",
         method, path_and_query, target_url, target.host, target.port
     );
+
+    if let Some(dialer) = dialer {
+        return forward_via_dialer(
+            dialer,
+            target,
+            &target_url,
+            auth_ctx,
+            method,
+            request_headers,
+            body_bytes,
+        )
+        .await;
+    }
 
     let mut client_builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -583,6 +625,118 @@ pub async fn forward_to_aggregator(
             service_unavailable_response(&format!("aggregated API server unavailable: {}", e))
         }
     }
+}
+
+/// The proxy transport with a selected dialer: the TLS config of the
+/// `transport.Config` built in handler_proxy.go:221-230 (`Insecure`,
+/// `ServerName`, front-proxy `CertData`/`KeyData`, `CAData`) over
+/// `DialContext = dialer` (client-go `transport/cache.go` `tlsCache.get`).
+/// The connection is made to the resolved endpoint (`target.host`), exactly
+/// as the reqwest path pins it; TLS verifies `server_name`.
+async fn forward_via_dialer(
+    dialer: crate::egress_selector::Dialer,
+    target: &AggregatorTarget,
+    target_url: &str,
+    auth_ctx: &AuthContext,
+    method: Method,
+    request_headers: &HeaderMap,
+    body_bytes: Vec<u8>,
+) -> Response {
+    // Same trust fallbacks as the reqwest path above.
+    let ca = if target.insecure_skip_tls_verify {
+        None
+    } else {
+        target.ca_bundle.as_deref()
+    };
+    let tls = match crate::egress_http::tls_client_config(
+        ca,
+        ca.is_none(),
+        proxy_client_identity_pem().as_deref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("APIService caBundle is not usable: {e} — falling back to insecure");
+            match crate::egress_http::tls_client_config(
+                None,
+                true,
+                proxy_client_identity_pem().as_deref(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    return service_unavailable_response(&format!("aggregator client error: {e}"))
+                }
+            }
+        }
+    };
+    // Connect to the endpoint address; the URL host is the verification name.
+    let connect_url = {
+        let host = if target.host.contains(':') && !target.host.starts_with('[') {
+            format!("[{}]", target.host)
+        } else {
+            target.host.clone()
+        };
+        let url_host = target.server_name.as_deref().unwrap_or(&target.host);
+        target_url.replacen(
+            &format!("{}://{}:{}", target.scheme, url_host, target.port),
+            &format!("{}://{}:{}", target.scheme, host, target.port),
+            1,
+        )
+    };
+    let client = crate::egress_http::EgressHttpClient::with_server_name(
+        dialer,
+        tls,
+        std::time::Duration::from_secs(30),
+        target.server_name.clone(),
+    );
+    let headers = build_proxy_headers(auth_ctx, request_headers);
+    let headers: Vec<(&str, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    let hyper_method =
+        hyper::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(hyper::Method::GET);
+    match client
+        .send(hyper_method, &connect_url, &headers, body_bytes)
+        .await
+    {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let content_type = resp
+                .headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+            let mut builder = Response::builder()
+                .status(status)
+                .header(axum::http::header::CONTENT_TYPE, content_type);
+            if let Some(etag) = resp.headers.get(axum::http::header::ETAG) {
+                builder = builder.header(axum::http::header::ETAG, etag.clone());
+            }
+            builder.body(Body::from(resp.body)).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap()
+            })
+        }
+        Err(e) => {
+            warn!("API aggregation proxy error: {}", e);
+            service_unavailable_response(&format!("aggregated API server unavailable: {}", e))
+        }
+    }
+}
+
+/// The front-proxy client credential as one PEM (cert + key) for rustls.
+fn proxy_client_identity_pem() -> Option<Vec<u8>> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut pem = std::fs::read(PROXY_CLIENT_CERT).ok()?;
+            pem.extend_from_slice(&std::fs::read(PROXY_CLIENT_KEY).ok()?);
+            Some(pem)
+        })
+        .clone()
 }
 
 /// Build a reqwest client configured to reach an aggregated backend: TLS trust

@@ -87,6 +87,10 @@ impl Connection for EgressIo {
 pub struct EgressConnector {
     dialer: Dialer,
     tls: Arc<rustls::ClientConfig>,
+    /// `tls.Config.ServerName`: the name the certificate is verified against
+    /// when it is not the URL host (the aggregator dials the endpoint IP but
+    /// verifies `<service>.<namespace>.svc`, handler_proxy.go:221).
+    server_name: Option<String>,
 }
 
 impl tower::Service<Uri> for EgressConnector {
@@ -117,7 +121,10 @@ impl tower::Service<Uri> for EgressConnector {
                 .await
                 .map_err(|e| io_err(format!("dial tcp {addr}: {e}")))?;
             let conn: Conn = if https {
-                let bare = host.trim_start_matches('[').trim_end_matches(']');
+                let bare = this
+                    .server_name
+                    .as_deref()
+                    .unwrap_or_else(|| host.trim_start_matches('[').trim_end_matches(']'));
                 let name = rustls::pki_types::ServerName::try_from(bare.to_string())
                     .map_err(|e| io_err(format!("invalid server name {bare:?}: {e}")))?;
                 let tls = tokio_rustls::TlsConnector::from(this.tls.clone())
@@ -133,6 +140,15 @@ impl tower::Service<Uri> for EgressConnector {
 }
 
 type HyperClient = hyper_util::client::legacy::Client<EgressConnector, Full<Bytes>>;
+
+/// Go's `url.Error` operation name for a method (`Post`, `Get`, ...).
+fn go_method_label(m: &hyper::Method) -> String {
+    let s = m.as_str().to_ascii_lowercase();
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+        .unwrap_or_default()
+}
 
 /// An HTTP/1.1 client dialing through an egress `Dialer`.
 #[derive(Clone)]
@@ -220,9 +236,21 @@ pub fn tls_client_config(
 
 impl EgressHttpClient {
     pub fn new(dialer: Dialer, tls: rustls::ClientConfig, timeout: Duration) -> Self {
+        Self::with_server_name(dialer, tls, timeout, None)
+    }
+
+    /// As [`Self::new`], verifying the server certificate against
+    /// `server_name` instead of the URL host (`transport.TLSConfig.ServerName`).
+    pub fn with_server_name(
+        dialer: Dialer,
+        tls: rustls::ClientConfig,
+        timeout: Duration,
+        server_name: Option<String>,
+    ) -> Self {
         let connector = EgressConnector {
             dialer,
             tls: Arc::new(tls),
+            server_name,
         };
         Self {
             client: hyper_util::client::legacy::Client::builder(TokioExecutor::new())
@@ -239,14 +267,28 @@ impl EgressHttpClient {
         headers: &[(&str, String)],
         body: Vec<u8>,
     ) -> Result<EgressHttpResponse, EgressHttpError> {
+        let mut headers = headers.to_vec();
+        headers.push(("content-type", "application/json".to_string()));
+        headers.push(("accept", "application/json".to_string()));
+        self.send(hyper::Method::POST, url, &headers, body).await
+    }
+
+    /// One request with any method; `headers` are added as given. Redirects
+    /// are not followed (hyper-util's legacy client never does).
+    pub async fn send(
+        &self,
+        method: hyper::Method,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Vec<u8>,
+    ) -> Result<EgressHttpResponse, EgressHttpError> {
+        let label = go_method_label(&method);
         let err = |message: String| EgressHttpError {
             message,
             timeout: false,
             connection_reset: false,
         };
-        let mut req = hyper::Request::post(url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json");
+        let mut req = hyper::Request::builder().method(method).uri(url);
         for (k, v) in headers {
             req = req.header(*k, v);
         }
@@ -257,7 +299,7 @@ impl EgressHttpClient {
             let resp = self.client.request(req).await.map_err(|e| {
                 // Go's `url.Error` message carries the wrapped dial error.
                 let mut reset = false;
-                let mut message = format!("Post \"{url}\": {e}");
+                let mut message = format!("{label} \"{url}\": {e}");
                 let mut src = std::error::Error::source(&e);
                 while let Some(s) = src {
                     message.push_str(&format!(": {s}"));
@@ -287,7 +329,7 @@ impl EgressHttpClient {
         match tokio::time::timeout(self.timeout, exchange).await {
             Ok(r) => r,
             Err(_) => Err(EgressHttpError {
-                message: format!("Post \"{url}\": context deadline exceeded"),
+                message: format!("{label} \"{url}\": context deadline exceeded"),
                 timeout: true,
                 connection_reset: false,
             }),
