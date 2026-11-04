@@ -38,6 +38,7 @@ use controllers::{
     storage_class::StorageClassController,
     storageversiongc::StorageVersionGCController,
     ttl_controller::TTLController,
+    vac_protection::VacProtectionController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
@@ -363,6 +364,18 @@ where
         let c = Arc::new(PvProtectionController::new(s));
         if let Err(e) = c.run().await {
             error!("PV protection controller error: {}", e);
+        }
+    }));
+
+    // `vacprotection.NewVACProtectionController` (cmd/kube-controller-manager/
+    // app/core.go `newVolumeAttributesClassProtectionControllerDescriptor`): without it
+    // a VolumeAttributesClass keeps `kubernetes.io/vac-protection` forever and
+    // its DELETE never completes (#4367). main.rs already starts it.
+    let s = storage_for("VacProtection");
+    handles.push(tokio::spawn(async move {
+        let c = Arc::new(VacProtectionController::new(s));
+        if let Err(e) = c.run().await {
+            error!("VAC protection controller error: {}", e);
         }
     }));
 

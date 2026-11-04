@@ -35,10 +35,20 @@ pub fn need_to_add_finalizer(meta: &ObjectMeta, finalizer: &str) -> bool {
     meta.deletion_timestamp.is_none() && !has_finalizer(meta, finalizer)
 }
 
-/// Persist `obj` after a finalizer change. A terminating object whose last
-/// finalizer is gone is deleted here: upstream PATCHes/Updates and the
-/// apiserver reaps it, but this controller writes to storage directly (the
-/// same shortcut `servicecidr::remove_finalizer_if_needed` takes).
+/// Persist `obj` after a finalizer change, the way upstream does: a PUT/PATCH
+/// with the finalizer removed (`pvc_protection_controller.go:processPVC` ->
+/// `removeFinalizer` -> `Update`). The apiserver's registry then reaps a
+/// terminating object whose last finalizer is gone
+/// (`registry/generic/registry/store.go:Update` ->
+/// `ShouldDeleteDuringUpdate`, store.go:565-586).
+///
+/// A direct storage backend (etcd / sqlite / redis / memory) has no registry
+/// in front of it, so the write alone leaves the emptied object behind; the
+/// trailing `delete` reaps it there (the same shortcut
+/// `servicecidr::remove_finalizer_if_needed` takes). Over the API
+/// (`ApiStorage`) the PUT has already reaped it and the `delete` is a
+/// NotFound, which is ignored. The write MUST come first: `ApiStorage::delete`
+/// is a DELETE, which an object still holding its finalizer survives (#4367).
 pub async fn update_or_reap<S: Storage, T>(storage: &S, key: &str, obj: &T) -> Result<()>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
@@ -47,13 +57,12 @@ where
     let finalizers_left = meta["metadata"]["finalizers"]
         .as_array()
         .is_some_and(|f| !f.is_empty());
+    storage.update(key, obj).await?;
     if !finalizers_left && !meta["metadata"]["deletionTimestamp"].is_null() {
         match storage.delete(key).await {
             Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
-    } else {
-        storage.update(key, obj).await?;
     }
     Ok(())
 }
