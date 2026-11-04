@@ -34,6 +34,9 @@ on:
   workflow_dispatch:
 
 env:
+  # One line per build step instead of an in-place redraw; the redraw becomes
+  # thousands of lines in a non-TTY job log.
+  BUILDKIT_PROGRESS: plain
   # GitHub-hosted runners cannot reach the cluster-side sccache→MinIO backend,
   # and a fresh ephemeral runner has no warm BuildKit cache-mount either — so
   # sccache buys nothing here and only costs the CARGO_INCREMENTAL=0 tax. Force

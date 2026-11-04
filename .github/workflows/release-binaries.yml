@@ -41,6 +41,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # One line per build step instead of an in-place redraw; the redraw becomes
+  # thousands of lines in a non-TTY job log.
+  BUILDKIT_PROGRESS: plain
   TARGET: x86_64-unknown-linux-musl
 
 jobs:
