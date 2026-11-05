@@ -3193,6 +3193,96 @@ mod tests {
             .expect("Ready condition must be present");
         assert_eq!(ready.status, "False");
     }
+
+    fn terminal_test_pod(name: &str, uid: &str, phase: Phase) -> Pod {
+        let mut pod = host_network_pod_for_3687(name);
+        pod.metadata.uid = uid.to_string();
+        pod.metadata.generation = Some(3);
+        pod.status = Some(rusternetes_common::resources::PodStatus {
+            phase: Some(phase),
+            reason: Some("Keep".to_string()),
+            message: Some("kept".to_string()),
+            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                condition_type: "DisruptionTarget".to_string(),
+                status: "True".to_string(),
+                reason: Some("DeletionByTaintManager".to_string()),
+                message: None,
+                last_probe_time: None,
+                last_transition_time: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        });
+        pod
+    }
+
+    /// The terminating/terminated sync paths publish Succeeded through
+    /// `generateAPIPodStatus` (#3901): observedGeneration set, conditions the
+    /// kubelet does not own (DisruptionTarget) preserved.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_status_goes_through_generate_api_pod_status() {
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
+        let pod = terminal_test_pod("t1", "uid-1", Phase::Running);
+        let key = "/registry/pods/default/t1";
+        storage.create(key, &pod).await.unwrap();
+
+        k.publish_terminal_pod_status(&pod, false, |_| {}).await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Succeeded));
+        assert_eq!(st.observed_generation, Some(3));
+        assert!(st
+            .conditions
+            .unwrap()
+            .iter()
+            .any(|c| c.condition_type == "DisruptionTarget"));
+        // Phase changed: the old phase's reason/message are not carried over.
+        assert_eq!(st.reason, None);
+        assert_eq!(st.message, None);
+    }
+
+    /// A stored Failed phase is not rewritten to Succeeded (terminal guard,
+    /// kubelet_pods.go:1938-1945) and keeps its reason/message.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_status_keeps_a_failed_phase() {
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
+        let pod = terminal_test_pod("t2", "uid-2", Phase::Failed);
+        let key = "/registry/pods/default/t2";
+        storage.create(key, &pod).await.unwrap();
+
+        k.publish_terminal_pod_status(&pod, false, |_| {}).await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Failed));
+        assert_eq!(st.reason.as_deref(), Some("Keep"));
+    }
+
+    /// A recreated same-name pod is not written (status_manager.go:1051-1060).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_status_skips_a_recreated_pod() {
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
+        let old = terminal_test_pod("t3", "uid-old", Phase::Running);
+        let new = terminal_test_pod("t3", "uid-new", Phase::Running);
+        let key = "/registry/pods/default/t3";
+        storage.create(key, &new).await.unwrap();
+
+        k.publish_terminal_pod_status(&old, false, |_| {}).await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Running));
+    }
 }
 
 mod sync_pod_fake_cri_tests {
