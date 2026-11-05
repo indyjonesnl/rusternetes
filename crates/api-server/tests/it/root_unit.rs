@@ -21,6 +21,7 @@ mod authorization_metrics;
 mod authorizer;
 mod autoregister;
 mod bootstrap;
+mod cache_watcher;
 mod conversion;
 mod crdregistration;
 mod deprecation;
