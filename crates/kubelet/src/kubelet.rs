@@ -3268,59 +3268,46 @@ impl Kubelet {
                 .unwrap_or(false);
             if !has_finalizers {
                 // Update status to terminal phase before removing from storage.
-                if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
-                    let original = p.clone();
-                    if let Some(ref mut status) = p.status {
-                        if status.phase != Some(Phase::Failed)
-                            && status.phase != Some(Phase::Succeeded)
-                        {
-                            status.phase = Some(Phase::Succeeded);
-                        }
-                        // Refresh init container statuses — set ready=true for
-                        // all completed init containers. When the pod reaches
-                        // Succeeded, all init containers must have completed.
-                        if let Some(ref mut ics) = status.init_container_statuses {
-                            for ic in ics.iter_mut() {
-                                if let Some(ContainerState {
-                                    terminated: Some(ContainerStateTerminated { exit_code, .. }),
-                                    ..
-                                }) = &ic.state
-                                {
-                                    if *exit_code == 0 {
-                                        ic.ready = true;
-                                        ic.started = Some(true);
-                                    }
-                                } else {
-                                    // Docker removed the container — mark as completed
-                                    ic.state = Some(ContainerState {
-                                        terminated: Some(ContainerStateTerminated {
-                                            exit_code: 0,
-                                            reason: Some("Completed".to_string()),
-                                            message: None,
-                                            started_at: None,
-                                            finished_at: None,
-                                            container_id: None,
-                                            signal: None,
-                                        }),
-                                        ..Default::default()
-                                    });
+                // Terminal status via generateAPIPodStatus (pod_status.rs); the
+                // closure refreshes init container statuses — set ready=true for
+                // all completed init containers (when the pod reaches Succeeded,
+                // all init containers must have completed).
+                self.publish_terminal_pod_status(pod, true, |status| {
+                    // Refresh init container statuses — set ready=true for
+                    // all completed init containers. When the pod reaches
+                    // Succeeded, all init containers must have completed.
+                    if let Some(ref mut ics) = status.init_container_statuses {
+                        for ic in ics.iter_mut() {
+                            if let Some(ContainerState {
+                                terminated: Some(ContainerStateTerminated { exit_code, .. }),
+                                ..
+                            }) = &ic.state
+                            {
+                                if *exit_code == 0 {
                                     ic.ready = true;
                                     ic.started = Some(true);
                                 }
+                            } else {
+                                // Docker removed the container — mark as completed
+                                ic.state = Some(ContainerState {
+                                    terminated: Some(ContainerStateTerminated {
+                                        exit_code: 0,
+                                        reason: Some("Completed".to_string()),
+                                        message: None,
+                                        started_at: None,
+                                        finished_at: None,
+                                        container_id: None,
+                                        signal: None,
+                                    }),
+                                    ..Default::default()
+                                });
+                                ic.ready = true;
+                                ic.started = Some(true);
                             }
                         }
                     }
-                    // Refresh container statuses
-                    let fresh_statuses = self.get_container_statuses(&p).await.ok();
-                    if let Some(ref mut status) = p.status {
-                        if let Some(cs) = fresh_statuses {
-                            status.container_statuses = Some(cs);
-                        }
-                    }
-                    if !pod_status_equal(&original, &p) {
-                        let _ = self.storage.update_status(&key, &p).await;
-                    }
-                }
+                })
+                .await;
                 // Now that containers are stopped and the terminal status is
                 // persisted, decide whether the object stays or is removed. The
                 // rule lives in `finalize_terminated_pod_storage` so it can be
@@ -3382,19 +3369,7 @@ impl Kubelet {
                 self.forget_restart_backoff(namespace, pod_name);
             } else {
                 // Pod has finalizers — update status to Failed but don't delete
-                if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
-                    let original = p.clone();
-                    if let Some(ref mut status) = p.status {
-                        if status.phase != Some(Phase::Failed)
-                            && status.phase != Some(Phase::Succeeded)
-                        {
-                            status.phase = Some(Phase::Succeeded);
-                        }
-                    }
-                    if !pod_status_equal(&original, &p) {
-                        let _ = self.storage.update_status(&key, &p).await;
-                    }
-                }
+                self.publish_terminal_pod_status(pod, false, |_| {}).await;
             }
             // Volumes are cleaned by stop_pod_for during TerminatingPod.
             // Remove pod worker state — K8s HandlePodCleanups removes finished workers
@@ -3488,25 +3463,8 @@ impl Kubelet {
 
             // Update pod status to terminal phase.
             // K8s kubelet NEVER deletes pods from the API server.
-            let key = build_key("pods", Some(namespace), pod_name);
-            if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
-                let original = p.clone();
-                if let Some(ref mut status) = p.status {
-                    if status.phase != Some(Phase::Failed) {
-                        status.phase = Some(Phase::Succeeded);
-                    }
-                    Self::fixup_init_container_ready(status);
-                }
-                let fresh_statuses = self.get_container_statuses(&p).await.ok();
-                if let Some(ref mut status) = p.status {
-                    if let Some(cs) = fresh_statuses {
-                        status.container_statuses = Some(cs);
-                    }
-                }
-                if !pod_status_equal(&original, &p) {
-                    let _ = self.storage.update_status(&key, &p).await;
-                }
-            }
+            self.publish_terminal_pod_status(pod, true, Self::fixup_init_container_ready)
+                .await;
             debug!(
                 "Pod {}/{} terminated (containers stopped, left for GC)",
                 namespace, pod_name
@@ -6517,6 +6475,66 @@ impl Kubelet {
         }
 
         Ok(())
+    }
+
+    /// Publish the terminal (Succeeded) phase of `pod` through
+    /// `generate_api_pod_status`, for the terminating/terminated pod-worker
+    /// paths (kubelet.rs `sync_pod`; upstream `syncTerminatingPod` /
+    /// `syncTerminatedPod` -> `statusManager.SetPodStatus`, kubelet.go:2398,
+    /// :2467, with the status from `generateAPIPodStatus`,
+    /// kubelet_pods.go:1889).
+    ///
+    /// Only the incarnation with `pod`'s UID is written (a recreated pod of the
+    /// same name is skipped, status_manager.go:1051-1060). A stored Failed
+    /// phase stays Failed (terminal guard, kubelet_pods.go:1938-1945).
+    /// `adjust` is the site's container-status fix-up, applied to the
+    /// generated status; `refresh_containers` re-reads container statuses from
+    /// the runtime afterwards.
+    pub async fn publish_terminal_pod_status(
+        &self,
+        pod: &Pod,
+        refresh_containers: bool,
+        adjust: impl FnOnce(&mut PodStatus),
+    ) {
+        let key = build_key(
+            "pods",
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
+        );
+        let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, &pod.metadata.uid).await
+        else {
+            return;
+        };
+        let original = p.clone();
+        // Upstream derives the phase from the runtime (`getPhase`), so an
+        // already-terminal pod yields its own terminal phase and keeps its
+        // reason/message (:1915-1926). The hardcoded Succeeded of these
+        // paths stands in for that only for a pod not yet terminal.
+        let phase = match p.status.as_ref().and_then(|s| s.phase.clone()) {
+            Some(t @ (Phase::Failed | Phase::Succeeded)) => t,
+            _ => Phase::Succeeded,
+        };
+        let input = crate::pod_status::ApiPodStatusInput::from_prior(
+            &p,
+            phase,
+            None,
+            None,
+            self.host_ip_fields(),
+            chrono::Utc::now(),
+        );
+        let mut status = crate::pod_status::generate_api_pod_status(&p, input);
+        adjust(&mut status);
+        p.status = Some(status);
+        if refresh_containers {
+            if let Ok(cs) = self.get_container_statuses(&p).await {
+                if let Some(ref mut status) = p.status {
+                    status.container_statuses = Some(cs);
+                }
+            }
+        }
+        if !pod_status_equal(&original, &p) {
+            let _ = self.storage.update_status(&key, &p).await;
+        }
     }
 
     async fn update_pod_status_error(&self, pod: &Pod, error: &str) -> Result<()> {
