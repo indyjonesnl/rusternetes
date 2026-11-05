@@ -11,7 +11,7 @@ use rusternetes_common::validation::metav1::validate_delete_options;
 use rusternetes_common::{Error, List, Result, Status};
 
 use super::admission::{Admission, DeleteValidation};
-use super::rest::{authorize, dry_run_param, is_dry_run, respond, respond_object, RequestScope};
+use super::rest::{dry_run_param, is_dry_run, respond, respond_object, RequestScope};
 use crate::handlers::list_options::validate_list_options;
 use crate::registry::generic::Deleted;
 use crate::registry::rest::{zero_delete_options, Object, RequestContext};
@@ -95,17 +95,6 @@ pub async fn delete_resource<T: Object>(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(
-        state,
-        user,
-        "delete",
-        &scope.resource,
-        scope.subresource,
-        namespace,
-        Some(name),
-    )
-    .await?;
-
     let options = decode_delete_options(params, body)?;
     log_delete_options(scope, &options, body);
     let ctx =
@@ -155,17 +144,6 @@ pub async fn delete_collection<T: Object>(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(
-        state,
-        user,
-        "deletecollection",
-        &scope.resource,
-        scope.subresource,
-        namespace,
-        None,
-    )
-    .await?;
-
     // delete.go:242-247: `ValidateListOptions` precedes decoding the body;
     // a failure is `NewInvalid(meta.k8s.io ListOptions, "", errs)`.
     let list_errs = validate_list_options(params);

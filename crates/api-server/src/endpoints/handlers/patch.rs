@@ -20,7 +20,7 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
-    authorize, check_name, dry_run_param, is_dry_run, respond_object,
+    check_name, dry_run_param, is_dry_run, respond_object,
     retry_without_managed_fields_if_too_large, ApplyFn, RequestScope,
 };
 use crate::fieldmanager::manager_or_user_agent;
@@ -59,17 +59,6 @@ pub async fn patch_resource<T: Object>(
     content_type: &str,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(
-        state,
-        user,
-        "patch",
-        &scope.resource,
-        scope.subresource,
-        namespace,
-        Some(name),
-    )
-    .await?;
-
     // patch.go:78-89: drop "; charset=...", then require a supported type.
     let content_type = match content_type.find(';') {
         Some(idx) if idx > 0 => &content_type[..idx],
