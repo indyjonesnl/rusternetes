@@ -18,8 +18,6 @@ use rusternetes_storage::{build_prefix, Storage, WatchEvent};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval, timeout};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
 /// Kubernetes watch event types
@@ -218,22 +216,6 @@ pub fn watch_params_from_query(params: &std::collections::HashMap<String, String
 pub type WatchObjectConverter =
     Arc<dyn Fn(serde_json::Value) -> BoxFuture<'static, serde_json::Value> + Send + Sync>;
 
-/// Deserialize a raw JSON string into `T`, first running it through `converter`
-/// when present. Returns `None` if any stage (parse → convert → deserialize)
-/// fails — callers treat that exactly like the previous `from_str` failure.
-async fn deserialize_converted<T: DeserializeOwned>(
-    raw: &str,
-    converter: &Option<WatchObjectConverter>,
-) -> Option<T> {
-    match converter {
-        Some(convert) => {
-            let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-            serde_json::from_value(convert(value).await).ok()
-        }
-        None => serde_json::from_str::<T>(raw).ok(),
-    }
-}
-
 /// Does this watch open with a snapshot of the current state, delivered as one
 /// synthetic `ADDED` per object before the live stream?
 ///
@@ -263,105 +245,6 @@ fn opens_with_current_state(send_initial_events: Option<bool>, requested_rv: Opt
         Some(true) => true,
         Some(false) => requested_rv == Some("1"),
         None => matches!(requested_rv, None | Some("") | Some("0") | Some("1")),
-    }
-}
-
-/// Open the live half of a watch: replay from the requested resourceVersion
-/// when there is one, otherwise subscribe from now.
-///
-/// Ported from `watchCache.getAllEventsSinceLocked`
-/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/watch_cache.go:878-913`),
-/// which every watch goes through upstream: a specific resourceVersion is
-/// answered from the event ring, and one below the ring's floor is
-/// `errors.NewResourceExpired("too old resource version: %d (%d)")`. The
-/// `Err` arm is that expiry, already built as the streamed ERROR envelope the
-/// handler must return as-is (see `build_watch_error_response`).
-///
-/// rv=0 and rv=1 mean "list current state" and are never replayed — early
-/// revisions may have been compacted (the `rv=1` divergence is documented on
-/// `opens_with_current_state`). Timestamp-like values far beyond the head are
-/// also not replayed.
-async fn open_watch_stream(
-    state: &ApiServerState,
-    prefix: &str,
-    requested_rv: Option<&str>,
-    scope: &crate::watch_cache::WatchScope,
-) -> Result<std::result::Result<rusternetes_storage::WatchStream, Response>> {
-    // `cacher.Watch` (storage/cacher/cacher.go:513-516) and `etcd3.store.Watch`
-    // (storage/etcd3/store.go:967-970) return `ParseResourceVersion`'s
-    // `InvalidError` untouched, and `Store.WatchPredicate` passes it on
-    // (registry/generic/registry/store.go:1459-1462). Nothing in release-1.35
-    // calls `storage/errors.InterpretWatchError`, so the endpoint renders a
-    // plain error: a 500 with no reason (`Error::aggregate`), as `Get` does.
-    if let Some(rv) = requested_rv {
-        if let Err(errs) = crate::registry::generic::store::parse_resource_version_str(rv) {
-            return Err(Error::aggregate(&errs));
-        }
-    }
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let replay_revision = requested_rv
-        .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
-        .and_then(|rv| rv.parse::<i64>().ok())
-        .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
-
-    let Some(since_rev) = replay_revision else {
-        let rx = state.watch_cache.subscribe_scoped(prefix, scope).await;
-        return Ok(Ok(crate::watch_cache::broadcast_to_stream(rx)));
-    };
-
-    // A compacted revision is an in-stream ERROR envelope (HTTP 200 +
-    // `{type:"ERROR", object:Status{Code:410, Reason:"Expired"}}`), not an
-    // HTTP 410: by the time `cacher.Watch` can report the failure,
-    // `endpoints/handlers/watch.go::serveWatch` has already written the 200
-    // and chunked headers. Pinned by `watch_event_envelope_test.rs::
-    // watch_envelope_error_carries_status`.
-    if state
-        .storage
-        .is_revision_compacted(since_rev)
-        .await
-        .unwrap_or(false)
-    {
-        warn!(
-            "watch {}: resourceVersion {} is compacted (head {}) — answering 410 Expired",
-            prefix, since_rev, current_rev
-        );
-        return build_watch_error_response(resource_expired_status(since_rev, current_rev))
-            .map(Err);
-    }
-
-    // ALWAYS through the shared per-prefix watch cache, never a per-client
-    // storage watch. Upstream serves every watch from the cacher (ONE storage
-    // watch per resource, fanned out in memory). Per-client
-    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
-    // stall silently under write bursts, blinding one informer at a time with
-    // no error for either side to react to (#1165). The shared cache loop has
-    // supervised reconnect-with-replay, so a backend hiccup heals for every
-    // subscriber at once.
-    match state
-        .watch_cache
-        .subscribe_from_checked_scoped(prefix, since_rev, scope)
-        .await
-    {
-        Ok((history, rx)) => {
-            debug!(
-                "Serving watch from cache ring: {} history events since rev {} for prefix {}",
-                history.len(),
-                since_rev,
-                prefix
-            );
-            Ok(Ok(crate::watch_cache::broadcast_to_stream_with_history(
-                history, rx, since_rev,
-            )))
-        }
-        Err(floor) => {
-            // A client-go RetryWatcher stops for good after a 410 and the
-            // caller sees only "watch closed" (#2383): record why we sent it.
-            warn!(
-                "watch {}: resourceVersion {} is below the replay floor {} (head {}) — answering 410 Expired",
-                prefix, since_rev, floor, current_rev
-            );
-            build_watch_error_response(resource_expired_status(since_rev, floor)).map(Err)
-        }
     }
 }
 
@@ -554,6 +437,524 @@ where
     .await
 }
 
+/// An object a watch streams: parsed from the stored JSON, filtered through
+/// the selectors and serialized back with its kind and apiVersion.
+///
+/// Upstream has ONE watch path for every resource: the generic registry's
+/// `Watch` -> `cacher.Watch` -> `serveWatch`
+/// (`staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go`), which
+/// does not care what the object is. Here the object is either a typed
+/// resource ([`TypedWatchObject`]) or raw JSON ([`JsonWatchObject`]).
+trait WatchObject: Serialize + HasMetadata + Send + Sized + 'static {
+    fn from_raw(raw: &str) -> Option<Self>;
+    fn from_value(value: serde_json::Value) -> Option<Self>;
+}
+
+/// A typed resource as a [`WatchObject`].
+struct TypedWatchObject<T>(T);
+
+impl<T: Serialize> Serialize for TypedWatchObject<T> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<T: HasMetadata> HasMetadata for TypedWatchObject<T> {
+    fn metadata(&self) -> &ObjectMeta {
+        self.0.metadata()
+    }
+    fn metadata_mut(&mut self) -> &mut ObjectMeta {
+        self.0.metadata_mut()
+    }
+}
+
+impl<T> WatchObject for TypedWatchObject<T>
+where
+    T: Serialize + DeserializeOwned + Send + 'static + HasMetadata,
+{
+    fn from_raw(raw: &str) -> Option<Self> {
+        serde_json::from_str::<T>(raw).ok().map(Self)
+    }
+    fn from_value(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value::<T>(value).ok().map(Self)
+    }
+}
+
+impl WatchObject for JsonWatchObject {
+    fn from_raw(raw: &str) -> Option<Self> {
+        Self::from_value(serde_json::from_str(raw).ok()?)
+    }
+    fn from_value(value: serde_json::Value) -> Option<Self> {
+        let meta = value
+            .get("metadata")
+            .cloned()
+            .and_then(|m| serde_json::from_value::<ObjectMeta>(m).ok())
+            .unwrap_or_default();
+        Some(Self { value, meta })
+    }
+}
+
+/// Parse a stored object, converting it to the requested version first (CRD
+/// version conversion) so selector filtering sees the requested layout.
+async fn parse_watch_object<O: WatchObject>(
+    raw: &str,
+    converter: &Option<WatchObjectConverter>,
+) -> Option<O> {
+    match converter {
+        Some(convert) => {
+            let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+            O::from_value(convert(value).await)
+        }
+        None => O::from_raw(raw),
+    }
+}
+
+/// `authorizer.Authorize` for the watch verb, on the resource (and namespace)
+/// being watched.
+async fn authorize_watch(
+    state: &ApiServerState,
+    auth_ctx: &AuthContext,
+    resource_type: &str,
+    api_group: &str,
+    namespace: Option<&str>,
+) -> Result<()> {
+    let mut attrs = RequestAttributes::new(
+        auth_ctx.user.clone(),
+        "watch",
+        authorized_resource(resource_type, api_group),
+    )
+    .with_api_group(api_group);
+    if let Some(namespace) = namespace {
+        attrs = attrs.with_namespace(namespace);
+    }
+    match state.authorizer.authorize(&attrs).await? {
+        Decision::Allow => Ok(()),
+        Decision::Deny(reason) => Err(Error::Forbidden(reason)),
+    }
+}
+
+/// Everything a watch needs once the request is authorized.
+struct WatchSpec {
+    state: Arc<ApiServerState>,
+    prefix: String,
+    /// What the cache indexes the watcher by (`cacher.Watch`'s name / trigger
+    /// value from the predicate).
+    scope: crate::watch_cache::WatchScope,
+    params: WatchParams,
+    converter: Option<WatchObjectConverter>,
+    kind: String,
+    api_version: String,
+    /// The longest a watch is held open, and the default when the client sets
+    /// no `timeoutSeconds`. Client-go's conformance tests ask for 350-572s, so
+    /// a cap below that closes the watch under the client.
+    timeout_cap: u64,
+}
+
+/// A watcher registered with the cache, before its initial events are known.
+struct OpenedWatch {
+    /// Ring events newer than the requested resourceVersion.
+    history: Vec<crate::watch_cache::CachedWatchEvent>,
+    rx: crate::cache_watcher::WatchReceiver,
+    /// The requested resourceVersion when one is replayed, else 0.
+    since_revision: i64,
+}
+
+/// Selector filtering and event encoding for one watch: the part of
+/// `cacheWatcher.convertToWatchEvent` (`cache_watcher.go:374-395`) that turns
+/// a change moving an object into the selector into `ADDED` and out of it into
+/// `DELETED`.
+struct WatchEncoder {
+    label_selector: Option<String>,
+    field_selector: Option<String>,
+    converter: Option<WatchObjectConverter>,
+    kind: String,
+    api_version: String,
+    /// Names currently outside the selector, so a later MODIFIED that moves
+    /// one in surfaces as ADDED.
+    excluded: std::collections::HashSet<String>,
+}
+
+impl WatchEncoder {
+    /// The line for one storage event; `None` when the selector drops it.
+    async fn encode<O: WatchObject>(&mut self, event: WatchEvent) -> Option<String> {
+        let (event_type, object) = match event {
+            WatchEvent::Added(_, raw) => {
+                let object = parse_watch_object::<O>(&raw, &self.converter).await?;
+                if !watch_added_matches(
+                    &object,
+                    &self.label_selector,
+                    &self.field_selector,
+                    &mut self.excluded,
+                ) {
+                    return None;
+                }
+                (WatchEventType::Added, object)
+            }
+            WatchEvent::Modified(_, raw) => {
+                let object = parse_watch_object::<O>(&raw, &self.converter).await?;
+                let event_type = watch_modified_event_type(
+                    &object,
+                    &self.label_selector,
+                    &self.field_selector,
+                    &mut self.excluded,
+                )?;
+                (event_type, object)
+            }
+            WatchEvent::Deleted(key, prev) => {
+                // A delete must reach the client with the full object. The
+                // previous value can be empty after compaction or not fit the
+                // typed struct; the delete is still delivered, best effort.
+                let Some(object) = parse_watch_object::<O>(&prev, &self.converter).await else {
+                    debug!(
+                        "watch: object of DELETE {} does not parse, using the raw fallback",
+                        key
+                    );
+                    let json = build_delete_fallback_json(
+                        &key,
+                        &prev,
+                        Some((&self.kind, &self.api_version)),
+                    )?;
+                    return Some(format!("{}\n", json));
+                };
+                // A deletion reaches only watchers whose selector held the
+                // object; the object is gone, so forget its exclusion.
+                if !matches_label_selector(object.metadata(), &self.label_selector)
+                    || !matches_field_selector(&object, &self.field_selector)
+                {
+                    return None;
+                }
+                self.excluded.remove(&object.metadata().name);
+                (WatchEventType::Deleted, object)
+            }
+        };
+        let event = K8sWatchEvent { event_type, object };
+        typed_event_json(&event, &self.kind, &self.api_version)
+            .ok()
+            .map(|json| format!("{}\n", json))
+    }
+
+    /// A BOOKMARK line (`watch.Bookmark`): kind, apiVersion and a
+    /// resourceVersion, plus the `k8s.io/initial-events-end` annotation on the
+    /// one that ends a watch-list's initial events
+    /// (`storage.AnnotateInitialEventsEndBookmark`).
+    fn bookmark(&self, revision: i64, initial_events_end: bool) -> Option<String> {
+        let annotations = initial_events_end.then(|| {
+            std::collections::HashMap::from([(
+                "k8s.io/initial-events-end".to_string(),
+                "true".to_string(),
+            )])
+        });
+        let event = K8sWatchEvent {
+            event_type: WatchEventType::Bookmark,
+            object: BookmarkObject {
+                kind: Some(self.kind.clone()),
+                api_version: Some(self.api_version.clone()),
+                metadata: ObjectMeta {
+                    resource_version: Some(revision.to_string()),
+                    annotations,
+                    ..Default::default()
+                },
+            },
+        };
+        serde_json::to_string(&event)
+            .ok()
+            .map(|json| format!("{}\n", json))
+    }
+}
+
+/// Register the watcher with the cache and, for a resourceVersion, collect the
+/// events to replay (`cacher.Watch` + `getAllEventsSinceLocked`).
+///
+/// A specific resourceVersion is answered from the event ring, and one below
+/// the ring's floor is `errors.NewResourceExpired("too old resource version:
+/// %d (%d)")`; that `Err` is already built as the streamed ERROR envelope the
+/// handler returns as-is (see `build_watch_error_response`).
+///
+/// rv=0 and rv=1 mean "list current state" and are never replayed — early
+/// revisions may have been compacted (the `rv=1` divergence is documented on
+/// `opens_with_current_state`). Timestamp-like values far beyond the head are
+/// also not replayed.
+async fn open_watch(
+    state: &ApiServerState,
+    prefix: &str,
+    requested_rv: Option<&str>,
+    scope: &crate::watch_cache::WatchScope,
+) -> Result<std::result::Result<OpenedWatch, Response>> {
+    // `cacher.Watch` (storage/cacher/cacher.go:513-516) and `etcd3.store.Watch`
+    // (storage/etcd3/store.go:967-970) return `ParseResourceVersion`'s
+    // `InvalidError` untouched, and `Store.WatchPredicate` passes it on
+    // (registry/generic/registry/store.go:1459-1462). Nothing in release-1.35
+    // calls `storage/errors.InterpretWatchError`, so the endpoint renders a
+    // plain error: a 500 with no reason (`Error::aggregate`), as `Get` does.
+    if let Some(rv) = requested_rv {
+        if let Err(errs) = crate::registry::generic::store::parse_resource_version_str(rv) {
+            return Err(Error::aggregate(&errs));
+        }
+    }
+    let current_rev = state.storage.current_revision().await.unwrap_or(1);
+    let replay_revision = requested_rv
+        .filter(|rv| !rv.is_empty() && *rv != "0" && *rv != "1")
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
+
+    let Some(since_rev) = replay_revision else {
+        let rx = state.watch_cache.subscribe_scoped(prefix, scope).await;
+        return Ok(Ok(OpenedWatch {
+            history: Vec::new(),
+            rx,
+            since_revision: 0,
+        }));
+    };
+
+    // A compacted revision is an in-stream ERROR envelope (HTTP 200 +
+    // `{type:"ERROR", object:Status{Code:410, Reason:"Expired"}}`), not an
+    // HTTP 410: by the time `cacher.Watch` can report the failure,
+    // `endpoints/handlers/watch.go::serveWatch` has already written the 200
+    // and chunked headers. Pinned by `watch_event_envelope_test.rs::
+    // watch_envelope_error_carries_status`.
+    if state
+        .storage
+        .is_revision_compacted(since_rev)
+        .await
+        .unwrap_or(false)
+    {
+        warn!(
+            "watch {}: resourceVersion {} is compacted (head {}) — answering 410 Expired",
+            prefix, since_rev, current_rev
+        );
+        return build_watch_error_response(resource_expired_status(since_rev, current_rev))
+            .map(Err);
+    }
+
+    // ALWAYS through the shared per-prefix watch cache, never a per-client
+    // storage watch. Upstream serves every watch from the cacher (ONE storage
+    // watch per resource, fanned out in memory). Per-client
+    // `watch_from_revision` streams to the rhino/SQLite backend proved able to
+    // stall silently under write bursts, blinding one informer at a time with
+    // no error for either side to react to (#1165). The shared cache loop has
+    // supervised reconnect-with-replay, so a backend hiccup heals for every
+    // subscriber at once.
+    match state
+        .watch_cache
+        .subscribe_from_checked_scoped(prefix, since_rev, scope)
+        .await
+    {
+        Ok((history, rx)) => {
+            debug!(
+                "Serving watch from cache ring: {} history events since rev {} for prefix {}",
+                history.len(),
+                since_rev,
+                prefix
+            );
+            Ok(Ok(OpenedWatch {
+                history,
+                rx,
+                since_revision: since_rev,
+            }))
+        }
+        Err(floor) => {
+            // A client-go RetryWatcher stops for good after a 410 and the
+            // caller sees only "watch closed" (#2383): record why we sent it.
+            warn!(
+                "watch {}: resourceVersion {} is below the replay floor {} (head {}) — answering 410 Expired",
+                prefix, since_rev, floor, current_rev
+            );
+            build_watch_error_response(resource_expired_status(since_rev, floor)).map(Err)
+        }
+    }
+}
+
+/// The one watch path. Ported from `cacher.Watch`
+/// (`storage/cacher/cacher.go:513-663`) and `serveWatch`
+/// (`endpoints/handlers/watch.go`):
+///
+/// * the watcher registers with the cache (`allowWatchBookmarks`, deadline),
+/// * the initial state is read after registering and handed to the cache
+///   watcher as its replayed interval, cut at the snapshot's revision
+///   (`cacheInterval`, `cacheWatcher.process`),
+/// * a watch-list request gets the `k8s.io/initial-events-end` bookmark after
+///   it (`setInitialEventsEndBookmarkIfRequested`),
+/// * every later bookmark is produced by the cache (`timeBucketWatchers`,
+///   `nextBookmarkTime`), not by the handler,
+/// * the handler only encodes what the watcher delivers.
+async fn serve_watch<O: WatchObject>(spec: WatchSpec) -> Result<Response> {
+    let WatchSpec {
+        state,
+        prefix,
+        mut scope,
+        params,
+        converter,
+        kind,
+        api_version,
+        timeout_cap,
+    } = spec;
+    let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
+    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
+    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
+    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
+    // depend on `allowWatchBookmarks`.
+    let send_initial_events = params.send_initial_events;
+    let watchlist = send_initial_events == Some(true);
+    let timeout_duration = Duration::from_secs(
+        params
+            .timeout_seconds
+            .unwrap_or(timeout_cap)
+            .min(timeout_cap),
+    );
+    let requested_rv = params.resource_version.clone();
+
+    scope.options = crate::cache_watcher::WatcherOptions {
+        allow_watch_bookmarks: allow_bookmarks || watchlist,
+        deadline: Some(std::time::Instant::now() + timeout_duration),
+        bookmark_after_resource_version: 0,
+    };
+    let OpenedWatch {
+        mut history,
+        rx,
+        mut since_revision,
+    } = match open_watch(&state, &prefix, requested_rv.as_deref(), &scope).await? {
+        Ok(opened) => opened,
+        Err(expired) => return Ok(expired),
+    };
+
+    let current_rev = state.storage.current_revision().await.unwrap_or(1);
+    let should_send_initial =
+        opens_with_current_state(send_initial_events, requested_rv.as_deref());
+    let mut first_bookmark = None;
+    if should_send_initial {
+        // Read after registering, so a write in the gap is on the live queue
+        // as well as in the snapshot; the cutoff drops the second copy (#2038,
+        // `skip_events_covered_by_snapshot`). Objects that do not parse are
+        // skipped when encoded: upstream skips bad objects and keeps
+        // streaming the valid ones.
+        let (snapshot, cutoff) = watch_snapshot(&state, &prefix).await?;
+        let cutoff = cutoff.map(|c| c as i64);
+        let snapshot_empty = snapshot.is_empty();
+        let mut initial: Vec<crate::watch_cache::CachedWatchEvent> =
+            Vec::with_capacity(snapshot.len() + history.len());
+        for object in &snapshot {
+            let Ok(raw) = serde_json::to_string(object) else {
+                continue;
+            };
+            let name = object
+                .pointer("/metadata/name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            let revision = json_resource_version(object)
+                .and_then(|rv| rv.parse::<i64>().ok())
+                .unwrap_or(0);
+            initial.push(crate::watch_cache::CachedWatchEvent {
+                event: crate::watch_cache::WatchEventData::Added(
+                    format!("{}{}", prefix, name),
+                    Arc::new(raw),
+                ),
+                revision,
+                recorded: std::time::Instant::now(),
+            });
+        }
+        let listed_max = initial.iter().map(|e| e.revision).max().unwrap_or(0);
+        let cutoff = cutoff.unwrap_or(listed_max);
+        // Ring events newer than the snapshot still follow it.
+        history.retain(|e| e.revision > cutoff);
+        initial.append(&mut history);
+        history = initial;
+        since_revision = cutoff;
+
+        if watchlist && allow_bookmarks {
+            first_bookmark = Some(crate::cache_watcher::FirstBookmark {
+                revision: if cutoff > 0 { cutoff } else { current_rev },
+                initial_events_end: true,
+            });
+        } else if allow_bookmarks && snapshot_empty {
+            first_bookmark = Some(crate::cache_watcher::FirstBookmark {
+                revision: if cutoff > 0 { cutoff } else { current_rev },
+                initial_events_end: false,
+            });
+        }
+    } else {
+        signal_watch_initialized();
+        // An immediate bookmark so the client sees data right away and does
+        // not time out waiting for the first HTTP/2 DATA frame. ONLY when
+        // allowWatchBookmarks is true — clients that did not ask treat a
+        // bookmark as an unexpected event.
+        if allow_bookmarks {
+            let revision = requested_rv
+                .as_deref()
+                .and_then(|rv| rv.parse::<i64>().ok())
+                .filter(|rv| *rv > 1)
+                .unwrap_or(current_rev);
+            first_bookmark = Some(crate::cache_watcher::FirstBookmark {
+                revision,
+                initial_events_end: false,
+            });
+        }
+    }
+
+    let mut items = crate::cache_watcher::process_with(history, first_bookmark, rx, since_revision);
+    let mut encoder = WatchEncoder {
+        label_selector: params.label_selector.clone(),
+        field_selector: params.field_selector.clone(),
+        converter,
+        kind,
+        api_version,
+        excluded: std::collections::HashSet::new(),
+    };
+    // The selector bookkeeping starts from the initial events, which pass
+    // through `encode` like any other.
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+    let stream = async_stream::stream! {
+        loop {
+            let item = match tokio::time::timeout_at(deadline, items.recv()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    info!("Watch stream timeout after {:?}", timeout_duration);
+                    break;
+                }
+            };
+            match item {
+                Some(crate::cache_watcher::WatchItem::Event(event)) => {
+                    if let Some(line) = encoder.encode::<O>(event).await {
+                        yield Ok::<String, std::io::Error>(line);
+                    }
+                }
+                Some(crate::cache_watcher::WatchItem::Bookmark {
+                    revision,
+                    initial_events_end,
+                }) => {
+                    if let Some(line) = encoder.bookmark(revision, initial_events_end) {
+                        yield Ok(line);
+                    }
+                }
+                None => {
+                    // The cache terminated this watcher (too slow). NEVER
+                    // splice a fresh subscription in silently: every event
+                    // committed in between would be dropped, leaving the
+                    // client's informer permanently stale (KCM endpointslice
+                    // tracker wedge, #1165). Upstream ends the watch; the
+                    // client relists with a fresh resourceVersion. Send 410 so
+                    // reflectors relist immediately.
+                    warn!("watch stream ended for a subscriber — sending 410 so the client relists");
+                    yield Ok(watch_lagged_error_line("watch stream ended; please relist"));
+                    break;
+                }
+            }
+        }
+    };
+
+    // Note: do NOT set a Connection header — it is prohibited in HTTP/2 and
+    // can make client-go drop watch connections.
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-cache, private")
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .body(Body::from_stream(stream))
+        .map_err(|e| Error::Internal(format!("Failed to build response: {}", e)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn watch_namespaced_inner<T>(
     state: Arc<ApiServerState>,
@@ -575,504 +976,31 @@ where
         params.timeout_seconds,
         params.allow_watch_bookmarks.unwrap_or(false)
     );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user.clone(),
-        "watch",
-        authorized_resource(resource_type, api_group),
-    )
-    .with_namespace(&namespace)
-    .with_api_group(api_group);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(Error::Forbidden(reason));
-        }
-    }
-
-    // Create watch stream via the shared watch cache (one etcd watch per prefix)
-    let prefix = build_prefix(resource_type, Some(&namespace));
-
-    // Extract parameters
-    let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
-    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
-    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
-    // depend on `allowWatchBookmarks`.
-    let send_initial_events = params.send_initial_events;
-    let watchlist = send_initial_events == Some(true);
-    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
-    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
-    // request 350-572s timeouts. Capping below the client's request causes
-    // "context canceled" errors when the server closes the watch early.
-    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
-    let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(600).min(600),
-    ));
-    let label_selector = params.label_selector.clone();
-    let field_selector = params.field_selector.clone();
-    let requested_rv = params.resource_version.clone();
-    let (bookmark_kind, bookmark_api_version) =
-        bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
-
-    let watch_stream = match open_watch_stream(
+    authorize_watch(
         &state,
-        &prefix,
-        requested_rv.as_deref(),
-        &crate::watch_cache::WatchScope::new(
+        &auth_ctx,
+        resource_type,
+        api_group,
+        Some(&namespace),
+    )
+    .await?;
+    let (kind, api_version) =
+        bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
+    serve_watch::<TypedWatchObject<T>>(WatchSpec {
+        prefix: build_prefix(resource_type, Some(&namespace)),
+        scope: crate::watch_cache::WatchScope::new(
             api_group,
             resource_type,
             params.field_selector.as_deref(),
         ),
-    )
-    .await?
-    {
-        Ok(stream) => stream,
-        Err(expired) => return Ok(expired),
-    };
-
-    // List existing resources to send as initial ADDED events.
-    // List as raw JSON Values first so that one undeserializable stored
-    // object (e.g. a Deployment missing `spec`) does not abort the entire
-    // watch with HTTP 400. Upstream Kubernetes skips bad objects and
-    // continues streaming valid ones.
-    let (raw_existing, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
-    // Convert each stored object to the requested version before it becomes an
-    // initial ADDED event, so field-selector filtering sees the requested-version
-    // layout (mirrors the LIST path). No-op when `converter` is None.
-    let raw_existing: Vec<serde_json::Value> = if let Some(ref convert) = converter {
-        let mut converted = Vec::with_capacity(raw_existing.len());
-        for v in raw_existing {
-            converted.push(convert(v).await);
-        }
-        converted
-    } else {
-        raw_existing
-    };
-    let existing_resources: Vec<T> = raw_existing
-        .into_iter()
-        .filter_map(|v| match serde_json::from_value::<T>(v) {
-            Ok(obj) => Some(obj),
-            Err(e) => {
-                debug!(
-                    "watch initial-events: skipping undeserializable object in prefix={}: {}",
-                    prefix, e
-                );
-                None
-            }
-        })
-        .collect();
-
-    // Get the current revision from storage for bookmark fallback.
-    // This prevents sending bookmark RV "0" which confuses client-go.
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let current_rev_str = current_rev.to_string();
-
-    // Create channel for sending events to client.
-    // Buffer must be large enough to hold initial events + bookmarks without
-    // blocking the pre-buffer loop (which uses try_send). 256 is enough for
-    // most namespaces while keeping memory usage reasonable. Real events in
-    // the background task use send().await to guarantee delivery.
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
-
-    // Determine whether to send initial ADDED events. A specific
-    // resourceVersion (> 1) is served by the replay above instead.
-    let should_send_initial =
-        opens_with_current_state(send_initial_events, requested_rv.as_deref());
-    // Cut the live stream at the snapshot (#2038): see
-    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
-    let watch_stream = if should_send_initial {
-        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
-    } else {
-        watch_stream
-    };
-
-    // PRE-BUFFER initial events BEFORE returning the Response.
-    // K8s sends headers + first events synchronously (watch.go:237-282).
-    // If we return Response with empty Body, client-go times out waiting
-    // for first DATA frame → "context canceled" (1777 failures in round 137).
-    // By pre-populating the channel, Hyper has data available immediately
-    // when it first polls the Body stream.
-    let mut initial_latest_rv: Option<String> = None;
-    // Tracks object names that do NOT currently match the label+field selector,
-    // so a later MODIFIED that transitions INTO the selector emits a synthetic
-    // ADDED. Seeded from the initial list, then moved into the watch task.
-    let mut deleted_from_watch: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    if should_send_initial {
-        for object in &existing_resources {
-            if let Some(rv) = object.metadata().resource_version.as_ref() {
-                initial_latest_rv = Some(rv.clone());
-            }
-            if !watch_added_matches(
-                object,
-                &label_selector,
-                &field_selector,
-                &mut deleted_from_watch,
-            ) {
-                continue;
-            }
-            let k8s_event = K8sWatchEvent {
-                event_type: WatchEventType::Added,
-                object: object.clone(),
-            };
-            if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                let _ = tx.try_send(Ok(format!("{}\n", json)));
-            }
-        }
-    }
-
-    // Send initial-events-end bookmark if sendInitialEvents was requested
-    if watchlist && allow_bookmarks {
-        let rv = initial_latest_rv
-            .clone()
-            .unwrap_or_else(|| current_rev_str.clone());
-        let mut annotations = std::collections::HashMap::new();
-        annotations.insert("k8s.io/initial-events-end".to_string(), "true".to_string());
-        let bookmark = BookmarkObject {
-            kind: Some(bookmark_kind.clone()),
-            api_version: Some(bookmark_api_version.clone()),
-            metadata: ObjectMeta {
-                resource_version: Some(rv.clone()),
-                annotations: Some(annotations),
-                ..Default::default()
-            },
-        };
-        let k8s_event = K8sWatchEvent {
-            event_type: WatchEventType::Bookmark,
-            object: bookmark,
-        };
-        if let Ok(json) = serde_json::to_string(&k8s_event) {
-            let _ = tx.try_send(Ok(format!("{}\n", json)));
-        }
-    }
-
-    // If no initial events were sent, send an immediate bookmark so the
-    // client sees data right away and doesn't timeout waiting for the
-    // first HTTP/2 DATA frame.
-    // ONLY send when allowWatchBookmarks is true — clients that don't
-    // request bookmarks treat them as unexpected events and fail.
-    if (!should_send_initial || existing_resources.is_empty()) && allow_bookmarks {
-        let rv = initial_latest_rv
-            .clone()
-            .or_else(|| requested_rv.clone())
-            .unwrap_or_else(|| current_rev_str.clone());
-        let bookmark = BookmarkObject {
-            kind: Some(bookmark_kind.clone()),
-            api_version: Some(bookmark_api_version.clone()),
-            metadata: ObjectMeta {
-                resource_version: Some(rv),
-                ..Default::default()
-            },
-        };
-        let k8s_event = K8sWatchEvent {
-            event_type: WatchEventType::Bookmark,
-            object: bookmark,
-        };
-        if let Ok(json) = serde_json::to_string(&k8s_event) {
-            let _ = tx.try_send(Ok(format!("{}\n", json)));
-        }
-    }
-
-    // Spawn background task for ongoing watch events (etcd watch stream).
-    // Initial events are already in the channel — this task handles
-    // subsequent ADDED/MODIFIED/DELETED events and periodic bookmarks.
-    tokio::spawn(async move {
-        // Initial events already sent to channel before spawn.
-        // Track the latest resourceVersion for bookmarks.
-        let mut latest_resource_version: Option<String> = {
-            let base_rv = initial_latest_rv.or_else(|| {
-                requested_rv
-                    .as_deref()
-                    .and_then(|rv| rv.parse::<i64>().ok())
-                    .map(|rv| rv.to_string())
-            });
-            match base_rv {
-                Some(rv) => {
-                    if let Ok(rv_i64) = rv.parse::<i64>() {
-                        Some(rv_i64.max(current_rev).to_string())
-                    } else {
-                        Some(current_rev.to_string())
-                    }
-                }
-                None => Some(current_rev.to_string()),
-            }
-        };
-
-        // Initial events and bookmarks already pre-buffered.
-        {}
-
-        // Always send periodic bookmarks as keep-alive to prevent the K8s client
-        // from closing the watch connection due to inactivity
-        // K8s flushes after every event when the channel buffer is empty
-        // (watch.go:275). More frequent bookmarks act as keepalives that
-        // prevent client-go from timing out on idle connections.
-        let mut bookmark_interval = Some(interval(Duration::from_secs(1)));
-
-        // Box-pin the watch stream so it can be replaced on reconnect
-        let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
-        > = Box::pin(watch_stream);
-
-        // Watch loop with timeout support
-        let watch_future = async {
-            loop {
-                tokio::select! {
-                    // Process watch events
-                    event_opt = watch_stream.next() => {
-                        match event_opt {
-                            Some(Ok(WatchEvent::Added(key, value))) => {
-                                debug!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Apply label+field selectors; track exclusions so a
-                                    // later transition INTO the selector emits ADDED.
-                                    if !watch_added_matches(
-                                        &object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut deleted_from_watch,
-                                    ) {
-                                        continue;
-                                    }
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type: WatchEventType::Added,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        // Use send().await to guarantee delivery. With
-                                        // rhino/SQLite the poll loop has up to 1s latency,
-                                        // so events can arrive in bursts. try_send() would
-                                        // drop events when the channel is temporarily full
-                                        // (e.g. HTTP/2 back-pressure), permanently losing
-                                        // watch notifications. send() waits for channel
-                                        // space or returns Err if the receiver is dropped.
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(WatchEvent::Modified(key, value))) => {
-                                debug!("Watch MODIFIED event for key={}", key);
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Determine the ADDED/MODIFIED/DELETED transition under
-                                    // the combined label+field selector. None = suppress (still
-                                    // unmatched and already excluded). A field that changes INTO
-                                    // the selector yields ADDED, out of it yields DELETED.
-                                    let event_type = match watch_modified_event_type(
-                                        &object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut deleted_from_watch,
-                                    ) {
-                                        Some(et) => et,
-                                        None => continue,
-                                    };
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(WatchEvent::Deleted(key, prev_value))) => {
-                                debug!("Watch event - Deleted: {}", key);
-                                // For DELETE events, Kubernetes requires the full object with metadata.
-                                // Try typed deserialization first; fall back to raw JSON if it fails.
-                                // prev_kv can be empty after etcd compaction or when the storage
-                                // backend doesn't capture the previous value. Silently dropping
-                                // the DELETE event causes watchers to hang (conformance #4).
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&prev_value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Filter DELETED events by both label and field selector.
-                                    // Only send DELETED to watchers whose selector matches the
-                                    // deleted object — otherwise watchers receive spurious deletes
-                                    // for objects they never saw as ADDED.
-                                    if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(&object, &field_selector)
-                                    {
-                                        continue;
-                                    }
-
-                                    // Remove from deleted_from_watch tracking since the object
-                                    // is truly gone now
-                                    let obj_key = object.metadata().name.clone();
-                                    deleted_from_watch.remove(&obj_key);
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type: WatchEventType::Deleted,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    // Typed deserialization failed — use raw JSON fallback.
-                                    debug!("Watch: typed deser failed for DELETE key={}, using raw fallback", key);
-                                    if let Some(rv) = extract_rv_from_json(&prev_value) {
-                                        latest_resource_version = Some(rv);
-                                    }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, Some((&bookmark_kind, &bookmark_api_version))) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                if matches!(e, Error::Gone(_)) {
-                                    // Lag termination from the watch cache: events were
-                                    // dropped for this subscriber. Tell the client to
-                                    // relist (410 ERROR event) and END the stream — do
-                                    // NOT resubscribe, the drop would be silently lost.
-                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
-                                    break;
-                                }
-                                // Empty watch responses and transient errors are normal —
-                                // etcd sends keep-alive responses with no events. Don't break.
-                                debug!("Watch stream transient error (continuing): {}", e);
-                                continue;
-                            }
-                            None => {
-                                // Watch stream ended. NEVER splice a fresh
-                                // subscription in silently: every event
-                                // committed between the old stream's end and
-                                // the new subscribe would be dropped, leaving
-                                // the client's informer permanently stale
-                                // (KCM endpointslice tracker wedge, #1165).
-                                // Upstream ends the watch; the client relists
-                                // with a fresh resourceVersion. Send 410 so
-                                // reflectors relist immediately.
-                                warn!("watch stream ended for a subscriber — sending 410 so the client relists");
-                                let _ = tx.send(Ok(watch_lagged_error_line(
-                                    "watch stream ended; please relist",
-                                ))).await;
-                                break;
-                            }
-                        }
-                    }
-                    // Send periodic bookmarks if enabled
-                    _ = async {
-                        if let Some(ref mut interval) = bookmark_interval {
-                            interval.tick().await;
-                        } else {
-                            // If bookmarks are disabled, park this branch forever
-                            futures::future::pending::<()>().await
-                        }
-                    } => {
-                        if allow_bookmarks || watchlist {
-                            if let Some(ref rv) = latest_resource_version {
-                                debug!("Sending bookmark with resourceVersion: {}", rv);
-                                let bookmark = BookmarkObject {
-                                    kind: Some(bookmark_kind.clone()),
-                                    api_version: Some(bookmark_api_version.clone()),
-                                    metadata: ObjectMeta {
-                                        resource_version: Some(rv.clone()),
-                                        ..Default::default()
-                                    },
-                                };
-                                let k8s_event = K8sWatchEvent {
-                                    event_type: WatchEventType::Bookmark,
-                                    object: bookmark,
-                                };
-                                if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                    let _ = tx.try_send(Ok(format!("{}\n", json)));
-                                    // Don't break on bookmark send failure — the client
-                                    // might have reset just the bookmark stream but the
-                                    // watch connection is still alive.
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        // Apply timeout if specified
-        if let Some(timeout_dur) = timeout_duration {
-            match timeout(timeout_dur, watch_future).await {
-                Ok(_) => {
-                    debug!("Watch stream completed normally");
-                }
-                Err(_) => {
-                    info!("Watch stream timeout after {:?}", timeout_dur);
-                    // Send final bookmark before closing if bookmarks are enabled
-                    if allow_bookmarks || watchlist {
-                        if let Some(ref rv) = latest_resource_version {
-                            let bookmark = BookmarkObject {
-                                kind: Some(bookmark_kind.clone()),
-                                api_version: Some(bookmark_api_version.clone()),
-                                metadata: ObjectMeta {
-                                    resource_version: Some(rv.clone()),
-                                    ..Default::default()
-                                },
-                            };
-                            let k8s_event = K8sWatchEvent {
-                                event_type: WatchEventType::Bookmark,
-                                object: bookmark,
-                            };
-                            if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                let _ = tx.try_send(Ok(format!("{}\n", json)));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // No timeout, run forever
-            watch_future.await;
-        }
-    });
-
-    // Convert receiver to stream
-    let stream = ReceiverStream::new(rx);
-
-    // Build response with proper headers for streaming.
-    // Note: Do NOT set Connection header — it's prohibited in HTTP/2
-    // and can cause client-go to drop watch connections.
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-cache, private")
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .body(Body::from_stream(stream))
-        .map_err(|e| Error::Internal(format!("Failed to build response: {}", e)))?;
-
-    Ok(response)
+        state,
+        params,
+        converter,
+        kind,
+        api_version,
+        timeout_cap: 600,
+    })
+    .await
 }
 
 /// Generic watch handler for cluster-scoped resources.
@@ -1146,502 +1074,24 @@ where
         params.timeout_seconds,
         params.allow_watch_bookmarks.unwrap_or(false)
     );
-    info!(
-        "  Watch params: rv={:?}, sendInitialEvents={:?}, labelSelector={:?}",
-        params.resource_version, params.send_initial_events, params.label_selector
-    );
-
-    // Check authorization
-    let attrs = RequestAttributes::new(
-        auth_ctx.user.clone(),
-        "watch",
-        authorized_resource(resource_type, api_group),
-    )
-    .with_api_group(api_group);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(Error::Forbidden(reason));
-        }
-    }
-
-    // Create watch stream via the shared watch cache
-    let prefix = build_prefix(resource_type, None);
-
-    // Extract parameters
-    let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
-    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
-    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
-    // depend on `allowWatchBookmarks`.
-    let send_initial_events = params.send_initial_events;
-    let watchlist = send_initial_events == Some(true);
-    // Watch timeout: honor client-requested timeout, capped at 10 minutes.
-    // K8s default --min-request-timeout is 1800s (30 min). Conformance tests
-    // request 350-572s timeouts. Capping below the client's request causes
-    // "context canceled" errors when the server closes the watch early.
-    // K8s ref: staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go
-    let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(600).min(600),
-    ));
-    let label_selector = params.label_selector.clone();
-    let field_selector = params.field_selector.clone();
-    let requested_rv = params.resource_version.clone();
-    let (bookmark_kind, bookmark_api_version) =
+    authorize_watch(&state, &auth_ctx, resource_type, api_group, None).await?;
+    let (kind, api_version) =
         bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
-
-    let watch_stream = match open_watch_stream(
-        &state,
-        &prefix,
-        requested_rv.as_deref(),
-        &crate::watch_cache::WatchScope::new(
+    serve_watch::<TypedWatchObject<T>>(WatchSpec {
+        prefix: build_prefix(resource_type, None),
+        scope: crate::watch_cache::WatchScope::new(
             api_group,
             resource_type,
             params.field_selector.as_deref(),
         ),
-    )
-    .await?
-    {
-        Ok(stream) => stream,
-        Err(expired) => return Ok(expired),
-    };
-
-    // List existing resources to send as initial ADDED events.
-    // List as raw JSON Values first so that one undeserializable stored
-    // object (e.g. a Deployment missing `spec`) does not abort the entire
-    // watch with HTTP 400. Upstream Kubernetes skips bad objects and
-    // continues streaming valid ones.
-    let (raw_existing, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
-    // Convert each stored object to the requested version before it becomes an
-    // initial ADDED event, so field-selector filtering sees the requested-version
-    // layout (mirrors the LIST path). No-op when `converter` is None.
-    let raw_existing: Vec<serde_json::Value> = if let Some(ref convert) = converter {
-        let mut converted = Vec::with_capacity(raw_existing.len());
-        for v in raw_existing {
-            converted.push(convert(v).await);
-        }
-        converted
-    } else {
-        raw_existing
-    };
-    let existing_resources: Vec<T> = raw_existing
-        .into_iter()
-        .filter_map(|v| match serde_json::from_value::<T>(v) {
-            Ok(obj) => Some(obj),
-            Err(e) => {
-                debug!(
-                    "watch initial-events: skipping undeserializable object in prefix={}: {}",
-                    prefix, e
-                );
-                None
-            }
-        })
-        .collect();
-
-    // Get the current revision from storage for bookmark fallback.
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let current_rev_str = current_rev.to_string();
-
-    // Create channel for sending events to client.
-    // Buffer must be large enough to hold initial events without blocking
-    // the spawned task. The task uses send().await for real events to
-    // guarantee delivery under HTTP/2 back-pressure.
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
-
-    // Determine whether to send initial ADDED events. A specific
-    // resourceVersion (> 1) is served by the replay above instead.
-    let should_send_initial =
-        opens_with_current_state(send_initial_events, requested_rv.as_deref());
-    // Cut the live stream at the snapshot (#2038): see
-    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
-    let watch_stream = if should_send_initial {
-        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
-    } else {
-        watch_stream
-    };
-
-    // Spawn task to convert watch events to HTTP response
-    tokio::spawn(async move {
-        // Track the latest resourceVersion for bookmarks.
-        // Initialize to MAX of current revision and requested RV so bookmarks
-        // never report a lower RV than what the client already knows.
-        let mut latest_resource_version: Option<String> = {
-            let rv = requested_rv
-                .as_deref()
-                .and_then(|rv| rv.parse::<i64>().ok())
-                .unwrap_or(0)
-                .max(current_rev);
-            Some(rv.to_string())
-        };
-
-        // Tracks object names that do NOT currently match the label+field
-        // selector, so a later MODIFIED that transitions INTO the selector emits
-        // a synthetic ADDED. Seeded from the initial list.
-        let mut deleted_from_watch: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        // Send initial state as ADDED events (only when appropriate)
-        if should_send_initial {
-            for object in &existing_resources {
-                // Update latest resourceVersion
-                if let Some(rv) = object.metadata().resource_version.as_ref() {
-                    latest_resource_version = Some(rv.clone());
-                }
-
-                // Apply label+field selectors; track exclusions for transitions.
-                if !watch_added_matches(
-                    object,
-                    &label_selector,
-                    &field_selector,
-                    &mut deleted_from_watch,
-                ) {
-                    continue;
-                }
-
-                let k8s_event = K8sWatchEvent {
-                    event_type: WatchEventType::Added,
-                    object,
-                };
-                if let Ok(json) =
-                    typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version)
-                {
-                    // Use send().await to guarantee delivery. try_send() caused
-                    // initial events to be silently dropped when the channel was
-                    // full (before Hyper starts draining), which then caused the
-                    // task to exit and all subsequent events to be lost.
-                    if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                        return; // Client disconnected
-                    }
-                }
-            }
-        } // end should_send_initial
-
-        // If no initial events were sent and client supports bookmarks,
-        // send an immediate bookmark so the client sees data right away.
-        // Only send when allow_bookmarks is true — clients that don't
-        // request bookmarks treat them as unexpected events and fail.
-        if (!should_send_initial || existing_resources.is_empty()) && allow_bookmarks {
-            let rv = latest_resource_version
-                .clone()
-                .or_else(|| requested_rv.clone())
-                .unwrap_or_else(|| current_rev_str.clone());
-            let bookmark = BookmarkObject {
-                kind: Some(bookmark_kind.clone()),
-                api_version: Some(bookmark_api_version.clone()),
-                metadata: ObjectMeta {
-                    resource_version: Some(rv),
-                    ..Default::default()
-                },
-            };
-            let k8s_event = K8sWatchEvent {
-                event_type: WatchEventType::Bookmark,
-                object: bookmark,
-            };
-            if let Ok(json) = serde_json::to_string(&k8s_event) {
-                let _ = tx.try_send(Ok(format!("{}\n", json)));
-            }
-        }
-
-        // When sendInitialEvents=true, send an initial BOOKMARK after the ADDED
-        // events to signal "initial list is complete". The bookmark must have the
-        // annotation "k8s.io/initial-events-end": "true" — client-go checks for
-        // this specific annotation to know initial sync is done.
-        if watchlist && allow_bookmarks {
-            // MUST send initial-events-end bookmark — client hangs without it.
-            // Use latest resourceVersion from initial resources, or "0" as fallback.
-            let rv = latest_resource_version
-                .clone()
-                .unwrap_or_else(|| "1".to_string());
-            let mut annotations = std::collections::HashMap::new();
-            annotations.insert("k8s.io/initial-events-end".to_string(), "true".to_string());
-            let bookmark = BookmarkObject {
-                kind: Some(bookmark_kind.clone()),
-                api_version: Some(bookmark_api_version.clone()),
-                metadata: ObjectMeta {
-                    resource_version: Some(rv.clone()),
-                    annotations: Some(annotations),
-                    ..Default::default()
-                },
-            };
-            let k8s_event = K8sWatchEvent {
-                event_type: WatchEventType::Bookmark,
-                object: bookmark,
-            };
-            if let Ok(json) = serde_json::to_string(&k8s_event) {
-                let _ = tx.try_send(Ok(format!("{}\n", json)));
-            }
-            debug!(
-                "Sent initial-events-end bookmark with resourceVersion: {}",
-                rv
-            );
-            // Ensure latest_resource_version is set so periodic bookmarks work
-            if latest_resource_version.is_none() {
-                latest_resource_version = Some(rv);
-            }
-        }
-
-        // Always send periodic bookmarks as keep-alive to prevent the K8s client
-        // from closing the watch connection due to inactivity
-        // K8s flushes after every event when the channel buffer is empty
-        // (watch.go:275). More frequent bookmarks act as keepalives that
-        // prevent client-go from timing out on idle connections.
-        let mut bookmark_interval = Some(interval(Duration::from_secs(1)));
-
-        // Box-pin the watch stream so it can be replaced on reconnect
-        let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
-        > = Box::pin(watch_stream);
-
-        // Watch loop with timeout support
-        let watch_future = async {
-            loop {
-                tokio::select! {
-                    // Process watch events
-                    event_opt = watch_stream.next() => {
-                        match event_opt {
-                            Some(Ok(WatchEvent::Added(key, value))) => {
-                                debug!("Watch ADDED event for key={}, should_send_initial={}", key, should_send_initial);
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Apply label+field selectors; track exclusions so a
-                                    // later transition INTO the selector emits ADDED.
-                                    if !watch_added_matches(
-                                        &object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut deleted_from_watch,
-                                    ) {
-                                        continue;
-                                    }
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type: WatchEventType::Added,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(WatchEvent::Modified(key, value))) => {
-                                debug!("Watch MODIFIED event for key={}", key);
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Determine the ADDED/MODIFIED/DELETED transition under
-                                    // the combined label+field selector. None = suppress (still
-                                    // unmatched and already excluded). A field that changes INTO
-                                    // the selector yields ADDED, out of it yields DELETED.
-                                    let event_type = match watch_modified_event_type(
-                                        &object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut deleted_from_watch,
-                                    ) {
-                                        Some(et) => et,
-                                        None => continue,
-                                    };
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(WatchEvent::Deleted(key, prev_value))) => {
-                                debug!("Watch event - Deleted: {}", key);
-                                // For DELETE events, Kubernetes requires the full object with metadata.
-                                // Try typed deserialization first; fall back to raw JSON if it fails.
-                                // prev_kv can be empty after etcd compaction or when the storage
-                                // backend doesn't capture the previous value. Silently dropping
-                                // the DELETE event causes watchers to hang (conformance #4).
-                                if let Some(object) =
-                                    deserialize_converted::<T>(&prev_value, &converter).await
-                                {
-                                    // Update latest resourceVersion
-                                    if let Some(rv) = object.metadata().resource_version.as_ref() {
-                                        latest_resource_version = Some(rv.clone());
-                                    }
-
-                                    // Filter DELETED events by both label and field selector.
-                                    // Only send DELETED to watchers whose selector matches the
-                                    // deleted object — otherwise watchers receive spurious deletes
-                                    // for objects they never saw as ADDED.
-                                    if !matches_label_selector(object.metadata(), &label_selector)
-                                        || !matches_field_selector(&object, &field_selector)
-                                    {
-                                        continue;
-                                    }
-
-                                    // Remove from deleted_from_watch tracking since the object
-                                    // is truly gone now
-                                    let obj_key = object.metadata().name.clone();
-                                    deleted_from_watch.remove(&obj_key);
-
-                                    let k8s_event = K8sWatchEvent {
-                                        event_type: WatchEventType::Deleted,
-                                        object,
-                                    };
-                                    if let Ok(json) = typed_event_json(&k8s_event, &bookmark_kind, &bookmark_api_version) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    // Typed deserialization failed — use raw JSON fallback.
-                                    debug!("Watch: typed deser failed for DELETE key={}, using raw fallback", key);
-                                    if let Some(rv) = extract_rv_from_json(&prev_value) {
-                                        latest_resource_version = Some(rv);
-                                    }
-                                    if let Some(json) = build_delete_fallback_json(&key, &prev_value, Some((&bookmark_kind, &bookmark_api_version))) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            debug!("Watch: tx.send failed, client disconnected");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                if matches!(e, Error::Gone(_)) {
-                                    // Lag termination from the watch cache: events were
-                                    // dropped for this subscriber. Tell the client to
-                                    // relist (410 ERROR event) and END the stream — do
-                                    // NOT resubscribe, the drop would be silently lost.
-                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
-                                    break;
-                                }
-                                // Empty watch responses and transient errors are normal —
-                                // etcd sends keep-alive responses with no events. Don't break.
-                                debug!("Watch stream transient error (continuing): {}", e);
-                                continue;
-                            }
-                            None => {
-                                // Watch stream ended. NEVER splice a fresh
-                                // subscription in silently: every event
-                                // committed between the old stream's end and
-                                // the new subscribe would be dropped, leaving
-                                // the client's informer permanently stale
-                                // (KCM endpointslice tracker wedge, #1165).
-                                // Upstream ends the watch; the client relists
-                                // with a fresh resourceVersion. Send 410 so
-                                // reflectors relist immediately.
-                                let _ = tx.send(Ok(watch_lagged_error_line(
-                                    "watch stream ended; please relist",
-                                ))).await;
-                                break;
-                            }
-                        }
-                    }
-                    // Send periodic bookmarks if enabled
-                    _ = async {
-                        if let Some(ref mut interval) = bookmark_interval {
-                            interval.tick().await;
-                        } else {
-                            // If bookmarks are disabled, park this branch forever
-                            futures::future::pending::<()>().await
-                        }
-                    } => {
-                        if allow_bookmarks || watchlist {
-                            if let Some(ref rv) = latest_resource_version {
-                                debug!("Sending bookmark with resourceVersion: {}", rv);
-                                let bookmark = BookmarkObject {
-                                    kind: Some(bookmark_kind.clone()),
-                                    api_version: Some(bookmark_api_version.clone()),
-                                    metadata: ObjectMeta {
-                                        resource_version: Some(rv.clone()),
-                                        ..Default::default()
-                                    },
-                                };
-                                let k8s_event = K8sWatchEvent {
-                                    event_type: WatchEventType::Bookmark,
-                                    object: bookmark,
-                                };
-                                if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                    let _ = tx.try_send(Ok(format!("{}\n", json)));
-                                    // Don't break on bookmark send failure — the client
-                                    // might have reset just the bookmark stream but the
-                                    // watch connection is still alive.
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        // Apply timeout if specified
-        if let Some(timeout_dur) = timeout_duration {
-            match timeout(timeout_dur, watch_future).await {
-                Ok(_) => {
-                    debug!("Watch stream completed normally");
-                }
-                Err(_) => {
-                    info!("Watch stream timeout after {:?}", timeout_dur);
-                    // Send final bookmark before closing if bookmarks are enabled
-                    if allow_bookmarks || watchlist {
-                        if let Some(ref rv) = latest_resource_version {
-                            let bookmark = BookmarkObject {
-                                kind: Some(bookmark_kind.clone()),
-                                api_version: Some(bookmark_api_version.clone()),
-                                metadata: ObjectMeta {
-                                    resource_version: Some(rv.clone()),
-                                    ..Default::default()
-                                },
-                            };
-                            let k8s_event = K8sWatchEvent {
-                                event_type: WatchEventType::Bookmark,
-                                object: bookmark,
-                            };
-                            if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                let _ = tx.try_send(Ok(format!("{}\n", json)));
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // No timeout, run forever
-            watch_future.await;
-        }
-    });
-
-    // Convert receiver to stream
-    let stream = ReceiverStream::new(rx);
-
-    // Build response with proper headers for streaming.
-    // Note: Do NOT set Connection header — it's prohibited in HTTP/2
-    // and can cause client-go to drop watch connections.
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-cache, private")
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .body(Body::from_stream(stream))
-        .map_err(|e| Error::Internal(format!("Failed to build response: {}", e)))?;
-
-    Ok(response)
+        state,
+        params,
+        converter,
+        kind,
+        api_version,
+        timeout_cap: 600,
+    })
+    .await
 }
 
 /// Check if an object matches a label selector
@@ -1875,14 +1325,6 @@ impl HasMetadata for JsonWatchObject {
     }
 }
 
-/// Filter one JSON watch event through the label and field selectors.
-///
-/// Upstream runs every watch through the cacher's predicate,
-/// `filterWithAttrsAndPrefixFunction`
-/// (`staging/src/k8s.io/apiserver/pkg/storage/cacher/cacher.go:1201-1209`),
-/// and `cacheWatcher.convertToWatchEvent` (`cache_watcher.go:374-395`) turns a
-/// change that moves an object into the selector into `ADDED` and out of it
-/// into `DELETED`. `None` suppresses the event (#2044).
 /// Serialize a typed watch event whose object always names its `kind` and
 /// `apiVersion`.
 ///
@@ -1904,47 +1346,6 @@ fn typed_event_json<T: Serialize>(
         stamp_gvk(object, kind, api_version);
     }
     serde_json::to_string(&value)
-}
-
-fn json_watch_event(
-    event_type: &'static str,
-    value: serde_json::Value,
-    label_selector: &Option<String>,
-    field_selector: &Option<String>,
-    excluded: &mut std::collections::HashSet<String>,
-) -> Option<(&'static str, serde_json::Value)> {
-    let unfiltered = |s: &Option<String>| s.as_deref().is_none_or(str::is_empty);
-    if unfiltered(label_selector) && unfiltered(field_selector) {
-        return Some((event_type, value));
-    }
-    let meta = value
-        .get("metadata")
-        .cloned()
-        .and_then(|m| serde_json::from_value::<ObjectMeta>(m).ok())
-        .unwrap_or_default();
-    let object = JsonWatchObject { value, meta };
-    let event_type = match event_type {
-        "ADDED" => watch_added_matches(&object, label_selector, field_selector, excluded)
-            .then_some("ADDED")?,
-        "MODIFIED" => {
-            match watch_modified_event_type(&object, label_selector, field_selector, excluded)? {
-                WatchEventType::Added => "ADDED",
-                WatchEventType::Deleted => "DELETED",
-                _ => "MODIFIED",
-            }
-        }
-        _ => {
-            // A deletion reaches only watchers whose selector held the object.
-            if !(matches_label_selector(object.metadata(), label_selector)
-                && matches_field_selector(&object, field_selector))
-            {
-                return None;
-            }
-            excluded.remove(&object.meta.name);
-            event_type
-        }
-    };
-    Some((event_type, object.value))
 }
 
 /// Construct a fallback DELETE event JSON when typed deserialization fails.
@@ -3149,239 +2550,23 @@ pub async fn watch_cluster_scoped_json(
     params: WatchParams,
 ) -> Result<Response> {
     info!("Starting JSON watch for cluster-scoped {}", resource_type);
-
-    let attrs = RequestAttributes::new(
-        auth_ctx.user.clone(),
-        "watch",
-        authorized_resource(resource_type, api_group),
-    )
-    .with_api_group(api_group);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(Error::Forbidden(reason));
-        }
-    }
-
-    let prefix = build_prefix(resource_type, None);
-
-    // A specific resourceVersion replays MODIFIED events from the watch
-    // cache ring, which is critical for CRD Established condition delivery —
-    // the Go informer ignores a duplicate ADDED but processes a MODIFIED.
-    let requested_rv = params.resource_version.clone();
-    let watch_stream = match open_watch_stream(
-        &state,
-        &prefix,
-        requested_rv.as_deref(),
-        &crate::watch_cache::WatchScope::new(
+    authorize_watch(&state, &auth_ctx, resource_type, api_group, None).await?;
+    let (kind, api_version) = resource_type_to_kind_and_version(resource_type, api_group);
+    serve_watch::<JsonWatchObject>(WatchSpec {
+        prefix: build_prefix(resource_type, None),
+        scope: crate::watch_cache::WatchScope::new(
             api_group,
             resource_type,
             params.field_selector.as_deref(),
         ),
-    )
-    .await?
-    {
-        Ok(stream) => stream,
-        Err(expired) => return Ok(expired),
-    };
-    let (existing_resources, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
-
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let current_rev_str = current_rev.to_string();
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
-
-    let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
-    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
-    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
-    // depend on `allowWatchBookmarks`.
-    let send_initial_events = params.send_initial_events;
-    let watchlist = send_initial_events == Some(true);
-    let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
-    ));
-    let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
-
-    let should_send_initial =
-        opens_with_current_state(send_initial_events, requested_rv.as_deref());
-    // Cut the live stream at the snapshot (#2038): see
-    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
-    let watch_stream = if should_send_initial {
-        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
-    } else {
-        watch_stream
-    };
-
-    let label_selector = params.label_selector.clone();
-    let field_selector = params.field_selector.clone();
-
-    tokio::spawn(async move {
-        let mut latest_resource_version: Option<String> = Some(current_rev_str);
-        // Names currently outside the selector, so a change that moves one
-        // in or out surfaces as ADDED / DELETED (see `json_watch_event`).
-        let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        if should_send_initial {
-            for object in existing_resources {
-                if let Some(rv) = json_resource_version(&object) {
-                    latest_resource_version = Some(rv);
-                }
-                let Some((event_type, mut object)) = json_watch_event(
-                    "ADDED",
-                    object,
-                    &label_selector,
-                    &field_selector,
-                    &mut excluded,
-                ) else {
-                    continue;
-                };
-                stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
-                let k8s_event = serde_json::json!({
-                    "type": event_type,
-                    "object": object
-                });
-                if let Ok(json) = serde_json::to_string(&k8s_event) {
-                    if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        if watchlist && allow_bookmarks {
-            if let Some(ref rv) = latest_resource_version {
-                let bookmark = serde_json::json!({
-                    "type": "BOOKMARK",
-                    "object": {
-                        "kind": bookmark_kind,
-                        "apiVersion": bookmark_api_version,
-                        "metadata": {
-                            "resourceVersion": rv,
-                            "annotations": {
-                                "k8s.io/initial-events-end": "true"
-                            }
-                        }
-                    }
-                });
-                if let Ok(json) = serde_json::to_string(&bookmark) {
-                    let _ = tx.try_send(Ok(format!("{}\n", json)));
-                }
-            }
-        }
-
-        let mut bookmark_interval = if allow_bookmarks || watchlist {
-            Some(interval(Duration::from_secs(5)))
-        } else {
-            None
-        };
-
-        let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
-        > = Box::pin(watch_stream);
-
-        let watch_future = async {
-            loop {
-                tokio::select! {
-                    event_opt = watch_stream.next() => {
-                        match event_opt {
-                            Some(Ok(event)) => {
-                                let (event_type, value_str) = match event {
-                                    WatchEvent::Added(_, v) => ("ADDED", v),
-                                    WatchEvent::Modified(_, v) => ("MODIFIED", v),
-                                    WatchEvent::Deleted(_, v) => ("DELETED", v),
-                                };
-                                if let Ok(object) = serde_json::from_str::<serde_json::Value>(&value_str) {
-                                    if let Some(rv) = json_resource_version(&object) {
-                                        latest_resource_version = Some(rv);
-                                    }
-                                    let Some((event_type, mut object)) = json_watch_event(
-                                        event_type,
-                                        object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut excluded,
-                                    ) else {
-                                        continue;
-                                    };
-                                    stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
-                                    let k8s_event = serde_json::json!({
-                                        "type": event_type,
-                                        "object": object
-                                    });
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                if matches!(e, Error::Gone(_)) {
-                                    // Lag termination — 410 + end stream (see the
-                                    // namespaced arm for rationale).
-                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
-                                    break;
-                                }
-                                debug!("Watch stream transient error (continuing): {}", e);
-                                continue;
-                            }
-                            None => {
-                                // Stream ended — 410 + terminate, never a
-                                // silent gap-splicing resubscribe (see the
-                                // namespaced arm for rationale).
-                                let _ = tx.send(Ok(watch_lagged_error_line(
-                                    "watch stream ended; please relist",
-                                ))).await;
-                                break;
-                            }
-                        }
-                    }
-                    _ = async {
-                        if let Some(ref mut bi) = bookmark_interval {
-                            bi.tick().await
-                        } else {
-                            std::future::pending::<tokio::time::Instant>().await
-                        }
-                    } => {
-                        if let Some(ref rv) = latest_resource_version {
-                            let bookmark = serde_json::json!({
-                                "type": "BOOKMARK",
-                                "object": {
-                                    "kind": bookmark_kind,
-                                    "apiVersion": bookmark_api_version,
-                                    "metadata": {
-                                        "resourceVersion": rv
-                                    }
-                                }
-                            });
-                            if let Ok(json) = serde_json::to_string(&bookmark) {
-                                let _ = tx.try_send(Ok(format!("{}\n", json)));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        if let Some(dur) = timeout_duration {
-            let _ = timeout(dur, watch_future).await;
-        } else {
-            watch_future.await;
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .unwrap())
+        state,
+        params,
+        converter: None,
+        kind,
+        api_version,
+        timeout_cap: 300,
+    })
+    .await
 }
 
 /// Watch namespaced resources using serde_json::Value (for DRA types without HasMetadata)
@@ -3397,234 +2582,28 @@ pub async fn watch_namespaced_json(
         "Starting JSON watch for namespaced {}/{}",
         namespace, resource_type
     );
-
-    let attrs = RequestAttributes::new(
-        auth_ctx.user.clone(),
-        "watch",
-        authorized_resource(resource_type, api_group),
-    )
-    .with_api_group(api_group)
-    .with_namespace(&namespace);
-
-    match state.authorizer.authorize(&attrs).await? {
-        Decision::Allow => {}
-        Decision::Deny(reason) => {
-            return Err(Error::Forbidden(reason));
-        }
-    }
-
-    let prefix = build_prefix(resource_type, Some(&namespace));
-    let requested_rv = params.resource_version.clone();
-    let watch_stream = match open_watch_stream(
+    authorize_watch(
         &state,
-        &prefix,
-        requested_rv.as_deref(),
-        &crate::watch_cache::WatchScope::new(
+        &auth_ctx,
+        resource_type,
+        api_group,
+        Some(&namespace),
+    )
+    .await?;
+    let (kind, api_version) = resource_type_to_kind_and_version(resource_type, api_group);
+    serve_watch::<JsonWatchObject>(WatchSpec {
+        prefix: build_prefix(resource_type, Some(&namespace)),
+        scope: crate::watch_cache::WatchScope::new(
             api_group,
             resource_type,
             params.field_selector.as_deref(),
         ),
-    )
-    .await?
-    {
-        Ok(stream) => stream,
-        Err(expired) => return Ok(expired),
-    };
-    let (existing_resources, snapshot_rv) = watch_snapshot(&state, &prefix).await?;
-    let current_rev = state.storage.current_revision().await.unwrap_or(1);
-    let current_rev_str = current_rev.to_string();
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<String, std::io::Error>>(256);
-
-    let allow_bookmarks = params.allow_watch_bookmarks.unwrap_or(false);
-    // `sendInitialEvents` is three-way — see `opens_with_current_state`.
-    // `watchlist` is upstream's `*opts.SendInitialEvents` being true, the
-    // half of `isListWatchRequest` (`cacher.go:1241-1243`) that does not
-    // depend on `allowWatchBookmarks`.
-    let send_initial_events = params.send_initial_events;
-    let watchlist = send_initial_events == Some(true);
-    let timeout_duration = Some(Duration::from_secs(
-        params.timeout_seconds.unwrap_or(300).min(300),
-    ));
-    let (bookmark_kind, bookmark_api_version) =
-        resource_type_to_kind_and_version(resource_type, api_group);
-
-    // A specific resourceVersion (> 1) is served by the replay above.
-    let should_send_initial =
-        opens_with_current_state(send_initial_events, requested_rv.as_deref());
-    // Cut the live stream at the snapshot (#2038): see
-    // `skip_events_covered_by_snapshot`. A resumed watch has no snapshot.
-    let watch_stream = if should_send_initial {
-        skip_events_covered_by_snapshot(watch_stream, snapshot_rv)
-    } else {
-        watch_stream
-    };
-
-    let label_selector = params.label_selector.clone();
-    let field_selector = params.field_selector.clone();
-
-    tokio::spawn(async move {
-        let mut latest_resource_version: Option<String> = Some(current_rev_str);
-        // Names currently outside the selector, so a change that moves one
-        // in or out surfaces as ADDED / DELETED (see `json_watch_event`).
-        let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        if should_send_initial {
-            for object in existing_resources {
-                if let Some(rv) = json_resource_version(&object) {
-                    latest_resource_version = Some(rv);
-                }
-                let Some((event_type, mut object)) = json_watch_event(
-                    "ADDED",
-                    object,
-                    &label_selector,
-                    &field_selector,
-                    &mut excluded,
-                ) else {
-                    continue;
-                };
-                stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
-                let k8s_event = serde_json::json!({
-                    "type": event_type,
-                    "object": object
-                });
-                if let Ok(json) = serde_json::to_string(&k8s_event) {
-                    if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-
-        if watchlist && allow_bookmarks {
-            if let Some(ref rv) = latest_resource_version {
-                let bookmark = serde_json::json!({
-                    "type": "BOOKMARK",
-                    "object": {
-                        "kind": bookmark_kind,
-                        "apiVersion": bookmark_api_version,
-                        "metadata": {
-                            "resourceVersion": rv,
-                            "annotations": {
-                                "k8s.io/initial-events-end": "true"
-                            }
-                        }
-                    }
-                });
-                if let Ok(json) = serde_json::to_string(&bookmark) {
-                    let _ = tx.try_send(Ok(format!("{}\n", json)));
-                }
-            }
-        }
-
-        let mut bookmark_interval = if allow_bookmarks || watchlist {
-            Some(interval(Duration::from_secs(5)))
-        } else {
-            None
-        };
-
-        let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
-        > = Box::pin(watch_stream);
-
-        let watch_future = async {
-            loop {
-                tokio::select! {
-                    event_opt = watch_stream.next() => {
-                        match event_opt {
-                            Some(Ok(event)) => {
-                                let (event_type, value_str) = match event {
-                                    WatchEvent::Added(_, v) => ("ADDED", v),
-                                    WatchEvent::Modified(_, v) => ("MODIFIED", v),
-                                    WatchEvent::Deleted(_, v) => ("DELETED", v),
-                                };
-                                if let Ok(object) = serde_json::from_str::<serde_json::Value>(&value_str) {
-                                    if let Some(rv) = json_resource_version(&object) {
-                                        latest_resource_version = Some(rv);
-                                    }
-                                    let Some((event_type, mut object)) = json_watch_event(
-                                        event_type,
-                                        object,
-                                        &label_selector,
-                                        &field_selector,
-                                        &mut excluded,
-                                    ) else {
-                                        continue;
-                                    };
-                                    stamp_gvk(&mut object, &bookmark_kind, &bookmark_api_version);
-                                    let k8s_event = serde_json::json!({
-                                        "type": event_type,
-                                        "object": object
-                                    });
-                                    if let Ok(json) = serde_json::to_string(&k8s_event) {
-                                        if tx.send(Ok(format!("{}\n", json))).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                if matches!(e, Error::Gone(_)) {
-                                    // Lag termination — 410 + end stream (see the
-                                    // namespaced arm for rationale).
-                                    let _ = tx.send(Ok(watch_lagged_error_line(&e.to_string()))).await;
-                                    break;
-                                }
-                                debug!("Watch stream transient error (continuing): {}", e);
-                                continue;
-                            }
-                            None => {
-                                // Stream ended — 410 + terminate, never a
-                                // silent gap-splicing resubscribe (see the
-                                // namespaced arm for rationale).
-                                let _ = tx.send(Ok(watch_lagged_error_line(
-                                    "watch stream ended; please relist",
-                                ))).await;
-                                break;
-                            }
-                        }
-                    }
-                    _ = async {
-                        if let Some(ref mut bi) = bookmark_interval {
-                            bi.tick().await
-                        } else {
-                            std::future::pending::<tokio::time::Instant>().await
-                        }
-                    } => {
-                        if let Some(ref rv) = latest_resource_version {
-                            let bookmark = serde_json::json!({
-                                "type": "BOOKMARK",
-                                "object": {
-                                    "kind": bookmark_kind,
-                                    "apiVersion": bookmark_api_version,
-                                    "metadata": {
-                                        "resourceVersion": rv
-                                    }
-                                }
-                            });
-                            if let Ok(json) = serde_json::to_string(&bookmark) {
-                                let _ = tx.try_send(Ok(format!("{}\n", json)));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        if let Some(dur) = timeout_duration {
-            let _ = timeout(dur, watch_future).await;
-        } else {
-            watch_future.await;
-        }
-    });
-
-    let stream = ReceiverStream::new(rx);
-    let body = Body::from_stream(stream);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .unwrap())
+        state,
+        params,
+        converter: None,
+        kind,
+        api_version,
+        timeout_cap: 300,
+    })
+    .await
 }

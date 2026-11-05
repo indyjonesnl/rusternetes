@@ -30,6 +30,13 @@
 //!   watcher as the transition it must turn into a DELETED.
 //!   `suggestedWatchChannelSize` gets `indexExists`/`triggerUsed` accordingly.
 //!
+//! * Bookmarks (`cacher.go` `dispatchEvents` bookmark timer,
+//!   `startDispatchingBookmarkEventsLocked`, `cache_watcher.go`
+//!   `nextBookmarkTime` / `bookmarkAfterResourceVersion` state): a watcher that
+//!   allows bookmarks is queued in [`TimeBucketWatchers`] and is offered a
+//!   bookmark when its bucket expires, roughly every minute and shortly before
+//!   its deadline.
+//!
 //! Deviations (Rusternetes-specific):
 //! * The namespace dimension of `namespacedName` is the storage prefix itself
 //!   (a namespaced watch has its own prefix).
@@ -41,14 +48,16 @@
 //!   when the trigger is unsupported (`startDispatching`'s paranoid branch),
 //!   is offered to every trigger watcher. The map is dropped when the last
 //!   trigger watcher goes away, so it can never go stale.
-//! * The cacher's bookmark time buckets (`watcherBookmarkTimeBuckets`) are not
-//!   ported here; watch bookmarks are produced by the watch handler.
+//! * Bookmark resource versions come from the last event the shared watch
+//!   delivered (`lastProcessedResourceVersion`); there are no storage progress
+//!   notifications to advance it on a quiet prefix.
 //! * `cacheWatcher.process`'s `result` channel is [`process`]'s output queue,
 //!   also `chanSize` deep.
 
 use crate::watch_cache::{CachedWatchEvent, WatchEventData, EVENT_FRESH_DURATION};
+use crate::watcher_bookmark::{BookmarkSchedule, BookmarkState, NextBookmark, TimeBucketWatchers};
 use rusternetes_storage::WatchEvent;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -154,22 +163,182 @@ impl TimeBudget {
     }
 }
 
+/// An item on a watcher's input queue (`watchCacheEvent`, whose `Type` may be
+/// `Bookmark`).
+#[derive(Debug, Clone)]
+pub enum CacheItem {
+    Event(CachedWatchEvent),
+    Bookmark { revision: i64 },
+}
+
+/// What the consumer of a watch receives (`watch.Event`).
+#[derive(Debug, Clone)]
+pub enum WatchItem {
+    Event(WatchEvent),
+    /// `initial_events_end` is the `k8s.io/initial-events-end` annotation
+    /// (`storage.AnnotateInitialEventsEndBookmark`): set on the first bookmark
+    /// after the initial events of a watch-list request.
+    Bookmark {
+        revision: i64,
+        initial_events_end: bool,
+    },
+}
+
+/// How a watcher is created (`newCacheWatcher` arguments that matter here).
+#[derive(Debug, Clone, Default)]
+pub struct WatcherOptions {
+    /// `pred.AllowWatchBookmarks`.
+    pub allow_watch_bookmarks: bool,
+    /// The watch's deadline, so a bookmark can be sent just before it.
+    pub deadline: Option<Instant>,
+    /// `bookmarkAfterResourceVersion`: 0 means no special preference.
+    pub bookmark_after_resource_version: i64,
+}
+
+/// State shared by the dispatcher-side and the consumer-side halves of a
+/// `cacheWatcher`.
+pub struct WatcherState {
+    stopped: AtomicBool,
+    deadline: Option<Instant>,
+    bookmark_after_rv: AtomicI64,
+    /// `cacheWatcher.state` under `stateMutex`.
+    state: Mutex<BookmarkState>,
+}
+
+impl WatcherState {
+    fn new(opts: &WatcherOptions) -> Self {
+        let s = Self {
+            stopped: AtomicBool::new(false),
+            deadline: opts.deadline,
+            bookmark_after_rv: AtomicI64::new(0),
+            state: Mutex::new(BookmarkState::BookmarkSent),
+        };
+        s.set_bookmark_after_resource_version(opts.bookmark_after_resource_version);
+        s
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, BookmarkState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `setBookmarkAfterResourceVersion`.
+    pub fn set_bookmark_after_resource_version(&self, rv: i64) {
+        *self.state() = if rv == 0 {
+            BookmarkState::BookmarkSent // no specific RV requested: a no-op
+        } else {
+            BookmarkState::WaitingForBookmark
+        };
+        self.bookmark_after_rv.store(rv, Ordering::Release);
+    }
+
+    /// `wasBookmarkAfterRvReceivedLocked`.
+    pub fn was_bookmark_after_rv_received(&self) -> bool {
+        *self.state() != BookmarkState::WaitingForBookmark
+    }
+
+    /// `wasBookmarkAfterRvSent`.
+    pub fn was_bookmark_after_rv_sent(&self) -> bool {
+        *self.state() == BookmarkState::BookmarkSent
+    }
+
+    /// `markBookmarkAfterRvAsReceived`: a bookmark reached the input queue.
+    pub fn mark_bookmark_after_rv_as_received(&self) {
+        let mut st = self.state();
+        if *st == BookmarkState::WaitingForBookmark {
+            *st = BookmarkState::BookmarkReceived;
+        }
+    }
+
+    /// `markBookmarkAfterRvSent`: a bookmark was sent to the client.
+    pub fn mark_bookmark_after_rv_sent(&self) {
+        *self.state() = BookmarkState::BookmarkSent;
+    }
+
+    /// `cacheWatcher.nextBookmarkTime` (`cache_watcher.go:244-285`).
+    pub fn next_bookmark_time(&self, now: Instant, bookmark_frequency: Duration) -> NextBookmark {
+        // (c) the bookmarkAfterResourceVersion was not confirmed yet.
+        if !self.was_bookmark_after_rv_received() {
+            return NextBookmark::Immediately;
+        }
+        let heartbeat = now + bookmark_frequency;
+        let Some(deadline) = self.deadline else {
+            return NextBookmark::At(heartbeat);
+        };
+        // (a) right before the deadline, (b) roughly every minute.
+        let pretimeout = deadline.checked_sub(Duration::from_secs(2));
+        let at = match pretimeout {
+            Some(p) if p < heartbeat => p,
+            _ => heartbeat,
+        };
+        if at < now {
+            return NextBookmark::Never;
+        }
+        NextBookmark::At(at)
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
 /// The dispatcher-side half of a `cacheWatcher`.
 pub struct CacheWatcher {
-    input: mpsc::Sender<CachedWatchEvent>,
-    stopped: Arc<AtomicBool>,
+    input: mpsc::Sender<CacheItem>,
+    shared: Arc<WatcherState>,
+}
+
+impl BookmarkSchedule for CacheWatcher {
+    fn next_bookmark_time(&self, now: Instant, frequency: Duration) -> NextBookmark {
+        self.shared.next_bookmark_time(now, frequency)
+    }
 }
 
 impl CacheWatcher {
+    /// `newCacheWatcher`: the dispatcher half and the consumer half.
+    pub fn new(chan_size: usize, opts: &WatcherOptions) -> (Arc<Self>, WatchReceiver) {
+        let (tx, rx) = mpsc::channel(chan_size);
+        let shared = Arc::new(WatcherState::new(opts));
+        (
+            Arc::new(Self {
+                input: tx,
+                shared: shared.clone(),
+            }),
+            WatchReceiver {
+                rx,
+                shared,
+                chan_size,
+            },
+        )
+    }
+
+    /// The shared bookmark state.
+    pub fn state(&self) -> &Arc<WatcherState> {
+        &self.shared
+    }
+
     /// `cacheWatcher.nonblockingAdd`.
-    fn nonblocking_add(&self, event: &CachedWatchEvent) -> bool {
-        self.input.try_send(event.clone()).is_ok()
+    fn nonblocking_add(&self, item: &CacheItem) -> bool {
+        if let CacheItem::Bookmark { revision } = item {
+            // Discard a bookmark older than bookmarkAfterResourceVersion so the
+            // input queue is not polluted.
+            if *revision < self.shared.bookmark_after_rv.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+        if self.input.try_send(item.clone()).is_ok() {
+            if matches!(item, CacheItem::Bookmark { .. }) {
+                self.shared.mark_bookmark_after_rv_as_received();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// The watcher can no longer receive: its consumer went away or it was
     /// terminated.
     fn is_gone(&self) -> bool {
-        self.input.is_closed() || self.stopped.load(Ordering::Acquire)
+        self.input.is_closed() || self.shared.is_terminated()
     }
 
     /// `cacheWatcher.forget(false)` from `add`'s `closeFunc`: stop without
@@ -182,14 +351,14 @@ impl CacheWatcher {
             self.input.max_capacity() - self.input.capacity(),
             self.input.max_capacity()
         );
-        self.stopped.store(true, Ordering::Release);
+        self.shared.stopped.store(true, Ordering::Release);
     }
 }
 
 /// The consumer-side half of a `cacheWatcher`: its `input` channel.
 pub struct WatchReceiver {
-    rx: mpsc::Receiver<CachedWatchEvent>,
-    stopped: Arc<AtomicBool>,
+    rx: mpsc::Receiver<CacheItem>,
+    shared: Arc<WatcherState>,
     chan_size: usize,
 }
 
@@ -203,28 +372,43 @@ impl std::fmt::Debug for WatchReceiver {
 }
 
 impl WatchReceiver {
-    /// Next event, or `None` once the watcher was stopped (terminated as too
-    /// slow, or the cache shut down). Events still queued at that point are
+    /// Next item, or `None` once the watcher was stopped (terminated as too
+    /// slow, or the cache shut down). Items still queued at that point are
     /// discarded, as with `drainInputBuffer == false`.
+    pub async fn recv_item(&mut self) -> Option<CacheItem> {
+        if self.shared.is_terminated() {
+            return None;
+        }
+        let item = self.rx.recv().await?;
+        if self.shared.is_terminated() {
+            return None;
+        }
+        Some(item)
+    }
+
+    /// Next event, skipping bookmarks.
     pub async fn recv(&mut self) -> Option<CachedWatchEvent> {
-        if self.stopped.load(Ordering::Acquire) {
-            return None;
+        loop {
+            match self.recv_item().await? {
+                CacheItem::Event(e) => return Some(e),
+                CacheItem::Bookmark { .. } => continue,
+            }
         }
-        let ev = self.rx.recv().await?;
-        if self.stopped.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(ev)
     }
 
     /// Whether the dispatcher terminated this watcher.
     pub fn is_terminated(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.shared.is_terminated()
     }
 
     /// `chanSize` this watcher was created with.
     pub fn chan_size(&self) -> usize {
         self.chan_size
+    }
+
+    /// The shared watcher state (bookmark bookkeeping).
+    pub fn state(&self) -> &Arc<WatcherState> {
+        &self.shared
     }
 }
 
@@ -276,6 +460,12 @@ pub struct Dispatcher {
     /// `key -> last trigger value` while the prefix has trigger watchers (see
     /// the module docs: the previous object upstream reads from `w.store`).
     trigger_state: Mutex<std::collections::HashMap<String, String>>,
+    /// `c.bookmarkWatchers`.
+    bookmark_watchers: Mutex<TimeBucketWatchers<CacheWatcher>>,
+    /// `lastProcessedResourceVersion` (`cacher.go:dispatchEvents`): the
+    /// highest revision this prefix's event stream has delivered, the
+    /// revision a bookmark carries.
+    last_processed: AtomicI64,
 }
 
 impl Default for Dispatcher {
@@ -286,11 +476,38 @@ impl Default for Dispatcher {
 
 impl Dispatcher {
     pub fn new() -> Self {
+        let now = Instant::now();
         Self {
             watchers: Mutex::new(WatcherSet::default()),
-            budget: Mutex::new(TimeBudget::default()),
+            budget: Mutex::new(TimeBudget::new(now)),
             group_resource: std::sync::OnceLock::new(),
             trigger_state: Mutex::new(std::collections::HashMap::new()),
+            bookmark_watchers: Mutex::new(TimeBucketWatchers::new(
+                now,
+                crate::watcher_bookmark::DEFAULT_BOOKMARK_FREQUENCY,
+            )),
+            last_processed: AtomicI64::new(0),
+        }
+    }
+
+    /// Seed `lastProcessedResourceVersion`: the ring is complete up to here,
+    /// so a bookmark at this revision is safe.
+    pub fn set_last_processed(&self, revision: i64) {
+        self.last_processed.fetch_max(revision, Ordering::AcqRel);
+    }
+
+    /// `lastProcessedResourceVersion`.
+    pub fn last_processed(&self) -> i64 {
+        self.last_processed.load(Ordering::Acquire)
+    }
+
+    /// The bookmark timer of `Cacher.dispatchEvents` (`cacher.go:858-899`):
+    /// when the clock reaches a bucket, offer a bookmark at the last processed
+    /// revision to its watchers. Nothing is sent before any revision is known.
+    pub fn bookmark_tick(&self, now: Instant) {
+        let revision = self.last_processed();
+        if revision > 0 {
+            self.dispatch_bookmark(now, revision);
         }
     }
 
@@ -309,6 +526,12 @@ impl Dispatcher {
         let _ = self
             .group_resource
             .set((group.to_string(), resource.to_string()));
+    }
+
+    fn buckets(&self) -> std::sync::MutexGuard<'_, TimeBucketWatchers<CacheWatcher>> {
+        self.bookmark_watchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// `newCacheWatcher` + registration (`cacher.go:569-663`), with the input
@@ -330,12 +553,18 @@ impl Dispatcher {
         // trigger, `triggerUsed` whether this watch pins it.
         let index_exists = self.trigger().is_some();
         let trigger_value = scope.trigger_value.clone().filter(|_| index_exists);
-        self.register(capacity, scope.name.clone(), trigger_value, index_exists)
+        self.register(
+            capacity,
+            scope.name.clone(),
+            trigger_value,
+            index_exists,
+            scope.options.clone(),
+        )
     }
 
     /// [`Self::add_watcher`] for a watcher scoped to one object `name`.
     pub fn add_scoped_watcher(&self, capacity: usize, name: Option<String>) -> WatchReceiver {
-        self.register(capacity, name, None, false)
+        self.register(capacity, name, None, false, WatcherOptions::default())
     }
 
     fn register(
@@ -344,6 +573,7 @@ impl Dispatcher {
         name: Option<String>,
         trigger_value: Option<String>,
         index_exists: bool,
+        opts: WatcherOptions,
     ) -> WatchReceiver {
         let chan_size = suggested_watch_channel_size(
             capacity,
@@ -351,27 +581,22 @@ impl Dispatcher {
             index_exists,
             trigger_value.is_some(),
         );
-        let (tx, rx) = mpsc::channel(chan_size);
-        let stopped = Arc::new(AtomicBool::new(false));
-        let watcher = Arc::new(CacheWatcher {
-            input: tx,
-            stopped: stopped.clone(),
-        });
+        let (watcher, rx) = CacheWatcher::new(chan_size, &opts);
         {
             let mut set = self.list();
             // `watchersSet.addWatcher`: a trigger watcher lives under its value
             // only, any other under its name scope.
             match (trigger_value, name) {
-                (Some(v), _) => set.by_value.entry(v).or_default().push(watcher),
-                (None, Some(n)) => set.by_name.entry(n).or_default().push(watcher),
-                (None, None) => set.unscoped.push(watcher),
+                (Some(v), _) => set.by_value.entry(v).or_default().push(watcher.clone()),
+                (None, Some(n)) => set.by_name.entry(n).or_default().push(watcher.clone()),
+                (None, None) => set.unscoped.push(watcher.clone()),
             }
         }
-        WatchReceiver {
-            rx,
-            stopped,
-            chan_size,
+        // "Add it to the queue only when the client supports watch bookmarks."
+        if opts.allow_watch_bookmarks {
+            self.buckets().add_watcher(watcher, Instant::now());
         }
+        rx
     }
 
     /// Live watchers (the receiver count of the old shared channel).
@@ -394,12 +619,43 @@ impl Dispatcher {
             .chain(by_name.into_values().flatten())
             .chain(by_value.into_values().flatten())
         {
-            w.stopped.store(true, Ordering::Release);
+            w.shared.stopped.store(true, Ordering::Release);
+        }
+    }
+
+    /// `Cacher.dispatchEvent` for a bookmark (`cacher.go:952-964`,
+    /// `startDispatchingBookmarkEventsLocked`, `finishDispatching`): offer a
+    /// bookmark at `revision` to the watchers whose bucket expired, without
+    /// blocking, and queue them again for the next one.
+    pub fn dispatch_bookmark(&self, now: Instant, revision: i64) {
+        // Pop already expired watchers; stopped ones are ignored (they are not
+        // removed from the buckets when they stop).
+        let expired: Vec<Arc<CacheWatcher>> = self
+            .buckets()
+            .pop_expired_watchers(now)
+            .into_iter()
+            .flatten()
+            .filter(|w| !w.is_gone())
+            .collect();
+        let item = CacheItem::Bookmark { revision };
+        for w in &expired {
+            w.nonblocking_add(&item);
+        }
+        // finishDispatching: requeue the watchers that are still running.
+        let mut buckets = self.buckets();
+        for w in expired {
+            if !w.is_gone() {
+                buckets.add_watcher(w, now);
+            }
         }
     }
 
     /// `Cacher.dispatchEvent` for a non-bookmark event.
     pub async fn dispatch(&self, prefix: &str, event: &CachedWatchEvent) {
+        if event.revision > 0 {
+            self.set_last_processed(event.revision);
+        }
+        let item = CacheItem::Event(event.clone());
         // startDispatching: the watchers interested in this event; forget the
         // ones that are already gone.
         let (is_delete, key, value) = match &event.event {
@@ -458,7 +714,7 @@ impl Dispatcher {
         // Non-blocking first, so faster watchers are not held up by slower ones.
         let blocked: Vec<&Arc<CacheWatcher>> = targets
             .iter()
-            .filter(|w| !w.nonblocking_add(event))
+            .filter(|w| !w.nonblocking_add(&item))
             .collect();
         if blocked.is_empty() {
             return;
@@ -475,11 +731,11 @@ impl Dispatcher {
         let mut fired = false;
         for w in blocked {
             // `add`: retry without blocking first.
-            if w.nonblocking_add(event) {
+            if w.nonblocking_add(&item) {
                 continue;
             }
             if !fired {
-                match tokio::time::timeout_at(deadline, w.input.send(event.clone())).await {
+                match tokio::time::timeout_at(deadline, w.input.send(item.clone())).await {
                     Ok(_) => continue, // sent (or the consumer is gone)
                     Err(_) => fired = true,
                 }
@@ -513,44 +769,122 @@ fn to_watch_event(cached: CachedWatchEvent) -> WatchEvent {
     }
 }
 
-/// `cacheWatcher.process` (`cache_watcher.go`): replay `history`, then forward
-/// live events newer than `since_revision` (raised past everything replayed)
-/// into a `chan_size`-deep result queue that the HTTP stream drains. Ends when
-/// the watcher is terminated or the consumer goes away.
+/// `cacheWatcher.processInterval` + `process` (`cache_watcher.go`): replay
+/// `history`, send the initial-events-end bookmark when one is due
+/// (`cacheInterval.initialEventsEndBookmark`), then forward live items newer
+/// than `since_revision` (raised past everything replayed) into a
+/// `chan_size`-deep result queue that the HTTP stream drains. Ends when the
+/// watcher is terminated or the consumer goes away.
 ///
 /// A live event is skipped only when it carries a real revision (> 0): the
 /// in-memory backend stamps none, which would otherwise read as already seen.
 pub fn process(
     history: Vec<CachedWatchEvent>,
+    initial_events_end: Option<i64>,
+    rx: WatchReceiver,
+    since_revision: i64,
+) -> mpsc::Receiver<WatchItem> {
+    process_with(
+        history,
+        initial_events_end.map(|revision| FirstBookmark {
+            revision,
+            initial_events_end: true,
+        }),
+        rx,
+        since_revision,
+    )
+}
+
+/// A bookmark sent right after the replayed events.
+#[derive(Debug, Clone, Copy)]
+pub struct FirstBookmark {
+    pub revision: i64,
+    /// Carries the `k8s.io/initial-events-end` annotation (the watch-list
+    /// terminator). Without it the bookmark is a plain first frame.
+    pub initial_events_end: bool,
+}
+
+/// [`process`] with the first bookmark spelled out.
+pub fn process_with(
+    history: Vec<CachedWatchEvent>,
+    first_bookmark: Option<FirstBookmark>,
     mut rx: WatchReceiver,
     since_revision: i64,
-) -> mpsc::Receiver<WatchEvent> {
+) -> mpsc::Receiver<WatchItem> {
     let max_seen = history
         .iter()
         .map(|e| e.revision)
         .max()
         .unwrap_or(0)
         .max(since_revision);
+    let shared = rx.shared.clone();
     let (tx, result) = mpsc::channel(rx.chan_size());
     tokio::spawn(async move {
         for cached in history {
-            if tx.send(to_watch_event(cached)).await.is_err() {
+            if tx
+                .send(WatchItem::Event(to_watch_event(cached)))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
+        if let Some(first) = first_bookmark {
+            // `convertToWatchEvent` annotates a bookmark sent while
+            // `!wasBookmarkAfterRvSent`; this one always is the first.
+            if tx
+                .send(WatchItem::Bookmark {
+                    revision: first.revision,
+                    initial_events_end: first.initial_events_end,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            shared.mark_bookmark_after_rv_sent();
+        }
         loop {
-            let cached = tokio::select! {
+            let item = tokio::select! {
                 _ = tx.closed() => return,
-                ev = rx.recv() => match ev {
-                    Some(ev) => ev,
+                item = rx.recv_item() => match item {
+                    Some(item) => item,
                     None => return,
                 },
             };
-            if cached.revision > 0 && cached.revision <= max_seen {
-                continue;
-            }
-            if tx.send(to_watch_event(cached)).await.is_err() {
-                return;
+            match item {
+                CacheItem::Event(cached) => {
+                    if cached.revision > 0 && cached.revision <= max_seen {
+                        continue;
+                    }
+                    if tx
+                        .send(WatchItem::Event(to_watch_event(cached)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                CacheItem::Bookmark { revision } => {
+                    // Only a bookmark newer than what was sent, or the one
+                    // at exactly that version when none was sent yet.
+                    if revision > max_seen
+                        || (revision == max_seen && !shared.was_bookmark_after_rv_sent())
+                    {
+                        let initial_events_end = !shared.was_bookmark_after_rv_sent();
+                        if tx
+                            .send(WatchItem::Bookmark {
+                                revision,
+                                initial_events_end,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        shared.mark_bookmark_after_rv_sent();
+                    }
+                }
             }
         }
     });

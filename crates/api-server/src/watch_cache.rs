@@ -4,7 +4,7 @@
 //! to all subscribed client watches. This avoids creating N etcd watches
 //! for N clients, which overwhelms etcd and exhausts HTTP/2 stream limits.
 
-use crate::cache_watcher::{Dispatcher, WatchReceiver};
+use crate::cache_watcher::{Dispatcher, WatchReceiver, WatcherOptions};
 use async_trait::async_trait;
 use rusternetes_storage::StorageBackend;
 use rusternetes_storage::{Storage, WatchEvent, WatchStream};
@@ -136,6 +136,9 @@ pub struct WatchScope {
     /// `pred.MatcherIndex`: the value the watch pins the resource's trigger
     /// field to (pods' `spec.nodeName=<node>`), if any.
     pub trigger_value: Option<String>,
+    /// Bookmark options of the watch (`pred.AllowWatchBookmarks`, deadline,
+    /// `bookmarkAfterResourceVersion`).
+    pub options: WatcherOptions,
 }
 
 impl WatchScope {
@@ -172,6 +175,7 @@ impl WatchScope {
             resource: resource.to_string(),
             name,
             trigger_value,
+            options: WatcherOptions::default(),
         }
     }
 }
@@ -312,6 +316,10 @@ impl WatchCache {
             .write()
             .await
             .insert(prefix.to_string(), start_floor);
+        // The ring is complete up to the floor, so that is the first revision a
+        // bookmark may carry (`lastProcessedResourceVersion`).
+        dispatcher.set_last_processed(start_floor);
+        spawn_bookmark_ticker(&dispatcher);
 
         // Highest revision we have delivered so far. `None` on the very first
         // connection (tail from now — the handler's initial LIST covers
@@ -917,6 +925,23 @@ fn cache_event(ev: WatchEvent) -> CachedWatchEvent {
     }
 }
 
+/// The bookmark timer of `Cacher.dispatchEvents` (`cacher.go:858-899`): about
+/// once a second (`wait.Jitter(time.Second, 0.25)`), hand the buckets that
+/// expired to the dispatcher. Ends with the last reference to the dispatcher.
+fn spawn_bookmark_ticker(dispatcher: &Arc<Dispatcher>) {
+    let weak = Arc::downgrade(dispatcher);
+    tokio::spawn(async move {
+        loop {
+            let jitter = 1.0 + rand::random::<f64>() * 0.25;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(jitter)).await;
+            let Some(dispatcher) = weak.upgrade() else {
+                return;
+            };
+            dispatcher.bookmark_tick(std::time::Instant::now());
+        }
+    });
+}
+
 /// Convert a watcher's input queue into a WatchStream compatible with existing
 /// handlers. The stream ends (no error) when the dispatcher terminates the
 /// watcher as too slow: the client re-watches from the last resourceVersion it
@@ -941,10 +966,13 @@ pub fn broadcast_to_stream_with_history(
     rx: WatchReceiver,
     since_revision: i64,
 ) -> WatchStream {
-    let mut result = crate::cache_watcher::process(history, rx, since_revision);
+    let mut result = crate::cache_watcher::process(history, None, rx, since_revision);
     let stream = async_stream::stream! {
-        while let Some(event) = result.recv().await {
-            yield Ok(event);
+        while let Some(item) = result.recv().await {
+            // Callers of this stream never ask for bookmarks.
+            if let crate::cache_watcher::WatchItem::Event(event) = item {
+                yield Ok(event);
+            }
         }
     };
     Box::pin(stream)

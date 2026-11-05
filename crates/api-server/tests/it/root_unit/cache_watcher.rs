@@ -308,3 +308,168 @@ async fn trigger_watchers_use_the_small_queue() {
         "no TriggerFunc for secrets: indexExists is false"
     );
 }
+
+// ---- bookmark scheduling ----------------------------------------------------
+
+use rusternetes_api_server::cache_watcher::{CacheItem, CacheWatcher, WatchItem, WatcherOptions};
+use rusternetes_api_server::watcher_bookmark::{TimeBucketWatchers, DEFAULT_BOOKMARK_FREQUENCY};
+
+fn bm_watcher(deadline: Instant, after: i64) -> Arc<CacheWatcher> {
+    CacheWatcher::new(
+        0.max(1),
+        &WatcherOptions {
+            allow_watch_bookmarks: true,
+            deadline: Some(deadline),
+            bookmark_after_resource_version: after,
+        },
+    )
+    .0
+}
+
+/// `cache_watcher_test.go::TestTimeBucketWatchersBasic`.
+#[test]
+fn time_bucket_watchers_basic() {
+    let t0 = Instant::now();
+    let mut w = TimeBucketWatchers::new(t0, DEFAULT_BOOKMARK_FREQUENCY);
+    w.add_watcher(bm_watcher(t0 + Duration::from_secs(10), 0), t0);
+    w.add_watcher(bm_watcher(t0 + Duration::from_secs(20), 0), t0);
+    w.add_watcher(bm_watcher(t0 + Duration::from_secs(20), 0), t0);
+    assert_eq!(w.bucket_count(), 2);
+    assert_eq!(w.pop_expired_watchers(t0).len(), 0);
+
+    let t1 = t0 + Duration::from_secs(10);
+    let w1 = w.pop_expired_watchers(t1);
+    assert!(w1.len() == 1 && w1[0].len() == 1, "{}", w1.len());
+    assert_eq!(w.pop_expired_watchers(t1).len(), 0);
+
+    let t2 = t1 + Duration::from_secs(12);
+    let w2 = w.pop_expired_watchers(t2);
+    assert!(w2.len() == 1 && w2[0].len() == 2);
+}
+
+/// `cache_watcher_test.go::TestBookmarkAfterResourceVersionWatchers`.
+#[test]
+fn bookmark_after_resource_version_watchers() {
+    let t0 = Instant::now();
+    let mut target = TimeBucketWatchers::new(t0, DEFAULT_BOOKMARK_FREQUENCY);
+    assert!(target.add_watcher(bm_watcher(t0 + Duration::from_secs(120), 10), t0));
+
+    // Waiting for the bookmark: scheduled immediately.
+    let mut ret = target.pop_expired_watchers(t0);
+    assert!(ret.len() == 1 && ret[0].len() == 1);
+    assert!(target.add_watcher(ret[0][0].clone(), t0));
+
+    // After one second it is still expired.
+    let t1 = t0 + Duration::from_secs(1);
+    ret = target.pop_expired_watchers(t1);
+    assert!(ret.len() == 1 && ret[0].len() == 1);
+    assert!(target.add_watcher(ret[0][0].clone(), t1));
+
+    // After 29 more seconds still.
+    let t2 = t1 + Duration::from_secs(29);
+    ret = target.pop_expired_watchers(t2);
+    assert!(ret.len() == 1 && ret[0].len() == 1);
+
+    // Once the bookmark was received it is no longer immediate.
+    ret[0][0].state().mark_bookmark_after_rv_as_received();
+    assert!(target.add_watcher(ret[0][0].clone(), t2));
+    let t3 = t2 + Duration::from_secs(30);
+    assert_eq!(target.pop_expired_watchers(t3).len(), 0);
+    let t4 = t3 + Duration::from_secs(30);
+    let r = target.pop_expired_watchers(t4);
+    assert!(r.len() == 1 && r[0].len() == 1);
+}
+
+/// `nextBookmarkTime`: right before the deadline when that is sooner, and
+/// never once the deadline is closer than the 2s margin allows.
+#[test]
+fn next_bookmark_time_rules() {
+    use rusternetes_api_server::watcher_bookmark::NextBookmark;
+    let now = Instant::now();
+    let f = DEFAULT_BOOKMARK_FREQUENCY;
+    let w = bm_watcher(now + Duration::from_secs(300), 0);
+    assert_eq!(
+        w.state().next_bookmark_time(now, f),
+        NextBookmark::At(now + f)
+    );
+    let w = bm_watcher(now + Duration::from_secs(10), 0);
+    assert_eq!(
+        w.state().next_bookmark_time(now, f),
+        NextBookmark::At(now + Duration::from_secs(8))
+    );
+    let w = bm_watcher(now + Duration::from_secs(1), 0);
+    assert_eq!(w.state().next_bookmark_time(now, f), NextBookmark::Never);
+}
+
+/// `dispatchEvent` for a bookmark: only watchers whose bucket expired are
+/// offered it, and they are queued again; a bookmark older than
+/// `bookmarkAfterResourceVersion` is dropped.
+#[tokio::test]
+async fn bookmarks_are_dispatched_when_buckets_expire() {
+    let d = Dispatcher::new();
+    let mut w = d.add_watcher_with(
+        LOWER_BOUND_CAPACITY,
+        WatcherOptions {
+            allow_watch_bookmarks: true,
+            deadline: None,
+            bookmark_after_resource_version: 0,
+        },
+    );
+    let mut plain = d.add_watcher(LOWER_BOUND_CAPACITY);
+    let now = Instant::now();
+    d.dispatch_bookmark(now, 5); // nothing expired yet (due in 60s)
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), w.recv_item())
+            .await
+            .is_err()
+    );
+    let later = now + Duration::from_secs(61);
+    d.dispatch_bookmark(later, 7);
+    match w.recv_item().await {
+        Some(CacheItem::Bookmark { revision }) => assert_eq!(revision, 7),
+        other => panic!("{other:?}"),
+    }
+    // Requeued for the next bookmark.
+    d.dispatch_bookmark(later + Duration::from_secs(61), 9);
+    assert!(matches!(
+        w.recv_item().await,
+        Some(CacheItem::Bookmark { revision: 9 })
+    ));
+    // Watchers that did not ask for bookmarks never get one.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), plain.recv_item())
+            .await
+            .is_err()
+    );
+}
+
+/// `process`: the initial-events-end bookmark follows the replay and carries
+/// the annotation; a later periodic bookmark does not.
+#[tokio::test]
+async fn process_marks_the_initial_events_end_bookmark() {
+    let d = Dispatcher::new();
+    let rx = d.add_watcher_with(
+        LOWER_BOUND_CAPACITY,
+        WatcherOptions {
+            allow_watch_bookmarks: true,
+            ..Default::default()
+        },
+    );
+    let mut out = rusternetes_api_server::cache_watcher::process(vec![ev(3)], Some(5), rx, 0);
+    d.dispatch_bookmark(Instant::now() + Duration::from_secs(61), 8);
+    assert!(matches!(out.recv().await, Some(WatchItem::Event(_))));
+    assert!(matches!(
+        out.recv().await,
+        Some(WatchItem::Bookmark {
+            revision: 5,
+            initial_events_end: true
+        })
+    ));
+    assert!(matches!(
+        out.recv().await,
+        Some(WatchItem::Bookmark {
+            revision: 8,
+            initial_events_end: false
+        })
+    ));
+}

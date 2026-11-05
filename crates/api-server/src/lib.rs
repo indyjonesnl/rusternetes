@@ -76,6 +76,7 @@ pub mod startup;
 pub mod state;
 pub mod streaming;
 pub mod watch_cache;
+pub mod watcher_bookmark;
 pub mod zpages;
 
 use axum_server::tls_rustls::RustlsConfig;
