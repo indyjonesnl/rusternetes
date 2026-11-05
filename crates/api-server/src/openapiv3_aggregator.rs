@@ -580,36 +580,67 @@ impl<S: rusternetes_storage::Storage + Send + Sync + 'static> SpecServer for Pro
             }
             Err(resp) => return response_to_handler_response(resp).await,
         };
-        let auth_ctx = crate::middleware::AuthContext {
-            user: rusternetes_common::auth::UserInfo {
-                username: req.user.clone(),
-                uid: String::new(),
-                groups: req.groups.clone(),
-                extra: Default::default(),
-            },
-        };
-        let mut headers = axum::http::HeaderMap::new();
-        if !req.accept.is_empty() {
-            if let Ok(v) = axum::http::HeaderValue::from_str(&req.accept) {
-                headers.insert(axum::http::header::ACCEPT, v);
-            }
-        }
-        if let Some(etag) = &req.if_none_match {
-            if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
-                headers.insert(axum::http::header::IF_NONE_MATCH, v);
-            }
-        }
-        let resp = crate::handlers::aggregator::forward_to_aggregator(
-            &target,
-            &auth_ctx,
-            axum::http::Method::GET,
-            &req.path,
-            &headers,
-            Vec::new(),
-        )
-        .await;
-        response_to_handler_response(resp).await
+        forward_handler_request(&target, &req, None).await
     }
+}
+
+/// Forwards `req` (a `GET` as `req.user`/`req.groups`) to the resolved
+/// aggregated server through [`crate::handlers::aggregator::forward_to_aggregator`]:
+/// the egress selector's `Cluster` dialer (`proxyTransportDial`), the
+/// front-proxy client identity and the `X-Remote-*` identity headers, as the
+/// APIService's `proxyHandler` does for any request. `dialer` is the proxy
+/// transport's dial fixed at construction (`None` looks the selector up per
+/// request, `Some(None)` is the default dial).
+pub async fn forward_handler_request(
+    target: &crate::handlers::aggregator::AggregatorTarget,
+    req: &HandlerRequest,
+    dialer: Option<Option<crate::egress_selector::Dialer>>,
+) -> HandlerResponse {
+    let auth_ctx = crate::middleware::AuthContext {
+        user: rusternetes_common::auth::UserInfo {
+            username: req.user.clone(),
+            uid: String::new(),
+            groups: req.groups.clone(),
+            extra: Default::default(),
+        },
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    if !req.accept.is_empty() {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&req.accept) {
+            headers.insert(axum::http::header::ACCEPT, v);
+        }
+    }
+    if let Some(etag) = &req.if_none_match {
+        if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
+            headers.insert(axum::http::header::IF_NONE_MATCH, v);
+        }
+    }
+    let resp = match dialer {
+        None => {
+            crate::handlers::aggregator::forward_to_aggregator(
+                target,
+                &auth_ctx,
+                axum::http::Method::GET,
+                &req.path,
+                &headers,
+                Vec::new(),
+            )
+            .await
+        }
+        Some(dialer) => {
+            crate::handlers::aggregator::forward_to_aggregator_with_dialer(
+                target,
+                &auth_ctx,
+                axum::http::Method::GET,
+                &req.path,
+                &headers,
+                Vec::new(),
+                dialer,
+            )
+            .await
+        }
+    };
+    response_to_handler_response(resp).await
 }
 
 /// Register the `apiservice-openapiv3-controller` post-start hook

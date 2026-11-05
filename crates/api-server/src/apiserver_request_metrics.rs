@@ -791,6 +791,45 @@ pub async fn instrument_request(
     resp
 }
 
+/// `InstrumentHandlerFunc` (metrics.go:652-666) as a middleware for a handler
+/// registered outside the installer with fixed labels: verb `GET`, no group,
+/// version, resource or scope, no component, and the given `subresource`
+/// (kube-aggregator's `specProxier.register`, controllers/openapiv3/aggregator/
+/// aggregator.go: `openapi/v3` and `openapi/v3/`).
+pub async fn instrument_handler_func(
+    subresource: &'static str,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    let mut meta = request_meta(&req);
+    meta.is_resource_request = false;
+    meta.namespace = String::new();
+    meta.name = String::new();
+    meta.api_group = String::new();
+    meta.api_version = String::new();
+    meta.resource = String::new();
+    meta.subresource = subresource.to_string();
+    let started = std::time::Instant::now();
+    let trackers = rusternetes_common::latency_trackers::latency_trackers_from_context();
+    let resp = next.run(req).await;
+    let size = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse().ok())
+        .or_else(|| resp.body().size_hint().exact())
+        .unwrap_or(0);
+    monitor_request(
+        &meta,
+        "",
+        resp.status().as_u16(),
+        started.elapsed(),
+        size,
+        trackers.map(|t| t.excluded_latency()),
+    );
+    resp
+}
+
 /// `RecordDroppedRequest` (metrics.go:508-526): the request was rejected via
 /// `http.TooManyRequests`; counted in `apiserver_request_total` with code 429.
 pub fn record_dropped_request(req: &RequestMeta, component: &str, _is_mutating: bool) {

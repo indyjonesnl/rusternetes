@@ -1199,10 +1199,32 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route("/version", get(handlers::discovery::get_version))
         // OpenAPI spec endpoints
         .route("/openapi/v2", get(handlers::openapi::get_swagger_spec))
-        .route("/openapi/v3", get(handlers::openapi::get_openapi_spec))
+        // `specProxier.register` wraps both handlers in
+        // `metrics.InstrumentHandlerFunc` (subresource `openapi/v3` and
+        // `openapi/v3/`).
+        .route(
+            "/openapi/v3",
+            get(handlers::openapi::get_openapi_spec).layer(axum_middleware::from_fn(
+                |req, next| {
+                    crate::apiserver_request_metrics::instrument_handler_func(
+                        "openapi/v3",
+                        req,
+                        next,
+                    )
+                },
+            )),
+        )
         .route(
             "/openapi/v3/*path",
-            get(handlers::openapi::get_openapi_spec_path),
+            get(handlers::openapi::get_openapi_spec_path).layer(axum_middleware::from_fn(
+                |req, next| {
+                    crate::apiserver_request_metrics::instrument_handler_func(
+                        "openapi/v3/",
+                        req,
+                        next,
+                    )
+                },
+            )),
         )
         .route("/swagger.json", get(handlers::openapi::get_swagger_spec))
         .layer(axum_middleware::map_response(
