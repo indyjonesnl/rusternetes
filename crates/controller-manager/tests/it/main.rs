@@ -62,6 +62,7 @@ mod node_zone_disruption_test;
 mod pdb_controller_test;
 mod pdb_disruption_controller_test;
 mod priorityclass_controller_test;
+mod protection_finalizer_over_api_test;
 mod pv_binder_test;
 mod pv_controller_extended_test;
 mod replicaset_controller_test;
