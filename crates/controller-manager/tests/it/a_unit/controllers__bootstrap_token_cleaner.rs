@@ -156,4 +156,31 @@ mod tests {
         assert!(exists(&st, &k("kube-system", &opaque.metadata.name)).await);
         assert!(exists(&st, &k("default", &other_ns.metadata.name)).await);
     }
+
+    // `queue.AddAfter(key, ttl)` (tokencleaner.go:219): the pass reports the
+    // soonest pending expiry so the loop wakes then, capped at the 10s worker period.
+    #[tokio::test]
+    async fn sync_all_reports_soonest_requeue_and_next_wake_honours_it() {
+        let now = Utc::now();
+        let st = Arc::new(MemoryStorage::new());
+        for (id, off) in [("aaaaaa", D::seconds(3)), ("bbbbbb", D::hours(1))] {
+            let mut s = new_token_secret(id, "x");
+            add_expiration(&mut s, &time_string(now, off));
+            st.create(
+                &build_key("secrets", Some("kube-system"), &s.metadata.name),
+                &s,
+            )
+            .await
+            .unwrap();
+        }
+        let soonest = TokenCleaner::new(st.clone()).sync_all(now).await.unwrap();
+        assert!(soonest <= Duration::from_secs(3), "{soonest:?}");
+        assert_eq!(
+            next_wake(Some(soonest)),
+            soonest.max(Duration::from_millis(10))
+        );
+        assert_eq!(next_wake(Some(Duration::from_secs(3600))), WORKER_PERIOD);
+        assert_eq!(next_wake(None), WORKER_PERIOD);
+        assert!(next_wake(Some(Duration::ZERO)) >= Duration::from_millis(10));
+    }
 }
