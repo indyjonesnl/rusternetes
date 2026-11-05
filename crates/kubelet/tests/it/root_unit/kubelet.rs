@@ -1729,6 +1729,47 @@ mod tests {
         assert_eq!(st.phase, Some(Phase::Failed), "terminal phase is sticky");
     }
 
+    /// #3478: `syncLoop` (kubelet.go:2529-2537) skips the iteration while
+    /// `runtimeErrors()` is set, sleeping 100ms doubling to a 5s cap, and
+    /// resets the back-off once the runtime is healthy.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn sync_loop_skips_iteration_on_runtime_errors_with_backoff() {
+        use rusternetes_cri::v1;
+        use rusternetes_kubelet::kubelet::SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE as BASE;
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-gate", &["10.1.1.1"], false).await;
+
+        // No runtime sync yet: "container runtime status check may not have
+        // completed yet".
+        let mut backoff = BASE;
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            assert!(k.skip_sync_on_runtime_errors(&mut backoff).await);
+            seen.push(backoff);
+        }
+        let ms: Vec<u128> = seen.iter().map(Duration::as_millis).collect();
+        assert_eq!(ms, [200, 400, 800, 1600, 3200, 5000, 5000, 5000]);
+
+        let ready = |ty: &str| v1::RuntimeCondition {
+            r#type: ty.to_string(),
+            status: true,
+            reason: String::new(),
+            message: String::new(),
+        };
+        k.runtime_state.update_from_status(Ok(v1::StatusResponse {
+            status: Some(v1::RuntimeStatus {
+                conditions: vec![ready("RuntimeReady"), ready("NetworkReady")],
+            }),
+            ..Default::default()
+        }));
+        assert!(!k.skip_sync_on_runtime_errors(&mut backoff).await);
+        assert_eq!(backoff, BASE, "back-off resets on success");
+    }
+
     /// #3687: every status write goes through the host-IP block of
     /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040): a hostNetwork pod's
     /// init-failure status inherits the node IPs as PodIPs too.

@@ -719,6 +719,12 @@ pub struct TerminalStatus {
     pub kubelet_conditions: Option<Vec<PodCondition>>,
 }
 
+/// `base` / `max` / `factor` of `syncLoop`'s runtime-error back-off
+/// (pkg/kubelet/kubelet.go:2515-2519).
+pub const SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE: Duration = Duration::from_millis(100);
+pub const SYNC_LOOP_RUNTIME_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
+pub const SYNC_LOOP_RUNTIME_ERROR_BACKOFF_FACTOR: u32 = 2;
+
 impl Default for TerminalStatus {
     fn default() -> Self {
         Self {
@@ -1701,7 +1707,33 @@ impl Kubelet {
             });
         }
 
+        // `syncLoopMonitor`'s companion: `kl.syncNodeStatus` runs on its own
+        // goroutine upstream (`go wait.JitterUntil(kl.syncNodeStatus, ...)`,
+        // kubelet.go:1852), not inside `syncLoop`, so the heartbeat keeps
+        // reporting (and can report NotReady) while the loop below is skipping
+        // iterations on runtime errors.
+        {
+            let hb_self = Arc::clone(self);
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = hb_self.update_node_status().await {
+                        error!("Error updating node status: {}", e);
+                    }
+                    tokio::time::sleep(hb_self.jittered_node_status_interval()).await;
+                }
+            });
+        }
+
+        let mut runtime_error_backoff = SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE;
         loop {
+            // syncLoop (kubelet.go:2529-2537): skip the iteration, with an
+            // exponential back-off, while the runtime reports errors.
+            if self
+                .skip_sync_on_runtime_errors(&mut runtime_error_backoff)
+                .await
+            {
+                continue;
+            }
             // `kl.syncLoopMonitor.Store(kl.clock.Now())` (kubelet.go:2539),
             // on entry to and exit from every iteration.
             self.sync_loop_monitor.store(std::time::Instant::now());
@@ -1770,20 +1802,25 @@ impl Kubelet {
                         Ok(Err(e)) => error!("Error in periodic sync: {}", e),
                         Err(_) => warn!("sync_loop timed out after 5s"),
                     }
-                    // Always send heartbeat after sync
-                    if let Err(e) = self.update_node_status().await {
-                        error!("Error updating node status: {}", e);
-                    }
-                }
-                // Dedicated heartbeat — runs every nodeStatusUpdateFrequency
-                // (default 10s) independently of sync
-                _ = tokio::time::sleep(self.jittered_node_status_interval()) => {
-                    if let Err(e) = self.update_node_status().await {
-                        error!("Error updating node status: {}", e);
-                    }
                 }
             }
         }
+    }
+
+    /// The head of `syncLoop`'s `for` (kubelet.go:2529-2535): while
+    /// `runtimeState.runtimeErrors()` is set, log, sleep `*backoff` and double
+    /// it up to the cap. Returns true when the iteration must be skipped. On
+    /// success the back-off resets (kubelet.go:2537).
+    pub async fn skip_sync_on_runtime_errors(&self, backoff: &mut Duration) -> bool {
+        if let Some(err) = self.runtime_state.runtime_errors() {
+            error!("Skipping pod synchronization: {err}");
+            tokio::time::sleep(*backoff).await;
+            *backoff = (*backoff * SYNC_LOOP_RUNTIME_ERROR_BACKOFF_FACTOR)
+                .min(SYNC_LOOP_RUNTIME_ERROR_BACKOFF_MAX);
+            return true;
+        }
+        *backoff = SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE;
+        false
     }
 
     /// Port of `updateRuntimeUp` (pkg/kubelet/kubelet.go:3113): poll the CRI

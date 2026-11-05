@@ -7,12 +7,10 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rusternetes_kubelet::{
     config, credentialprovider_plugin, eviction, image_gc, kubelet, node_ip, pluginmanager, server,
-    server_auth, server_cri_metrics, server_debug, server_logs, server_metrics_endpoints,
-    server_resource_metrics, serving_tls, streaming_server, volume_plugins,
+    server_auth, server_logs, serving_tls, volume_plugins,
 };
 
 use anyhow::{Context, Result};
-use axum::{routing::get, Json, Router};
 use clap::Parser;
 use config::{KubeletConfiguration, RuntimeConfig};
 use eviction::{
@@ -789,105 +787,21 @@ async fn main() -> Result<()> {
         (!authn_config.client_ca_file.is_empty()).then(|| authn_config.client_ca_file.clone());
     tokio::spawn(async move {
         let _keep_auth_stop = _auth_stop_tx;
-        let app = Router::new()
-            .route("/metrics", get(|| async move { metrics_clone.gather() }))
-            .merge(server_metrics_endpoints::router())
-            .merge(server_resource_metrics::router(Some(
-                server_state
-                    .kubelet
-                    .as_ref()
-                    .expect("kubelet")
-                    .runtime
-                    .cri_client(),
-            )))
-            .merge(server_cri_metrics::router(Some(
-                server_state
-                    .kubelet
-                    .as_ref()
-                    .expect("kubelet")
-                    .runtime
-                    .cri_client(),
-            )))
-            .merge(server::auth_not_required_router(server_state.clone()));
-        // server.go:315-325 `InstallAuthRequiredHandlers` /
-        // `InstallDebuggingDisabledHandlers`: the debugging handlers (and
-        // /configz, /runningpods/) exist only when `EnableDebuggingHandlers`.
-        let checkpoint_enabled = server::checkpoint_enabled();
-        let app = if enable_debugging_handlers {
-            let run_state = streaming_server::RunState {
-                server: server_state.clone(),
-                checkpoints_dir: checkpoints_dir.clone(),
-            };
-            let app = app
-                .route(
-                    "/configz",
-                    get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
-                )
-                .route(
-                    "/exec/:namespace/:pod/:container",
-                    get(streaming_server::handle_exec).post(streaming_server::handle_exec),
-                )
-                .route(
-                    "/exec/:namespace/:pod/:uid/:container",
-                    get(streaming_server::handle_exec_uid).post(streaming_server::handle_exec_uid),
-                )
-                .route(
-                    "/attach/:namespace/:pod/:container",
-                    get(streaming_server::handle_attach).post(streaming_server::handle_attach),
-                )
-                .route(
-                    "/attach/:namespace/:pod/:uid/:container",
-                    get(streaming_server::handle_attach_uid)
-                        .post(streaming_server::handle_attach_uid),
-                )
-                .route(
-                    "/portForward/:namespace/:pod",
-                    get(streaming_server::handle_portforward)
-                        .post(streaming_server::handle_portforward),
-                )
-                .route(
-                    "/portForward/:namespace/:pod/:uid",
-                    get(streaming_server::handle_portforward_uid)
-                        .post(streaming_server::handle_portforward_uid),
-                )
-                .route(
-                    "/containerLogs/:namespace/:pod/:container",
-                    get(streaming_server::handle_container_logs),
-                )
-                .merge(server::running_pods_router(server_state))
-                .merge(streaming_server::run_router(run_state, checkpoint_enabled));
-            // server.go:602-607 `flagz.Install` (InstallAuthRequiredHandlers).
-            let app = server::install_flagz(app);
-            // server.go:322-323 `InstallProfilingHandler` / `InstallDebugFlagsHandler`.
-            let app = server_debug::install_profiling_handler(
-                app,
+        let app = server::build_server_router(
+            server_state,
+            metrics_clone,
+            kubelet_config_clone,
+            server::ServerRouterOptions {
+                enable_debugging_handlers,
+                enable_system_log_handler,
+                enable_system_log_query,
                 enable_profiling_handler,
                 enable_contention_profiling,
-            );
-            server_debug::install_debug_flags_handler(
-                app,
                 enable_debug_flags_handler,
-                std::sync::Arc::new(server_debug::glog_setter),
-            )
-        } else {
-            server::install_debugging_disabled_handlers(app)
-        };
-        // server.go:315-325 InstallSystemLogHandler / InstallDebuggingDisabledHandlers.
-        let app = server_logs::install_logs_handlers(
-            app,
-            enable_debugging_handlers,
-            enable_system_log_handler,
-            enable_system_log_query,
-            std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
+                checkpoints_dir,
+                logs_root: std::path::PathBuf::from(server_logs::NODE_LOG_DIR),
+            },
         );
-        // server.go:328 `installStatusZ()`: last, over the routes registered so far.
-        let registered = server::registered_handle_paths(
-            enable_debugging_handlers,
-            enable_system_log_handler,
-            enable_profiling_handler,
-            server::flagz_installed(),
-        );
-        let app = server::install_statusz(app, registered);
         // server.go:312-314 `InstallAuthFilter`: wraps every route registered
         // above (and /statusz).
         let app = server_auth::install_auth_filter(app, Some(auth));
