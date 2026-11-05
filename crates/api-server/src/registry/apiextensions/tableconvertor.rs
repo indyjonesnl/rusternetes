@@ -9,10 +9,11 @@
 //! `k8s.io/client-go/util/jsonpath/jsonpath.go` (`FindResults`, `walk`,
 //! `evalField`, `evalArray`, `evalWildcard`, `evalUnion`, `PrintResults`) a
 //! printer column can use, run over the parse tree of
-//! [`rusternetes_common::jsonpath`] with `AllowMissingKeys(true)`. Filters
-//! (`[?(...)]`), recursive descent (`..`) and `range`/`end` evaluate to an
-//! error, which `ConvertToTable` renders as a `null` cell, exactly as it does
-//! for any other evaluation error.
+//! [`rusternetes_common::jsonpath`] with `AllowMissingKeys(true)`, including
+//! filters (`[?(...)]`, with the comparisons of
+//! `client-go/third_party/forked/golang/template/funcs.go`), recursive descent
+//! (`..`) and the `range`/`end` block state machine of `FindResults`. An
+//! evaluation error is rendered by `ConvertToTable` as a `null` cell.
 //!
 //! Not ported: the `Desired`/`Actual` columns upstream serves for the scale
 //! subresource (`getScaleColumnsForVersion`), and `TableOptions.includeObject`
@@ -244,48 +245,300 @@ pub fn cell_for_json_value(header_type: &str, value: &Value) -> Value {
 
 type EvalResult = Result<Vec<Value>, String>;
 
+/// The `JSONPath` evaluator state of jsonpath.go: the `range`/`end` block
+/// counters and the last `end` node reached (identified by its absolute index
+/// in the template, since upstream compares `&nodes[k]` pointers into one
+/// backing array).
+#[derive(Default)]
+struct Evaluator {
+    begin_range: usize,
+    in_range: usize,
+    end_range: usize,
+    last_end_node: Option<usize>,
+}
+
 /// `FindResults`: one result set per top-level node of the template.
 pub fn find_results(root: &ListNode, data: &Value) -> Result<Vec<Vec<Value>>, String> {
-    let mut full = Vec::new();
-    for node in &root.nodes {
-        full.push(walk(std::slice::from_ref(data), node)?);
-    }
-    Ok(full)
+    Evaluator::default().find(&root.nodes, 0, vec![data.clone()])
 }
 
-/// `walk`.
-fn walk(input: &[Value], node: &Node) -> EvalResult {
-    match node {
-        Node::List(l) => eval_list(input, l),
-        Node::Text(t) => Ok(vec![Value::String(t.clone())]),
-        Node::Field(name) => eval_field(input, name),
-        Node::Array(p) => eval_array(input, p),
-        Node::Wildcard => Ok(eval_wildcard(input)),
-        Node::Union(lists) => {
-            let mut out = Vec::new();
-            for l in lists {
-                out.extend(eval_list(input, l)?);
+impl Evaluator {
+    /// `FindResults` (jsonpath.go:81-135). `nodes` is the remaining template
+    /// (upstream reassigns `parser.Root.Nodes = nodes[i+1:]` before recursing);
+    /// `base` is its offset in the original template.
+    fn find(
+        &mut self,
+        nodes: &[Node],
+        base: usize,
+        cur: Vec<Value>,
+    ) -> Result<Vec<Vec<Value>>, String> {
+        let mut full = Vec::new();
+        let mut i = 0;
+        while i < nodes.len() {
+            let results = self.walk(&cur, &nodes[i])?;
+
+            // encounter an end node, break the current block
+            if self.end_range > 0 && self.end_range <= self.in_range {
+                self.end_range -= 1;
+                self.last_end_node = Some(base + i);
+                break;
             }
-            Ok(out)
+            // encounter a range node, start a range loop
+            if self.begin_range > 0 {
+                self.begin_range -= 1;
+                self.in_range += 1;
+                if !results.is_empty() {
+                    for value in results {
+                        full.extend(self.find(&nodes[i + 1..], base + i + 1, vec![value])?);
+                    }
+                } else {
+                    // No results: still process the nodes within the range so
+                    // the position advances to the end node.
+                    self.find(&nodes[i + 1..], base + i + 1, vec![Value::Null])?;
+                }
+                self.in_range -= 1;
+
+                // Fast forward to resume after the most recent end node.
+                for k in i + 1..nodes.len() {
+                    if self.last_end_node == Some(base + k) {
+                        i = k;
+                        break;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            full.push(results);
+            i += 1;
         }
-        Node::Int(i) => Ok(vec![Value::from(*i)]),
-        Node::Float(f) => Ok(vec![
-            serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number)
-        ]),
-        Node::Bool(b) => Ok(vec![Value::Bool(*b)]),
-        Node::Identifier(id) => Err(format!("unrecognized identifier {id}")),
-        Node::Filter { .. } => Err("filter expressions are not supported".to_string()),
-        Node::Recursive => Err("recursive descent is not supported".to_string()),
+        Ok(full)
+    }
+
+    /// `walk`.
+    fn walk(&mut self, input: &[Value], node: &Node) -> EvalResult {
+        match node {
+            Node::List(l) => self.eval_list(input, l),
+            Node::Text(t) => Ok(vec![Value::String(t.clone())]),
+            Node::Field(name) => eval_field(input, name),
+            Node::Array(p) => eval_array(input, p),
+            Node::Filter {
+                left,
+                right,
+                operator,
+            } => self.eval_filter(input, left, right, operator),
+            Node::Wildcard => Ok(eval_wildcard(input)),
+            Node::Recursive => Ok(eval_recursive(input)),
+            Node::Union(lists) => {
+                let mut out = Vec::new();
+                for l in lists {
+                    out.extend(self.eval_list(input, l)?);
+                }
+                Ok(out)
+            }
+            // `evalInt` / `evalFloat` / `evalBool`: one literal per input.
+            Node::Int(i) => Ok(input.iter().map(|_| Value::from(*i)).collect()),
+            Node::Float(f) => Ok(input
+                .iter()
+                .map(|_| serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number))
+                .collect()),
+            Node::Bool(b) => Ok(input.iter().map(|_| Value::Bool(*b)).collect()),
+            Node::Identifier(id) => self.eval_identifier(input, id),
+        }
+    }
+
+    /// `evalList`: each node runs over the previous node's results.
+    fn eval_list(&mut self, input: &[Value], list: &ListNode) -> EvalResult {
+        let mut cur = input.to_vec();
+        for node in &list.nodes {
+            cur = self.walk(&cur, node)?;
+        }
+        Ok(cur)
+    }
+
+    /// `evalIdentifier`: only `range` and `end` are recognised.
+    fn eval_identifier(&mut self, input: &[Value], name: &str) -> EvalResult {
+        match name {
+            "range" => {
+                self.begin_range += 1;
+                Ok(input.to_vec())
+            }
+            "end" => {
+                if self.in_range > 0 {
+                    self.end_range += 1;
+                    Ok(Vec::new())
+                } else {
+                    Err("not in range, nothing to end".to_string())
+                }
+            }
+            _ => Err(format!("unrecognized identifier {name}")),
+        }
+    }
+
+    /// `evalFilter`: keeps the elements of each input array for which
+    /// `left <operator> right` holds (or, for `exists`, `left` is non-empty).
+    fn eval_filter(
+        &mut self,
+        input: &[Value],
+        left: &ListNode,
+        right: &ListNode,
+        operator: &str,
+    ) -> EvalResult {
+        let mut results = Vec::new();
+        for value in input {
+            let Value::Array(items) = value else {
+                return Err(format!(
+                    "{value} is not array or slice and cannot be filtered"
+                ));
+            };
+            for item in items {
+                let temp = std::slice::from_ref(item);
+                let lefts = self.eval_list(temp, left);
+
+                // case exists
+                if operator == "exists" {
+                    if lefts.is_ok_and(|l| !l.is_empty()) {
+                        results.push(item.clone());
+                    }
+                    continue;
+                }
+                let lefts = lefts?;
+                if lefts.is_empty() {
+                    continue;
+                }
+                if lefts.len() > 1 {
+                    return Err("can only compare one element at a time".to_string());
+                }
+                let rights = self.eval_list(temp, right)?;
+                if rights.is_empty() {
+                    continue;
+                }
+                if rights.len() > 1 {
+                    return Err("can only compare one element at a time".to_string());
+                }
+                let (l, r) = (&lefts[0], &rights[0]);
+                let pass = match operator {
+                    "<" => template_less(l, r)?,
+                    ">" => template_greater(l, r)?,
+                    "==" => template_equal(l, r)?,
+                    "!=" => !template_equal(l, r)?,
+                    "<=" => template_less_equal(l, r)?,
+                    ">=" => template_greater_equal(l, r)?,
+                    _ => return Err(format!("unrecognized filter operator {operator}")),
+                };
+                if pass {
+                    results.push(item.clone());
+                }
+            }
+        }
+        Ok(results)
     }
 }
 
-/// `evalList`: each node runs over the previous node's results.
-fn eval_list(input: &[Value], list: &ListNode) -> EvalResult {
-    let mut cur = input.to_vec();
-    for node in &list.nodes {
-        cur = walk(&cur, node)?;
+// ---------------------------------------------------------------------------
+// `k8s.io/client-go/third_party/forked/golang/template/funcs.go` comparisons.
+// ---------------------------------------------------------------------------
+
+/// `kind` of `basicKind`: JSON decoded into `interface{}` by the apiserver
+/// holds `int64` (intKind), `uint64` beyond `i64::MAX` (uintKind) and
+/// `float64` (floatKind); parser literals are `int`, `float64`, `bool`,
+/// `string`. Anything else is `errBadComparisonType`.
+enum Basic<'a> {
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    Str(&'a str),
+}
+
+fn basic_kind(v: &Value) -> Result<Basic<'_>, String> {
+    match v {
+        Value::Bool(b) => Ok(Basic::Bool(*b)),
+        Value::String(s) => Ok(Basic::Str(s)),
+        Value::Number(n) => Ok(if let Some(i) = n.as_i64() {
+            Basic::Int(i)
+        } else if let Some(u) = n.as_u64() {
+            Basic::Uint(u)
+        } else {
+            Basic::Float(n.as_f64().unwrap_or(0.0))
+        }),
+        _ => Err("invalid type for comparison".to_string()),
     }
-    Ok(cur)
+}
+
+const BAD_COMPARISON: &str = "incompatible types for comparison";
+
+/// `Equal` (one comparand).
+fn template_equal(a: &Value, b: &Value) -> Result<bool, String> {
+    use Basic::*;
+    Ok(match (basic_kind(a)?, basic_kind(b)?) {
+        (Bool(x), Bool(y)) => x == y,
+        (Float(x), Float(y)) => x == y,
+        (Int(x), Int(y)) => x == y,
+        (Str(x), Str(y)) => x == y,
+        (Uint(x), Uint(y)) => x == y,
+        (Int(x), Uint(y)) => x >= 0 && x as u64 == y,
+        (Uint(x), Int(y)) => y >= 0 && x == y as u64,
+        _ => return Err(BAD_COMPARISON.to_string()),
+    })
+}
+
+/// `Less`.
+fn template_less(a: &Value, b: &Value) -> Result<bool, String> {
+    use Basic::*;
+    Ok(match (basic_kind(a)?, basic_kind(b)?) {
+        (Bool(_), Bool(_)) => return Err("invalid type for comparison".to_string()),
+        (Float(x), Float(y)) => x < y,
+        (Int(x), Int(y)) => x < y,
+        (Str(x), Str(y)) => x < y,
+        (Uint(x), Uint(y)) => x < y,
+        (Int(x), Uint(y)) => x < 0 || (x as u64) < y,
+        (Uint(x), Int(y)) => y >= 0 && x < y as u64,
+        _ => return Err(BAD_COMPARISON.to_string()),
+    })
+}
+
+/// `LessEqual`.
+fn template_less_equal(a: &Value, b: &Value) -> Result<bool, String> {
+    if template_less(a, b)? {
+        return Ok(true);
+    }
+    template_equal(a, b)
+}
+
+/// `Greater`.
+fn template_greater(a: &Value, b: &Value) -> Result<bool, String> {
+    Ok(!template_less_equal(a, b)?)
+}
+
+/// `GreaterEqual`.
+fn template_greater_equal(a: &Value, b: &Value) -> Result<bool, String> {
+    Ok(!template_less(a, b)?)
+}
+
+/// The children `evalWildcard` / `evalRecursive` enumerate: a map's values, an
+/// array's elements, or a string's bytes (`value.Index(i)` on a string is a
+/// `uint8`).
+fn children(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Object(m) => m.values().cloned().collect(),
+        Value::Array(a) => a.clone(),
+        Value::String(s) => s.bytes().map(Value::from).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `evalRecursive`: every value that has children, depth first, each followed
+/// by the recursion over its children. Leaf scalars are not included.
+fn eval_recursive(input: &[Value]) -> Vec<Value> {
+    let mut result = Vec::new();
+    for value in input {
+        let kids = children(value);
+        if !kids.is_empty() {
+            result.push(value.clone());
+            result.extend(eval_recursive(&kids));
+        }
+    }
+    result
 }
 
 /// `evalField` with `allowMissingKeys`: a missing key (or a non-object input)
@@ -304,15 +557,7 @@ fn eval_field(input: &[Value], name: &str) -> EvalResult {
 
 /// `evalWildcard`.
 fn eval_wildcard(input: &[Value]) -> Vec<Value> {
-    let mut out = Vec::new();
-    for v in input {
-        match v {
-            Value::Object(m) => out.extend(m.values().cloned()),
-            Value::Array(a) => out.extend(a.iter().cloned()),
-            _ => {}
-        }
-    }
-    out
+    input.iter().flat_map(children).collect()
 }
 
 /// `evalArray`: `[i]`, `[a:b]`, `[a:b:step]` with Go's bounds errors.
