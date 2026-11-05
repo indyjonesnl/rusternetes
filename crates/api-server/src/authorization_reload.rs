@@ -208,6 +208,15 @@ impl Authorizer for ReloadableAuthorizer {
     ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
         self.current().get_user_rules(user, namespace).await
     }
+
+    // reload.go:82 forwards the full RulesFor tuple.
+    async fn get_user_rules_outcome(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        self.current().get_user_rules_outcome(user, namespace).await
+    }
 }
 
 /// `filesystem.WatchUntil` (pkg/util/filesystem/watcher.go:94-): watch `path`

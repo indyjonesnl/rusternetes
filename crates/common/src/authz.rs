@@ -284,6 +284,20 @@ impl AuthorizationOutcome {
     }
 }
 
+/// The full `authorizer.RuleResolver.RulesFor` tuple
+/// (`staging/src/k8s.io/apiserver/pkg/authorization/authorizer/interfaces.go`
+/// `RulesFor`): rules, the `incomplete` flag and the evaluation error. Rules
+/// may be present alongside an error. Consumed by `SelfSubjectRulesReview`
+/// (`pkg/registry/authorization/selfsubjectrulesreview/rest.go`), which
+/// reports `incomplete` and `evaluationError` in its status.
+#[derive(Debug, Clone, Default)]
+pub struct UserRulesOutcome {
+    pub resource_rules: Vec<crate::resources::ResourceRule>,
+    pub non_resource_rules: Vec<crate::resources::NonResourceRule>,
+    pub incomplete: bool,
+    pub error: Option<String>,
+}
+
 /// Authorizer trait for authorization implementations.
 #[async_trait]
 pub trait Authorizer: Send + Sync {
@@ -318,6 +332,28 @@ pub trait Authorizer: Send + Sync {
         Vec<crate::resources::ResourceRule>,
         Vec<crate::resources::NonResourceRule>,
     )>;
+
+    /// `RulesFor` with its `incomplete` flag and error. The default adapts
+    /// [`Authorizer::get_user_rules`]: a failure becomes the error (upstream
+    /// RBAC returns the rules found plus the error, `rbac.go:129-155`) and the
+    /// result is complete unless the authorizer says otherwise.
+    async fn get_user_rules_outcome(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<UserRulesOutcome> {
+        Ok(match self.get_user_rules(user, namespace).await {
+            Ok((resource_rules, non_resource_rules)) => UserRulesOutcome {
+                resource_rules,
+                non_resource_rules,
+                ..Default::default()
+            },
+            Err(error) => UserRulesOutcome {
+                error: Some(error.to_string()),
+                ..Default::default()
+            },
+        })
+    }
 }
 
 /// RBAC Authorizer that uses Role and RoleBinding resources
@@ -865,6 +901,27 @@ impl Authorizer for UnionAuthorizer {
             }
         }
         Ok((resource_rules, non_resource_rules))
+    }
+
+    /// `unionAuthzRulesHandler.RulesFor` (`union/union.go:80-106`): concatenate
+    /// every delegate's rules in order, OR the `incomplete` flags, and
+    /// aggregate the errors; a failing delegate never hides the others.
+    async fn get_user_rules_outcome(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<UserRulesOutcome> {
+        let mut union = UserRulesOutcome::default();
+        let mut errors = Vec::new();
+        for authorizer in &self.authorizers {
+            let delegate = authorizer.get_user_rules_outcome(user, namespace).await?;
+            union.incomplete |= delegate.incomplete;
+            errors.extend(delegate.error);
+            union.resource_rules.extend(delegate.resource_rules);
+            union.non_resource_rules.extend(delegate.non_resource_rules);
+        }
+        union.error = aggregate_errors(&errors);
+        Ok(union)
     }
 }
 

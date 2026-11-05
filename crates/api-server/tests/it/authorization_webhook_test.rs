@@ -795,3 +795,31 @@ async fn request_selectors_ignored_for_a_different_resource() {
         .get("labelSelector")
         .is_none());
 }
+
+// `WebhookAuthorizer.RulesFor` (webhook.go:404-412) reports no rules, incomplete,
+// and "webhook authorizer does not support user rule resolution"; the union
+// (union.go:80-106) and the instrumentation wrapper must carry both through to
+// SelfSubjectRulesReview's `incomplete` / `evaluationError`.
+#[tokio::test]
+async fn rules_for_is_incomplete_through_union_and_instrumentation() {
+    use rusternetes_common::authz::UnionAuthorizer;
+    let url = serve(allowing_mock()).await;
+    let wh = authorizer(&url, "v1", Duration::ZERO, FailurePolicy::NoOpinion);
+    let chain: Arc<dyn Authorizer> = Arc::new(UnionAuthorizer::new(vec![
+        rusternetes_api_server::authorization_metrics::instrumented_authorizer(
+            "Webhook",
+            "wh",
+            Arc::new(wh),
+        ),
+    ]));
+    let got = chain
+        .get_user_rules_outcome(&UserInfo::anonymous(), "default")
+        .await
+        .unwrap();
+    assert!(got.incomplete);
+    assert_eq!(
+        got.error.as_deref(),
+        Some("webhook authorizer does not support user rule resolution")
+    );
+    assert!(got.resource_rules.is_empty() && got.non_resource_rules.is_empty());
+}

@@ -492,6 +492,106 @@ mod tests {
         );
     }
 
+    /// `unionAuthzRulesHandler.RulesFor` (union.go:80-106): a delegate's error
+    /// and `incomplete` are aggregated, never dropped, and a failing delegate
+    /// does not hide the rules of the others.
+    #[tokio::test]
+    async fn union_rules_outcome_aggregates_errors_and_incomplete() {
+        use rusternetes_common::authz::UserRulesOutcome;
+        use rusternetes_common::resources::ResourceRule;
+        struct Outcome(UserRulesOutcome);
+        #[async_trait]
+        impl Authorizer for Outcome {
+            async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
+                Ok(Decision::Deny(String::new()))
+            }
+            async fn get_user_rules(
+                &self,
+                _: &UserInfo,
+                _: &str,
+            ) -> Result<(
+                Vec<ResourceRule>,
+                Vec<rusternetes_common::resources::NonResourceRule>,
+            )> {
+                Ok((vec![], vec![]))
+            }
+            async fn get_user_rules_outcome(
+                &self,
+                _: &UserInfo,
+                _: &str,
+            ) -> Result<UserRulesOutcome> {
+                Ok(self.0.clone())
+            }
+        }
+        let rule = |res: &str| ResourceRule {
+            verbs: vec!["get".into()],
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec![res.into()]),
+            resource_names: None,
+        };
+        let outcome = |rules: Vec<ResourceRule>, incomplete: bool, error: Option<&str>| {
+            Arc::new(Outcome(UserRulesOutcome {
+                resource_rules: rules,
+                incomplete,
+                error: error.map(str::to_string),
+                ..Default::default()
+            })) as Arc<dyn Authorizer>
+        };
+        let u = UnionAuthorizer::new(vec![
+            outcome(vec![rule("pods")], false, None),
+            outcome(
+                vec![],
+                true,
+                Some("webhook authorizer does not support user rule resolution"),
+            ),
+            outcome(vec![rule("secrets")], false, Some("boom")),
+            outcome(vec![], false, Some("boom")),
+        ]);
+        let got = u.get_user_rules_outcome(&mk_user("a"), "ns").await.unwrap();
+        assert!(got.incomplete);
+        assert_eq!(
+            got.error.as_deref(),
+            Some("[webhook authorizer does not support user rule resolution, boom]"),
+            "errors aggregate, deduplicated, in delegate order"
+        );
+        assert_eq!(
+            serde_json::to_value(&got.resource_rules).unwrap(),
+            serde_json::to_value(vec![rule("pods"), rule("secrets")]).unwrap()
+        );
+
+        // No delegate complaints: complete, no error.
+        let clean = UnionAuthorizer::new(vec![outcome(vec![rule("pods")], false, None)]);
+        let got = clean
+            .get_user_rules_outcome(&mk_user("a"), "ns")
+            .await
+            .unwrap();
+        assert!(!got.incomplete && got.error.is_none());
+
+        // The default adapter turns a get_user_rules failure into the error.
+        struct Failing;
+        #[async_trait]
+        impl Authorizer for Failing {
+            async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
+                Ok(Decision::Deny(String::new()))
+            }
+            async fn get_user_rules(
+                &self,
+                _: &UserInfo,
+                _: &str,
+            ) -> Result<(
+                Vec<ResourceRule>,
+                Vec<rusternetes_common::resources::NonResourceRule>,
+            )> {
+                Err(rusternetes_common::Error::Internal("list failed".into()))
+            }
+        }
+        let got = Failing
+            .get_user_rules_outcome(&mk_user("a"), "ns")
+            .await
+            .unwrap();
+        assert!(got.error.unwrap().contains("list failed") && !got.incomplete);
+    }
+
     /// #1664: the Node,RBAC union is allow-override — a `Deny` from one
     /// authorizer falls through to the next, any `Allow` wins, and only an
     /// all-deny chain denies. In particular a kubelet (`system:node:<n>`) is
