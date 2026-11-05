@@ -92,8 +92,8 @@ async fn handle_list_running_pods(State(state): State<ServerState>) -> impl Into
 /// No kubelet attached (router-shape tests / early startup): healthy.
 fn syncloop_checker(kubelet: Option<Arc<Kubelet>>) -> HealthChecker {
     HealthChecker::named("syncloop", move || match &kubelet {
-        Some(k) if !k.healthy() => Err("sync Loop took longer than expected".to_string()),
-        _ => Ok(()),
+        Some(k) => k.sync_loop_health_check(),
+        None => Ok(()),
     })
 }
 
@@ -472,6 +472,39 @@ pub fn install_metrics_filter(
     router.layer(axum::middleware::from_fn_with_state(state, metrics_filter))
 }
 
+static FLAGZ: std::sync::OnceLock<rusternetes_common::flagz::NamedFlagSetsReader> =
+    std::sync::OnceLock::new();
+
+/// `kubeletDeps.Flagz = flagz.NamedFlagSetsReader{...}`
+/// (cmd/kubelet/app/server.go:270-275): set once from the parsed command line,
+/// and only when `ComponentFlagz` is enabled. Unset leaves `/flagz`
+/// uninstalled (`s.flagz != nil`, server.go:603).
+pub fn set_flagz_reader(reader: rusternetes_common::flagz::NamedFlagSetsReader) {
+    let _ = FLAGZ.set(reader);
+}
+
+/// `ComponentFlagz` is on and a flagz registry was set (server.go:602-603).
+pub fn flagz_installed() -> bool {
+    FLAGZ.get().is_some()
+        && rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::ComponentFlagz,
+        )
+}
+
+/// `flagz.Install(s.restfulCont, ComponentKubelet, s.flagz)` behind the
+/// `ComponentFlagz` gate and `s.flagz != nil` (server.go:602-607, inside
+/// `InstallAuthRequiredHandlers`).
+pub fn install_flagz(router: Router) -> Router {
+    rusternetes_common::flagz::install_if_enabled(
+        router,
+        COMPONENT_KUBELET,
+        FLAGZ
+            .get()
+            .cloned()
+            .map(|r| Box::new(r) as Box<dyn rusternetes_common::flagz::FlagReader>),
+    )
+}
+
 /// The `ContainerCheckpoint` gate, read once when the handlers are installed
 /// (server.go:620 reads it inside `InstallAuthRequiredHandlers`).
 pub fn checkpoint_enabled() -> bool {
@@ -481,12 +514,12 @@ pub fn checkpoint_enabled() -> bool {
 /// The `NewServer` bucket inputs for this kubelet's installed handlers:
 /// `enable_debugging_handlers` is `kubeCfg.EnableDebuggingHandlers`,
 /// `ComponentStatusz` follows its gate, `checkpoint` follows
-/// [`checkpoint_enabled`], and `flagz` is off because this kubelet installs no
-/// flagz handler (no flagz registry, server.go:602-607).
+/// [`checkpoint_enabled`], and `flagz` follows [`flagz_installed`]
+/// (server.go:602-607).
 pub fn server_bucket_options(enable_debugging_handlers: bool) -> ServerBucketOptions {
     ServerBucketOptions {
         enable_debugging_handlers,
-        flagz_enabled: false,
+        flagz_enabled: flagz_installed(),
         checkpoint_enabled: checkpoint_enabled(),
         statusz_enabled: rusternetes_common::feature_gates::enabled(
             rusternetes_common::feature_gates::Feature::ComponentStatusz,
@@ -648,12 +681,15 @@ pub fn install_debugging_disabled_handlers(router: Router) -> Router {
 /// (server_test.go `TestStatusz` expects exactly `/configz /debug /healthz
 /// /metrics`). `installStatusZ` (server.go:393-398) hands this list to
 /// `statusz.WithListedPaths`. Only paths this kubelet really serves are listed
-/// (so no `/healthz/<check>` sub-paths, no `/flagz`), in upstream's
-/// registration order:
+/// (so `/flagz` only when [`flagz_installed`]), in upstream's registration
+/// order:
 ///
-/// * `InstallAuthNotRequiredHandlers`: `/healthz`, `/metrics/slis`,
+/// * `InstallAuthNotRequiredHandlers`: `/healthz` and its checks
+///   (`healthz.InstallHandler`: `/healthz/ping`, `/healthz/log`,
+///   `/healthz/syncloop`), `/metrics/slis`,
 ///   `/metrics`, `/metrics/cadvisor`, `/metrics/resource`, `/metrics/probes`.
-/// * `enable_debugging_handlers`: `InstallAuthRequiredHandlers`' `/configz`;
+/// * `enable_debugging_handlers`: `InstallAuthRequiredHandlers`' `/configz`
+///   and, when `flagz_installed`, `/flagz`;
 ///   `InstallSystemLogHandler`'s `/logs/` only when
 ///   `enable_system_log_handler` is off; `InstallProfilingHandler`'s
 ///   `/debug/pprof/` only when `enable_profiling_handler` is off;
@@ -664,9 +700,13 @@ pub fn registered_handle_paths(
     enable_debugging_handlers: bool,
     enable_system_log_handler: bool,
     enable_profiling_handler: bool,
+    flagz_installed: bool,
 ) -> Vec<String> {
     let mut paths: Vec<&str> = vec![
         "/healthz",
+        "/healthz/ping",
+        "/healthz/log",
+        "/healthz/syncloop",
         "/metrics/slis",
         "/metrics",
         "/metrics/cadvisor",
@@ -675,6 +715,9 @@ pub fn registered_handle_paths(
     ];
     if enable_debugging_handlers {
         paths.push("/configz");
+        if flagz_installed {
+            paths.push("/flagz");
+        }
         if !enable_system_log_handler {
             paths.push("/logs/");
         }
