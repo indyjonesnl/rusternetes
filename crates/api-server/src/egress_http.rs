@@ -93,6 +93,18 @@ pub struct EgressConnector {
     server_name: Option<String>,
 }
 
+impl EgressConnector {
+    /// The transport's `DialContext` as a standalone connector, for callers
+    /// that drive their own hyper client (streaming and upgraded connections).
+    pub fn new(dialer: Dialer, tls: rustls::ClientConfig, server_name: Option<String>) -> Self {
+        Self {
+            dialer,
+            tls: Arc::new(tls),
+            server_name,
+        }
+    }
+}
+
 impl tower::Service<Uri> for EgressConnector {
     type Response = EgressIo;
     type Error = std::io::Error;
