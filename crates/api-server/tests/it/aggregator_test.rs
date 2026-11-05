@@ -771,3 +771,279 @@ async fn forward_handler_request_sends_identity_accept_and_if_none_match() {
         "system:kube-aggregator|application/json|\"e1\""
     );
 }
+
+// ----- upgrade-aware proxy (handler_proxy.go ServeHTTP / upgradeaware.go) ----
+
+mod upgrade_aware_proxy {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::response::Response;
+    use rusternetes_api_server::upgrade_aware::{serve_proxy_with, set_auth_proxy_headers};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A one-shot HTTP backend: records the request head, answers with `reply`.
+    async fn backend(reply: &'static str) -> (std::net::SocketAddr, Arc<Mutex<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    *seen.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    if reply.starts_with("HTTP/1.1 101") {
+                        // echo until the peer closes
+                        let mut b = [0u8; 256];
+                        while let Ok(n) = sock.read(&mut b).await {
+                            if n == 0 || sock.write_all(&b[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn target(addr: std::net::SocketAddr) -> AggregatorTarget {
+        AggregatorTarget {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            insecure_skip_tls_verify: true,
+            ca_bundle: None,
+            scheme: "http",
+            server_name: None,
+        }
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[tokio::test]
+    async fn stomps_auth_proxy_headers_and_drops_authorization() {
+        let (addr, seen) = backend("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let user = test_user("alice", &["dev"], &[("scopes", &["read"])]).user;
+        let req = Request::builder()
+            .uri("/apis/x.io/v1/things?b=2&a=1&a=0")
+            .header("X-Remote-User", "mallory")
+            .header("X-Remote-Group", "system:masters")
+            .header("X-Remote-Extra-Evil", "yes")
+            .header("Authorization", "Bearer secret")
+            .header("X-Custom", "kept")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_proxy_with(&target(addr), &user, req, None, true).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(body_string(resp).await, "ok");
+        let head = seen.lock().unwrap().to_lowercase();
+        // `req.URL.Query().Encode()`: sorted by key.
+        assert!(
+            head.starts_with("get /apis/x.io/v1/things?a=1&a=0&b=2 http/1.1"),
+            "{head}"
+        );
+        assert!(head.contains("x-remote-user: alice"));
+        assert!(head.contains("x-remote-uid: uid-alice"));
+        assert!(head.contains("x-remote-group: dev"));
+        assert!(head.contains("x-remote-extra-scopes: read"));
+        assert!(!head.contains("mallory"));
+        assert!(!head.contains("system:masters"));
+        assert!(!head.contains("evil"));
+        assert!(!head.contains("bearer secret"));
+        assert!(head.contains("x-custom: kept"));
+        // Transport.RoundTrip
+        assert!(head.contains("x-forwarded-uri: /apis/x.io/v1/things"));
+        assert!(head.contains("x-forwarded-proto: http"));
+        assert!(head.contains(&format!("x-forwarded-host: 127.0.0.1:{}", addr.port())));
+    }
+
+    #[tokio::test]
+    async fn set_auth_proxy_headers_replaces_every_spoofed_field() {
+        let mut h = HeaderMap::new();
+        h.insert("x-remote-user", HeaderValue::from_static("mallory"));
+        h.append("x-remote-group", HeaderValue::from_static("g1"));
+        h.insert("x-remote-extra-a", HeaderValue::from_static("1"));
+        let user = UserInfo {
+            username: "bob".into(),
+            uid: String::new(),
+            groups: vec!["g2".into()],
+            extra: HashMap::new(),
+        };
+        set_auth_proxy_headers(&mut h, &user);
+        assert_eq!(h.get("x-remote-user").unwrap(), "bob");
+        assert_eq!(h.get_all("x-remote-group").iter().count(), 1);
+        assert_eq!(h.get("x-remote-group").unwrap(), "g2");
+        assert!(h.get("x-remote-extra-a").is_none());
+        // `len(uid) > 0` only.
+        assert!(h.get("x-remote-uid").is_none());
+    }
+
+    // TestRejectForwardingRedirects-style: a 3xx with a Location is replaced.
+    #[tokio::test]
+    async fn redirects_are_rejected_with_bad_gateway() {
+        let (addr, _) = backend(
+            "HTTP/1.1 302 Found\r\nLocation: http://elsewhere/x\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let user = test_user("alice", &[], &[]).user;
+        let req = Request::builder()
+            .uri("/apis/x.io/v1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_proxy_with(&target(addr), &user, req, None, true).await;
+        assert_eq!(resp.status(), 502);
+        assert_eq!(
+            body_string(resp).await,
+            "the backend attempted to redirect this request, which is not permitted"
+        );
+    }
+
+    // Without RejectForwardingRedirects the redirect is forwarded, a
+    // same-host Location rewritten by `Transport.rewriteURL`.
+    #[tokio::test]
+    async fn redirects_are_forwarded_when_not_rejected() {
+        let (addr, _) =
+            backend("HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n").await;
+        let user = test_user("alice", &[], &[]).user;
+        let req = Request::builder()
+            .uri("/apis/x.io/v1/y")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_proxy_with(&target(addr), &user, req, None, false).await;
+        assert_eq!(resp.status(), 302);
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            &format!("http://127.0.0.1:{}/other", addr.port())
+        );
+    }
+
+    // `Transport.RoundTrip` error -> `responder.Error` -> `http.Error(.., 503)`.
+    #[tokio::test]
+    async fn unreachable_backend_is_a_plain_text_503() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let user = test_user("alice", &[], &[]).user;
+        let req = Request::builder()
+            .uri("/apis/x.io/v1/y")
+            .body(Body::empty())
+            .unwrap();
+        let resp = serve_proxy_with(&target(addr), &user, req, None, true).await;
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(body_string(resp)
+            .await
+            .starts_with("error trying to reach service: "));
+    }
+
+    async fn serve_via_proxy(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        let target = target(addr);
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let target = target.clone();
+            async move {
+                let user = test_user("alice", &["dev"], &[]).user;
+                serve_proxy_with(&target, &user, req, None, true).await
+            }
+        });
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        a
+    }
+
+    // TestProxyUpgrade: the 101 is forwarded and both directions are spliced.
+    #[tokio::test]
+    async fn upgrade_requests_are_spliced_to_the_backend() {
+        let (addr, seen) = backend(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+        )
+        .await;
+        let front = serve_via_proxy(addr).await;
+        let mut c = TcpStream::connect(front).await.unwrap();
+        c.write_all(
+            b"GET /apis/x.io/v1/things/a/exec HTTP/1.1\r\nHost: front\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\nX-Remote-User: mallory\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        let mut b = [0u8; 512];
+        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = c.read(&mut b).await.unwrap();
+            assert!(n > 0, "closed before 101");
+            got.extend_from_slice(&b[..n]);
+        }
+        assert!(String::from_utf8_lossy(&got).starts_with("HTTP/1.1 101"));
+        c.write_all(b"hello").await.unwrap();
+        let mut echo = [0u8; 5];
+        c.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello");
+        let head = seen.lock().unwrap().to_lowercase();
+        assert!(head.contains("upgrade: spdy/3.1"), "{head}");
+        assert!(head.contains("x-remote-user: alice"), "{head}");
+        assert!(!head.contains("mallory"));
+    }
+
+    // tryUpgrade: a backend that did not upgrade and answered < 400 is an
+    // "invalid upgrade response" through the responder.
+    #[tokio::test]
+    async fn upgrade_answered_without_switching_is_a_503() {
+        let (addr, _) = backend("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let front = serve_via_proxy(addr).await;
+        let mut c = TcpStream::connect(front).await.unwrap();
+        c.write_all(
+            b"GET /x HTTP/1.1\r\nHost: front\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        // The 503 keeps the connection alive, so bound the read instead of
+        // waiting for EOF.
+        let mut got = Vec::new();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut got)).await;
+        let text = String::from_utf8_lossy(&got).to_string();
+        assert!(text.starts_with("HTTP/1.1 503"), "{text}");
+        assert!(text.contains("invalid upgrade response: status code 200"));
+    }
+
+    // tryUpgrade: an error response is forwarded as is.
+    #[tokio::test]
+    async fn upgrade_error_response_is_forwarded() {
+        let (addr, _) = backend("HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\nnope").await;
+        let front = serve_via_proxy(addr).await;
+        let mut c = TcpStream::connect(front).await.unwrap();
+        c.write_all(
+            b"GET /x HTTP/1.1\r\nHost: front\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut got = Vec::new();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.read_to_end(&mut got)).await;
+        let text = String::from_utf8_lossy(&got).to_string();
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+        assert!(text.ends_with("nope"));
+    }
+}

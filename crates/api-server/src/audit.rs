@@ -798,6 +798,15 @@ fn add_annotation_locked(ev: &mut AuditEvent, key: &str, value: &str) {
     ann.insert(key.to_string(), value.to_string());
 }
 
+/// `audit.AuditIDFrom(ctx)` (context.go): the current request's audit ID, or
+/// `None` when the request is not audited.
+pub fn audit_id_from_context() -> Option<String> {
+    AUDIT_CONTEXT
+        .try_with(|ac| ac.audit_id())
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
 /// `audit.AddAuditAnnotations(ctx, kv...)` (context.go:312): a no-op when the
 /// request is not audited (`!ac.Enabled()`).
 pub fn add_audit_annotations(kvs: &[(String, String)]) {

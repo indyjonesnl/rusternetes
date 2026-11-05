@@ -628,6 +628,86 @@ pub async fn forward_to_aggregator_with_dialer(
     }
 }
 
+/// The tail of `proxyHandler.ServeHTTP` for a resolved `target`: the request is
+/// handed to the upgrade-aware proxy over the transport whose dialer is
+/// `proxyTransportDial` (NewWithDelegate, apiserver.go:235-246: with an egress
+/// selector, `Lookup(Cluster)`; a selector with no Cluster selection leaves
+/// the default dialer).
+pub async fn proxy_request(
+    target: &AggregatorTarget,
+    auth_ctx: &AuthContext,
+    req: axum::extract::Request,
+) -> Response {
+    let dialer = crate::egress_selector::egress_selector()
+        .and_then(|s| s.lookup(crate::egress_selector::EgressType::Cluster));
+    crate::upgrade_aware::serve_proxy(target, &auth_ctx.user, req, dialer).await
+}
+
+/// The mux entry `proxyPath = "/api"` / `UnlistedHandlePrefix("/api/")` of the
+/// legacy `v1.` APIService (apiserver.go:544-546, :573-576).
+///
+/// kube-aggregator is the outermost server: its handler chain
+/// (authentication, audit, authorization, ...) runs before the mux reaches a
+/// `proxyHandler`, and the proxied request is not admitted locally. This is
+/// installed as a layer inside `with_authorization` and outside the local
+/// admission layers, so the proxy sees an authenticated, authorized request
+/// and a delegated one proceeds exactly as before.
+pub async fn legacy_api_proxy(
+    axum::extract::State(state): axum::extract::State<Arc<ApiServerState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    if path != "/api" && !path.starts_with("/api/") {
+        return next.run(req).await;
+    }
+    let Some(mgr) = crate::aggregator_mux::active_handler_manager() else {
+        return next.run(req).await;
+    };
+    // `proxyHandlers["v1."]`: nothing mounted -> the mux has no "/api" entry.
+    let Some(handler) = mgr.proxy_handler("", "v1") else {
+        return next.run(req).await;
+    };
+    match resolve_aggregator_target_for_handler(state.storage.as_ref(), "", "v1", &handler).await {
+        // `localDelegate.ServeHTTP`.
+        Ok(None) => next.run(req).await,
+        Ok(Some(target)) => {
+            // `proxyError(w, req, "missing user", http.StatusInternalServerError)`.
+            let Some(auth_ctx) = req.extensions().get::<AuthContext>().cloned() else {
+                return proxy_error_response("missing user");
+            };
+            proxy_request(&target, &auth_ctx, req).await
+        }
+        Err(resp) => resp,
+    }
+}
+
+/// The TLS config of the proxy transport for `target`, with the same trust
+/// fallbacks as the reqwest path above (an unusable caBundle falls back to
+/// insecure).
+pub(crate) fn proxy_tls_config(target: &AggregatorTarget) -> anyhow::Result<rustls::ClientConfig> {
+    let ca = if target.insecure_skip_tls_verify {
+        None
+    } else {
+        target.ca_bundle.as_deref()
+    };
+    match crate::egress_http::tls_client_config(
+        ca,
+        ca.is_none(),
+        proxy_client_identity_pem().as_deref(),
+    ) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            warn!("APIService caBundle is not usable: {e} — falling back to insecure");
+            crate::egress_http::tls_client_config(
+                None,
+                true,
+                proxy_client_identity_pem().as_deref(),
+            )
+        }
+    }
+}
+
 /// The proxy transport with a selected dialer: the TLS config of the
 /// `transport.Config` built in handler_proxy.go:221-230 (`Insecure`,
 /// `ServerName`, front-proxy `CertData`/`KeyData`, `CAData`) over
@@ -643,31 +723,9 @@ async fn forward_via_dialer(
     request_headers: &HeaderMap,
     body_bytes: Vec<u8>,
 ) -> Response {
-    // Same trust fallbacks as the reqwest path above.
-    let ca = if target.insecure_skip_tls_verify {
-        None
-    } else {
-        target.ca_bundle.as_deref()
-    };
-    let tls = match crate::egress_http::tls_client_config(
-        ca,
-        ca.is_none(),
-        proxy_client_identity_pem().as_deref(),
-    ) {
+    let tls = match proxy_tls_config(target) {
         Ok(t) => t,
-        Err(e) => {
-            warn!("APIService caBundle is not usable: {e} — falling back to insecure");
-            match crate::egress_http::tls_client_config(
-                None,
-                true,
-                proxy_client_identity_pem().as_deref(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    return service_unavailable_response(&format!("aggregator client error: {e}"))
-                }
-            }
-        }
+        Err(e) => return service_unavailable_response(&format!("aggregator client error: {e}")),
     };
     // Connect to the endpoint address; the URL host is the verification name.
     let connect_url = {

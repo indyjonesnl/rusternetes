@@ -178,6 +178,12 @@ struct Args {
     )]
     event_ttl: u64,
 
+    /// `--aggregator-reject-forwarding-redirect`: "Aggregator reject forwarding
+    /// redirect response back to client." (pkg/controlplane/apiserver/options/options.go:204,
+    /// default true).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    aggregator_reject_forwarding_redirect: bool,
+
     /// Install the API Priority and Fairness request filter
     /// (`WithPriorityAndFairness`, server/config.go:1027). Upstream enables it
     /// by default (`APIPriorityAndFairness` is GA); it is opt-in here until a
@@ -841,6 +847,9 @@ async fn main() -> Result<()> {
         None
     };
 
+    rusternetes_api_server::upgrade_aware::set_reject_forwarding_redirects(
+        args.aggregator_reject_forwarding_redirect,
+    );
     // API Priority and Fairness: installed before the router is built, which
     // layers it on the protected routes when present (#2704).
     post_start_hooks::register_generic_server_hooks(
