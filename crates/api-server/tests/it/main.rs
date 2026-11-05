@@ -269,6 +269,7 @@ mod pod_log_error_status_test;
 mod pod_probe_default_test;
 mod pod_qos_class_parity_test;
 mod pod_requests_from_limits_default_test;
+mod pod_reset_fields_filter_2226_test;
 mod pod_security_admission_test;
 mod pod_spec_decodes_when_absent_test;
 mod pod_store_test;

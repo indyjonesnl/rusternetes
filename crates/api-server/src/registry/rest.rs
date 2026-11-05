@@ -210,6 +210,14 @@ pub trait RestUpdateStrategy<T>: NamespaceScopedStrategy + Send + Sync {
     fn get_reset_fields(&self) -> crate::ssa::ResetFields {
         crate::ssa::ResetFields::new()
     }
+    /// `ResetFieldsFilterStrategy.GetResetFieldsFilter` (apiserver/pkg/
+    /// registry/rest/rest.go:391-394): a filter per apiVersion for a strategy
+    /// that resets everything but specific nested fields. Empty for a strategy
+    /// that does not implement the interface. It and [`Self::get_reset_fields`]
+    /// are alternatives (installer.go:697-711).
+    fn get_reset_fields_filter(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+    }
     /// The `typeConverter` the field manager is built with
     /// (`NewDefaultFieldManager`, installer.go:697-722) for a type whose schema
     /// is not a built-in's: a custom resource's structural schema (#2734).
@@ -787,6 +795,24 @@ pub trait RestStorage<T: Object>: Send + Sync {
     /// field manager. Empty for a storage with no `ResetFieldsStrategy`.
     fn get_reset_fields(&self) -> crate::ssa::ResetFields {
         crate::ssa::ResetFields::new()
+    }
+
+    /// `Store.GetResetFieldsFilter`: the strategy's reset-fields filter, see
+    /// `RestUpdateStrategy::get_reset_fields_filter`.
+    fn get_reset_fields_filter(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::new()
+    }
+
+    /// What `NewDefaultFieldManager` is given as `resetFields`
+    /// (endpoints/installer.go:697-711): the `ResetFieldsStrategy` set or the
+    /// `ResetFieldsFilterStrategy` filter, and an error when a storage
+    /// provides both ("may not implement both ..."), which upstream returns
+    /// from the install so the apiserver does not start. A storage that does
+    /// is a programming error here too, so it fails loudly rather than
+    /// silently picking one.
+    fn field_manager_reset_fields(&self) -> crate::ssa::ResetFields {
+        crate::ssa::ResetFields::combine(self.get_reset_fields(), self.get_reset_fields_filter())
+            .unwrap_or_else(|e| panic!("{}: {}", self.qualified_resource().resource, e))
     }
 
     /// The strategy's field-manager schema, see

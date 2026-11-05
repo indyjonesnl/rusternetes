@@ -106,7 +106,7 @@ pub async fn patch_resource<T: Object>(
                 // NewDefaultFieldManager's `resetFields` (installer.go:697-722).
                 options: ApplyOptions::new(field_manager)
                     .with_force(options.force.unwrap_or(false))
-                    .with_reset_fields(scope.store.get_reset_fields())
+                    .with_reset_fields(scope.store.field_manager_reset_fields())
                     .with_schema(scope.store.field_schema())
                     .with_converter(scope.store.field_converter())
                     // buildManagerInfoManager.subresource (buildmanagerinfo.go:55-61).

@@ -153,7 +153,7 @@ impl<T: Object> RequestScope<T> {
         crate::fieldmanager::FieldManager::new(
             &api_version,
             self.subresource,
-            self.store.get_reset_fields(),
+            self.store.field_manager_reset_fields(),
         )
         .with_schema(schema)
         .with_converter(self.store.field_converter())

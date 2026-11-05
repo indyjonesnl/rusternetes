@@ -1780,6 +1780,11 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.update_strategy.get_reset_fields()
     }
 
+    /// `Store.GetResetFieldsFilter`, see `RestUpdateStrategy::get_reset_fields_filter`.
+    fn get_reset_fields_filter(&self) -> crate::ssa::ResetFields {
+        self.update_strategy.get_reset_fields_filter()
+    }
+
     fn field_schema(
         &self,
     ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {

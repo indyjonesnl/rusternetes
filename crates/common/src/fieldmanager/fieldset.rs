@@ -112,6 +112,45 @@ impl Set {
         out
     }
 
+    /// `Set.FilterIncludeMatches` (fieldpath/set.go:323-342) and
+    /// `SetNodeMap.FilterIncludeMatches` (:704-728): only the field paths
+    /// `pattern` matches.
+    ///
+    /// Upstream keeps a `Set`'s members and its children apart; here an
+    /// element is one node carrying both. An element survives when a matcher
+    /// at its level matches it (a wildcard takes precedence), keeping its
+    /// member flag whatever that matcher's child says, and its children are
+    /// filtered by that matcher's child; a node with neither left is dropped.
+    pub fn filter_include_matches(&self, pattern: &SetMatcher) -> Set {
+        if pattern.wildcard {
+            return self.clone();
+        }
+        let mut out = Set::new();
+        for (element, node) in &self.children {
+            let matcher = pattern
+                .members
+                .iter()
+                .find(|(pm, _)| *pm == PathElementMatcher::Any)
+                .or_else(|| pattern.members.iter().find(|(pm, _)| pm.matches(element)));
+            let Some((_, child_matcher)) = matcher else {
+                continue;
+            };
+            let below = Set {
+                member: false,
+                children: node.children.clone(),
+            }
+            .filter_include_matches(child_matcher);
+            let kept = Set {
+                member: node.member,
+                children: below.children,
+            };
+            if !kept.is_empty() {
+                out.children.insert(element.clone(), kept);
+            }
+        }
+        out
+    }
+
     /// `Set.Intersection`.
     pub fn intersection(&self, other: &Set) -> Set {
         let mut out = Set {
@@ -241,6 +280,144 @@ pub struct Comparison {
     pub removed: Set,
     pub modified: Set,
     pub added: Set,
+}
+
+/// `fieldpath.PathElementMatcher` (set.go:290-299): any element, or the one
+/// element (`"f:name"`, `"k:{...}"`, `"v:..."`, `"i:N"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathElementMatcher {
+    /// `MatchAnyPathElement()`.
+    Any,
+    Element(String),
+}
+
+impl PathElementMatcher {
+    /// A plain field name, `PathElementMatcher{PathElement{FieldName}}`.
+    pub fn field(name: &str) -> Self {
+        Self::Element(format!("f:{name}"))
+    }
+
+    /// A list index, `PathElementMatcher{PathElement{Index}}`.
+    pub fn index(index: usize) -> Self {
+        Self::Element(format!("i:{index}"))
+    }
+
+    /// A scalar or set-type list element, `PathElement{Value}`.
+    pub fn value(value: &Value) -> Self {
+        Self::Element(format!("v:{value}"))
+    }
+
+    /// A list-map key, `PathElement{Key}`: the key fields as a sorted JSON
+    /// object. `None` when there is no key field (upstream: "associative list
+    /// key type path elements must have at least one key").
+    pub fn key(keys: &[(&str, Value)]) -> Option<Self> {
+        if keys.is_empty() {
+            return None;
+        }
+        let sorted: BTreeMap<&str, &Value> = keys.iter().map(|(k, v)| (*k, v)).collect();
+        Some(Self::Element(format!(
+            "k:{}",
+            serde_json::to_string(&sorted).ok()?
+        )))
+    }
+
+    fn matches(&self, element: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Element(e) => e == element,
+        }
+    }
+}
+
+/// `fieldpath.SetMatcher` (set.go:229-239): a `Set` with wildcards.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SetMatcher {
+    wildcard: bool,
+    members: Vec<(PathElementMatcher, SetMatcher)>,
+}
+
+impl SetMatcher {
+    /// `MatchAnySet()`.
+    pub fn any() -> Self {
+        Self {
+            wildcard: true,
+            members: Vec::new(),
+        }
+    }
+
+    /// `PrefixMatcher(parts...)` (set.go:171-209): every field path prefixed
+    /// by `parts`.
+    pub fn prefix(parts: &[PathElementMatcher]) -> Self {
+        let mut current = Self::any();
+        for part in parts.iter().rev() {
+            current = Self {
+                wildcard: false,
+                members: vec![(part.clone(), current)],
+            };
+        }
+        current
+    }
+
+    /// `SetMatcher.Merge` (set.go:255-273): matches what either matches.
+    pub fn merge(&self, other: &SetMatcher) -> SetMatcher {
+        if self.wildcard || other.wildcard {
+            return Self::any();
+        }
+        let mut members = self.members.clone();
+        for (path, child) in &other.members {
+            match members.iter_mut().find(|(p, _)| p == path) {
+                Some((_, existing)) => *existing = existing.merge(child),
+                None => members.push((path.clone(), child.clone())),
+            }
+        }
+        Self {
+            wildcard: false,
+            members,
+        }
+    }
+}
+
+/// `fieldpath.Filter` (set.go:767-780): what a strategy tells the field
+/// manager it resets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// `NewExcludeSetFilter`: removes the paths in the set and everything under
+    /// them.
+    Exclude(Set),
+    /// `NewIncludeMatcherFilter`: removes everything the matcher does not
+    /// match.
+    IncludeMatcher(SetMatcher),
+}
+
+impl Filter {
+    /// `NewIncludeMatcherFilter(matchers...)` (set.go:803-814): no matcher
+    /// includes everything.
+    pub fn include_matcher(matchers: &[SetMatcher]) -> Filter {
+        let mut iter = matchers.iter();
+        let Some(first) = iter.next() else {
+            return Filter::IncludeMatcher(SetMatcher::any());
+        };
+        Filter::IncludeMatcher(iter.fold(first.clone(), |acc, m| acc.merge(m)))
+    }
+
+    /// `Filter.Filter`: a filtered copy of the set.
+    pub fn filter(&self, set: &Set) -> Set {
+        match self {
+            Filter::Exclude(exclude) => set.recursive_difference(exclude),
+            Filter::IncludeMatcher(matcher) => set.filter_include_matches(matcher),
+        }
+    }
+}
+
+impl Comparison {
+    /// `Comparison.FilterFields` (typed/compare.go:75-83).
+    pub fn filter_fields(&self, filter: &Filter) -> Comparison {
+        Comparison {
+            removed: filter.filter(&self.removed),
+            modified: filter.filter(&self.modified),
+            added: filter.filter(&self.added),
+        }
+    }
 }
 
 impl Comparison {

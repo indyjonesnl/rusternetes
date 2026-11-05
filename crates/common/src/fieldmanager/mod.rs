@@ -48,14 +48,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::fieldset::{field_path, Fields, Set};
+pub use self::fieldset::{Filter, PathElementMatcher, SetMatcher};
 use self::versionconverter::{Converter, UpdateFailure};
 
 /// `map[fieldpath.APIVersion]*fieldpath.Set`: what a strategy resets on write,
 /// per `group/version` (`rest.ResetFieldsStrategy.GetResetFields`,
 /// apiserver/pkg/registry/rest/rest.go:385-389). Each set is a list of field
 /// paths (`fieldpath.MakePathOrDie("status")` is `["status"]`).
+///
+/// A strategy may instead provide a `fieldpath.Filter` per version
+/// (`rest.ResetFieldsFilterStrategy.GetResetFieldsFilter`, rest.go:391-394),
+/// for a subresource that writes only specific nested fields: see
+/// [`ResetFields::with_filter`]. The two are alternatives
+/// ([`ResetFields::combine`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResetFields(BTreeMap<String, Vec<Vec<String>>>);
+pub struct ResetFields {
+    sets: BTreeMap<String, Vec<Vec<String>>>,
+    filters: BTreeMap<String, Filter>,
+}
 
 impl ResetFields {
     pub fn new() -> Self {
@@ -64,7 +74,7 @@ impl ResetFields {
 
     /// Add the set reset in `api_version` (`"networking.k8s.io/v1"`).
     pub fn with(mut self, api_version: &str, paths: &[&[&str]]) -> Self {
-        self.0.insert(
+        self.sets.insert(
             api_version.to_string(),
             paths
                 .iter()
@@ -74,9 +84,54 @@ impl ResetFields {
         self
     }
 
+    /// `GetResetFieldsFilter()[version]`: the filter this strategy resets
+    /// `api_version` through (`fieldpath.NewIncludeMatcherFilter` and
+    /// friends).
+    pub fn with_filter(mut self, api_version: &str, filter: Filter) -> Self {
+        self.filters.insert(api_version.to_string(), filter);
+        self
+    }
+
     /// `GetResetFields()[version]`: empty when the version has no entry.
     pub fn for_version(&self, api_version: &str) -> &[Vec<String>] {
-        self.0.get(api_version).map(Vec::as_slice).unwrap_or(&[])
+        self.sets.get(api_version).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The filter applied for `api_version`, `None` when nothing is reset:
+    /// the `ResetFieldsStrategy` set as an exclude filter
+    /// (`NewExcludeFilterSetMap`), or the strategy's own filter.
+    pub fn filter_for(&self, api_version: &str) -> Option<Filter> {
+        if let Some(filter) = self.filters.get(api_version) {
+            return Some(filter.clone());
+        }
+        let paths = self.for_version(api_version);
+        if paths.is_empty() {
+            return None;
+        }
+        let mut set = Set::new();
+        for path in paths {
+            let names: Vec<&str> = path.iter().map(String::as_str).collect();
+            set.insert(&field_path(&names));
+        }
+        Some(Filter::Exclude(set))
+    }
+
+    /// The reset fields `NewDefaultFieldManager` is built with
+    /// (endpoints/installer.go:697-711): a storage provides a
+    /// `ResetFieldsStrategy` or a `ResetFieldsFilterStrategy`, "may not
+    /// implement both". A strategy implements one by returning something
+    /// from it.
+    pub fn combine(sets: ResetFields, filters: ResetFields) -> Result<ResetFields, String> {
+        if !sets.sets.is_empty() && !filters.filters.is_empty() {
+            return Err(
+                "may not implement both ResetFieldsStrategy and ResetFieldsFilterStrategy"
+                    .to_string(),
+            );
+        }
+        Ok(ResetFields {
+            sets: sets.sets,
+            filters: filters.filters,
+        })
     }
 }
 
@@ -333,7 +388,7 @@ impl FieldManager {
         // stripMetaManager.Update and structuredMergeManager.Update, which is
         // `merge.Updater.Update` (update.go:167-204) with the name "current-operation"
         // as the manager, so no entry is skipped.
-        let exclude = self.reset_set();
+        let reset = self.reset_filter();
         // update.go:112-139: other managers lose what this operation changed
         // (force is true for an update) and what it removed, each compared at
         // its own version.
@@ -346,8 +401,8 @@ impl FieldManager {
         let changed = comparison.modified.union(&comparison.added);
 
         let mut current = changed;
-        if !exclude.is_empty() {
-            current = current.recursive_difference(&exclude);
+        if let Some(reset) = &reset {
+            current = reset.filter(&current);
         }
         // stripMetaManager.stripFields (stripmeta.go:44-56, 87-101).
         current = current.difference(&strip_set());
@@ -376,19 +431,14 @@ impl FieldManager {
         Ok(managed)
     }
 
-    /// The strategy's reset fields for this version, as a set.
-    fn reset_set(&self) -> Set {
-        self.reset_set_for(&self.api_version)
+    /// The strategy's reset filter for this version.
+    fn reset_filter(&self) -> Option<Filter> {
+        self.reset_filter_for(&self.api_version)
     }
 
-    /// `GetResetFields()[version]` as a set.
-    pub(crate) fn reset_set_for(&self, version: &str) -> Set {
-        let mut set = Set::new();
-        for path in self.reset_fields.for_version(version) {
-            let names: Vec<&str> = path.iter().map(String::as_str).collect();
-            set.insert(&field_path(&names));
-        }
-        set
+    /// `GetResetFields()[version]` / `GetResetFieldsFilter()[version]`.
+    pub(crate) fn reset_filter_for(&self, version: &str) -> Option<Filter> {
+        self.reset_fields.filter_for(version)
     }
 }
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use rusternetes_common::equality::semantic_equal;
+use rusternetes_common::fieldmanager::{Filter, PathElementMatcher, SetMatcher};
 use rusternetes_common::podutil::update_pod_condition;
 use rusternetes_common::resources::pod::PodSpec;
 use rusternetes_common::resources::pod::{AppArmorProfile, PodAffinityTerm, SecurityContext};
@@ -599,6 +600,19 @@ impl NamespaceScopedStrategy for EphemeralContainersStrategy {
 }
 
 impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
+    /// `GetResetFieldsFilter` (core/pod/strategy.go:333-340): only
+    /// `spec.ephemeralContainers` is written through this subresource, so a
+    /// manager owns nothing else.
+    fn get_reset_fields_filter(&self) -> ResetFields {
+        ResetFields::new().with_filter(
+            "v1",
+            Filter::include_matcher(&[SetMatcher::prefix(&[
+                PathElementMatcher::field("spec"),
+                PathElementMatcher::field("ephemeralContainers"),
+            ])]),
+        )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
@@ -716,6 +730,29 @@ fn container_resources_changed(old: &Pod, new: &Pod) -> bool {
 }
 
 impl RestUpdateStrategy<Pod> for ResizeStrategy {
+    /// `GetResetFieldsFilter` (core/pod/strategy.go:437-445, filter at
+    /// :349-355): only the containers' `resources` and `resizePolicy` are
+    /// written through `/resize`.
+    fn get_reset_fields_filter(&self) -> ResetFields {
+        let matcher = |list: &str, field: &str| {
+            SetMatcher::prefix(&[
+                PathElementMatcher::field("spec"),
+                PathElementMatcher::field(list),
+                PathElementMatcher::Any,
+                PathElementMatcher::field(field),
+            ])
+        };
+        ResetFields::new().with_filter(
+            "v1",
+            Filter::include_matcher(&[
+                matcher("containers", "resources"),
+                matcher("containers", "resizePolicy"),
+                matcher("initContainers", "resources"),
+                matcher("initContainers", "resizePolicy"),
+            ]),
+        )
+    }
+
     fn allow_create_on_update(&self) -> bool {
         false
     }
