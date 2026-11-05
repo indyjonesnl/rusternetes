@@ -63,6 +63,7 @@ pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
 pub mod request_header_authentication;
+pub mod shared_informer_factory;
 pub mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
 pub mod cache_metrics;
@@ -509,7 +510,12 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         .unwrap_or(6443);
 
     // This entry point never enables APF (no `--enable-priority-and-fairness`).
-    post_start_hooks::register_generic_server_hooks(post_start_hooks::global(), false);
+    post_start_hooks::register_generic_server_hooks(
+        post_start_hooks::global(),
+        shared_informer_factory::global(),
+        storage.clone(),
+        false,
+    );
     // So `WithMaxInFlightLimit` stands in for it (server/config.go:1033), at
     // the flags' upstream defaults.
     if let Some(limits) = max_in_flight_filter::MaxInFlight::new(

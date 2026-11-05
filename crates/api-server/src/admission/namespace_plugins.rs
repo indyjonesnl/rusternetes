@@ -29,9 +29,18 @@ fn is_namespace_kind(kind: &GroupVersionKind) -> bool {
     kind.group.is_empty() && kind.kind == "Namespace"
 }
 
-/// Whether the namespace exists, read live from storage. Any read error other
-/// than NotFound is returned as is for the caller to wrap.
+/// Whether the namespace exists: from the namespace informer's cache when it
+/// has synced and holds it, else read live from storage. NamespaceLifecycle
+/// does the same (`namespace/lifecycle/admission.go` `Admit`: lister `Get`,
+/// then on a miss a live `Namespaces().Get` "in case the cache is stale").
+/// Any read error other than NotFound is returned as is for the caller to
+/// wrap.
 pub async fn namespace_exists(storage: &StorageBackend, name: &str) -> Result<bool> {
+    if let Some(informer) = crate::shared_informer_factory::global().existing("namespaces") {
+        if informer.has_synced() && informer.store().get(name).is_some() {
+            return Ok(true);
+        }
+    }
     match storage
         .get::<serde_json::Value>(&build_key("namespaces", None, name))
         .await

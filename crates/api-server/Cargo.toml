@@ -65,6 +65,7 @@ http-body = "1"
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+rusternetes-client = { path = "../client" }
 async-stream = "0.3"
 tokio-stream = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -100,7 +101,6 @@ prost-build = "0.13"
 
 [dev-dependencies]
 rusternetes-controller-manager = { path = "../controller-manager" }
-rusternetes-client = { path = "../client" }
 tokio-rustls = { workspace = true }
 tokio-test = "0.4"
 jsonwebtoken.workspace = true
