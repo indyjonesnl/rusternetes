@@ -25,7 +25,7 @@
 
 use super::node_graph::{NodeGraph, VertexType};
 use super::reasons::quoted;
-use super::{node_rules_allow, Authorizer, Decision, Opinion, RequestAttributes};
+use super::{node_rules_allow, Authorizer, Decision, Opinion, RequestAttributes, UserRulesOutcome};
 use crate::auth::UserInfo;
 use crate::error::Result;
 use crate::feature_gates::{self, Feature};
@@ -594,42 +594,31 @@ impl Authorizer for NodeAuthorizer {
         })
     }
 
+    /// `RulesFor` (node_authorizer.go:101-107): a node has no enumerable
+    /// rules (`nil, nil, false, nil` for a non-node).
     async fn get_user_rules(
+        &self,
+        _user: &UserInfo,
+        _namespace: &str,
+    ) -> Result<(Vec<ResourceRule>, Vec<crate::resources::NonResourceRule>)> {
+        Ok((vec![], vec![]))
+    }
+
+    /// `RulesFor` (node_authorizer.go:101-107): "indicate nodes do not have
+    /// fully enumerated permissions": no rules, `incomplete` and the error
+    /// "node authorizer does not support user rule resolution".
+    async fn get_user_rules_outcome(
         &self,
         user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<crate::resources::NonResourceRule>)> {
-        // Upstream's RulesFor reports "node authorizer does not support user
-        // rule resolution" for nodes; the representative rules below predate
-        // the graph.
-        if !Self::node_identity(user).1 {
-            return Ok((vec![], vec![]));
+    ) -> Result<UserRulesOutcome> {
+        if Self::node_identity(user).1 {
+            return Ok(UserRulesOutcome {
+                incomplete: true,
+                error: Some("node authorizer does not support user rule resolution".to_string()),
+                ..Default::default()
+            });
         }
-        let rule = |verbs: &[&str], resources: &[&str]| ResourceRule {
-            verbs: verbs.iter().map(|s| s.to_string()).collect(),
-            api_groups: Some(vec!["".to_string()]),
-            resources: Some(resources.iter().map(|s| s.to_string()).collect()),
-            resource_names: None,
-        };
-        Ok((
-            vec![
-                rule(
-                    &["get", "list", "watch"],
-                    &[
-                        "services",
-                        "endpoints",
-                        "nodes",
-                        "pods",
-                        "secrets",
-                        "configmaps",
-                        "persistentvolumeclaims",
-                        "persistentvolumes",
-                    ],
-                ),
-                rule(&["create"], &["events"]),
-                rule(&["update", "patch"], &["nodes", "pods"]),
-            ],
-            vec![],
-        ))
+        Ok(UserRulesOutcome::default())
     }
 }
