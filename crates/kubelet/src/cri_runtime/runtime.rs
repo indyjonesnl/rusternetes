@@ -417,6 +417,9 @@ pub struct CriContainerRuntime {
     /// used to default unset resourceFieldRef LIMITS into downward-API env
     /// (upstream `MergeContainerResourceLimits`). Empty leaves such vars unset.
     pub node_allocatable: std::collections::HashMap<String, String>,
+    /// `imageManager.backOff` + `prevPullErrMsg` (`image_manager.go`), shared
+    /// across clones so every pod sync sees the same back-off state.
+    pub pull_back_off: Arc<crate::image_manager::PullBackOff>,
 }
 
 impl CriContainerRuntime {
@@ -441,6 +444,7 @@ impl CriContainerRuntime {
             node_ips: Vec::new(),
             host_ips: Arc::new(std::sync::Mutex::new(Vec::new())),
             node_allocatable: std::collections::HashMap::new(),
+            pull_back_off: Arc::new(crate::image_manager::PullBackOff::default()),
         })
     }
 
@@ -824,6 +828,29 @@ impl CriContainerRuntime {
                 }));
             }
         }
+        // `pullImage` (`image_manager.go:332-353`): the back-off is keyed
+        // `<podUID>_<image>`; without an object reference upstream has no pod
+        // either (`podUID` is empty for image volumes' callers).
+        let back_off_key = im::back_off_key(
+            event_ctx
+                .map(|(p, _)| p.metadata.uid.as_str())
+                .unwrap_or_default(),
+            image,
+        );
+        if let im::BackOffCheck::BackOff {
+            event_message,
+            message,
+        } = self
+            .pull_back_off
+            .check(&back_off_key, image, std::time::Instant::now())
+        {
+            log_it(EventType::Normal, im::BACK_OFF_PULL_IMAGE, event_message).await;
+            return Err(ImageManagerError {
+                kind: ImageErrorKind::ImagePullBackOff,
+                message,
+            }
+            .into());
+        }
         // `pullImage` (`image_manager.go:300-359`).
         log_it(
             EventType::Normal,
@@ -850,9 +877,17 @@ impl CriContainerRuntime {
                 )
                 .await;
                 let (message, kind) = im::eval_cri_pull_err(image, &e.to_string());
+                self.pull_back_off.record_failure(
+                    &back_off_key,
+                    kind,
+                    &message,
+                    std::time::Instant::now(),
+                );
                 return Err(ImageManagerError { kind, message }.into());
             }
         };
+        // `m.backOff.GC()` (`image_manager.go:378`).
+        self.pull_back_off.record_success(std::time::Instant::now());
         // `puller.go:58-61`: best-effort `GetImageSize` (an `ImageStatus`).
         let size = if image_ref.is_empty() {
             0
