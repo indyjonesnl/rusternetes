@@ -32,10 +32,10 @@ pub fn ensure_service_account_name(spec: &mut PodSpec) -> String {
 
 /// Build the projected `kube-api-access` SA-token volume (token + ca.crt +
 /// namespace), matching upstream `TokenVolumeSource()`.
-fn sa_token_volume() -> Volume {
+fn sa_token_volume(name: String) -> Volume {
     Volume {
         legacy_sources: Default::default(),
-        name: SA_TOKEN_VOLUME_NAME.to_string(),
+        name,
         empty_dir: None,
         host_path: None,
         config_map: None,
@@ -101,35 +101,33 @@ fn sa_token_volume() -> Volume {
     }
 }
 
-/// Inject the `kube-api-access` projected volume into `spec` and mount it
+/// Inject the `kube-api-access-*` projected volume into `spec` and mount it
 /// read-only into every container and init container. Idempotent.
 ///
 /// Port of `Plugin.mountServiceAccountToken`
 /// (plugin/pkg/admission/serviceaccount/admission.go:416-480): an existing
 /// volume named `kube-api-access-*` is reused (its name is the mount's); a
-/// container already mounting `DefaultAPITokenMountPath` is left alone; and
-/// the volume is added only when some container needed the mount.
-/// Deviation: a fresh volume is named `kube-api-access` rather than
-/// `GenerateName("kube-api-access-")`, as other components address it by that
-/// name.
+/// container already mounting `DefaultAPITokenMountPath` is left alone; the
+/// volume is added only when some container needed the mount; and a fresh
+/// volume is named `GenerateName("kube-api-access-")` (admission.go:432,
+/// `names.SimpleNameGenerator`). Consumers find it by that prefix or by its
+/// projected serviceAccountToken source, never by the bare name.
 ///
 /// Callers are responsible for the `automountServiceAccountToken` decision —
 /// only call this when the token should be mounted.
 pub fn add_kube_api_access_volume(spec: &mut PodSpec) {
+    let prefix = format!("{SA_TOKEN_VOLUME_NAME}-");
     let existing = spec
         .volumes
         .iter()
         .flatten()
-        .find(|v| {
-            v.name == SA_TOKEN_VOLUME_NAME
-                || v.name.starts_with(&format!("{SA_TOKEN_VOLUME_NAME}-"))
-        })
+        .find(|v| v.name.starts_with(&prefix))
         .map(|v| v.name.clone());
     let has_token_volume = existing.is_some();
-    let volume_name = existing.unwrap_or_else(|| SA_TOKEN_VOLUME_NAME.to_string());
+    let volume_name = existing.unwrap_or_else(|| crate::names::simple_name_generator(&prefix));
 
     let mount = VolumeMount {
-        name: volume_name,
+        name: volume_name.clone(),
         mount_path: SA_TOKEN_MOUNT_PATH.to_string(),
         read_only: Some(true),
         sub_path: None,
@@ -170,7 +168,7 @@ pub fn add_kube_api_access_volume(spec: &mut PodSpec) {
     if !has_token_volume && needs_token_volume {
         spec.volumes
             .get_or_insert_with(Vec::new)
-            .push(sa_token_volume());
+            .push(sa_token_volume(volume_name));
     }
 }
 

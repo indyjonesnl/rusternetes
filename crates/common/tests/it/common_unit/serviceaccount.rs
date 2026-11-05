@@ -103,7 +103,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .iter()
-            .find(|v| v.name == SA_TOKEN_VOLUME_NAME)
+            .find(|v| v.name.starts_with("kube-api-access-"))
             .expect("volume injected");
         let sources = vol.projected.as_ref().unwrap().sources.as_ref().unwrap();
         assert_eq!(sources.len(), 3, "token + ca.crt + namespace");
@@ -127,7 +127,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .iter()
-                .filter(|v| v.name == SA_TOKEN_VOLUME_NAME)
+                .filter(|v| v.name.starts_with("kube-api-access-"))
                 .count(),
             1
         );
@@ -141,5 +141,36 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // admission_test.go TestAdmit: a fresh token volume is generated as
+    // `kube-api-access-<5 random>` and the mount uses the same name.
+    #[test]
+    fn fresh_token_volume_name_is_generated() {
+        let mut spec = spec_with_container();
+        add_kube_api_access_volume(&mut spec);
+        let name = spec.volumes.as_ref().unwrap()[0].name.clone();
+        assert!(name.starts_with("kube-api-access-"), "{name}");
+        assert_eq!(name.len(), "kube-api-access-".len() + 5);
+        assert_eq!(
+            spec.containers[0].volume_mounts.as_ref().unwrap()[0].name,
+            name
+        );
+        // Two pods get different names (with overwhelming probability).
+        let mut other = spec_with_container();
+        add_kube_api_access_volume(&mut other);
+        assert_ne!(other.volumes.as_ref().unwrap()[0].name, name);
+    }
+
+    // The bare name is not the upstream prefix and is not reused.
+    #[test]
+    fn bare_kube_api_access_name_is_not_reused() {
+        let mut spec = spec_with_container();
+        spec.volumes = Some(vec![serde_json::from_value(
+            serde_json::json!({"name": "kube-api-access", "emptyDir": {}}),
+        )
+        .unwrap()]);
+        add_kube_api_access_volume(&mut spec);
+        assert_eq!(spec.volumes.as_ref().unwrap().len(), 2);
     }
 }
