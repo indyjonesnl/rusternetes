@@ -65,6 +65,7 @@ pub mod registry;
 pub mod request_header_authentication;
 pub mod storage_readiness_hook;
 pub use rusternetes_protobuf as protobuf;
+pub mod cache_metrics;
 pub mod cache_watcher;
 pub mod fieldmanager;
 pub mod response;

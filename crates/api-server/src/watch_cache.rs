@@ -121,6 +121,42 @@ const IDLE_GC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 /// missed event. Bounded staleness instead of a silent forever-wedge (#1165).
 const WATCH_LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// What a watcher is interested in, as far as the cache's dispatch index and
+/// metrics are concerned (the `cacheWatcher` fields upstream derives from
+/// `storage.SelectionPredicate` and the cacher's `groupResource`).
+#[derive(Debug, Clone, Default)]
+pub struct WatchScope {
+    /// `Cacher.groupResource` (metric labels).
+    pub group: String,
+    pub resource: String,
+    /// `pred.Field.RequiresExactMatch("metadata.name")`: the watcher is
+    /// registered under `namespacedName{name}` and offered only that name's
+    /// events.
+    pub name: Option<String>,
+}
+
+impl WatchScope {
+    pub fn new(group: &str, resource: &str, field_selector: Option<&str>) -> Self {
+        let name = field_selector
+            .and_then(|s| rusternetes_common::field_selector::FieldSelector::parse(s).ok())
+            .and_then(|sel| {
+                sel.requirements()
+                    .iter()
+                    .find(|r| {
+                        r.field == "metadata.name"
+                            && r.operator
+                                == rusternetes_common::field_selector::FieldOperator::Equals
+                    })
+                    .map(|r| r.value.clone())
+            });
+        Self {
+            group: group.to_string(),
+            resource: resource.to_string(),
+            name,
+        }
+    }
+}
+
 /// A cached watch event with metadata
 #[derive(Debug, Clone)]
 pub struct CachedWatchEvent {
@@ -194,7 +230,12 @@ impl WatchCache {
     /// Returns a broadcast receiver that will receive all events for this prefix.
     /// If no etcd watch exists for this prefix, one is started.
     pub async fn subscribe(&self, prefix: &str) -> WatchReceiver {
-        self.subscribe_with_floor(prefix, None).await
+        self.subscribe_scoped(prefix, &WatchScope::default()).await
+    }
+
+    /// [`Self::subscribe`] for a watch with the given [`WatchScope`].
+    pub async fn subscribe_scoped(&self, prefix: &str, scope: &WatchScope) -> WatchReceiver {
+        self.subscribe_with_floor(prefix, None, scope).await
     }
 
     /// Like [`subscribe`], but when THIS call creates the shared watcher, start
@@ -209,13 +250,16 @@ impl WatchCache {
         &self,
         prefix: &str,
         desired_floor: Option<i64>,
+        scope: &WatchScope,
     ) -> WatchReceiver {
         // Check if we already have a watcher for this prefix
         {
             let watchers = self.watchers.read().await;
             if let Some(d) = watchers.get(prefix) {
+                let d = d.clone();
+                drop(watchers);
                 let cap = self.current_capacity(prefix).await;
-                return d.add_watcher(cap);
+                return d.add_scoped(cap, scope);
             }
         }
 
@@ -230,10 +274,10 @@ impl WatchCache {
                 let existing = existing.clone();
                 drop(watchers);
                 let cap = self.current_capacity(prefix).await;
-                return existing.add_watcher(cap);
+                return existing.add_scoped(cap, scope);
             }
             watchers.insert(prefix.to_string(), dispatcher.clone());
-            dispatcher.add_watcher(LOWER_BOUND_CAPACITY)
+            dispatcher.add_scoped(LOWER_BOUND_CAPACITY, scope)
         };
 
         // Record the replay floor BEFORE the shared watch starts: the ring is
@@ -620,11 +664,22 @@ impl WatchCache {
         prefix: &str,
         since_revision: i64,
     ) -> Result<(Vec<CachedWatchEvent>, WatchReceiver), i64> {
+        self.subscribe_from_checked_scoped(prefix, since_revision, &WatchScope::default())
+            .await
+    }
+
+    /// [`Self::subscribe_from_checked`] for a watch with the given [`WatchScope`].
+    pub async fn subscribe_from_checked_scoped(
+        &self,
+        prefix: &str,
+        since_revision: i64,
+        scope: &WatchScope,
+    ) -> Result<(Vec<CachedWatchEvent>, WatchReceiver), i64> {
         // Subscribe first: creates the shared watcher if absent, flooring it at
         // the client's RV so the very first watch of an on-demand prefix is
         // served (backend replay from rv+1 fills the ring for it).
         let rx = self
-            .subscribe_with_floor(prefix, Some(since_revision))
+            .subscribe_with_floor(prefix, Some(since_revision), scope)
             .await;
         let mut floor = self.floors.read().await.get(prefix).copied().unwrap_or(0);
         if since_revision < floor {

@@ -285,6 +285,7 @@ async fn open_watch_stream(
     state: &ApiServerState,
     prefix: &str,
     requested_rv: Option<&str>,
+    scope: &crate::watch_cache::WatchScope,
 ) -> Result<std::result::Result<rusternetes_storage::WatchStream, Response>> {
     // `cacher.Watch` (storage/cacher/cacher.go:513-516) and `etcd3.store.Watch`
     // (storage/etcd3/store.go:967-970) return `ParseResourceVersion`'s
@@ -304,7 +305,7 @@ async fn open_watch_stream(
         .filter(|&rv| rv > 0 && rv <= current_rev + 1000);
 
     let Some(since_rev) = replay_revision else {
-        let rx = state.watch_cache.subscribe(prefix).await;
+        let rx = state.watch_cache.subscribe_scoped(prefix, scope).await;
         return Ok(Ok(crate::watch_cache::broadcast_to_stream(rx)));
     };
 
@@ -338,7 +339,7 @@ async fn open_watch_stream(
     // subscriber at once.
     match state
         .watch_cache
-        .subscribe_from_checked(prefix, since_rev)
+        .subscribe_from_checked_scoped(prefix, since_rev, scope)
         .await
     {
         Ok((history, rx)) => {
@@ -616,7 +617,18 @@ where
     let (bookmark_kind, bookmark_api_version) =
         bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
-    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+    let watch_stream = match open_watch_stream(
+        &state,
+        &prefix,
+        requested_rv.as_deref(),
+        &crate::watch_cache::WatchScope::new(
+            api_group,
+            resource_type,
+            params.field_selector.as_deref(),
+        ),
+    )
+    .await?
+    {
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
@@ -1179,7 +1191,18 @@ where
     let (bookmark_kind, bookmark_api_version) =
         bookmark_gvk.unwrap_or_else(|| resource_type_to_kind_and_version(resource_type, api_group));
 
-    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+    let watch_stream = match open_watch_stream(
+        &state,
+        &prefix,
+        requested_rv.as_deref(),
+        &crate::watch_cache::WatchScope::new(
+            api_group,
+            resource_type,
+            params.field_selector.as_deref(),
+        ),
+    )
+    .await?
+    {
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
@@ -3147,7 +3170,18 @@ pub async fn watch_cluster_scoped_json(
     // cache ring, which is critical for CRD Established condition delivery —
     // the Go informer ignores a duplicate ADDED but processes a MODIFIED.
     let requested_rv = params.resource_version.clone();
-    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+    let watch_stream = match open_watch_stream(
+        &state,
+        &prefix,
+        requested_rv.as_deref(),
+        &crate::watch_cache::WatchScope::new(
+            api_group,
+            resource_type,
+            params.field_selector.as_deref(),
+        ),
+    )
+    .await?
+    {
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };
@@ -3381,7 +3415,18 @@ pub async fn watch_namespaced_json(
 
     let prefix = build_prefix(resource_type, Some(&namespace));
     let requested_rv = params.resource_version.clone();
-    let watch_stream = match open_watch_stream(&state, &prefix, requested_rv.as_deref()).await? {
+    let watch_stream = match open_watch_stream(
+        &state,
+        &prefix,
+        requested_rv.as_deref(),
+        &crate::watch_cache::WatchScope::new(
+            api_group,
+            resource_type,
+            params.field_selector.as_deref(),
+        ),
+    )
+    .await?
+    {
         Ok(stream) => stream,
         Err(expired) => return Ok(expired),
     };

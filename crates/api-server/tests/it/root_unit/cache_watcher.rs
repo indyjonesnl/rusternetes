@@ -3,7 +3,7 @@
 //! `Cacher.dispatchEvent` semantics of `cache_watcher_test.go` / `cacher.go`.
 use rusternetes_api_server::cache_watcher::*;
 use rusternetes_api_server::watch_cache::{
-    CachedWatchEvent, WatchEventData, EVENT_FRESH_DURATION, LOWER_BOUND_CAPACITY,
+    CachedWatchEvent, WatchEventData, WatchScope, EVENT_FRESH_DURATION, LOWER_BOUND_CAPACITY,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -149,4 +149,64 @@ async fn dropped_consumer_is_forgotten() {
     assert_eq!(d.receiver_count(), 0);
     d.dispatch("p", &ev(1)).await;
     d.terminate_all();
+}
+
+/// `startDispatching` (`cacher.go:1039`): a watcher scoped to a name only sees
+/// that name's events; unscoped watchers see everything.
+#[tokio::test]
+async fn name_scoped_watcher_is_offered_only_its_name() {
+    let d = Dispatcher::new();
+    let mut all = d.add_watcher(LOWER_BOUND_CAPACITY);
+    let scope = WatchScope::new("", "pods", Some("metadata.name=p2"));
+    assert_eq!(scope.name.as_deref(), Some("p2"));
+    let mut only = d.add_scoped(LOWER_BOUND_CAPACITY, &scope);
+    for rev in 1..=3 {
+        d.dispatch("/registry/pods/", &ev(rev)).await;
+    }
+    let got: Vec<_> = vec![
+        all.recv().await.unwrap().revision,
+        all.recv().await.unwrap().revision,
+        all.recv().await.unwrap().revision,
+    ];
+    assert_eq!(got, [1, 2, 3]);
+    assert_eq!(only.recv().await.unwrap().revision, 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), only.recv())
+            .await
+            .is_err(),
+        "no other name is offered"
+    );
+    assert_eq!(d.receiver_count(), 2);
+}
+
+#[test]
+fn watch_scope_name_comes_from_an_exact_metadata_name_selector() {
+    let n = |sel: Option<&str>| WatchScope::new("", "pods", sel).name;
+    assert_eq!(n(Some("metadata.name=a")).as_deref(), Some("a"));
+    assert_eq!(
+        n(Some("metadata.name==a,status.phase=Running")).as_deref(),
+        Some("a")
+    );
+    assert_eq!(n(Some("metadata.name!=a")), None);
+    assert_eq!(n(Some("status.phase=Running")), None);
+    assert_eq!(n(Some("")), None);
+    assert_eq!(n(None), None);
+}
+
+/// `cacheWatcher.add` closeFunc: `TerminatedWatchersCounter{group,resource}`.
+#[tokio::test]
+async fn terminating_a_watcher_counts_it_under_group_and_resource() {
+    use rusternetes_api_server::cache_metrics::terminated_watchers;
+    let d = Dispatcher::new();
+    let scope = WatchScope::new("apps", "deployments-terminated-test", None);
+    let rx = d.add_scoped(LOWER_BOUND_CAPACITY, &scope);
+    let before = terminated_watchers("apps", "deployments-terminated-test");
+    for rev in 1..=(rx.chan_size() as i64 + 3) {
+        d.dispatch("/registry/deployments/ns/", &ev(rev)).await;
+    }
+    assert!(rx.is_terminated());
+    assert_eq!(
+        terminated_watchers("apps", "deployments-terminated-test"),
+        before + 1
+    );
 }
