@@ -845,6 +845,8 @@ async fn main() -> Result<()> {
     // layers it on the protected routes when present (#2704).
     post_start_hooks::register_generic_server_hooks(
         post_start_hooks::global(),
+        rusternetes_api_server::shared_informer_factory::global(),
+        storage.clone(),
         args.enable_priority_and_fairness,
     );
     if args.enable_priority_and_fairness {

@@ -50,6 +50,60 @@ mod tests {
         assert_eq!(reg.check("x/y"), Some(Err("not finished")));
     }
 
+    fn memory() -> Arc<rusternetes_storage::StorageBackend> {
+        Arc::new(rusternetes_storage::StorageBackend::Memory(Arc::new(
+            rusternetes_storage::MemoryStorage::new(),
+        )))
+    }
+
+    fn factory() -> Arc<rusternetes_api_server::shared_informer_factory::SharedInformerFactory> {
+        Arc::new(rusternetes_api_server::shared_informer_factory::SharedInformerFactory::new())
+    }
+
+    /// `informerSync.Check` (healthz.go:138-152) over the factory the
+    /// `generic-apiserver-start-informers` hook starts: a started informer
+    /// that has not synced fails the check with upstream's message; once it
+    /// syncs the check passes. An informer that was never started is not
+    /// counted (`WaitForCacheSync` only waits for started informers).
+    #[tokio::test]
+    async fn informer_sync_tracks_started_informers_until_synced() {
+        let reg = PostStartHooks::new();
+        let f = factory();
+        register_generic_server_hooks(&reg, &f, memory(), false);
+        // Registered but not started: not counted.
+        assert_eq!(reg.check("informer-sync"), None);
+        assert_eq!(f.informer_sync_check(), Ok(()));
+        // The hook task has not run yet on this single-threaded runtime.
+        assert!(finished(&reg, "generic-apiserver-start-informers").await);
+        for _ in 0..300 {
+            if f.informer_sync_check().is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.informer_sync_check(), Ok(()));
+        assert_eq!(f.sync_state().get("namespaces"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn started_but_unsynced_informer_fails_the_check() {
+        let f = factory();
+        f.informer_for("pods", &memory());
+        f.start();
+        // `start` only spawns the reflector; it has not listed yet.
+        assert_eq!(
+            f.informer_sync_check(),
+            Err("1 informers not started yet: [pods]".to_string())
+        );
+        for _ in 0..300 {
+            if f.informer_sync_check().is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("pods informer never synced");
+    }
+
     async fn finished(reg: &PostStartHooks, name: &str) -> bool {
         for _ in 0..300 {
             if reg.check(name) == Some(Ok(())) {
@@ -67,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn apf_off_registers_all_three_hooks_and_informer_sync() {
         let reg = PostStartHooks::new();
-        register_generic_server_hooks(&reg, false);
+        register_generic_server_hooks(&reg, &factory(), memory(), false);
         for name in [
             "generic-apiserver-start-informers",
             "start-apiserver-admission-initializer",
@@ -88,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn apf_on_omits_max_in_flight_filter() {
         let reg = PostStartHooks::new();
-        register_generic_server_hooks(&reg, true);
+        register_generic_server_hooks(&reg, &factory(), memory(), true);
         assert!(finished(&reg, "generic-apiserver-start-informers").await);
         assert!(finished(&reg, "start-apiserver-admission-initializer").await);
         assert_eq!(reg.check("max-in-flight-filter"), None);

@@ -11,6 +11,8 @@
 //!   is killed and `done` is never closed. There is no "stay up but not
 //!   ready" mode: the check only reports failure while the hook is running.
 
+use crate::shared_informer_factory::SharedInformerFactory;
+use rusternetes_storage::StorageBackend;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,12 +184,11 @@ pub const MAX_IN_FLIGHT_FILTER_HOOK: &str = "max-in-flight-filter";
 ///
 /// - `generic-apiserver-start-informers` (config.go:899-917):
 ///   `c.SharedInformerFactory.Start(stop)` plus the `informer-sync` readyz
-///   check (`InformerSyncHealthz`: every started informer `HasSynced`). This
-///   server has no shared informer factory -- handlers read storage directly --
-///   so there is nothing to start and nothing that can be unsynced; the hook
-///   and the check are registered so `/readyz?verbose` and
-///   `/healthz/poststarthook/<name>` expose the upstream surface. Deliberate
-///   deviation: the check is vacuously ok.
+///   check (`InformerSyncHealthz`: every *started* informer `HasSynced`),
+///   both backed by [`SharedInformerFactory`]. The informers registered with
+///   the factory today are those of the plugins that consume it (the
+///   namespace informer of `namespace_exists`); handlers elsewhere still read
+///   storage directly, so the factory holds only what a consumer asked for.
 /// - `start-apiserver-admission-initializer` (options/admission.go:151-170):
 ///   `discoveryRESTMapper.Reset()` every 30s for the admission plugins'
 ///   REST mapper. Admission here resolves resources without a cached
@@ -198,9 +199,26 @@ pub const MAX_IN_FLIGHT_FILTER_HOOK: &str = "max-in-flight-filter";
 ///   The executing watermark is fed by `max_in_flight_filter`
 ///   (`WithMaxInFlightLimit`); with APF on, `priority-and-fairness-filter`
 ///   owns the same flush.
-pub fn register_generic_server_hooks(registry: &PostStartHooks, apf_enabled: bool) {
-    spawn_starting_hook_with(registry, GENERIC_APISERVER_START_INFORMERS_HOOK, || {});
-    registry.register_boot_check(INFORMER_SYNC_CHECK, || Ok(()));
+pub fn register_generic_server_hooks(
+    registry: &PostStartHooks,
+    factory: &Arc<SharedInformerFactory>,
+    storage: Arc<StorageBackend>,
+    apf_enabled: bool,
+) {
+    // The namespace informer NamespaceLifecycle / NamespaceAutoProvision take
+    // from the factory (`namespace/lifecycle/admission.go:SetExternalKubeInformerFactory`),
+    // registered before `Start` as upstream's plugin initializers do.
+    factory.informer_for("namespaces", &storage);
+    let start_factory = factory.clone();
+    spawn_starting_hook_with(
+        registry,
+        GENERIC_APISERVER_START_INFORMERS_HOOK,
+        move || start_factory.start(),
+    );
+    let check_factory = factory.clone();
+    registry.register_boot_check(INFORMER_SYNC_CHECK, move || {
+        check_factory.informer_sync_check()
+    });
     spawn_starting_hook_with(registry, ADMISSION_INITIALIZER_HOOK, || {});
     if !apf_enabled {
         spawn_starting_hook_with(registry, MAX_IN_FLIGHT_FILTER_HOOK, || {
