@@ -3283,6 +3283,104 @@ mod tests {
         let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
         assert_eq!(st.phase, Some(Phase::Running));
     }
+
+    /// Natural completion (restartPolicy Never, a container failed) publishes
+    /// through `generateAPIPodStatus` (#3901): the Failed phase, the site's
+    /// message and observed container statuses are written, the kubelet-owned
+    /// conditions are replaced by the terminal set (never Ready) and
+    /// DisruptionTarget survives.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn natural_completion_status_goes_through_generate_api_pod_status() {
+        use rusternetes_kubelet::kubelet::TerminalStatus;
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
+        let mut pod = terminal_test_pod("n1", "uid-n1", Phase::Running);
+        pod.status.as_mut().unwrap().reason = None;
+        pod.status.as_mut().unwrap().message = None;
+        let key = "/registry/pods/default/n1";
+        storage.create(key, &pod).await.unwrap();
+        let cs: rusternetes_common::resources::ContainerStatus = serde_json::from_value(
+            serde_json::json!({"name": "app", "ready": false, "restartCount": 0}),
+        )
+        .unwrap();
+
+        k.publish_terminal_status(
+            &pod,
+            TerminalStatus {
+                phase: Phase::Failed,
+                message: Some("Pod failed".to_string()),
+                container_statuses: Some(vec![cs]),
+                kubelet_conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                    condition_type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: Some("PodCompleted".to_string()),
+                    message: None,
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    observed_generation: None,
+                }]),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Failed));
+        assert_eq!(st.message.as_deref(), Some("Pod failed"));
+        assert_eq!(st.observed_generation, Some(3));
+        assert_eq!(st.container_statuses.unwrap()[0].name, "app");
+        let conds = st.conditions.unwrap();
+        assert!(conds.iter().any(|c| c.condition_type == "DisruptionTarget"));
+        let ready = conds.iter().find(|c| c.condition_type == "Ready").unwrap();
+        assert_eq!(ready.status, "False");
+    }
+
+    /// A completion computed as Succeeded never rewrites a stored Failed pod,
+    /// and a recreated same-name pod is not written at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn natural_completion_respects_terminal_phase_and_uid() {
+        use rusternetes_kubelet::kubelet::TerminalStatus;
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
+        let failed = terminal_test_pod("n2", "uid-n2", Phase::Failed);
+        storage
+            .create("/registry/pods/default/n2", &failed)
+            .await
+            .unwrap();
+        k.publish_terminal_status(&failed, TerminalStatus::default(), |_| {})
+            .await;
+        let st = storage
+            .get::<Pod>("/registry/pods/default/n2")
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, Some(Phase::Failed));
+        assert_eq!(st.reason.as_deref(), Some("Keep"));
+
+        let old = terminal_test_pod("n3", "uid-old", Phase::Running);
+        let new = terminal_test_pod("n3", "uid-new", Phase::Running);
+        storage
+            .create("/registry/pods/default/n3", &new)
+            .await
+            .unwrap();
+        k.publish_terminal_status(&old, TerminalStatus::default(), |_| {})
+            .await;
+        let st = storage
+            .get::<Pod>("/registry/pods/default/n3")
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, Some(Phase::Running));
+    }
 }
 
 mod sync_pod_fake_cri_tests {

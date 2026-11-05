@@ -709,6 +709,35 @@ pub fn terminating_grace_elapsed(
     deletion_timestamp.map(|dt| now >= dt).unwrap_or(true)
 }
 
+/// What a terminal pod-status write publishes
+/// ([`Kubelet::publish_terminal_status`]).
+pub struct TerminalStatus {
+    pub phase: Phase,
+    pub message: Option<String>,
+    /// Observed container statuses to publish as they are.
+    pub container_statuses: Option<Vec<ContainerStatus>>,
+    /// Re-read init container statuses from the runtime.
+    pub refresh_init_containers: bool,
+    /// Re-read container statuses from the runtime after the generated status
+    /// is applied.
+    pub refresh_containers: bool,
+    /// Replaces the kubelet-owned conditions; `None` keeps the prior ones.
+    pub kubelet_conditions: Option<Vec<PodCondition>>,
+}
+
+impl Default for TerminalStatus {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Succeeded,
+            message: None,
+            container_statuses: None,
+            refresh_init_containers: false,
+            refresh_containers: false,
+            kubelet_conditions: None,
+        }
+    }
+}
+
 /// The stored pod at `key`, only if it is the incarnation with `uid`.
 ///
 /// The kubelet's pod workers are keyed by UID but the store is keyed by
@@ -4784,39 +4813,33 @@ impl Kubelet {
                                     "Pod completed successfully".to_string()
                                 };
 
-                                let key = build_key("pods", Some(namespace), pod_name);
-                                let mut new_pod: Pod = match self.storage.get(&key).await {
-                                    Ok(p) => p,
-                                    _ => pod.clone(),
-                                };
-                                let original = new_pod.clone();
                                 // Refresh init container statuses so completed init containers
                                 // have ready=true in the final pod status.
                                 // K8s ref: pkg/kubelet/prober/prober_manager.go — UpdatePodStatus
-                                let init_container_statuses =
-                                    self.get_init_container_statuses(&new_pod).await;
-                                if let Some(ref mut status) = new_pod.status {
-                                    status.phase = Some(terminal_phase);
-                                    status.message = Some(message);
-                                    status.container_statuses = Some(container_statuses);
-                                    if init_container_statuses.is_some() {
-                                        status.init_container_statuses = init_container_statuses;
-                                    }
-                                    // Update conditions — terminated pod is not Ready
-                                    if let Some(ref mut conditions) = status.conditions {
-                                        for c in conditions.iter_mut() {
-                                            if c.condition_type == "Ready"
-                                                || c.condition_type == "ContainersReady"
-                                            {
-                                                c.status = "False".to_string();
-                                                c.reason = Some("PodCompleted".to_string());
+                                self.publish_terminal_status(
+                                    pod,
+                                    TerminalStatus {
+                                        phase: terminal_phase,
+                                        message: Some(message),
+                                        container_statuses: Some(container_statuses),
+                                        refresh_init_containers: true,
+                                        ..Default::default()
+                                    },
+                                    |status| {
+                                        // Update conditions — terminated pod is not Ready
+                                        if let Some(ref mut conditions) = status.conditions {
+                                            for c in conditions.iter_mut() {
+                                                if c.condition_type == "Ready"
+                                                    || c.condition_type == "ContainersReady"
+                                                {
+                                                    c.status = "False".to_string();
+                                                    c.reason = Some("PodCompleted".to_string());
+                                                }
                                             }
                                         }
-                                    }
-                                }
-                                if !pod_status_equal(&original, &new_pod) {
-                                    let _ = self.storage.update_status(&key, &new_pod).await;
-                                }
+                                    },
+                                )
+                                .await;
                                 return Ok(());
                             }
 
@@ -4826,29 +4849,21 @@ impl Kubelet {
                                 });
 
                                 if !any_failed {
-                                    // All containers exited successfully — re-read for fresh RV
-                                    let key = build_key("pods", Some(namespace), pod_name);
-                                    let mut new_pod: Pod = match self.storage.get(&key).await {
-                                        Ok(p) => p,
-                                        _ => pod.clone(),
-                                    };
-                                    let original = new_pod.clone();
-                                    let init_container_statuses =
-                                        self.get_init_container_statuses(&new_pod).await;
-                                    if let Some(ref mut status) = new_pod.status {
-                                        status.phase = Some(Phase::Succeeded);
-                                        status.message =
-                                            Some("Pod completed successfully".to_string());
-                                        status.container_statuses = Some(container_statuses);
-                                        if init_container_statuses.is_some() {
-                                            status.init_container_statuses =
-                                                init_container_statuses;
-                                        }
-                                        status.conditions = Some(Self::succeeded_pod_conditions());
-                                    }
-                                    if !pod_status_equal(&original, &new_pod) {
-                                        let _ = self.storage.update_status(&key, &new_pod).await;
-                                    }
+                                    // All containers exited successfully.
+                                    self.publish_terminal_status(
+                                        pod,
+                                        TerminalStatus {
+                                            message: Some("Pod completed successfully".to_string()),
+                                            container_statuses: Some(container_statuses),
+                                            refresh_init_containers: true,
+                                            kubelet_conditions: Some(
+                                                Self::succeeded_pod_conditions(),
+                                            ),
+                                            ..Default::default()
+                                        },
+                                        |_| {},
+                                    )
+                                    .await;
                                     return Ok(());
                                 }
                             }
@@ -5228,25 +5243,20 @@ impl Kubelet {
                                     return Ok(());
                                 } else {
                                     // All containers exited 0 — transition to Succeeded
-                                    let key = build_key("pods", Some(namespace), pod_name);
-                                    let mut new_pod: Pod = match self.storage.get(&key).await {
-                                        Ok(p) => p,
-                                        _ => pod.clone(),
-                                    };
-                                    let init_container_statuses =
-                                        self.get_init_container_statuses(&new_pod).await;
-                                    if let Some(ref mut status) = new_pod.status {
-                                        status.phase = Some(Phase::Succeeded);
-                                        status.message =
-                                            Some("Pod completed successfully".to_string());
-                                        status.container_statuses = Some(container_statuses);
-                                        if init_container_statuses.is_some() {
-                                            status.init_container_statuses =
-                                                init_container_statuses;
-                                        }
-                                        status.conditions = Some(Self::succeeded_pod_conditions());
-                                    }
-                                    let _ = self.storage.update_status(&key, &new_pod).await;
+                                    self.publish_terminal_status(
+                                        pod,
+                                        TerminalStatus {
+                                            message: Some("Pod completed successfully".to_string()),
+                                            container_statuses: Some(container_statuses),
+                                            refresh_init_containers: true,
+                                            kubelet_conditions: Some(
+                                                Self::succeeded_pod_conditions(),
+                                            ),
+                                            ..Default::default()
+                                        },
+                                        |_| {},
+                                    )
+                                    .await;
                                     return Ok(());
                                 }
                             }
@@ -5394,27 +5404,18 @@ impl Kubelet {
                                 "Pod {}/{} completed successfully (restartPolicy=OnFailure)",
                                 namespace, pod_name
                             );
-                            let key = build_key("pods", Some(namespace), pod_name);
-                            let mut new_pod: Pod = match self.storage.get(&key).await {
-                                Ok(p) => p,
-                                _ => pod.clone(),
-                            };
-                            let init_container_statuses =
-                                self.get_init_container_statuses(&new_pod).await;
-                            if let Some(ref mut status) = new_pod.status {
-                                status.phase = Some(Phase::Succeeded);
-                                status.message = Some("Pod completed successfully".to_string());
-                                if let Some(ref cs) = container_statuses {
-                                    status.container_statuses = Some(cs.clone());
-                                }
-                                if init_container_statuses.is_some() {
-                                    status.init_container_statuses = init_container_statuses;
-                                }
-                                Self::fixup_init_container_ready(status);
-                                status.conditions = Some(Self::succeeded_pod_conditions());
-                            }
-                            let key = build_key("pods", Some(namespace), pod_name);
-                            let _ = self.storage.update_status(&key, &new_pod).await;
+                            self.publish_terminal_status(
+                                pod,
+                                TerminalStatus {
+                                    message: Some("Pod completed successfully".to_string()),
+                                    container_statuses: container_statuses.clone(),
+                                    refresh_init_containers: true,
+                                    kubelet_conditions: Some(Self::succeeded_pod_conditions()),
+                                    ..Default::default()
+                                },
+                                Self::fixup_init_container_ready,
+                            )
+                            .await;
                         }
                     }
                     "Never" => {
@@ -5432,36 +5433,29 @@ impl Kubelet {
                             "Pod {}/{} terminated (restartPolicy=Never, phase={:?})",
                             namespace, pod_name, terminal_phase
                         );
-                        let key = build_key("pods", Some(namespace), pod_name);
-                        let mut new_pod: Pod = match self.storage.get(&key).await {
-                            Ok(p) => p,
-                            _ => pod.clone(),
+                        // A terminal pod is never Ready. `IsPodReady` (which
+                        // the conformance suite checks) reads the Ready
+                        // CONDITION, so set it False for BOTH terminal phases
+                        // — not just Succeeded (the Failed case previously
+                        // leaked the Running conditions with Ready=True).
+                        let kubelet_conditions = if terminal_phase == Phase::Succeeded {
+                            Self::succeeded_pod_conditions()
+                        } else {
+                            Self::failed_pod_conditions()
                         };
-                        let init_container_statuses =
-                            self.get_init_container_statuses(&new_pod).await;
-                        if let Some(ref mut status) = new_pod.status {
-                            status.phase = Some(terminal_phase.clone());
-                            status.message = Some(message);
-                            if let Some(ref cs) = container_statuses {
-                                status.container_statuses = Some(cs.clone());
-                            }
-                            if init_container_statuses.is_some() {
-                                status.init_container_statuses = init_container_statuses;
-                            }
-                            Self::fixup_init_container_ready(status);
-                            // A terminal pod is never Ready. `IsPodReady` (which
-                            // the conformance suite checks) reads the Ready
-                            // CONDITION, so set it False for BOTH terminal phases
-                            // — not just Succeeded (the Failed case previously
-                            // leaked the Running conditions with Ready=True).
-                            status.conditions = Some(if terminal_phase == Phase::Succeeded {
-                                Self::succeeded_pod_conditions()
-                            } else {
-                                Self::failed_pod_conditions()
-                            });
-                        }
-                        let key = build_key("pods", Some(namespace), pod_name);
-                        let _ = self.storage.update_status(&key, &new_pod).await;
+                        self.publish_terminal_status(
+                            pod,
+                            TerminalStatus {
+                                phase: terminal_phase,
+                                message: Some(message),
+                                container_statuses: container_statuses.clone(),
+                                refresh_init_containers: true,
+                                kubelet_conditions: Some(kubelet_conditions),
+                                ..Default::default()
+                            },
+                            Self::fixup_init_container_ready,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
@@ -6479,21 +6473,37 @@ impl Kubelet {
 
     /// Publish the terminal (Succeeded) phase of `pod` through
     /// `generate_api_pod_status`, for the terminating/terminated pod-worker
-    /// paths (kubelet.rs `sync_pod`; upstream `syncTerminatingPod` /
-    /// `syncTerminatedPod` -> `statusManager.SetPodStatus`, kubelet.go:2398,
-    /// :2467, with the status from `generateAPIPodStatus`,
-    /// kubelet_pods.go:1889).
-    ///
-    /// Only the incarnation with `pod`'s UID is written (a recreated pod of the
-    /// same name is skipped, status_manager.go:1051-1060). A stored Failed
-    /// phase stays Failed (terminal guard, kubelet_pods.go:1938-1945).
-    /// `adjust` is the site's container-status fix-up, applied to the
-    /// generated status; `refresh_containers` re-reads container statuses from
-    /// the runtime afterwards.
+    /// paths. See [`Self::publish_terminal_status`].
     pub async fn publish_terminal_pod_status(
         &self,
         pod: &Pod,
         refresh_containers: bool,
+        adjust: impl FnOnce(&mut PodStatus),
+    ) {
+        self.publish_terminal_status(
+            pod,
+            TerminalStatus {
+                refresh_containers,
+                ..Default::default()
+            },
+            adjust,
+        )
+        .await;
+    }
+
+    /// Publish a terminal phase of `pod` through `generate_api_pod_status`
+    /// (upstream `syncTerminatingPod` / `syncTerminatedPod` and the pod
+    /// worker's completion path publish the status `generateAPIPodStatus`
+    /// produced, kubelet_pods.go:1889; kubelet.go:2398, :2467).
+    ///
+    /// Only the incarnation with `pod`'s UID is written (a recreated pod of the
+    /// same name is skipped, status_manager.go:1051-1060). A stored terminal
+    /// phase stays as it is (terminal guard, kubelet_pods.go:1938-1945).
+    /// `adjust` is the site's fix-up of the generated status.
+    pub async fn publish_terminal_status(
+        &self,
+        pod: &Pod,
+        terminal: TerminalStatus,
         adjust: impl FnOnce(&mut PodStatus),
     ) {
         let key = build_key(
@@ -6508,24 +6518,42 @@ impl Kubelet {
         let original = p.clone();
         // Upstream derives the phase from the runtime (`getPhase`), so an
         // already-terminal pod yields its own terminal phase and keeps its
-        // reason/message (:1915-1926). The hardcoded Succeeded of these
-        // paths stands in for that only for a pod not yet terminal.
+        // reason/message (:1915-1926). The phase these paths computed stands
+        // in for that only for a pod not yet terminal.
         let phase = match p.status.as_ref().and_then(|s| s.phase.clone()) {
             Some(t @ (Phase::Failed | Phase::Succeeded)) => t,
-            _ => Phase::Succeeded,
+            _ => terminal.phase,
+        };
+        let init_container_statuses = if terminal.refresh_init_containers {
+            self.get_init_container_statuses(&p).await
+        } else {
+            None
         };
         let input = crate::pod_status::ApiPodStatusInput::from_prior(
             &p,
             phase,
             None,
-            None,
+            terminal.message,
             self.host_ip_fields(),
             chrono::Utc::now(),
         );
         let mut status = crate::pod_status::generate_api_pod_status(&p, input);
+        if let Some(cs) = terminal.container_statuses {
+            status.container_statuses = Some(cs);
+        }
+        if init_container_statuses.is_some() {
+            status.init_container_statuses = init_container_statuses;
+        }
+        if let Some(kubelet_conditions) = terminal.kubelet_conditions {
+            // Replace the kubelet-owned conditions, keep the others
+            // (kubelet_pods.go:1957-1962).
+            let conditions = status.conditions.get_or_insert_with(Vec::new);
+            conditions.retain(|c| !crate::pod_status::pod_condition_by_kubelet(&c.condition_type));
+            conditions.extend(kubelet_conditions);
+        }
         adjust(&mut status);
         p.status = Some(status);
-        if refresh_containers {
+        if terminal.refresh_containers {
             if let Ok(cs) = self.get_container_statuses(&p).await {
                 if let Some(ref mut status) = p.status {
                     status.container_statuses = Some(cs);
