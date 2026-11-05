@@ -117,4 +117,12 @@ impl Authorizer for InstrumentedAuthorizer {
     ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
         self.delegate.get_user_rules(user, namespace).await
     }
+
+    async fn get_user_rules_outcome(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        self.delegate.get_user_rules_outcome(user, namespace).await
+    }
 }

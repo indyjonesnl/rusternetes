@@ -121,4 +121,14 @@ impl Authorizer for CachingAuthorizer {
     ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
         self.authorizer.get_user_rules(user, namespace).await
     }
+
+    async fn get_user_rules_outcome(
+        &self,
+        user: &UserInfo,
+        namespace: &str,
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        self.authorizer
+            .get_user_rules_outcome(user, namespace)
+            .await
+    }
 }

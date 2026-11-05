@@ -365,16 +365,19 @@ pub async fn create_self_subject_rules_review(
     }
 
     // Get all rules that apply to the current user in the specified namespace
-    let (resource_rules, non_resource_rules) = state
+    // `RulesFor` returns rules, `incomplete` and an error together; the error is
+    // reported in the status, never as a failed request
+    // (selfsubjectrulesreview/rest.go:84-98: `EvaluationError = err.Error()`).
+    let rules = state
         .authorizer
-        .get_user_rules(&auth_ctx.user, &ssrr.spec.namespace)
+        .get_user_rules_outcome(&auth_ctx.user, &ssrr.spec.namespace)
         .await?;
 
     ssrr.status = Some(SubjectRulesReviewStatus {
-        resource_rules,
-        non_resource_rules,
-        incomplete: false,
-        evaluation_error: None,
+        resource_rules: rules.resource_rules,
+        non_resource_rules: rules.non_resource_rules,
+        incomplete: rules.incomplete,
+        evaluation_error: rules.error,
     });
 
     Ok((StatusCode::CREATED, crate::audit::json_response(ssrr)))
