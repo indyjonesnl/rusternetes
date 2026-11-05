@@ -4053,14 +4053,12 @@ impl Kubelet {
                             // upstream generates the whole status at write time.
                             let (container_statuses, pod_ip) = crate::poll::observe_running_status(
                                 || async { self.get_container_statuses(&fresh_pod).await.ok() },
-                                || async {
-                                    self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten()
-                                },
+                                || async { self.pod_ips(&fresh_pod).await },
                                 std::time::Duration::from_secs(10),
                                 std::time::Duration::from_millis(150),
                             )
                             .await;
-                            let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
+                            let (pod_ip, pod_i_ps) = Self::pod_ip_fields(pod_ip);
 
                             // Write Running status using the fresh resourceVersion
                             let mut new_pod = fresh_pod;
@@ -4484,12 +4482,12 @@ impl Kubelet {
                     // Statuses are read AFTER the bounded IP wait (#2771).
                     let (container_statuses, pod_ip) = crate::poll::observe_running_status(
                         || async { self.get_container_statuses(&fresh_pod).await.ok() },
-                        || async { self.runtime.get_pod_ip(&fresh_pod).await.ok().flatten() },
+                        || async { self.pod_ips(&fresh_pod).await },
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_millis(150),
                     )
                     .await;
-                    let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
+                    let (pod_ip, pod_i_ps) = Self::pod_ip_fields(pod_ip);
 
                     // Update status to Running
                     let mut new_pod = fresh_pod;
@@ -5208,7 +5206,7 @@ impl Kubelet {
                             }
 
                             // Get pod IP (important for pods started by docker-compose)
-                            let pod_ip = self.runtime.get_pod_ip(pod).await.ok().flatten();
+                            let (pod_ip, pod_i_ps) = Self::pod_ip_fields(self.pod_ips(pod).await);
 
                             // Re-read pod from storage to get latest resourceVersion
                             // to avoid CAS conflicts when other controllers have
@@ -5230,9 +5228,13 @@ impl Kubelet {
                                 status.ephemeral_container_statuses = ephemeral_container_statuses;
                                 status.observed_generation = new_pod.metadata.generation;
                                 // Update pod IP if we got one and it's different
-                                if pod_ip.is_some() && status.pod_ip != pod_ip {
-                                    status.pod_i_ps =
-                                        pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
+                                let ips_of = |v: &Option<Vec<PodIP>>| {
+                                    v.as_ref()
+                                        .map(|v| v.iter().map(|p| p.ip.clone()).collect::<Vec<_>>())
+                                };
+                                if pod_ip.is_some() && ips_of(&status.pod_i_ps) != ips_of(&pod_i_ps)
+                                {
+                                    status.pod_i_ps = pod_i_ps;
                                     status.pod_ip = pod_ip;
                                 }
                                 status.message = Some(
@@ -6539,6 +6541,26 @@ impl Kubelet {
         p.status = Some(crate::pod_status::rejected_pod_status(&p, reason, message));
         if !pod_status_equal(&original, &p) {
             let _ = self.storage.update_status(&key, &p).await;
+        }
+    }
+
+    /// The pod's IPs as `convertStatusToAPIStatus` reports them
+    /// (kubelet_pods.go:2083-2098): the sandbox IPs ordered by the node IP's
+    /// family preference (`sortPodIPs`), `None` when there are none yet.
+    async fn pod_ips(&self, pod: &Pod) -> Option<Vec<String>> {
+        let ips = self.runtime.get_pod_ips(pod).await.ok()?;
+        let sorted = crate::node_ip::sort_pod_ips(&self.node_ips, &ips);
+        (!sorted.is_empty()).then_some(sorted)
+    }
+
+    /// `PodIP` / `PodIPs` for a sorted IP list (`PodIP = PodIPs[0]`).
+    fn pod_ip_fields(ips: Option<Vec<String>>) -> (Option<String>, Option<Vec<PodIP>>) {
+        match ips {
+            Some(ips) => (
+                ips.first().cloned(),
+                Some(ips.into_iter().map(|ip| PodIP { ip }).collect()),
+            ),
+            None => (None, None),
         }
     }
 

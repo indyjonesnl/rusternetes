@@ -41,7 +41,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn returns_none_on_timeout() {
         let got = poll_until_some(
-            || async { None },
+            || async { None::<String> },
             std::time::Duration::from_secs(1),
             std::time::Duration::from_millis(150),
         )
@@ -91,7 +91,7 @@ mod tests {
             },
             || {
                 polls.set(polls.get() + 1);
-                async { None }
+                async { None::<String> }
             },
             std::time::Duration::from_secs(1),
             std::time::Duration::from_millis(150),

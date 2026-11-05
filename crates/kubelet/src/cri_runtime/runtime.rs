@@ -2219,6 +2219,33 @@ impl CriContainerRuntime {
             .collect())
     }
 
+    /// Every IP of the pod's sandbox, primary first then the CRI's additional
+    /// IPs: `determinePodSandboxIPs`
+    /// (pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:305-335). An unparseable
+    /// IP yields none at all, as upstream returns nil there.
+    pub async fn get_pod_ips(&self, pod: &Pod) -> Result<Vec<String>> {
+        let Some(sandbox_id) = self.sandbox_id_for_pod(pod).await? else {
+            return Ok(Vec::new());
+        };
+        let mut cri = self.cri.clone();
+        let status = cri.pod_sandbox_status(&sandbox_id, false).await?;
+        let Some(network) = status.status.and_then(|s| s.network) else {
+            return Ok(Vec::new());
+        };
+        let mut ips = Vec::new();
+        if !network.ip.is_empty() {
+            ips.push(network.ip);
+        }
+        ips.extend(network.additional_ips.into_iter().map(|i| i.ip));
+        if ips
+            .iter()
+            .any(|ip| crate::node_ip::parse_ip_sloppy(ip).is_none())
+        {
+            return Ok(Vec::new());
+        }
+        Ok(ips)
+    }
+
     /// The pod's primary IP, read from its sandbox network status. `None` if the
     /// pod has no sandbox or no IP yet (e.g. CNI not done). Host-network pods
     /// report the node IP.

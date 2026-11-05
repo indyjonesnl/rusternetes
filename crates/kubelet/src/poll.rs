@@ -2,14 +2,14 @@
 
 /// Call `f` immediately, then every `interval`, until it returns `Some` or
 /// `timeout` elapses. Returns the first `Some`, or `None` on timeout.
-pub async fn poll_until_some<F, Fut>(
+pub async fn poll_until_some<P, F, Fut>(
     mut f: F,
     timeout: std::time::Duration,
     interval: std::time::Duration,
-) -> Option<String>
+) -> Option<P>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Option<String>>,
+    Fut: std::future::Future<Output = Option<P>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -32,17 +32,17 @@ where
 /// publishes it asynchronously; the container statuses MUST be read after that
 /// wait, or they are as stale as the wait is long (#2771: statuses read before a
 /// 10s IP poll that timed out were persisted as `Waiting/ContainerCreating`).
-pub async fn observe_running_status<T, S, SFut, I, IFut>(
+pub async fn observe_running_status<T, P, S, SFut, I, IFut>(
     read_statuses: S,
     poll_ip: I,
     ip_timeout: std::time::Duration,
     ip_interval: std::time::Duration,
-) -> (Option<T>, Option<String>)
+) -> (Option<T>, Option<P>)
 where
     S: FnOnce() -> SFut,
     SFut: std::future::Future<Output = Option<T>>,
     I: FnMut() -> IFut,
-    IFut: std::future::Future<Output = Option<String>>,
+    IFut: std::future::Future<Output = Option<P>>,
 {
     let ip = poll_until_some(poll_ip, ip_timeout, ip_interval).await;
     let statuses = read_statuses().await;
