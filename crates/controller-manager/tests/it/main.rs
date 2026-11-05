@@ -65,6 +65,7 @@ mod priorityclass_controller_test;
 mod protection_finalizer_over_api_test;
 mod pv_binder_test;
 mod pv_controller_extended_test;
+mod pv_terminating_release_test;
 mod replicaset_controller_test;
 mod resource_quota_idempotency_test;
 mod resource_quota_spec_clobber_test;

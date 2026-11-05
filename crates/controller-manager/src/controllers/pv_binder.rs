@@ -349,6 +349,14 @@ impl<S: Storage + 'static> PVBinderController<S> {
                     event = watch.next() => {
                         match event {
                             Some(Ok(ev)) => {
+                                // `deleteClaim` (pv_controller_base.go:273-295):
+                                // "sync the volume when its claim is deleted"
+                                // so its Release does not wait for the resync.
+                                if matches!(ev, rusternetes_storage::WatchEvent::Deleted(..)) {
+                                    if let Err(e) = self.sync_volumes(&queue).await {
+                                        error!("PV sync after claim deletion failed: {}", e);
+                                    }
+                                }
                                 let key = extract_key(&ev);
                                 queue.add(key).await;
                             }
@@ -478,10 +486,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
     pub async fn sync_volumes(&self, claim_queue: &WorkQueue) -> Result<()> {
         let pvs: Vec<PersistentVolume> = self.storage.list("/registry/persistentvolumes/").await?;
         for pv in pvs {
-            // Being deleted: nothing to advance.
-            if pv.metadata.deletion_timestamp.is_some() {
-                continue;
-            }
+            // No skip for a terminating volume: `syncVolume`
+            // (pv_controller.go:556-770) never looks at DeletionTimestamp. A
+            // volume deleted right after its claim must still be marked
+            // Released, or pv-protection (`isBeingUsed` == Bound) keeps its
+            // finalizer forever (#4367).
             let name = pv.metadata.name.clone();
             if let Err(e) = self.sync_volume(pv, claim_queue).await {
                 error!("Failed to sync PV {}: {}", name, e);
