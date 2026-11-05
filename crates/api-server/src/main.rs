@@ -614,6 +614,7 @@ async fn main() -> Result<()> {
         .resolve(args.client_ca_file.as_deref())?;
     request_timeout::set_request_timeout(args.request_timeout);
     apply_feature_gates(&args)?;
+    args.upstream.apply_runtime_config()?;
     // `ServerRunOptions.Validate` (server_run_options.go:197-203).
     let limit_errs = max_in_flight_filter::validate_limits(
         args.max_requests_inflight,
@@ -632,6 +633,9 @@ async fn main() -> Result<()> {
     rusternetes_api_server::audit_metrics::register_metrics();
     rusternetes_common::dump::install_panic_hook("api-server");
     for msg in args.upstream.ignored_flags() {
+        warn!("{msg}");
+    }
+    for msg in args.upstream.partial_flags() {
         warn!("{msg}");
     }
 
