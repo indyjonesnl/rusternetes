@@ -3381,6 +3381,48 @@ mod tests {
             .unwrap();
         assert_eq!(st.phase, Some(Phase::Running));
     }
+
+    /// `rejectPod` (kubelet.go:2475-2482): Failed with the reason and the
+    /// "Pod was rejected: " message, a Warning event, and no write to a
+    /// recreated same-name pod.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reject_pod_publishes_minimal_failed_status() {
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-r", &["10.1.1.1"], false).await;
+        let pod = terminal_test_pod("r1", "uid-r1", Phase::Pending);
+        let key = "/registry/pods/default/r1";
+        storage.create(key, &pod).await.unwrap();
+
+        k.reject_pod(&pod, "SysctlForbidden", "forbidden sysctl: \"x\"")
+            .await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Failed));
+        assert_eq!(st.reason.as_deref(), Some("SysctlForbidden"));
+        assert_eq!(
+            st.message.as_deref(),
+            Some("Pod was rejected: forbidden sysctl: \"x\"")
+        );
+        assert_eq!(st.observed_generation, Some(3));
+
+        let old = terminal_test_pod("r2", "uid-old", Phase::Pending);
+        let new = terminal_test_pod("r2", "uid-new", Phase::Pending);
+        storage
+            .create("/registry/pods/default/r2", &new)
+            .await
+            .unwrap();
+        k.reject_pod(&old, "HostPortConflict", "x").await;
+        let st = storage
+            .get::<Pod>("/registry/pods/default/r2")
+            .await
+            .unwrap()
+            .status
+            .unwrap();
+        assert_eq!(st.phase, Some(Phase::Pending));
+    }
 }
 
 mod sync_pod_fake_cri_tests {
