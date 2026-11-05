@@ -133,6 +133,9 @@ pub struct WatchScope {
     /// registered under `namespacedName{name}` and offered only that name's
     /// events.
     pub name: Option<String>,
+    /// `pred.MatcherIndex`: the value the watch pins the resource's trigger
+    /// field to (pods' `spec.nodeName=<node>`), if any.
+    pub trigger_value: Option<String>,
 }
 
 impl WatchScope {
@@ -149,10 +152,26 @@ impl WatchScope {
                     })
                     .map(|r| r.value.clone())
             });
+        let trigger_value =
+            crate::cache_watcher::trigger_field(group, resource).and_then(|field| {
+                field_selector
+                    .and_then(|s| rusternetes_common::field_selector::FieldSelector::parse(s).ok())
+                    .and_then(|sel| {
+                        sel.requirements()
+                            .iter()
+                            .find(|r| {
+                                r.field == field
+                                    && r.operator
+                                        == rusternetes_common::field_selector::FieldOperator::Equals
+                            })
+                            .map(|r| r.value.clone())
+                    })
+            });
         Self {
             group: group.to_string(),
             resource: resource.to_string(),
             name,
+            trigger_value,
         }
     }
 }

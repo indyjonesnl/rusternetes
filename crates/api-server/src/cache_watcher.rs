@@ -20,15 +20,27 @@
 //!   others are offered every event. The terminated-watchers counter
 //!   (`metrics.TerminatedWatchersCounter`) is bumped on every termination.
 //!
+//! * Trigger-value indexing (`cacher.go:835-850` `triggerValuesThreadUnsafe`,
+//!   `watchersSet.valueWatchers`): for a resource with a `TriggerFunc`
+//!   ([`trigger_field`]: pods' `spec.nodeName`,
+//!   `pkg/registry/core/pod/storage/storage.go:96`), a watcher whose field
+//!   selector pins the trigger (`pred.MatcherIndex`) is registered under that
+//!   value only and is offered an event when the object's current OR previous
+//!   trigger value matches, so an object leaving the value still reaches the
+//!   watcher as the transition it must turn into a DELETED.
+//!   `suggestedWatchChannelSize` gets `indexExists`/`triggerUsed` accordingly.
+//!
 //! Deviations (Rusternetes-specific):
 //! * The namespace dimension of `namespacedName` is the storage prefix itself
-//!   (a namespaced watch has its own prefix). Trigger-value indexing
-//!   (`valueWatchers`, `TriggerFunc`) is NOT ported: it needs the previous
-//!   object of an update (`triggerValuesThreadUnsafe` reads both `Object` and
-//!   `PrevObject`) and our cached events carry only the new one, so a
-//!   watcher whose object moved out of its trigger value would miss the
-//!   DELETE. There is no trigger, so `suggestedWatchChannelSize` is called with
-//!   `indexExists = false` (cap 100).
+//!   (a namespaced watch has its own prefix).
+//! * Upstream's `watchCache` keeps every object (`w.store`), and
+//!   `processEvent` reads the previous one from it (`PrevObject`). That is the
+//!   whole resource in memory, which this project avoids: while a prefix has
+//!   trigger watchers we keep only `key -> last trigger value`. An update for
+//!   a key not yet seen has an UNKNOWN previous value and, as upstream does
+//!   when the trigger is unsupported (`startDispatching`'s paranoid branch),
+//!   is offered to every trigger watcher. The map is dropped when the last
+//!   trigger watcher goes away, so it can never go stale.
 //! * The cacher's bookmark time buckets (`watcherBookmarkTimeBuckets`) are not
 //!   ported here; watch bookmarks are produced by the watch handler.
 //! * `cacheWatcher.process`'s `result` channel is [`process`]'s output queue,
@@ -66,10 +78,27 @@ pub fn suggested_watch_channel_size(
     size.max(MIN_WATCH_CHAN_SIZE).min(max)
 }
 
-/// The size [`Dispatcher::add_watcher`] uses for a prefix whose ring currently
-/// holds `capacity` events (`cacher.go:569`, no index).
-pub fn watch_channel_size(capacity: usize) -> usize {
-    suggested_watch_channel_size(capacity, EVENT_FRESH_DURATION, false, false)
+/// `TriggerFunc` registrations of the registries
+/// (`pkg/registry/core/pod/storage/storage.go:96`): the field whose value is
+/// the dispatch index of a resource. Only pods have one that matters here.
+pub fn trigger_field(group: &str, resource: &str) -> Option<&'static str> {
+    (group.is_empty() && resource == "pods").then_some("spec.nodeName")
+}
+
+/// `NodeNameTriggerFunc` generalised: the string at a dotted field path of a
+/// stored JSON object (`""` when absent, as for an unscheduled pod).
+fn trigger_value_of(value: &str, field: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(value) else {
+        return String::new();
+    };
+    let mut cur = &v;
+    for part in field.split('.') {
+        match cur.get(part) {
+            Some(next) => cur = next,
+            None => return String::new(),
+        }
+    }
+    cur.as_str().unwrap_or_default().to_string()
 }
 
 /// `refreshPerSecond` (`time_budget.go`).
@@ -200,21 +229,25 @@ impl WatchReceiver {
 }
 
 /// The watchers of a prefix, indexed as upstream's `watchersSet`
-/// (`allWatchers` keyed by `namespacedName`): unscoped watchers, and watchers
-/// scoped to one object name.
+/// (`allWatchers` keyed by `namespacedName`, `valueWatchers` keyed by trigger
+/// value): unscoped watchers, watchers scoped to one object name, and watchers
+/// pinned to one trigger value.
 #[derive(Default)]
 struct WatcherSet {
     unscoped: Vec<Arc<CacheWatcher>>,
     by_name: std::collections::HashMap<String, Vec<Arc<CacheWatcher>>>,
+    by_value: std::collections::HashMap<String, Vec<Arc<CacheWatcher>>>,
 }
 
 impl WatcherSet {
     fn retain_live(&mut self) {
         self.unscoped.retain(|w| !w.is_gone());
-        self.by_name.retain(|_, ws| {
-            ws.retain(|w| !w.is_gone());
-            !ws.is_empty()
-        });
+        for map in [&mut self.by_name, &mut self.by_value] {
+            map.retain(|_, ws| {
+                ws.retain(|w| !w.is_gone());
+                !ws.is_empty()
+            });
+        }
     }
 
     fn count(&self) -> usize {
@@ -222,6 +255,7 @@ impl WatcherSet {
             + self
                 .by_name
                 .values()
+                .chain(self.by_value.values())
                 .flatten()
                 .filter(|w| !w.is_gone())
                 .count()
@@ -239,6 +273,9 @@ pub struct Dispatcher {
     budget: Mutex<TimeBudget>,
     /// `(group, resource)` metric labels, set by the first scoped subscriber.
     group_resource: std::sync::OnceLock<(String, String)>,
+    /// `key -> last trigger value` while the prefix has trigger watchers (see
+    /// the module docs: the previous object upstream reads from `w.store`).
+    trigger_state: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl Default for Dispatcher {
@@ -253,7 +290,14 @@ impl Dispatcher {
             watchers: Mutex::new(WatcherSet::default()),
             budget: Mutex::new(TimeBudget::default()),
             group_resource: std::sync::OnceLock::new(),
+            trigger_state: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// `c.indexedTrigger`: the trigger field of this prefix's resource.
+    fn trigger(&self) -> Option<&'static str> {
+        let (g, r) = self.group_resource.get()?;
+        trigger_field(g, r)
     }
 
     fn list(&self) -> std::sync::MutexGuard<'_, WatcherSet> {
@@ -282,12 +326,31 @@ impl Dispatcher {
         if !scope.resource.is_empty() {
             self.set_group_resource(&scope.group, &scope.resource);
         }
-        self.add_scoped_watcher(capacity, scope.name.clone())
+        // `cacher.go:553-569`: `indexExists` is whether the resource has a
+        // trigger, `triggerUsed` whether this watch pins it.
+        let index_exists = self.trigger().is_some();
+        let trigger_value = scope.trigger_value.clone().filter(|_| index_exists);
+        self.register(capacity, scope.name.clone(), trigger_value, index_exists)
     }
 
     /// [`Self::add_watcher`] for a watcher scoped to one object `name`.
     pub fn add_scoped_watcher(&self, capacity: usize, name: Option<String>) -> WatchReceiver {
-        let chan_size = watch_channel_size(capacity);
+        self.register(capacity, name, None, false)
+    }
+
+    fn register(
+        &self,
+        capacity: usize,
+        name: Option<String>,
+        trigger_value: Option<String>,
+        index_exists: bool,
+    ) -> WatchReceiver {
+        let chan_size = suggested_watch_channel_size(
+            capacity,
+            EVENT_FRESH_DURATION,
+            index_exists,
+            trigger_value.is_some(),
+        );
         let (tx, rx) = mpsc::channel(chan_size);
         let stopped = Arc::new(AtomicBool::new(false));
         let watcher = Arc::new(CacheWatcher {
@@ -296,9 +359,12 @@ impl Dispatcher {
         });
         {
             let mut set = self.list();
-            match name {
-                Some(n) => set.by_name.entry(n).or_default().push(watcher),
-                None => set.unscoped.push(watcher),
+            // `watchersSet.addWatcher`: a trigger watcher lives under its value
+            // only, any other under its name scope.
+            match (trigger_value, name) {
+                (Some(v), _) => set.by_value.entry(v).or_default().push(watcher),
+                (None, Some(n)) => set.by_name.entry(n).or_default().push(watcher),
+                (None, None) => set.unscoped.push(watcher),
             }
         }
         WatchReceiver {
@@ -315,14 +381,19 @@ impl Dispatcher {
 
     /// Stop every watcher (`terminateAllWatchers`).
     pub fn terminate_all(&self) {
-        let (unscoped, by_name) = {
+        let (unscoped, by_name, by_value) = {
             let mut set = self.list();
             (
                 std::mem::take(&mut set.unscoped),
                 std::mem::take(&mut set.by_name),
+                std::mem::take(&mut set.by_value),
             )
         };
-        for w in unscoped.into_iter().chain(by_name.into_values().flatten()) {
+        for w in unscoped
+            .into_iter()
+            .chain(by_name.into_values().flatten())
+            .chain(by_value.into_values().flatten())
+        {
             w.stopped.store(true, Ordering::Release);
         }
     }
@@ -331,17 +402,56 @@ impl Dispatcher {
     pub async fn dispatch(&self, prefix: &str, event: &CachedWatchEvent) {
         // startDispatching: the watchers interested in this event; forget the
         // ones that are already gone.
+        let (is_delete, key, value) = match &event.event {
+            WatchEventData::Added(k, v) => (false, k, v),
+            WatchEventData::Modified(k, v) => (false, k, v),
+            WatchEventData::Deleted(k, v) => (true, k, v),
+        };
+        let was_added = matches!(event.event, WatchEventData::Added(..));
+        // `triggerValuesThreadUnsafe`, only when some watcher is indexed by value.
+        let trigger = self.trigger().filter(|_| !self.list().by_value.is_empty());
+        let values = trigger.map(|field| {
+            let cur = trigger_value_of(value, field);
+            let mut state = self.trigger_state.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = if is_delete {
+                state.remove(key)
+            } else {
+                state.insert(key.clone(), cur.clone())
+            };
+            match prev {
+                // No previous object (a create), or an unchanged value.
+                _ if was_added => Some(vec![cur]),
+                _ if is_delete => Some(vec![cur]),
+                Some(p) if p == cur => Some(vec![cur]),
+                Some(p) => Some(vec![cur, p]),
+                // Previous value unknown: offer to every value watcher.
+                None => None,
+            }
+        });
+        if trigger.is_none() {
+            self.trigger_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
         let targets: Vec<Arc<CacheWatcher>> = {
             let mut set = self.list();
             set.retain_live();
-            let name = match &event.event {
-                WatchEventData::Added(k, _)
-                | WatchEventData::Modified(k, _)
-                | WatchEventData::Deleted(k, _) => key_name(k),
-            };
+            let name = key_name(key);
             let mut t = set.unscoped.clone();
             if let Some(ws) = set.by_name.get(name) {
                 t.extend(ws.iter().cloned());
+            }
+            match values {
+                Some(Some(vals)) => {
+                    for v in vals {
+                        if let Some(ws) = set.by_value.get(&v) {
+                            t.extend(ws.iter().cloned());
+                        }
+                    }
+                }
+                // Unsupported trigger or unknown previous value.
+                _ => t.extend(set.by_value.values().flatten().cloned()),
             }
             t
         };
