@@ -47,6 +47,7 @@ pub mod static_pods;
 pub mod streaming_server;
 pub mod swap_util;
 pub mod sync_locks;
+pub mod sync_loop_monitor;
 pub mod sysctl;
 pub mod token_manager;
 pub mod volume_manager;
@@ -254,10 +255,17 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         // Only `Container.Handle`d paths are registered (see
         // `server::registered_handle_paths`); this binary serves /metrics,
         // /healthz and /configz of those.
-        let registered: Vec<String> = ["/healthz", "/metrics", "/configz"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let registered: Vec<String> = [
+            "/healthz",
+            "/healthz/ping",
+            "/healthz/log",
+            "/healthz/syncloop",
+            "/metrics",
+            "/configz",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         let app = server::install_statusz(app, registered);
         let app = server_auth::install_auth_filter(app, Some(auth));
         // server.go:1176 `ServeHTTP`: request metrics outside the auth filter.

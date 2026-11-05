@@ -14,11 +14,8 @@ use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, Watc
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::{atomic::Ordering, Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -501,12 +498,9 @@ pub struct Kubelet {
     /// When a watch event arrives for a pod, we signal its channel to
     /// trigger an immediate reconciliation without a full sync_loop.
     pub pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
-    /// Unix-seconds timestamp of the most recent successful `sync_loop`
-    /// completion. Exposed via [`Kubelet::healthy`] so the HTTP
-    /// `/healthz` endpoint can answer 200 only when the reconciler has
-    /// ticked recently. Mirrors upstream `pkg/kubelet/kubelet.go`'s
-    /// `syncLoopMonitor`. 0 = no successful sync yet.
-    pub last_sync: AtomicU64,
+    /// `kl.syncLoopMonitor` (`kubelet.go:1435`): when the main loop last
+    /// entered / left an iteration. Backs [`Kubelet::sync_loop_health_check`].
+    pub sync_loop_monitor: crate::sync_loop_monitor::SyncLoopMonitor,
     /// Effective `crashLoopBackOff.maxContainerRestartPeriod` (default 5m).
     pub crash_loop_backoff_max: Duration,
     /// `boInitial` from `newCrashLoopBackOff` (10s, or 1s with
@@ -1020,7 +1014,7 @@ impl Kubelet {
             restart_backoff: Mutex::new(HashMap::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
-            last_sync: AtomicU64::new(0),
+            sync_loop_monitor: Default::default(),
             crash_loop_backoff_max: new_crash_loop_backoff(
                 crate::config::KubeletConfiguration::default_max_container_restart_period(None),
             )
@@ -1285,22 +1279,12 @@ impl Kubelet {
         )
     }
 
-    /// Liveness probe — true iff `sync_loop` completed inside the
-    /// stale-sync window (`max(6, 2 × sync_interval)` seconds, mirroring
-    /// upstream's `syncLoopHealthCheck` constants in
-    /// `pkg/kubelet/kubelet.go`). Backs the HTTP `/healthz` endpoint.
-    /// Returns `false` until the first successful sync_loop tick.
-    pub fn healthy(&self) -> bool {
-        let last = self.last_sync.load(Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let stale_after = self.sync_interval.as_secs().saturating_mul(2).max(6);
-        now.saturating_sub(last) <= stale_after
+    /// `SyncLoopHealthCheck` (`kubelet.go:3096-3107`): `resyncInterval` is the
+    /// sync frequency; fails only once the loop has started and not entered an
+    /// iteration for `max(2 * resyncInterval, 5m)`. Backs `/healthz/syncloop`.
+    pub fn sync_loop_health_check(&self) -> Result<(), String> {
+        self.sync_loop_monitor
+            .health_check(std::time::Instant::now(), self.sync_interval)
     }
 
     /// Ensure the node-heartbeat Lease carries an `OwnerReference` back to its
@@ -1718,6 +1702,9 @@ impl Kubelet {
         }
 
         loop {
+            // `kl.syncLoopMonitor.Store(kl.clock.Now())` (kubelet.go:2539),
+            // on entry to and exit from every iteration.
+            self.sync_loop_monitor.store(std::time::Instant::now());
             tokio::select! {
                 // Watch-triggered: a specific pod changed, signal its per-pod worker
                 Some(key) = watch_rx.recv() => {
@@ -2660,12 +2647,6 @@ impl Kubelet {
         // stale pod records that block namespace deletion.
         self.cleanup_terminal_pods(&node_pods).await;
 
-        // Record completion for the /healthz liveness probe.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        self.last_sync.store(now, Ordering::Relaxed);
         self.pods_synced.store(true, Ordering::SeqCst);
 
         Ok(())

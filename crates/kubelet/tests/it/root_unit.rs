@@ -41,6 +41,7 @@ mod static_pod_url;
 mod static_pod_watch;
 mod streaming_server;
 mod sync_locks;
+mod sync_loop_monitor;
 mod sysctl;
 mod token_manager;
 mod volume_ownership;

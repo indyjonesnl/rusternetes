@@ -338,8 +338,19 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.exit())
+        .unwrap();
     apply_feature_gates(&args)?;
+    // cmd/kubelet/app/server.go:270-275: once the feature gates are applied,
+    // the flagz reader exists only when ComponentFlagz is enabled.
+    if rusternetes_common::feature_gates::enabled(
+        rusternetes_common::feature_gates::Feature::ComponentFlagz,
+    ) {
+        server::set_flagz_reader(rusternetes_common::flagz::flags_from_clap(&cmd, &matches));
+    }
 
     // Load configuration file if specified
     let config_file = if let Some(config_path) = &args.config {
@@ -845,6 +856,8 @@ async fn main() -> Result<()> {
                 )
                 .merge(server::running_pods_router(server_state))
                 .merge(streaming_server::run_router(run_state, checkpoint_enabled));
+            // server.go:602-607 `flagz.Install` (InstallAuthRequiredHandlers).
+            let app = server::install_flagz(app);
             // server.go:322-323 `InstallProfilingHandler` / `InstallDebugFlagsHandler`.
             let app = server_debug::install_profiling_handler(
                 app,
@@ -872,6 +885,7 @@ async fn main() -> Result<()> {
             enable_debugging_handlers,
             enable_system_log_handler,
             enable_profiling_handler,
+            server::flagz_installed(),
         );
         let app = server::install_statusz(app, registered);
         // server.go:312-314 `InstallAuthFilter`: wraps every route registered

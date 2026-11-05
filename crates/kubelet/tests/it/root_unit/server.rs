@@ -477,7 +477,7 @@ mod debugging_handlers_tests {
     // enabled, ...) are not `RegisteredHandlePaths`.
     #[test]
     fn registered_paths_default_aggregate() {
-        let paths = registered_handle_paths(true, true, true);
+        let paths = registered_handle_paths(true, true, true, false);
         assert_eq!(
             rusternetes_common::statusz::aggregate_paths(&paths),
             vec!["/configz", "/debug", "/healthz", "/metrics"]
@@ -490,11 +490,46 @@ mod debugging_handlers_tests {
         assert!(paths.contains(&"/metrics/cadvisor".to_string()));
     }
 
+    // healthz.InstallHandler registers the checks as sub-paths, and flagz.Install
+    // (behind ComponentFlagz + a registry) adds /flagz after /configz; neither
+    // changes the aggregate (server_test.go TestStatusz).
+    #[test]
+    fn registered_paths_include_healthz_checks_and_flagz() {
+        let p = registered_handle_paths(true, true, true, true);
+        let at = |s: &str| {
+            p.iter()
+                .position(|x| x == s)
+                .unwrap_or_else(|| panic!("{s}"))
+        };
+        assert!(at("/healthz") < at("/healthz/ping"));
+        assert!(at("/healthz/ping") < at("/healthz/log"));
+        assert!(at("/healthz/log") < at("/healthz/syncloop"));
+        assert_eq!(at("/flagz"), at("/configz") + 1);
+        assert_eq!(
+            rusternetes_common::statusz::aggregate_paths(&p),
+            vec!["/configz", "/debug", "/flagz", "/healthz", "/metrics"]
+        );
+        // Debugging handlers off: /flagz belongs to InstallAuthRequiredHandlers.
+        assert!(!registered_handle_paths(false, true, true, true).contains(&"/flagz".to_string()));
+    }
+
+    // Every healthz path the kubelet registers answers.
+    #[tokio::test]
+    async fn registered_healthz_paths_answer() {
+        let app = healthz_router(None);
+        for p in registered_handle_paths(true, true, true, false)
+            .iter()
+            .filter(|p| p.starts_with("/healthz"))
+        {
+            assert_eq!(call(&app, Method::GET, p).await.0, 200, "{p}");
+        }
+    }
+
     // server.go:InstallSystemLogHandler / InstallProfilingHandler: the
     // disabled-endpoint `Handle`s are registered only when switched off.
     #[test]
     fn registered_paths_follow_the_gates() {
-        let p = registered_handle_paths(true, false, false);
+        let p = registered_handle_paths(true, false, false, false);
         assert!(p.contains(&"/logs/".to_string()));
         assert!(p.contains(&"/debug/pprof/".to_string()));
     }
@@ -503,7 +538,7 @@ mod debugging_handlers_tests {
     // /configz and no /debug/flags/v.
     #[test]
     fn registered_paths_debugging_disabled() {
-        let p = registered_handle_paths(false, true, true);
+        let p = registered_handle_paths(false, true, true, false);
         for want in DEBUGGING_DISABLED_PATHS.into_iter().chain(["/logs/"]) {
             assert!(p.contains(&want.to_string()), "{want}");
         }
