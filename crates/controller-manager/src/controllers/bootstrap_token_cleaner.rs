@@ -16,9 +16,10 @@
 //!   Namespace == tokenSecretNamespace` and requeues a not-yet-expired
 //!   secret with `queue.AddAfter(key, ttl)`. The `Storage` trait has no
 //!   list-by-type, so each pass lists the `kube-system` secrets and filters
-//!   by type; the pass runs on the worker period (10s,
-//!   `wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`) which stands in
-//!   for the `AddAfter` requeue (expiry is noticed within one period).
+//!   by type. `queue.AddAfter(key, ttl)` is honoured by sleeping until the
+//!   soonest pending expiry (never longer than the worker period of 10s,
+//!   `wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`), so a token is
+//!   deleted when it expires, not up to a period later.
 //! - The delete's `Preconditions{UID}` is checked by re-reading the Secret
 //!   just before deleting (no preconditions in `Storage`); a UID mismatch is
 //!   the swallowed Conflict.
@@ -39,6 +40,15 @@ pub use super::bootstrap_secret_util::{
 pub const DEFAULT_TOKEN_SECRET_NAMESPACE: &str = "kube-system";
 /// The worker period of `Run` (`wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`).
 pub const WORKER_PERIOD: Duration = Duration::from_secs(10);
+
+/// How long to sleep before the next pass: the soonest `AddAfter` delay, capped
+/// at the worker period. A zero delay still yields a minimal wait so an expiry
+/// landing on the boundary cannot spin.
+pub fn next_wake(requeue: Option<Duration>) -> Duration {
+    requeue
+        .map_or(WORKER_PERIOD, |ttl| ttl.min(WORKER_PERIOD))
+        .max(Duration::from_millis(10))
+}
 
 /// What `evalSecret` did with a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,13 +79,14 @@ impl<S: Storage + 'static> TokenCleaner<S> {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting token cleaner controller");
         loop {
-            self.sync_all(Utc::now()).await;
-            tokio::time::sleep(WORKER_PERIOD).await;
+            let requeue = self.sync_all(Utc::now()).await;
+            tokio::time::sleep(next_wake(requeue)).await;
         }
     }
 
     /// One pass: the informer's FilterFunc (type + namespace) then `syncFunc`.
-    pub async fn sync_all(&self, now: DateTime<Utc>) {
+    /// Returns the soonest `queue.AddAfter` delay requested by `evalSecret`.
+    pub async fn sync_all(&self, now: DateTime<Utc>) -> Option<Duration> {
         let secrets: Vec<Secret> = match self
             .storage
             .list(&build_prefix("secrets", Some(&self.token_secret_namespace)))
@@ -84,16 +95,20 @@ impl<S: Storage + 'static> TokenCleaner<S> {
             Ok(s) => s,
             Err(e) => {
                 error!("Listing bootstrap token secrets: {e}");
-                return;
+                return None;
             }
         };
+        let mut soonest: Option<Duration> = None;
         for secret in secrets {
             if secret.secret_type.as_deref() == Some(SECRET_TYPE_BOOTSTRAP_TOKEN)
                 && secret.metadata.namespace.as_deref() == Some(&self.token_secret_namespace)
             {
-                self.eval_secret(&secret, now).await;
+                if let EvalOutcome::RequeueAfter(ttl) = self.eval_secret(&secret, now).await {
+                    soonest = Some(soonest.map_or(ttl, |s| s.min(ttl)));
+                }
             }
         }
+        soonest
     }
 
     /// `evalSecret`.
