@@ -210,3 +210,101 @@ async fn terminating_a_watcher_counts_it_under_group_and_resource() {
         before + 1
     );
 }
+
+fn pod_ev(kind: &str, name: &str, node: &str, rev: i64) -> CachedWatchEvent {
+    let key = format!("/registry/pods/ns/{name}");
+    let v = Arc::new(format!(
+        r#"{{"metadata":{{"name":"{name}","resourceVersion":"{rev}"}},"spec":{{"nodeName":"{node}"}}}}"#
+    ));
+    CachedWatchEvent {
+        event: match kind {
+            "add" => WatchEventData::Added(key, v),
+            "mod" => WatchEventData::Modified(key, v),
+            _ => WatchEventData::Deleted(key, v),
+        },
+        revision: rev,
+        recorded: Instant::now(),
+    }
+}
+
+async fn drain(w: &mut WatchReceiver) -> Vec<i64> {
+    let mut out = Vec::new();
+    while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(20), w.recv()).await {
+        out.push(e.revision);
+    }
+    out
+}
+
+#[test]
+fn watch_scope_trigger_value_comes_from_the_pods_node_name_selector() {
+    let t = |g: &str, r: &str, sel: &str| WatchScope::new(g, r, Some(sel)).trigger_value;
+    assert_eq!(t("", "pods", "spec.nodeName=n1").as_deref(), Some("n1"));
+    assert_eq!(t("", "pods", "spec.nodeName=").as_deref(), Some(""));
+    assert_eq!(t("", "pods", "spec.nodeName!=n1"), None);
+    assert_eq!(t("", "pods", "status.phase=Running"), None);
+    // Only resources with a TriggerFunc have an index.
+    assert_eq!(t("", "secrets", "spec.nodeName=n1"), None);
+}
+
+/// `startDispatching` + `triggerValuesThreadUnsafe`: a pod bound to a node is
+/// offered to the watcher of its OLD value ("" = unscheduled) as well, so that
+/// watcher can turn it into a DELETED; unrelated nodes are not offered it.
+#[tokio::test]
+async fn trigger_watchers_get_events_for_the_current_and_previous_value() {
+    let d = Dispatcher::new();
+    let scope = |n: &str| WatchScope::new("", "pods", Some(&format!("spec.nodeName={n}")));
+    let mut unscheduled = d.add_scoped(LOWER_BOUND_CAPACITY, &scope(""));
+    let mut a = d.add_scoped(LOWER_BOUND_CAPACITY, &scope("a"));
+    let mut b = d.add_scoped(LOWER_BOUND_CAPACITY, &scope("b"));
+    let mut all = d.add_scoped(LOWER_BOUND_CAPACITY, &WatchScope::new("", "pods", None));
+    let p = "/registry/pods/";
+    d.dispatch(p, &pod_ev("add", "p1", "", 1)).await; // created unscheduled
+    d.dispatch(p, &pod_ev("mod", "p1", "a", 2)).await; // bound to a
+    d.dispatch(p, &pod_ev("mod", "p1", "a", 3)).await; // status update on a
+    d.dispatch(p, &pod_ev("del", "p1", "a", 4)).await; // deleted
+    assert_eq!(drain(&mut unscheduled).await, [1, 2]);
+    assert_eq!(drain(&mut a).await, [2, 3, 4]);
+    assert_eq!(drain(&mut b).await, Vec::<i64>::new());
+    assert_eq!(
+        drain(&mut all).await,
+        [1, 2, 3, 4],
+        "no trigger pinned: every event"
+    );
+}
+
+/// A key not seen before has an unknown previous value: offered to every
+/// trigger watcher (upstream's paranoid branch), then learned.
+#[tokio::test]
+async fn unknown_previous_value_is_offered_to_every_trigger_watcher() {
+    let d = Dispatcher::new();
+    let scope = |n: &str| WatchScope::new("", "pods", Some(&format!("spec.nodeName={n}")));
+    let mut a = d.add_scoped(LOWER_BOUND_CAPACITY, &scope("a"));
+    let mut b = d.add_scoped(LOWER_BOUND_CAPACITY, &scope("b"));
+    let p = "/registry/pods/";
+    d.dispatch(p, &pod_ev("mod", "p1", "a", 1)).await; // never seen
+    d.dispatch(p, &pod_ev("mod", "p1", "a", 2)).await; // now known
+    assert_eq!(drain(&mut a).await, [1, 2]);
+    assert_eq!(drain(&mut b).await, [1]);
+}
+
+/// `suggestedWatchChannelSize` with `indexExists`: a pinned trigger caps the
+/// queue at 10, an unpinned watch of an indexed resource may use up to 1000.
+#[tokio::test]
+async fn trigger_watchers_use_the_small_queue() {
+    let d = Dispatcher::new();
+    let pinned = d.add_scoped(
+        100 * 1024,
+        &WatchScope::new("", "pods", Some("spec.nodeName=n")),
+    );
+    let unpinned = d.add_scoped(100 * 1024, &WatchScope::new("", "pods", None));
+    assert_eq!(pinned.chan_size(), 10);
+    assert_eq!(unpinned.chan_size(), 1000);
+    let other = Dispatcher::new();
+    assert_eq!(
+        other
+            .add_scoped(100 * 1024, &WatchScope::new("", "secrets", None))
+            .chan_size(),
+        100,
+        "no TriggerFunc for secrets: indexExists is false"
+    );
+}
