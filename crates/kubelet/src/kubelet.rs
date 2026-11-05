@@ -4159,7 +4159,13 @@ impl Kubelet {
                             if let Err(e) = self.storage.update_status(&key, &new_pod).await {
                                 // Retry with fresh read on conflict (K8s pattern)
                                 if crate::lifecycle::is_status_write_conflict(&e) {
-                                    if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
+                                    if let Some(fresh_pod) = stored_pod_of(
+                                        self.storage.as_ref(),
+                                        &key,
+                                        &pod.metadata.uid,
+                                    )
+                                    .await
+                                    {
                                         // Terminal phases are sticky — don't
                                         // regress a Succeeded/Failed pod to
                                         // Running on the conflict retry.
@@ -4173,13 +4179,6 @@ impl Kubelet {
                                             return Ok(());
                                         }
                                         let mut retry_pod = fresh_pod;
-                                        // observedGeneration tracks the generation of
-                                        // the re-read object, not the value computed
-                                        // from the pre-conflict read — a concurrent
-                                        // spec update is what bumped generation and
-                                        // caused this conflict (#1170). Capture before
-                                        // the mut borrow below.
-                                        let retry_gen = retry_pod.metadata.generation;
                                         // Re-fetch ALL statuses for the retry — stale
                                         // init_container_statuses from an intermediate
                                         // write may have ready=false for completed inits.
@@ -4189,16 +4188,28 @@ impl Kubelet {
                                             self.get_init_container_statuses(pod).await;
                                         let fresh_container_statuses =
                                             self.get_container_statuses(pod).await.ok();
-                                        if let Some(ref mut status) = retry_pod.status {
-                                            status.phase = Some(Phase::Running);
-                                            status.message =
-                                                Some("All containers ready".to_string());
-                                            status.init_container_statuses = fresh_init_statuses;
-                                            status.observed_generation = retry_gen;
-                                            if let Some(cs) = fresh_container_statuses {
-                                                status.container_statuses = Some(cs);
-                                            }
+                                        // Regenerate against the re-read object
+                                        // (generateAPIPodStatus, kubelet_pods.go:1889), so
+                                        // observedGeneration tracks the re-read generation —
+                                        // a concurrent spec update is what bumped it and
+                                        // caused this conflict (#1170).
+                                        let mut input =
+                                            crate::pod_status::ApiPodStatusInput::from_prior(
+                                                &retry_pod,
+                                                Phase::Running,
+                                                None,
+                                                Some("All containers ready".to_string()),
+                                                self.host_ip_fields(),
+                                                chrono::Utc::now(),
+                                            );
+                                        input.init_container_statuses = fresh_init_statuses;
+                                        if fresh_container_statuses.is_some() {
+                                            input.container_statuses = fresh_container_statuses;
                                         }
+                                        retry_pod.status =
+                                            Some(crate::pod_status::generate_api_pod_status(
+                                                &retry_pod, input,
+                                            ));
                                         self.apply_host_ips_to_pod(&mut retry_pod).await;
                                         if let Err(e2) =
                                             self.storage.update_status(&key, &retry_pod).await
@@ -4247,7 +4258,10 @@ impl Kubelet {
                                     namespace, pod_name, err_msg
                                 );
                                 let key = build_key("pods", Some(namespace), pod_name);
-                                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                                if let Some(mut p) =
+                                    stored_pod_of(self.storage.as_ref(), &key, &pod.metadata.uid)
+                                        .await
+                                {
                                     // Set container statuses to Waiting{ContainerCreating}
                                     let container_statuses: Vec<ContainerStatus> = p
                                         .spec
@@ -4283,12 +4297,13 @@ impl Kubelet {
                                                 .collect()
                                         })
                                         .unwrap_or_default();
-                                    if let Some(ref mut status) = p.status {
-                                        status.phase = Some(Phase::Pending);
-                                        status.container_statuses = Some(container_statuses);
-                                        status.conditions = Some(Self::not_ready_pod_conditions());
+                                    let original = p.clone();
+                                    p.status =
+                                        Some(self.volume_wait_pod_status(&p, container_statuses));
+                                    self.apply_host_ips_to_pod(&mut p).await;
+                                    if !pod_status_equal(&original, &p) {
+                                        let _ = self.storage.update_status(&key, &p).await;
                                     }
-                                    let _ = self.storage.update_status(&key, &p).await;
                                 }
                                 return Ok(());
                             }
@@ -5844,6 +5859,30 @@ impl Kubelet {
                 })
                 .collect()
         })
+    }
+
+    /// Status for a pod waiting on a volume source: Pending with every app
+    /// container `Waiting{ContainerCreating}` (`defaultWaitingState`,
+    /// kubelet_pods.go:2496) and the not-ready conditions, generated through
+    /// `generate_api_pod_status` (kubelet_pods.go:1889 generateAPIPodStatus)
+    /// over the pod's last published runtime observations. The caller applies
+    /// the host-IP block afterwards.
+    pub fn volume_wait_pod_status(
+        &self,
+        pod: &Pod,
+        container_statuses: Vec<ContainerStatus>,
+    ) -> PodStatus {
+        let mut input = crate::pod_status::ApiPodStatusInput::from_prior(
+            pod,
+            Phase::Pending,
+            None,
+            None,
+            self.host_ip_fields(),
+            chrono::Utc::now(),
+        );
+        input.conditions = Self::not_ready_pod_conditions();
+        input.container_statuses = Some(container_statuses);
+        crate::pod_status::generate_api_pod_status(pod, input)
     }
 
     /// Pending status for a container creation/config error (typed CRI
