@@ -100,9 +100,11 @@ pub struct UpstreamCompatArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub contention_profiling: Option<bool>,
 
-    /// `--runtime-config` (api_enablement.go:49). Accepted, ignored.
+    /// `--runtime-config` (api_enablement.go:49), a `cliflag.ConfigurationMap`
+    /// (comma separated `key=value`, repeatable). Parsed, validated and merged
+    /// by [`UpstreamCompatArgs::apply_runtime_config`].
     #[arg(long)]
-    pub runtime_config: Option<String>,
+    pub runtime_config: Vec<String>,
 
     /// `--cloud-provider` (options.go). Accepted, ignored.
     #[arg(long)]
@@ -122,6 +124,62 @@ impl UpstreamCompatArgs {
             );
         }
         Ok(())
+    }
+
+    /// `APIEnablementOptions.Validate` + `ApplyTo` (api_enablement.go): parse
+    /// `--runtime-config`, refuse unknown groups, merge it over the default
+    /// resource config and hand the result to the discovery evaluator
+    /// (`c.MergedResourceConfig`). Does nothing when the flag is unset.
+    ///
+    /// The merged config feeds the resource-expiration evaluator only: serving
+    /// is not yet gated by it (see the tracking issue), so the flag is
+    /// validated but does not enable or disable groups.
+    pub fn apply_runtime_config(&self) -> Result<()> {
+        use rusternetes_common::resource_encoding::Scheme;
+        use rusternetes_discovery::resource_config as rc;
+        if self.runtime_config.is_empty() {
+            return Ok(());
+        }
+        let mut overrides = rc::ConfigurationMap::new();
+        for value in &self.runtime_config {
+            rc::parse_configuration_map(value, &mut overrides);
+        }
+        let registry = Scheme::legacy();
+        let errs = rc::validate_runtime_config(&overrides, &registry);
+        if !errs.is_empty() {
+            bail!("invalid --runtime-config: {}", errs.join("; "));
+        }
+        // Default: every GA version the scheme registers is on
+        // (DefaultAPIResourceConfigSource, pkg/controlplane/instance.go, is not
+        // ported; it only matters once serving is gated).
+        let mut default = rc::ResourceConfig::new();
+        default.enable_versions(
+            &rc::GroupVersionRegistry::prioritized_versions_all_groups(&registry)
+                .into_iter()
+                .filter(|(_, v)| {
+                    v.strip_prefix('v')
+                        .is_some_and(|d| d.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let merged = rc::merge_api_resource_configs(default, &overrides, &registry)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        rusternetes_discovery::set_runtime_config(Some(merged));
+        rusternetes_discovery::check_runtime_config_against_emulation_version()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
+    }
+
+    /// Notes for flags that were accepted but only partly honoured.
+    pub fn partial_flags(&self) -> Vec<String> {
+        if self.runtime_config.is_empty() {
+            return vec![];
+        }
+        vec![
+            "--runtime-config is parsed and validated but does not yet enable or disable \
+              API groups, versions or resources at serving time"
+                .into(),
+        ]
     }
 
     /// Flags that were given, accepted, and have no effect (message per flag).
@@ -161,7 +219,6 @@ impl UpstreamCompatArgs {
                 self.contention_profiling == Some(true),
                 "--contention-profiling",
             ),
-            (self.runtime_config.is_some(), "--runtime-config"),
             (self.cloud_provider.is_some(), "--cloud-provider"),
         ];
         let mut out: Vec<String> = given
@@ -252,6 +309,38 @@ mod tests {
         );
         // Accepted-but-inert flags are reported, never silent.
         assert_eq!(a.upstream.ignored_flags().len(), 10);
+    }
+
+    #[test]
+    fn runtime_config_is_parsed_validated_and_unset_is_a_noop() {
+        let parse = |v: &[&str]| {
+            let mut argv = vec!["api-server".to_string()];
+            argv.extend(v.iter().map(|s| s.to_string()));
+            Args::try_parse_from(argv).unwrap().upstream
+        };
+        // Unset: nothing happens (the default must not change behaviour).
+        assert!(parse(&[]).apply_runtime_config().is_ok());
+        assert!(parse(&[]).partial_flags().is_empty());
+        // Repeated flags accumulate, as ConfigurationMap.Set does.
+        let ok = parse(&[
+            "--runtime-config=apps/v1=true",
+            "--runtime-config=api/beta=false,batch/v1",
+        ]);
+        assert_eq!(ok.runtime_config.len(), 2);
+        assert!(ok.apply_runtime_config().is_ok());
+        assert_eq!(ok.partial_flags().len(), 1);
+        // Validate(): unknown group, api/all=false alone, malformed bool.
+        let err = |v: &str| {
+            parse(&[&format!("--runtime-config={v}")])
+                .apply_runtime_config()
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("nope/v1=true").contains("unknown api groups nope"));
+        assert!(err("api/all=false").contains("invalid key with only api/all=false"));
+        assert!(err("apps/v1=maybe").contains("invalid value of apps/v1"));
+        assert!(err("apps/v9=true").contains("has not been registered"));
+        rusternetes_discovery::set_runtime_config(None);
     }
 
     #[test]

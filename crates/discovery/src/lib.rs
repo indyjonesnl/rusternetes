@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod deferred_restmapper;
 pub mod deleted_kinds;
 pub mod kube_version;
+pub mod resource_config;
 pub mod restmapper;
 pub mod vap_typechecking;
 
@@ -1057,13 +1058,69 @@ fn emulation_served_resources_at(
     group: &str,
     emulation: rusternetes_common::feature_gates::Version,
 ) -> Option<deleted_kinds::VersionedResources> {
+    try_emulation_served_resources_at(
+        group,
+        emulation,
+        runtime_config()
+            .as_deref()
+            .map(|c| c as &dyn deleted_kinds::ResourceConfig),
+    )
+    .ok()
+    .flatten()
+}
+
+static RUNTIME_CONFIG: std::sync::RwLock<Option<std::sync::Arc<resource_config::ResourceConfig>>> =
+    std::sync::RwLock::new(None);
+
+/// Install the merged `--runtime-config` (`c.MergedResourceConfig`,
+/// api_enablement.go `ApplyTo`), which the resource-expiration evaluator reads
+/// through `APIResourceConfigSource`. Unset means no runtime-config rules, as
+/// before.
+pub fn set_runtime_config(config: Option<resource_config::ResourceConfig>) {
+    *RUNTIME_CONFIG.write().unwrap_or_else(|e| e.into_inner()) = config.map(std::sync::Arc::new);
+}
+
+fn runtime_config() -> Option<std::sync::Arc<resource_config::ResourceConfig>> {
+    RUNTIME_CONFIG
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// `InstallAPIGroups` runs `RemoveUnavailableKinds` per group and fails server
+/// start on its error (genericapiserver.go): a future API explicitly enabled in
+/// `--runtime-config` without forward compatibility. This runs the same pass
+/// over every built-in group at the current emulation version.
+pub fn check_runtime_config_against_emulation_version() -> Result<(), String> {
+    let config = runtime_config();
+    let emulation = rusternetes_common::feature_gates::emulation_version();
+    let mut groups: Vec<&str> = raw_api_group_names().into_iter().map(|(g, _)| g).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    for group in groups {
+        try_emulation_served_resources_at(
+            group,
+            emulation,
+            config
+                .as_deref()
+                .map(|c| c as &dyn deleted_kinds::ResourceConfig),
+        )?;
+    }
+    Ok(())
+}
+
+fn try_emulation_served_resources_at(
+    group: &str,
+    emulation: rusternetes_common::feature_gates::Version,
+    config: Option<&dyn deleted_kinds::ResourceConfig>,
+) -> Result<Option<deleted_kinds::VersionedResources>, String> {
     use rusternetes_common::resource_encoding::Scheme;
     static SCHEME: std::sync::OnceLock<Scheme> = std::sync::OnceLock::new();
 
     if emulation
         >= rusternetes_common::compatibility::default_build_effective_version().emulation_version()
     {
-        return None;
+        return Ok(None);
     }
     let scheme = SCHEME.get_or_init(Scheme::legacy);
     let mut versions: Vec<String> = Vec::new();
@@ -1114,14 +1171,11 @@ fn emulation_served_resources_at(
         deleted_kinds::ResourceExpirationEvaluator::from_options(deleted_kinds::Options {
             current_version: Some(emulation),
             ..Default::default()
-        })
-        .ok()?;
-    // No runtime-config and no --emulation-forward-compatible here, so the
-    // evaluator cannot fail (its errors name an explicitly enabled future API).
-    evaluator
-        .remove_unintroduced_kinds(group, &versions, &mut resources, None)
-        .ok()?;
-    Some(resources)
+        })?;
+    // The evaluator fails only for a future API explicitly enabled in
+    // runtime-config (no --emulation-forward-compatible flag exists upstream).
+    evaluator.remove_unintroduced_kinds(group, &versions, &mut resources, config)?;
+    Ok(Some(resources))
 }
 
 /// Whether `group/version` is still served at the emulation version. A version
@@ -6188,6 +6242,31 @@ mod emulation_tests {
         let at_34 = emulation_served_resources_at("resource.k8s.io", Version::major_minor(1, 34))
             .expect("filtered below the binary version");
         assert!(at_34.contains_key("v1"));
+    }
+
+    #[test]
+    fn runtime_config_enabling_a_future_api_fails_unless_unset() {
+        use crate::resource_config::{
+            merge_api_resource_configs, ConfigurationMap, ResourceConfig,
+        };
+        let emulation = Version::major_minor(1, 33);
+        let scheme = rusternetes_common::resource_encoding::Scheme::legacy();
+        let mut overrides = ConfigurationMap::new();
+        overrides.insert("resource.k8s.io/v1".into(), "true".into());
+        let cfg = merge_api_resource_configs(ResourceConfig::new(), &overrides, &scheme).unwrap();
+        // resource.k8s.io/v1 is wholly introduced at 1.34 (see above).
+        let err = try_emulation_served_resources_at("resource.k8s.io", emulation, Some(&cfg))
+            .expect_err("explicitly enabling a future version is an error");
+        assert!(
+            err.contains("cannot enable version resource.k8s.io/v1 in runtime-config"),
+            "{err}"
+        );
+        // Unset runtime-config is the no-op default.
+        assert!(try_emulation_served_resources_at("resource.k8s.io", emulation, None).is_ok());
+        let empty = ResourceConfig::new();
+        assert!(
+            try_emulation_served_resources_at("resource.k8s.io", emulation, Some(&empty)).is_ok()
+        );
     }
 
     #[test]

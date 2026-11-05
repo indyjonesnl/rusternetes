@@ -196,6 +196,22 @@ impl Scheme {
         self.groups.contains_key(group)
     }
 
+    /// `IsVersionRegistered`: the version is one of the group's prioritized
+    /// versions (the internal version is never addressed by runtime-config).
+    pub fn is_version_registered(&self, group: &str, version: &str) -> bool {
+        self.groups
+            .get(group)
+            .is_some_and(|g| g.versions.iter().any(|v| v.version == version))
+    }
+
+    /// `PrioritizedVersionsAllGroups`.
+    pub fn prioritized_versions_all_groups(&self) -> Vec<GroupVersion> {
+        self.groups
+            .keys()
+            .flat_map(|group| self.prioritized_versions_for_group(group))
+            .collect()
+    }
+
     /// `PrioritizedVersionsForGroup`.
     pub fn prioritized_versions_for_group(&self, group: &str) -> Vec<GroupVersion> {
         self.groups
