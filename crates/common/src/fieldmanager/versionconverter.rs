@@ -326,11 +326,9 @@ impl FieldManager {
     ) -> Result<super::fieldset::Comparison, UpdateFailure> {
         let compare_at = |old: &Value, new: &Value, version: &str| {
             let comparison = self.fields_of(old).compare(&self.fields_of(new));
-            let exclude = self.reset_set_for(version);
-            if exclude.is_empty() {
-                comparison
-            } else {
-                comparison.exclude(&exclude)
+            match self.reset_filter_for(version) {
+                Some(reset) => comparison.filter_fields(&reset),
+                None => comparison,
             }
         };
         let current = compare_at(old, new, &self.api_version);

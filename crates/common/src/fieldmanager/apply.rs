@@ -181,9 +181,8 @@ impl FieldManager {
             .get(&id)
             .map(|vs| (vs.set.clone(), vs.api_version.clone()));
         let mut set = self.fields_of(config).set;
-        let exclude = self.reset_set();
-        if !exclude.is_empty() {
-            set = set.recursive_difference(&exclude);
+        if let Some(reset) = self.reset_filter() {
+            set = reset.filter(&set);
         }
         managed.fields.insert(
             id.clone(),
