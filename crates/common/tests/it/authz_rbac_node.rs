@@ -1094,3 +1094,26 @@ async fn node_authorizer_static_rules_cover_unsubdivided_resources() {
         Decision::Deny(_)
     ));
 }
+
+/// node_authorizer.go:101-107 `RulesFor`: a node's rules are "incomplete" with
+/// "node authorizer does not support user rule resolution"; a non-node gets
+/// `nil, nil, false, nil`.
+#[tokio::test]
+async fn node_authorizer_rules_for_reports_incomplete_for_nodes_only() {
+    let az = NodeAuthorizer::new(graph_with_pod("worker-1"));
+    let node = az
+        .get_user_rules_outcome(&node_identity("worker-1"), "ns")
+        .await
+        .unwrap();
+    assert!(node.incomplete);
+    assert!(node.resource_rules.is_empty() && node.non_resource_rules.is_empty());
+    assert_eq!(
+        node.error.as_deref(),
+        Some("node authorizer does not support user rule resolution")
+    );
+
+    let other = user_with_groups("alice", &[]);
+    let out = az.get_user_rules_outcome(&other, "ns").await.unwrap();
+    assert!(!out.incomplete && out.error.is_none());
+    assert!(out.resource_rules.is_empty() && out.non_resource_rules.is_empty());
+}
