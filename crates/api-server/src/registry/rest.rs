@@ -797,8 +797,9 @@ pub trait RestStorage<T: Object>: Send + Sync {
         crate::ssa::ResetFields::new()
     }
 
-    /// `Store.GetResetFieldsFilter`: the strategy's reset-fields filter, see
-    /// `RestUpdateStrategy::get_reset_fields_filter`.
+    /// `ResetFieldsFilterStrategy.GetResetFieldsFilter` of the storage
+    /// (rest.go:391-394). Upstream's `Store` does not implement it, so only a
+    /// storage that is not a `Store` can provide one; the default is none.
     fn get_reset_fields_filter(&self) -> crate::ssa::ResetFields {
         crate::ssa::ResetFields::new()
     }

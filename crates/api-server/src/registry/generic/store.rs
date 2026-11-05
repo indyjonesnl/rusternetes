@@ -1780,10 +1780,10 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         self.update_strategy.get_reset_fields()
     }
 
-    /// `Store.GetResetFieldsFilter`, see `RestUpdateStrategy::get_reset_fields_filter`.
-    fn get_reset_fields_filter(&self) -> crate::ssa::ResetFields {
-        self.update_strategy.get_reset_fields_filter()
-    }
+    // No `GetResetFieldsFilter` here: in release-1.35 `Store` implements only
+    // `GetResetFields` (store.go:1698-1703) and nothing forwards a strategy's
+    // `ResetFieldsFilterStrategy`, so the installer never sees a filter for a
+    // Store-backed resource (installer.go:707-711). The default (empty) stands.
 
     fn field_schema(
         &self,
