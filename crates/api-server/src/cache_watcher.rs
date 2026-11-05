@@ -14,11 +14,21 @@
 //!   event is TERMINATED (`forget(false)`): its stream ends and the client
 //!   re-watches from the last resourceVersion it received.
 //!
+//! * `watchersBuffer` selection (`cacher.go:1039-1112`, `startDispatching`): a
+//!   watcher scoped to one name (`metadata.name=<n>` field selector,
+//!   `namespacedName{name: n}`) is offered only events for that name, the
+//!   others are offered every event. The terminated-watchers counter
+//!   (`metrics.TerminatedWatchersCounter`) is bumped on every termination.
+//!
 //! Deviations (Rusternetes-specific):
-//! * Watchers are not indexed by namespace/name/trigger: our cache is per
-//!   storage prefix and every watcher of the prefix is offered every event;
-//!   selector filtering happens in the watch handler. `suggestedWatchChannelSize`
-//!   is therefore always called with `indexExists = false` (cap 100).
+//! * The namespace dimension of `namespacedName` is the storage prefix itself
+//!   (a namespaced watch has its own prefix). Trigger-value indexing
+//!   (`valueWatchers`, `TriggerFunc`) is NOT ported: it needs the previous
+//!   object of an update (`triggerValuesThreadUnsafe` reads both `Object` and
+//!   `PrevObject`) and our cached events carry only the new one, so a
+//!   watcher whose object moved out of its trigger value would miss the
+//!   DELETE. There is no trigger, so `suggestedWatchChannelSize` is called with
+//!   `indexExists = false` (cap 100).
 //! * The cacher's bookmark time buckets (`watcherBookmarkTimeBuckets`) are not
 //!   ported here; watch bookmarks are produced by the watch handler.
 //! * `cacheWatcher.process`'s `result` channel is [`process`]'s output queue,
@@ -135,7 +145,9 @@ impl CacheWatcher {
 
     /// `cacheWatcher.forget(false)` from `add`'s `closeFunc`: stop without
     /// draining the input buffer.
-    fn terminate(&self, prefix: &str) {
+    fn terminate(&self, group: &str, resource: &str) {
+        crate::cache_metrics::observe_terminated_watcher(group, resource);
+        let prefix = resource;
         tracing::info!(
             "Forcing watcher of {prefix} to close due to unresponsiveness (queue {} of {} events)",
             self.input.max_capacity() - self.input.capacity(),
@@ -187,10 +199,46 @@ impl WatchReceiver {
     }
 }
 
+/// The watchers of a prefix, indexed as upstream's `watchersSet`
+/// (`allWatchers` keyed by `namespacedName`): unscoped watchers, and watchers
+/// scoped to one object name.
+#[derive(Default)]
+struct WatcherSet {
+    unscoped: Vec<Arc<CacheWatcher>>,
+    by_name: std::collections::HashMap<String, Vec<Arc<CacheWatcher>>>,
+}
+
+impl WatcherSet {
+    fn retain_live(&mut self) {
+        self.unscoped.retain(|w| !w.is_gone());
+        self.by_name.retain(|_, ws| {
+            ws.retain(|w| !w.is_gone());
+            !ws.is_empty()
+        });
+    }
+
+    fn count(&self) -> usize {
+        self.unscoped.iter().filter(|w| !w.is_gone()).count()
+            + self
+                .by_name
+                .values()
+                .flatten()
+                .filter(|w| !w.is_gone())
+                .count()
+    }
+}
+
+/// The object name of a storage key (`/registry/<resource>[/<ns>]/<name>`).
+fn key_name(key: &str) -> &str {
+    key.rsplit('/').next().unwrap_or_default()
+}
+
 /// A prefix's watcher set and `dispatchEvent` (`cacher.go:952`).
 pub struct Dispatcher {
-    watchers: Mutex<Vec<Arc<CacheWatcher>>>,
+    watchers: Mutex<WatcherSet>,
     budget: Mutex<TimeBudget>,
+    /// `(group, resource)` metric labels, set by the first scoped subscriber.
+    group_resource: std::sync::OnceLock<(String, String)>,
 }
 
 impl Default for Dispatcher {
@@ -202,25 +250,57 @@ impl Default for Dispatcher {
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
-            watchers: Mutex::new(Vec::new()),
+            watchers: Mutex::new(WatcherSet::default()),
             budget: Mutex::new(TimeBudget::default()),
+            group_resource: std::sync::OnceLock::new(),
         }
     }
 
-    fn list(&self) -> std::sync::MutexGuard<'_, Vec<Arc<CacheWatcher>>> {
+    fn list(&self) -> std::sync::MutexGuard<'_, WatcherSet> {
         self.watchers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Label the terminated-watchers metric (first call wins).
+    pub fn set_group_resource(&self, group: &str, resource: &str) {
+        let _ = self
+            .group_resource
+            .set((group.to_string(), resource.to_string()));
     }
 
     /// `newCacheWatcher` + registration (`cacher.go:569-663`), with the input
     /// queue sized for a ring of `capacity` events.
     pub fn add_watcher(&self, capacity: usize) -> WatchReceiver {
+        self.add_scoped_watcher(capacity, None)
+    }
+
+    /// Register a watcher for `scope` (labels the metric, indexes by name).
+    pub fn add_scoped(
+        &self,
+        capacity: usize,
+        scope: &crate::watch_cache::WatchScope,
+    ) -> WatchReceiver {
+        if !scope.resource.is_empty() {
+            self.set_group_resource(&scope.group, &scope.resource);
+        }
+        self.add_scoped_watcher(capacity, scope.name.clone())
+    }
+
+    /// [`Self::add_watcher`] for a watcher scoped to one object `name`.
+    pub fn add_scoped_watcher(&self, capacity: usize, name: Option<String>) -> WatchReceiver {
         let chan_size = watch_channel_size(capacity);
         let (tx, rx) = mpsc::channel(chan_size);
         let stopped = Arc::new(AtomicBool::new(false));
-        self.list().push(Arc::new(CacheWatcher {
+        let watcher = Arc::new(CacheWatcher {
             input: tx,
             stopped: stopped.clone(),
-        }));
+        });
+        {
+            let mut set = self.list();
+            match name {
+                Some(n) => set.by_name.entry(n).or_default().push(watcher),
+                None => set.unscoped.push(watcher),
+            }
+        }
         WatchReceiver {
             rx,
             stopped,
@@ -230,12 +310,19 @@ impl Dispatcher {
 
     /// Live watchers (the receiver count of the old shared channel).
     pub fn receiver_count(&self) -> usize {
-        self.list().iter().filter(|w| !w.is_gone()).count()
+        self.list().count()
     }
 
     /// Stop every watcher (`terminateAllWatchers`).
     pub fn terminate_all(&self) {
-        for w in self.list().drain(..) {
+        let (unscoped, by_name) = {
+            let mut set = self.list();
+            (
+                std::mem::take(&mut set.unscoped),
+                std::mem::take(&mut set.by_name),
+            )
+        };
+        for w in unscoped.into_iter().chain(by_name.into_values().flatten()) {
             w.stopped.store(true, Ordering::Release);
         }
     }
@@ -245,9 +332,18 @@ impl Dispatcher {
         // startDispatching: the watchers interested in this event; forget the
         // ones that are already gone.
         let targets: Vec<Arc<CacheWatcher>> = {
-            let mut list = self.list();
-            list.retain(|w| !w.is_gone());
-            list.clone()
+            let mut set = self.list();
+            set.retain_live();
+            let name = match &event.event {
+                WatchEventData::Added(k, _)
+                | WatchEventData::Modified(k, _)
+                | WatchEventData::Deleted(k, _) => key_name(k),
+            };
+            let mut t = set.unscoped.clone();
+            if let Some(ws) = set.by_name.get(name) {
+                t.extend(ws.iter().cloned());
+            }
+            t
         };
         // Non-blocking first, so faster watchers are not held up by slower ones.
         let blocked: Vec<&Arc<CacheWatcher>> = targets
@@ -278,13 +374,24 @@ impl Dispatcher {
                     Err(_) => fired = true,
                 }
             }
-            w.terminate(prefix);
+            let (group, resource) = match self.group_resource.get() {
+                Some((g, r)) => (g.as_str(), r.as_str()),
+                None => (
+                    "",
+                    prefix
+                        .trim_start_matches("/registry/")
+                        .split('/')
+                        .next()
+                        .unwrap_or_default(),
+                ),
+            };
+            w.terminate(group, resource);
         }
         self.budget
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .return_unused(timeout.saturating_sub(start.elapsed()));
-        self.list().retain(|w| !w.is_gone());
+        self.list().retain_live();
     }
 }
 
