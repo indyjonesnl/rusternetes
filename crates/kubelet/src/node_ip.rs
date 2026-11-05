@@ -32,6 +32,24 @@ pub fn parse_ip_sloppy(s: &str) -> Option<IpAddr> {
     Some(IpAddr::V4(Ipv4Addr::from(o)))
 }
 
+/// `Kubelet.sortPodIPs` (pkg/kubelet/kubelet_pods.go:2045-2078): "pick out the
+/// first returned IP of the same IP family as the node IP first, followed by
+/// the first IP of the opposite IP family (if any)". The family preference is
+/// the first node IP's (IPv4 when the node has none). IPs are re-stringified
+/// after a sloppy parse, so an irregular CRI format comes out canonical.
+pub fn sort_pod_ips(node_ips: &[IpAddr], pod_ips: &[String]) -> Vec<String> {
+    let primary_v4 = node_ips.first().is_none_or(|ip| ip.is_ipv4());
+    let parsed: Vec<IpAddr> = pod_ips.iter().filter_map(|s| parse_ip_sloppy(s)).collect();
+    let mut out = Vec::with_capacity(2);
+    if let Some(ip) = parsed.iter().find(|ip| ip.is_ipv4() == primary_v4) {
+        out.push(ip.to_string());
+    }
+    if let Some(ip) = parsed.iter().find(|ip| ip.is_ipv4() != primary_v4) {
+        out.push(ip.to_string());
+    }
+    out
+}
+
 /// `parseNodeIP(nodeIP, allowDual, sloppy=true)` via `ParseNodeIPArgument`
 /// (ips.go:33-75). Returns `(ips, invalid_tokens)`; invalid tokens are
 /// returned for the caller to log and ignore. `cloud_provider` "" or

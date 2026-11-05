@@ -735,4 +735,52 @@ mod tests {
         assert!(apply_host_ips(false, &mut s, &[ip("10.0.0.2")]).is_none());
         assert!(apply_host_ips(false, &mut status(), &[ip("10.0.0.2")]).is_none());
     }
+
+    // kubelet_pods_test.go TestGenerateAPIPodStatusPodIPs / sortPodIPs: the
+    // first CRI IP of the node IP's family comes first, then the first of the
+    // other family; an empty node IP list prefers IPv4.
+    #[test]
+    fn sort_pod_ips_cases() {
+        let sort = |node: &[&str], cri: &[&str]| {
+            let node: Vec<IpAddr> = node.iter().map(|s| ip(s)).collect();
+            let cri: Vec<String> = cri.iter().map(|s| s.to_string()).collect();
+            sort_pod_ips(&node, &cri)
+        };
+        assert_eq!(sort(&[], &["10.0.0.1"]), ["10.0.0.1"]);
+        assert_eq!(
+            sort(&[], &["10.0.0.1", "fd01::1234"]),
+            ["10.0.0.1", "fd01::1234"]
+        );
+        assert_eq!(
+            sort(&["192.168.1.1"], &["10.0.0.1", "fd01::1234"]),
+            ["10.0.0.1", "fd01::1234"]
+        );
+        // CRI returning the wrong family first.
+        assert_eq!(
+            sort(&[], &["fd01::1234", "10.0.0.1"]),
+            ["10.0.0.1", "fd01::1234"]
+        );
+        assert_eq!(
+            sort(&["192.168.1.1"], &["fd01::1234", "10.0.0.1"]),
+            ["10.0.0.1", "fd01::1234"]
+        );
+        // IPv6 node IP.
+        assert_eq!(
+            sort(&["fd00::5678"], &["10.0.0.1", "fd01::1234"]),
+            ["fd01::1234", "10.0.0.1"]
+        );
+        assert_eq!(
+            sort(&["fd00::5678"], &["fd01::1234", "10.0.0.1"]),
+            ["fd01::1234", "10.0.0.1"]
+        );
+        // No pod IP of the node's family: only the other one.
+        assert_eq!(sort(&["fd00::5678"], &["10.0.0.1"]), ["10.0.0.1"]);
+        assert_eq!(sort(&[], &["fd01::1234"]), ["fd01::1234"]);
+        // Truncated to one per family; irregular formats re-stringified.
+        assert_eq!(
+            sort(&[], &["10.0.0.1", "10.0.0.2", "fd01::1", "fd01::2"]),
+            ["10.0.0.1", "fd01::1"]
+        );
+        assert_eq!(sort(&[], &["010.000.000.001"]), ["10.0.0.1"]);
+    }
 }
