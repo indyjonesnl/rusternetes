@@ -1,6 +1,7 @@
 //! Tests for `src/openapiv3_aggregator.rs`, ported from
 //! `kube-aggregator/pkg/controllers/openapiv3/aggregator/{downloader,aggregator}_test.go`
-//! (`TestDownloadOpenAPISpec`, `TestV3APIService`, `TestV2APIService`).
+//! (`TestDownloadOpenAPISpec`, `TestV3APIService`; `TestV2APIService` is in
+//! `openapi_aggregator.rs` next to the v2 controller's tests).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -235,8 +236,9 @@ async fn update_of_an_unknown_api_service_is_err_api_service_not_found() {
 
 #[tokio::test]
 async fn an_api_service_without_openapi_v3_is_marked_legacy_and_not_asked_again() {
-    // TestV2APIService's "legacy" half: 404 -> isLegacyAPIService. The v2
-    // download/convert is not ported, so it contributes no v3 path.
+    // TestV2APIService's "legacy" half: 404 -> isLegacyAPIService, then only
+    // `/openapi/v2` is asked for. This server has no v2 document either, so it
+    // contributes no v3 path.
     let server = Arc::new(V2OnlyServer(AtomicUsize::new(0)));
     let p = proxier(server.clone());
     let svc = api_service("group.example.com", "v1", true);
@@ -244,7 +246,8 @@ async fn an_api_service_without_openapi_v3_is_marked_legacy_and_not_asked_again(
     p.update_api_service_spec(&svc.metadata.name).await.unwrap();
     p.update_api_service_spec(&svc.metadata.name).await.unwrap();
     assert!(p.get_open_api_v3_root().paths.is_empty());
-    assert_eq!(server.0.load(Ordering::SeqCst), 1, "sticky isLegacy");
+    // v3 once (404), then v2 on both refreshes: "sticky isLegacy".
+    assert_eq!(server.0.load(Ordering::SeqCst), 3, "sticky isLegacy");
     assert_eq!(p.get_api_service_names().len(), 1);
 }
 
