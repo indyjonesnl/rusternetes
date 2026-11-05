@@ -4,12 +4,13 @@
 //! to all subscribed client watches. This avoids creating N etcd watches
 //! for N clients, which overwhelms etcd and exhausts HTTP/2 stream limits.
 
+use crate::cache_watcher::{Dispatcher, WatchReceiver};
 use async_trait::async_trait;
 use rusternetes_storage::StorageBackend;
 use rusternetes_storage::{Storage, WatchEvent, WatchStream};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// The minimal storage surface the shared per-prefix watch loop needs.
@@ -143,9 +144,10 @@ pub enum WatchEventData {
 /// WatchCache manages shared watch streams for resource prefixes.
 /// Instead of one etcd watch per client, we have one per prefix.
 pub struct WatchCache {
-    /// Map of resource prefix → broadcast sender
-    /// Each prefix has one etcd watch that broadcasts to all subscribers
-    pub watchers: RwLock<HashMap<String, broadcast::Sender<CachedWatchEvent>>>,
+    /// Map of resource prefix → dispatcher (the prefix's cacheWatchers).
+    /// Each prefix has one etcd watch that is dispatched to every watcher's own
+    /// bounded input queue (see [`crate::cache_watcher`]).
+    pub watchers: RwLock<HashMap<String, Arc<Dispatcher>>>,
     pub storage: Arc<dyn WatchSource>,
     /// Current revision counter (approximation based on timestamp)
     pub revision: RwLock<i64>,
@@ -191,7 +193,7 @@ impl WatchCache {
     /// Subscribe to watch events for a resource prefix.
     /// Returns a broadcast receiver that will receive all events for this prefix.
     /// If no etcd watch exists for this prefix, one is started.
-    pub async fn subscribe(&self, prefix: &str) -> broadcast::Receiver<CachedWatchEvent> {
+    pub async fn subscribe(&self, prefix: &str) -> WatchReceiver {
         self.subscribe_with_floor(prefix, None).await
     }
 
@@ -207,29 +209,32 @@ impl WatchCache {
         &self,
         prefix: &str,
         desired_floor: Option<i64>,
-    ) -> broadcast::Receiver<CachedWatchEvent> {
+    ) -> WatchReceiver {
         // Check if we already have a watcher for this prefix
         {
             let watchers = self.watchers.read().await;
-            if let Some(tx) = watchers.get(prefix) {
-                return tx.subscribe();
+            if let Some(d) = watchers.get(prefix) {
+                let cap = self.current_capacity(prefix).await;
+                return d.add_watcher(cap);
             }
         }
 
         // Create a new watcher
-        // Buffer size: K8s default watch cache is 1000 events. 16384 used ~1.2GB
-        // of memory with 26 prefixes × 16K events × ~3KB each. 4096 keeps the
-        // lag-termination path (see broadcast_to_stream) rare under conformance
-        // churn while staying well under that ceiling.
-        let (tx, rx) = broadcast::channel(4096);
-        {
+        // Each watcher gets its own input queue sized from the ring capacity
+        // (`suggestedWatchChannelSize`), not one shared fan-out buffer.
+        let dispatcher = Arc::new(Dispatcher::new());
+        let rx = {
             let mut watchers = self.watchers.write().await;
             // Double-check after acquiring write lock
-            if let Some(existing_tx) = watchers.get(prefix) {
-                return existing_tx.subscribe();
+            if let Some(existing) = watchers.get(prefix) {
+                let existing = existing.clone();
+                drop(watchers);
+                let cap = self.current_capacity(prefix).await;
+                return existing.add_watcher(cap);
             }
-            watchers.insert(prefix.to_string(), tx.clone());
-        }
+            watchers.insert(prefix.to_string(), dispatcher.clone());
+            dispatcher.add_watcher(LOWER_BOUND_CAPACITY)
+        };
 
         // Record the replay floor BEFORE the shared watch starts: the ring is
         // complete for revisions > floor. Starting the loop with
@@ -277,7 +282,7 @@ impl WatchCache {
         // Continue the watch (reconnects included) in a background task.
         let storage = self.storage.clone();
         let prefix_owned = prefix.to_string();
-        let tx_clone = tx.clone();
+        let dispatcher_clone = dispatcher.clone();
         let history_ref = self.history.clone();
         let last_write_ref = Arc::clone(&self.last_write);
         let floors_ref = self.floors.clone();
@@ -468,8 +473,8 @@ impl WatchCache {
                                     resume_rev = Some(cached.revision);
                                 }
 
-                                // Broadcast to live subscribers (Err is OK if no receivers)
-                                let _ = tx_clone.send(cached);
+                                // `Cacher.dispatchEvent`: offer to every watcher's own queue.
+                                dispatcher_clone.dispatch(&prefix_owned, &cached).await;
                             }
                         }
                         // Stream ended, reconnect after brief pause
@@ -535,7 +540,7 @@ impl WatchCache {
             let now = std::time::Instant::now();
             watchers
                 .iter()
-                .filter(|(_, tx)| tx.receiver_count() == 0)
+                .filter(|(_, d)| d.receiver_count() == 0)
                 .filter(|(prefix, _)| {
                     // Absent = never written = quiet.
                     last_write
@@ -576,6 +581,16 @@ impl WatchCache {
         }
     }
 
+    /// `watchCache.currentCapacity`: the prefix's ring capacity.
+    async fn current_capacity(&self, prefix: &str) -> usize {
+        self.capacities
+            .read()
+            .await
+            .get(prefix)
+            .copied()
+            .unwrap_or(LOWER_BOUND_CAPACITY)
+    }
+
     /// Get the current approximate revision
     pub async fn current_revision(&self) -> i64 {
         *self.revision.read().await
@@ -604,7 +619,7 @@ impl WatchCache {
         &self,
         prefix: &str,
         since_revision: i64,
-    ) -> Result<(Vec<CachedWatchEvent>, broadcast::Receiver<CachedWatchEvent>), i64> {
+    ) -> Result<(Vec<CachedWatchEvent>, WatchReceiver), i64> {
         // Subscribe first: creates the shared watcher if absent, flooring it at
         // the client's RV so the very first watch of an on-demand prefix is
         // served (backend replay from rv+1 fills the ring for it).
@@ -828,50 +843,15 @@ fn cache_event(ev: WatchEvent) -> CachedWatchEvent {
     }
 }
 
-/// Convert a broadcast receiver into a WatchStream compatible with existing handlers.
-pub fn broadcast_to_stream(mut rx: broadcast::Receiver<CachedWatchEvent>) -> WatchStream {
-    let stream = async_stream::stream! {
-        loop {
-            match rx.recv().await {
-                Ok(cached) => {
-                    let event = match cached.event {
-                        WatchEventData::Added(key, value) => WatchEvent::Added(key, (*value).clone()),
-                        WatchEventData::Modified(key, value) => WatchEvent::Modified(key, (*value).clone()),
-                        WatchEventData::Deleted(key, prev) => WatchEvent::Deleted(key, (*prev).clone()),
-                    };
-                    yield Ok(event);
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // The subscriber fell behind the broadcast ring and `n`
-                    // events are irretrievably gone for THIS stream. Silently
-                    // continuing would leave the client permanently blind to
-                    // those objects (client-go reflectors never re-list on
-                    // their own) — the exact wedge behind stuck informers
-                    // (#1165: deployment ReadyReplicas, endpointslice
-                    // readiness, quota usage). Upstream's watch cache
-                    // TERMINATES a too-slow watcher so the client re-lists
-                    // (apiserver/pkg/storage/cacher). Mirror that: surface a
-                    // 410-style error and end the stream.
-                    tracing::warn!(
-                        "watch subscriber lagged by {} events — terminating watch so the client relists",
-                        n
-                    );
-                    yield Err(rusternetes_common::Error::Gone(format!(
-                        "too old resource version: watch lagged behind by {} events",
-                        n
-                    )));
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    break;
-                }
-            }
-        }
-    };
-    Box::pin(stream)
+/// Convert a watcher's input queue into a WatchStream compatible with existing
+/// handlers. The stream ends (no error) when the dispatcher terminates the
+/// watcher as too slow: the client re-watches from the last resourceVersion it
+/// received, as after a `cacheWatcher` is closed upstream.
+pub fn broadcast_to_stream(rx: WatchReceiver) -> WatchStream {
+    broadcast_to_stream_with_history(Vec::new(), rx, 0)
 }
 
-/// Convert historical events + a broadcast receiver into a WatchStream.
+/// Convert historical events + a watcher's input queue into a WatchStream.
 /// Historical events are replayed first (in order), then live events follow.
 ///
 /// `since_revision` is the resourceVersion the client asked to watch from.
@@ -884,70 +864,13 @@ pub fn broadcast_to_stream(mut rx: broadcast::Receiver<CachedWatchEvent>) -> Wat
 /// already saw, history is empty and that write would arrive live as if new.
 pub fn broadcast_to_stream_with_history(
     history: Vec<CachedWatchEvent>,
-    mut rx: broadcast::Receiver<CachedWatchEvent>,
+    rx: WatchReceiver,
     since_revision: i64,
 ) -> WatchStream {
-    // Highest revision the client already has: the one it asked to watch
-    // from, raised past everything replayed below.
-    let max_history_rev = history
-        .iter()
-        .map(|e| e.revision)
-        .max()
-        .unwrap_or(0)
-        .max(since_revision);
-
+    let mut result = crate::cache_watcher::process(history, rx, since_revision);
     let stream = async_stream::stream! {
-        // Replay historical events first
-        for cached in history {
-            let event = match cached.event {
-                WatchEventData::Added(key, value) => WatchEvent::Added(key, (*value).clone()),
-                WatchEventData::Modified(key, value) => WatchEvent::Modified(key, (*value).clone()),
-                WatchEventData::Deleted(key, prev) => WatchEvent::Deleted(key, (*prev).clone()),
-            };
+        while let Some(event) = result.recv().await {
             yield Ok(event);
-        }
-
-        // Then stream live events, skipping any that overlap with history
-        loop {
-            match rx.recv().await {
-                Ok(cached) => {
-                    // Skip events we already replayed from history. Only
-                    // applies when the event carries a REAL revision (> 0):
-                    // the in-memory backend never stamps a resourceVersion
-                    // onto the raw published object, so `extract_rv` always
-                    // returns 0 for it — indistinguishable from
-                    // `max_history_rev`'s empty-history default of 0. Without
-                    // this guard, `0 <= 0` treated every live MemoryStorage
-                    // event as an already-seen duplicate and silently dropped
-                    // it (reflector_lists_then_streams_live_mutations).
-                    if cached.revision > 0 && cached.revision <= max_history_rev {
-                        continue;
-                    }
-                    let event = match cached.event {
-                        WatchEventData::Added(key, value) => WatchEvent::Added(key, (*value).clone()),
-                        WatchEventData::Modified(key, value) => WatchEvent::Modified(key, (*value).clone()),
-                        WatchEventData::Deleted(key, prev) => WatchEvent::Deleted(key, (*prev).clone()),
-                    };
-                    yield Ok(event);
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // See broadcast_to_stream: a lagged subscriber lost events
-                    // permanently — terminate so the client relists (upstream
-                    // cacher parity), never silently continue.
-                    tracing::warn!(
-                        "watch subscriber (with history) lagged by {} events — terminating watch so the client relists",
-                        n
-                    );
-                    yield Err(rusternetes_common::Error::Gone(format!(
-                        "too old resource version: watch lagged behind by {} events",
-                        n
-                    )));
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    break;
-                }
-            }
         }
     };
     Box::pin(stream)

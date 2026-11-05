@@ -197,51 +197,52 @@ mod tests {
         }
     }
 
-    // Regression (#1165 wedge): a broadcast subscriber that lags must be
-    // TERMINATED with a Gone error (→ handler sends a 410 ERROR event, client
-    // relists), never silently skipped past — a silently dropped MODIFIED
-    // leaves long-lived informers (KCM deployment ReadyReplicas, endpointslice
-    // readiness, quota usage) permanently stale.
+    // Regression (#1165 wedge): a watcher that cannot keep up must be
+    // TERMINATED (its stream ends so the client re-watches from the last
+    // resourceVersion it received), never silently skipped past — a silently
+    // dropped MODIFIED leaves long-lived informers permanently stale. Upstream:
+    // `cacheWatcher.add` closes a watcher that is still blocked once the
+    // dispatch timer fired (cacher/cache_watcher.go).
     #[tokio::test]
-    async fn lagged_subscriber_terminates_with_gone() {
-        let (tx, rx) = broadcast::channel::<CachedWatchEvent>(2);
-        // Overflow the 2-slot ring before the stream consumes anything.
-        for rev in 1..=5 {
+    async fn slow_watcher_is_terminated_and_its_stream_ends() {
+        let dispatcher = rusternetes_api_server::cache_watcher::Dispatcher::new();
+        let rx = dispatcher.add_watcher(LOWER_BOUND_CAPACITY);
+        let chan = rx.chan_size();
+        assert_eq!(chan, 10);
+        // Overflow the watcher's queue (plus the processing stage's) before
+        // anything consumes.
+        let mut stream = broadcast_to_stream(rx);
+        for rev in 1..=(4 * chan as i64) {
             let val = Arc::new(format!(
                 "{{\"metadata\":{{\"name\":\"k{rev}\",\"resourceVersion\":\"{rev}\"}}}}"
             ));
-            tx.send(CachedWatchEvent {
-                revision: rev,
-                recorded: std::time::Instant::now(),
-                event: WatchEventData::Added(format!("/registry/secrets/ns/k{rev}"), val),
-            })
-            .unwrap();
+            dispatcher
+                .dispatch(
+                    "/registry/secrets/",
+                    &CachedWatchEvent {
+                        revision: rev,
+                        recorded: std::time::Instant::now(),
+                        event: WatchEventData::Added(format!("/registry/secrets/ns/k{rev}"), val),
+                    },
+                )
+                .await;
         }
-
-        let mut stream = broadcast_to_stream(rx);
-        let mut yielded = Vec::new();
-        let mut got_gone = false;
+        assert_eq!(
+            dispatcher.receiver_count(),
+            0,
+            "terminated watcher is dropped"
+        );
+        // The stream ends cleanly after (at most) what was already delivered
+        // to its result queue.
+        let mut n = 0;
         while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
-            .expect("stream must not hang after lag")
+            .expect("stream must end after termination")
         {
-            match item {
-                Ok(ev) => yielded.push(ev),
-                Err(rusternetes_common::Error::Gone(msg)) => {
-                    assert!(
-                        msg.contains("lagged"),
-                        "Gone error should describe the lag, got: {msg}"
-                    );
-                    got_gone = true;
-                }
-                Err(other) => panic!("unexpected error type: {other}"),
-            }
+            item.expect("no error: termination just ends the stream");
+            n += 1;
         }
-        assert!(
-            got_gone,
-            "lagged subscriber MUST receive Error::Gone before the stream ends (got {} events, then clean end)",
-            yielded.len()
-        );
+        assert!(n < 4 * chan, "events after termination are discarded: {n}");
     }
 
     fn added(rev: i64) -> Result<WatchEvent, rusternetes_common::Error> {
@@ -401,14 +402,13 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 match rx.recv().await {
-                    Ok(ev) => {
+                    Some(ev) => {
                         seen.push(ev.revision);
                         if ev.revision == 6 {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    None => return,
                 }
             }
         })
@@ -464,11 +464,12 @@ mod tests {
 
         // A shared watcher exists (as at boot) but nobody is subscribed, and
         // the prefix is being written continuously.
-        let (tx, rx) = broadcast::channel(1000);
-        drop(rx);
         {
             let mut watchers = cache.watchers.write().await;
-            watchers.insert("/registry/nodes/".to_string(), tx);
+            watchers.insert(
+                "/registry/nodes/".to_string(),
+                Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new()),
+            );
         }
         {
             let mut hist = cache.history.write().await;
@@ -508,14 +509,15 @@ mod tests {
         let cache = WatchCache::new(storage);
 
         // Prefix "a": a watcher with a LIVE receiver — must not be shrunk.
-        let (tx_a, rx_a) = broadcast::channel(1000);
+        let disp_a = Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new());
+        let rx_a = disp_a.add_watcher(100);
         // Prefix "b": a watcher whose receiver was dropped — count 0, eligible.
-        let (tx_b, rx_b) = broadcast::channel(1000);
-        drop(rx_b);
+        let disp_b = Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new());
+        drop(disp_b.add_watcher(100));
         {
             let mut watchers = cache.watchers.write().await;
-            watchers.insert("a".to_string(), tx_a);
-            watchers.insert("b".to_string(), tx_b);
+            watchers.insert("a".to_string(), disp_a.clone());
+            watchers.insert("b".to_string(), disp_b.clone());
         }
         {
             let mut hist = cache.history.write().await;
