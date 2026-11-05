@@ -709,6 +709,37 @@ pub fn terminating_grace_elapsed(
     deletion_timestamp.map(|dt| now >= dt).unwrap_or(true)
 }
 
+/// The stored pod at `key`, only if it is the incarnation with `uid`.
+///
+/// The kubelet's pod workers are keyed by UID but the store is keyed by
+/// namespace/name, so a worker finishing an OLD pod can find a NEW pod of the
+/// same name at its key (the pattern of e2e `Get2NodesThatCanRunPod`: delete
+/// `without-label` with grace 0, immediately create it again elsewhere).
+/// Writing the old pod's terminal status onto that object made the new pod
+/// `Succeeded` (#3816). Upstream: `statusManager.syncPod`
+/// (pkg/kubelet/status/status_manager.go:1051-1060): "Pod was deleted and then
+/// recreated, skipping status update".
+pub async fn stored_pod_of<S: Storage + ?Sized>(storage: &S, key: &str, uid: &str) -> Option<Pod> {
+    let p = storage.get::<Pod>(key).await.ok()?;
+    if p.metadata.uid == uid {
+        Some(p)
+    } else {
+        info!(
+            "Pod {key} was deleted and then recreated (uid {uid} -> {}), skipping status update",
+            p.metadata.uid
+        );
+        None
+    }
+}
+
+/// Whether a pod with a different UID now holds `key`.
+pub async fn pod_recreated<S: Storage + ?Sized>(storage: &S, key: &str, uid: &str) -> bool {
+    storage
+        .get::<Pod>(key)
+        .await
+        .is_ok_and(|p| p.metadata.uid != uid)
+}
+
 /// Decide whether a pod that has reached `TerminatedPod` should be removed
 /// from storage, and remove it if so. Returns `Ok(true)` when the object was
 /// deleted, `Ok(false)` when it was intentionally retained.
@@ -3237,7 +3268,7 @@ impl Kubelet {
                 .unwrap_or(false);
             if !has_finalizers {
                 // Update status to terminal phase before removing from storage.
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
                     let original = p.clone();
                     if let Some(ref mut status) = p.status {
                         if status.phase != Some(Phase::Failed)
@@ -3295,14 +3326,21 @@ impl Kubelet {
                 // rule lives in `finalize_terminated_pod_storage` so it can be
                 // unit-tested against real storage; see that helper for why an
                 // explicitly-deleted, finalizer-free pod must be removed.
-                match finalize_terminated_pod_storage(
-                    self.storage.as_ref(),
-                    &key,
-                    pod.metadata.deletion_timestamp.is_some(),
-                    has_finalizers,
-                )
-                .await
-                {
+                // A same-named pod that replaced this incarnation is not ours to
+                // remove (statusManager.syncPod's UID translation, and the UID
+                // precondition on its delete).
+                let finalize = if pod_recreated(self.storage.as_ref(), &key, pod_uid).await {
+                    Ok(false)
+                } else {
+                    finalize_terminated_pod_storage(
+                        self.storage.as_ref(),
+                        &key,
+                        pod.metadata.deletion_timestamp.is_some(),
+                        has_finalizers,
+                    )
+                    .await
+                };
+                match finalize {
                     Ok(true) => {
                         // Defense in depth (#1157): a finalize that reports
                         // removal but leaves the object behind would make this
@@ -3344,7 +3382,7 @@ impl Kubelet {
                 self.forget_restart_backoff(namespace, pod_name);
             } else {
                 // Pod has finalizers — update status to Failed but don't delete
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
                     let original = p.clone();
                     if let Some(ref mut status) = p.status {
                         if status.phase != Some(Phase::Failed)
@@ -3385,7 +3423,7 @@ impl Kubelet {
             // terminating" waits for this via an informer.
             {
                 let key = build_key("pods", Some(namespace), pod_name);
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+                if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
                     let original = p.clone();
                     if let Some(ref mut status) = p.status {
                         status.conditions = Some(Self::merge_pod_conditions(
@@ -3451,7 +3489,7 @@ impl Kubelet {
             // Update pod status to terminal phase.
             // K8s kubelet NEVER deletes pods from the API server.
             let key = build_key("pods", Some(namespace), pod_name);
-            if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
+            if let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, pod_uid).await {
                 let original = p.clone();
                 if let Some(ref mut status) = p.status {
                     if status.phase != Some(Phase::Failed) {

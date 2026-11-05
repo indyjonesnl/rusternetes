@@ -12,7 +12,7 @@ use rusternetes_common::resources::{
     HTTPGetAction, Lifecycle, LifecycleHandler, Pod, PodSpec, PodStatus,
 };
 use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_kubelet::kubelet::finalize_terminated_pod_storage;
+use rusternetes_kubelet::kubelet::{finalize_terminated_pod_storage, pod_recreated, stored_pod_of};
 use rusternetes_storage::{MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
@@ -1476,4 +1476,41 @@ fn terminated_pod_without_deletion_timestamp_must_remain_in_storage() {
         !should_delete_from_storage,
         "naturally-terminated pod (no deletionTimestamp) must remain in storage"
     );
+}
+
+// ===========================================================================
+// A recreated pod of the same name is not the old incarnation (#3816)
+//
+// e2e `Get2NodesThatCanRunPod` deletes pod `without-label` with grace 0 and at
+// once creates another with that name. The old pod's worker must not write its
+// terminal status onto, or delete, the new pod.
+// Reference: pkg/kubelet/status/status_manager.go:1051-1060 ("Pod was deleted
+// and then recreated, skipping status update").
+// ===========================================================================
+
+#[tokio::test]
+async fn stored_pod_of_ignores_a_recreated_pod() {
+    let storage = MemoryStorage::new();
+    let key = "/registry/pods/default/without-label";
+    let mut new_pod = make_pod(
+        "without-label",
+        "Always",
+        vec![],
+        vec![make_container("c", "pause")],
+    );
+    new_pod.metadata.uid = "uid-new".to_string();
+    storage.create(key, &new_pod).await.unwrap();
+
+    assert!(stored_pod_of(&storage, key, "uid-old").await.is_none());
+    assert!(pod_recreated(&storage, key, "uid-old").await);
+    assert!(stored_pod_of(&storage, key, "uid-new").await.is_some());
+    assert!(!pod_recreated(&storage, key, "uid-new").await);
+}
+
+#[tokio::test]
+async fn pod_recreated_is_false_when_the_pod_is_gone() {
+    let storage = MemoryStorage::new();
+    let key = "/registry/pods/default/gone";
+    assert!(!pod_recreated(&storage, key, "uid-old").await);
+    assert!(stored_pod_of(&storage, key, "uid-old").await.is_none());
 }
