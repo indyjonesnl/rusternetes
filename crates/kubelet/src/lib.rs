@@ -8,6 +8,7 @@ pub mod cri_runtime;
 pub mod downward_api;
 pub mod events;
 pub mod eviction;
+pub mod flowcontrol;
 #[cfg(target_os = "linux")]
 pub mod fsquota;
 pub mod go_selinux;

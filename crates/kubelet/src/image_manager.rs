@@ -11,9 +11,115 @@
 //! `err.Error()` is the reason, the message is the detail), so each kind's
 //! [`ImageErrorKind::as_str`] is that reason.
 //!
+//! The pull back-off of `pullImage` (`image_manager.go:332-374`) is
+//! [`PullBackOff`]: a [`crate::flowcontrol::Backoff`] keyed `<podUID>_<image>`
+//! plus `prevPullErrMsg`.
+//!
 //! Not ported: `KubeletEnsureSecretPulledImages` credential verification
-//! (`pullmanager`), the pull back-off (`ErrImagePullBackOff`), and the
-//! parallel/serial puller limits (`puller.go`).
+//! (`pullmanager`) and the parallel/serial puller limits (`puller.go`).
+
+use crate::flowcontrol::Backoff;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// `imageBackOffPeriod` (`kubelet.go:225`).
+pub const IMAGE_BACK_OFF_PERIOD: Duration = Duration::from_secs(10);
+/// `MaxImageBackOff` (`kubelet.go:177`).
+pub const MAX_IMAGE_BACK_OFF: Duration = Duration::from_secs(300);
+/// `events.BackOffPullImage` (`events/event.go:52`).
+pub const BACK_OFF_PULL_IMAGE: &str = "BackOff";
+
+/// `backOffKey := fmt.Sprintf("%s_%s", podUID, image)` (`image_manager.go:332`).
+pub fn back_off_key(pod_uid: &str, image: &str) -> String {
+    format!("{pod_uid}_{image}")
+}
+
+/// What [`PullBackOff::check`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackOffCheck {
+    /// Not backing off: pull now.
+    Pull,
+    /// In back-off: emit `BackOffPullImage` with `event_message`, then fail
+    /// `ErrImagePullBackOff` with `message` (the event message plus the previous
+    /// pull error).
+    BackOff {
+        event_message: String,
+        message: String,
+    },
+}
+
+/// `imageManager.backOff` + `imageManager.prevPullErrMsg`.
+#[derive(Debug)]
+pub struct PullBackOff {
+    backoff: Backoff,
+    prev_pull_err_msg: Mutex<HashMap<String, String>>,
+}
+
+impl Default for PullBackOff {
+    /// `flowcontrol.NewBackOff(imageBackOffPeriod, MaxImageBackOff)`
+    /// (`kubelet.go:682`).
+    fn default() -> Self {
+        Self::new(IMAGE_BACK_OFF_PERIOD, MAX_IMAGE_BACK_OFF)
+    }
+}
+
+impl PullBackOff {
+    pub fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            backoff: Backoff::new(initial, max),
+            prev_pull_err_msg: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn prev(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.prev_pull_err_msg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The back-off gate of `pullImage` (`image_manager.go:332-353`). Outside a
+    /// back-off the stored previous error is dropped ("ensure that the map
+    /// cannot grow indefinitely").
+    pub fn check(&self, key: &str, image: &str, now: Instant) -> BackOffCheck {
+        if self.backoff.is_in_back_off_since_update(key, now) {
+            let event_message = format!("Back-off pulling image {image:?}");
+            let message = match self.prev().get(key) {
+                Some(prev) => format!("{event_message}: {prev}"),
+                None => event_message.clone(),
+            };
+            return BackOffCheck::BackOff {
+                event_message,
+                message,
+            };
+        }
+        self.prev().remove(key);
+        BackOffCheck::Pull
+    }
+
+    /// A failed pull (`image_manager.go:361-369`): `Next`, and remember
+    /// `"<sentinel>: <message>"` for the back-off message.
+    pub fn record_failure(&self, key: &str, kind: ImageErrorKind, message: &str, now: Instant) {
+        self.backoff.next(key, now);
+        self.prev()
+            .insert(key.to_string(), format!("{}: {message}", kind.as_str()));
+    }
+
+    /// A successful pull (`image_manager.go:378`): `m.backOff.GC()`.
+    pub fn record_success(&self, now: Instant) {
+        self.backoff.gc(now);
+    }
+
+    /// Tracked back-off keys (tests).
+    pub fn tracked(&self) -> usize {
+        self.backoff.len()
+    }
+
+    /// Stored previous-error entries (tests).
+    pub fn prev_errors(&self) -> usize {
+        self.prev().len()
+    }
+}
 
 /// The sentinel errors of `images/types.go:26-38` (plus the CRI errors
 /// `evalCRIPullErr` maps to, `cri-api/pkg/errors/errors.go:27-31`).
@@ -25,6 +131,8 @@ pub enum ImageErrorKind {
     ImageInspect,
     /// `ErrInvalidImageName`: unable to parse the image name.
     InvalidImageName,
+    /// `ErrImagePullBackOff`: image pull failed, the kubelet is backing off.
+    ImagePullBackOff,
     /// `crierrors.ErrRegistryUnavailable`.
     RegistryUnavailable,
     /// `crierrors.ErrSignatureValidationFailed`.
@@ -36,6 +144,7 @@ impl ImageErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ImageErrorKind::ImagePull => "ErrImagePull",
+            ImageErrorKind::ImagePullBackOff => "ImagePullBackOff",
             ImageErrorKind::ImageInspect => "ImageInspectError",
             ImageErrorKind::InvalidImageName => "InvalidImageName",
             ImageErrorKind::RegistryUnavailable => "RegistryUnavailable",

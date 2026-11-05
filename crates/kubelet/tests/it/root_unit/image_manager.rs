@@ -273,3 +273,76 @@ async fn registry_unavailable_pull_failure_is_mapped() {
         "image pull failed for img:1 because the registry is unavailable: 503"
     );
 }
+
+#[test]
+fn back_off_key_and_message() {
+    assert_eq!(back_off_key("uid", "img:1"), "uid_img:1");
+    let b = PullBackOff::default();
+    let t = std::time::Instant::now();
+    assert_eq!(b.check("k", "img", t), BackOffCheck::Pull);
+    b.record_failure("k", ImageErrorKind::ImagePull, "boom", t);
+    assert_eq!(
+        b.check("k", "img", t + Duration::from_secs(5)),
+        BackOffCheck::BackOff {
+            event_message: r#"Back-off pulling image "img""#.into(),
+            message: r#"Back-off pulling image "img": ErrImagePull: boom"#.into(),
+        }
+    );
+    // Past the window the stored error is dropped (`delete(m.prevPullErrMsg,
+    // backOffKey)`), bounding the map.
+    assert_eq!(
+        b.check("k", "img", t + Duration::from_secs(10)),
+        BackOffCheck::Pull
+    );
+    assert_eq!(b.prev_errors(), 0);
+}
+
+#[tokio::test]
+async fn pull_failure_then_retry_is_image_pull_back_off() {
+    let e = env().await;
+    e.fake.fail_pull_image("pull denied");
+    let first =
+        e.rt.ensure_image_ref("missing_image", None, Some((&e.pod, "c")), None)
+            .await
+            .unwrap_err();
+    assert_eq!(reason_from_anyhow(&first), Some("ErrImagePull"));
+    let pulls = |e: &Env| e.fake.called().iter().filter(|c| *c == "PullImage").count();
+    assert_eq!(pulls(&e), 1);
+
+    // Immediate retry: no PullImage, ErrImagePullBackOff carrying the last error.
+    let second =
+        e.rt.ensure_image_ref("missing_image", None, Some((&e.pod, "c")), None)
+            .await
+            .unwrap_err();
+    assert_eq!(reason_from_anyhow(&second), Some("ImagePullBackOff"));
+    assert_eq!(
+        second.to_string(),
+        r#"Back-off pulling image "missing_image": ErrImagePull: pull denied"#
+    );
+    assert_eq!(pulls(&e), 1);
+    let ev = events(&e).await;
+    let bo = ev.iter().find(|x| x.0 == "BackOff").unwrap();
+    assert_eq!(bo.1, "Normal");
+    assert_eq!(bo.2, r#"Back-off pulling image "missing_image""#);
+    assert_eq!(ev.iter().filter(|x| x.0 == "Pulling").count(), 1);
+
+    // A different pod UID (or image) is a different key.
+    let mut other = e.pod.clone();
+    other.metadata.uid = "other".into();
+    let third =
+        e.rt.ensure_image_ref("missing_image", None, Some((&other, "c")), None)
+            .await
+            .unwrap_err();
+    assert_eq!(reason_from_anyhow(&third), Some("ErrImagePull"));
+    assert_eq!(pulls(&e), 2);
+}
+
+#[tokio::test]
+async fn successful_pull_runs_gc() {
+    let e = env().await;
+    e.rt.ensure_image_ref("ok_image", None, Some((&e.pod, "c")), None)
+        .await
+        .unwrap();
+    assert_eq!(e.rt.pull_back_off.tracked(), 0);
+    assert_eq!(e.rt.pull_back_off.prev_errors(), 0);
+}

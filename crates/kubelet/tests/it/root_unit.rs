@@ -8,6 +8,7 @@ mod credentialprovider_plugin;
 mod downward_api;
 mod events;
 mod eviction;
+mod flowcontrol;
 mod go_selinux;
 mod go_selinux_label;
 mod host_port;
