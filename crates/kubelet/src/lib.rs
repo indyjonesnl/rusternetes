@@ -13,6 +13,7 @@ pub mod flowcontrol;
 pub mod fsquota;
 pub mod go_selinux;
 pub mod go_selinux_label;
+pub mod healthz;
 pub mod host_port;
 pub mod image_gc;
 pub mod image_gc_cri;

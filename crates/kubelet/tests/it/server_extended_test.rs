@@ -210,3 +210,17 @@ async fn stats_summary_emits_node_block_and_pod_refs() {
     // No cross-node leakage.
     assert!(!names.contains(&"on-other"));
 }
+
+#[tokio::test]
+async fn healthz_sub_paths_are_served_by_the_kubelet_router() {
+    let storage = Arc::new(StorageBackend::new_memory());
+    let app = read_only_router(server_state(storage, "node-1"));
+    for p in ["/healthz/ping", "/healthz/log", "/healthz/syncloop"] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(p).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{p}");
+    }
+}
