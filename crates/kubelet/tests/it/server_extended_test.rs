@@ -224,3 +224,82 @@ async fn healthz_sub_paths_are_served_by_the_kubelet_router() {
         assert_eq!(resp.status(), StatusCode::OK, "{p}");
     }
 }
+
+/// `NewServer` (server.go:311-328): every path the assembled kubelet server
+/// registers is served. The `Container.Handle` paths come from
+/// `RegisteredHandlePaths()` (`registered_handle_paths`); the go-restful
+/// `WebService` routes (`/pods`, `/stats/`, `/run`, `/exec`, `/attach`,
+/// `/portForward`, `/containerLogs`, `/runningpods/`, `/checkpoint/`) are not
+/// in that list, so they are named here. A missing route answers axum's empty
+/// 404; a handler answers with its own status and a body.
+async fn assert_every_registered_path_is_served(enable_debugging_handlers: bool) {
+    use rusternetes_kubelet::server::{
+        build_server_router, registered_handle_paths, ServerRouterOptions,
+    };
+    let storage = Arc::new(StorageBackend::new_memory());
+    let dir = tempfile::tempdir().unwrap();
+    let app = build_server_router(
+        server_state(storage, "node-1"),
+        Arc::new(
+            rusternetes_common::observability::MetricsRegistry::new()
+                .with_kubelet_metrics()
+                .unwrap(),
+        ),
+        Arc::new(Default::default()),
+        ServerRouterOptions {
+            enable_debugging_handlers,
+            enable_system_log_handler: true,
+            enable_system_log_query: false,
+            enable_profiling_handler: true,
+            enable_contention_profiling: false,
+            enable_debug_flags_handler: true,
+            checkpoints_dir: dir.path().join("checkpoints"),
+            logs_root: dir.path().to_path_buf(),
+        },
+    );
+    let mut paths: Vec<String> =
+        registered_handle_paths(enable_debugging_handlers, true, true, false);
+    paths.extend(
+        [
+            "/pods",
+            "/stats/summary",
+            "/runningpods/",
+            "/run/ns/pod/c",
+            "/exec/ns/pod/c",
+            "/attach/ns/pod/c",
+            "/portForward/ns/pod",
+            "/containerLogs/ns/pod/c",
+            "/logs/",
+            "/debug/pprof/",
+        ]
+        .map(String::from),
+    );
+    // `/checkpoint/` exists only with the ContainerCheckpoint gate, inside
+    // `InstallAuthRequiredHandlers` (server.go:620-622).
+    if enable_debugging_handlers && rusternetes_kubelet::server::checkpoint_enabled() {
+        paths.push("/checkpoint/ns/pod/c".to_string());
+    }
+    for p in paths {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(&p).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !(status == StatusCode::NOT_FOUND && body.is_empty()),
+            "{p} is not routed (debugging handlers: {enable_debugging_handlers})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_registered_path_is_served_with_debugging_handlers() {
+    assert_every_registered_path_is_served(true).await;
+}
+
+#[tokio::test]
+async fn every_registered_path_is_served_without_debugging_handlers() {
+    assert_every_registered_path_is_served(false).await;
+}

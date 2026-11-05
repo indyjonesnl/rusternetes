@@ -731,3 +731,132 @@ pub fn registered_handle_paths(
     }
     paths.into_iter().map(String::from).collect()
 }
+
+/// The switches of `NewServer` (pkg/kubelet/server/server.go:311-330) that
+/// decide which handlers are installed.
+#[derive(Debug, Clone)]
+pub struct ServerRouterOptions {
+    /// `kubeCfg.EnableDebuggingHandlers`.
+    pub enable_debugging_handlers: bool,
+    /// `kubeCfg.EnableSystemLogHandler`.
+    pub enable_system_log_handler: bool,
+    /// `NodeLogQuery` gate and `kubeCfg.EnableSystemLogQuery`.
+    pub enable_system_log_query: bool,
+    /// `kubeCfg.EnableProfilingHandler`.
+    pub enable_profiling_handler: bool,
+    /// `kubeCfg.EnableContentionProfiling`.
+    pub enable_contention_profiling: bool,
+    /// `kubeCfg.EnableDebugFlagsHandler`.
+    pub enable_debug_flags_handler: bool,
+    /// `getCheckpointsDir` (kubelet_getters.go:89).
+    pub checkpoints_dir: std::path::PathBuf,
+    /// Root of the `/logs/` handler (`/var/log`).
+    pub logs_root: std::path::PathBuf,
+}
+
+/// The handler installation of `NewServer` (server.go:311-328), up to and
+/// including `installStatusZ`: `InstallAuthNotRequiredHandlers`, then
+/// `InstallAuthRequiredHandlers` + `InstallSystemLogHandler` +
+/// `InstallProfilingHandler` + `InstallDebugFlagsHandler` or
+/// `InstallDebuggingDisabledHandlers`, then `installStatusZ`. The caller wraps
+/// the result in the auth filter (`InstallAuthFilter`, server.go:312-314) and
+/// the metrics filter (`ServeHTTP`, :1176).
+pub fn build_server_router(
+    state: ServerState,
+    metrics: Arc<rusternetes_common::observability::MetricsRegistry>,
+    kubelet_config: Arc<crate::config::KubeletConfiguration>,
+    opts: ServerRouterOptions,
+) -> Router {
+    let cri = state.kubelet.as_ref().map(|k| k.runtime.cri_client());
+    let app = Router::new()
+        .route("/metrics", get(|| async move { metrics.gather() }))
+        .merge(crate::server_metrics_endpoints::router())
+        .merge(crate::server_resource_metrics::router(cri.clone()))
+        .merge(crate::server_cri_metrics::router(cri.clone()))
+        .merge(auth_not_required_router(state.clone()));
+    // server.go:315-325 `InstallAuthRequiredHandlers` /
+    // `InstallDebuggingDisabledHandlers`: the debugging handlers (and
+    // /configz, /runningpods/) exist only when `EnableDebuggingHandlers`.
+    let checkpoint_gate = checkpoint_enabled();
+    let app = if opts.enable_debugging_handlers {
+        let run_state = crate::streaming_server::RunState {
+            server: state.clone(),
+            checkpoints_dir: opts.checkpoints_dir.clone(),
+        };
+        let app = app
+            .route(
+                "/configz",
+                get(|| async move { Json(kubelet_config.as_ref().clone()) }),
+            )
+            .route(
+                "/exec/:namespace/:pod/:container",
+                get(crate::streaming_server::handle_exec)
+                    .post(crate::streaming_server::handle_exec),
+            )
+            .route(
+                "/exec/:namespace/:pod/:uid/:container",
+                get(crate::streaming_server::handle_exec_uid)
+                    .post(crate::streaming_server::handle_exec_uid),
+            )
+            .route(
+                "/attach/:namespace/:pod/:container",
+                get(crate::streaming_server::handle_attach)
+                    .post(crate::streaming_server::handle_attach),
+            )
+            .route(
+                "/attach/:namespace/:pod/:uid/:container",
+                get(crate::streaming_server::handle_attach_uid)
+                    .post(crate::streaming_server::handle_attach_uid),
+            )
+            .route(
+                "/portForward/:namespace/:pod",
+                get(crate::streaming_server::handle_portforward)
+                    .post(crate::streaming_server::handle_portforward),
+            )
+            .route(
+                "/portForward/:namespace/:pod/:uid",
+                get(crate::streaming_server::handle_portforward_uid)
+                    .post(crate::streaming_server::handle_portforward_uid),
+            )
+            .route(
+                "/containerLogs/:namespace/:pod/:container",
+                get(crate::streaming_server::handle_container_logs),
+            )
+            .merge(running_pods_router(state))
+            .merge(crate::streaming_server::run_router(
+                run_state,
+                checkpoint_gate,
+            ));
+        // server.go:602-607 `flagz.Install` (InstallAuthRequiredHandlers).
+        let app = install_flagz(app);
+        // server.go:322-323 `InstallProfilingHandler` / `InstallDebugFlagsHandler`.
+        let app = crate::server_debug::install_profiling_handler(
+            app,
+            opts.enable_profiling_handler,
+            opts.enable_contention_profiling,
+        );
+        crate::server_debug::install_debug_flags_handler(
+            app,
+            opts.enable_debug_flags_handler,
+            std::sync::Arc::new(crate::server_debug::glog_setter),
+        )
+    } else {
+        install_debugging_disabled_handlers(app)
+    };
+    // server.go:315-325 InstallSystemLogHandler / InstallDebuggingDisabledHandlers.
+    let app = crate::server_logs::install_logs_handlers(
+        app,
+        opts.enable_debugging_handlers,
+        opts.enable_system_log_handler,
+        opts.enable_system_log_query,
+        opts.logs_root.clone(),
+    );
+    // server.go:328 `installStatusZ()`: last, over the routes registered so far.
+    let registered = registered_handle_paths(
+        opts.enable_debugging_handlers,
+        opts.enable_system_log_handler,
+        opts.enable_profiling_handler,
+        flagz_installed(),
+    );
+    install_statusz(app, registered)
+}
