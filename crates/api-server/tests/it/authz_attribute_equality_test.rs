@@ -412,3 +412,45 @@ async fn fixed_divergences_are_not_denied_by_the_handler() {
         );
     }
 }
+
+struct DenyAll;
+
+#[async_trait]
+impl Authorizer for DenyAll {
+    async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
+        Ok(Decision::Deny("denied".into()))
+    }
+    async fn get_user_rules(
+        &self,
+        _: &UserInfo,
+        _: &str,
+    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
+        Ok((vec![], vec![]))
+    }
+}
+
+/// #3515: the generic REST handlers (`endpoints/handlers/{create,get,update,
+/// patch,delete}.rs`) make no authorizer call of their own, as upstream's
+/// `createHandler`/`GetResource`/`UpdateResource`/`PatchResource`/
+/// `DeleteResource` do not; the `WithAuthorization` filter alone denies. A
+/// denying authorizer must still turn every verb into a 403 at the router.
+#[tokio::test(flavor = "multi_thread")]
+async fn generic_rest_verbs_are_denied_by_the_filter_alone() {
+    let server = TestApiServer::builder()
+        .authorizer(Arc::new(DenyAll))
+        .build();
+    for (method, uri) in [
+        ("POST", "/api/v1/namespaces/ns1/configmaps"),
+        ("GET", "/api/v1/namespaces/ns1/configmaps/obj1"),
+        ("PUT", "/api/v1/namespaces/ns1/configmaps/obj1"),
+        ("PATCH", "/api/v1/namespaces/ns1/configmaps/obj1"),
+        ("DELETE", "/api/v1/namespaces/ns1/configmaps/obj1"),
+        ("DELETE", "/api/v1/namespaces/ns1/configmaps"),
+    ] {
+        assert_eq!(
+            drive(&server, method, uri).await,
+            StatusCode::FORBIDDEN.as_u16(),
+            "{method} {uri}"
+        );
+    }
+}

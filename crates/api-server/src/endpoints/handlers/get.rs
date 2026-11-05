@@ -7,7 +7,7 @@ use axum::response::Response;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::{Error, Result};
 
-use super::rest::{authorize, respond_object, RequestScope};
+use super::rest::{respond_object, RequestScope};
 use crate::registry::generic::GetOptions;
 use crate::registry::rest::{Object, RequestContext};
 use crate::state::ApiServerState;
@@ -32,25 +32,18 @@ pub fn decode_get_options(params: &HashMap<String, String>) -> Result<GetOptions
     })
 }
 
-/// GET of a named object.
+/// GET of a named object. Authorization is the `WithAuthorization` filter's
+/// alone (`endpoints/filters/authorization.go`); `GetResource`
+/// (`handlers/get.go`) makes no authorizer call, so `state` and `user` are
+/// kept only for the callers' signature.
 pub async fn get_resource<T: Object>(
-    state: &ApiServerState,
+    _state: &ApiServerState,
     scope: &RequestScope<T>,
-    user: &UserInfo,
+    _user: &UserInfo,
     namespace: Option<&str>,
     name: &str,
     params: &HashMap<String, String>,
 ) -> Result<Response> {
-    authorize(
-        state,
-        user,
-        "get",
-        &scope.resource,
-        scope.subresource,
-        namespace,
-        Some(name),
-    )
-    .await?;
     let options = decode_get_options(params)?;
     let ctx =
         RequestContext::new(namespace).with_group_version(&scope.kind.group, &scope.kind.version);

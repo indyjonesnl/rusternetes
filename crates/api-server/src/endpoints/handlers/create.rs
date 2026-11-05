@@ -11,8 +11,8 @@ use rusternetes_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation};
 use super::rest::{
-    authorize, decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run,
-    respond_object, retry_without_managed_fields_if_too_large, RequestScope,
+    decode, dedup_owner_references_and_add_warning, dry_run_param, is_dry_run, respond_object,
+    retry_without_managed_fields_if_too_large, RequestScope,
 };
 use crate::fieldmanager::manager_or_user_agent;
 use crate::registry::generic;
@@ -46,17 +46,6 @@ pub async fn create_resource<T: Object>(
     params: &HashMap<String, String>,
     body: &[u8],
 ) -> Result<Response> {
-    authorize(
-        state,
-        user,
-        "create",
-        &scope.resource,
-        scope.subresource,
-        namespace,
-        None,
-    )
-    .await?;
-
     let options = checked_create_options(params)?;
     let dry_run = is_dry_run(options.dry_run.as_deref());
 
