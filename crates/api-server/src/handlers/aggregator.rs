@@ -441,6 +441,7 @@ pub fn build_proxy_headers(
             "accept"
                 | "accept-encoding"
                 | "content-type"
+                | "if-none-match"
                 | "user-agent"
                 | "x-forwarded-for"
                 | "x-forwarded-proto"

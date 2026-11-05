@@ -244,6 +244,64 @@ async fn serve_aggregated_group_version(
     )
 }
 
+/// `handler3.OpenAPIService.HandleGroupVersion` for a document the
+/// `openapiv2converter` service publishes: the content hash is the ETag; a
+/// request whose `hash` differs is redirected to the current URL, a matching
+/// one is cacheable forever; `If-None-Match` is answered with 304
+/// (`http.ServeContent`).
+/// K8s ref: k8s.io/kube-openapi/pkg/handler3/handler.go
+fn serve_converted_group_version(
+    gv: &str,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    doc: &serde_json::Value,
+) -> Response {
+    let json = serde_json::to_vec(doc).unwrap_or_default();
+    let etag = crate::openapiv3_aggregator::compute_etag(&json);
+    let quoted = format!("\"{etag}\"");
+    let hash = query
+        .into_iter()
+        .flat_map(|q| q.split('&'))
+        .find_map(|kv| kv.strip_prefix("hash="))
+        .filter(|h| !h.is_empty());
+    if let Some(hash) = hash {
+        if hash != etag {
+            return Response::builder()
+                .status(StatusCode::MOVED_PERMANENTLY)
+                .header(header::ETAG, &quoted)
+                .header(header::VARY, "Accept")
+                .header(header::LOCATION, format!("/openapi/v3/{gv}?hash={etag}"))
+                .body(Body::empty())
+                .unwrap();
+        }
+    }
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == quoted));
+    let mut resp = if not_modified {
+        Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap()
+    } else {
+        openapi_v3_response(headers, doc)
+    };
+    let h = resp.headers_mut();
+    h.insert(header::ETAG, quoted.parse().unwrap());
+    h.insert(header::VARY, "Accept".parse().unwrap());
+    if hash.is_some() {
+        h.insert(header::CACHE_CONTROL, "public, immutable".parse().unwrap());
+        let expires = (chrono::Utc::now() + chrono::Duration::days(365))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        if let Ok(v) = expires.parse() {
+            h.insert(header::EXPIRES, v);
+        }
+    }
+    resp
+}
+
 /// GET /openapi/v3/*path
 /// Returns the OpenAPI v3 spec for a specific group version.
 ///
@@ -265,6 +323,28 @@ pub async fn get_openapi_spec_path(
         serve_aggregated_group_version(&state, gv_path.trim_matches('/'), &request).await
     {
         return resp;
+    }
+    // A group version a legacy APIService's converted OpenAPI v2 publishes
+    // (the `openapiv2converter` service) is served from the converted
+    // document.
+    if let Some(doc) = crate::aggregator_mux::active_handler_manager()
+        .and_then(|m| m.openapi_v3_controller().cloned())
+        .and_then(|c| {
+            c.spec_proxier
+                .converted_group_version(gv_path.trim_matches('/'))
+        })
+    {
+        if !local_root_paths(&state)
+            .await
+            .contains_key(gv_path.trim_matches('/'))
+        {
+            return serve_converted_group_version(
+                gv_path.trim_matches('/'),
+                &headers,
+                request.uri.query(),
+                &doc,
+            );
+        }
     }
     // A group version whose storage was never installed has no document.
     if !openapi_path_served(gv_path.trim_matches('/')) {
@@ -749,6 +829,23 @@ pub fn wrap_in_k8s_protobuf(_content_type: &str, data: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// The merge the kube-aggregator `apiservice-openapi-controller`'s
+/// `specAggregator` serves at `/openapi/v2`: the built-in document first, then
+/// every aggregated APIService's downloaded spec in `sortByPriority` order,
+/// `MergeSpecsIgnorePathConflictRenamingDefinitionsAndParameters`.
+/// K8s ref: kube-aggregator/pkg/controllers/openapi/aggregator/aggregator.go
+fn merge_aggregated_swagger(local: serde_json::Value) -> Result<serde_json::Value, String> {
+    let controller = crate::aggregator_mux::active_handler_manager()
+        .and_then(|m| m.openapi_controller().cloned());
+    let Some(controller) = controller else {
+        return Ok(local);
+    };
+    Ok(controller
+        .spec_aggregator
+        .merged_spec(Some(&local))?
+        .unwrap_or(local))
+}
+
 /// GET /openapi/v2 and /swagger.json
 /// Returns an OpenAPI v2 (Swagger) specification.
 ///
@@ -781,6 +878,15 @@ pub async fn get_swagger_spec(
         .unwrap_or_default();
 
     let spec = build_swagger_spec_for_crds(&crds);
+    // The OpenAPI v2 specs of the aggregated APIServices join the built-in
+    // document (kube-aggregator `specAggregator`'s `cached.MergeList`).
+    let spec = match merge_aggregated_swagger(spec) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("OpenAPI /v2: {e}");
+            return axum::response::IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let total_definitions = spec
         .get("definitions")
         .and_then(|d| d.as_object())

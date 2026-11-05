@@ -16,12 +16,19 @@
 //!   Add/Update/RemoveAPIService calls
 //!   ([`crate::apiservice_registration::AggregatorHandlerManager`]).
 //!
+//! - `aggregator/aggregator.go` `updateAPIServiceSpecLocked`'s OpenAPI v2
+//!   fallback: an APIService answering 404 on `/openapi/v3` is marked
+//!   `isLegacyAPIService`, its `/openapi/v2` is downloaded
+//!   ([`crate::openapi_aggregator::Downloader`]), converted with
+//!   `openapiconv.ConvertV2ToV3` ([`crate::openapiconv`]) and published by the
+//!   `openapiv2converter` service.
+//!
 //! Deviations (each a deliberate scope decision, not an equivalent):
-//! - The OpenAPI v2 fallback for an APIService that answers 404 on
-//!   `/openapi/v3` (download `/openapi/v2`, `openapiconv.ConvertV2ToV3`, serve
-//!   it from the `openapiv2converter` service) is not ported: the converter
-//!   is a separate kube-openapi package. Such an APIService is marked
-//!   `isLegacyAPIService` as upstream does and contributes no v3 document.
+//! - The `openapiv2converter` service (a `handler3.OpenAPIService` behind a
+//!   `PathRecorderMux`, registered as an APIService whose discovery the
+//!   controller downloads) is the in-process [`SpecProxier::converted`] map:
+//!   its discovery is computed on read and a group-version it lists is served
+//!   from the map, so no download of its own discovery happens.
 //! - The local services (`BuildAndRegisterAggregator`'s aggregator types and
 //!   delegation chain) are not entries of the store: the built-in documents
 //!   are served by `handlers::openapi`, which merges this store's discovery
@@ -41,6 +48,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusternetes_common::resources::APIService;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::aggregated_discovery::{HandlerRequest, HandlerResponse};
@@ -163,6 +171,8 @@ struct ServiceInfo {
     discovery: Option<OpenAPIV3Discovery>,
     /// `isLegacyAPIService`: the APIService does not serve `/openapi/v3`.
     is_legacy: bool,
+    /// The etag of the last `/openapi/v2` download (legacy APIServices only).
+    etag: String,
 }
 
 /// `specProxier`: the OpenAPI v3 specs by APIService name.
@@ -171,6 +181,29 @@ pub struct SpecProxier {
     info: RwLock<HashMap<String, ServiceInfo>>,
     downloader: Downloader,
     server: Arc<dyn SpecServer>,
+    /// The `openapiv2converter` service's documents: the converted OpenAPI v3
+    /// document of each legacy APIService, by `apis/<group>/<version>`.
+    converted: RwLock<BTreeMap<String, Value>>,
+}
+
+/// `getGroupVersionStringFromAPIService`.
+fn group_version_string(api_service: &APIService) -> String {
+    if api_service.spec.group.is_empty() && api_service.spec.version.is_empty() {
+        return String::new();
+    }
+    format!(
+        "apis/{}/{}",
+        api_service.spec.group, api_service.spec.version
+    )
+}
+
+/// `handler3.computeETag`.
+pub fn compute_etag(data: &[u8]) -> String {
+    use sha2::{Digest, Sha512};
+    Sha512::digest(data)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect()
 }
 
 impl SpecProxier {
@@ -179,7 +212,14 @@ impl SpecProxier {
             info: RwLock::new(HashMap::new()),
             downloader,
             server,
+            converted: RwLock::new(BTreeMap::new()),
         }
+    }
+
+    /// The converted OpenAPI v3 document of the legacy APIService serving
+    /// `target_gv` (`openAPIV2ConverterHandler.HandleGroupVersion`).
+    pub fn converted_group_version(&self, target_gv: &str) -> Option<Value> {
+        self.converted.read().unwrap().get(target_gv).cloned()
     }
 
     /// `AddUpdateAPIService`: "If the APIService is being updated, use the
@@ -198,51 +238,77 @@ impl SpecProxier {
                 handler,
                 discovery: None,
                 is_legacy: false,
+                etag: String::new(),
             },
         );
     }
 
     /// `UpdateAPIServiceSpec` / `updateAPIServiceSpecLocked`: refresh the
-    /// APIService's discovery document.
+    /// APIService's discovery document, or (legacy) its converted OpenAPI v2.
     pub async fn update_api_service_spec(&self, name: &str) -> Result<(), UpdateError> {
-        let (handler, group, version, is_legacy) = {
+        let (handler, api_service, is_legacy, etag) = {
             let info = self.info.read().unwrap();
             let Some(i) = info.get(name) else {
                 return Err(UpdateError::NotFound);
             };
             (
                 i.handler.clone(),
-                i.api_service.spec.group.clone(),
-                i.api_service.spec.version.clone(),
+                i.api_service.clone(),
                 i.is_legacy,
+                i.etag.clone(),
             )
         };
-        if is_legacy {
-            // The OpenAPI v2 download + `ConvertV2ToV3` is not ported (module
-            // docs): nothing to refresh.
-            return Ok(());
+        let (group, version) = (&api_service.spec.group, &api_service.spec.version);
+        if !is_legacy {
+            let (gv, status) = self
+                .downloader
+                .openapi_v3_root(self.server.as_ref(), &handler, group, version)
+                .await
+                .map_err(UpdateError::Other)?;
+            let mut info = self.info.write().unwrap();
+            let Some(i) = info.get_mut(name) else {
+                // Removed while downloading.
+                return Err(UpdateError::NotFound);
+            };
+            if status != 404 {
+                i.discovery = gv;
+                return Ok(());
+            }
+            i.is_legacy = true;
         }
-        let (gv, status) = self
-            .downloader
-            .openapi_v3_root(self.server.as_ref(), &handler, &group, &version)
+
+        // The OpenAPI v2 fallback: `newDownloader.Download(handler, etag)`.
+        let (v2_spec, new_etag, status) = crate::openapi_aggregator::Downloader::new()
+            .download(self.server.as_ref(), &handler, group, version, &etag)
             .await
             .map_err(UpdateError::Other)?;
-        let mut info = self.info.write().unwrap();
-        let Some(i) = info.get_mut(name) else {
-            // Removed while downloading.
-            return Err(UpdateError::NotFound);
-        };
-        if status == 404 {
-            i.is_legacy = true;
-        } else {
-            i.discovery = gv;
+        {
+            let mut info = self.info.write().unwrap();
+            let Some(i) = info.get_mut(name) else {
+                return Err(UpdateError::NotFound);
+            };
+            i.etag = new_etag;
+        }
+        if status == 200 {
+            if let Some(v2) = v2_spec {
+                let v3 = crate::openapiconv::convert_v2_to_v3(&v2);
+                self.converted
+                    .write()
+                    .unwrap()
+                    .insert(group_version_string(&api_service), v3);
+            }
         }
         Ok(())
     }
 
     /// `RemoveAPIServiceSpec`: "If it does not exist, no error is returned."
     pub fn remove_api_service_spec(&self, name: &str) {
-        self.info.write().unwrap().remove(name);
+        if let Some(removed) = self.info.write().unwrap().remove(name) {
+            self.converted
+                .write()
+                .unwrap()
+                .remove(&group_version_string(&removed.api_service));
+        }
     }
 
     /// `GetAPIServiceNames`.
@@ -263,6 +329,17 @@ impl SpecProxier {
             for (k, v) in &d.paths {
                 merged.paths.insert(k.clone(), v.clone());
             }
+        }
+        // The `openapiv2converter` service's discovery
+        // (`handler3.OpenAPIService.HandleDiscovery`).
+        for (gv, doc) in self.converted.read().unwrap().iter() {
+            let etag = compute_etag(&serde_json::to_vec(doc).unwrap_or_default());
+            merged
+                .paths
+                .entry(gv.clone())
+                .or_insert_with(|| OpenAPIV3DiscoveryGroupVersion {
+                    server_relative_url: format!("/openapi/v3/{gv}?hash={etag}"),
+                });
         }
         merged
     }
@@ -515,6 +592,11 @@ impl<S: rusternetes_storage::Storage + Send + Sync + 'static> SpecServer for Pro
         if !req.accept.is_empty() {
             if let Ok(v) = axum::http::HeaderValue::from_str(&req.accept) {
                 headers.insert(axum::http::header::ACCEPT, v);
+            }
+        }
+        if let Some(etag) = &req.if_none_match {
+            if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
+                headers.insert(axum::http::header::IF_NONE_MATCH, v);
             }
         }
         let resp = crate::handlers::aggregator::forward_to_aggregator(
