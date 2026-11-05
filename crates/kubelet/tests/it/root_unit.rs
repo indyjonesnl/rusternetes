@@ -11,6 +11,7 @@ mod eviction;
 mod flowcontrol;
 mod go_selinux;
 mod go_selinux_label;
+mod healthz;
 mod host_port;
 mod image_gc;
 mod image_gc_cri;

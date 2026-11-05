@@ -23,6 +23,7 @@ use rusternetes_storage::{build_prefix, Storage, StorageBackend};
 use serde_json::json;
 use std::sync::Arc;
 
+use crate::healthz::HealthChecker;
 use crate::kubelet::Kubelet;
 
 /// State injected into the kubelet's read-only HTTP routes.
@@ -86,35 +87,27 @@ async fn handle_list_running_pods(State(state): State<ServerState>) -> impl Into
     }
 }
 
-async fn handle_healthz(State(state): State<ServerState>) -> impl IntoResponse {
-    use crate::server_metrics_endpoints::{observe_healthcheck, HealthcheckStatus};
-    // healthz.go:handleRootHealth observes every check (`slis.ObserveHealthcheck`)
-    // under type "healthz": ping, log and syncloop (server.go:430-434).
-    observe_healthcheck("ping", "healthz", HealthcheckStatus::Success);
-    observe_healthcheck("log", "healthz", HealthcheckStatus::Success);
-    let healthy = match &state.kubelet {
-        // No kubelet attached (router-shape tests / early startup): treat as healthy.
-        None => true,
-        Some(k) => k.healthy(),
-    };
-    observe_healthcheck(
-        "syncloop",
-        "healthz",
-        if healthy {
-            HealthcheckStatus::Success
-        } else {
-            HealthcheckStatus::Error
-        },
-    );
-    if healthy {
-        (StatusCode::OK, "ok").into_response()
-    } else {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "kubelet sync_loop is stale",
-        )
-            .into_response()
-    }
+/// `s.host.SyncLoopHealthCheck` as a checker (`server.go:433`), fed by the
+/// kubelet's last completed sync-loop timestamp ([`Kubelet::healthy`]).
+/// No kubelet attached (router-shape tests / early startup): healthy.
+fn syncloop_checker(kubelet: Option<Arc<Kubelet>>) -> HealthChecker {
+    HealthChecker::named("syncloop", move || match &kubelet {
+        Some(k) if !k.healthy() => Err("sync Loop took longer than expected".to_string()),
+        _ => Ok(()),
+    })
+}
+
+/// `healthz.InstallHandler(s.restfulCont, ping, log, syncloop)`
+/// (`server.go:430-436`): `/healthz` and its `/healthz/<check>` sub-paths.
+pub fn healthz_router(kubelet: Option<Arc<Kubelet>>) -> Router {
+    crate::healthz::install_path_handler(
+        "/healthz",
+        vec![
+            HealthChecker::ping(),
+            HealthChecker::log(),
+            syncloop_checker(kubelet),
+        ],
+    )
 }
 
 /// Minimal cAdvisor-shape JSON for `GET /stats/summary`. Upstream
@@ -172,9 +165,9 @@ pub fn read_only_router(state: ServerState) -> Router {
 pub fn auth_not_required_router(state: ServerState) -> Router {
     Router::new()
         .route("/pods", get(handle_list_pods))
-        .route("/healthz", get(handle_healthz))
         .route("/stats/summary", get(handle_stats_summary))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(healthz_router(state.kubelet.clone()))
 }
 
 /// `/runningpods/` (server.go:609-618, "used for testing only").
