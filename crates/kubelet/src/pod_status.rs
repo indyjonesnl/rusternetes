@@ -218,3 +218,36 @@ pub fn generate_api_pod_status(pod: &Pod, input: ApiPodStatusInput) -> PodStatus
         ..Default::default()
     }
 }
+
+/// The status `rejectPod` hands to `statusManager.SetPodStatus`
+/// (pkg/kubelet/kubelet.go:2475-2482): a minimal Failed status with the QOS
+/// class kept, `"Pod was rejected: " + message`, and `observedGeneration`
+/// (`SetPodStatus`, status_manager.go:432-433). It is NOT produced by
+/// `generateAPIPodStatus`. `mergePodStatus` (status_manager.go) keeps only the
+/// conditions the kubelet does not own from the pod's prior status.
+pub fn rejected_pod_status(pod: &Pod, reason: &str, message: &str) -> PodStatus {
+    let conditions: Vec<PodCondition> = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| !pod_condition_by_kubelet(&c.condition_type))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    PodStatus {
+        qos_class: Some(
+            rusternetes_common::qos::compute_pod_qos(pod)
+                .as_str()
+                .to_string(),
+        ),
+        phase: Some(Phase::Failed),
+        reason: Some(reason.to_string()),
+        message: Some(format!("Pod was rejected: {message}")),
+        observed_generation: pod.metadata.generation,
+        conditions: (!conditions.is_empty()).then_some(conditions),
+        ..Default::default()
+    }
+}

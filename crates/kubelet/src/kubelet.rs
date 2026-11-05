@@ -3623,18 +3623,12 @@ impl Kubelet {
                         "Pod {}/{} rejected: pod OS {:?} not supported on this (linux) node",
                         namespace, pod_name, os.name
                     );
-                    let key = build_key("pods", Some(namespace), pod_name);
-                    if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                        if let Some(ref mut status) = p.status {
-                            status.phase = Some(Phase::Failed);
-                            status.reason = Some("PodOSNotSupported".to_string());
-                            status.message = Some(
-                                "Pod was rejected as the node does not support the requested pod OS"
-                                    .to_string(),
-                            );
-                        }
-                        let _ = self.storage.update_status(&key, &p).await;
-                    }
+                    self.reject_pod(
+                        pod,
+                        "PodOSNotSupported",
+                        "Failed to admit pod as the OS field doesn't match node OS",
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -3648,15 +3642,8 @@ impl Kubelet {
         if matches!(current_phase, Phase::Pending) && !is_running {
             if let Err(message) = self.sysctl_allowlist.admit(pod) {
                 info!("Pod {}/{} rejected: {}", namespace, pod_name, message);
-                let key = build_key("pods", Some(namespace), pod_name);
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                    if let Some(ref mut status) = p.status {
-                        status.phase = Some(Phase::Failed);
-                        status.reason = Some(crate::sysctl::FORBIDDEN_REASON.to_string());
-                        status.message = Some(message);
-                    }
-                    let _ = self.storage.update_status(&key, &p).await;
-                }
+                self.reject_pod(pod, crate::sysctl::FORBIDDEN_REASON, &message)
+                    .await;
                 return Ok(());
             }
         }
@@ -3685,15 +3672,8 @@ impl Kubelet {
                     "Pod {}/{} rejected: hostPort {}/{} conflicts with pod {}",
                     namespace, pod_name, conflict.port, conflict.protocol, conflict.conflicting_pod
                 );
-                let key = build_key("pods", Some(namespace), pod_name);
-                if let Ok(mut p) = self.storage.get::<Pod>(&key).await {
-                    if let Some(ref mut status) = p.status {
-                        status.phase = Some(Phase::Failed);
-                        status.reason = Some("HostPortConflict".to_string());
-                        status.message = Some(conflict.message());
-                    }
-                    let _ = self.storage.update_status(&key, &p).await;
-                }
+                self.reject_pod(pod, "HostPortConflict", &conflict.message())
+                    .await;
                 return Ok(());
             }
         }
@@ -4213,22 +4193,7 @@ impl Kubelet {
                                     crate::volume_manager::VOLUME_ATTACHMENT_LIMIT_EXCEEDED_REASON;
                                 let message = limit.to_string();
                                 warn!("Pod {}/{} rejected: {}", namespace, pod_name, message);
-                                crate::volume_plugins::util::node_expander::record_event(
-                                    &self.node_event_recorder,
-                                    &crate::events::pod_object_reference(pod),
-                                    Some(&self.node_name),
-                                    rusternetes_common::resources::EventType::Warning,
-                                    reason,
-                                    &message,
-                                )
-                                .await;
-                                self.update_pod_status(
-                                    pod,
-                                    Phase::Failed,
-                                    Some(reason),
-                                    Some(&format!("Pod was rejected: {message}")),
-                                )
-                                .await?;
+                                self.reject_pod(pod, reason, &message).await;
                                 return Ok(());
                             }
 
@@ -6541,6 +6506,37 @@ impl Kubelet {
                 }
             }
         }
+        if !pod_status_equal(&original, &p) {
+            let _ = self.storage.update_status(&key, &p).await;
+        }
+    }
+
+    /// `rejectPod` (pkg/kubelet/kubelet.go:2475-2482): a Warning event with the
+    /// rejection reason, then the minimal Failed status via
+    /// `statusManager.SetPodStatus` (see [`crate::pod_status::rejected_pod_status`]).
+    /// Only the incarnation with `pod`'s UID is written
+    /// (status_manager.go:1051-1060).
+    pub async fn reject_pod(&self, pod: &Pod, reason: &str, message: &str) {
+        crate::volume_plugins::util::node_expander::record_event(
+            &self.node_event_recorder,
+            &crate::events::pod_object_reference(pod),
+            Some(&self.node_name),
+            rusternetes_common::resources::EventType::Warning,
+            reason,
+            message,
+        )
+        .await;
+        let key = build_key(
+            "pods",
+            pod.metadata.namespace.as_deref(),
+            &pod.metadata.name,
+        );
+        let Some(mut p) = stored_pod_of(self.storage.as_ref(), &key, &pod.metadata.uid).await
+        else {
+            return;
+        };
+        let original = p.clone();
+        p.status = Some(crate::pod_status::rejected_pod_status(&p, reason, message));
         if !pod_status_equal(&original, &p) {
             let _ = self.storage.update_status(&key, &p).await;
         }

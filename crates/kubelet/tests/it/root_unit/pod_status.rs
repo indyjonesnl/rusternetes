@@ -323,4 +323,32 @@ mod tests {
         assert_eq!(s.host_ip.as_deref(), Some("10.0.0.9"));
         assert_eq!(s.start_time, Some(now));
     }
+
+    /// `rejectPod` (kubelet.go:2475-2482) + `SetPodStatus`
+    /// (status_manager.go:425-439): a minimal Failed status, not the output of
+    /// `generateAPIPodStatus`; kubelet-owned conditions and observed fields are
+    /// dropped, others kept.
+    #[test]
+    fn rejected_status_is_minimal_failed() {
+        let mut pod = pod_with(
+            Some(Phase::Pending),
+            vec![
+                cond("PodScheduled", "True"),
+                cond("DisruptionTarget", "True"),
+            ],
+            Some(4),
+        );
+        pod.status.as_mut().unwrap().host_ip = Some("10.0.0.1".into());
+        let s = rejected_pod_status(&pod, "HostPortConflict", "port taken");
+        assert_eq!(s.phase, Some(Phase::Failed));
+        assert_eq!(s.reason.as_deref(), Some("HostPortConflict"));
+        assert_eq!(s.message.as_deref(), Some("Pod was rejected: port taken"));
+        assert_eq!(s.observed_generation, Some(4));
+        assert_eq!(s.qos_class.as_deref(), Some("BestEffort"));
+        assert_eq!(s.host_ip, None);
+        assert_eq!(s.start_time, None);
+        let conds = s.conditions.unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0].condition_type, "DisruptionTarget");
+    }
 }
