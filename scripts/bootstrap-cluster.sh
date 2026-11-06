@@ -68,8 +68,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 #   * CI prebuilt path — CONTROL_PLANE_IMAGE_REGISTRY is set (the
 #     bring-up-cluster action exports ghcr.io/indyjonesnl/rusternetes when the
 #     GHCR pull succeeds). We template that registry ref + tag into the static
-#     pod manifests / dns Deployment and let imagePullPolicy: IfNotPresent make
-#     containerd pull from the registry itself (the packages are public).
+#     pod manifests / dns Deployment. The docker daemon already holds those
+#     images (`compose pull`, which retries), so they are imported into the
+#     containerd store exactly like the local build path, and
+#     imagePullPolicy: IfNotPresent then never makes containerd reach the
+#     registry itself. That in-cluster pull can time out on TLS even while the
+#     host daemon pulls fine (scripts/sideload-images.sh header); if the image is
+#     not in the daemon the import is a warning no-op and containerd pulls it
+#     as before.
 #
 #   * Local build path — registry unset. Images were built into the local
 #     docker/podman daemon as rusternetes-<component>:latest, which the separate
@@ -269,6 +275,27 @@ import_image_into_containerd() {
     done
 }
 
+# The sandbox (pause) image containerd requests before any pod can start
+# (deploy/containerd/config.toml pinned_images.sandbox). Pull it with the host
+# daemon, which retries, and import it like the control-plane images: the
+# in-cluster pull of it can time out on TLS and then no static pod ever starts.
+# Best effort — a failure leaves the pull to containerd, as before.
+import_sandbox_image() {
+    local image attempt=1
+    image="$(sed -nE "s/^[[:space:]]*sandbox *= *['\"]([^'\"]+)['\"].*/\1/p" "$PROJECT_ROOT/deploy/containerd/config.toml" 2>/dev/null | head -1)"
+    [ -n "$image" ] || return 0
+    if ! $CONTAINER_RT image inspect "$image" >/dev/null 2>&1; then
+        until $CONTAINER_RT pull --quiet "$image" >/dev/null 2>&1; do
+            if [ "$attempt" -ge 3 ]; then
+                print_warning "Could not pull sandbox image $image on the host — containerd will pull it itself"
+                return 0
+            fi
+            sleep $((attempt * 5)); attempt=$((attempt + 1))
+        done
+    fi
+    import_image_into_containerd "$image"
+}
+
 # Discover the Docker bridge gateway (always [subnet].1) so we can
 # bootstrap rusternetes-dns and other resources without hardcoding an IP.
 # Uses the discover-bridge-gateway helper; callers can override via
@@ -362,6 +389,7 @@ echo ""
 CERTS_PATH="$PROJECT_ROOT/.rusternetes/certs"
 export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
+    import_sandbox_image
     print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
     mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
     # Node IPAM follows the stack's declared pod subnet (see
@@ -398,12 +426,10 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
         # CSI attach flags + driver-socket hostPath mounts (#3128, #3133).
         template_csi_attach "$dst"
         echo "  $(basename "$src") -> $dst (image: $cp_image)"
-        # Local build path: the image only exists in the docker/podman daemon —
-        # import it into the containerd CRI store so IfNotPresent resolves it.
-        # GHCR path: containerd pulls $cp_image itself, no import needed.
-        if [ -z "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
-            import_image_into_containerd "$cp_image"
-        fi
+        # The image only exists in the docker/podman daemon (locally built or
+        # `compose pull`ed) — import it into the containerd CRI store so
+        # IfNotPresent resolves it without a registry round-trip.
+        import_image_into_containerd "$cp_image"
     done
     # Persist CERTS_PATH so a compose restart picks up the same mount path.
     if [ -f "$PROJECT_ROOT/.env" ] && grep -q '^CERTS_PATH=' "$PROJECT_ROOT/.env" 2>/dev/null; then
@@ -609,9 +635,7 @@ EOF
         # into containerd otherwise.
         dns_image="$(resolve_cluster_image dns)"
         echo "  rusternetes-dns image: $dns_image"
-        if [ -z "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
-            import_image_into_containerd "$dns_image"
-        fi
+        import_image_into_containerd "$dns_image"
         sed "s|image: rusternetes-dns:latest|image: ${dns_image}|" \
             "$PROJECT_ROOT/bootstrap-dns.yaml" | $KUBECTL $KUBECTL_FLAGS apply -f -
 
