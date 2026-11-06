@@ -1770,6 +1770,77 @@ mod tests {
         assert_eq!(backoff, BASE, "back-off resets on success");
     }
 
+    /// #3901: the volume-wait Pending write is a generateAPIPodStatus output
+    /// (kubelet_pods.go:1889): the Pending phase and ContainerCreating
+    /// waiting state are the caller's observation, while podIP, startTime,
+    /// qosClass and conditions the kubelet does not own survive from the
+    /// prior status, and observedGeneration is set (kubelet_pods.go:1957-1962).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn volume_wait_status_is_generated_from_prior_status() {
+        use rusternetes_common::resources::ContainerStatus;
+        use rusternetes_storage::StorageBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage, "node-vw", &["10.1.1.1"], false).await;
+        let t0 = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut pod = Pod::new("vw", Default::default());
+        pod.metadata.generation = Some(4);
+        pod.status = Some(PodStatus {
+            phase: Some(Phase::Pending),
+            pod_ip: Some("10.2.0.9".into()),
+            qos_class: Some("Burstable".into()),
+            start_time: Some(t0),
+            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                condition_type: "DisruptionTarget".into(),
+                status: "True".into(),
+                reason: None,
+                message: None,
+                last_probe_time: None,
+                last_transition_time: None,
+                observed_generation: None,
+            }]),
+            ..Default::default()
+        });
+        let waiting = ContainerStatus {
+            name: "c".into(),
+            ready: false,
+            restart_count: 0,
+            state: None,
+            last_state: None,
+            image: None,
+            image_id: None,
+            container_id: None,
+            started: Some(false),
+            allocated_resources: None,
+            allocated_resources_status: None,
+            resources: None,
+            user: None,
+            volume_mounts: None,
+            stop_signal: None,
+        };
+        let st = k.volume_wait_pod_status(&pod, vec![waiting]);
+        assert_eq!(st.phase, Some(Phase::Pending));
+        assert_eq!(st.pod_ip.as_deref(), Some("10.2.0.9"));
+        assert_eq!(st.qos_class.as_deref(), Some("Burstable"));
+        assert_eq!(st.start_time, Some(t0), "startTime must not reset");
+        assert_eq!(st.observed_generation, Some(4));
+        assert_eq!(st.container_statuses.as_ref().map(Vec::len), Some(1));
+        let types: Vec<&str> = st
+            .conditions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.condition_type.as_str())
+            .collect();
+        assert!(types.contains(&"DisruptionTarget"));
+        assert!(types.contains(&"ContainersReady"));
+
+        pod.status.as_mut().unwrap().phase = Some(Phase::Failed);
+        let st = k.volume_wait_pod_status(&pod, vec![]);
+        assert_eq!(st.phase, Some(Phase::Failed), "terminal phase is sticky");
+    }
+
     /// #3687: every status write goes through the host-IP block of
     /// `generateAPIPodStatus` (kubelet_pods.go:2005-2040): a hostNetwork pod's
     /// init-failure status inherits the node IPs as PodIPs too.
