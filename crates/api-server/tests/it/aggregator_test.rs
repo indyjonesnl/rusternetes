@@ -659,3 +659,115 @@ async fn forward_to_aggregator_dials_through_cluster_dialer() {
     assert!(body.contains("\"user\":\"alice\""));
     assert_eq!(*seen.lock().unwrap(), vec!["10.254.254.1:8443".to_string()]);
 }
+
+/// apiserver.go:235-246 / handler_proxy.go:230: the discovery manager reaches an
+/// aggregated server through the APIService's `proxyHandler`, i.e. through the
+/// `Cluster` dialer too -- not a bare HTTP client. The proxier is asked for the
+/// resolved endpoint's address.
+#[tokio::test]
+async fn proxy_discovery_handler_dials_through_cluster_dialer() {
+    use rusternetes_api_server::aggregated_discovery::{
+        AggregatorHandler, HandlerRequest, ProxyDiscoveryHandler,
+    };
+    let storage = Arc::new(MemoryStorage::new());
+    seed_service(&storage, "wardle", "sample-apiserver", "10.254.254.9", 7443).await;
+    seed_apiservice(
+        &storage,
+        "v1alpha1.wardle.example.com",
+        "wardle.example.com",
+        "v1alpha1",
+        json!({
+            "insecureSkipTLSVerify": true,
+            "service": { "name": "sample-apiserver", "namespace": "wardle", "port": 7443 },
+        }),
+    )
+    .await;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialer = rusternetes_api_server::egress_selector::DialerCreator {
+        connector: Some(Arc::new(ClusterTunnel {
+            // Nothing listens here: the dial is observed, then fails.
+            target: "127.0.0.1:1".to_string(),
+            seen: seen.clone(),
+        })),
+        direct: false,
+        options: rusternetes_api_server::egress_selector::MetricsOptions {
+            transport: "tcp".into(),
+            protocol: "HTTPConnect".into(),
+        },
+    }
+    .create_dialer();
+
+    let handler = ProxyDiscoveryHandler::with_dialer(storage, Some(dialer));
+    let resp = handler
+        .serve(
+            "wardle.example.com",
+            "v1alpha1",
+            HandlerRequest {
+                path: "/apis".to_string(),
+                accept: "application/json".to_string(),
+                if_none_match: Some("\"abc\"".to_string()),
+                user: "system:kube-aggregator".to_string(),
+                groups: vec!["system:masters".to_string()],
+            },
+        )
+        .await;
+    assert_eq!(resp.status, 503, "the tunnel's backend is unreachable");
+    assert_eq!(*seen.lock().unwrap(), vec!["10.254.254.9:7443".to_string()]);
+}
+
+/// The request the discovery manager sends (`Accept`, `If-None-Match`, the
+/// aggregator identity) reaches the backend through the proxy's forward.
+#[tokio::test]
+async fn forward_handler_request_sends_identity_accept_and_if_none_match() {
+    use rusternetes_api_server::aggregated_discovery::HandlerRequest;
+    let route = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+        let h = |n: &str| {
+            headers
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        axum::http::Response::builder()
+            .status(200)
+            .header("ETag", "\"e2\"")
+            .body(axum::body::Body::from(format!(
+                "{}|{}|{}",
+                h("x-remote-user"),
+                h("accept"),
+                h("if-none-match")
+            )))
+            .unwrap()
+    });
+    let (addr, _h) = rusternetes_test_support::mock_http::serve_graceful_handle(
+        route,
+        std::future::pending::<()>(),
+    );
+    let target = AggregatorTarget {
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        insecure_skip_tls_verify: true,
+        ca_bundle: None,
+        scheme: "http",
+        server_name: None,
+    };
+    let resp = rusternetes_api_server::openapiv3_aggregator::forward_handler_request(
+        &target,
+        &HandlerRequest {
+            path: "/apis".to_string(),
+            accept: "application/json".to_string(),
+            if_none_match: Some("\"e1\"".to_string()),
+            user: "system:kube-aggregator".to_string(),
+            groups: vec![],
+        },
+        Some(None),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.etag.as_deref(), Some("\"e2\""));
+    assert_eq!(
+        String::from_utf8_lossy(&resp.body),
+        "system:kube-aggregator|application/json|\"e1\""
+    );
+}

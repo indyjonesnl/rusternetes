@@ -605,4 +605,66 @@ mod tests {
             Some("1.38")
         );
     }
+
+    // kube-aggregator controllers/openapiv3/aggregator/aggregator_test.go
+    // TestOpenAPIRequestMetrics: `specProxier.register` wraps the discovery
+    // handler and the group-version handler in `InstrumentHandlerFunc` with
+    // subresource `openapi/v3` and `openapi/v3/`, no component, group, version,
+    // resource or scope.
+    #[tokio::test]
+    async fn openapi_v3_handlers_are_instrumented_with_their_subresource() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/openapi/v3",
+                axum::routing::get(|| async { "{}" }).layer(axum::middleware::from_fn(
+                    |req, next| instrument_handler_func("openapi/v3", req, next),
+                )),
+            )
+            .route(
+                "/openapi/v3/*path",
+                axum::routing::get(|| async { "{}" }).layer(axum::middleware::from_fn(
+                    |req, next| instrument_handler_func("openapi/v3/", req, next),
+                )),
+            );
+        let discovery = [
+            ("verb", "GET"),
+            ("subresource", "openapi/v3"),
+            ("component", ""),
+            ("resource", ""),
+            ("scope", ""),
+            ("code", "200"),
+        ];
+        let group_version = [
+            ("verb", "GET"),
+            ("subresource", "openapi/v3/"),
+            ("component", ""),
+            ("resource", ""),
+            ("scope", ""),
+            ("code", "200"),
+        ];
+        let before_d = sample("apiserver_request_total", &discovery);
+        let before_g = sample("apiserver_request_total", &group_version);
+
+        for path in ["/openapi/v3", "/openapi/v3/apis/group.example.com/v1"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            // "Metrics should be updated after requesting the root document."
+            // / "... after requesting OpenAPI for a group version."
+            // (`>=`: other tests in this process serve the same routes.)
+            assert!(sample("apiserver_request_total", &discovery) >= before_d + 1.0);
+            if path != "/openapi/v3" {
+                assert!(sample("apiserver_request_total", &group_version) >= before_g + 1.0);
+            }
+        }
+    }
 }

@@ -31,9 +31,7 @@ use rusternetes_storage::Storage;
 use serde_json::{json, Map, Value};
 
 use crate::apiservice_registration::{DiscoveryFreshness, VersionDiscovery};
-use crate::handlers::aggregator::{
-    build_aggregator_client, resolve_aggregator_target_with_storage,
-};
+use crate::handlers::aggregator::resolve_aggregator_target_with_storage;
 
 /// `discovery.AcceptV2` (client-go discovery_client.go:67).
 pub const ACCEPT_V2: &str = "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList";
@@ -352,14 +350,31 @@ pub fn legacy_path(group: &str, version: &str) -> String {
 
 /// Reaches the aggregated server of an APIService the way the aggregator proxy
 /// does: [`resolve_aggregator_target_with_storage`] (Available gate, endpoint
-/// resolution, caBundle) then an HTTPS request pinned to the backend pod.
+/// resolution, caBundle) then the proxy's forward, which dials through the
+/// egress selector's `Cluster` dialer (`proxyTransportDial`,
+/// handler_proxy.go:230; apiserver.go:235-246).
 pub struct ProxyDiscoveryHandler<S: Storage + Send + Sync + 'static> {
     storage: Arc<S>,
+    /// `proxyTransportDial`: `None` looks the egress selector's `Cluster`
+    /// dialer up per request.
+    dialer: Option<Option<crate::egress_selector::Dialer>>,
 }
 
 impl<S: Storage + Send + Sync + 'static> ProxyDiscoveryHandler<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            dialer: None,
+        }
+    }
+
+    /// A handler whose proxy transport dials through `dialer` (`None` is the
+    /// default dial), as a `proxyHandler` built with a fixed `proxyTransportDial`.
+    pub fn with_dialer(storage: Arc<S>, dialer: Option<crate::egress_selector::Dialer>) -> Self {
+        Self {
+            storage,
+            dialer: Some(dialer),
+        }
     }
 }
 
@@ -394,44 +409,7 @@ impl<S: Storage + Send + Sync + 'static> AggregatorHandler for ProxyDiscoveryHan
                     };
                 }
             };
-        let Some(client) = build_aggregator_client(&target) else {
-            return unavailable("aggregator client error");
-        };
-        let url_host = target.server_name.as_deref().unwrap_or(&target.host);
-        let url = format!(
-            "{}://{}:{}{}",
-            target.scheme, url_host, target.port, req.path
-        );
-        let mut b = client
-            .get(&url)
-            .header("Accept", &req.accept)
-            .header("X-Remote-User", &req.user);
-        for g in &req.groups {
-            b = b.header("X-Remote-Group", g);
-        }
-        if let Some(etag) = &req.if_none_match {
-            b = b.header("If-None-Match", etag);
-        }
-        match b.send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let header = |n: &str| {
-                    resp.headers()
-                        .get(n)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_string)
-                };
-                let content_type = header("content-type");
-                let etag = header("etag");
-                let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-                HandlerResponse {
-                    status,
-                    content_type,
-                    etag,
-                    body,
-                }
-            }
-            Err(e) => unavailable(&format!("aggregated API server unavailable: {e}")),
-        }
+        crate::openapiv3_aggregator::forward_handler_request(&target, &req, self.dialer.clone())
+            .await
     }
 }
