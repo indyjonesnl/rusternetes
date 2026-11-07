@@ -243,29 +243,11 @@ async fn custom_resource_fallback(
         };
         match resolved {
             Ok(Some(target)) => {
-                let path_and_query = match uri.query() {
-                    Some(q) => format!("{}?{}", uri.path(), q),
-                    None => uri.path().to_string(),
-                };
-                let headers = req.headers().clone();
-                let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-                    .await
-                    .map_err(|_| StatusCode::BAD_REQUEST)?
-                    .to_vec();
                 debug!(
                     "API aggregation: proxying {}/{} -> {}:{}",
                     group, version, target.host, target.port
                 );
-                let resp = handlers::aggregator::forward_to_aggregator(
-                    &target,
-                    &auth_ctx,
-                    method,
-                    &path_and_query,
-                    &headers,
-                    body_bytes,
-                )
-                .await;
-                return Ok(resp);
+                return Ok(handlers::aggregator::proxy_request(&target, &auth_ctx, req).await);
             }
             Ok(None) => { /* not an aggregated group; continue to CRD logic */ }
             Err(resp) => return Ok(resp),
@@ -3059,6 +3041,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::deprecation::warnings::add_endpoint_warnings,
         ));
+        // The legacy `v1.` APIService's `/api` proxy: reached after
+        // authentication and authorization, before local handling.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            handlers::aggregator::legacy_api_proxy,
+        ));
         // WithAuthorization is the innermost filter: after authentication,
         // audit, impersonation and priority-and-fairness, around the handler
         // (server/config.go:1015-1043).
@@ -3139,6 +3127,12 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         // `Warning:` header, added once the request reached the route.
         protected_routes = protected_routes.layer(axum_middleware::from_fn(
             crate::deprecation::warnings::add_endpoint_warnings,
+        ));
+        // The legacy `v1.` APIService's `/api` proxy: reached after
+        // authentication and authorization, before local handling.
+        protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            handlers::aggregator::legacy_api_proxy,
         ));
         // WithAuthorization is the innermost filter: after authentication,
         // audit, impersonation and priority-and-fairness, around the handler

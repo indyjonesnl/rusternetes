@@ -68,6 +68,7 @@ pub mod registry;
 pub mod request_header_authentication;
 pub mod shared_informer_factory;
 pub mod storage_readiness_hook;
+pub mod upgrade_aware;
 pub use rusternetes_protobuf as protobuf;
 pub mod cache_metrics;
 pub mod cache_watcher;

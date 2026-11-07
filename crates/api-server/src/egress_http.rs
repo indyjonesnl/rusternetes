@@ -93,6 +93,18 @@ pub struct EgressConnector {
     server_name: Option<String>,
 }
 
+impl EgressConnector {
+    /// The `DialContext` + TLS config of one transport; `server_name` as in
+    /// [`EgressHttpClient::with_server_name`].
+    pub fn new(dialer: Dialer, tls: rustls::ClientConfig, server_name: Option<String>) -> Self {
+        Self {
+            dialer,
+            tls: Arc::new(tls),
+            server_name,
+        }
+    }
+}
+
 impl tower::Service<Uri> for EgressConnector {
     type Response = EgressIo;
     type Error = std::io::Error;
