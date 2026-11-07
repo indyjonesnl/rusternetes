@@ -9,6 +9,8 @@ use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::EndpointSlice;
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, warn};
@@ -17,13 +19,46 @@ use tracing::{debug, error, warn};
 /// controllers with `Run(5, ...)` (staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:341,363).
 const CONCURRENT_APISERVICE_AVAILABILITY_SYNCS: usize = 5;
 
+/// Attempts of the discovery check
+/// (`remote_available_controller.go`, `attempts := 5`).
+const DISCOVERY_CHECK_ATTEMPTS: usize = 5;
+
+/// One attempt of the discovery check: `serviceResolver.ResolveEndpoint`, then
+/// a GET of `/apis/<group>/<version>` (`/api/<version>` for `v1.`) with the
+/// `system:kube-aggregator` / `system:masters` auth proxy identity, over the
+/// `proxyTransportDial` transport, bounded by the 5s client timeout and the 6s
+/// outer wait. `Err` carries the attempt's error text, as upstream's
+/// `results <- fmt.Errorf(...)`. Injected because the transport (egress
+/// selector, front-proxy client cert) lives in the api-server, as upstream
+/// hands the controller its `proxyTransportDial` and `serviceResolver`.
+pub type DiscoveryProbe = Arc<
+    dyn Fn(serde_json::Value) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct APIServiceAvailabilityController<S: Storage> {
     storage: Arc<S>,
+    /// `c.serviceResolver != nil` and the dial holder: when absent no discovery
+    /// request is made.
+    discovery_probe: Option<DiscoveryProbe>,
 }
 
 impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            discovery_probe: None,
+        }
+    }
+
+    /// A controller that hits the discovery endpoint of every remote
+    /// APIService once the service and endpoint checks pass.
+    pub fn with_discovery_probe(storage: Arc<S>, probe: DiscoveryProbe) -> Self {
+        Self {
+            storage,
+            discovery_probe: Some(probe),
+        }
     }
 
     /// Work-queue-based run loop. Watch events enqueue resource keys;
@@ -286,134 +321,168 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             }
         };
 
-        // Get the service port from APIService spec
-        let apiservice_port = apiservice
-            .pointer("/spec/service/port")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(443) as i32;
+        // `if service.Spec.Type == v1.ServiceTypeClusterIP`
+        // (remote_available_controller.go:231): only a cluster IP service must
+        // listen on the configured port and have endpoints.
+        let service_type = svc
+            .pointer("/spec/type")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("ClusterIP");
+        if service_type == "ClusterIP" {
+            // Get the service port from APIService spec
+            let apiservice_port = apiservice
+                .pointer("/spec/service/port")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(443) as i32;
 
-        // Find the matching port name in the service
-        let mut port_name = String::new();
-        let mut found_port = false;
-        if let Some(ports) = svc.pointer("/spec/ports").and_then(|v| v.as_array()) {
-            for port in ports {
-                let p = port.get("port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                if p == apiservice_port {
-                    found_port = true;
-                    port_name = port
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    break;
+            // Find the matching port name in the service
+            let mut port_name = String::new();
+            let mut found_port = false;
+            if let Some(ports) = svc.pointer("/spec/ports").and_then(|v| v.as_array()) {
+                for port in ports {
+                    let p = port.get("port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    if p == apiservice_port {
+                        found_port = true;
+                        port_name = port
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        break;
+                    }
                 }
             }
-        }
 
-        if !found_port {
-            self.update_condition(
-                name,
-                "False",
-                "ServicePortError",
-                &format!(
-                    "service/{} in \"{}\" is not listening on port {}",
-                    svc_name, svc_ns, apiservice_port
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
+            if !found_port {
+                self.update_condition(
+                    name,
+                    "False",
+                    "ServicePortError",
+                    &format!(
+                        "service/{} in \"{}\" is not listening on port {}",
+                        svc_name, svc_ns, apiservice_port
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
 
-        // Check EndpointSlices for the service
-        let ep_prefix = build_prefix("endpointslices", Some(&svc_ns));
-        let all_slices: Vec<EndpointSlice> =
-            self.storage.list(&ep_prefix).await.unwrap_or_default();
+            // Check EndpointSlices for the service
+            let ep_prefix = build_prefix("endpointslices", Some(&svc_ns));
+            let all_slices: Vec<EndpointSlice> =
+                self.storage.list(&ep_prefix).await.unwrap_or_default();
 
-        // Filter slices belonging to this service
-        let service_slices: Vec<&EndpointSlice> = all_slices
-            .iter()
-            .filter(|slice| {
-                slice
-                    .metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|l| l.get("kubernetes.io/service-name"))
-                    .map(|sn| sn == &svc_name)
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if service_slices.is_empty() {
-            // No endpoint slices — check Endpoints resource as fallback
-            let ep_key = rusternetes_storage::build_key("endpoints", Some(&svc_ns), &svc_name);
-            if let Ok(ep) = self
-                .storage
-                .get::<rusternetes_common::resources::Endpoints>(&ep_key)
-                .await
-            {
-                let has_ready = ep.subsets.iter().any(|s| {
-                    s.addresses
+            // Filter slices belonging to this service
+            let service_slices: Vec<&EndpointSlice> = all_slices
+                .iter()
+                .filter(|slice| {
+                    slice
+                        .metadata
+                        .labels
                         .as_ref()
-                        .map(|addrs| !addrs.is_empty())
+                        .and_then(|l| l.get("kubernetes.io/service-name"))
+                        .map(|sn| sn == &svc_name)
                         .unwrap_or(false)
-                });
-                if has_ready {
-                    self.update_condition(name, "True", "Passed", "all checks passed")
-                        .await?;
+                })
+                .collect();
+
+            if service_slices.is_empty() {
+                // No endpoint slices — check Endpoints resource as fallback
+                let ep_key = rusternetes_storage::build_key("endpoints", Some(&svc_ns), &svc_name);
+                let fallback_ready = match self
+                    .storage
+                    .get::<rusternetes_common::resources::Endpoints>(&ep_key)
+                    .await
+                {
+                    Ok(ep) => ep.subsets.iter().any(|s| {
+                        s.addresses
+                            .as_ref()
+                            .map(|addrs| !addrs.is_empty())
+                            .unwrap_or(false)
+                    }),
+                    Err(_) => false,
+                };
+                if !fallback_ready {
+                    self.update_condition(
+                        name,
+                        "False",
+                        "EndpointsNotFound",
+                        &format!(
+                            "cannot find endpointslices for service/{} in \"{}\"",
+                            svc_name, svc_ns
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            } else {
+                // Check for at least one ready endpoint with the matching port
+                let mut has_active = false;
+                'outer: for slice in &service_slices {
+                    let has_ready_endpoint = slice.endpoints.iter().any(|ep| {
+                        ep.conditions
+                            .as_ref()
+                            .map(|c| c.ready.unwrap_or(true)) // nil ready = ready
+                            .unwrap_or(true)
+                    });
+                    if !has_ready_endpoint {
+                        continue;
+                    }
+                    // Check if the slice has the matching port
+                    for ep_port in &slice.ports {
+                        let ep_port_name = ep_port.name.as_deref().unwrap_or("");
+                        if ep_port_name == port_name && ep_port.port.is_some() {
+                            has_active = true;
+                            break 'outer;
+                        }
+                    }
+                }
+
+                if !has_active {
+                    self.update_condition(
+                        name,
+                        "False",
+                        "MissingEndpoints",
+                        &format!(
+                            "endpointslices for service/{} in \"{}\" have no addresses with port name \"{}\"",
+                            svc_name, svc_ns, port_name
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
-
-            self.update_condition(
-                name,
-                "False",
-                "EndpointsNotFound",
-                &format!(
-                    "cannot find endpointslices for service/{} in \"{}\"",
-                    svc_name, svc_ns
-                ),
-            )
-            .await?;
-            return Ok(());
         }
 
-        // Check for at least one ready endpoint with the matching port
-        let mut has_active = false;
-        'outer: for slice in &service_slices {
-            let has_ready_endpoint = slice.endpoints.iter().any(|ep| {
-                ep.conditions
-                    .as_ref()
-                    .map(|c| c.ready.unwrap_or(true)) // nil ready = ready
-                    .unwrap_or(true)
-            });
-            if !has_ready_endpoint {
-                continue;
+        // Actually hit the discovery endpoint when routing as a service
+        // (remote_available_controller.go:277-352): `attempts` concurrent
+        // tries, the first success wins, otherwise the last result is the
+        // failure.
+        if let Some(probe) = &self.discovery_probe {
+            let mut attempts = futures::stream::FuturesUnordered::new();
+            for _ in 0..DISCOVERY_CHECK_ATTEMPTS {
+                attempts.push(probe(apiservice.clone()));
             }
-            // Check if the slice has the matching port
-            for ep_port in &slice.ports {
-                let ep_port_name = ep_port.name.as_deref().unwrap_or("");
-                if ep_port_name == port_name && ep_port.port.is_some() {
-                    has_active = true;
-                    break 'outer;
+            let mut last_error = None;
+            while let Some(result) = attempts.next().await {
+                last_error = result.err();
+                // if we had at least one success, we are successful overall
+                if last_error.is_none() {
+                    break;
                 }
             }
+            if let Some(message) = last_error {
+                self.update_condition(name, "False", "FailedDiscoveryCheck", &message)
+                    .await?;
+                // force a requeue to make it very obvious that this will be
+                // retried at some point in the future
+                return Err(anyhow::anyhow!(message));
+            }
         }
 
-        if has_active {
-            self.update_condition(name, "True", "Passed", "all checks passed")
-                .await?;
-        } else {
-            self.update_condition(
-                name,
-                "False",
-                "MissingEndpoints",
-                &format!(
-                    "endpointslices for service/{} in \"{}\" have no addresses with port name \"{}\"",
-                    svc_name, svc_ns, port_name
-                ),
-            )
+        self.update_condition(name, "True", "Passed", "all checks passed")
             .await?;
-        }
 
         Ok(())
     }

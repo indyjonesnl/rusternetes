@@ -456,3 +456,171 @@ async fn missing_service_reports_not_available() {
     assert_eq!(status, "False");
     assert_eq!(reason, "ServiceNotFound");
 }
+
+// remote_available_controller.go:277-352: after the service and endpoint
+// checks, `attempts` concurrent discovery requests; one success is overall
+// success, otherwise the last result is the FailedDiscoveryCheck message.
+
+use rusternetes_controller_manager::controllers::apiservice::DiscoveryProbe;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+async fn available_setup(
+    storage: &Arc<MemoryStorage>,
+    api_name: &str,
+) -> (&'static str, &'static str) {
+    let (ns, svc) = ("sample", "sample-apiserver-service");
+    put(
+        storage,
+        &build_key("apiservices", None, api_name),
+        &apiservice(api_name, ns, svc, 443),
+    )
+    .await;
+    put(
+        storage,
+        &build_key("services", Some(ns), svc),
+        &service(svc, ns, 443, None),
+    )
+    .await;
+    let slice = ready_slice(ns, svc, 443, None);
+    put(
+        storage,
+        &build_key("endpointslices", Some(ns), &slice.metadata.name),
+        &slice,
+    )
+    .await;
+    (ns, svc)
+}
+
+fn probe_with(
+    calls: Arc<AtomicUsize>,
+    f: impl Fn(usize) -> Result<(), String> + Send + Sync + 'static,
+) -> DiscoveryProbe {
+    let f = Arc::new(f);
+    Arc::new(move |_apiservice| {
+        let n = calls.fetch_add(1, Ordering::SeqCst);
+        let f = f.clone();
+        Box::pin(async move { f(n) })
+    })
+}
+
+#[tokio::test]
+async fn failed_discovery_check_marks_unavailable_and_requeues() {
+    let storage = Arc::new(MemoryStorage::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let controller = APIServiceAvailabilityController::with_discovery_probe(
+        storage.clone(),
+        probe_with(calls.clone(), |_| Err("bad status from x: 503".to_string())),
+    );
+    let api_name = "v1alpha1.wardle.example.com";
+    available_setup(&storage, api_name).await;
+
+    let err = controller
+        .reconcile(api_name)
+        .await
+        .expect_err("a failed discovery check returns the error so the key is requeued");
+    assert_eq!(err.to_string(), "bad status from x: 503");
+    assert_eq!(calls.load(Ordering::SeqCst), 5, "five attempts");
+
+    let (status, reason, message) = read_available(&storage, api_name).await.unwrap();
+    assert_eq!(status, "False");
+    assert_eq!(reason, "FailedDiscoveryCheck");
+    assert_eq!(message, "bad status from x: 503");
+}
+
+#[tokio::test]
+async fn one_successful_discovery_attempt_is_overall_success() {
+    let storage = Arc::new(MemoryStorage::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let controller = APIServiceAvailabilityController::with_discovery_probe(
+        storage.clone(),
+        probe_with(calls, |n| {
+            if n == 3 {
+                Ok(())
+            } else {
+                Err("failing or missing response".to_string())
+            }
+        }),
+    );
+    let api_name = "v1alpha1.wardle.example.com";
+    available_setup(&storage, api_name).await;
+
+    controller.reconcile(api_name).await.expect("reconcile ok");
+
+    let (status, reason, message) = read_available(&storage, api_name).await.unwrap();
+    assert_eq!(status, "True");
+    assert_eq!(reason, "Passed");
+    assert_eq!(message, "all checks passed");
+}
+
+#[tokio::test]
+async fn discovery_is_not_attempted_when_endpoints_are_missing() {
+    let storage = Arc::new(MemoryStorage::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let controller = APIServiceAvailabilityController::with_discovery_probe(
+        storage.clone(),
+        probe_with(calls.clone(), |_| Ok(())),
+    );
+    let (ns, svc, api_name) = (
+        "sample",
+        "sample-apiserver-service",
+        "v1alpha1.wardle.example.com",
+    );
+    put(
+        &storage,
+        &build_key("apiservices", None, api_name),
+        &apiservice(api_name, ns, svc, 443),
+    )
+    .await;
+    put(
+        &storage,
+        &build_key("services", Some(ns), svc),
+        &service(svc, ns, 443, None),
+    )
+    .await;
+
+    controller.reconcile(api_name).await.expect("reconcile ok");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (_, reason, _) = read_available(&storage, api_name).await.unwrap();
+    assert_eq!(reason, "EndpointsNotFound");
+}
+
+// `if service.Spec.Type == v1.ServiceTypeClusterIP` (:231): the port and
+// endpoint checks apply to cluster IP services only.
+#[tokio::test]
+async fn non_cluster_ip_service_skips_port_and_endpoint_checks() {
+    let storage = Arc::new(MemoryStorage::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let controller = APIServiceAvailabilityController::with_discovery_probe(
+        storage.clone(),
+        probe_with(calls.clone(), |_| Ok(())),
+    );
+    let (ns, svc, api_name) = ("sample", "external", "v1alpha1.wardle.example.com");
+    put(
+        &storage,
+        &build_key("apiservices", None, api_name),
+        &apiservice(api_name, ns, svc, 443),
+    )
+    .await;
+    put(
+        &storage,
+        &build_key("services", Some(ns), svc),
+        &json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": svc, "namespace": ns },
+            "spec": { "type": "ExternalName", "externalName": "backend.example.com" },
+        }),
+    )
+    .await;
+
+    controller.reconcile(api_name).await.expect("reconcile ok");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "every attempt is launched; the first success ends the wait"
+    );
+    let (status, reason, _) = read_available(&storage, api_name).await.unwrap();
+    assert_eq!((status.as_str(), reason.as_str()), ("True", "Passed"));
+}
