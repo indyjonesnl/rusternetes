@@ -1138,7 +1138,23 @@ pub fn spawn_apiservice_availability_controller(
 fn spawn_apiservice_availability_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
     use rusternetes_controller_core::apiservice::APIServiceAvailabilityController;
     tokio::spawn(async move {
-        let controller = Arc::new(APIServiceAvailabilityController::new(storage));
+        // `serviceResolver` + `proxyTransportDial` of the aggregator's
+        // availability controller (kube-aggregator apiserver.go:339-366).
+        let probe_storage = storage.clone();
+        let probe: rusternetes_controller_core::apiservice::DiscoveryProbe =
+            Arc::new(move |apiservice| {
+                let storage = probe_storage.clone();
+                Box::pin(async move {
+                    crate::handlers::aggregator::availability_discovery_attempt(
+                        storage.as_ref(),
+                        &apiservice,
+                    )
+                    .await
+                })
+            });
+        let controller = Arc::new(APIServiceAvailabilityController::with_discovery_probe(
+            storage, probe,
+        ));
         if let Err(e) = controller.run().await {
             warn!("APIService availability controller exited: {}", e);
         }

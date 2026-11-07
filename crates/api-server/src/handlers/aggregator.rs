@@ -226,7 +226,7 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
     clippy::too_many_arguments,
     reason = "the Err is the axum error Response the handler returns as-is"
 )]
-async fn resolve_backend_target<S: Storage + Send + Sync>(
+pub(crate) async fn resolve_backend_target<S: Storage + Send + Sync>(
     storage: &S,
     group: &str,
     version: &str,
@@ -986,4 +986,129 @@ pub async fn list_registered_apiservice_groups_with_storage<S: Storage + Send + 
         }));
     }
     out
+}
+
+/// One attempt of the availability controller's discovery check
+/// (`remote_available_controller.go:277-352`, the body of one of the
+/// `attempts` goroutines): `ResolveEndpoint`, a GET of the group version's
+/// discovery path as `system:kube-aggregator` in `system:masters`, over a
+/// transport that ignores TLS verification (`Insecure: true`), presents the
+/// front-proxy client certificate and dials through `proxyTransportDial`
+/// (`Lookup(Cluster)`). The client times out after 5s and does not follow
+/// redirects; the attempt as a whole is abandoned after 6s.
+pub async fn availability_discovery_attempt<S: Storage + Send + Sync>(
+    storage: &S,
+    apiservice: &Value,
+) -> Result<(), String> {
+    let name = apiservice
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let group = apiservice
+        .pointer("/spec/group")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let version = apiservice
+        .pointer("/spec/version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let svc_name = apiservice
+        .pointer("/spec/service/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let svc_ns = apiservice
+        .pointer("/spec/service/namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let svc_port = apiservice
+        .pointer("/spec/service/port")
+        .and_then(|v| v.as_i64())
+        .map(|p| p as u16);
+
+    let target = match resolve_backend_target(
+        storage, group, version, svc_ns, svc_name, svc_port, true, None,
+    )
+    .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err("no endpoints available".to_string()),
+        Err(resp) => {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            return Err(String::from_utf8_lossy(&body).trim().to_string());
+        }
+    };
+    availability_discovery_request(&target, name, group, version).await
+}
+
+/// The request half of [`availability_discovery_attempt`] against a resolved
+/// endpoint.
+pub async fn availability_discovery_request(
+    target: &AggregatorTarget,
+    name: &str,
+    group: &str,
+    version: &str,
+) -> Result<(), String> {
+    let host = if target.host.contains(':') && !target.host.starts_with('[') {
+        format!("[{}]", target.host)
+    } else {
+        target.host.clone()
+    };
+    // render legacyAPIService health check path when it is delegated to a service
+    let path = if name == "v1." {
+        format!("/api/{version}")
+    } else {
+        format!("/apis/{group}/{version}")
+    };
+    let url = format!("{}://{}:{}{}", target.scheme, host, target.port, path);
+
+    let dialer = crate::egress_selector::egress_selector()
+        .and_then(|s| s.lookup(crate::egress_selector::EgressType::Cluster))
+        .unwrap_or(crate::egress_selector::Dialer::Direct);
+    let tls =
+        crate::egress_http::tls_client_config(None, true, proxy_client_identity_pem().as_deref())
+            .map_err(|e| e.to_string())?;
+    let client =
+        crate::egress_http::EgressHttpClient::new(dialer, tls, std::time::Duration::from_secs(5));
+
+    // transport.SetAuthProxyHeaders(newReq, "system:kube-aggregator", "",
+    // []string{"system:masters"}, nil)
+    let mut map = HeaderMap::new();
+    crate::upgrade_aware::set_auth_proxy_headers(
+        &mut map,
+        &rusternetes_common::auth::UserInfo {
+            username: "system:kube-aggregator".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
+        },
+    );
+    let headers: Vec<(&str, String)> = map
+        .iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v.to_string())))
+        .collect();
+
+    let attempt = async {
+        match client
+            .send(hyper::Method::GET, &url, &headers, Vec::new())
+            .await
+        {
+            // we should always been in the 200s or 300s
+            Ok(resp) if !(200..300).contains(&resp.status) => {
+                Err(format!("bad status from {url}: {}", resp.status))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!(
+                "failing or missing response from {url}: {}",
+                e.message
+            )),
+        }
+    };
+    // we had trouble with slow dial and DNS responses causing us to wait too
+    // long. we added this as insurance
+    match tokio::time::timeout(std::time::Duration::from_secs(6), attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("timed out waiting for {url}")),
+    }
 }
