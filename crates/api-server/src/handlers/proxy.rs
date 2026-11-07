@@ -661,6 +661,35 @@ async fn proxy_request_with_rewrite(
     body: Body,
     proxy_base_path: Option<String>,
 ) -> Result<Response> {
+    // cmd/kube-apiserver/app/server.go:251-259: with an egress selector,
+    // `Lookup(Cluster)` is the `DialContext` of the `ProxyTransport` used by
+    // the node, pod and service "proxy" subresources. No selector, or none
+    // for `Cluster`, keeps the default dial.
+    let dialer = crate::egress_selector::egress_selector()
+        .and_then(|s| s.lookup(crate::egress_selector::EgressType::Cluster));
+    proxy_request_with_dialer(
+        target_url,
+        original_uri,
+        method,
+        headers,
+        body,
+        proxy_base_path,
+        dialer,
+    )
+    .await
+}
+
+/// [`proxy_request_with_rewrite`] with the `ProxyTransport` dialer resolved by
+/// the caller (`None`: the default dial).
+pub async fn proxy_request_with_dialer(
+    target_url: String,
+    original_uri: &Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+    proxy_base_path: Option<String>,
+    dialer: Option<crate::egress_selector::Dialer>,
+) -> Result<Response> {
     // Forward the original query string verbatim. Re-encoding a HashMap
     // loses key ordering, duplicate keys, and exact encoding — all of which
     // proxy clients rely on. K8s forwards the raw query bytes through.
@@ -674,6 +703,19 @@ async fn proxy_request_with_rewrite(
     info!("Forwarding {} request to {}", method, full_url);
 
     let client = get_proxy_client();
+    let egress_client = match dialer {
+        Some(d) => match egress_proxy_client(d) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Content-Type", "text/plain")
+                    .body(Body::from(format!("error trying to reach backend: {e}")))
+                    .unwrap());
+            }
+        },
+        None => None,
+    };
 
     // Convert axum body to bytes
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
@@ -709,29 +751,27 @@ async fn proxy_request_with_rewrite(
             );
         }
 
-        // Build the request
-        let req_method: reqwest::Method = method.as_str().parse().unwrap_or(reqwest::Method::GET);
-        let mut request = client
-            .request(req_method, &full_url)
-            .body(body_bytes.to_vec());
-
-        // Forward headers
-        for (name, value) in &forward_headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
+        let upstream = match &egress_client {
+            Some(c) => send_via_dialer(c, &method, &full_url, &forward_headers, &body_bytes).await,
+            None => {
+                send_via_reqwest(client, &method, &full_url, &forward_headers, &body_bytes).await
+            }
+        };
 
         // Execute the request
-        match request.send().await {
-            Ok(response) => {
+        match upstream {
+            Upstream::Response {
+                status,
+                headers: upstream_headers,
+                body: upstream_body,
+            } => {
                 // Successfully connected — forward the response verbatim.
-                let status = response.status();
                 let mut axum_response = Response::builder().status(
-                    StatusCode::from_u16(status.as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 );
 
                 // Copy response headers, skipping Content-Length (recalculated from body).
-                for (name, value) in response.headers().iter() {
+                for (name, value) in upstream_headers.iter() {
                     let name_str = name.as_str();
                     if !is_hop_by_hop_header(name_str) {
                         // Always skip upstream Content-Length. reqwest may
@@ -749,7 +789,7 @@ async fn proxy_request_with_rewrite(
                 }
 
                 // Get response body
-                let resp_bytes = match response.bytes().await {
+                let resp_bytes = match upstream_body {
                     Ok(b) => b,
                     Err(e) => {
                         warn!("Failed to read proxy response body: {}", e);
@@ -792,10 +832,12 @@ async fn proxy_request_with_rewrite(
                     rusternetes_common::Error::Internal(format!("Failed to build response: {}", e))
                 });
             }
-            Err(e) => {
-                last_error = e.to_string();
+            Upstream::Failed {
+                error: e,
+                connect: is_connect_error,
+            } => {
+                last_error = e.clone();
                 // Only retry on connection errors, not on timeouts or other errors
-                let is_connect_error = e.is_connect();
                 if !is_connect_error || attempt == max_retries {
                     warn!(
                         "Proxy request to {} failed after {} attempts: {}",
@@ -827,6 +869,94 @@ async fn proxy_request_with_rewrite(
             last_error
         )))
         .unwrap())
+}
+
+/// What one attempt at the backend produced, whichever client sent it.
+enum Upstream {
+    Response {
+        status: u16,
+        headers: HeaderMap,
+        body: std::result::Result<axum::body::Bytes, String>,
+    },
+    Failed {
+        error: String,
+        /// A dial failure (`reqwest::Error::is_connect`), the only retried kind.
+        connect: bool,
+    },
+}
+
+/// The `ProxyTransport` with a selected dialer (server.go:255-258
+/// `c.DialContext = dialer`): connections to the kubelet's self-signed serving
+/// certificate are not verified, as with the default client.
+fn egress_proxy_client(
+    dialer: crate::egress_selector::Dialer,
+) -> anyhow::Result<crate::egress_http::EgressHttpClient> {
+    let tls = crate::egress_http::tls_client_config(None, true, None)?;
+    Ok(crate::egress_http::EgressHttpClient::new(
+        dialer,
+        tls,
+        std::time::Duration::from_secs(30),
+    ))
+}
+
+async fn send_via_dialer(
+    client: &crate::egress_http::EgressHttpClient,
+    method: &Method,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Upstream {
+    let hyper_method =
+        hyper::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(hyper::Method::GET);
+    let headers: Vec<(&str, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    match client
+        .send(hyper_method, url, &headers, body.to_vec())
+        .await
+    {
+        Ok(resp) => Upstream::Response {
+            status: resp.status,
+            headers: resp.headers,
+            body: Ok(resp.body),
+        },
+        Err(e) => Upstream::Failed {
+            // hyper-util's `client error (Connect)`: the dialer failed.
+            connect: e.message.contains("client error (Connect)"),
+            error: e.message,
+        },
+    }
+}
+
+async fn send_via_reqwest(
+    client: &reqwest::Client,
+    method: &Method,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Upstream {
+    let req_method: reqwest::Method = method.as_str().parse().unwrap_or(reqwest::Method::GET);
+    let mut request = client.request(req_method, url).body(body.to_vec());
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let headers = response.headers().clone();
+            let body = response.bytes().await.map_err(|e| e.to_string());
+            Upstream::Response {
+                status,
+                headers,
+                body,
+            }
+        }
+        Err(e) => Upstream::Failed {
+            connect: e.is_connect(),
+            error: e.to_string(),
+        },
+    }
 }
 
 /// Check if a header is a hop-by-hop header that should not be forwarded
