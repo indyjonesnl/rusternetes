@@ -94,8 +94,9 @@ pub struct EgressConnector {
 }
 
 impl EgressConnector {
-    /// The `DialContext` + TLS config of one transport; `server_name` as in
-    /// [`EgressHttpClient::with_server_name`].
+    /// The `DialContext` + TLS config of one transport, usable standalone by
+    /// callers that drive their own hyper client (streaming and upgraded
+    /// connections); `server_name` as in [`EgressHttpClient::with_server_name`].
     pub fn new(dialer: Dialer, tls: rustls::ClientConfig, server_name: Option<String>) -> Self {
         Self {
             dialer,

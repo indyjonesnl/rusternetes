@@ -374,3 +374,123 @@ async fn test_proxy_pod_named_port_storage_round_trip() {
     // Clean up
     storage.delete(key).await.unwrap();
 }
+
+// ----- egress selector `Cluster` dial (#3466) --------------------------------
+
+/// A konnectivity-like proxier: records the address asked for and tunnels to
+/// the real local backend, or fails when `target` is `None`.
+struct ClusterTunnel {
+    target: Option<String>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+struct ClusterProxier {
+    target: Option<String>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait::async_trait]
+impl rusternetes_api_server::egress_selector::ProxyServerConnector for ClusterTunnel {
+    async fn connect(
+        &self,
+    ) -> Result<Box<dyn rusternetes_api_server::egress_selector::Proxier>, String> {
+        Ok(Box::new(ClusterProxier {
+            target: self.target.clone(),
+            seen: self.seen.clone(),
+        }))
+    }
+}
+#[async_trait::async_trait]
+impl rusternetes_api_server::egress_selector::Proxier for ClusterProxier {
+    async fn proxy(
+        &self,
+        addr: &str,
+    ) -> Result<rusternetes_api_server::egress_selector::Conn, String> {
+        self.seen.lock().unwrap().push(addr.to_string());
+        let target = self.target.as_ref().ok_or("tunnel closed")?;
+        let c = tokio::net::TcpStream::connect(target)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(c))
+    }
+}
+
+fn cluster_dialer(
+    target: Option<String>,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> rusternetes_api_server::egress_selector::Dialer {
+    rusternetes_api_server::egress_selector::DialerCreator {
+        connector: Some(Arc::new(ClusterTunnel { target, seen })),
+        direct: false,
+        options: rusternetes_api_server::egress_selector::MetricsOptions {
+            transport: "tcp".into(),
+            protocol: "HTTPConnect".into(),
+        },
+    }
+    .create_dialer()
+}
+
+/// server.go:255-258: the proxy subresources' `ProxyTransport` dials through
+/// `Lookup(Cluster)`. The address the tunnel is asked for is the target's, and
+/// the backend's response (status, headers, body) is relayed unchanged.
+#[tokio::test]
+async fn proxy_request_dials_through_cluster_dialer() {
+    let route = axum::Router::new().fallback(|uri: axum::http::Uri| async move {
+        axum::http::Response::builder()
+            .status(202)
+            .header("X-Backend", "yes")
+            .body(axum::body::Body::from(format!("path={}", uri.path())))
+            .unwrap()
+    });
+    let (addr, _h) = rusternetes_test_support::mock_http::serve_graceful_handle(
+        route,
+        std::future::pending::<()>(),
+    );
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialer = cluster_dialer(Some(addr.to_string()), seen.clone());
+
+    // An address nothing listens on: reachable only through the tunnel.
+    let uri: axum::http::Uri = "/api/v1/nodes/n1/proxy/healthz".parse().unwrap();
+    let resp = rusternetes_api_server::handlers::proxy::proxy_request_with_dialer(
+        "http://10.254.254.1:10255/healthz".to_string(),
+        &uri,
+        axum::http::Method::GET,
+        axum::http::HeaderMap::new(),
+        axum::body::Body::empty(),
+        None,
+        Some(dialer),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), axum::http::StatusCode::ACCEPTED);
+    assert_eq!(resp.headers().get("x-backend").unwrap(), "yes");
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"path=/healthz");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["10.254.254.1:10255".to_string()]
+    );
+}
+
+/// A dial failure through the dialer is a connect error: retried (four
+/// attempts in all, as the default client) and then a plain-text 502.
+#[tokio::test]
+async fn proxy_request_retries_cluster_dial_failures_then_502() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dialer = cluster_dialer(None, seen.clone());
+    let uri: axum::http::Uri = "/api/v1/nodes/n1/proxy/healthz".parse().unwrap();
+    let resp = rusternetes_api_server::handlers::proxy::proxy_request_with_dialer(
+        "http://10.254.254.1:10255/healthz".to_string(),
+        &uri,
+        axum::http::Method::GET,
+        axum::http::HeaderMap::new(),
+        axum::body::Body::empty(),
+        None,
+        Some(dialer),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_GATEWAY);
+    assert_eq!(seen.lock().unwrap().len(), 4);
+}

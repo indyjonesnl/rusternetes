@@ -51,6 +51,15 @@ fn load_kubelet_client_identity() -> Option<(
     Some((certs, key))
 }
 
+/// The api-server's kubelet client identity (certificate chain then key, PEM),
+/// for a caller that builds its own TLS config. `None` when absent.
+pub fn kubelet_client_identity_pem() -> Option<Vec<u8>> {
+    let mut pem = std::fs::read(KUBELET_CLIENT_CERT).ok()?;
+    pem.push(b'\n');
+    pem.extend_from_slice(&std::fs::read(KUBELET_CLIENT_KEY).ok()?);
+    Some(pem)
+}
+
 /// Build the shared kubelet-proxy connector. Presents the kubeadm
 /// `apiserver-kubelet-client` cert when it exists so a vanilla kubelet
 /// authenticates the api-server; otherwise no client auth (rusternetes' own

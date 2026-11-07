@@ -4,6 +4,7 @@ use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use http::{StatusCode, Uri};
 use http_body_util::BodyExt;
+pub use tls::kubelet_client_identity_pem;
 use tracing::{debug, warn};
 
 /// Returns true for the standard set of hop-by-hop headers that must NOT be
@@ -66,6 +67,16 @@ pub struct ConnectionHold(pub std::sync::Arc<dyn std::any::Any + Send + Sync>);
 /// 101 splices both upgraded byte streams. Mirrors apimachinery
 /// proxy.NewUpgradeAwareHandler(upgradeRequired=true).
 pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
+    proxy_upgrade_with(target, req, tls::kubelet_proxy_connector()).await
+}
+
+/// [`proxy_upgrade`] over a caller-supplied connector: the `DialContext` of
+/// the transport (client-go `transport/cache.go` `tlsCache.get`), e.g. an
+/// egress-selector dialer. The connector owns the TLS handshake.
+pub async fn proxy_upgrade_with<C>(target: Uri, req: Request, connector: C) -> Response
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
     // 1. Take the client's OnUpgrade future before consuming the request.
     //    hyper 1.x places OnUpgrade as a request extension when it sees
     //    Connection: Upgrade on an HTTP/1.1 connection.
@@ -128,7 +139,7 @@ pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
 
     // 3. Send to backend.
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(crate::tls::kubelet_proxy_connector());
+        .build(connector);
 
     let backend_resp = match client.request(backend_req).await {
         Ok(r) => r,
@@ -197,6 +208,15 @@ pub async fn proxy_upgrade(target: Uri, req: Request) -> Response {
 
 /// Non-upgrade streaming reverse proxy (body streamed, not buffered).
 pub async fn proxy_stream(target: Uri, req: Request) -> Response {
+    proxy_stream_with(target, req, tls::kubelet_proxy_connector()).await
+}
+
+/// [`proxy_stream`] over a caller-supplied connector (see
+/// [`proxy_upgrade_with`]).
+pub async fn proxy_stream_with<C>(target: Uri, req: Request, connector: C) -> Response
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
     let (parts, body) = req.into_parts();
 
     let mut builder = http::Request::builder().method(parts.method).uri(target);
@@ -220,7 +240,7 @@ pub async fn proxy_stream(target: Uri, req: Request) -> Response {
     };
 
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(crate::tls::kubelet_proxy_connector());
+        .build(connector);
 
     match client.request(backend_req).await {
         Ok(backend_resp) => {

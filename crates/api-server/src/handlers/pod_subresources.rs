@@ -19,6 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
+use futures::TryStreamExt as _;
 use rusternetes_common::{
     authz::{Decision, RequestAttributes},
     Error, Result,
@@ -390,7 +391,7 @@ pub async fn get_logs(
         // Fetch the kubelet log stream over plain HTTP (same target URL the
         // non-upgrade path proxies). We build a fresh GET so the websocket
         // upgrade headers are not forwarded to the kubelet.
-        let stream = match fetch_kubelet_log_stream(&target_url, &name).await? {
+        let stream = match fetch_kubelet_log_stream(&target_url, &name, kubelet_dialer()).await? {
             Ok(stream) => stream,
             // The kubelet refused: answer the HTTP request with a Status
             // instead of upgrading and framing the error text as log output.
@@ -417,7 +418,7 @@ pub async fn get_logs(
     // the kubelet log endpoint is plain HTTP (no WebSocket / SPDY upgrade).
     // A kubelet error is converted to a Status before anything is streamed,
     // exactly as upstream's ResponseChecker does (#1920).
-    let proxied = rusternetes_streamproxy::proxy_stream(target_url, req).await;
+    let proxied = proxy_kubelet_stream(target_url, req, kubelet_dialer()).await;
     Ok(check_kubelet_log_response(proxied, &name).await)
 }
 
@@ -429,7 +430,7 @@ pub async fn get_logs(
 /// query parameters server-side — they are already baked into `target_url`.
 type LogByteStream = std::pin::Pin<
     Box<
-        dyn futures::Stream<Item = std::result::Result<axum::body::Bytes, reqwest::Error>>
+        dyn futures::Stream<Item = std::result::Result<axum::body::Bytes, std::io::Error>>
             + Send
             + 'static,
     >,
@@ -455,6 +456,113 @@ fn load_kubelet_client_identity() -> Option<reqwest::Identity> {
     }
 }
 
+/// `kubelet_client.go:96-104` `makeTransport`: with an egress selector the
+/// kubelet client's `DialHolder` is `Lookup(Cluster)` (set from
+/// `cmd/kube-apiserver/app/server.go:251`). No selector, or none for
+/// `Cluster`, keeps the default dial.
+pub fn kubelet_dialer() -> Option<crate::egress_selector::Dialer> {
+    crate::egress_selector::egress_selector()
+        .and_then(|s| s.lookup(crate::egress_selector::EgressType::Cluster))
+}
+
+/// The kubelet client transport over `dialer`: the same trust model as the
+/// default connector (serving certificate not verified, the kubeadm
+/// `apiserver-kubelet-client` identity when present, `transportConfig` in
+/// kubelet_client.go:109-125) with the dial through the egress selector.
+fn kubelet_egress_connector(
+    dialer: crate::egress_selector::Dialer,
+) -> Result<crate::egress_http::EgressConnector> {
+    let identity = rusternetes_streamproxy::kubelet_client_identity_pem();
+    let tls = crate::egress_http::tls_client_config(None, true, identity.as_deref())
+        .map_err(|e| Error::Internal(format!("failed to build kubelet client: {e}")))?;
+    Ok(crate::egress_http::EgressConnector::new(dialer, tls, None))
+}
+
+fn bad_gateway() -> Response {
+    StatusCode::BAD_GATEWAY.into_response()
+}
+
+/// `proxy_upgrade` to the kubelet, dialing through `dialer` when set.
+pub async fn proxy_kubelet_upgrade(
+    target: Uri,
+    req: Request,
+    dialer: Option<crate::egress_selector::Dialer>,
+) -> Response {
+    match dialer {
+        None => rusternetes_streamproxy::proxy_upgrade(target, req).await,
+        Some(d) => match kubelet_egress_connector(d) {
+            Ok(c) => rusternetes_streamproxy::proxy_upgrade_with(target, req, c).await,
+            Err(e) => {
+                tracing::warn!("kubelet upgrade proxy: {e}");
+                bad_gateway()
+            }
+        },
+    }
+}
+
+/// `proxy_stream` from the kubelet, dialing through `dialer` when set.
+pub async fn proxy_kubelet_stream(
+    target: Uri,
+    req: Request,
+    dialer: Option<crate::egress_selector::Dialer>,
+) -> Response {
+    match dialer {
+        None => rusternetes_streamproxy::proxy_stream(target, req).await,
+        Some(d) => match kubelet_egress_connector(d) {
+            Ok(c) => rusternetes_streamproxy::proxy_stream_with(target, req, c).await,
+            Err(e) => {
+                tracing::warn!("kubelet stream proxy: {e}");
+                bad_gateway()
+            }
+        },
+    }
+}
+
+/// [`fetch_kubelet_log_stream`] over the egress dialer: a hyper client whose
+/// connector is the dialer, streaming the body.
+async fn fetch_kubelet_log_stream_via_dialer(
+    target_url: &Uri,
+    pod_name: &str,
+    dialer: crate::egress_selector::Dialer,
+) -> Result<std::result::Result<LogByteStream, Response>> {
+    use http_body_util::BodyExt;
+    let connector = kubelet_egress_connector(dialer)?;
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build::<_, axum::body::Body>(connector);
+    let req = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(target_url.clone())
+        .body(axum::body::Body::empty())
+        .map_err(|e| Error::Internal(format!("kubelet log request failed: {e}")))?;
+    let resp = client
+        .request(req)
+        .await
+        .map_err(|e| Error::Internal(format!("kubelet log request failed: {e}")))?;
+    let (parts, body) = resp.into_parts();
+    let code = parts.status;
+    if !(StatusCode::OK..=StatusCode::PARTIAL_CONTENT).contains(&code) {
+        // `io.ReadAll(io.LimitReader(resp.Body, maxReadLength))`.
+        let mut body = body;
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() < KUBELET_ERROR_MAX_READ {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        let take = (KUBELET_ERROR_MAX_READ - buf.len()).min(data.len());
+                        buf.extend_from_slice(&data[..take]);
+                    }
+                }
+                _ => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        return Ok(Err(kubelet_error_response(code, text, pod_name)));
+    }
+    Ok(Ok(Box::pin(
+        body.into_data_stream().map_err(std::io::Error::other),
+    )))
+}
+
 /// Fetch the kubelet log stream, or the `Response` that must be returned
 /// instead when the kubelet refused.
 ///
@@ -462,10 +570,14 @@ fn load_kubelet_client_identity() -> Option<reqwest::Identity> {
 /// kubelet's error text is framed into the websocket as if it were log output,
 /// which is worse than the plain path's bad content type — the client cannot
 /// tell an error from a log line at all.
-async fn fetch_kubelet_log_stream(
+pub async fn fetch_kubelet_log_stream(
     target_url: &Uri,
     pod_name: &str,
+    dialer: Option<crate::egress_selector::Dialer>,
 ) -> Result<std::result::Result<LogByteStream, Response>> {
+    if let Some(dialer) = dialer {
+        return fetch_kubelet_log_stream_via_dialer(target_url, pod_name, dialer).await;
+    }
     // `danger_accept_invalid_certs` mirrors the api-server->kubelet trust model
     // used by the streaming proxy (the kubelet serves a self-signed cert).
     let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(true);
@@ -504,7 +616,9 @@ async fn fetch_kubelet_log_stream(
         return Ok(Err(kubelet_error_response(code, text, pod_name)));
     }
 
-    Ok(Ok(Box::pin(resp.bytes_stream())))
+    Ok(Ok(Box::pin(
+        resp.bytes_stream().map_err(std::io::Error::other),
+    )))
 }
 
 /// Build the kubelet stream URL for an exec or attach subresource.
@@ -794,7 +908,7 @@ pub async fn exec(
     // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
     // The WebSocket upgrade (if any) is handled transparently by proxy_upgrade via the
     // raw hyper OnUpgrade future; we don't need to handle it separately.
-    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
+    Ok(proxy_kubelet_upgrade(target_url, req, kubelet_dialer()).await)
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/attach
@@ -915,7 +1029,7 @@ pub async fn attach(
     // Upgrade-proxy the request to the kubelet (handles SPDY, WebSocket, and plain HTTP).
     // Suppress the unused `ws` warning — the upgrade is handled transparently by
     // proxy_upgrade via the raw hyper OnUpgrade future.
-    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
+    Ok(proxy_kubelet_upgrade(target_url, req, kubelet_dialer()).await)
 }
 
 /// Build the kubelet `portForward` query from the request's `ports` options.
@@ -1074,7 +1188,7 @@ pub async fn portforward(
         namespace, name, target_url
     );
 
-    Ok(rusternetes_streamproxy::proxy_upgrade(target_url, req).await)
+    Ok(proxy_kubelet_upgrade(target_url, req, kubelet_dialer()).await)
 }
 
 /// Feature name kubelets advertise in `node.status.declaredFeatures` once they
