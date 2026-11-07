@@ -624,3 +624,50 @@ async fn non_cluster_ip_service_skips_port_and_endpoint_checks() {
     let (status, reason, _) = read_available(&storage, api_name).await.unwrap();
     assert_eq!((status.as_str(), reason.as_str()), ("True", "Passed"));
 }
+
+// Upstream reads EndpointSlices only (remote_available_controller.go:259-265):
+// a legacy Endpoints object alone does not make the APIService available.
+#[tokio::test]
+async fn legacy_endpoints_without_a_slice_are_not_enough() {
+    let storage = Arc::new(MemoryStorage::new());
+    let controller = APIServiceAvailabilityController::new(storage.clone());
+    let (ns, svc, api_name) = (
+        "sample",
+        "sample-apiserver-service",
+        "v1alpha1.wardle.example.com",
+    );
+    put(
+        &storage,
+        &build_key("apiservices", None, api_name),
+        &apiservice(api_name, ns, svc, 443),
+    )
+    .await;
+    put(
+        &storage,
+        &build_key("services", Some(ns), svc),
+        &service(svc, ns, 443, None),
+    )
+    .await;
+    put(
+        &storage,
+        &build_key("endpoints", Some(ns), svc),
+        &json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": svc, "namespace": ns },
+            "subsets": [{
+                "addresses": [{ "ip": "10.244.0.5" }],
+                "ports": [{ "port": 443 }],
+            }],
+        }),
+    )
+    .await;
+
+    controller.reconcile(api_name).await.expect("reconcile ok");
+
+    let (status, reason, _) = read_available(&storage, api_name).await.unwrap();
+    assert_eq!(
+        (status.as_str(), reason.as_str()),
+        ("False", "EndpointsNotFound")
+    );
+}
