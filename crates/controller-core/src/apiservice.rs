@@ -387,35 +387,21 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
                 })
                 .collect();
 
+            // `len(endpointSlices) == 0` (remote_available_controller.go:259-265):
+            // upstream reads EndpointSlices only, with no legacy Endpoints
+            // fallback.
             if service_slices.is_empty() {
-                // No endpoint slices — check Endpoints resource as fallback
-                let ep_key = rusternetes_storage::build_key("endpoints", Some(&svc_ns), &svc_name);
-                let fallback_ready = match self
-                    .storage
-                    .get::<rusternetes_common::resources::Endpoints>(&ep_key)
-                    .await
-                {
-                    Ok(ep) => ep.subsets.iter().any(|s| {
-                        s.addresses
-                            .as_ref()
-                            .map(|addrs| !addrs.is_empty())
-                            .unwrap_or(false)
-                    }),
-                    Err(_) => false,
-                };
-                if !fallback_ready {
-                    self.update_condition(
-                        name,
-                        "False",
-                        "EndpointsNotFound",
-                        &format!(
-                            "cannot find endpointslices for service/{} in \"{}\"",
-                            svc_name, svc_ns
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
+                self.update_condition(
+                    name,
+                    "False",
+                    "EndpointsNotFound",
+                    &format!(
+                        "cannot find endpointslices for service/{} in \"{}\"",
+                        svc_name, svc_ns
+                    ),
+                )
+                .await?;
+                return Ok(());
             } else {
                 // Check for at least one ready endpoint with the matching port
                 let mut has_active = false;
