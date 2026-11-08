@@ -436,6 +436,36 @@ pub fn log_openid_metadata_status(token_manager: &TokenManager) {
     }
 }
 
+/// The process-wide options both entry points (this crate's `run` and the
+/// standalone `api-server` binary) install before serving, so a flag cannot
+/// take effect in one and be ignored in the other:
+///
+/// - `EgressSelectorOptions.Validate` then `ApplyTo`
+///   (pkg/server/options/egress_selector.go:80, :55); before the authorizer is
+///   built, as `BuildAuthorizer` takes the selector's `Lookup`
+///   (config.go:167, :245).
+/// - `buildServiceResolver(opts.EnableAggregatorRouting,
+///   LoopbackClientConfig.Host, ..)` (cmd/kube-apiserver/app/server.go:283).
+pub fn install_server_options(config: &ApiServerConfig) -> anyhow::Result<()> {
+    let egress_errs = egress_selector::validate_options(&config.egress_selector_config_file);
+    if !egress_errs.is_empty() {
+        anyhow::bail!("{}", egress_errs.join(", "));
+    }
+    egress_selector::set_egress_selector(
+        egress_selector::apply_to(&config.egress_selector_config_file)
+            .map_err(|e| anyhow::anyhow!(e))?,
+    );
+    service_resolver::set_service_resolver(service_resolver::ServiceResolver::new(
+        config.enable_aggregator_routing,
+        config
+            .bind_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| ("127.0.0.1".to_string(), a.port())),
+    ));
+    Ok(())
+}
+
 /// Run the API server component.
 ///
 /// This is the main entry point for embedding the API server in the all-in-one binary.
@@ -464,28 +494,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
     );
     log_openid_metadata_status(&token_manager);
 
-    // `EgressSelectorOptions.Validate` then `ApplyTo`
-    // (pkg/server/options/egress_selector.go:80, :55); before the authorizer is
-    // built, as `BuildAuthorizer` takes the selector's `Lookup` (config.go:167, :245).
-    let egress_errs = egress_selector::validate_options(&config.egress_selector_config_file);
-    if !egress_errs.is_empty() {
-        anyhow::bail!("{}", egress_errs.join(", "));
-    }
-    egress_selector::set_egress_selector(
-        egress_selector::apply_to(&config.egress_selector_config_file)
-            .map_err(|e| anyhow::anyhow!(e))?,
-    );
-
-    // `buildServiceResolver(opts.EnableAggregatorRouting, LoopbackClientConfig.Host, ..)`
-    // (cmd/kube-apiserver/app/server.go:283).
-    service_resolver::set_service_resolver(service_resolver::ServiceResolver::new(
-        config.enable_aggregator_routing,
-        config
-            .bind_address
-            .parse::<std::net::SocketAddr>()
-            .ok()
-            .map(|a| ("127.0.0.1".to_string(), a.port())),
-    ));
+    install_server_options(&config)?;
 
     if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");

@@ -307,3 +307,16 @@ fn routing_flag_picks_the_resolver() {
     assert_eq!(ServiceResolver::new(true, None).routing, Routing::Endpoint);
     assert_eq!(ServiceResolver::default().routing, Routing::ClusterIp);
 }
+
+// Both entry points (`run` and the standalone binary) install the egress
+// selector and the service resolver through `install_server_options`; a bad
+// egress configuration must stop startup there, as
+// `EgressSelectorOptions.Validate` does (egress_selector.go:80).
+#[test]
+fn install_server_options_rejects_an_unreadable_egress_config() {
+    let cfg = rusternetes_api_server::ApiServerConfig {
+        egress_selector_config_file: "/nonexistent/egress-selector.yaml".into(),
+        ..Default::default()
+    };
+    assert!(rusternetes_api_server::install_server_options(&cfg).is_err());
+}

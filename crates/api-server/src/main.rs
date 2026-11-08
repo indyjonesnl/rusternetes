@@ -763,6 +763,15 @@ async fn main() -> Result<()> {
     );
     rusternetes_api_server::log_openid_metadata_status(&token_manager);
 
+    // Egress selector and aggregator service resolver, installed as `run` does
+    // and before the authorizer takes the selector's `Lookup`.
+    rusternetes_api_server::install_server_options(&rusternetes_api_server::ApiServerConfig {
+        bind_address: args.bind_address.clone(),
+        egress_selector_config_file: args.egress_selector.config_file.clone(),
+        enable_aggregator_routing: args.enable_aggregator_routing,
+        ..Default::default()
+    })?;
+
     // Authorizer chain, shared with the all-in-one entry point (#2679).
     if args.skip_auth {
         warn!("⚠️  AUTHENTICATION AND AUTHORIZATION DISABLED - INSECURE MODE");
