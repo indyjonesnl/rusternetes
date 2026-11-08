@@ -39,93 +39,6 @@ pub struct AggregatorTarget {
     pub server_name: Option<String>,
 }
 
-/// Look up the APIService registered for `{group}/{version}` and resolve a
-/// reachable backend address through the backing Service / Endpoints.
-///
-/// Returns `Ok(None)` when no APIService is registered, `Err(503)` when the
-/// APIService exists but the backing service is unreachable.
-/// Resolve a reachable `(ip, port)` for an aggregated APIService backend
-/// service. Prefers a ready pod IP (EndpointSlices → Endpoints) because the
-/// api-server cannot reach ClusterIPs; falls back to the ClusterIP only if no
-/// endpoints exist. `svc_port` is the APIService's `spec.service.port`.
-async fn resolve_aggregator_backend_address<S: Storage + Send + Sync>(
-    storage: &S,
-    svc_ns: &str,
-    svc_name: &str,
-    svc_port: Option<u16>,
-) -> Option<(String, u16)> {
-    // Strategy 1: EndpointSlices (preferred — gives a ready pod IP + targetPort).
-    let es_prefix = rusternetes_storage::build_prefix("endpointslices", Some(svc_ns));
-    let slices: Vec<rusternetes_common::resources::EndpointSlice> =
-        storage.list(&es_prefix).await.unwrap_or_default();
-    for es in &slices {
-        let owns = es
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get("kubernetes.io/service-name"))
-            .map(|s| s == svc_name)
-            .unwrap_or(false);
-        if !owns {
-            continue;
-        }
-        // Proxying straight to a pod IP, so the endpoint targetPort wins over
-        // the Service port (which only applies to ClusterIP access).
-        let ep_port = es.ports.first().and_then(|p| p.port).map(|p| p as u16);
-        for ep in &es.endpoints {
-            if ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
-                if let Some(addr) = ep.addresses.first() {
-                    return Some((addr.clone(), ep_port.or(svc_port).unwrap_or(443)));
-                }
-            }
-        }
-    }
-
-    // Strategy 2: legacy Endpoints object.
-    let ep_key = rusternetes_storage::build_key("endpoints", Some(svc_ns), svc_name);
-    if let Ok(ep) = storage
-        .get::<rusternetes_common::resources::Endpoints>(&ep_key)
-        .await
-    {
-        if let Some(addr) = ep
-            .subsets
-            .iter()
-            .flat_map(|s| s.addresses.iter().flatten())
-            .next()
-        {
-            let ep_port = ep
-                .subsets
-                .iter()
-                .flat_map(|s| s.ports.iter().flatten())
-                .next()
-                .map(|p| p.port);
-            return Some((addr.ip.clone(), ep_port.or(svc_port).unwrap_or(443)));
-        }
-    }
-
-    // Strategy 3: last resort — ClusterIP (only works if the api-server's netns
-    // happens to have kube-proxy rules, which it usually does not).
-    let svc_key = rusternetes_storage::build_key("services", Some(svc_ns), svc_name);
-    if let Ok(svc) = storage
-        .get::<rusternetes_common::resources::Service>(&svc_key)
-        .await
-    {
-        if let Some(ip) = svc
-            .spec
-            .cluster_ip
-            .clone()
-            .filter(|ip| !ip.is_empty() && ip != "None")
-        {
-            let port = svc_port
-                .or_else(|| svc.spec.ports.first().map(|p| p.port))
-                .unwrap_or(443);
-            return Some((ip, port));
-        }
-    }
-
-    None
-}
-
 #[allow(
     clippy::result_large_err,
     reason = "the Err is the axum error Response the handler returns as-is"
@@ -236,33 +149,32 @@ pub(crate) async fn resolve_backend_target<S: Storage + Send + Sync>(
     insecure_skip_tls_verify: bool,
     ca_bundle: Option<Vec<u8>>,
 ) -> Result<Option<AggregatorTarget>, Response> {
-    // Resolve a reachable backend address. The api-server runs in its own
-    // network namespace WITHOUT kube-proxy iptables, so it cannot reach the
-    // backend's ClusterIP — it must talk to a backing pod IP directly (same as
-    // the node/service proxy handlers). Prefer EndpointSlices, then the legacy
-    // Endpoints object, and only fall back to ClusterIP as a last resort.
-    let resolved = resolve_aggregator_backend_address(storage, svc_ns, svc_name, svc_port).await;
-
-    match resolved {
-        Some((host, port)) => Ok(Some(AggregatorTarget {
+    // `rloc, err := r.serviceResolver.ResolveEndpoint(ns, name, port)`; an
+    // error is logged and answered with the fixed "service unavailable" 503
+    // (handler_proxy.go:141-146).
+    let resolver = crate::service_resolver::service_resolver();
+    // `SetDefaults_ServiceReference`: an unset port is 443.
+    let port = i32::from(svc_port.unwrap_or(443));
+    match resolver
+        .resolve_endpoint(storage, svc_ns, svc_name, port)
+        .await
+    {
+        Ok((host, port)) => Ok(Some(AggregatorTarget {
             host,
             port,
             insecure_skip_tls_verify,
             ca_bundle,
             scheme: "https",
             // The serving cert is issued for the service DNS name; verify TLS
-            // against it while connecting to the resolved pod IP.
+            // against it while connecting to the resolved address.
             server_name: Some(format!("{}.{}.svc", svc_name, svc_ns)),
         })),
-        None => {
+        Err(e) => {
             warn!(
-                "API aggregation: service {}/{} not available for {}/{}",
-                svc_ns, svc_name, group, version
+                "error resolving {}/{} for {}/{}: {}",
+                svc_ns, svc_name, group, version, e
             );
-            Err(service_unavailable_response(&format!(
-                "no endpoints available for service \"{}/{}\"",
-                svc_ns, svc_name
-            )))
+            Err(service_unavailable_response("service unavailable"))
         }
     }
 }

@@ -53,6 +53,7 @@ services:
       - "--data-dir"
       - "/data/db/rusternetes.db"
       - "--tls"
+      - "--enable-aggregator-routing=true"
       - "--tls-cert-file"
       - "/etc/kubernetes/pki/api-server.crt"
       - "--tls-key-file"

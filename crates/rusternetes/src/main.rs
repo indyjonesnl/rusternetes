@@ -228,6 +228,18 @@ struct Args {
     #[arg(long, default_value = rusternetes_api_server::registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE)]
     service_cluster_ip_range: String,
 
+    /// `--enable-aggregator-routing`: turns on aggregator routing requests to
+    /// endpoints IP rather than cluster IP. Handed to the embedded api-server.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    enable_aggregator_routing: bool,
+
     /// ClusterIP CIDR kube-proxy scopes its POSTROUTING MASQUERADE rule to.
     /// Defaults to the IPv4 range of `--service-cluster-ip-range` (kube-proxy
     /// here is IPv4-only), so a non-default service range needs no second
@@ -483,6 +495,7 @@ async fn async_main() -> Result<()> {
         console_dir: args.console_dir.map(std::path::PathBuf::from),
         client_ca_file: args.client_ca_file.clone(),
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
+        enable_aggregator_routing: args.enable_aggregator_routing,
         event_ttl: args.event_ttl,
         service_account: args.service_account.to_options(),
         authorization_mode: args.authorization.authorization_mode.clone(),

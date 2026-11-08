@@ -71,6 +71,7 @@ services:
       - "--redis-url"
       - "redis://redis:6379"
       - "--tls"
+      - "--enable-aggregator-routing=true"
       - "--tls-cert-file"
       - "/etc/kubernetes/pki/api-server.crt"
       - "--tls-key-file"

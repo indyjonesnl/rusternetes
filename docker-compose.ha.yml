@@ -135,6 +135,7 @@ services:
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
+      - "--enable-aggregator-routing=true"
       - "--etcd-servers"
       - "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"
       - "--tls"
@@ -167,6 +168,7 @@ services:
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
+      - "--enable-aggregator-routing=true"
       - "--etcd-servers"
       - "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"
       - "--tls"
@@ -199,6 +201,7 @@ services:
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
+      - "--enable-aggregator-routing=true"
       - "--etcd-servers"
       - "http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379"
       - "--tls"

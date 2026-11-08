@@ -66,6 +66,7 @@ pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
 pub mod request_header_authentication;
+pub mod service_resolver;
 pub mod shared_informer_factory;
 pub mod storage_readiness_hook;
 pub mod upgrade_aware;
@@ -227,6 +228,9 @@ pub struct ApiServerConfig {
     pub authorization_legacy_flags_set: bool,
     /// `--egress-selector-config-file` (#3416); empty means dial directly.
     pub egress_selector_config_file: String,
+    /// `--enable-aggregator-routing` (`ServerRunOptions.EnableAggregatorRouting`):
+    /// route aggregated requests to endpoint IPs rather than the ClusterIP.
+    pub enable_aggregator_routing: bool,
     pub prometheus_url: Option<String>,
     /// Path to the console SPA build directory. When set, the API server
     /// serves the console UI at `/console/` and falls back to `index.html`
@@ -401,6 +405,7 @@ impl Default for ApiServerConfig {
             authorization_config: String::new(),
             authorization_legacy_flags_set: false,
             egress_selector_config_file: String::new(),
+            enable_aggregator_routing: false,
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
@@ -470,6 +475,17 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
         egress_selector::apply_to(&config.egress_selector_config_file)
             .map_err(|e| anyhow::anyhow!(e))?,
     );
+
+    // `buildServiceResolver(opts.EnableAggregatorRouting, LoopbackClientConfig.Host, ..)`
+    // (cmd/kube-apiserver/app/server.go:283).
+    service_resolver::set_service_resolver(service_resolver::ServiceResolver::new(
+        config.enable_aggregator_routing,
+        config
+            .bind_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| ("127.0.0.1".to_string(), a.port())),
+    ));
 
     if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");

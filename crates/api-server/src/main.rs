@@ -108,6 +108,18 @@ struct Args {
     #[command(flatten)]
     egress_selector: rusternetes_api_server::egress_selector::EgressSelectorArgs,
 
+    /// `--enable-aggregator-routing`: turns on aggregator routing requests to
+    /// endpoints IP rather than cluster IP (options.go `EnableAggregatorRouting`).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    enable_aggregator_routing: bool,
+
     /// Upstream kube-apiserver flags accepted for kubeadm/Talos argv
     /// compatibility (`--secure-port`, ignored-with-WARN flags, #3908).
     #[command(flatten)]
@@ -790,6 +802,7 @@ async fn main() -> Result<()> {
         authorization_config: args.authorization.authorization_config.clone(),
         authorization_legacy_flags_set: args.authorization.legacy_flags_set,
         egress_selector_config_file: args.egress_selector.config_file.clone(),
+        enable_aggregator_routing: args.enable_aggregator_routing,
         ..Default::default()
     };
     let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;

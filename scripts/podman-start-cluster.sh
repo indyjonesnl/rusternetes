@@ -69,6 +69,7 @@ podman run -d \
   -e DOCKER_HOST=unix:///var/run/docker.sock \
   localhost/rusternetes_api-server \
   --bind-address 0.0.0.0:6443 \
+  --enable-aggregator-routing=true \
   --etcd-servers http://etcd:2379 \
   --tls \
   --tls-cert-file /etc/kubernetes/pki/api-server.crt \
