@@ -126,15 +126,17 @@ impl ConversionWebhookClient {
             )
         })?;
 
-        // Build webhook URL, then resolve the in-cluster Service DNS name to a
-        // reachable endpoint IP. The api-server container cannot resolve `*.svc`
-        // names or route to ClusterIPs, so look up the backing endpoint exactly
-        // like the admission webhook client does.
-        let url = self.build_webhook_url(&webhook.client_config)?;
-        let url = rusternetes_admission_webhook::AdmissionWebhookClient::resolve_service_url(
-            &url, storage,
+        // `webhookConverter`'s client (apiextensions-apiserver
+        // pkg/apiserver/conversion/webhook_converter.go) is
+        // `ClientManager.HookClient`: a service is dialed at the address
+        // `ServiceResolver.ResolveEndpoint` returns, through the egress
+        // selector's `Cluster` lookup; a URL through `ControlPlane`.
+        let target = self.build_webhook_target(&webhook.client_config)?;
+        let target = rusternetes_admission_webhook::AdmissionWebhookClient::resolve_webhook_target(
+            target, storage,
         )
         .await;
+        let url = target.url.clone();
 
         info!(
             "Calling conversion webhook at {} for CRD {} to version {}",
@@ -158,29 +160,13 @@ impl ConversionWebhookClient {
             response: None,
         };
 
-        // Build a TLS client that trusts the webhook's caBundle. A conversion
-        // webhook in K8s e2e serves with a self-signed cert; without trusting
-        // the provided CA the TLS handshake fails. Mirrors the admission webhook
-        // client in crates/admission-webhook.
-        let client = {
-            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
-            if let Some(ca_b64) = webhook.client_config.ca_bundle.as_ref() {
-                use base64::Engine;
-                let ca_data = base64::engine::general_purpose::STANDARD
-                    .decode(ca_b64)
-                    .unwrap_or_else(|_| ca_b64.as_bytes().to_vec());
-                if let Ok(cert) = reqwest::Certificate::from_pem(&ca_data) {
-                    builder = builder.add_root_certificate(cert);
-                }
-                builder = builder.danger_accept_invalid_certs(true);
-            }
-            builder.build().map_err(|e| {
-                rusternetes_common::Error::Network(format!(
-                    "Failed to build conversion webhook client: {}",
-                    e
-                ))
-            })?
-        };
+        // `caBundle` is `[]byte`, base64 on the wire.
+        let ca_data = webhook.client_config.ca_bundle.as_ref().map(|ca_b64| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(ca_b64)
+                .unwrap_or_else(|_| ca_b64.as_bytes().to_vec())
+        });
 
         // Call webhook
         debug!("Sending conversion request: {:?}", review);
@@ -188,14 +174,30 @@ impl ConversionWebhookClient {
         // A failed conversion webhook is a hard error (surfaced as 500) — it must
         // NOT silently pass through the stored objects unconverted, which would
         // serve the wrong apiVersion than the client requested.
-        let response = client.post(&url).json(&review).send().await.map_err(|e| {
-            rusternetes_common::Error::Network(format!("Conversion webhook {url} unreachable: {e}"))
+        let body = serde_json::to_vec(&review).map_err(|e| {
+            rusternetes_common::Error::Internal(format!("failed to encode conversion request: {e}"))
         })?;
+        let response = rusternetes_admission_webhook::transport::transport()
+            .post_json(
+                rusternetes_admission_webhook::transport::WebhookHttpRequest {
+                    target: &target,
+                    body,
+                    timeout: Duration::from_secs(30),
+                    ca_bundle: ca_data.as_deref(),
+                },
+            )
+            .await
+            .map_err(|e| {
+                rusternetes_common::Error::Network(format!(
+                    "Conversion webhook {url} unreachable: {}",
+                    e.message
+                ))
+            })?;
 
-        if !response.status().is_success() {
+        if !(200..300).contains(&response.status) {
             return Err(rusternetes_common::Error::Network(format!(
                 "Conversion webhook {url} returned status {}",
-                response.status()
+                response.status
             )));
         }
 
@@ -203,9 +205,7 @@ impl ConversionWebhookClient {
         // CRD conversion webhook) may reply with YAML rather than JSON, and the
         // upstream apiserver tolerates both. serde_yaml accepts JSON too (JSON
         // is a YAML subset), so it covers both content types.
-        let body = response.text().await.map_err(|e| {
-            rusternetes_common::Error::Network(format!("Failed to read webhook response body: {e}"))
-        })?;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
         let review_response: ConversionReview = serde_yaml::from_str(&body).map_err(|e| {
             rusternetes_common::Error::Network(format!("Failed to parse webhook response: {e}"))
         })?;
@@ -252,28 +252,13 @@ impl ConversionWebhookClient {
         Ok(converted_objects)
     }
 
-    /// Build webhook URL from client config
-    pub fn build_webhook_url(&self, config: &WebhookClientConfig) -> Result<String> {
-        if let Some(ref url) = config.url {
-            return Ok(url.clone());
-        }
-
-        if let Some(ref service) = config.service {
-            // Build service URL
-            let namespace = &service.namespace;
-            let name = &service.name;
-            let path = service.path.as_deref().unwrap_or("/convert");
-            let port = service.port.unwrap_or(443);
-
-            // In-cluster service URL
-            let url = format!("https://{}.{}.svc:{}{}", name, namespace, port, path);
-
-            return Ok(url);
-        }
-
-        Err(rusternetes_common::Error::InvalidResource(
-            "Webhook client config must specify either url or service".to_string(),
-        ))
+    /// `hookClientConfig` (util/webhook/client.go): see
+    /// [`rusternetes_admission_webhook::AdmissionWebhookClient::build_webhook_target`].
+    pub fn build_webhook_target(
+        &self,
+        config: &WebhookClientConfig,
+    ) -> Result<rusternetes_admission_webhook::transport::WebhookTarget> {
+        rusternetes_admission_webhook::AdmissionWebhookClient::new().build_webhook_target(config)
     }
 }
 

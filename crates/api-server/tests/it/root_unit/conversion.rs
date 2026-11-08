@@ -129,7 +129,7 @@ mod tests {
             ca_bundle: None,
         };
 
-        let url = client.build_webhook_url(&config);
+        let url = client.build_webhook_target(&config).map(|t| t.url);
         assert!(url.is_ok());
         assert_eq!(url.unwrap(), "https://converter.default.svc:443/convert");
     }
@@ -143,7 +143,7 @@ mod tests {
             ca_bundle: None,
         };
 
-        let url = client.build_webhook_url(&config);
+        let url = client.build_webhook_target(&config).map(|t| t.url);
         assert!(url.is_ok());
         assert_eq!(url.unwrap(), "https://example.com/convert");
     }

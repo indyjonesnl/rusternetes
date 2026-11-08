@@ -6,6 +6,8 @@
 pub mod admission_metrics;
 pub use rusternetes_common::cancellation;
 pub mod cel_evaluators;
+pub mod service_resolver;
+pub mod transport;
 pub mod webhook_match;
 
 #[cfg(test)]
@@ -31,10 +33,10 @@ use rusternetes_common::{
 };
 use rusternetes_storage::Storage;
 use serde_json::Value;
-use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use transport::{Dial, ServiceRef, WebhookTarget};
 
 /// `webhookReinvokeContext`, this plugin's value in the request's shared
 /// `ReinvocationContext` (webhook/mutating/reinvocationcontext.go:28-79).
@@ -296,7 +298,7 @@ impl AdmissionWebhookClient {
         webhook: &ValidatingWebhook,
         request: &AdmissionReviewRequest,
     ) -> Result<AdmissionReviewResponse> {
-        let url = self.build_webhook_url(&webhook.client_config)?;
+        let url = self.build_webhook_target(&webhook.client_config)?;
         let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
 
         info!("Calling validating webhook {} at {}", webhook.name, url);
@@ -339,7 +341,7 @@ impl AdmissionWebhookClient {
         webhook: &MutatingWebhook,
         request: &AdmissionReviewRequest,
     ) -> Result<AdmissionReviewResponse> {
-        let url = self.build_webhook_url(&webhook.client_config)?;
+        let url = self.build_webhook_target(&webhook.client_config)?;
         let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
 
         info!("Calling mutating webhook {} at {}", webhook.name, url);
@@ -379,11 +381,12 @@ impl AdmissionWebhookClient {
     /// Internal method to call a webhook
     async fn call_webhook(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
     ) -> Result<AdmissionReviewResponse> {
-        self.call_webhook_with_ca(url, review, timeout, None).await
+        self.call_webhook_with_ca(target, review, timeout, None)
+            .await
     }
 
     /// Call a webhook with optional CA bundle for TLS verification.
@@ -395,12 +398,12 @@ impl AdmissionWebhookClient {
     /// request is aborted at the deadline regardless of which phase is blocking.
     async fn call_webhook_with_ca(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
     ) -> Result<AdmissionReviewResponse> {
-        self.call_webhook_coded(url, review, timeout, ca_bundle)
+        self.call_webhook_coded(target, review, timeout, ca_bundle)
             .await
             .map_err(|f| f.error)
     }
@@ -409,12 +412,12 @@ impl AdmissionWebhookClient {
     /// `ErrCallingWebhook.Status` carries (see [`CallFailure`]).
     async fn call_webhook_coded(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
     ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
-        self.call_webhook_cancellable(url, review, timeout, ca_bundle, None)
+        self.call_webhook_cancellable(target, review, timeout, ca_bundle, None)
             .await
     }
 
@@ -422,7 +425,7 @@ impl AdmissionWebhookClient {
     /// [`CallFailure`] when `cancellation` trips first.
     async fn call_webhook_cancellable(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
@@ -430,18 +433,18 @@ impl AdmissionWebhookClient {
     ) -> std::result::Result<AdmissionReviewResponse, CallFailure> {
         let Some(cancellation) = cancellation else {
             return self
-                .call_webhook_coded_uncancellable(url, review, timeout, ca_bundle)
+                .call_webhook_coded_uncancellable(target, review, timeout, ca_bundle)
                 .await;
         };
         tokio::select! {
-            result = self.call_webhook_coded_uncancellable(url, review, timeout, ca_bundle) => result,
+            result = self.call_webhook_coded_uncancellable(target, review, timeout, ca_bundle) => result,
             // `<-ctx.Done()`: a cancel or the request deadline. Only
             // `context.Canceled` is kept out of the metrics.
             reason = cancellation.done() => Err(CallFailure {
                 error: rusternetes_common::Error::Internal(format!(
                     "failed to call webhook: {} querying {}?timeout={}s",
                     reason,
-                    url,
+                    target.url,
                     timeout.as_secs()
                 )),
                 code: 503,
@@ -452,7 +455,7 @@ impl AdmissionWebhookClient {
 
     async fn call_webhook_coded_uncancellable(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
@@ -462,7 +465,7 @@ impl AdmissionWebhookClient {
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/generic/webhook.go
         match tokio::time::timeout(
             timeout,
-            self.call_webhook_inner(url, review, timeout, ca_bundle),
+            self.call_webhook_inner(target, review, timeout, ca_bundle),
         )
         .await
         {
@@ -483,7 +486,7 @@ impl AdmissionWebhookClient {
             // strength of that misreading.
             Err(_elapsed) => Err(rusternetes_common::Error::Internal(format!(
                 "failed to call webhook: context deadline exceeded querying {}?timeout={}s",
-                url,
+                target.url,
                 timeout.as_secs()
             ))
             .into()),
@@ -492,7 +495,7 @@ impl AdmissionWebhookClient {
 
     async fn call_webhook_inner(
         &self,
-        url: &str,
+        target: &WebhookTarget,
         review: &AdmissionReview,
         timeout: Duration,
         ca_bundle: Option<&[u8]>,
@@ -500,113 +503,91 @@ impl AdmissionWebhookClient {
         // K8s appends ?timeout={seconds}s to the webhook URL so the backend
         // knows how long it has. Tests check for this in error messages.
         // K8s ref: staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/request/admissionreview.go
-        let url_with_timeout = format!("{}?timeout={}s", url, timeout.as_secs());
+        let url_with_timeout = format!("{}?timeout={}s", target.url, timeout.as_secs());
         let url = &url_with_timeout;
-
-        let mut builder = reqwest::Client::builder()
-            .timeout(timeout)
-            .connect_timeout(Duration::from_secs(2));
-
-        if let Some(ca_data) = ca_bundle {
-            // CA bundle provided — add as root cert. Also accept invalid certs
-            // for cases where the CA bundle is self-signed (common in K8s).
-            if let Ok(cert) = reqwest::Certificate::from_pem(ca_data) {
-                builder = builder.add_root_certificate(cert);
-            }
-            // With a CA bundle, we trust the provided CA
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        // Without a CA bundle, use system CAs only (no danger_accept).
-        // K8s behavior: webhook calls without a CA bundle fail TLS verification
-        // against self-signed certs, which is the expected behavior for
-        // fail-closed webhook tests.
-
-        let client = builder.build().map_err(|e| {
-            rusternetes_common::Error::Network(format!("Failed to create HTTP client: {}", e))
+        let request_target = WebhookTarget {
+            url: url_with_timeout.clone(),
+            ..target.clone()
+        };
+        let body = serde_json::to_vec(review).map_err(|e| {
+            rusternetes_common::Error::Internal(format!("failed to encode webhook request: {e}"))
         })?;
 
-        let response = client.post(url).json(review).send().await.map_err(|e| {
-            // Build full error cause chain for diagnostics
-            let mut causes = Vec::new();
-            let mut source: Option<&dyn StdError> = StdError::source(&e);
-            while let Some(cause) = source {
-                causes.push(format!("{}", cause));
-                source = cause.source();
-            }
-            let detail = if e.is_connect() {
-                "connection refused/failed"
-            } else if e.is_timeout() {
-                "timeout"
-            } else if e.is_request() {
-                "request error"
-            } else {
-                "unknown"
-            };
-            let cause_chain = if causes.is_empty() {
-                String::new()
-            } else {
-                format!(" causes=[{}]", causes.join(" -> "))
-            };
-            error!(
-                "Webhook call to {} failed: {} ({}){}",
-                url, e, detail, cause_chain
-            );
-            // Include cause chain so errors like "deadline has elapsed" are visible to clients.
-            // Go's context timeout produces "context deadline exceeded", which is one of the
-            // two phrases upstream's timeout test accepts
-            // (`webhook.go:2488`). Reqwest produces "operation timed out" for
-            // read timeouts and "deadline has elapsed" for connect timeouts, so
-            // normalize to carry "context deadline exceeded".
-            let cause_str = causes.join(": ");
-            let normalized_causes = if e.is_timeout() || cause_str.contains("timed out") {
-                if cause_str.contains("deadline") {
-                    cause_str
+        let response = transport::transport()
+            .post_json(transport::WebhookHttpRequest {
+                target: &request_target,
+                body,
+                timeout,
+                ca_bundle,
+            })
+            .await
+            .map_err(|e| {
+                let cause_str = e.causes.join(": ");
+                let detail = if e.connect {
+                    "connection refused/failed"
+                } else if e.timeout {
+                    "timeout"
                 } else {
-                    format!("{}: context deadline exceeded", cause_str)
-                }
-            } else {
-                cause_str
-            };
-            // `url` here is url_with_timeout (carries `?timeout={n}s`). Naming it
-            // in the error is what upstream's timeout test matches on — the
-            // queried endpoint, e.g. `/always-allow-delay-5s?timeout=1s`
-            // (`webhook.go:2489`).
-            let full_error = if causes.is_empty() && !e.is_timeout() {
-                format!("failed to call webhook: {} querying {}", e, url)
-            } else if causes.is_empty() {
-                format!(
-                    "failed to call webhook: {}: context deadline exceeded querying {}",
-                    e, url
-                )
-            } else {
-                format!(
-                    "failed to call webhook: {} ({}) querying {}",
-                    e, normalized_causes, url
-                )
-            };
-            rusternetes_common::Error::Internal(full_error)
-        })?;
+                    "unknown"
+                };
+                let cause_chain = if e.causes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" causes=[{}]", e.causes.join(" -> "))
+                };
+                error!(
+                    "Webhook call to {} failed: {} ({}){}",
+                    url, e.message, detail, cause_chain
+                );
+                // Go's context timeout produces "context deadline exceeded", which is one of the
+                // two phrases upstream's timeout test accepts
+                // (`webhook.go:2488`). Reqwest produces "operation timed out" for
+                // read timeouts and "deadline has elapsed" for connect timeouts, so
+                // normalize to carry "context deadline exceeded".
+                let normalized_causes = if e.timeout || cause_str.contains("timed out") {
+                    if cause_str.contains("deadline") {
+                        cause_str
+                    } else {
+                        format!("{}: context deadline exceeded", cause_str)
+                    }
+                } else {
+                    cause_str
+                };
+                // `url` here is url_with_timeout (carries `?timeout={n}s`). Naming it
+                // in the error is what upstream's timeout test matches on — the
+                // queried endpoint, e.g. `/always-allow-delay-5s?timeout=1s`
+                // (`webhook.go:2489`).
+                let full_error = if e.causes.is_empty() && !e.timeout {
+                    format!("failed to call webhook: {} querying {}", e.message, url)
+                } else if e.causes.is_empty() {
+                    format!(
+                        "failed to call webhook: {}: context deadline exceeded querying {}",
+                        e.message, url
+                    )
+                } else {
+                    format!(
+                        "failed to call webhook: {} ({}) querying {}",
+                        e.message, normalized_causes, url
+                    )
+                };
+                rusternetes_common::Error::Internal(full_error)
+            })?;
 
-        if !response.status().is_success() {
+        if !(200..300).contains(&response.status) {
             // client-go turns a non-2xx response into a `StatusError` with the
             // HTTP code, which `ErrCallingWebhook.Status` keeps
             // (validating/dispatcher.go:281-285).
             return Err(CallFailure {
-                code: i32::from(response.status().as_u16()),
+                code: i32::from(response.status),
                 error: rusternetes_common::Error::Network(format!(
                     "Webhook returned status: {}",
-                    response.status()
+                    response.status
                 )),
                 canceled: false,
             });
         }
 
-        let body_bytes = response.bytes().await.map_err(|e| {
-            rusternetes_common::Error::Network(format!(
-                "Failed to read webhook response body: {}",
-                e
-            ))
-        })?;
+        let body_bytes = response.body;
 
         // Log raw response for diagnostics
         tracing::info!(
@@ -679,23 +660,35 @@ impl AdmissionWebhookClient {
         })
     }
 
-    /// Build webhook URL from client config
-    fn build_webhook_url(&self, config: &WebhookClientConfig) -> Result<String> {
-        if let Some(ref url) = config.url {
-            return Ok(url.clone());
+    /// `hookClientConfig` (staging/src/k8s.io/apiserver/pkg/util/webhook/client.go):
+    /// a `service` is checked first and reached at
+    /// `https://<name>.<namespace>.svc:<port><path>` (port 443 when unset or 0);
+    /// otherwise the `url` is used as given.
+    pub fn build_webhook_target(&self, config: &WebhookClientConfig) -> Result<WebhookTarget> {
+        if let Some(ref service) = config.service {
+            let port = match service.port {
+                None | Some(0) => 443,
+                Some(p) => p,
+            };
+            let service = ServiceRef {
+                namespace: service.namespace.clone(),
+                name: service.name.clone(),
+                port,
+            };
+            let path = config
+                .service
+                .as_ref()
+                .and_then(|s| s.path.as_deref())
+                .unwrap_or("/");
+            return Ok(WebhookTarget {
+                url: format!("https://{}{}", service.host_port(), path),
+                service: Some(service),
+                dial: Dial::Default,
+            });
         }
 
-        if let Some(ref service) = config.service {
-            // Build service URL — use DNS-style name that will be resolved to endpoint IP
-            let namespace = &service.namespace;
-            let name = &service.name;
-            let path = service.path.as_deref().unwrap_or("/");
-            let port = service.port.unwrap_or(443);
-
-            // Store service ref for later resolution to endpoint IP
-            let url = format!("https://{}.{}.svc:{}{}", name, namespace, port, path);
-
-            return Ok(url);
+        if let Some(ref url) = config.url {
+            return Ok(WebhookTarget::from_url(url.clone()));
         }
 
         Err(rusternetes_common::Error::InvalidResource(
@@ -703,213 +696,28 @@ impl AdmissionWebhookClient {
         ))
     }
 
-    /// Resolve a K8s service URL to an endpoint IP.
-    /// The API server can't resolve .svc DNS names — look up the service's
-    /// endpoint IPs from storage instead.
-    pub async fn resolve_service_url<S2: Storage>(url: &str, storage: &Arc<S2>) -> String {
-        // Parse service name and namespace from URL like https://name.ns.svc:port/path
-        let url_without_scheme = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .unwrap_or(url);
-        let host_and_rest: Vec<&str> = url_without_scheme.splitn(2, '/').collect();
-        let host_port: Vec<&str> = host_and_rest[0].splitn(2, ':').collect();
-        let host = host_port[0];
-        let port = host_port.get(1).unwrap_or(&"443");
-        let path = if host_and_rest.len() > 1 {
-            format!("/{}", host_and_rest[1])
-        } else {
-            "/".to_string()
-        };
-
-        // Check if host ends with .svc (K8s service)
-        if !host.ends_with(".svc") {
-            return url.to_string();
+    /// The `rest.Config.Dial` of a service webhook (client.go:196-212): the
+    /// service address is swapped for what `ServiceResolver.ResolveEndpoint`
+    /// returns, and its error is the dial error.
+    pub async fn resolve_webhook_target<S2: Storage>(
+        mut target: WebhookTarget,
+        storage: &Arc<S2>,
+    ) -> WebhookTarget {
+        if let Some(svc) = &target.service {
+            target.dial = match service_resolver::service_resolver()
+                .resolve_endpoint(storage, &svc.namespace, &svc.name, svc.port)
+                .await
+            {
+                Ok((host, port)) => Dial::Resolved(if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                }),
+                Err(e) => Dial::Failed(e),
+            };
         }
-
-        // Parse name.namespace.svc
-        let parts: Vec<&str> = host
-            .strip_suffix(".svc")
-            .unwrap_or(host)
-            .splitn(2, '.')
-            .collect();
-        if parts.len() != 2 {
-            return url.to_string();
-        }
-        let svc_name = parts[0];
-        let svc_namespace = parts[1];
-
-        // K8s resolves webhook services via DNS → ClusterIP → kube-proxy.
-        // See: staging/src/k8s.io/apiserver/pkg/util/webhook/serviceresolver.go
-        // The real apiserver connects to the ClusterIP and kube-proxy iptables
-        // DNATs to a ready pod endpoint.
-        //
-        // Rusternetes' api-server runs on the cluster bridge network, but
-        // kube-proxy runs in the HOST network namespace — so its iptables DNAT
-        // rules for ClusterIPs are NOT present in the api-server's netns. A call
-        // to a webhook's ClusterIP from inside the api-server container therefore
-        // gets connection-refused / times out, which is exactly why core-resource
-        // admission webhooks (e.g. the conformance sample-webhook) never fired.
-        //
-        // The api-server CAN reach pod IPs directly on the bridge network, so we
-        // resolve the service to a READY pod endpoint first (this is the same
-        // destination kube-proxy would DNAT to). ClusterIP is only used as a
-        // last-resort fallback. This makes webhook invocation work for core
-        // resources without depending on iptables in the api-server netns.
-        let svc_key = format!("/registry/services/{}/{}", svc_namespace, svc_name);
-        let service = storage
-            .get::<rusternetes_common::resources::Service>(&svc_key)
-            .await
-            .ok();
-
-        // Map the webhook clientConfig port (a service *port*) to the matching
-        // backend targetPort so the endpoint connection hits the right container
-        // port. K8s does this translation in the service/endpoint controllers.
-        let want_port: u16 = port.parse::<u16>().unwrap_or(443);
-        let target_port: Option<u16> = service.as_ref().and_then(|svc| {
-            svc.spec
-                .ports
-                .iter()
-                .find(|p| p.port == want_port)
-                .or_else(|| svc.spec.ports.first())
-                .and_then(|p| p.target_port.as_ref())
-                .and_then(|tp| match tp {
-                    rusternetes_common::resources::IntOrString::Int(p) => Some(*p as u16),
-                    rusternetes_common::resources::IntOrString::String(s) => s.parse::<u16>().ok(),
-                })
-        });
-
-        // Preferred path: resolve to a ready pod endpoint IP (reachable on the
-        // bridge network from the api-server). Works for both ClusterIP and
-        // headless services.
-        let es_prefix = format!("/registry/endpointslices/{}/", svc_namespace);
-        match storage.list::<serde_json::Value>(&es_prefix).await {
-            Ok(raw) => {
-                // Decode per item: one undecodable slice must not hide the good
-                // ones (a typed list fails as a whole) — #2374.
-                let mut slices = Vec::with_capacity(raw.len());
-                for v in raw {
-                    match serde_json::from_value::<rusternetes_common::resources::EndpointSlice>(
-                        v.clone(),
-                    ) {
-                        Ok(s) => slices.push(s),
-                        Err(e) => warn!(
-                            "Webhook service {}/{}: skipping undecodable EndpointSlice {}: {}",
-                            svc_namespace,
-                            svc_name,
-                            v.pointer("/metadata/name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("?"),
-                            e
-                        ),
-                    }
-                }
-                match select_slice_endpoint(&slices, svc_name, target_port, want_port) {
-                    Ok((addr, ep_port)) => {
-                        return format!("https://{}:{}{}", addr, ep_port, path);
-                    }
-                    Err(reasons) => warn!(
-                        "Webhook service {}/{}: no usable EndpointSlice endpoint ({} slices listed): {}",
-                        svc_namespace,
-                        svc_name,
-                        slices.len(),
-                        if reasons.is_empty() {
-                            "no slices in namespace".to_string()
-                        } else {
-                            reasons.join("; ")
-                        }
-                    ),
-                }
-            }
-            Err(e) => warn!(
-                "Webhook service {}/{}: listing EndpointSlices failed: {}",
-                svc_namespace, svc_name, e
-            ),
-        }
-
-        // Fallback: route through ClusterIP like the real apiserver. This only
-        // works if the api-server netns has kube-proxy DNAT rules (e.g. host
-        // network mode); otherwise the call will fail and failurePolicy decides.
-        if let Some(svc) = &service {
-            if let Some(cluster_ip) = &svc.spec.cluster_ip {
-                if !cluster_ip.is_empty() && cluster_ip != "None" {
-                    let service_port = svc
-                        .spec
-                        .ports
-                        .iter()
-                        .find(|p| p.port == want_port)
-                        .map(|p| p.port)
-                        .or_else(|| svc.spec.ports.first().map(|p| p.port))
-                        .unwrap_or(want_port);
-                    return format!("https://{}:{}{}", cluster_ip, service_port, path);
-                }
-            }
-        }
-
-        // Service not found or no ready endpoints. Return original URL — the
-        // HTTP client will fail with a DNS/connection error. FailurePolicy
-        // determines whether this blocks the request or is ignored.
-        warn!(
-            "Webhook service {}/{} not found or has no ready endpoints, falling back to original URL",
-            svc_namespace, svc_name
-        );
-        url.to_string()
+        target
     }
-}
-
-/// Pick a ready endpoint address and port for `svc_name` from `slices`.
-///
-/// `ready` follows discovery.k8s.io semantics: a nil value is ready
-/// (staging/src/k8s.io/api/discovery/v1/types.go, EndpointConditions.Ready).
-/// On failure returns one human-readable reason per rejected slice so the
-/// caller can log why the ClusterIP fallback was taken (#2374).
-fn select_slice_endpoint(
-    slices: &[rusternetes_common::resources::EndpointSlice],
-    svc_name: &str,
-    target_port: Option<u16>,
-    want_port: u16,
-) -> std::result::Result<(String, u16), Vec<String>> {
-    let mut reasons = Vec::new();
-    for slice in slices {
-        let sname = &slice.metadata.name;
-        let matches = slice
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get("kubernetes.io/service-name"))
-            .map(|n| n == svc_name)
-            .unwrap_or(false);
-        if !matches {
-            reasons.push(format!("slice {sname} not labelled for service {svc_name}"));
-            continue;
-        }
-        // Prefer the EndpointSlice port (already resolved to the container
-        // port), then the service targetPort, then the requested service port.
-        let ep_port = slice
-            .ports
-            .first()
-            .and_then(|p| p.port)
-            .map(|p| p as u16)
-            .or(target_port)
-            .unwrap_or(want_port);
-        if slice.endpoints.is_empty() {
-            reasons.push(format!("slice {sname} has no endpoints"));
-        }
-        for ep in &slice.endpoints {
-            if !ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true) {
-                reasons.push(format!(
-                    "slice {sname} endpoint {:?} not ready",
-                    ep.addresses
-                ));
-                continue;
-            }
-            match ep.addresses.first() {
-                Some(addr) => return Ok((addr.clone(), ep_port)),
-                None => reasons.push(format!("slice {sname} ready endpoint has no addresses")),
-            }
-        }
-    }
-    Err(reasons)
 }
 
 impl Default for AdmissionWebhookClient {
@@ -1033,7 +841,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
         // This is the "ShouldCallHook" phase in K8s.
         struct WebhookInvocation {
             webhook_name: String,
-            resolved_url: String,
+            resolved_url: WebhookTarget,
             timeout: Duration,
             ca_bundle: Option<String>,
             failure_policy: FailurePolicy,
@@ -1265,7 +1073,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     // `NewInternalError` (500), so failurePolicy applies
                     // (validating/dispatcher.go:263-266,
                     // mutating/dispatcher.go:262-265).
-                    let raw_url = match self.client.build_webhook_url(&webhook.client_config) {
+                    let raw_url = match self.client.build_webhook_target(&webhook.client_config) {
                         Ok(u) => u,
                         Err(e) => {
                             let ignore =
@@ -1296,7 +1104,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     };
                     let resolved_url =
-                        AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
+                        AdmissionWebhookClient::resolve_webhook_target(raw_url, &self.storage)
+                            .await;
                     let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
                     let failure_policy = webhook
                         .failure_policy
@@ -1924,7 +1733,7 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                     // `NewInternalError` (500), so failurePolicy applies
                     // (validating/dispatcher.go:263-266,
                     // mutating/dispatcher.go:262-265).
-                    let raw_url = match self.client.build_webhook_url(&webhook.client_config) {
+                    let raw_url = match self.client.build_webhook_target(&webhook.client_config) {
                         Ok(u) => u,
                         Err(e) => {
                             let ignore =
@@ -1955,7 +1764,8 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                         }
                     };
                     let resolved_url =
-                        AdmissionWebhookClient::resolve_service_url(&raw_url, &self.storage).await;
+                        AdmissionWebhookClient::resolve_webhook_target(raw_url, &self.storage)
+                            .await;
                     let timeout = resolve_webhook_timeout(webhook.timeout_seconds);
                     let review = AdmissionReview::new_request(request.clone());
                     // K8s caBundle is []byte → JSON base64. Decode to get PEM.
@@ -3664,7 +3474,7 @@ mod tests {
             ca_bundle: None,
         };
 
-        let url = client.build_webhook_url(&config).unwrap();
+        let url = client.build_webhook_target(&config).unwrap().url;
         assert_eq!(url, "https://example.com/webhook");
     }
 
@@ -3682,7 +3492,7 @@ mod tests {
             ca_bundle: None,
         };
 
-        let url = client.build_webhook_url(&config).unwrap();
+        let url = client.build_webhook_target(&config).unwrap().url;
         assert_eq!(
             url,
             "https://webhook-service.webhook-system.svc:8443/validate"
@@ -3703,7 +3513,7 @@ mod tests {
             ca_bundle: None,
         };
 
-        let url = client.build_webhook_url(&config).unwrap();
+        let url = client.build_webhook_target(&config).unwrap().url;
         assert_eq!(url, "https://my-webhook.default.svc:443/");
     }
 
@@ -3716,257 +3526,12 @@ mod tests {
             ca_bundle: None,
         };
 
-        let result = client.build_webhook_url(&config);
+        let result = client.build_webhook_target(&config);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("must specify either url or service"));
-    }
-
-    // ===== resolve_service_url Tests =====
-    //
-    // These guard the core fix for admission-webhook invocation on CORE
-    // resources: the api-server runs on the cluster bridge network but
-    // kube-proxy runs in the host netns, so the api-server cannot reach a
-    // webhook service's ClusterIP. resolve_service_url must prefer a READY pod
-    // endpoint IP (reachable on the bridge) over the ClusterIP.
-
-    use rusternetes_common::resources::endpointslice::{
-        Endpoint, EndpointConditions, EndpointPort, EndpointSlice,
-    };
-    use rusternetes_common::resources::{IntOrString, Service, ServicePort, ServiceSpec};
-
-    fn webhook_service(name: &str, ns: &str, cluster_ip: &str) -> Service {
-        let mut svc = Service::new(
-            name,
-            ServiceSpec {
-                cluster_ip: Some(cluster_ip.to_string()),
-                ports: vec![ServicePort {
-                    name: None,
-                    port: 443,
-                    target_port: Some(IntOrString::Int(8443)),
-                    protocol: "TCP".to_string(),
-                    node_port: None,
-                    app_protocol: None,
-                }],
-                ..Default::default()
-            },
-        );
-        svc.metadata.namespace = Some(ns.to_string());
-        svc
-    }
-
-    fn webhook_endpointslice(svc_name: &str, ns: &str, ip: &str, ready: bool) -> EndpointSlice {
-        let mut slice = EndpointSlice::new(format!("{svc_name}-abc"), "IPv4");
-        slice.metadata.namespace = Some(ns.to_string());
-        slice.metadata.labels = Some(
-            [(
-                "kubernetes.io/service-name".to_string(),
-                svc_name.to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        slice.ports = vec![EndpointPort {
-            name: None,
-            port: Some(8443),
-            protocol: "TCP".to_string(),
-            app_protocol: None,
-        }];
-        slice.endpoints = vec![Endpoint {
-            addresses: vec![ip.to_string()],
-            conditions: Some(EndpointConditions {
-                ready: Some(ready),
-                serving: Some(ready),
-                terminating: Some(false),
-            }),
-            hostname: None,
-            target_ref: None,
-            node_name: None,
-            zone: None,
-            hints: None,
-            deprecated_topology: None,
-        }];
-        slice
-    }
-
-    #[tokio::test]
-    async fn test_resolve_service_url_prefers_ready_endpoint_over_cluster_ip() {
-        // The api-server can't reach a ClusterIP (no kube-proxy in its netns),
-        // so resolution must point at the ready pod endpoint instead.
-        let storage = Arc::new(MemoryStorage::new());
-        storage
-            .create(
-                "/registry/services/kube-system/sample-webhook",
-                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
-            )
-            .await
-            .unwrap();
-        storage
-            .create(
-                "/registry/endpointslices/kube-system/sample-webhook-abc",
-                &webhook_endpointslice("sample-webhook", "kube-system", "172.18.0.9", true),
-            )
-            .await
-            .unwrap();
-
-        let resolved = AdmissionWebhookClient::resolve_service_url(
-            "https://sample-webhook.kube-system.svc:443/mutating",
-            &storage,
-        )
-        .await;
-
-        // Endpoint IP + container (target) port, NOT the ClusterIP.
-        assert_eq!(resolved, "https://172.18.0.9:8443/mutating");
-    }
-
-    #[tokio::test]
-    async fn test_resolve_service_url_skips_unready_endpoints() {
-        // An unready endpoint must not be used; with no ready endpoint we fall
-        // back to the ClusterIP (best effort).
-        let storage = Arc::new(MemoryStorage::new());
-        storage
-            .create(
-                "/registry/services/kube-system/sample-webhook",
-                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
-            )
-            .await
-            .unwrap();
-        storage
-            .create(
-                "/registry/endpointslices/kube-system/sample-webhook-abc",
-                &webhook_endpointslice("sample-webhook", "kube-system", "172.18.0.9", false),
-            )
-            .await
-            .unwrap();
-
-        let resolved = AdmissionWebhookClient::resolve_service_url(
-            "https://sample-webhook.kube-system.svc:443/mutating",
-            &storage,
-        )
-        .await;
-
-        assert_eq!(resolved, "https://10.96.1.5:443/mutating");
-    }
-
-    #[tokio::test]
-    async fn test_resolve_service_url_cluster_ip_fallback_when_no_slices() {
-        let storage = Arc::new(MemoryStorage::new());
-        storage
-            .create(
-                "/registry/services/kube-system/sample-webhook",
-                &webhook_service("sample-webhook", "kube-system", "10.96.1.5"),
-            )
-            .await
-            .unwrap();
-
-        let resolved = AdmissionWebhookClient::resolve_service_url(
-            "https://sample-webhook.kube-system.svc:443/mutating",
-            &storage,
-        )
-        .await;
-
-        assert_eq!(resolved, "https://10.96.1.5:443/mutating");
-    }
-
-    // #2374: one undecodable EndpointSlice in the namespace made the typed
-    // `list::<EndpointSlice>` fail as a whole, silently skipping every good slice
-    // and falling back to the unroutable ClusterIP.
-    #[tokio::test]
-    async fn test_resolve_service_url_survives_one_undecodable_slice() {
-        let storage = Arc::new(MemoryStorage::new());
-        storage
-            .create(
-                "/registry/services/cert-manager/webhook",
-                &webhook_service("webhook", "cert-manager", "10.107.189.222"),
-            )
-            .await
-            .unwrap();
-        // Sorts first; endpoints is the wrong JSON type so it cannot decode.
-        storage
-            .create(
-                "/registry/endpointslices/cert-manager/aaa-bad",
-                &json!({
-                    "metadata": {"name": "aaa-bad", "namespace": "cert-manager"},
-                    "addressType": "IPv4",
-                    "endpoints": "garbage"
-                }),
-            )
-            .await
-            .unwrap();
-        storage
-            .create(
-                "/registry/endpointslices/cert-manager/webhook-abc",
-                &webhook_endpointslice("webhook", "cert-manager", "10.244.0.2", true),
-            )
-            .await
-            .unwrap();
-
-        let resolved = AdmissionWebhookClient::resolve_service_url(
-            "https://webhook.cert-manager.svc:443/validate",
-            &storage,
-        )
-        .await;
-        assert_eq!(resolved, "https://10.244.0.2:8443/validate");
-    }
-
-    // discovery.k8s.io EndpointConditions: "A nil value should be interpreted
-    // as true" for ready (staging/src/k8s.io/api/discovery/v1/types.go).
-    #[test]
-    fn test_select_slice_endpoint_nil_ready_is_ready() {
-        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
-        slice.endpoints[0].conditions = None;
-        let got = select_slice_endpoint(&[slice], "webhook", Some(8443), 443);
-        assert_eq!(got, Ok(("10.244.0.2".to_string(), 8443)));
-        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
-        slice.endpoints[0].conditions = Some(EndpointConditions {
-            ready: None,
-            serving: None,
-            terminating: None,
-        });
-        let got = select_slice_endpoint(&[slice], "webhook", Some(8443), 443);
-        assert_eq!(got, Ok(("10.244.0.2".to_string(), 8443)));
-    }
-
-    #[test]
-    fn test_select_slice_endpoint_reports_why_rejected() {
-        let other = webhook_endpointslice("other", "ns", "10.244.0.9", true);
-        let unready = webhook_endpointslice("webhook", "ns", "10.244.0.2", false);
-        let mut noaddr = webhook_endpointslice("webhook", "ns", "x", true);
-        noaddr.metadata.name = "noaddr".into();
-        noaddr.endpoints[0].addresses.clear();
-        let err =
-            select_slice_endpoint(&[other, unready, noaddr], "webhook", None, 443).unwrap_err();
-        assert!(
-            err.iter().any(|r| r.contains("not labelled for service")),
-            "{err:?}"
-        );
-        assert!(err.iter().any(|r| r.contains("not ready")), "{err:?}");
-        assert!(err.iter().any(|r| r.contains("no addresses")), "{err:?}");
-    }
-
-    #[test]
-    fn test_select_slice_endpoint_falls_back_to_service_port_when_slice_port_missing() {
-        let mut slice = webhook_endpointslice("webhook", "ns", "10.244.0.2", true);
-        slice.ports[0].port = None; // named port left unresolved
-        assert_eq!(
-            select_slice_endpoint(&[slice.clone()], "webhook", Some(8443), 443),
-            Ok(("10.244.0.2".to_string(), 8443))
-        );
-        assert_eq!(
-            select_slice_endpoint(&[slice], "webhook", None, 443),
-            Ok(("10.244.0.2".to_string(), 443))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_service_url_passthrough_for_direct_url() {
-        let storage = Arc::new(MemoryStorage::new());
-        let resolved =
-            AdmissionWebhookClient::resolve_service_url("https://1.2.3.4:9443/admit", &storage)
-                .await;
-        assert_eq!(resolved, "https://1.2.3.4:9443/admit");
     }
 
     // ===== ValidatingAdmissionPolicy Tests =====

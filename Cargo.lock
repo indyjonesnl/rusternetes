@@ -4257,6 +4257,7 @@ dependencies = [
  "chrono",
  "futures",
  "prometheus",
+ "rand 0.9.4",
  "reqwest",
  "rusternetes-common",
  "rusternetes-storage",

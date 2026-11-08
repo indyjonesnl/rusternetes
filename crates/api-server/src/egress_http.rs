@@ -91,6 +91,10 @@ pub struct EgressConnector {
     /// when it is not the URL host (the aggregator dials the endpoint IP but
     /// verifies `<service>.<namespace>.svc`, handler_proxy.go:221).
     server_name: Option<String>,
+    /// `(from, to)`: a dial of `from` goes to `to` instead, as a
+    /// `rest.Config.Dial` that swaps the service address for the one
+    /// `ServiceResolver.ResolveEndpoint` returns (util/webhook/client.go:203-212).
+    dial_override: Option<(String, String)>,
 }
 
 impl EgressConnector {
@@ -102,7 +106,14 @@ impl EgressConnector {
             dialer,
             tls: Arc::new(tls),
             server_name,
+            dial_override: None,
         }
+    }
+
+    /// Makes a dial of `from` (`host:port`) go to `to`.
+    pub fn with_dial_override(mut self, dial_override: Option<(String, String)>) -> Self {
+        self.dial_override = dial_override;
+        self
     }
 }
 
@@ -127,7 +138,12 @@ impl tower::Service<Uri> for EgressConnector {
             let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
             // `host` keeps the brackets of an IPv6 literal, as `host:port`
             // needs them.
-            let addr = format!("{host}:{port}");
+            let mut addr = format!("{host}:{port}");
+            if let Some((from, to)) = &this.dial_override {
+                if *from == addr {
+                    addr = to.clone();
+                }
+            }
             let conn = this
                 .dialer
                 .dial("tcp", &addr)
@@ -260,11 +276,24 @@ impl EgressHttpClient {
         timeout: Duration,
         server_name: Option<String>,
     ) -> Self {
-        let connector = EgressConnector {
-            dialer,
-            tls: Arc::new(tls),
-            server_name,
-        };
+        let connector = EgressConnector::new(dialer, tls, server_name);
+        Self::from_connector(connector, timeout)
+    }
+
+    /// [`Self::new`] where a dial of `from` is made to `to` (see
+    /// [`EgressConnector::with_dial_override`]); the TLS server name stays the
+    /// URL's host.
+    pub fn with_dial_override(
+        dialer: Dialer,
+        tls: rustls::ClientConfig,
+        timeout: Duration,
+        dial_override: Option<(String, String)>,
+    ) -> Self {
+        let connector = EgressConnector::new(dialer, tls, None).with_dial_override(dial_override);
+        Self::from_connector(connector, timeout)
+    }
+
+    fn from_connector(connector: EgressConnector, timeout: Duration) -> Self {
         Self {
             client: hyper_util::client::legacy::Client::builder(TokioExecutor::new())
                 .build(connector),

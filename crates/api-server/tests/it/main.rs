@@ -424,6 +424,7 @@ mod webhook_config_protobuf_response_test;
 mod webhook_config_watch_cabundle_test;
 mod webhook_match_conditions_test;
 mod webhook_timeout_test;
+mod webhook_transport_test;
 mod wire_format_apps_batch_test;
 mod wire_format_coverage_test;
 mod workload_template_decodes_when_absent_test;
