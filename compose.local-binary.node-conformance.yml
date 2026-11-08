@@ -18,6 +18,7 @@ services:
     command:
       - "--bind-address"
       - "0.0.0.0:6443"
+      - "--enable-aggregator-routing=true"
       - "--etcd-servers"
       - "http://rhino:2379"
       - "--tls"
