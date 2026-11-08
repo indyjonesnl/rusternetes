@@ -66,10 +66,11 @@ pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
 pub mod request_header_authentication;
-pub mod service_resolver;
+pub use rusternetes_admission_webhook::service_resolver;
 pub mod shared_informer_factory;
 pub mod storage_readiness_hook;
 pub mod upgrade_aware;
+pub mod webhook_transport;
 pub use rusternetes_protobuf as protobuf;
 pub mod cache_metrics;
 pub mod cache_watcher;
@@ -446,6 +447,8 @@ pub fn log_openid_metadata_status(token_manager: &TokenManager) {
 ///   (config.go:167, :245).
 /// - `buildServiceResolver(opts.EnableAggregatorRouting,
 ///   LoopbackClientConfig.Host, ..)` (cmd/kube-apiserver/app/server.go:283).
+/// - the webhook client's egress-aware dial
+///   (`NewDefaultAuthenticationInfoResolverWrapper`).
 pub fn install_server_options(config: &ApiServerConfig) -> anyhow::Result<()> {
     let egress_errs = egress_selector::validate_options(&config.egress_selector_config_file);
     if !egress_errs.is_empty() {
@@ -462,6 +465,11 @@ pub fn install_server_options(config: &ApiServerConfig) -> anyhow::Result<()> {
             .parse::<std::net::SocketAddr>()
             .ok()
             .map(|a| ("127.0.0.1".to_string(), a.port())),
+    ));
+    // The webhook client's dial: `NewDefaultAuthenticationInfoResolverWrapper`
+    // (util/webhook/authentication.go:46), built from the same egress selector.
+    rusternetes_admission_webhook::transport::set_transport(std::sync::Arc::new(
+        webhook_transport::EgressWebhookTransport::new(egress_selector::egress_selector()),
     ));
     Ok(())
 }
