@@ -17,7 +17,6 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{
     AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
 };
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::{Error, Result};
 
 type Cached<T> = std::result::Result<T, String>;
@@ -112,14 +111,6 @@ impl Authorizer for CachingAuthorizer {
         let result = self.authorizer.authorize_outcome(attrs).await;
         self.outcomes.lock().unwrap().insert(key, remember(&result));
         result
-    }
-
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.authorizer.get_user_rules(user, namespace).await
     }
 
     async fn get_user_rules_outcome(

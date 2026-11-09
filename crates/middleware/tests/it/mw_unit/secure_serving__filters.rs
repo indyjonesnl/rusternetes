@@ -81,15 +81,13 @@ mod tests {
                 },
             })
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _u: &UserInfo,
             _ns: &str,
-        ) -> rusternetes_common::error::Result<(
-            Vec<rusternetes_common::resources::ResourceRule>,
-            Vec<rusternetes_common::resources::NonResourceRule>,
-        )> {
-            Ok((vec![], vec![]))
+        ) -> rusternetes_common::error::Result<rusternetes_common::authz::UserRulesOutcome>
+        {
+            Ok(rusternetes_common::authz::UserRulesOutcome::default())
         }
     }
 

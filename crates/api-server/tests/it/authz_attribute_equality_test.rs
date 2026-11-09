@@ -21,7 +21,6 @@ use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{
     AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
 };
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use rusternetes_test_support::harness::TestApiServer;
 use std::sync::{Arc, Mutex};
@@ -68,12 +67,12 @@ impl Authorizer for Recorder {
         self.log.lock().unwrap().push(key(a));
         self.inner.authorize_outcome(a).await
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         u: &UserInfo,
         ns: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.inner.get_user_rules(u, ns).await
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        self.inner.get_user_rules_outcome(u, ns).await
     }
 }
 
@@ -315,12 +314,12 @@ impl Authorizer for AllowOnly {
             Decision::Deny("not the filter's attributes".into())
         })
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -420,12 +419,12 @@ impl Authorizer for DenyAll {
     async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
         Ok(Decision::Deny("denied".into()))
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

@@ -19,7 +19,6 @@ use rusternetes_api_server::audit::request_info;
 use rusternetes_api_server::request_scope::first_value_for_authz_keys;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use rusternetes_test_support::harness::TestApiServer;
 use std::sync::Arc;
@@ -95,12 +94,12 @@ impl Authorizer for Pred {
             Decision::Deny("denied".into())
         })
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

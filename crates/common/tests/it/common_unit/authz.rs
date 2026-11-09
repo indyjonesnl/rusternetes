@@ -336,15 +336,12 @@ mod tests {
                 error: self.error.map(str::to_string),
             })
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<(
-            Vec<rusternetes_common::resources::ResourceRule>,
-            Vec<rusternetes_common::resources::NonResourceRule>,
-        )> {
-            Ok((vec![], vec![]))
+        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+            Ok(rusternetes_common::authz::UserRulesOutcome::default())
         }
     }
 
@@ -430,15 +427,16 @@ mod tests {
         async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
             Ok(Decision::Deny(String::new()))
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<(
-            Vec<rusternetes_common::resources::ResourceRule>,
-            Vec<rusternetes_common::resources::NonResourceRule>,
-        )> {
-            Ok((self.0.clone(), self.1.clone()))
+        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+            Ok(rusternetes_common::authz::UserRulesOutcome {
+                resource_rules: self.0.clone(),
+                non_resource_rules: self.1.clone(),
+                ..Default::default()
+            })
         }
     }
 
@@ -475,7 +473,8 @@ mod tests {
                 vec![nr("/api/*")],
             )),
         ]);
-        let (res, non) = u.get_user_rules(&mk_user("a"), "").await.unwrap();
+        let got = u.get_user_rules_outcome(&mk_user("a"), "").await.unwrap();
+        let (res, non) = (got.resource_rules, got.non_resource_rules);
         let want_res = vec![
             rr(&["*"], &["bindings"], None),
             rr(&["get", "list", "watch"], &["*"], None),
@@ -504,16 +503,6 @@ mod tests {
         impl Authorizer for Outcome {
             async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
                 Ok(Decision::Deny(String::new()))
-            }
-            async fn get_user_rules(
-                &self,
-                _: &UserInfo,
-                _: &str,
-            ) -> Result<(
-                Vec<ResourceRule>,
-                Vec<rusternetes_common::resources::NonResourceRule>,
-            )> {
-                Ok((vec![], vec![]))
             }
             async fn get_user_rules_outcome(
                 &self,
@@ -567,22 +556,24 @@ mod tests {
             .unwrap();
         assert!(!got.incomplete && got.error.is_none());
 
-        // The default adapter turns a get_user_rules failure into the error.
+        // A delegate failure is reported as the outcome's error, not dropped.
         struct Failing;
         #[async_trait]
         impl Authorizer for Failing {
             async fn authorize(&self, _: &RequestAttributes) -> Result<Decision> {
                 Ok(Decision::Deny(String::new()))
             }
-            async fn get_user_rules(
+            async fn get_user_rules_outcome(
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> Result<(
-                Vec<ResourceRule>,
-                Vec<rusternetes_common::resources::NonResourceRule>,
-            )> {
-                Err(rusternetes_common::Error::Internal("list failed".into()))
+            ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+                Ok(rusternetes_common::authz::UserRulesOutcome {
+                    error: Some(
+                        rusternetes_common::Error::Internal("list failed".into()).to_string(),
+                    ),
+                    ..Default::default()
+                })
             }
         }
         let got = Failing
@@ -911,15 +902,12 @@ mod allow_reason_tests {
         async fn authorize_opinion(&self, _: &RequestAttributes) -> Result<Opinion> {
             Ok(self.0.clone())
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<(
-            Vec<rusternetes_common::resources::ResourceRule>,
-            Vec<rusternetes_common::resources::NonResourceRule>,
-        )> {
-            Ok((vec![], vec![]))
+        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+            Ok(rusternetes_common::authz::UserRulesOutcome::default())
         }
     }
 

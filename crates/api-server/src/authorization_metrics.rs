@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use prometheus::{register, IntCounterVec, Opts};
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use std::sync::{Arc, LazyLock, Once};
 
@@ -108,14 +107,6 @@ impl Authorizer for InstrumentedAuthorizer {
         let outcome = self.delegate.authorize_outcome(attrs).await?;
         self.record(&outcome.opinion);
         Ok(outcome)
-    }
-
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.delegate.get_user_rules(user, namespace).await
     }
 
     async fn get_user_rules_outcome(

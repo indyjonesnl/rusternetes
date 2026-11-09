@@ -323,37 +323,16 @@ pub trait Authorizer: Send + Sync {
             .map(AuthorizationOutcome::from_opinion)
     }
 
-    /// Get all rules that apply to a user in a given namespace
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )>;
-
-    /// `RulesFor` with its `incomplete` flag and error. The default adapts
-    /// [`Authorizer::get_user_rules`]: a failure becomes the error (upstream
-    /// RBAC returns the rules found plus the error, `rbac.go:129-155`) and the
-    /// result is complete unless the authorizer says otherwise.
+    /// `authorizer.RuleResolver.RulesFor` (`staging/src/k8s.io/apiserver/pkg/
+    /// authorization/authorizer/interfaces.go`): the rules that apply to a user
+    /// in a namespace, with the `incomplete` flag and error. A failure becomes
+    /// the outcome's error (upstream RBAC returns the rules found plus the
+    /// error, `rbac.go:129-155`).
     async fn get_user_rules_outcome(
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> Result<UserRulesOutcome> {
-        Ok(match self.get_user_rules(user, namespace).await {
-            Ok((resource_rules, non_resource_rules)) => UserRulesOutcome {
-                resource_rules,
-                non_resource_rules,
-                ..Default::default()
-            },
-            Err(error) => UserRulesOutcome {
-                error: Some(error.to_string()),
-                ..Default::default()
-            },
-        })
-    }
+    ) -> Result<UserRulesOutcome>;
 }
 
 /// RBAC Authorizer that uses Role and RoleBinding resources
@@ -551,20 +530,27 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
         self.check_rbac(attrs).await
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
+    ) -> Result<UserRulesOutcome> {
         let mut resource_rules = Vec::new();
         let mut non_resource_rules = Vec::new();
 
         // Get all role bindings that apply to this user in the namespace
-        let role_bindings = self.storage.list::<RoleBinding>(Some(namespace)).await?;
-        let cluster_role_bindings = self.storage.list::<ClusterRoleBinding>(None).await?;
+        let list_err = |error: crate::error::Error| UserRulesOutcome {
+            error: Some(error.to_string()),
+            ..Default::default()
+        };
+        let role_bindings = match self.storage.list::<RoleBinding>(Some(namespace)).await {
+            Ok(v) => v,
+            Err(e) => return Ok(list_err(e)),
+        };
+        let cluster_role_bindings = match self.storage.list::<ClusterRoleBinding>(None).await {
+            Ok(v) => v,
+            Err(e) => return Ok(list_err(e)),
+        };
 
         // Process namespace-scoped role bindings
         for binding in role_bindings {
@@ -655,7 +641,11 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
             }
         }
 
-        Ok((resource_rules, non_resource_rules))
+        Ok(UserRulesOutcome {
+            resource_rules,
+            non_resource_rules,
+            ..Default::default()
+        })
     }
 }
 
@@ -673,27 +663,25 @@ impl Authorizer for AlwaysAllowAuthorizer {
         Ok(Opinion::Allow(String::new()))
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
+    ) -> Result<UserRulesOutcome> {
         // Return wildcard rules for testing
-        Ok((
-            vec![crate::resources::ResourceRule {
+        Ok(UserRulesOutcome {
+            resource_rules: vec![crate::resources::ResourceRule {
                 verbs: vec!["*".to_string()],
                 api_groups: Some(vec!["*".to_string()]),
                 resources: Some(vec!["*".to_string()]),
                 resource_names: None,
             }],
-            vec![crate::resources::NonResourceRule {
+            non_resource_rules: vec![crate::resources::NonResourceRule {
                 verbs: vec!["*".to_string()],
                 non_resource_urls: Some(vec!["*".to_string()]),
             }],
-        ))
+            ..Default::default()
+        })
     }
 }
 
@@ -714,16 +702,13 @@ impl Authorizer for AlwaysDenyAuthorizer {
         })
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
+    ) -> Result<UserRulesOutcome> {
         // Return empty rules for testing
-        Ok((vec![], vec![]))
+        Ok(UserRulesOutcome::default())
     }
 }
 
@@ -884,25 +869,6 @@ impl Authorizer for UnionAuthorizer {
         })
     }
 
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
-        let mut resource_rules = Vec::new();
-        let mut non_resource_rules = Vec::new();
-        for authorizer in &self.authorizers {
-            if let Ok((rr, nrr)) = authorizer.get_user_rules(user, namespace).await {
-                resource_rules.extend(rr);
-                non_resource_rules.extend(nrr);
-            }
-        }
-        Ok((resource_rules, non_resource_rules))
-    }
-
     /// `unionAuthzRulesHandler.RulesFor` (`union/union.go:80-106`): concatenate
     /// every delegate's rules in order, OR the `incomplete` flags, and
     /// aggregate the errors; a failing delegate never hides the others.
@@ -974,15 +940,12 @@ impl Authorizer for PrivilegedGroupAuthorizer {
         })
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
-        Ok((vec![], vec![]))
+    ) -> Result<UserRulesOutcome> {
+        Ok(UserRulesOutcome::default())
     }
 }
 
@@ -1121,16 +1084,13 @@ impl Authorizer for WebhookAuthorizer {
         }
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<crate::resources::ResourceRule>,
-        Vec<crate::resources::NonResourceRule>,
-    )> {
+    ) -> Result<UserRulesOutcome> {
         // Webhook authorizers don't support listing user rules
         // This would require a different API call or mechanism
-        Ok((vec![], vec![]))
+        Ok(UserRulesOutcome::default())
     }
 }

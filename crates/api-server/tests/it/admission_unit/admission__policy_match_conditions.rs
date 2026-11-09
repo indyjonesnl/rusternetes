@@ -508,15 +508,13 @@ mod tests {
                 };
                 r.clone().map_err(Error::Authorization)
             }
-            async fn get_user_rules(
+            async fn get_user_rules_outcome(
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> rusternetes_common::Result<(
-                Vec<rusternetes_common::resources::ResourceRule>,
-                Vec<rusternetes_common::resources::NonResourceRule>,
-            )> {
-                Ok((vec![], vec![]))
+            ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome>
+            {
+                Ok(rusternetes_common::authz::UserRulesOutcome::default())
             }
         }
 
