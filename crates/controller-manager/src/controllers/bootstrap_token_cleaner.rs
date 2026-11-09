@@ -11,15 +11,21 @@
 //! (`staging/src/k8s.io/cluster-bootstrap/util/secrets/secrets.go:59-78`) are
 //! ported 1:1, including "an unparseable expiration is treated as expired".
 //!
-//! Deviations (storage seam instead of informer + workqueue):
-//! - Upstream filters an informer on `Type == SecretTypeBootstrapToken &&
-//!   Namespace == tokenSecretNamespace` and requeues a not-yet-expired
-//!   secret with `queue.AddAfter(key, ttl)`. The `Storage` trait has no
-//!   list-by-type, so each pass lists the `kube-system` secrets and filters
-//!   by type. `queue.AddAfter(key, ttl)` is honoured by sleeping until the
-//!   soonest pending expiry (never longer than the worker period of 10s,
-//!   `wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`), so a token is
-//!   deleted when it expires, not up to a period later.
+//! Work loop ported 1:1: a rate-limited queue named `token_cleaner` holds
+//! `<namespace>/<name>` keys (`NewTokenCleaner`); the worker's
+//! `processNextWorkItem` runs `syncFunc` per key and `AddRateLimited`s a
+//! failure or `Forget`s a success; `syncFunc` reads the Secret (NotFound is
+//! "has been deleted") and calls `evalSecret` for bootstrap tokens, which
+//! deletes an expired one or `queue.AddAfter(key, ttl)`s a not-yet-expired one,
+//! so a token is deleted when it expires.
+//!
+//! Deviations (storage seam instead of informer):
+//! - Upstream enqueues from informer Add/Update events filtered on
+//!   `Type == SecretTypeBootstrapToken && Namespace == tokenSecretNamespace`
+//!   (`enqueueSecrets`, no resync by default). The `Storage` trait has no event
+//!   hook, so [`TokenCleaner::enqueue_secrets`] lists the namespace's secrets
+//!   and applies the same filter every [`WORKER_PERIOD`]; the queue collapses
+//!   repeats.
 //! - The delete's `Preconditions{UID}` is checked by re-reading the Secret
 //!   just before deleting (no preconditions in `Storage`); a UID mismatch is
 //!   the swallowed Conflict.
@@ -27,10 +33,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusternetes_common::resources::Secret;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use super::bootstrap_secret_util::get_expiration;
 pub use super::bootstrap_secret_util::{
@@ -41,13 +47,16 @@ pub const DEFAULT_TOKEN_SECRET_NAMESPACE: &str = "kube-system";
 /// The worker period of `Run` (`wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`).
 pub const WORKER_PERIOD: Duration = Duration::from_secs(10);
 
-/// How long to sleep before the next pass: the soonest `AddAfter` delay, capped
-/// at the worker period. A zero delay still yields a minimal wait so an expiry
-/// landing on the boundary cannot spin.
-pub fn next_wake(requeue: Option<Duration>) -> Duration {
-    requeue
-        .map_or(WORKER_PERIOD, |ttl| ttl.min(WORKER_PERIOD))
-        .max(Duration::from_millis(10))
+/// `queue`'s name (tokencleaner.go, `NewTokenCleaner`).
+pub const QUEUE_NAME: &str = "token_cleaner";
+
+/// `cache.MetaNamespaceKeyFunc`: `<namespace>/<name>`.
+fn queue_key(secret: &Secret) -> String {
+    format!(
+        "{}/{}",
+        secret.metadata.namespace.as_deref().unwrap_or(""),
+        secret.metadata.name
+    )
 }
 
 /// What `evalSecret` did with a secret.
@@ -75,18 +84,31 @@ impl<S: Storage + 'static> TokenCleaner<S> {
         }
     }
 
-    /// `Run`: sync every worker period.
+    /// `Run`: enqueue (the informer events) and service the queue until it
+    /// shuts down.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting token cleaner controller");
-        loop {
-            let requeue = self.sync_all(Utc::now()).await;
-            tokio::time::sleep(next_wake(requeue)).await;
-        }
+        let queue = WorkQueue::named(QUEUE_NAME);
+
+        let poker = Arc::clone(&self);
+        let poke_queue = queue.clone();
+        tokio::spawn(async move {
+            loop {
+                poker.enqueue_secrets(&poke_queue).await;
+                tokio::time::sleep(WORKER_PERIOD).await;
+            }
+        });
+
+        // `wait.UntilWithContext(ctx, tc.worker, 10*time.Second)`: `worker`
+        // loops `processNextWorkItem` until the queue quits.
+        while self.process_next_work_item(&queue).await {}
+        info!("Shutting down token cleaner controller");
+        Ok(())
     }
 
-    /// One pass: the informer's FilterFunc (type + namespace) then `syncFunc`.
-    /// Returns the soonest `queue.AddAfter` delay requested by `evalSecret`.
-    pub async fn sync_all(&self, now: DateTime<Utc>) -> Option<Duration> {
+    /// The informer's FilterFunc (type + namespace) then `enqueueSecrets`
+    /// (`tc.queue.Add(key)`) for each bootstrap token Secret.
+    pub async fn enqueue_secrets(&self, queue: &WorkQueue) {
         let secrets: Vec<Secret> = match self
             .storage
             .list(&build_prefix("secrets", Some(&self.token_secret_namespace)))
@@ -95,29 +117,79 @@ impl<S: Storage + 'static> TokenCleaner<S> {
             Ok(s) => s,
             Err(e) => {
                 error!("Listing bootstrap token secrets: {e}");
-                return None;
+                return;
             }
         };
-        let mut soonest: Option<Duration> = None;
         for secret in secrets {
             if secret.secret_type.as_deref() == Some(SECRET_TYPE_BOOTSTRAP_TOKEN)
                 && secret.metadata.namespace.as_deref() == Some(&self.token_secret_namespace)
             {
-                if let EvalOutcome::RequeueAfter(ttl) = self.eval_secret(&secret, now).await {
-                    soonest = Some(soonest.map_or(ttl, |s| s.min(ttl)));
-                }
+                queue.add(queue_key(&secret)).await;
             }
         }
-        soonest
     }
 
-    /// `evalSecret`.
-    pub async fn eval_secret(&self, secret: &Secret, now: DateTime<Utc>) -> EvalOutcome {
+    /// `processNextWorkItem`: `false` once the queue quits.
+    pub async fn process_next_work_item(&self, queue: &WorkQueue) -> bool {
+        let Some(key) = queue.get().await else {
+            return false;
+        };
+        match self.sync_func(queue, &key, Utc::now()).await {
+            Err(e) => {
+                queue.requeue_rate_limited(key.clone()).await;
+                error!("Sync {key} failed with : {e}");
+            }
+            Ok(()) => queue.forget(&key).await,
+        }
+        queue.done(&key).await;
+        true
+    }
+
+    /// `syncFunc`.
+    pub async fn sync_func(
+        &self,
+        queue: &WorkQueue,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), rusternetes_common::Error> {
+        // `cache.SplitMetaNamespaceKey`.
+        let Some((namespace, name)) = key.split_once('/') else {
+            return Err(rusternetes_common::Error::BadRequest(format!(
+                "unexpected key format: {key:?}"
+            )));
+        };
+        let secret: Secret = match self
+            .storage
+            .get(&build_key("secrets", Some(namespace), name))
+            .await
+        {
+            Ok(s) => s,
+            Err(rusternetes_common::Error::NotFound(_)) => {
+                debug!("Secret {key} has been deleted");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if secret.secret_type.as_deref() == Some(SECRET_TYPE_BOOTSTRAP_TOKEN) {
+            self.eval_secret(queue, &secret, now).await;
+        }
+        Ok(())
+    }
+
+    /// `evalSecret`: delete an expired token, or `queue.AddAfter(key, ttl)` a
+    /// token that expires later.
+    pub async fn eval_secret(
+        &self,
+        queue: &WorkQueue,
+        secret: &Secret,
+        now: DateTime<Utc>,
+    ) -> EvalOutcome {
         let (ttl, already_expired) = get_expiration(secret, now);
         if already_expired {
             self.delete_with_uid_precondition(secret).await;
             EvalOutcome::Deleted
         } else if !ttl.is_zero() {
+            queue.add_after(queue_key(secret), ttl).await;
             EvalOutcome::RequeueAfter(ttl)
         } else {
             EvalOutcome::Nothing
