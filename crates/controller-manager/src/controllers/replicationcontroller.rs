@@ -67,7 +67,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("ReplicationController controller started (watch-based)");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("replicationmanager");
 
         // Upstream launches `ConcurrentRCSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

@@ -75,7 +75,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
     pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
         info!("Deployment controller started (watch-based)");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("deployment");
 
         // Upstream launches `ConcurrentDeploymentSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

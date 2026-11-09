@@ -258,7 +258,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         info!("Starting DaemonSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("daemonset");
 
         // Upstream launches `ConcurrentDaemonSetSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

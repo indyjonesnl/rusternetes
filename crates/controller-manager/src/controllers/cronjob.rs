@@ -599,7 +599,7 @@ impl<S: Storage + 'static> CronJobController<S> {
         info!("Starting CronJobController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("cronjob");
 
         // Upstream starts `workers` goroutines over one queue (cronjob_controllerv2.go:156-159).
         spawn_workers(CONCURRENT_CRONJOB_SYNCS, &queue, |worker_queue| {

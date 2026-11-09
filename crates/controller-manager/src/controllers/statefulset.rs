@@ -58,7 +58,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         info!("Starting StatefulSetController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("statefulset");
 
         // Upstream starts `workers` goroutines over one queue (stateful_set.go:193-196).
         spawn_workers(CONCURRENT_STATEFULSET_SYNCS, &queue, |worker_queue| {

@@ -461,7 +461,7 @@ impl<S: Storage + 'static> JobController<S> {
             finalizer_expectations: FinalizerExpectations::new(),
             requeue_delays: std::sync::Mutex::new(HashMap::new()),
             backoff_store: BackoffStore::default(),
-            orphan_queue: WorkQueue::new(),
+            orphan_queue: WorkQueue::named("job_orphan_pod"),
         }
     }
 
@@ -984,7 +984,7 @@ impl<S: Storage + 'static> JobController<S> {
         info!("Starting JobController (watch-based)");
         let retry_interval = Duration::from_secs(5);
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("job");
 
         // Upstream starts `workers` goroutines over one queue (job_controller.go:268-270).
         spawn_workers(CONCURRENT_JOB_SYNCS, &queue, |worker_queue| {
