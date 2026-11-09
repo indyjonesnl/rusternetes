@@ -343,11 +343,55 @@ pub async fn spawn_api_service_event_handlers<S: Storage + 'static>(
     controller: Arc<AutoRegisterController>,
     check: Arc<APIServiceAvailableCheck>,
 ) {
-    let mut stream = match storage.watch(&build_prefix("apiservices", None)).await {
+    // The first list-and-watch finishes before this returns (callers rely on
+    // the handlers being live); a later one runs from the task below.
+    let mut stream = api_service_list_and_watch(&storage, &controller, &check).await;
+    tokio::spawn(async move {
+        loop {
+            if let Some(mut s) = stream.take() {
+                while let Some(ev) = s.next().await {
+                    let Ok(ev) = ev else { continue };
+                    match ev {
+                        WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
+                            let Ok(a) = serde_json::from_str::<APIService>(&v) else {
+                                continue;
+                            };
+                            controller.on_update(&a);
+                            check.handle_api_service_change(&a);
+                        }
+                        WatchEvent::Deleted(_, v) => {
+                            let Ok(a) = serde_json::from_str::<APIService>(&v) else {
+                                continue;
+                            };
+                            controller.on_delete(&a);
+                        }
+                    }
+                }
+                tracing::warn!("autoregister: APIService watch ended, relisting");
+            }
+            // `Reflector.ListAndWatch` is restarted by `wait.BackoffUntil`
+            // (reflector.go `Run`) when the watch ends or cannot be started.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            stream = api_service_list_and_watch(&storage, &controller, &check).await;
+        }
+    });
+}
+
+type ApiServiceWatch =
+    futures::stream::BoxStream<'static, Result<WatchEvent, rusternetes_common::Error>>;
+
+/// One `Reflector.ListAndWatch`: start the watch, then replay the list as Adds
+/// so no event falls between the two. `None` when the watch cannot be started.
+async fn api_service_list_and_watch<S: Storage + 'static>(
+    storage: &Arc<S>,
+    controller: &Arc<AutoRegisterController>,
+    check: &Arc<APIServiceAvailableCheck>,
+) -> Option<ApiServiceWatch> {
+    let stream = match storage.watch(&build_prefix("apiservices", None)).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("autoregister: cannot watch APIServices: {e}");
-            return;
+            return None;
         }
     };
     match storage
@@ -362,26 +406,7 @@ pub async fn spawn_api_service_event_handlers<S: Storage + 'static>(
         }
         Err(e) => tracing::error!("autoregister: cannot list APIServices: {e}"),
     }
-    tokio::spawn(async move {
-        while let Some(ev) = stream.next().await {
-            let Ok(ev) = ev else { continue };
-            match ev {
-                WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => {
-                    let Ok(a) = serde_json::from_str::<APIService>(&v) else {
-                        continue;
-                    };
-                    controller.on_update(&a);
-                    check.handle_api_service_change(&a);
-                }
-                WatchEvent::Deleted(_, v) => {
-                    let Ok(a) = serde_json::from_str::<APIService>(&v) else {
-                        continue;
-                    };
-                    controller.on_delete(&a);
-                }
-            }
-        }
-    });
+    Some(stream)
 }
 
 impl crate::crdregistration::AutoAPIServiceRegistration for AutoRegisterController {
