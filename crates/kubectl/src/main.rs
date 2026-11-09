@@ -1106,7 +1106,9 @@ async fn main() -> Result<()> {
         client_cert.map(|p| p.into_bytes()),
         client_key.map(|p| p.into_bytes()),
         token,
-    )?;
+    )?
+    // `rest.SetKubernetesDefaults`: the component's default User-Agent.
+    .with_default_user_agent(rusternetes_common::compatibility::default_kubernetes_user_agent());
 
     match cli.command {
         Commands::Get {

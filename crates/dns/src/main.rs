@@ -140,7 +140,13 @@ async fn main() -> Result<()> {
             "Using api-server data source at: {}",
             client_config.base_url
         );
-        let client = Arc::new(ApiClient::from_config(&client_config)?);
+        let client = Arc::new(
+            ApiClient::from_config(&client_config)?
+                // `rest.SetKubernetesDefaults`: the component's default User-Agent.
+                .with_default_user_agent(
+                    rusternetes_common::compatibility::default_kubernetes_user_agent(),
+                ),
+        );
         return run_with_api(client, config).await;
     }
 
