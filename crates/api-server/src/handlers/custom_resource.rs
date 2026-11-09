@@ -770,56 +770,51 @@ async fn get_crd_for_resource(
     state.storage.get(&key).await
 }
 
-/// Apply schema defaults from the CRD to a custom resource's spec.
-/// Walks the CRD's JSONSchemaProps and for each property with a `default`
-/// value, sets it on the CR if the field is missing.
+/// `structuralSchemas[v.Name]` (customresource_handler.go:665-681): the
+/// version's structural schema with its defaults pruned against the schema
+/// (`structuraldefaulting.PruneDefaults`), the latter skipped when the CRD has
+/// `preserveUnknownFields`. `None` when the version has no schema or it is not
+/// structural.
+pub fn serving_structural_schema(
+    crd: &CustomResourceDefinition,
+    version: &str,
+) -> Option<rusternetes_common::validation::structural::Structural> {
+    let schema = crd
+        .spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)?
+        .schema
+        .as_ref()?
+        .open_apiv3_schema
+        .as_ref()?;
+    let mut structural = rusternetes_common::validation::structural::new_structural(schema).ok()?;
+    if crd.spec.preserve_unknown_fields != Some(true) {
+        // "This should never happen" upstream: validation has rejected a CRD
+        // whose defaults cannot be pruned.
+        rusternetes_common::validation::structural::defaulting::prune_defaults(&mut structural)
+            .ok()?;
+    }
+    Some(structural)
+}
+
+/// `unstructuredDefaulter.Default` (customresource_handler.go:1240-1249):
+/// `structuraldefaulting.Default(u.UnstructuredContent(),
+/// structuralSchemas[version])` over the whole object.
 pub fn apply_schema_defaults(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &mut CustomResource,
 ) {
-    // Find the version in the CRD
-    let crd_version = match crd.spec.versions.iter().find(|v| v.name == version) {
-        Some(v) => v,
-        None => return,
+    let Some(structural) = serving_structural_schema(crd, version) else {
+        return;
     };
-
-    // Apply defaults from schema if present
-    if let Some(root_schema) = crd_version
-        .schema
-        .as_ref()
-        .and_then(|s| s.open_apiv3_schema.as_ref())
-    {
-        // The CRD schema's top-level properties typically include "spec", "status", etc.
-        // We need to find the "spec" property schema and apply defaults to cr.spec.
-        if let Some(ref properties) = root_schema.properties {
-            if let Some(spec_schema) = properties.get("spec") {
-                let spec = cr.spec.get_or_insert_with(|| serde_json::json!({}));
-                SchemaValidator::apply_defaults(spec_schema, spec);
-            }
-        }
-        // Also apply defaults at the top level for the whole object
-        // (handles cases where the schema defines defaults for top-level fields like "a")
-        let mut cr_value = serde_json::to_value(&*cr).unwrap_or_default();
-        SchemaValidator::apply_defaults(root_schema, &mut cr_value);
-        // Update spec from applied defaults
-        if let Some(spec_val) = cr_value.get("spec") {
-            cr.spec = Some(spec_val.clone());
-        }
-        // Update extra fields from applied defaults (top-level fields beyond
-        // apiVersion/kind/metadata/spec/status)
-        if let Some(obj) = cr_value.as_object() {
-            for (k, v) in obj {
-                if k != "apiVersion"
-                    && k != "kind"
-                    && k != "metadata"
-                    && k != "spec"
-                    && k != "status"
-                {
-                    cr.extra.insert(k.clone(), v.clone());
-                }
-            }
-        }
+    let Ok(mut value) = serde_json::to_value(&*cr) else {
+        return;
+    };
+    rusternetes_common::validation::structural::defaulting::default(&mut value, Some(&structural));
+    if let Ok(defaulted) = serde_json::from_value(value) {
+        *cr = defaulted;
     }
 }
 
