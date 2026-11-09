@@ -468,8 +468,49 @@ fn fill_missing(target: &mut Value, source: &Value) {
     }
 }
 
+/// `Scheme.Default` of the built-in types, and of a custom resource its CRD's
+/// `unstructuredDefaulter` (`structuraldefaulting.Default` over the version's
+/// structural schema, customresource_handler.go:1240-1249, wired as the REST
+/// scope's `Defaulter` at :966). A resource with no CRD is a built-in type.
+pub struct StorageObjectDefaulter<S: Storage> {
+    storage: Arc<S>,
+}
+
+impl<S: Storage> StorageObjectDefaulter<S> {
+    pub fn new(storage: Arc<S>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl<S: Storage> ObjectDefaulter for StorageObjectDefaulter<S> {
+    async fn default_object(&self, resource: &GroupVersionResource, object: &mut Value) {
+        if !resource.group.is_empty() {
+            let key = rusternetes_storage::build_key(
+                "customresourcedefinitions",
+                None,
+                &format!("{}.{}", resource.resource, resource.group),
+            );
+            if let Ok(crd) = self
+                .storage
+                .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+                .await
+            {
+                rusternetes_common::resources::crd::default_custom_resource_value(
+                    &crd,
+                    &resource.version,
+                    object,
+                );
+                return;
+            }
+        }
+        SchemeObjectDefaulter.default_object(resource, object).await;
+    }
+}
+
+#[async_trait]
 impl ObjectDefaulter for SchemeObjectDefaulter {
-    fn default_object(&self, object: &mut Value) {
+    async fn default_object(&self, _resource: &GroupVersionResource, object: &mut Value) {
         use crate::handlers::defaults as d;
         use rusternetes_common::resources as r;
         let api_version = object["apiVersion"].as_str().unwrap_or_default();
@@ -588,9 +629,9 @@ pub async fn new_mutating_policy_plugin<S: Storage + 'static>(
             EquivalentResourceRegistry::from_discovery(),
             crds,
         )),
-        namespace_objects: Arc::new(StorageNamespaceObjects::new(storage)),
+        namespace_objects: Arc::new(StorageNamespaceObjects::new(storage.clone())),
         type_converters: Arc::new(RegistryTypeConverters),
-        defaulter: Arc::new(SchemeObjectDefaulter),
+        defaulter: Arc::new(StorageObjectDefaulter::new(storage.clone())),
         authorizer,
     }))
 }

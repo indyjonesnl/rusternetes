@@ -81,8 +81,9 @@ mod tests {
 
     /// `fakeSetDefaultForDeployment` (dispatcher_test.go:709-715).
     struct DefaultStrategy;
+    #[async_trait]
     impl ObjectDefaulter for DefaultStrategy {
-        fn default_object(&self, o: &mut Value) {
+        async fn default_object(&self, _: &GroupVersionResource, o: &mut Value) {
             if o["spec"]["strategy"]["type"].is_null() {
                 o["spec"]["strategy"] = json!({"type": "RollingUpdate"});
             }

@@ -272,9 +272,13 @@ pub trait TypeConverters: Send + Sync {
     fn has_type_converter(&self, kind: &GroupVersionKind) -> bool;
 }
 
-/// `ObjectInterfaces.GetObjectDefaulter().Default`.
+/// `ObjectInterfaces.GetObjectDefaulter().Default`. `resource` is the matched
+/// resource the object is served as: a custom resource is defaulted by the
+/// `unstructuredDefaulter` of its CRD (customresource_handler.go:1240-1249),
+/// which here is found from it.
+#[async_trait]
 pub trait ObjectDefaulter: Send + Sync {
-    fn default_object(&self, object: &mut Value);
+    async fn default_object(&self, resource: &GroupVersionResource, object: &mut Value);
 }
 
 /// `matcher.GetNamespace`: the full `v1.Namespace`.
@@ -396,7 +400,9 @@ impl MutatingDispatcher {
                 RUNTIME_CEL_COST_BUDGET,
             )
             .await?;
-        self.defaulter.default_object(&mut new_object);
+        self.defaulter
+            .default_object(resource, &mut new_object)
+            .await;
 
         versioned.dirty = true;
         versioned.versioned_object = Some(new_object);

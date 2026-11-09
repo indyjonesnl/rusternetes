@@ -104,8 +104,9 @@ mod tests {
         }
     }
     struct NoDefaults;
+    #[async_trait]
     impl ObjectDefaulter for NoDefaults {
-        fn default_object(&self, _: &mut Value) {}
+        async fn default_object(&self, _: &GroupVersionResource, _: &mut Value) {}
     }
     struct SetLabel;
     #[async_trait]

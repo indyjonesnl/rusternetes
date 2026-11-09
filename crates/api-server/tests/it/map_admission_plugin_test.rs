@@ -103,8 +103,9 @@ impl TypeConverters for Fakes {
         true
     }
 }
+#[async_trait]
 impl ObjectDefaulter for Fakes {
-    fn default_object(&self, _: &mut Value) {}
+    async fn default_object(&self, _: &GroupVersionResource, _: &mut Value) {}
 }
 
 struct SetLabel;

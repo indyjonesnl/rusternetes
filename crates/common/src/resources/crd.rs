@@ -913,9 +913,16 @@ pub fn default_custom_resource_value(
     else {
         return;
     };
-    let Ok(structural) = crate::validation::structural::new_structural(schema) else {
+    let Ok(mut structural) = crate::validation::structural::new_structural(schema) else {
         return;
     };
+    // `structuralSchemas[v.Name]` has its defaults pruned unless the CRD
+    // preserves unknown fields (customresource_handler.go:665-681).
+    if crd.spec.preserve_unknown_fields != Some(true)
+        && crate::validation::structural::defaulting::prune_defaults(&mut structural).is_err()
+    {
+        return;
+    }
     crate::validation::structural::defaulting::default(value, Some(&structural));
 }
 
