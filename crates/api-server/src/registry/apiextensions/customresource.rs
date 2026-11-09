@@ -63,7 +63,7 @@ use rusternetes_common::validation::metav1::is_qualified_name;
 use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
 use rusternetes_common::validation::structural::listtype::validate_list_sets_and_maps;
 use rusternetes_common::validation::structural::objectmeta::{coerce_with_options, CoerceOptions};
-use rusternetes_common::validation::structural::{new_structural, Structural};
+use rusternetes_common::validation::structural::Structural;
 use rusternetes_common::{Error, Result};
 use rusternetes_storage::StorageBackend;
 
@@ -413,15 +413,7 @@ impl Strategy {
         if self.crd.spec.preserve_unknown_fields == Some(true) {
             return;
         }
-        let Some(schema) = self
-            .crd_version()
-            .and_then(|v| v.schema.as_ref())
-            .and_then(|s| s.open_apiv3_schema.as_ref())
-        else {
-            return;
-        };
-        let Ok(structural) = rusternetes_common::validation::structural::new_structural(schema)
-        else {
+        let Some(structural) = self.structural_schema() else {
             return;
         };
         let Ok(mut value) = serde_json::to_value(&*cr) else {
@@ -478,11 +470,7 @@ impl Strategy {
 
     /// The served version's structural schema (`structuralSchemas[gv.Version]`).
     fn structural_schema(&self) -> Option<Structural> {
-        let schema = self
-            .crd_version()
-            .and_then(|v| v.schema.as_ref())
-            .and_then(|s| s.open_apiv3_schema.as_ref())?;
-        new_structural(schema).ok()
+        crate::handlers::custom_resource::serving_structural_schema(&self.crd, &self.version)
     }
 
     /// `schemaobjectmeta.CoerceWithOptions(nil, u.Object,

@@ -121,8 +121,36 @@ async fn non_nullable_null_spec_and_status_are_pruned() {
     w["status"] = Value::Null;
     let (status, out) = api.post(WIDGETS, &w).await;
     assert_eq!(status, StatusCode::CREATED, "{out}");
-    // `apply_schema_defaults` still materialises an absent `spec` as `{}`
-    // (pre-existing, tracked separately); what matters is the null is gone.
-    assert!(!out["spec"].is_null(), "{out}");
+    // `structuraldefaulting.Default` does not create an object that has no
+    // default, so the pruned `spec` stays absent.
+    assert!(out.as_object().unwrap().get("spec").is_none(), "{out}");
     assert!(out.as_object().unwrap().get("status").is_none(), "{out}");
+}
+
+/// The defaulter is `structuraldefaulting.Default` over the whole object
+/// (customresource_handler.go:1240-1249): a CR without a `spec` gets no
+/// `spec`, and `status` is defaulted like any other property.
+#[tokio::test]
+async fn defaulting_covers_the_whole_object_and_creates_nothing() {
+    let api = TestApiServer::new();
+    let mut crd = widget_crd();
+    crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+        ["a"]["default"] = json!(7);
+    crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]["properties"]
+        ["b"]["default"] = json!(9);
+    let (status, out) = api.post(CRDS, &crd).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    api.wait_crd_established("widgets.example.com").await;
+
+    let (status, out) = api.post(WIDGETS, &widget("no-spec")).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    assert!(out.as_object().unwrap().get("spec").is_none(), "{out}");
+
+    let mut w = widget("with-both");
+    w["spec"] = json!({});
+    w["status"] = json!({});
+    let (status, out) = api.post(WIDGETS, &w).await;
+    assert_eq!(status, StatusCode::CREATED, "{out}");
+    assert_eq!(out["spec"]["a"], json!(7), "{out}");
+    assert_eq!(out["status"]["b"], json!(9), "{out}");
 }
