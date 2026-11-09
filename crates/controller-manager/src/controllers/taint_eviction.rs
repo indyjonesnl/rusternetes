@@ -298,8 +298,8 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
             recorder,
             taint_eviction_queue,
             tainted_nodes: Mutex::new(HashMap::new()),
-            node_update_queue: WorkQueue::new(),
-            pod_update_queue: WorkQueue::new(),
+            node_update_queue: WorkQueue::named("noexec_taint_node"),
+            pod_update_queue: WorkQueue::named("noexec_taint_pod"),
             node_cache: Mutex::new(HashMap::new()),
             pod_cache: Mutex::new(HashMap::new()),
         }

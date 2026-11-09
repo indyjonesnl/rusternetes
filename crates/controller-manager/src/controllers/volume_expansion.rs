@@ -68,7 +68,7 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
 
         info!("Starting Volume Expansion Controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("volume_expand");
 
         // N workers drain ONE shared queue; a key in flight is never handed to
         // a second worker (`wait.UntilWithContext(ctx, worker, time.Second)` x N).

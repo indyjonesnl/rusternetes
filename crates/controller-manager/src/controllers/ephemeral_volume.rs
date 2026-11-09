@@ -206,7 +206,7 @@ impl<S: Storage + 'static> EphemeralVolumeController<S> {
         use futures::StreamExt;
         info!("Starting ephemeral volume controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("ephemeral_volume");
         let worker = self.clone();
         let wq = queue.clone();
         tokio::spawn(async move {

@@ -251,8 +251,8 @@ impl<S: Storage + 'static> NodeController<S> {
     /// Watch-based run loop. Performs an initial full reconciliation, then watches
     /// for node changes. Falls back to periodic resync every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
-        let pod_queue = WorkQueue::new();
+        let queue = WorkQueue::named("node_lifecycle_controller");
+        let pod_queue = WorkQueue::named("node_lifecycle_controller_pods");
 
         // Node taint/label pass pool (:483-491).
         spawn_workers(NODE_UPDATE_WORKER_SIZE, &queue, |worker_queue| {
