@@ -405,8 +405,16 @@ mod tests {
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
     }
 
-    #[test]
-    fn defaulter_defaults_a_deployment_after_patch() {
+    fn apps_deployments() -> GroupVersionResource {
+        GroupVersionResource {
+            group: "apps".into(),
+            version: "v1".into(),
+            resource: "deployments".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn defaulter_defaults_a_deployment_after_patch() {
         // Scheme.Default runs SetDefaults_Deployment and the pod template's.
         let mut o = serde_json::json!({
             "apiVersion": "apps/v1", "kind": "Deployment",
@@ -415,7 +423,9 @@ mod tests {
                 "template": {"metadata": {"labels": {"a": "b"}},
                     "spec": {"containers": [{"name": "c", "image": "i", "customField": true}]}}}
         });
-        SchemeObjectDefaulter.default_object(&mut o);
+        SchemeObjectDefaulter
+            .default_object(&apps_deployments(), &mut o)
+            .await;
         assert_eq!(o["spec"]["strategy"]["type"], "RollingUpdate");
         assert_eq!(o["spec"]["template"]["spec"]["restartPolicy"], "Always");
         // Fields the typed form does not know survive.
@@ -425,19 +435,98 @@ mod tests {
         );
     }
 
-    #[test]
-    fn defaulter_leaves_set_values_and_unknown_kinds_alone() {
+    async fn widgets_crd_storage() -> Arc<rusternetes_storage::memory::MemoryStorage> {
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let crd: rusternetes_common::resources::CustomResourceDefinition =
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": "widgets.example.com"},
+                "spec": {
+                    "group": "example.com", "scope": "Namespaced",
+                    "names": {"plural": "widgets", "kind": "Widget"},
+                    "versions": [{
+                        "name": "v1", "served": true, "storage": true,
+                        "schema": {"openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {"spec": {"type": "object",
+                                "properties": {"a": {"type": "integer", "default": 7}}}}
+                        }}
+                    }]
+                }
+            }))
+            .unwrap();
+        storage
+            .create(
+                &rusternetes_storage::build_key(
+                    "customresourcedefinitions",
+                    None,
+                    "widgets.example.com",
+                ),
+                &crd,
+            )
+            .await
+            .unwrap();
+        storage
+    }
+
+    /// `GetObjectDefaulter().Default` of a custom resource is the CRD's
+    /// `unstructuredDefaulter` (customresource_handler.go:1240-1249,
+    /// policy/mutating/dispatcher.go:274), so the next policy sees the
+    /// defaults a patch removed.
+    #[tokio::test]
+    async fn defaulter_applies_the_crd_structural_defaults_to_a_custom_resource() {
+        let defaulter = StorageObjectDefaulter::new(widgets_crd_storage().await);
+        let widgets = GroupVersionResource {
+            group: "example.com".into(),
+            version: "v1".into(),
+            resource: "widgets".into(),
+        };
+        let mut o = serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Widget",
+            "metadata": {"name": "w"}, "spec": {}
+        });
+        defaulter.default_object(&widgets, &mut o).await;
+        assert_eq!(o["spec"]["a"], 7, "{o}");
+        // A value that is set stays.
+        let mut o = serde_json::json!({
+            "apiVersion": "example.com/v1", "kind": "Widget", "spec": {"a": 1}
+        });
+        defaulter.default_object(&widgets, &mut o).await;
+        assert_eq!(o["spec"]["a"], 1, "{o}");
+    }
+
+    #[tokio::test]
+    async fn storage_defaulter_falls_back_to_the_scheme_for_a_built_in_type() {
+        let defaulter = StorageObjectDefaulter::new(widgets_crd_storage().await);
+        let mut o = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {"name": "d"},
+            "spec": {"selector": {"matchLabels": {"a": "b"}},
+                "template": {"metadata": {"labels": {"a": "b"}},
+                    "spec": {"containers": [{"name": "c", "image": "i"}]}}}
+        });
+        defaulter.default_object(&apps_deployments(), &mut o).await;
+        assert_eq!(o["spec"]["strategy"]["type"], "RollingUpdate");
+    }
+
+    #[tokio::test]
+    async fn defaulter_leaves_set_values_and_unknown_kinds_alone() {
         let mut o = serde_json::json!({
             "apiVersion": "example.com/v1", "kind": "Widget", "spec": {"a": 1}
         });
         let before = o.clone();
-        SchemeObjectDefaulter.default_object(&mut o);
+        SchemeObjectDefaulter
+            .default_object(&apps_deployments(), &mut o)
+            .await;
         assert_eq!(o, before);
         let mut p = serde_json::json!({
             "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"},
             "spec": {"restartPolicy": "Never", "containers": [{"name": "c", "image": "i"}]}
         });
-        SchemeObjectDefaulter.default_object(&mut p);
+        SchemeObjectDefaulter
+            .default_object(&apps_deployments(), &mut p)
+            .await;
         assert_eq!(p["spec"]["restartPolicy"], "Never");
         assert_eq!(p["spec"]["enableServiceLinks"], true);
     }
