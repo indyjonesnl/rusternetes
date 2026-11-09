@@ -44,6 +44,13 @@ pub struct ApiClient {
     /// limiter belongs to ONE client: [`Self::for_controller`] gives a clone its
     /// own fresh bucket rather than sharing this one (#1863).
     limiter: Arc<RateLimiter>,
+    /// The component's default `User-Agent`
+    /// (`rest.DefaultKubernetesUserAgent()`, set by
+    /// [`Self::with_default_user_agent`]). [`Self::for_controller`] derives its
+    /// per-controller agent from it.
+    default_user_agent: Option<String>,
+    /// The `User-Agent` sent on every request, none when unset.
+    user_agent: Option<String>,
 }
 
 #[derive(Debug)]
@@ -249,6 +256,8 @@ impl ApiClient {
             stream_client,
             token,
             limiter: Arc::new(RateLimiter::unlimited()),
+            default_user_agent: None,
+            user_agent: None,
         })
     }
 
@@ -286,13 +295,42 @@ impl ApiClient {
     /// The HTTP connection pools (`reqwest::Client` is an `Arc` inside) are
     /// shared, as upstream shares the transport cache; only the limiter is new,
     /// with this skeleton's QPS/burst.
-    pub fn for_controller(&self, _name: &str) -> Self {
+    ///
+    /// The clone also gets its own `User-Agent`, `restclient.AddUserAgent(
+    /// &clientConfig, name)` (client_builder.go:46): the default agent with
+    /// `/<name>` appended (`rest/config.go:626-630`), so the api-server's audit
+    /// and request logs say which controller made a call. Without a default
+    /// agent ([`Self::with_default_user_agent`]) no header is sent.
+    pub fn for_controller(&self, name: &str) -> Self {
         Self {
             base_url: self.base_url.clone(),
             client: self.client.clone(),
             stream_client: self.stream_client.clone(),
             token: self.token.clone(),
             limiter: Arc::new(RateLimiter::new(self.limiter.qps(), self.limiter.burst())),
+            default_user_agent: self.default_user_agent.clone(),
+            user_agent: self
+                .default_user_agent
+                .as_ref()
+                .map(|default| format!("{default}/{name}")),
+        }
+    }
+
+    /// Set the component's default `User-Agent` and send it on every request
+    /// (`SetKubernetesDefaults`, `rest/config.go:484-489`). Pass
+    /// `rusternetes_common::compatibility::default_kubernetes_user_agent()`.
+    pub fn with_default_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        let ua = user_agent.into();
+        self.user_agent = Some(ua.clone());
+        self.default_user_agent = Some(ua);
+        self
+    }
+
+    /// Stamp the `User-Agent` on a request, when this client has one.
+    fn with_user_agent(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.user_agent {
+            Some(ua) => request.header(reqwest::header::USER_AGENT, ua),
+            None => request,
         }
     }
 
@@ -300,6 +338,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.get(&url);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -345,6 +384,7 @@ impl ApiClient {
         // Use the stream client (no total-request timeout) — a watch is a
         // long-lived stream and must not be killed by the CRUD timeout (#1165).
         let mut request = self.stream_client.get(&url);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -386,6 +426,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.post(&url).json(body);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -421,6 +462,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.put(&url).json(body);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -464,6 +506,7 @@ impl ApiClient {
 
         self.limiter.acquire().await;
         let mut request = self.client.delete(&url);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -499,6 +542,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.get(&url);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -522,6 +566,7 @@ impl ApiClient {
             .patch(&url)
             .header("Content-Type", content_type)
             .json(body);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -552,6 +597,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.get(&url);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
@@ -610,6 +656,7 @@ impl ApiClient {
         let url = format!("{}{}", self.base_url, path);
         self.limiter.acquire().await;
         let mut request = self.client.get(&url).header("Accept", accept);
+        request = self.with_user_agent(request);
 
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
