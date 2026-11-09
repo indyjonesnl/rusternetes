@@ -375,6 +375,66 @@ fn base_version_get() -> VersionInfo {
     }
 }
 
+/// `adjustCommit` (client-go `rest/config.go:493-501`): the first 7
+/// characters of the commit, `unknown` when empty.
+pub fn adjust_commit(c: &str) -> String {
+    if c.is_empty() {
+        return "unknown".to_string();
+    }
+    c.chars().take(7).collect()
+}
+
+/// `adjustVersion` (`rest/config.go:503-512`): strips "alpha", "beta", etc.
+/// from a `major.minor.patch-[alpha|beta|etc]` version; `unknown` when empty.
+pub fn adjust_version(v: &str) -> String {
+    if v.is_empty() {
+        return "unknown".to_string();
+    }
+    v.split('-').next().unwrap_or(v).to_string()
+}
+
+/// `adjustCommand` (`rest/config.go:514-522`): the last component of the
+/// command path, `unknown` when empty.
+pub fn adjust_command(p: &str) -> String {
+    if p.is_empty() {
+        return "unknown".to_string();
+    }
+    std::path::Path::new(p)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string())
+}
+
+/// `buildUserAgent` (`rest/config.go:524-527`).
+pub fn build_user_agent(
+    command: &str,
+    version: &str,
+    os: &str,
+    arch: &str,
+    commit: &str,
+) -> String {
+    format!("{command}/{version} ({os}/{arch}) kubernetes/{commit}")
+}
+
+/// `rest.DefaultKubernetesUserAgent()` (`rest/config.go:529-537`): built from
+/// the stamped build info ([`base_version_get`]) and the running binary, with
+/// Go's `GOOS`/`GOARCH` spelling (`x86_64` is `amd64`, `aarch64` is `arm64`).
+pub fn default_kubernetes_user_agent() -> String {
+    let info = base_version_get();
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    build_user_agent(
+        &adjust_command(&std::env::args().next().unwrap_or_default()),
+        &adjust_version(&info.git_version),
+        std::env::consts::OS,
+        arch,
+        &adjust_commit(&info.git_commit),
+    )
+}
+
 impl EffectiveVersion {
     /// `effectiveVersion.Info` (version.go:168-190). The binary version is
     /// never nil here (see `from_string`), so there is no nil return.

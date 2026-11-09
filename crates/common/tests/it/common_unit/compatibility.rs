@@ -395,4 +395,55 @@ mod tests {
         assert!(v.get("minCompatibilityMinor").is_none());
         assert_eq!(v["major"], "");
     }
+
+    // rest/config_test.go TestAdjustVersion
+    #[test]
+    fn adjust_version_strips_the_prerelease_suffix() {
+        assert_eq!(adjust_version("1.2.3-alpha4"), "1.2.3");
+        assert_eq!(adjust_version("1.2.3-alpha"), "1.2.3");
+        assert_eq!(adjust_version("1.2.3"), "1.2.3");
+        assert_eq!(adjust_version(""), "unknown");
+    }
+
+    // rest/config_test.go TestAdjustCommit
+    #[test]
+    fn adjust_commit_keeps_seven_characters() {
+        assert_eq!(adjust_commit("1234567890"), "1234567");
+        assert_eq!(adjust_commit("123456"), "123456");
+        assert_eq!(adjust_commit(""), "unknown");
+    }
+
+    // rest/config_test.go TestAdjustCommand
+    #[test]
+    fn adjust_command_is_the_last_path_component() {
+        assert_eq!(adjust_command("home/bob/Downloads/beans"), "beans");
+        assert_eq!(adjust_command("./beans"), "beans");
+        assert_eq!(adjust_command("beans"), "beans");
+        assert_eq!(adjust_command(""), "unknown");
+    }
+
+    // rest/config_test.go TestBuildUserAgent
+    #[test]
+    fn build_user_agent_formats_like_upstream() {
+        assert_eq!(
+            build_user_agent("lynx", "nicest", "beos", "itanium", "baaaaaaaaad"),
+            "lynx/nicest (beos/itanium) kubernetes/baaaaaaaaad"
+        );
+    }
+
+    // rest/config_test.go TestDefaultKubernetesUserAgent, plus the stamped
+    // build info and Go's GOOS/GOARCH spelling.
+    #[test]
+    fn default_user_agent_uses_the_build_stamp() {
+        let ua = default_kubernetes_user_agent();
+        assert!(ua.contains("kubernetes"), "{ua}");
+        let (cmd, rest) = ua.split_once('/').unwrap();
+        assert!(!cmd.is_empty() && !cmd.contains('/'), "{ua}");
+        assert!(rest.starts_with("v1.35.0 (linux/"), "{ua}");
+        assert!(
+            rest.ends_with("/amd64) kubernetes/rustern")
+                || rest.ends_with("/arm64) kubernetes/rustern"),
+            "{ua}"
+        );
+    }
 }

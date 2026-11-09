@@ -867,7 +867,12 @@ async fn run_api_mode(
             client_key.map(|p| p.into_bytes()),
             None,
         )?
-        .with_rate_limit(args.kube_api_qps, args.kube_api_burst),
+        .with_rate_limit(args.kube_api_qps, args.kube_api_burst)
+        // `rest.SetKubernetesDefaults`; each controller's clone appends its
+        // name (`AddUserAgent`).
+        .with_default_user_agent(
+            rusternetes_common::compatibility::default_kubernetes_user_agent(),
+        ),
     );
     let config = rusternetes_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,

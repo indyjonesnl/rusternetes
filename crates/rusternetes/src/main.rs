@@ -602,11 +602,14 @@ async fn async_main() -> Result<()> {
     // The controller-manager reaches cluster state through the embedded
     // api-server over the same loopback client as scheduler/DNS (#1128),
     // rather than the StorageBackend directly.
-    let cm_client = Arc::new(rusternetes_client::http::ApiClient::new(
-        &loopback_url,
-        args.tls,
-        None,
-    )?);
+    let cm_client = Arc::new(
+        rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+            // `rest.SetKubernetesDefaults`; each controller's clone appends
+            // its name (`AddUserAgent`).
+            .with_default_user_agent(
+                rusternetes_common::compatibility::default_kubernetes_user_agent(),
+            ),
+    );
     info!("Controller manager reading cluster state from embedded api-server at {loopback_url}");
     spawn_controller_manager_metrics(args.controller_manager_metrics_port);
     tokio::spawn(async move {
