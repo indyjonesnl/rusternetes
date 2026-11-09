@@ -344,6 +344,33 @@ impl Error {
         )))
     }
 
+    /// The HTTP status code this error carries, the counterpart of
+    /// `apierrors.APIStatus.Status().Code` (apimachinery
+    /// `pkg/api/errors/errors.go`). Matches the code `IntoResponse` writes for
+    /// every variant; a hand-built [`Error::Status`] reports its own `code`,
+    /// with an unset (0) code reported as 500 like `recordMetrics`
+    /// (`clustertrustbundlepublisher/metrics.go:57-69`).
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Error::NotFound(_) => 404,
+            Error::AlreadyExists(_) | Error::Conflict(_) => 409,
+            Error::InvalidResource(_) | Error::Invalid(_) => 422,
+            Error::BadRequest(_) | Error::Serialization(_) => 400,
+            Error::Authentication(_) => 401,
+            Error::Forbidden(_) => 403,
+            Error::TooManyRequests(_) => 429,
+            Error::Gone(_) | Error::GoneWithContinue { .. } => 410,
+            Error::UnsupportedMediaType(_) => 415,
+            Error::NotAcceptable(_) => 406,
+            Error::Network(_) => 503,
+            Error::Storage(_)
+            | Error::StorageTooLarge(_)
+            | Error::Authorization(_)
+            | Error::Internal(_) => 500,
+            Error::Status(status) => status.code.filter(|c| *c != 0).unwrap_or(500),
+        }
+    }
+
     /// Returns the machine-readable reason string matching Kubernetes StatusReason values
     pub fn reason(&self) -> &str {
         match self {
