@@ -16,13 +16,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # containerd (includes containerd, ctr, containerd-shim-runc-v2 under bin/).
-RUN curl -fsSL "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${TARGETARCH}.tar.gz" \
-      | tar -xz -C /usr/local
+# `--retry` survives transient GitHub download failures (e.g. HTTP 504). Download
+# to a temp file rather than piping to tar so a retry cannot concatenate a
+# partial stream and curl's non-zero exit is not masked by tar.
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+      "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${TARGETARCH}.tar.gz" \
+      -o /tmp/containerd.tar.gz \
+    && tar -xzf /tmp/containerd.tar.gz -C /usr/local \
+    && rm /tmp/containerd.tar.gz
 
 # CNI plugins (bridge, host-local, portmap, loopback, …) for pod networking.
 RUN mkdir -p /opt/cni/bin \
-    && curl -fsSL "https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-${TARGETARCH}-v${CNI_VERSION}.tgz" \
-      | tar -xz -C /opt/cni/bin
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+      "https://github.com/containernetworking/plugins/releases/download/v${CNI_VERSION}/cni-plugins-linux-${TARGETARCH}-v${CNI_VERSION}.tgz" \
+      -o /tmp/cni-plugins.tgz \
+    && tar -xzf /tmp/cni-plugins.tgz -C /opt/cni/bin \
+    && rm /tmp/cni-plugins.tgz
 
 # containerd's runc-v2 shim can drive crun directly via BinaryName. Keep a
 # runc-compatible path around as a safety belt for tools that still expect it.

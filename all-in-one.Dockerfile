@@ -68,8 +68,11 @@ RUN apt-get update && apt-get install -y \
          arm64) SCCACHE_ARCH=aarch64-unknown-linux-musl ;; \
          *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
        esac \
-    && curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz" \
-        | tar -xz -C /tmp \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}.tar.gz" \
+        -o /tmp/sccache.tar.gz \
+    && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+    && rm /tmp/sccache.tar.gz \
     && install -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}/sccache" /usr/local/bin/sccache \
     && rm -rf "/tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}"
 
