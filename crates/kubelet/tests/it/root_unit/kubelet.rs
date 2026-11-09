@@ -307,6 +307,55 @@ mod tests {
         assert_eq!(z.node_status_heartbeat_interval(), Duration::from_secs(10));
     }
 
+    /// `volumeStatsAggPeriod` reaches the resource analyzer's loop period
+    /// (kubelet.go:705 -> fs_resource_analyzer.go calcPeriod); 0/unset is the
+    /// v1beta1 default of 1m.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn volume_stats_agg_period_reaches_the_analyzer() {
+        use rusternetes_storage::StorageBackend;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("absent.sock");
+        std::env::set_var(
+            "CONTAINER_RUNTIME_ENDPOINT",
+            format!("unix://{}", sock.display()),
+        );
+        let mk = || async {
+            Kubelet::new(
+                "node-vs".into(),
+                std::sync::Arc::new(StorageBackend::new_memory()),
+                10,
+                dir.path().join("vols").display().to_string(),
+                "10.96.0.10".into(),
+                "cluster.local".into(),
+                "bridge".into(),
+                String::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let d = mk().await;
+        assert_eq!(
+            d.new_resource_analyzer().calc_period(),
+            Duration::from_secs(60)
+        );
+        let z = mk()
+            .await
+            .with_volume_stats_agg_period(Some(Duration::ZERO));
+        assert_eq!(
+            z.new_resource_analyzer().calc_period(),
+            Duration::from_secs(60)
+        );
+        let k = mk()
+            .await
+            .with_volume_stats_agg_period(Some(Duration::from_secs(7)));
+        assert_eq!(
+            k.new_resource_analyzer().calc_period(),
+            Duration::from_secs(7)
+        );
+    }
+
     /// `fileCheckFrequency` drives the static-pod file source poll
     /// (kubelet.go:384 -> file.go:93) and a poll publishes manifests to the
     /// cache `sync_loop` reads.

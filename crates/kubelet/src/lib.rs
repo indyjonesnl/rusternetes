@@ -41,6 +41,7 @@ pub mod server_logs;
 pub mod server_metrics;
 pub mod server_metrics_endpoints;
 pub mod server_resource_metrics;
+pub mod server_stats;
 pub mod serving_tls;
 pub mod static_pod_url;
 pub mod static_pod_watch;

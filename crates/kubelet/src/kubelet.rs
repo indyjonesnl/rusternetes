@@ -554,6 +554,12 @@ pub struct Kubelet {
     /// `kl.containerLogManager`, built and started by [`Kubelet::run`].
     pub container_log_manager:
         std::sync::OnceLock<Arc<dyn crate::container_log_manager::ContainerLogManager>>,
+    /// `KubeletConfiguration.volumeStatsAggPeriod` (v1beta1 default 1m): the
+    /// period of the volume stats aggregation (`kubelet.go:705`).
+    pub volume_stats_agg_period: Duration,
+    /// `kubelet.resourceAnalyzer` (`kubelet.go:705`), created and started by
+    /// [`Kubelet::run`] (`kubelet.go:1724`); read by the stats summary.
+    pub resource_analyzer: std::sync::OnceLock<Arc<crate::server_stats::FsResourceAnalyzer>>,
     /// `nodeStatusMaxImages` (v1beta1 default 50, -1 = no cap).
     pub node_status_max_images: i32,
     /// `lastStatusReportTime` + `delayAfterNodeStatusChange`
@@ -1048,6 +1054,8 @@ impl Kubelet {
             image_gc_policy: None,
             container_log_config: None,
             container_log_manager: std::sync::OnceLock::new(),
+            volume_stats_agg_period: Duration::from_secs(60),
+            resource_analyzer: std::sync::OnceLock::new(),
             node_status_max_images: 50,
             status_report_state: Mutex::new(StatusReportState::default()),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
@@ -1099,6 +1107,32 @@ impl Kubelet {
         self.file_check_frequency = d
             .filter(|d| !d.is_zero())
             .unwrap_or(Duration::from_secs(20));
+        self
+    }
+
+    /// `serverstats.NewResourceAnalyzer(ctx, klet, kubeCfg.VolumeStatsAggPeriod
+    /// .Duration, kubeDeps.Recorder)` (`kubelet.go:705`): the analyzer ticking
+    /// at the configured `volumeStatsAggPeriod`.
+    pub fn new_resource_analyzer(&self) -> Arc<crate::server_stats::FsResourceAnalyzer> {
+        crate::server_stats::FsResourceAnalyzer::new(
+            Arc::new(crate::server_stats::KubeletStatsProvider {
+                pod_manager: self.pod_cache.clone(),
+                volume_manager: self.volume_manager.clone(),
+            }),
+            self.volume_stats_agg_period,
+            Arc::new(crate::server_stats::StoragePodEvents {
+                recorder: rusternetes_storage::EventRecorder::new(self.storage.clone()),
+                node_name: self.node_name.clone(),
+            }),
+        )
+    }
+
+    /// Apply `KubeletConfiguration.volumeStatsAggPeriod` (1m when unset/zero,
+    /// v1beta1/defaults.go).
+    pub fn with_volume_stats_agg_period(mut self, d: Option<Duration>) -> Self {
+        self.volume_stats_agg_period = d
+            .filter(|d| !d.is_zero())
+            .unwrap_or(Duration::from_secs(60));
         self
     }
 
@@ -1379,6 +1413,17 @@ impl Kubelet {
             let synced = self.pods_synced.clone();
             self.volume_manager
                 .run(move || synced.load(Ordering::SeqCst));
+        }
+
+        // `klet.resourceAnalyzer = serverstats.NewResourceAnalyzer(ctx, klet,
+        // kubeCfg.VolumeStatsAggPeriod.Duration, kubeDeps.Recorder)`
+        // (`kubelet.go:705`) and `kl.resourceAnalyzer.Start(ctx)`
+        // (`kubelet.go:1724`).
+        {
+            let analyzer = self.new_resource_analyzer();
+            if self.resource_analyzer.set(analyzer.clone()).is_ok() {
+                analyzer.start();
+            }
         }
 
         // Check runtime state once before registering so the first Ready

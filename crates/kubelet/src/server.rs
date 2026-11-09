@@ -123,7 +123,16 @@ async fn handle_stats_summary(State(state): State<ServerState>) -> impl IntoResp
     let pod_summaries: Vec<_> = pods
         .iter()
         .map(|p| {
-            json!({
+            // `makePodStorageStats` (`pkg/kubelet/stats/helper.go:494-499`):
+            // `VolumeStats = append(ephemeral, persistent...)` when the
+            // resource analyzer has stats for the pod.
+            let volume = state
+                .kubelet
+                .as_ref()
+                .and_then(|k| k.resource_analyzer.get())
+                .and_then(|a| a.get_pod_volume_stats(&p.metadata.uid))
+                .map(|v| v.all());
+            let mut summary = json!({
                 "podRef": {
                     "name": p.metadata.name,
                     "namespace": p.metadata.namespace.clone().unwrap_or_default(),
@@ -131,7 +140,11 @@ async fn handle_stats_summary(State(state): State<ServerState>) -> impl IntoResp
                 },
                 "cpu": { "usageNanoCores": 0u64 },
                 "memory": { "workingSetBytes": 0u64 },
-            })
+            });
+            if let Some(volume) = volume {
+                summary["volume"] = json!(volume);
+            }
+            summary
         })
         .collect();
 

@@ -331,6 +331,31 @@ impl VolumeManager {
         paths
     }
 
+    /// Port of `GetMountedVolumesForPod` + `getMountedVolumes`
+    /// (`volume_manager.go:320-331`, `:581-598`): the pod's mounted volumes
+    /// keyed by `OuterVolumeSpecName`, joining the actual state of world's
+    /// mounted volumes with the desired state's outer names. Consumed by the
+    /// kubelet's `ListVolumesForPod` / `ListBlockVolumesForPod`
+    /// (`kubelet_volumes.go:39-74`).
+    pub fn get_mounted_volumes_for_pod(
+        &self,
+        pod_name: &UniquePodName,
+    ) -> HashMap<String, crate::volume_plugins::util::operation_executor::MountedVolume> {
+        let by_name: HashMap<_, _> = self
+            .actual_state_of_world
+            .get_mounted_volumes_for_pod(pod_name)
+            .into_iter()
+            .map(|v| (v.volume_name.clone(), v.0))
+            .collect();
+        self.desired_state_of_world
+            .get_volume_names_for_pod(pod_name)
+            .into_iter()
+            .filter_map(|(outer, volume_name)| {
+                by_name.get(&volume_name).map(|v| (outer, v.clone()))
+            })
+            .collect()
+    }
+
     /// Port of `WaitForUnmount` (`volume_manager.go:475-511`): waits for the
     /// reconciler to unmount every volume of a terminated pod
     /// (`SyncTerminatedPod`, `kubelet.go:2364`).
