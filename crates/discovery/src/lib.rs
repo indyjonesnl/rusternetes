@@ -1478,6 +1478,20 @@ fn get_aggregated_resources_for_group_unfiltered(
         })
     };
 
+    // A subresource whose storage is a `rest.GroupVersionKindProvider`
+    // (installer.go:1119-1124): its kind is registered under the group version
+    // the provider returns, not the one it is served under. `ScaleREST`
+    // (pkg/registry/{core/replicationcontroller,apps/*}/storage) returns
+    // autoscaling/v1 `Scale` for every served version; `EvictionREST`
+    // (pkg/registry/core/pod/storage/eviction.go:83) policy/v1 `Eviction`.
+    let sub_gvk = |name: &str, kgroup: &str, kversion: &str, kind: &str, verbs: &[&str]| {
+        serde_json::json!({
+            "subresource": name,
+            "responseKind": { "group": kgroup, "version": kversion, "kind": kind },
+            "verbs": verbs
+        })
+    };
+
     // Helper to build a top-level resource entry with optional subresources and short names
     let res_with_short = |name: &str,
                           singular: &str,
@@ -1562,7 +1576,7 @@ fn get_aggregated_resources_for_group_unfiltered(
                     sub("attach", "PodAttachOptions", &["get", "create"]),
                     sub("portforward", "PodPortForwardOptions", &["get", "create"]),
                     sub("binding", "Binding", &["create"]),
-                    sub("eviction", "Eviction", &["create"]),
+                    sub_gvk("eviction", "policy", "v1", "Eviction", &["create"]),
                     sub("ephemeralcontainers", "Pod", &["get", "patch", "update"]),
                     sub("proxy", "Pod", &["get", "put", "post", "delete", "patch"]),
                 ],
@@ -1677,7 +1691,7 @@ fn get_aggregated_resources_for_group_unfiltered(
                 all_verbs,
                 vec![
                     sub("status", "ReplicationController", status_verbs),
-                    sub("scale", "Scale", status_verbs),
+                    sub_gvk("scale", "autoscaling", "v1", "Scale", status_verbs),
                 ],
                 Some(vec!["rc"]),
             ),
@@ -1782,7 +1796,7 @@ fn get_aggregated_resources_for_group_unfiltered(
                 all_verbs,
                 vec![
                     sub("status", "Deployment", status_verbs),
-                    sub("scale", "Scale", status_verbs),
+                    sub_gvk("scale", "autoscaling", "v1", "Scale", status_verbs),
                 ],
                 Some(vec!["deploy"]),
             ),
@@ -1794,7 +1808,7 @@ fn get_aggregated_resources_for_group_unfiltered(
                 all_verbs,
                 vec![
                     sub("status", "ReplicaSet", status_verbs),
-                    sub("scale", "Scale", status_verbs),
+                    sub_gvk("scale", "autoscaling", "v1", "Scale", status_verbs),
                 ],
                 Some(vec!["rs"]),
             ),
@@ -1815,7 +1829,7 @@ fn get_aggregated_resources_for_group_unfiltered(
                 all_verbs,
                 vec![
                     sub("status", "StatefulSet", status_verbs),
-                    sub("scale", "Scale", status_verbs),
+                    sub_gvk("scale", "autoscaling", "v1", "Scale", status_verbs),
                 ],
                 Some(vec!["sts"]),
             ),
@@ -2428,6 +2442,14 @@ pub struct APIResource {
     pub categories: Option<Vec<String>>,
     #[serde(rename = "storageVersionHash", skip_serializing_if = "Option::is_none")]
     pub storage_version_hash: Option<String>,
+    /// `metav1.APIResource.Group`/`Version`: set when the resource's storage is
+    /// a `rest.GroupVersionKindProvider` (installer.go:1119-1124), i.e. the
+    /// `Scale` and `Eviction` subresources, whose kind is not in the group
+    /// version they are served under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl APIResourceList {
@@ -2477,6 +2499,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["ns".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "namespaces/status".to_string(),
@@ -2490,6 +2514,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods".to_string(),
@@ -2512,6 +2538,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["po".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/status".to_string(),
@@ -2525,6 +2553,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/log".to_string(),
@@ -2535,6 +2565,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/exec".to_string(),
@@ -2545,6 +2577,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/attach".to_string(),
@@ -2555,6 +2589,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/portforward".to_string(),
@@ -2565,6 +2601,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/binding".to_string(),
@@ -2575,6 +2613,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods/eviction".to_string(),
@@ -2585,6 +2625,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: Some("policy".to_string()),
+            version: Some("v1".to_string()),
         },
         APIResource {
             name: "services".to_string(),
@@ -2607,6 +2649,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["svc".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "services/status".to_string(),
@@ -2620,6 +2664,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "nodes".to_string(),
@@ -2635,6 +2681,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["no".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "nodes/status".to_string(),
@@ -2648,6 +2696,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "configmaps".to_string(),
@@ -2670,6 +2720,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["cm".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "secrets".to_string(),
@@ -2692,6 +2744,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "serviceaccounts".to_string(),
@@ -2714,6 +2768,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["sa".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "persistentvolumes".to_string(),
@@ -2729,6 +2785,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["pv".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "persistentvolumeclaims".to_string(),
@@ -2751,6 +2809,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["pvc".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "endpoints".to_string(),
@@ -2773,6 +2833,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["ep".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "events".to_string(),
@@ -2795,6 +2857,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["ev".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "resourcequotas".to_string(),
@@ -2810,6 +2874,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["quota".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "limitranges".to_string(),
@@ -2825,6 +2891,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["limits".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "replicationcontrollers".to_string(),
@@ -2840,6 +2908,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["rc".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "replicationcontrollers/status".to_string(),
@@ -2853,6 +2923,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "replicationcontrollers/scale".to_string(),
@@ -2866,6 +2938,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: Some("autoscaling".to_string()),
+            version: Some("v1".to_string()),
         },
         APIResource {
             name: "podtemplates".to_string(),
@@ -2881,6 +2955,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "componentstatuses".to_string(),
@@ -2891,6 +2967,8 @@ pub async fn get_core_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["cs".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -2932,6 +3010,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["deploy".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "deployments/status".to_string(),
@@ -2945,6 +3025,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "deployments/scale".to_string(),
@@ -2958,6 +3040,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: Some("autoscaling".to_string()),
+            version: Some("v1".to_string()),
         },
         APIResource {
             name: "replicasets".to_string(),
@@ -2980,6 +3064,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["rs".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "replicasets/status".to_string(),
@@ -2993,6 +3079,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "replicasets/scale".to_string(),
@@ -3006,6 +3094,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: Some("autoscaling".to_string()),
+            version: Some("v1".to_string()),
         },
         APIResource {
             name: "statefulsets".to_string(),
@@ -3028,6 +3118,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["sts".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "statefulsets/status".to_string(),
@@ -3041,6 +3133,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "statefulsets/scale".to_string(),
@@ -3054,6 +3148,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: Some("autoscaling".to_string()),
+            version: Some("v1".to_string()),
         },
         APIResource {
             name: "daemonsets".to_string(),
@@ -3076,6 +3172,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["ds".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "daemonsets/status".to_string(),
@@ -3089,6 +3187,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "controllerrevisions".to_string(),
@@ -3104,6 +3204,8 @@ pub async fn get_apps_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3145,6 +3247,8 @@ pub async fn get_batch_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "jobs/status".to_string(),
@@ -3158,6 +3262,8 @@ pub async fn get_batch_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "cronjobs".to_string(),
@@ -3180,6 +3286,8 @@ pub async fn get_batch_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["cj".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "cronjobs/status".to_string(),
@@ -3193,6 +3301,8 @@ pub async fn get_batch_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3234,6 +3344,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: Some(vec!["ing".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "ingresses/status".to_string(),
@@ -3247,6 +3359,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "ingressclasses".to_string(),
@@ -3269,6 +3383,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "networkpolicies".to_string(),
@@ -3291,6 +3407,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: Some(vec!["netpol".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "servicecidrs".to_string(),
@@ -3313,6 +3431,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "servicecidrs/status".to_string(),
@@ -3326,6 +3446,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "ipaddresses".to_string(),
@@ -3348,6 +3470,8 @@ pub async fn get_networking_v1_resources() -> (StatusCode, Json<APIResourceList>
             short_names: Some(vec!["ip".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3389,6 +3513,8 @@ pub async fn get_rbac_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "rolebindings".to_string(),
@@ -3411,6 +3537,8 @@ pub async fn get_rbac_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "clusterroles".to_string(),
@@ -3433,6 +3561,8 @@ pub async fn get_rbac_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "clusterrolebindings".to_string(),
@@ -3455,6 +3585,8 @@ pub async fn get_rbac_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3496,6 +3628,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["sc".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "csidrivers".to_string(),
@@ -3518,6 +3652,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "csinodes".to_string(),
@@ -3540,6 +3676,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "csistoragecapacities".to_string(),
@@ -3562,6 +3700,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumeattachments".to_string(),
@@ -3584,6 +3724,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumeattachments/status".to_string(),
@@ -3597,6 +3739,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumeattributesclasses".to_string(),
@@ -3619,6 +3763,8 @@ pub async fn get_storage_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3659,6 +3805,8 @@ pub async fn get_scheduling_v1_resources() -> (StatusCode, Json<APIResourceList>
         short_names: Some(vec!["pc".to_string()]),
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -3699,6 +3847,8 @@ pub async fn get_apiextensions_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: Some(vec!["crd".to_string(), "crds".to_string()]),
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "customresourcedefinitions/status".to_string(),
@@ -3712,6 +3862,8 @@ pub async fn get_apiextensions_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3753,6 +3905,8 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             short_names: None,
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "mutatingwebhookconfigurations".to_string(),
@@ -3775,6 +3929,8 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             short_names: None,
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "validatingadmissionpolicies".to_string(),
@@ -3797,6 +3953,8 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             short_names: None,
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "validatingadmissionpolicies/status".to_string(),
@@ -3810,6 +3968,8 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "validatingadmissionpolicybindings".to_string(),
@@ -3832,6 +3992,8 @@ pub async fn get_admissionregistration_v1_resources() -> (StatusCode, Json<APIRe
             short_names: None,
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -3872,6 +4034,8 @@ pub async fn get_coordination_v1_resources() -> (StatusCode, Json<APIResourceLis
         short_names: None,
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -3912,6 +4076,8 @@ pub async fn get_flowcontrol_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "flowschemas/status".to_string(),
@@ -3925,6 +4091,8 @@ pub async fn get_flowcontrol_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "prioritylevelconfigurations".to_string(),
@@ -3947,6 +4115,8 @@ pub async fn get_flowcontrol_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "prioritylevelconfigurations/status".to_string(),
@@ -3960,6 +4130,8 @@ pub async fn get_flowcontrol_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4001,6 +4173,8 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
             short_names: Some(vec!["csr".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "certificatesigningrequests/status".to_string(),
@@ -4014,6 +4188,8 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "certificatesigningrequests/approval".to_string(),
@@ -4024,6 +4200,8 @@ pub async fn get_certificates_v1_resources() -> (StatusCode, Json<APIResourceLis
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4079,6 +4257,8 @@ pub async fn get_storagemigration_v1beta1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "storageversionmigrations/status".to_string(),
@@ -4089,6 +4269,8 @@ pub async fn get_storagemigration_v1beta1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
     let resource_list = APIResourceList {
@@ -4150,6 +4332,8 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         });
     }
     if enabled(Feature::PodCertificateRequest) {
@@ -4162,6 +4346,8 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         });
         resources.push(APIResource {
             name: "podcertificaterequests/status".to_string(),
@@ -4175,6 +4361,8 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         });
     }
     let resource_list = APIResourceList {
@@ -4234,6 +4422,8 @@ pub async fn get_certificates_v1alpha1_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         }],
     };
     (
@@ -4282,6 +4472,8 @@ pub async fn get_resource_v1alpha3_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "devicetaintrules/status".to_string(),
@@ -4292,6 +4484,8 @@ pub async fn get_resource_v1alpha3_resources() -> Response {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
     let resource_list = APIResourceList {
@@ -4350,6 +4544,8 @@ pub async fn get_admissionregistration_v1beta1_resources() -> Response {
         short_names: None,
         categories: Some(vec!["api-extensions".to_string()]),
         storage_version_hash: None,
+        group: None,
+        version: None,
     };
     let resource_list = APIResourceList {
         kind: "APIResourceList".to_string(),
@@ -4383,6 +4579,8 @@ pub async fn get_admissionregistration_v1beta1_resources() -> Response {
                 short_names: None,
                 categories: None,
                 storage_version_hash: None,
+                group: None,
+                version: None,
             },
             resource(
                 "validatingadmissionpolicybindings",
@@ -4423,6 +4621,8 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumesnapshots".to_string(),
@@ -4445,6 +4645,8 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumesnapshots/status".to_string(),
@@ -4458,6 +4660,8 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumesnapshotcontents".to_string(),
@@ -4480,6 +4684,8 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "volumesnapshotcontents/status".to_string(),
@@ -4493,6 +4699,8 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4536,6 +4744,8 @@ pub async fn get_gateway_v1beta1_resources() -> (StatusCode, Json<APIResourceLis
         short_names: Some(vec!["refgrant".to_string()]),
         categories: Some(vec!["gateway-api".to_string()]),
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -4581,6 +4791,8 @@ pub async fn get_discovery_v1_resources() -> (StatusCode, Json<APIResourceList>)
         short_names: None,
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -4620,6 +4832,8 @@ pub async fn get_node_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         short_names: None,
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -4648,6 +4862,8 @@ pub async fn get_authentication_v1_resources() -> (StatusCode, Json<APIResourceL
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "selfsubjectreviews".to_string(),
@@ -4658,6 +4874,8 @@ pub async fn get_authentication_v1_resources() -> (StatusCode, Json<APIResourceL
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4687,6 +4905,8 @@ pub async fn get_authorization_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "selfsubjectaccessreviews".to_string(),
@@ -4697,6 +4917,8 @@ pub async fn get_authorization_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "localsubjectaccessreviews".to_string(),
@@ -4707,6 +4929,8 @@ pub async fn get_authorization_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "selfsubjectrulesreviews".to_string(),
@@ -4717,6 +4941,8 @@ pub async fn get_authorization_v1_resources() -> (StatusCode, Json<APIResourceLi
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4746,6 +4972,8 @@ pub async fn get_metrics_v1beta1_resources() -> (StatusCode, Json<APIResourceLis
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "pods".to_string(),
@@ -4756,6 +4984,8 @@ pub async fn get_metrics_v1beta1_resources() -> (StatusCode, Json<APIResourceLis
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4784,6 +5014,8 @@ pub async fn get_custom_metrics_v1beta2_resources() -> (StatusCode, Json<APIReso
         short_names: None,
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -4813,6 +5045,8 @@ pub async fn get_external_metrics_v1beta1_resources() -> (StatusCode, Json<APIRe
         short_names: None,
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -4853,6 +5087,8 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "resourceclaims/status".to_string(),
@@ -4866,6 +5102,8 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "resourceclaimtemplates".to_string(),
@@ -4888,6 +5126,8 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "deviceclasses".to_string(),
@@ -4910,6 +5150,8 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "resourceslices".to_string(),
@@ -4932,6 +5174,8 @@ pub async fn get_resource_v1_resources() -> (StatusCode, Json<APIResourceList>) 
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -4973,6 +5217,8 @@ pub async fn get_autoscaling_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: Some(vec!["hpa".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "horizontalpodautoscalers/status".to_string(),
@@ -4986,6 +5232,8 @@ pub async fn get_autoscaling_v1_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -5027,6 +5275,8 @@ pub async fn get_autoscaling_v2_resources() -> (StatusCode, Json<APIResourceList
             short_names: Some(vec!["hpa".to_string()]),
             categories: Some(vec!["all".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "horizontalpodautoscalers/status".to_string(),
@@ -5040,6 +5290,8 @@ pub async fn get_autoscaling_v2_resources() -> (StatusCode, Json<APIResourceList
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -5081,6 +5333,8 @@ pub async fn get_policy_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: Some(vec!["pdb".to_string()]),
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "poddisruptionbudgets/status".to_string(),
@@ -5094,6 +5348,8 @@ pub async fn get_policy_v1_resources() -> (StatusCode, Json<APIResourceList>) {
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
@@ -5134,6 +5390,8 @@ pub async fn get_events_v1_resources() -> (StatusCode, Json<APIResourceList>) {
         short_names: Some(vec!["ev".to_string()]),
         categories: None,
         storage_version_hash: None,
+        group: None,
+        version: None,
     }];
 
     let resource_list = APIResourceList {
@@ -5175,6 +5433,8 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
             // etcd.go:75-78 `REST.Categories`.
             categories: Some(vec!["api-extensions".to_string()]),
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
         APIResource {
             name: "apiservices/status".to_string(),
@@ -5188,6 +5448,8 @@ pub async fn get_apiregistration_v1_resources() -> (StatusCode, Json<APIResource
             short_names: None,
             categories: None,
             storage_version_hash: None,
+            group: None,
+            version: None,
         },
     ];
 
