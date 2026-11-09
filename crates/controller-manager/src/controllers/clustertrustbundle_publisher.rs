@@ -20,10 +20,15 @@
 //!
 //! Deviations (storage seam instead of informers + workqueue):
 //! - Upstream wakes on ClusterTrustBundle informer events plus the CA-content
-//!   listener (the static CA never fires it) and retries via
-//!   `AddRateLimited`. The `Storage` trait has no event hook, so `run` syncs
-//!   every [`SYNC_PERIOD`]; `sync` is idempotent and writes only on change.
-//!   A failed sync is simply retried on the next period.
+//!   listener (the static CA never fires it). The `Storage` trait has no
+//!   event hook, so `run` re-adds the key every [`SYNC_PERIOD`] in their
+//!   place; `sync` is idempotent and writes only on change. Everything else
+//!   is upstream's loop: one key (`""`) on a rate-limiting queue, a failed
+//!   sync is requeued with `AddRateLimited` (per-item exponential backoff,
+//!   5ms to 1000s) and a successful one `Forget`s it. The queue is the shared
+//!   [`rusternetes_storage::WorkQueue`] (its limiter has no overall bucket;
+//!   with a single key the 10 qps bucket of
+//!   `DefaultTypedControllerRateLimiter` can never bind).
 //! - Upstream picks the first of v1beta1 / v1alpha1 by discovery
 //!   (certificates.go:326-345). Rusternetes stores one internal
 //!   ClusterTrustBundle shape (served as v1beta1), so no discovery step.
@@ -34,7 +39,7 @@ use anyhow::{anyhow, Result};
 use prometheus::{HistogramVec, IntCounterVec};
 use rusternetes_common::resources::ClusterTrustBundle;
 use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -42,6 +47,8 @@ use tracing::{error, info};
 
 /// Signer published by the controller (certificates.go:342).
 pub const KUBE_APISERVER_SERVING_SIGNER_NAME: &str = "kubernetes.io/kube-apiserver-serving";
+/// The queue key upstream always uses (`p.queue.Add("")`, publisher.go:295).
+pub const QUEUE_KEY: &str = "";
 /// Re-evaluation period standing in for the informer event pokes.
 pub const SYNC_PERIOD: Duration = Duration::from_secs(10);
 
@@ -166,17 +173,44 @@ impl<S: Storage + 'static> ClusterTrustBundlePublisher<S> {
         }
     }
 
-    /// `Run`: sync immediately (`p.queue.Add("")`, publisher.go:295), then
-    /// every [`SYNC_PERIOD`] in place of the informer/listener pokes.
+    /// `Run` (publisher.go:272-304): `p.queue.Add("")` once, then a single
+    /// worker (`wait.UntilWithContext(ctx, p.runWorker(), time.Second)`)
+    /// drains the queue. The periodic re-add of the key stands in for the
+    /// informer and CA-listener pokes.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting ClusterTrustBundle CA cert publisher controller");
-        loop {
-            if let Err(e) = self.sync().await {
-                // processNextWorkItem: HandleError + AddRateLimited.
-                error!("syncing ClusterTrustBundle failed: {e}");
+        let queue = WorkQueue::new();
+        queue.add(QUEUE_KEY.to_string()).await;
+
+        let poker = queue.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SYNC_PERIOD).await;
+                poker.add(QUEUE_KEY.to_string()).await;
             }
-            tokio::time::sleep(SYNC_PERIOD).await;
+        });
+
+        while self.process_next_work_item(&queue).await {}
+        info!("Shutting down ClusterTrustBundle CA cert publisher controller");
+        Ok(())
+    }
+
+    /// `processNextWorkItem` (publisher.go:311-326): one key off the queue;
+    /// a failed sync is logged and `AddRateLimited`, a successful one
+    /// `Forget`s the key. Returns false when the queue is shut down.
+    pub async fn process_next_work_item(&self, queue: &WorkQueue) -> bool {
+        let Some(key) = queue.get().await else {
+            return false;
+        };
+        match self.sync().await {
+            Ok(()) => queue.forget(&key).await,
+            Err(e) => {
+                error!("syncing {key:?} failed: {e}");
+                queue.requeue_rate_limited(key.clone()).await;
+            }
         }
+        queue.done(&key).await;
+        true
     }
 
     /// `syncClusterTrustBundle` (publisher.go:328-370).

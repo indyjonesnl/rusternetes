@@ -299,4 +299,45 @@ mod tests {
             assert_eq!(sync_total(code), before + 1, "{desc}");
         }
     }
+
+    /// `processNextWorkItem` (publisher.go:311-326): a failed sync is
+    /// `AddRateLimited` (the failure count grows and the key comes back after
+    /// the backoff), a later successful sync `Forget`s it.
+    #[tokio::test]
+    async fn failed_sync_is_rate_limited_then_forgotten() {
+        let ca = test_ca_pem();
+        let name = construct_bundle_name(TEST_SIGNER, ca.as_bytes());
+        let s = Arc::new(MemoryStorage::new());
+        // Stale payload, so the sync takes the update path.
+        seed(&s, &[ctb(&name, TEST_SIGNER, "olddata")]).await;
+        s.inject_conflicts(1);
+        let p = ClusterTrustBundlePublisher::new(s.clone(), TEST_SIGNER, &ca).unwrap();
+
+        let queue = rusternetes_storage::WorkQueue::new();
+        queue.add(QUEUE_KEY.to_string()).await;
+
+        // First pass: the injected conflict fails the sync.
+        assert!(p.process_next_work_item(&queue).await);
+        assert_eq!(queue.num_requeues(QUEUE_KEY).await, 1);
+        assert_eq!(all(&s).await[0].spec.trust_bundle, "olddata");
+
+        // The key returns after the backoff; this pass succeeds and forgets it.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), p.process_next_work_item(&queue))
+                .await
+                .unwrap()
+        );
+        assert_eq!(queue.num_requeues(QUEUE_KEY).await, 0);
+        assert_eq!(all(&s).await[0].spec.trust_bundle, ca);
+    }
+
+    /// `Run` returns when the queue is shut down (`quit` from `Get`).
+    #[tokio::test]
+    async fn worker_stops_when_the_queue_shuts_down() {
+        let s = Arc::new(MemoryStorage::new());
+        let p = ClusterTrustBundlePublisher::new(s, TEST_SIGNER, test_ca_pem()).unwrap();
+        let queue = rusternetes_storage::WorkQueue::new();
+        queue.shutdown().await;
+        assert!(!p.process_next_work_item(&queue).await);
+    }
 }
