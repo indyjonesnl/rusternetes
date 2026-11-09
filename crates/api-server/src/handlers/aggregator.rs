@@ -246,19 +246,63 @@ fn proxy_error_response(message: &str) -> Response {
 /// Hop-by-hop headers and the inbound `Authorization` are intentionally
 /// dropped — the backend trusts the X-Remote-* identity, signed via mTLS, not
 /// the original client's bearer token. This matches kube-aggregator behaviour.
-/// Standard kubeadm location of the aggregation-layer proxy client credential
-/// (upstream `--proxy-client-cert-file` / `--proxy-client-key-file`, loaded by
+/// The aggregation-layer proxy client credential (upstream
+/// `--proxy-client-cert-file` / `--proxy-client-key-file`, loaded by
 /// kube-aggregator as `aggregator-proxy-cert`,
-/// staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go). The
+/// staging/src/k8s.io/kube-aggregator/pkg/apiserver/apiserver.go:297-308). The
 /// extension apiserver's requestheader authenticator only trusts the
 /// `X-Remote-*` identity headers when the CALLER's TLS client certificate
 /// verifies against the front-proxy CA (kube-system
 /// `extension-apiserver-authentication` ConfigMap). Without presenting this
 /// cert every proxied request is authenticated as `system:anonymous`, its
-/// delegated SubjectAccessReview denies, and the backend returns 403 — which
+/// delegated SubjectAccessReview denies, and the backend returns 403 -- which
 /// the Aggregator conformance test tolerates and polls until timeout.
-const PROXY_CLIENT_CERT: &str = "/etc/kubernetes/pki/front-proxy-client.crt";
-const PROXY_CLIENT_KEY: &str = "/etc/kubernetes/pki/front-proxy-client.key";
+///
+/// `proxyCurrentCertKeyContent` (apiserver.go:155, :259, :308): a func the
+/// proxy handler calls for the CURRENT cert and key, defaulting to
+/// `nil, nil`. Here the provider is process-global (installed once at
+/// startup by [`install_proxy_client_certs`]) and every proxied request reads
+/// it, so a rotated pair is what the next connection presents.
+static PROXY_CURRENT_CERT_KEY: std::sync::OnceLock<
+    Arc<crate::dynamic_certificates::DynamicCertKeyPairContent>,
+> = std::sync::OnceLock::new();
+
+/// `NewDynamicServingContentFromFiles("aggregator-proxy-cert", ...)` followed
+/// by `RunOnce` (apiserver.go:298-307): a load failure is a startup error.
+/// A no-op unless both files are named (`len(ProxyClientCertFile) > 0 &&
+/// len(ProxyClientKeyFile) > 0`, apiserver.go:297). Returns whether a provider
+/// was installed.
+pub fn install_proxy_client_certs(
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> anyhow::Result<bool> {
+    let (Some(cert), Some(key)) = (
+        cert_file.filter(|s| !s.is_empty()),
+        key_file.filter(|s| !s.is_empty()),
+    ) else {
+        return Ok(false);
+    };
+    let certs = crate::dynamic_certificates::DynamicCertKeyPairContent::new(
+        "aggregator-proxy-cert",
+        cert,
+        key,
+    )?;
+    certs.run_once()?;
+    Ok(PROXY_CURRENT_CERT_KEY.set(certs).is_ok())
+}
+
+/// The installed `aggregatorProxyCerts`, if `--proxy-client-*-file` were set.
+pub fn proxy_client_certs(
+) -> Option<&'static Arc<crate::dynamic_certificates::DynamicCertKeyPairContent>> {
+    PROXY_CURRENT_CERT_KEY.get()
+}
+
+/// `s.proxyCurrentCertKeyContent()`: empty when no provider is installed.
+pub fn proxy_current_cert_key_content() -> (Vec<u8>, Vec<u8>) {
+    proxy_client_certs()
+        .map(|c| c.current_cert_key_content())
+        .unwrap_or_default()
+}
 
 /// Load a reqwest client identity from a PEM cert + key file pair. Returns
 /// `None` when the files are absent (rusternetes' own cluster, whose backends
@@ -280,20 +324,18 @@ pub fn load_proxy_client_identity_from(
     }
 }
 
-/// Cached front-proxy client identity from the standard kubeadm path.
+/// The CURRENT front-proxy client identity (`CertData`/`KeyData` of the
+/// `transport.Config` built in handler_proxy.go:220-230); `None` when no
+/// proxy client cert is configured or the pair is unusable.
 fn proxy_client_identity() -> Option<reqwest::Identity> {
-    static CACHE: std::sync::OnceLock<Option<reqwest::Identity>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let id = load_proxy_client_identity_from(PROXY_CLIENT_CERT, PROXY_CLIENT_KEY);
-            if id.is_some() {
-                tracing::info!(
-                    "aggregation proxy: presenting front-proxy client cert from {PROXY_CLIENT_CERT}"
-                );
-            }
-            id
-        })
-        .clone()
+    let pem = proxy_client_identity_pem()?;
+    match reqwest::Identity::from_pem(&pem) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!("front-proxy client credential unusable: {e} -- proxying without client auth");
+            None
+        }
+    }
 }
 
 /// Percent-encode an impersonation extra key so `X-Remote-Extra-<key>` is a
@@ -698,16 +740,21 @@ async fn forward_via_dialer(
     }
 }
 
-/// The front-proxy client credential as one PEM (cert + key) for rustls.
+/// The CURRENT front-proxy client credential as one PEM (cert + key) for
+/// rustls; `None` when no cert is configured.
 fn proxy_client_identity_pem() -> Option<Vec<u8>> {
-    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let mut pem = std::fs::read(PROXY_CLIENT_CERT).ok()?;
-            pem.extend_from_slice(&std::fs::read(PROXY_CLIENT_KEY).ok()?);
-            Some(pem)
-        })
-        .clone()
+    let (mut pem, key) = proxy_current_cert_key_content();
+    if pem.is_empty() || key.is_empty() {
+        return None;
+    }
+    pem.push(b'\n');
+    pem.extend_from_slice(&key);
+    Some(pem)
+}
+
+/// Test seam: the PEM the next proxied connection presents.
+pub fn current_proxy_client_identity_pem() -> Option<Vec<u8>> {
+    proxy_client_identity_pem()
 }
 
 /// Build a reqwest client configured to reach an aggregated backend: TLS trust

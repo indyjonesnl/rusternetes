@@ -72,11 +72,12 @@ pub struct UpstreamCompatArgs {
     #[arg(long, value_delimiter = ',')]
     pub kubelet_preferred_address_types: Vec<String>,
 
-    /// `--proxy-client-cert-file` (controlplane options.go:174). Accepted, ignored.
+    /// `--proxy-client-cert-file` (controlplane options.go:174): the aggregator's
+    /// proxy client certificate, reloaded on change.
     #[arg(long)]
     pub proxy_client_cert_file: Option<String>,
 
-    /// `--proxy-client-key-file` (controlplane options.go). Accepted, ignored.
+    /// `--proxy-client-key-file` (controlplane options.go): its key, see above.
     #[arg(long)]
     pub proxy_client_key_file: Option<String>,
 
@@ -203,14 +204,6 @@ impl UpstreamCompatArgs {
                 !self.kubelet_preferred_address_types.is_empty(),
                 "--kubelet-preferred-address-types",
             ),
-            (
-                self.proxy_client_cert_file.is_some(),
-                "--proxy-client-cert-file",
-            ),
-            (
-                self.proxy_client_key_file.is_some(),
-                "--proxy-client-key-file",
-            ),
             (self.etcd_cafile.is_some(), "--etcd-cafile"),
             (self.etcd_certfile.is_some(), "--etcd-certfile"),
             (self.etcd_keyfile.is_some(), "--etcd-keyfile"),
@@ -308,7 +301,7 @@ mod tests {
             "0.0.0.0:6443"
         );
         // Accepted-but-inert flags are reported, never silent.
-        assert_eq!(a.upstream.ignored_flags().len(), 10);
+        assert_eq!(a.upstream.ignored_flags().len(), 8);
     }
 
     #[test]

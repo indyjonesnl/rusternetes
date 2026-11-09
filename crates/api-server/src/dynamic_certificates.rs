@@ -8,7 +8,11 @@
 //!     `handleWatchEvent`, the single-item rate-limited queue);
 //!   * `union_content.go` -- `unionCAContent`;
 //!   * `tlsconfig.go` -- `DynamicServingCertificateController` (`syncCerts`,
-//!     `Run`, the one-minute re-enqueue).
+//!     `Run`, the one-minute re-enqueue);
+//!   * `dynamic_serving_content.go` -- `DynamicCertKeyPairContent`
+//!     (`NewDynamicServingContentFromFiles`, `loadCertKeyPair`,
+//!     `watchCertKeyFile`, `handleWatchEvent`), which backs the aggregator's
+//!     `--proxy-client-cert-file` / `--proxy-client-key-file`.
 //!
 //! Go swaps a `*tls.Config` per handshake through `GetConfigForClient`; the
 //! rustls counterpart is `RustlsConfig::reload_from_config`, which the
@@ -509,6 +513,213 @@ impl DynamicServingCertificateController {
     async fn process_next_work_item(&self) {
         let ds_key = self.queue.get().await;
         match self.sync_certs() {
+            Ok(()) => self.queue.forget(),
+            Err(e) => {
+                error!("{ds_key} failed with : {e:#}");
+                self.queue.add_rate_limited();
+            }
+        }
+    }
+}
+
+/// `DynamicCertKeyPairContent` (dynamic_serving_content.go:36-52): a
+/// cert/key provider that reloads both files when either changes.
+pub struct DynamicCertKeyPairContent {
+    name: String,
+    /// `certFile`.
+    cert_file: String,
+    /// `keyFile`.
+    key_file: String,
+    /// `certKeyPair`: the last read, non-zero length cert and key content.
+    cert_key_pair: RwLock<Option<(Vec<u8>, Vec<u8>)>>,
+    listeners: Mutex<Vec<Arc<dyn Listener>>>,
+    queue: Arc<SingleItemQueue>,
+}
+
+impl DynamicCertKeyPairContent {
+    /// `NewDynamicServingContentFromFiles`: loads the pair once, failing if
+    /// either file is missing, empty, or the two are not a valid pair.
+    pub fn new(purpose: &str, cert_file: &str, key_file: &str) -> Result<Arc<Self>> {
+        if cert_file.is_empty() || key_file.is_empty() {
+            return Err(anyhow!("missing filename for serving cert"));
+        }
+        let ret = Arc::new(Self {
+            name: format!("{purpose}::{cert_file}::{key_file}"),
+            cert_file: cert_file.to_string(),
+            key_file: key_file.to_string(),
+            cert_key_pair: RwLock::new(None),
+            listeners: Mutex::new(Vec::new()),
+            queue: SingleItemQueue::new(),
+        });
+        ret.load_cert_key_pair()?;
+        Ok(ret)
+    }
+
+    /// `Name`: just an identifier.
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// `AddListener`.
+    pub fn add_listener(&self, listener: Arc<dyn Listener>) {
+        self.listeners.lock().unwrap().push(listener);
+    }
+
+    /// `CurrentCertKeyContent`: the cert and key bytes (PEM).
+    pub fn current_cert_key_content(&self) -> (Vec<u8>, Vec<u8>) {
+        self.cert_key_pair
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// `RunOnce`: a single sync.
+    pub fn run_once(&self) -> Result<()> {
+        self.load_cert_key_pair()
+    }
+
+    /// `loadCertKeyPair`: determines the next set of content for the files.
+    fn load_cert_key_pair(&self) -> Result<()> {
+        let cert =
+            std::fs::read(&self.cert_file).with_context(|| format!("open {}", self.cert_file))?;
+        let key =
+            std::fs::read(&self.key_file).with_context(|| format!("open {}", self.key_file))?;
+        if cert.is_empty() || key.is_empty() {
+            return Err(anyhow!("missing content for serving cert {:?}", self.name));
+        }
+
+        // Ensure that the key matches the cert and both are valid
+        // (`tls.X509KeyPair`); building a client identity from the pair
+        // performs the same parse and key/cert consistency check.
+        let mut identity = cert.clone();
+        identity.push(b'\n');
+        identity.extend_from_slice(&key);
+        crate::egress_http::tls_client_config(None, true, Some(&identity))
+            .context("tls: X509KeyPair")?;
+
+        // check to see if we have a change. If the values are the same, do nothing.
+        if self
+            .cert_key_pair
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(c, k)| *c == cert && *k == key)
+        {
+            return Ok(());
+        }
+
+        *self.cert_key_pair.write().unwrap() = Some((cert, key));
+        info!(name = %self.name, "Loaded a new cert/key pair");
+
+        // Clone out so a listener may call back into this provider.
+        let listeners = self.listeners.lock().unwrap().clone();
+        for listener in listeners {
+            listener.enqueue();
+        }
+        Ok(())
+    }
+
+    /// `Run`: one worker, plus the loop that watches the cert and key files
+    /// and restarts the watch every [`FILE_REFRESH_DURATION`] after it fails.
+    pub fn run(self: Arc<Self>) -> Vec<JoinHandle<()>> {
+        info!(name = %self.name, "Starting controller");
+        let worker = tokio::spawn(Arc::clone(&self).run_worker());
+        let watcher = tokio::spawn(async move {
+            loop {
+                if let Err(e) = self.watch_cert_key_file().await {
+                    error!("Failed to watch cert and key file, will retry later: {e:#}");
+                }
+                tokio::time::sleep(FILE_REFRESH_DURATION).await;
+            }
+        });
+        vec![worker, watcher]
+    }
+
+    /// `watchCertKeyFile`.
+    async fn watch_cert_key_file(&self) -> Result<()> {
+        // Trigger a check here to ensure the content will be checked
+        // periodically even if the following watch fails.
+        self.queue.add();
+
+        let inotify =
+            Inotify::init().map_err(|e| anyhow!("error creating fsnotify watcher: {e}"))?;
+        let mut watches = inotify.watches();
+        let mut watched = Vec::with_capacity(2);
+        for file in [&self.cert_file, &self.key_file] {
+            let wd = watches
+                .add(file, Self::watch_mask())
+                .map_err(|e| anyhow!("error adding watch for file {file}: {e}"))?;
+            watched.push((wd, file.clone()));
+        }
+        // Trigger a check in case the file is updated before the watch starts.
+        self.queue.add();
+
+        let mut events = inotify.into_event_stream(vec![0u8; 4096])?;
+        while let Some(event) = events.next().await {
+            let event = event.map_err(|e| anyhow!("received fsnotify error: {e}"))?;
+            self.handle_watch_event(event.wd, event.mask, &mut watches, &mut watched)?;
+        }
+        Ok(())
+    }
+
+    /// The fsnotify inotify event mask for a watched path.
+    fn watch_mask() -> WatchMask {
+        WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::CREATE
+            | WatchMask::ATTRIB
+            | WatchMask::MODIFY
+            | WatchMask::MOVE_SELF
+            | WatchMask::DELETE
+            | WatchMask::DELETE_SELF
+    }
+
+    /// `handleWatchEvent`: triggers reloading the cert and key file, and
+    /// restarts a new watch if it's a Remove or Rename event. If one file is
+    /// updated before the other, `load_cert_key_pair` catches the mismatch and
+    /// does not apply the change; the other file's event reloads it.
+    fn handle_watch_event(
+        &self,
+        wd: inotify::WatchDescriptor,
+        mask: EventMask,
+        watches: &mut inotify::Watches,
+        watched: &mut [(inotify::WatchDescriptor, String)],
+    ) -> Result<()> {
+        // This should be executed after restarting the watch (if applicable)
+        // to ensure no file event will be missing (`defer c.queue.Add`).
+        let result = (|| {
+            if !mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF) {
+                return Ok(());
+            }
+            let Some(entry) = watched.iter_mut().find(|(w, _)| *w == wd) else {
+                return Ok(());
+            };
+            // A delete already dropped the old inode's watch; a rename kept
+            // it. `w.Remove` then `w.Add` upstream; here the remove is
+            // best-effort and the add covers the replacement file.
+            if let Err(e) = watches.remove(entry.0.clone()) {
+                info!(file = %entry.1, err = %e, "Failed to remove file watch, it may have been deleted");
+            }
+            entry.0 = watches
+                .add(&entry.1, Self::watch_mask())
+                .map_err(|e| anyhow!("error adding watch for file {}: {e}", entry.1))?;
+            Ok(())
+        })();
+        self.queue.add();
+        result
+    }
+
+    async fn run_worker(self: Arc<Self>) {
+        loop {
+            self.process_next_work_item().await;
+        }
+    }
+
+    /// `processNextWorkItem`.
+    async fn process_next_work_item(&self) {
+        let ds_key = self.queue.get().await;
+        match self.load_cert_key_pair() {
             Ok(()) => self.queue.forget(),
             Err(e) => {
                 error!("{ds_key} failed with : {e:#}");

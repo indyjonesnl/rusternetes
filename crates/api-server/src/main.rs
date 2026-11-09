@@ -827,6 +827,13 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    // `NewDynamicServingContentFromFiles("aggregator-proxy-cert", ...)` +
+    // `RunOnce` (kube-aggregator apiserver.go:297-307): a bad pair stops startup.
+    rusternetes_api_server::handlers::aggregator::install_proxy_client_certs(
+        args.upstream.proxy_client_cert_file.as_deref(),
+        args.upstream.proxy_client_key_file.as_deref(),
+    )?;
+
     let crd_controllers = Default::default();
     rusternetes_api_server::startup::register_post_start_hooks(
         storage.clone(),

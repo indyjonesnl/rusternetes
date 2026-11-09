@@ -155,6 +155,7 @@ mod discovery_gvk_provider_test;
 mod dra_finalizers_test;
 mod dra_test;
 mod dynamic_ca_reload_test;
+mod dynamic_proxy_client_cert_test;
 mod e2e_inprocess_smoke_test;
 mod e2e_workflow_test;
 mod empty_selector_matches_everything_test;
