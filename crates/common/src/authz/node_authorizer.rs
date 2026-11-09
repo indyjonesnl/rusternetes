@@ -30,7 +30,6 @@ use crate::auth::UserInfo;
 use crate::error::Result;
 use crate::feature_gates::{self, Feature};
 use crate::field_selector::FieldOperator;
-use crate::resources::ResourceRule;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -592,16 +591,6 @@ impl Authorizer for NodeAuthorizer {
                 error: None,
             },
         })
-    }
-
-    /// `RulesFor` (node_authorizer.go:101-107): a node has no enumerable
-    /// rules (`nil, nil, false, nil` for a non-node).
-    async fn get_user_rules(
-        &self,
-        _user: &UserInfo,
-        _namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<crate::resources::NonResourceRule>)> {
-        Ok((vec![], vec![]))
     }
 
     /// `RulesFor` (node_authorizer.go:101-107): "indicate nodes do not have

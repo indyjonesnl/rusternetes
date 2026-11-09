@@ -430,11 +430,11 @@ impl Authorizer for PolicyList {
     }
 
     /// `PolicyList.RulesFor` (abac.go:241-272).
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> rusternetes_common::error::Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
+    ) -> rusternetes_common::error::Result<rusternetes_common::authz::UserRulesOutcome> {
         let mut resource_rules = Vec::new();
         let mut non_resource_rules = Vec::new();
         for p in &self.0 {
@@ -457,6 +457,10 @@ impl Authorizer for PolicyList {
                 }
             }
         }
-        Ok((resource_rules, non_resource_rules))
+        Ok(rusternetes_common::authz::UserRulesOutcome {
+            resource_rules,
+            non_resource_rules,
+            ..Default::default()
+        })
     }
 }

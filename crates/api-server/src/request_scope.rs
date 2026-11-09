@@ -242,16 +242,6 @@ impl rusternetes_common::authz::Authorizer for RequestInfoAuthorizer {
             .authorize_outcome(&with_request_name(attrs))
             .await
     }
-    async fn get_user_rules(
-        &self,
-        user: &rusternetes_common::auth::UserInfo,
-        namespace: &str,
-    ) -> rusternetes_common::Result<(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
-    )> {
-        self.inner.get_user_rules(user, namespace).await
-    }
     async fn get_user_rules_outcome(
         &self,
         user: &rusternetes_common::auth::UserInfo,

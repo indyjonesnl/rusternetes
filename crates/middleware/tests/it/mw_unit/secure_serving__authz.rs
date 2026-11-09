@@ -541,15 +541,12 @@ mod tests {
         async fn authorize_opinion(&self, _a: &RequestAttributes) -> Result<Opinion> {
             Ok(self.0.clone())
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _u: &UserInfo,
             _ns: &str,
-        ) -> Result<(
-            Vec<rusternetes_common::resources::ResourceRule>,
-            Vec<rusternetes_common::resources::NonResourceRule>,
-        )> {
-            Ok((vec![], vec![]))
+        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+            Ok(rusternetes_common::authz::UserRulesOutcome::default())
         }
     }
 

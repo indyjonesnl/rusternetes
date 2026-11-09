@@ -10,7 +10,6 @@ use rusternetes_api_server::state::ApiServerState;
 use rusternetes_common::auth::{TokenManager, UserInfo};
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
 use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use rusternetes_storage::{MemoryStorage, StorageBackend};
 use std::sync::Arc;
@@ -43,12 +42,12 @@ impl Authorizer for Fake {
             Err(e) => Err(rusternetes_common::Error::Authorization(e.to_string())),
         }
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

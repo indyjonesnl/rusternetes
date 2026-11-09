@@ -14,7 +14,6 @@ use rusternetes_common::{
     auth::UserInfo,
     authz::{AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes},
     latency_trackers::{with_latency_trackers, LatencyTrackers},
-    resources::{NonResourceRule, ResourceRule},
     Result,
 };
 use rusternetes_middleware::AuthContext;
@@ -34,12 +33,12 @@ impl Authorizer for AllowWithError {
             error: Some("evaluation failed elsewhere".into()),
         })
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

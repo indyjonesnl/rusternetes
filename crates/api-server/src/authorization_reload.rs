@@ -16,7 +16,6 @@ use futures::StreamExt;
 use inotify::{EventMask, Inotify, WatchMask};
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -199,14 +198,6 @@ impl Authorizer for ReloadableAuthorizer {
         attrs: &RequestAttributes,
     ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
         self.current().authorize_outcome(attrs).await
-    }
-
-    async fn get_user_rules(
-        &self,
-        user: &UserInfo,
-        namespace: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.current().get_user_rules(user, namespace).await
     }
 
     // reload.go:82 forwards the full RulesFor tuple.

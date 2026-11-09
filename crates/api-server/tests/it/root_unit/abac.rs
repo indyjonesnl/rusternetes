@@ -355,7 +355,11 @@ mod tests {
             ),
         ];
         for (i, (u, ns, want_r, want_nr)) in cases.into_iter().enumerate() {
-            let (rr, nrr) = pl.get_user_rules(&u, ns).await.unwrap();
+            let rusternetes_common::authz::UserRulesOutcome {
+                resource_rules: rr,
+                non_resource_rules: nrr,
+                ..
+            } = pl.get_user_rules_outcome(&u, ns).await.unwrap();
             let got_r: Res = rr
                 .into_iter()
                 .map(|x| {

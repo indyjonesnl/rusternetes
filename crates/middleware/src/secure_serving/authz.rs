@@ -66,15 +66,12 @@ impl Authorizer for PathAuthorizer {
         Ok(no_opinion)
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
-    )> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -307,15 +304,12 @@ impl Authorizer for SubjectAccessReviewAuthorizer {
         }
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
-    )> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

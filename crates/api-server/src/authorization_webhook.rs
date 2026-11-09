@@ -1159,19 +1159,6 @@ impl Authorizer for WebhookAuthorizer {
         })
     }
 
-    /// Upstream: "webhook authorizer does not support user rule resolution"
-    /// (webhook.go:405-412), incomplete.
-    async fn get_user_rules(
-        &self,
-        _user: &UserInfo,
-        _namespace: &str,
-    ) -> AuthzResult<(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
-    )> {
-        Ok((vec![], vec![]))
-    }
-
     /// `WebhookAuthorizer.RulesFor` (webhook.go:404-412): no rules, incomplete,
     /// and the error that says why.
     async fn get_user_rules_outcome(

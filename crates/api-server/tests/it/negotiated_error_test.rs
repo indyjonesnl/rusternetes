@@ -14,7 +14,6 @@ use rusternetes_api_server::authorization_filter::with_authorization;
 use rusternetes_api_server::request_scope::request_info_middleware;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use rusternetes_common::Result;
 use rusternetes_middleware::AuthContext;
 use std::sync::Arc;
@@ -30,12 +29,12 @@ impl Authorizer for Deny {
     async fn authorize_opinion(&self, _: &RequestAttributes) -> Result<Opinion> {
         Ok(Opinion::Deny("nope".into()))
     }
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        Ok((vec![], vec![]))
+    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+        Ok(rusternetes_common::authz::UserRulesOutcome::default())
     }
 }
 

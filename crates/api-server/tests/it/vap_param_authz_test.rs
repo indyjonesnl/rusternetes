@@ -333,7 +333,6 @@ async fn binding_to_an_unknown_policy_needs_permission_on_everything() {
 use async_trait::async_trait;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -367,12 +366,12 @@ impl Authorizer for CountingAuthorizer {
         self.inner.authorize_opinion(attrs).await
     }
 
-    async fn get_user_rules(
+    async fn get_user_rules_outcome(
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> rusternetes_common::Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-        self.inner.get_user_rules(user, namespace).await
+    ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome> {
+        self.inner.get_user_rules_outcome(user, namespace).await
     }
 }
 

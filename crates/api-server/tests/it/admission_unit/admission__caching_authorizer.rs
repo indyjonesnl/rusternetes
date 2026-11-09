@@ -38,12 +38,12 @@ mod tests {
                 .expect("got more backend invocations than expected");
             Err(Error::Internal(err.to_string()))
         }
-        async fn get_user_rules(
+        async fn get_user_rules_outcome(
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-            Ok((vec![], vec![]))
+        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+            Ok(rusternetes_common::authz::UserRulesOutcome::default())
         }
     }
 
@@ -219,12 +219,12 @@ mod tests {
                 *self.0.lock().unwrap() += 1;
                 Ok(Opinion::Deny("no".into()))
             }
-            async fn get_user_rules(
+            async fn get_user_rules_outcome(
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> Result<(Vec<ResourceRule>, Vec<NonResourceRule>)> {
-                Ok((vec![], vec![]))
+            ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+                Ok(rusternetes_common::authz::UserRulesOutcome::default())
             }
         }
         let inner = Arc::new(Op(Mutex::new(0)));
