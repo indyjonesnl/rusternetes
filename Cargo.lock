@@ -4787,6 +4787,7 @@ dependencies = [
  "criterion",
  "etcd-client",
  "futures",
+ "prometheus",
  "rhino",
  "rusternetes-client",
  "rusternetes-common",

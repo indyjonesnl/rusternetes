@@ -39,6 +39,7 @@ tracing.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+prometheus.workspace = true
 
 [dev-dependencies]
 # `testcontainers` spins up real etcd via Docker so the etcd backend tests

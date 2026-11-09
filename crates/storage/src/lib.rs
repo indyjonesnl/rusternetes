@@ -21,6 +21,7 @@ pub mod preconditions;
 pub mod rhino;
 pub mod size_estimator;
 pub mod workqueue;
+pub mod workqueue_metrics;
 
 pub use preconditions::Preconditions;
 

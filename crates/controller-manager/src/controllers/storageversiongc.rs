@@ -107,8 +107,10 @@ impl<S: Storage + 'static> StorageVersionGCController<S> {
     /// Upstream `Run`: one worker per queue.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting storage version garbage collector");
-        let lease_queue = WorkQueue::new();
-        let sv_queue = WorkQueue::new();
+        // `NewTypedRateLimitingQueueWithConfig(..., {Name: ...})`
+        // (gc_controller.go:68,72).
+        let lease_queue = WorkQueue::named("storage_version_garbage_collector_leases");
+        let sv_queue = WorkQueue::named("storage_version_garbage_collector_storageversions");
 
         let me = Arc::clone(&self);
         let q = lease_queue.clone();
