@@ -547,6 +547,13 @@ pub struct Kubelet {
     /// `imageGC{High,Low}ThresholdPercent` (kubelet.go:509-515). `None` keeps
     /// image GC off (tests / callers that do not configure it).
     pub image_gc_policy: Option<crate::image_gc::ImageGcPolicy>,
+    /// `containerLogMaxSize` / `MaxFiles` / `MaxWorkers` /
+    /// `MonitorInterval` (kubelet.go:714-721). `None` keeps container log
+    /// rotation off (tests / callers that do not configure it).
+    pub container_log_config: Option<crate::container_log_manager::ContainerLogConfig>,
+    /// `kl.containerLogManager`, built and started by [`Kubelet::run`].
+    pub container_log_manager:
+        std::sync::OnceLock<Arc<dyn crate::container_log_manager::ContainerLogManager>>,
     /// `nodeStatusMaxImages` (v1beta1 default 50, -1 = no cap).
     pub node_status_max_images: i32,
     /// `lastStatusReportTime` + `delayAfterNodeStatusChange`
@@ -1039,6 +1046,8 @@ impl Kubelet {
             http_static_pods: Mutex::new(Vec::new()),
             node_status_report_frequency: Duration::from_secs(300),
             image_gc_policy: None,
+            container_log_config: None,
+            container_log_manager: std::sync::OnceLock::new(),
             node_status_max_images: 50,
             status_report_state: Mutex::new(StatusReportState::default()),
             static_pods: Arc::new(Mutex::new(HashMap::new())),
@@ -1191,6 +1200,17 @@ impl Kubelet {
     /// from the KubeletConfiguration (kubelet.go:509-515).
     pub fn with_node_status_max_images(mut self, max: i32) -> Self {
         self.node_status_max_images = max;
+        self
+    }
+
+    /// Apply `containerLogMaxSize`, `containerLogMaxFiles`,
+    /// `containerLogMaxWorkers` and `containerLogMonitorInterval`
+    /// (callers pass `effective_container_log_config()`).
+    pub fn with_container_log_config(
+        mut self,
+        cfg: crate::container_log_manager::ContainerLogConfig,
+    ) -> Self {
+        self.container_log_config = Some(cfg);
         self
     }
 
@@ -1429,6 +1449,21 @@ impl Kubelet {
                     tokio::spawn(manager.run_gc_loop());
                 }
                 Err(err) => anyhow::bail!("failed to initialize image manager: {err}"),
+            }
+        }
+
+        // `NewContainerLogManager` (kubelet.go:714-725), then
+        // `kl.containerLogManager.Start(ctx)` (kubelet.go:1759): started only
+        // once the runtime is up, because it lists containers and asks the
+        // runtime to reopen logs after rotation.
+        if let Some(cfg) = self.container_log_config.clone() {
+            let manager = crate::container_log_manager::new_container_log_manager(
+                self.runtime.cri_client(),
+                &cfg,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to initialize container log manager: {e:#}"))?;
+            if self.container_log_manager.set(manager.clone()).is_ok() {
+                manager.start();
             }
         }
 
