@@ -50,6 +50,10 @@ mod tests {
         (TokenCleaner::new(st.clone()), st, key)
     }
 
+    fn q() -> rusternetes_storage::WorkQueue {
+        rusternetes_storage::WorkQueue::new()
+    }
+
     async fn exists(st: &MemoryStorage, key: &str) -> bool {
         st.get::<Secret>(key).await.is_ok()
     }
@@ -59,7 +63,10 @@ mod tests {
     async fn cleaner_no_expiration() {
         let s = new_token_secret("tokenID", "tokenSecret");
         let (c, st, key) = setup(&s).await;
-        assert_eq!(c.eval_secret(&s, Utc::now()).await, EvalOutcome::Nothing);
+        assert_eq!(
+            c.eval_secret(&q(), &s, Utc::now()).await,
+            EvalOutcome::Nothing
+        );
         assert!(exists(&st, &key).await);
     }
 
@@ -70,7 +77,7 @@ mod tests {
         let mut s = new_token_secret("tokenID", "tokenSecret");
         add_expiration(&mut s, &time_string(now, D::hours(-1)));
         let (c, st, key) = setup(&s).await;
-        assert_eq!(c.eval_secret(&s, now).await, EvalOutcome::Deleted);
+        assert_eq!(c.eval_secret(&q(), &s, now).await, EvalOutcome::Deleted);
         assert!(!exists(&st, &key).await);
     }
 
@@ -82,7 +89,7 @@ mod tests {
         add_expiration(&mut s, &time_string(now, D::hours(1)));
         let (c, st, key) = setup(&s).await;
         assert!(matches!(
-            c.eval_secret(&s, now).await,
+            c.eval_secret(&q(), &s, now).await,
             EvalOutcome::RequeueAfter(_)
         ));
         assert!(exists(&st, &key).await);
@@ -95,13 +102,13 @@ mod tests {
         let mut s = new_token_secret("tokenID", "tokenSecret");
         add_expiration(&mut s, &time_string(now, D::seconds(2)));
         let (c, st, key) = setup(&s).await;
-        let EvalOutcome::RequeueAfter(ttl) = c.eval_secret(&s, now).await else {
+        let EvalOutcome::RequeueAfter(ttl) = c.eval_secret(&q(), &s, now).await else {
             panic!("expected requeue");
         };
         assert!(ttl <= Duration::from_secs(2) && ttl > Duration::ZERO);
         assert!(exists(&st, &key).await);
         let later = now + D::seconds(3);
-        assert_eq!(c.eval_secret(&s, later).await, EvalOutcome::Deleted);
+        assert_eq!(c.eval_secret(&q(), &s, later).await, EvalOutcome::Deleted);
         assert!(!exists(&st, &key).await);
     }
 
@@ -111,7 +118,10 @@ mod tests {
         let mut s = new_token_secret("tokenID", "tokenSecret");
         add_expiration(&mut s, "not-a-time");
         let (c, st, key) = setup(&s).await;
-        assert_eq!(c.eval_secret(&s, Utc::now()).await, EvalOutcome::Deleted);
+        assert_eq!(
+            c.eval_secret(&q(), &s, Utc::now()).await,
+            EvalOutcome::Deleted
+        );
         assert!(!exists(&st, &key).await);
     }
 
@@ -124,13 +134,14 @@ mod tests {
         let mut live = stale.clone();
         live.metadata.uid = "other-uid".into();
         let (c, st, key) = setup(&live).await;
-        c.eval_secret(&stale, now).await;
+        c.eval_secret(&q(), &stale, now).await;
         assert!(exists(&st, &key).await);
     }
 
-    // Informer FilterFunc: only bootstrap-token secrets in kube-system.
+    // Informer FilterFunc + `enqueueSecrets`: only bootstrap-token secrets in
+    // kube-system are queued, by `<namespace>/<name>`.
     #[tokio::test]
-    async fn sync_all_filters_type_and_namespace() {
+    async fn enqueue_secrets_filters_type_and_namespace() {
         let now = Utc::now();
         let st = Arc::new(MemoryStorage::new());
         let exp = time_string(now, D::hours(-1));
@@ -150,37 +161,85 @@ mod tests {
                 .await
                 .unwrap();
         }
-        TokenCleaner::new(st.clone()).sync_all(now).await;
-        let k = |ns: &str, n: &str| build_key("secrets", Some(ns), n);
-        assert!(!exists(&st, &k("kube-system", &tok.metadata.name)).await);
-        assert!(exists(&st, &k("kube-system", &opaque.metadata.name)).await);
-        assert!(exists(&st, &k("default", &other_ns.metadata.name)).await);
+        let queue = q();
+        TokenCleaner::new(st.clone()).enqueue_secrets(&queue).await;
+        assert_eq!(queue.len().await, 1);
+        assert_eq!(
+            queue.get().await.unwrap(),
+            format!("kube-system/{}", tok.metadata.name)
+        );
     }
 
-    // `queue.AddAfter(key, ttl)` (tokencleaner.go:219): the pass reports the
-    // soonest pending expiry so the loop wakes then, capped at the 10s worker period.
+    // `processNextWorkItem` -> `syncFunc` -> `evalSecret`: an expired token is
+    // deleted and the key is Forgotten.
     #[tokio::test]
-    async fn sync_all_reports_soonest_requeue_and_next_wake_honours_it() {
+    async fn worker_deletes_an_expired_token() {
         let now = Utc::now();
-        let st = Arc::new(MemoryStorage::new());
-        for (id, off) in [("aaaaaa", D::seconds(3)), ("bbbbbb", D::hours(1))] {
-            let mut s = new_token_secret(id, "x");
-            add_expiration(&mut s, &time_string(now, off));
-            st.create(
-                &build_key("secrets", Some("kube-system"), &s.metadata.name),
-                &s,
-            )
+        let mut s = new_token_secret("tokenID", "tokenSecret");
+        add_expiration(&mut s, &time_string(now, D::hours(-1)));
+        let (c, st, key) = setup(&s).await;
+        let queue = q();
+        c.enqueue_secrets(&queue).await;
+        assert!(c.process_next_work_item(&queue).await);
+        assert!(!exists(&st, &key).await);
+        assert_eq!(
+            queue
+                .num_requeues(&format!("kube-system/{}", s.metadata.name))
+                .await,
+            0
+        );
+    }
+
+    // `queue.AddAfter(key, ttl)` (tokencleaner.go:219): a not-yet-expired token
+    // is re-queued after its remaining lifetime, not deleted.
+    #[tokio::test]
+    async fn eval_secret_requeues_a_future_expiry_with_add_after() {
+        let now = Utc::now();
+        let mut s = new_token_secret("tokenID", "tokenSecret");
+        add_expiration(&mut s, &time_string(now, D::seconds(1)));
+        let (c, st, key) = setup(&s).await;
+        let queue = q();
+        c.sync_func(&queue, &format!("kube-system/{}", s.metadata.name), now)
             .await
             .unwrap();
-        }
-        let soonest = TokenCleaner::new(st.clone()).sync_all(now).await.unwrap();
-        assert!(soonest <= Duration::from_secs(3), "{soonest:?}");
-        assert_eq!(
-            next_wake(Some(soonest)),
-            soonest.max(Duration::from_millis(10))
-        );
-        assert_eq!(next_wake(Some(Duration::from_secs(3600))), WORKER_PERIOD);
-        assert_eq!(next_wake(None), WORKER_PERIOD);
-        assert!(next_wake(Some(Duration::ZERO)) >= Duration::from_millis(10));
+        assert!(exists(&st, &key).await);
+        // Delayed: not ready now ...
+        assert_eq!(queue.len().await, 0);
+        // ... but ready once the ttl has elapsed.
+        let got = tokio::time::timeout(Duration::from_secs(5), queue.get())
+            .await
+            .expect("AddAfter never fired");
+        assert_eq!(got.unwrap(), format!("kube-system/{}", s.metadata.name));
+    }
+
+    // `syncFunc`: a deleted Secret is not an error.
+    #[tokio::test]
+    async fn sync_func_ignores_a_deleted_secret() {
+        let st = Arc::new(MemoryStorage::new());
+        let c = TokenCleaner::new(st);
+        c.sync_func(&q(), "kube-system/bootstrap-token-gone", Utc::now())
+            .await
+            .unwrap();
+    }
+
+    // `cache.SplitMetaNamespaceKey` failure is a sync error: rate-limited retry.
+    #[tokio::test]
+    async fn bad_key_is_rate_limited_not_forgotten() {
+        let st = Arc::new(MemoryStorage::new());
+        let c = TokenCleaner::new(st);
+        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        assert!(c.sync_func(&queue, "no-slash", Utc::now()).await.is_err());
+        queue.add("no-slash".into()).await;
+        assert!(c.process_next_work_item(&queue).await);
+        assert_eq!(queue.num_requeues("no-slash").await, 1);
+    }
+
+    #[tokio::test]
+    async fn worker_stops_when_the_queue_shuts_down() {
+        let c = TokenCleaner::new(Arc::new(MemoryStorage::new()));
+        let queue = q();
+        queue.shutdown().await;
+        assert!(!c.process_next_work_item(&queue).await);
+        assert_eq!(QUEUE_NAME, "token_cleaner");
     }
 }
