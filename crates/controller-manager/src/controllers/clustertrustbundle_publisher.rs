@@ -74,28 +74,18 @@ static SYNC_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
     h
 });
 
-/// The `apierrors.APIStatus` code of a storage error (`recordMetrics`:
-/// 500 when the error carries no status).
-fn status_code(e: &Error) -> &'static str {
-    match e {
-        Error::NotFound(_) => "404",
-        Error::AlreadyExists(_) | Error::Conflict(_) => "409",
-        Error::BadRequest(_) => "400",
-        Error::Forbidden(_) => "403",
-        _ => "500",
-    }
-}
-
-/// `recordMetrics` (metrics.go:57-69).
-fn record_metrics(start: Instant, result: &Result<(), Error>) {
+/// `recordMetrics` (metrics.go:57-69): the `code` label is `200` on success,
+/// else the error's `APIStatus` code ([`Error::status_code`]), `500` when it
+/// carries none.
+pub fn record_metrics(start: Instant, result: &Result<(), Error>) {
     let code = match result {
-        Ok(()) => "200",
-        Err(e) => status_code(e),
+        Ok(()) => "200".to_string(),
+        Err(e) => e.status_code().to_string(),
     };
     SYNC_LATENCY
-        .with_label_values(&[code])
+        .with_label_values(&[&code])
         .observe(start.elapsed().as_secs_f64());
-    SYNC_COUNTER.with_label_values(&[code]).inc();
+    SYNC_COUNTER.with_label_values(&[&code]).inc();
 }
 
 /// `constructBundleName` (publisher.go:372-377): the signer name with `/`

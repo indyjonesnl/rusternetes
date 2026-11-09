@@ -313,4 +313,40 @@ mod tests {
         assert_eq!(causes[1].reason.as_deref(), Some("FieldValueNotSupported"));
         assert_eq!(causes[1].field.as_deref(), Some("spec.restartPolicy"));
     }
+
+    /// `status_code` is the code `IntoResponse` writes, for every variant a
+    /// storage or handler path produces; an unset code on a hand-built
+    /// `Status` reads as 500.
+    #[test]
+    fn status_code_matches_the_response_status() {
+        use axum::response::IntoResponse;
+        let errs = vec![
+            Error::NotFound("a".into()),
+            Error::AlreadyExists("a".into()),
+            Error::InvalidResource("a".into()),
+            Error::BadRequest("a".into()),
+            Error::Storage("a".into()),
+            Error::StorageTooLarge("a".into()),
+            Error::Network("a".into()),
+            Error::Authentication("a".into()),
+            Error::Authorization("a".into()),
+            Error::Forbidden("a".into()),
+            Error::Conflict("a".into()),
+            Error::TooManyRequests("a".into()),
+            Error::Gone("a".into()),
+            Error::UnsupportedMediaType("a".into()),
+            Error::NotAcceptable("a".into()),
+            Error::Internal("a".into()),
+            Error::generic_server_response(422, "", "", "", "", "m", 0, false),
+        ];
+        for e in errs {
+            let want = e.status_code();
+            let got = e.into_response().status().as_u16();
+            assert_eq!(want, got);
+        }
+        let unset = Error::Status(Box::new(rusternetes_common::types::Status::failure(
+            "m", "r", 0,
+        )));
+        assert_eq!(unset.status_code(), 500);
+    }
 }

@@ -230,4 +230,73 @@ mod tests {
             .name
             .starts_with("kubernetes.io:kube-apiserver-serving:"));
     }
+
+    /// Current `clustertrustbundle_publisher_sync_total{code=...}` value,
+    /// read from the text exposition like `metrics_test.go`'s
+    /// `GatherAndCompare`.
+    fn sync_total(code: &str) -> u64 {
+        use prometheus::Encoder;
+        let fams: Vec<_> = prometheus::default_registry()
+            .gather()
+            .into_iter()
+            .filter(|f| f.name() == "clustertrustbundle_publisher_sync_total")
+            .collect();
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&fams, &mut buf)
+            .unwrap();
+        let prefix = format!("clustertrustbundle_publisher_sync_total{{code=\"{code}\"}} ");
+        String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix).map(|v| v.parse().unwrap()))
+            .unwrap_or(0)
+    }
+
+    /// `TestSyncCounter` (metrics_test.go): the `code` label is 200 on
+    /// success and the error's `APIStatus` code otherwise, 500 when the
+    /// error carries no code. Each case uses its own code label, so the
+    /// before/after delta is exact even with the process-wide registry.
+    #[test]
+    fn sync_counter_records_the_api_status_code() {
+        use rusternetes_common::types::Status;
+        let cases: Vec<(&str, Result<(), Error>, &str)> = vec![
+            ("nil error", Ok(()), "200"),
+            ("not found", Err(Error::NotFound("x".into())), "404"),
+            (
+                "bad request",
+                Err(Error::BadRequest("bad request!".into())),
+                "400",
+            ),
+            (
+                "unprocessable",
+                Err(Error::InvalidResource("bad".into())),
+                "422",
+            ),
+            (
+                "too many requests",
+                Err(Error::TooManyRequests("slow down".into())),
+                "429",
+            ),
+            (
+                "status without code",
+                Err(Error::Status(Box::new(Status {
+                    code: None,
+                    ..Status::failure("m", "r", 0)
+                }))),
+                "500",
+            ),
+            (
+                "status with code 0",
+                Err(Error::Status(Box::new(Status::failure("m", "r", 0)))),
+                "500",
+            ),
+            ("general error", Err(Error::Internal("test".into())), "500"),
+        ];
+        for (desc, result, code) in cases {
+            let before = sync_total(code);
+            record_metrics(Instant::now(), &result);
+            assert_eq!(sync_total(code), before + 1, "{desc}");
+        }
+    }
 }
