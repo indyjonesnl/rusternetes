@@ -1,198 +1,252 @@
+//! `/healthz`, `/livez`, `/readyz` and their per-check subpaths.
+//!
+//! Ported from `staging/src/k8s.io/apiserver/pkg/server/healthz/healthz.go`
+//! (`InstallPathHandlerWithHealthyFunc`, `handleRootHealth`,
+//! `adaptCheckToHandler`, `getExcludedChecks`) and
+//! `staging/src/k8s.io/apiserver/pkg/server/healthz.go`
+//! (`AddHealthChecks` / `AddBootSequenceHealthChecks`: boot-sequence checks and
+//! post-start-hook checks are on all three endpoints).
+
 use crate::state::ApiServerState;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
-use serde::{Deserialize, Serialize};
+use axum::extract::State;
+use axum::extract::{Path, RawQuery};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HealthStatus {
-    status: String,
-    checks: Vec<ComponentHealth>,
+type CheckFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// `healthz.HealthChecker`: a named check.
+pub struct HealthChecker {
+    pub name: String,
+    check: Box<dyn Fn() -> CheckFuture + Send + Sync>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ComponentHealth {
-    name: String,
-    status: String,
-    message: Option<String>,
-}
-
-/// Health check endpoint - liveness probe
-/// Matches upstream k8s `pkg/server/healthz/healthz.go`: 200 with body `ok`.
-/// Clients (kubectl wait loops, hydrophone, probes) grep stdout for `ok`,
-/// so an empty body silently fails the check.
-pub async fn healthz() -> (StatusCode, &'static str) {
-    (StatusCode::OK, "ok")
-}
-
-/// Readiness check endpoint - readiness probe
-/// Returns OK if the server is ready to accept requests
-/// Checks:
-/// - Storage (etcd) connectivity
-pub async fn readyz(State(state): State<Arc<ApiServerState>>) -> (StatusCode, Json<HealthStatus>) {
-    let mut checks = Vec::new();
-    let mut all_healthy = true;
-
-    // Check storage connectivity
-    match check_storage(&state).await {
-        Ok(_) => {
-            checks.push(ComponentHealth {
-                name: "storage".to_string(),
-                status: "ok".to_string(),
-                message: None,
-            });
-        }
-        Err(e) => {
-            all_healthy = false;
-            checks.push(ComponentHealth {
-                name: "storage".to_string(),
-                status: "failed".to_string(),
-                message: Some(e),
-            });
+impl HealthChecker {
+    pub fn new(
+        name: impl Into<String>,
+        check: impl Fn() -> CheckFuture + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            check: Box::new(check),
         }
     }
 
-    for (name, res) in crate::post_start_hooks::global().boot_checks() {
-        match res {
-            Ok(()) => checks.push(ComponentHealth {
-                name,
-                status: "ok".to_string(),
-                message: None,
-            }),
-            Err(e) => {
-                all_healthy = false;
-                checks.push(ComponentHealth {
-                    name,
-                    status: "failed".to_string(),
-                    message: Some(e),
-                });
-            }
-        }
+    /// A check that is already evaluated (`NamedCheck` over a ready value).
+    pub fn ready(name: impl Into<String>, result: Result<(), String>) -> Self {
+        Self::new(name, move || {
+            let result = result.clone();
+            Box::pin(async move { result })
+        })
     }
 
-    for (name, res) in crate::post_start_hooks::global().checks() {
-        match res {
-            Ok(()) => checks.push(ComponentHealth {
-                name,
-                status: "ok".to_string(),
-                message: None,
-            }),
-            Err(e) => {
-                all_healthy = false;
-                checks.push(ComponentHealth {
-                    name,
-                    status: "failed".to_string(),
-                    message: Some(e.to_string()),
-                });
-            }
+    async fn run(&self) -> Result<(), String> {
+        (self.check)().await
+    }
+}
+
+/// Which endpoint a check list is for (`healthzRegistry` / `livezRegistry` /
+/// `readyzRegistry`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HealthEndpoint {
+    Healthz,
+    Livez,
+    Readyz,
+}
+
+impl HealthEndpoint {
+    /// `name` in `InstallPathHandlerWithHealthyFunc`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Healthz => "healthz",
+            Self::Livez => "livez",
+            Self::Readyz => "readyz",
         }
     }
-
-    let status = if all_healthy {
-        HealthStatus {
-            status: "ok".to_string(),
-            checks,
-        }
-    } else {
-        HealthStatus {
-            status: "degraded".to_string(),
-            checks,
-        }
-    };
-
-    let status_code = if all_healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (status_code, Json(status))
 }
 
-/// `/healthz/poststarthook/<name>` and `/readyz/poststarthook/<name>`: the
-/// per-hook check `postStartHookHealthz` (hooks.go:222-246). 200 `ok` once the
-/// hook finished, 500 `internal server error: not finished` before (upstream
-/// healthz handler's failure body), 404 for an unregistered hook.
-pub async fn post_start_hook_check(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> (StatusCode, String) {
-    post_start_hook_response(crate::post_start_hooks::global(), &name)
+/// The checks installed on `endpoint`: `PingHealthz`, `LogHealthz`, the storage
+/// check (`etcd` on healthz/livez, `etcd-readiness` on readyz), then the
+/// boot-sequence checks and every `poststarthook/<name>` check.
+pub fn health_checks(state: &Arc<ApiServerState>, endpoint: HealthEndpoint) -> Vec<HealthChecker> {
+    let mut checks = vec![
+        // `PingHealthz`.
+        HealthChecker::ready("ping", Ok(())),
+        // `LogHealthz` fails when klog's flush is blocked; this server logs
+        // through `tracing`, which has no such flush to block on.
+        HealthChecker::ready("log", Ok(())),
+    ];
+    let storage_state = state.clone();
+    checks.push(HealthChecker::new(
+        match endpoint {
+            HealthEndpoint::Readyz => "etcd-readiness",
+            _ => "etcd",
+        },
+        move || {
+            let state = storage_state.clone();
+            Box::pin(async move { check_storage(&state).await })
+        },
+    ));
+    let hooks = crate::post_start_hooks::global();
+    for (name, result) in hooks.boot_checks() {
+        checks.push(HealthChecker::ready(name, result));
+    }
+    for (name, result) in hooks.checks() {
+        checks.push(HealthChecker::ready(name, result.map_err(str::to_string)));
+    }
+    checks
 }
 
-pub fn post_start_hook_response(
-    reg: &crate::post_start_hooks::PostStartHooks,
+fn text_response(status: StatusCode, body: String) -> Response {
+    let mut resp = (status, body).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
+
+/// `formatQuoted`: `"a","b"`.
+fn format_quoted(names: &BTreeSet<String>) -> String {
+    names
+        .iter()
+        .map(|n| format!("{n:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `handleRootHealth`: serves `checks` for the endpoint called `name`.
+/// `query` is the raw query string (`exclude=<check>` repeated, `verbose`).
+pub async fn handle_root_health(
     name: &str,
-) -> (StatusCode, String) {
-    match reg.check(name) {
-        None => (StatusCode::NOT_FOUND, "404 page not found".to_string()),
-        Some(Ok(())) => (StatusCode::OK, "ok".to_string()),
-        Some(Err(e)) => (
+    checks: &[HealthChecker],
+    query: Option<&str>,
+) -> Response {
+    let params: Vec<(String, String)> = url::form_urlencoded::parse(query.unwrap_or("").as_bytes())
+        .into_owned()
+        .collect();
+    let excluded: BTreeSet<String> = params
+        .iter()
+        .filter(|(k, _)| k == "exclude")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let mut unknown_excluded = excluded.clone();
+    let mut failed_verbose_log = String::new();
+    let mut failed_checks = Vec::new();
+    let mut individual = String::new();
+    for check in checks {
+        if excluded.contains(&check.name) {
+            unknown_excluded.remove(&check.name);
+            individual.push_str(&format!("[+]{} excluded: ok\n", check.name));
+            continue;
+        }
+        match check.run().await {
+            Err(err) => {
+                // "don't include the error since this endpoint is public."
+                individual.push_str(&format!("[-]{} failed: reason withheld\n", check.name));
+                failed_verbose_log.push_str(&format!("[-]{} failed: {err}\n", check.name));
+                failed_checks.push(check.name.clone());
+            }
+            Ok(()) => individual.push_str(&format!("[+]{} ok\n", check.name)),
+        }
+    }
+    if !unknown_excluded.is_empty() {
+        individual.push_str(&format!(
+            "warn: some health checks cannot be excluded: no matches for {}\n",
+            format_quoted(&unknown_excluded)
+        ));
+    }
+    // "always be verbose on failure"
+    if !failed_checks.is_empty() {
+        tracing::info!(
+            "{} check failed: {name}\n{failed_verbose_log}",
+            failed_checks.join(",")
+        );
+        return text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("internal server error: {e}"),
+            format!("{individual}{name} check failed\n"),
+        );
+    }
+    if !params.iter().any(|(k, _)| k == "verbose") {
+        return text_response(StatusCode::OK, "ok".to_string());
+    }
+    text_response(StatusCode::OK, format!("{individual}{name} check passed\n"))
+}
+
+/// `adaptCheckToHandler`: `<endpoint>/<check name>`; `None` is a 404 (no such
+/// check on the endpoint's mux).
+pub async fn handle_single_check(checks: &[HealthChecker], name: &str) -> Response {
+    let Some(check) = checks.iter().find(|c| c.name == name) else {
+        return text_response(StatusCode::NOT_FOUND, "404 page not found\n".to_string());
+    };
+    match check.run().await {
+        Err(e) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal server error: {e}\n"),
         ),
+        Ok(()) => text_response(StatusCode::OK, "ok".to_string()),
     }
 }
 
-/// Detailed health check endpoint
-/// Returns detailed status of all components
-pub async fn healthz_verbose(
+pub async fn healthz(
     State(state): State<Arc<ApiServerState>>,
-) -> (StatusCode, Json<HealthStatus>) {
-    let mut checks = Vec::new();
-    let mut all_healthy = true;
-
-    // Check storage
-    match check_storage(&state).await {
-        Ok(_) => {
-            checks.push(ComponentHealth {
-                name: "storage".to_string(),
-                status: "ok".to_string(),
-                message: Some("etcd connection healthy".to_string()),
-            });
-        }
-        Err(e) => {
-            all_healthy = false;
-            checks.push(ComponentHealth {
-                name: "storage".to_string(),
-                status: "failed".to_string(),
-                message: Some(e),
-            });
-        }
-    }
-
-    // Add metrics status
-    checks.push(ComponentHealth {
-        name: "metrics".to_string(),
-        status: "ok".to_string(),
-        message: Some("metrics collection active".to_string()),
-    });
-
-    let status = if all_healthy {
-        HealthStatus {
-            status: "healthy".to_string(),
-            checks,
-        }
-    } else {
-        HealthStatus {
-            status: "unhealthy".to_string(),
-            checks,
-        }
-    };
-
-    let status_code = if all_healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (status_code, Json(status))
+    RawQuery(query): RawQuery,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Healthz);
+    handle_root_health("healthz", &checks, query.as_deref()).await
 }
 
-/// Check storage connectivity by listing namespaces
+pub async fn livez(
+    State(state): State<Arc<ApiServerState>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Livez);
+    handle_root_health("livez", &checks, query.as_deref()).await
+}
+
+pub async fn readyz(
+    State(state): State<Arc<ApiServerState>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Readyz);
+    handle_root_health("readyz", &checks, query.as_deref()).await
+}
+
+pub async fn healthz_check(
+    State(state): State<Arc<ApiServerState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Healthz);
+    handle_single_check(&checks, &name).await
+}
+
+pub async fn livez_check(
+    State(state): State<Arc<ApiServerState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Livez);
+    handle_single_check(&checks, &name).await
+}
+
+pub async fn readyz_check(
+    State(state): State<Arc<ApiServerState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let checks = health_checks(&state, HealthEndpoint::Readyz);
+    handle_single_check(&checks, &name).await
+}
+
+/// Storage connectivity check (the `etcd` / `etcd-readiness` checks).
 async fn check_storage(state: &Arc<ApiServerState>) -> Result<(), String> {
     use rusternetes_common::resources::namespace::Namespace;
     use rusternetes_storage::Storage;
