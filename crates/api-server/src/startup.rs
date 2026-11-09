@@ -85,6 +85,15 @@ pub async fn register_post_start_hooks(
     // start-kube-aggregator-informers (kube-aggregator apiserver.go:316).
     crate::post_start_hooks::register_aggregator_informers_hook(crate::post_start_hooks::global());
 
+    // aggregator-reload-proxy-client-cert (kube-aggregator apiserver.go:297-313),
+    // only when --proxy-client-cert-file/--proxy-client-key-file were given.
+    if let Some(certs) = crate::handlers::aggregator::proxy_client_certs() {
+        crate::post_start_hooks::register_aggregator_reload_proxy_client_cert_hook(
+            crate::post_start_hooks::global(),
+            certs.clone(),
+        );
+    }
+
     // apiservice-registration-controller + apiservice-discovery-controller
     // PostStartHooks (kube-aggregator apiserver.go:368-420).
     crate::apiservice_registration::spawn_apiservice_registration_hooks(storage.clone());

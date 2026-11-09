@@ -255,3 +255,27 @@ pub const APIEXTENSIONS_INFORMERS_HOOK: &str = "start-apiextensions-informers";
 pub fn register_apiextensions_informers_hook(registry: &PostStartHooks) {
     spawn_starting_hook_with(registry, APIEXTENSIONS_INFORMERS_HOOK, || {});
 }
+
+/// `aggregator-reload-proxy-client-cert` (kube-aggregator/pkg/apiserver/
+/// apiserver.go:310-313): `go aggregatorProxyCerts.Run(postStartHookContext, 1)`
+/// then returns nil, so it finishes at once and is never fatal. Registered
+/// only when `--proxy-client-cert-file` and `--proxy-client-key-file` were
+/// both given (apiserver.go:297).
+pub const AGGREGATOR_RELOAD_PROXY_CLIENT_CERT_HOOK: &str = "aggregator-reload-proxy-client-cert";
+
+/// Register [`AGGREGATOR_RELOAD_PROXY_CLIENT_CERT_HOOK`] on `registry` for
+/// `certs`, and add `listener` (upstream: the
+/// `APIServiceRegistrationController`) to it. The context never cancels for
+/// the process lifetime, so the reload tasks are left running.
+pub fn register_aggregator_reload_proxy_client_cert_hook(
+    registry: &PostStartHooks,
+    certs: Arc<crate::dynamic_certificates::DynamicCertKeyPairContent>,
+) {
+    spawn_starting_hook_with(
+        registry,
+        AGGREGATOR_RELOAD_PROXY_CLIENT_CERT_HOOK,
+        move || {
+            drop(certs.run());
+        },
+    );
+}

@@ -992,6 +992,19 @@ pub fn register_apiservice_hooks_with(
     );
 }
 
+/// `APIServiceRegistrationController` as a `dynamiccertificates.Listener`:
+/// `Enqueue` lists every APIService and re-adds it.
+struct EnqueueAllAPIServices(Arc<APIServiceRegistrationController>);
+
+impl crate::dynamic_certificates::Listener for EnqueueAllAPIServices {
+    fn enqueue(&self) {
+        let controller = self.0.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { controller.enqueue().await });
+        }
+    }
+}
+
 /// The production wiring over `storage`, on the global hook registry. The
 /// discovery manager is created first and handed to the handler manager, as
 /// upstream does before `NewAPIServiceRegistrationController` runs.
@@ -1024,6 +1037,12 @@ pub fn spawn_apiservice_registration_hooks<S: Storage + 'static>(storage: Arc<S>
         Arc::new(StorageAPIServiceClient(storage.clone())),
         manager,
     ));
+    // `aggregatorProxyCerts.AddListener(apiserviceRegistrationController)`
+    // (apiserver.go:308): a rotated proxy client cert re-enqueues every
+    // APIService.
+    if let Some(certs) = crate::handlers::aggregator::proxy_client_certs() {
+        certs.add_listener(Arc::new(EnqueueAllAPIServices(controller.clone())));
+    }
     // `context.Done()` never fires for the process lifetime.
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
