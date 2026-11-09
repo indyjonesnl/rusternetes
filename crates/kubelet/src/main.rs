@@ -548,14 +548,20 @@ async fn main() -> Result<()> {
         );
         // The CA validates the server's TLS cert; client cert/key (when the
         // kubeconfig provides them) authenticate the kubelet via mTLS (#1578).
-        let client = Arc::new(ApiClient::with_tls(
-            &server,
-            insecure,
-            ca_pem,
-            client_cert.map(|p| p.into_bytes()),
-            client_key.map(|p| p.into_bytes()),
-            token,
-        )?);
+        let client = Arc::new(
+            ApiClient::with_tls(
+                &server,
+                insecure,
+                ca_pem,
+                client_cert.map(|p| p.into_bytes()),
+                client_key.map(|p| p.into_bytes()),
+                token,
+            )?
+            // `rest.SetKubernetesDefaults`: the component's default User-Agent.
+            .with_default_user_agent(
+                rusternetes_common::compatibility::default_kubernetes_user_agent(),
+            ),
+        );
         api_client = Some(client.clone());
         Arc::new(StorageBackend::new_api(client))
     } else {

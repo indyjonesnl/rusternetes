@@ -536,11 +536,13 @@ async fn async_main() -> Result<()> {
     let loopback_url = format!("{loopback_scheme}://127.0.0.1:{api_port}");
 
     // --- Scheduler ---
-    let sched_client = Arc::new(rusternetes_client::http::ApiClient::new(
-        &loopback_url,
-        args.tls,
-        None,
-    )?);
+    let sched_client = Arc::new(
+        rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+            // `rest.SetKubernetesDefaults`: the component's default User-Agent.
+            .with_default_user_agent(
+                rusternetes_common::compatibility::default_kubernetes_user_agent(),
+            ),
+    );
     info!("Scheduler reading cluster state from embedded api-server at {loopback_url}");
     tokio::spawn(async move {
         if let Err(e) = rusternetes_scheduler::run_with_api(sched_client, sched_config).await {
@@ -691,11 +693,13 @@ async fn async_main() -> Result<()> {
         // DNS reaches cluster state through the embedded api-server over
         // loopback rather than the StorageBackend directly (see the loopback
         // client note above the scheduler block, #1128).
-        let dns_client = Arc::new(rusternetes_client::http::ApiClient::new(
-            &loopback_url,
-            args.tls,
-            None,
-        )?);
+        let dns_client = Arc::new(
+            rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+                // `rest.SetKubernetesDefaults`: the component's default User-Agent.
+                .with_default_user_agent(
+                    rusternetes_common::compatibility::default_kubernetes_user_agent(),
+                ),
+        );
         info!("DNS reading cluster state from embedded api-server at {loopback_url}");
         tokio::spawn(async move {
             if let Err(e) = rusternetes_dns::run_with_api(dns_client, dns_config).await {
