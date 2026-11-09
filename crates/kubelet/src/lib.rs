@@ -2,6 +2,7 @@ pub mod atomic_writer;
 pub mod clustertrustbundle;
 pub mod cm_helpers;
 pub mod config;
+pub mod container_log_manager;
 pub mod credentialprovider;
 pub mod credentialprovider_plugin;
 pub mod cri_runtime;
@@ -214,7 +215,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         // takes no KubeletConfiguration file.
         .with_image_gc_policy(image_gc::ImageGcPolicy::from_config(
             &config::KubeletConfiguration::default(),
-        )),
+        ))
+        .with_container_log_config(
+            config::KubeletConfiguration::default().effective_container_log_config(),
+        ),
     );
 
     k.register_pod_certificate_metrics(&metrics.registry);

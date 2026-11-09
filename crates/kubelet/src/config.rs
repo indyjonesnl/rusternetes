@@ -178,6 +178,19 @@ pub struct KubeletConfiguration {
     )]
     pub container_log_monitor_interval: Option<std::time::Duration>,
 
+    /// `containerLogMaxSize` (quantity string; default "10Mi", negative
+    /// disables rotation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_log_max_size: Option<String>,
+
+    /// `containerLogMaxFiles` (default 5; must be > 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_log_max_files: Option<i32>,
+
+    /// `containerLogMaxWorkers` (default 1; must be >= 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_log_max_workers: Option<i32>,
+
     /// `shutdownGracePeriod` (`metav1.Duration`, Go duration string).
     #[serde(
         default,
@@ -442,6 +455,9 @@ impl Default for KubeletConfiguration {
             runtime_request_timeout: None,
             eviction_pressure_transition_period: None,
             container_log_monitor_interval: None,
+            container_log_max_size: None,
+            container_log_max_files: None,
+            container_log_max_workers: None,
             shutdown_grace_period: None,
             shutdown_grace_period_critical_pods: None,
             cpu_cfs_quota_period: None,
@@ -542,6 +558,24 @@ impl KubeletConfiguration {
     /// `containerLogMonitorInterval` with the upstream default applied (10s).
     pub fn effective_container_log_monitor_interval(&self) -> std::time::Duration {
         nonzero_or(self.container_log_monitor_interval, 10)
+    }
+
+    /// The container log manager inputs with the v1beta1 defaults applied
+    /// (`defaults.go:257-267`: 10Mi, 5 files, 1 worker, 10s).
+    pub fn effective_container_log_config(
+        &self,
+    ) -> crate::container_log_manager::ContainerLogConfig {
+        let d = crate::container_log_manager::ContainerLogConfig::default();
+        crate::container_log_manager::ContainerLogConfig {
+            max_size: self
+                .container_log_max_size
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(d.max_size),
+            max_files: self.container_log_max_files.unwrap_or(d.max_files),
+            max_workers: self.container_log_max_workers.unwrap_or(d.max_workers),
+            monitor_interval: self.effective_container_log_monitor_interval(),
+        }
     }
 
     /// `nodeStatusReportFrequency` with the upstream default applied: 5m, or
@@ -774,6 +808,22 @@ impl KubeletConfiguration {
             anyhow::bail!(
                 "invalid configuration: imageGCLowThresholdPercent (--image-gc-low-threshold) {low} must be less than imageGCHighThresholdPercent (--image-gc-high-threshold) {high}"
             );
+        }
+        // validation.go:363-373.
+        let log = self.effective_container_log_config();
+        if log.max_workers < 1 {
+            anyhow::bail!(
+                "invalid configuration: containerLogMaxWorkers must be greater than or equal to 1"
+            );
+        }
+        if self
+            .container_log_monitor_interval
+            .is_some_and(|d| d.as_secs_f64() < 3.0)
+        {
+            anyhow::bail!("invalid configuration: containerLogMonitorInterval must be a positive time duration greater than or equal to 3s");
+        }
+        if log.max_files <= 1 {
+            anyhow::bail!("invalid configuration: containerLogMaxFiles must be greater than 1");
         }
         let max_age = self.effective_image_maximum_gc_age();
         if !max_age.is_zero() && max_age <= self.effective_image_minimum_gc_age() {

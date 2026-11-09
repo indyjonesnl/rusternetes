@@ -34,6 +34,7 @@ mod conformance_node_variable_expansion;
 mod conformance_storage_configmap_secret_projected;
 mod conformance_storage_downwardapi_secrets_namespace;
 mod conformance_storage_emptydir_hostpath;
+mod container_log_manager;
 mod coverage_qos;
 mod cri_translate_e2e;
 mod csi_fake;

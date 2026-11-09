@@ -552,6 +552,22 @@ impl CriClient {
         Ok(resp.into_inner())
     }
 
+    /// `ReopenContainerLog` (`remote_runtime.go`): ask the runtime to reopen
+    /// the container's log file, after log rotation renamed it.
+    pub async fn reopen_container_log(&mut self, container_id: &str) -> Result<()> {
+        let request = v1::ReopenContainerLogRequest {
+            container_id: container_id.to_string(),
+        };
+        self.runtime
+            .reopen_container_log(with_deadline(request, Some(self.timeout)))
+            .await
+            .map_err(|source| CriError::Rpc {
+                rpc: "ReopenContainerLog",
+                source: Box::new(source),
+            })?;
+        Ok(())
+    }
+
     // ---- Listing / reconciliation ------------------------------------------
 
     /// List containers, optionally filtered (by id, sandbox, state, labels).

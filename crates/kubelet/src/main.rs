@@ -391,6 +391,12 @@ async fn main() -> Result<()> {
         image_gc::ImageGcPolicy::from_config(&c)
     };
 
+    // containerLog{MaxSize,MaxFiles,MaxWorkers,MonitorInterval} (kubelet.go:714-721).
+    let container_log_config = config_file
+        .clone()
+        .unwrap_or_default()
+        .effective_container_log_config();
+
     // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
     let crash_loop_backoff_max = config_file
         .as_ref()
@@ -673,6 +679,7 @@ async fn main() -> Result<()> {
         .with_runtime_request_timeout(runtime_request_timeout)
         .with_crash_loop_backoff_max(crash_loop_backoff_max)
         .with_image_gc_policy(image_gc_policy)
+        .with_container_log_config(container_log_config)
         .with_node_status_max_images(node_status_max_images),
     );
 

@@ -57,6 +57,11 @@ struct FakeState {
     image_status_error: Option<String>,
     /// Upstream `FakeImageService.InjectError` for `PullImage`.
     pull_error: Option<String>,
+    /// `ContainerStatus.LogPath` by container id (upstream's embedded
+    /// `ContainerStatus` of `FakeContainer`; `v1::Container` has no such field).
+    log_paths: HashMap<String, String>,
+    /// Upstream `FakeRuntimeService.InjectError("ReopenContainerLog", ..)`.
+    reopen_log_error: Option<String>,
 }
 
 impl FakeState {
@@ -104,6 +109,23 @@ impl FakeCri {
                 .collect(),
             ..Default::default()
         });
+    }
+
+    /// Seed a container whose `ContainerStatus.LogPath` is `log_path`
+    /// (upstream `FakeContainer{ContainerStatus: {Id, State, LogPath}}`).
+    pub fn add_container_with_log_path(&self, id: &str, state: v1::ContainerState, log_path: &str) {
+        self.add_container(id, &[], state);
+        self.state
+            .lock()
+            .unwrap()
+            .log_paths
+            .insert(id.to_string(), log_path.to_string());
+    }
+
+    /// Make every `ReopenContainerLog` fail with this status message
+    /// (upstream `InjectError("ReopenContainerLog", err)`).
+    pub fn fail_reopen_container_log(&self, message: &str) {
+        self.state.lock().unwrap().reopen_log_error = Some(message.to_string());
     }
 
     /// Seed a pod sandbox with the given labels.
@@ -441,12 +463,27 @@ fake_runtime_service! {
             },
             labels: c.labels.clone(),
             annotations: c.annotations.clone(),
+            log_path: st.log_paths.get(&id).cloned().unwrap_or_default(),
             ..Default::default()
         };
         Ok(Response::new(v1::ContainerStatusResponse {
             status: Some(status),
             info: HashMap::new(),
         }))
+    }
+
+    /// `ReopenContainerLog` (upstream `FakeRuntimeService.ReopenContainerLog`):
+    /// records the call and returns the injected error, if any.
+    async fn reopen_container_log(
+        &self,
+        _request: Request<v1::ReopenContainerLogRequest>,
+    ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
+        let mut st = self.state.lock().unwrap();
+        st.record("ReopenContainerLog");
+        if let Some(msg) = &st.reopen_log_error {
+            return Err(Status::unknown(msg.clone()));
+        }
+        Ok(Response::new(v1::ReopenContainerLogResponse {}))
     }
 
     /// `PodSandboxStatus` (upstream `FakeRuntimeService.PodSandboxStatus`,
@@ -494,7 +531,6 @@ fake_runtime_service! {
     stubs {
         version: VersionRequest => VersionResponse,
         update_container_resources: UpdateContainerResourcesRequest => UpdateContainerResourcesResponse,
-        reopen_container_log: ReopenContainerLogRequest => ReopenContainerLogResponse,
         exec_sync: ExecSyncRequest => ExecSyncResponse,
         exec: ExecRequest => ExecResponse,
         attach: AttachRequest => AttachResponse,
