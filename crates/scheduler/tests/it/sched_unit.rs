@@ -29,6 +29,7 @@ mod in_tree__volume_binding;
 mod inter_pod_affinity_score;
 mod listers;
 mod node_volume_limits;
+mod permit_post_bind;
 mod pod_topology_spread_score;
 mod prefilter_extensions;
 mod profile;

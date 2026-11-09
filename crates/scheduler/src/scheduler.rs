@@ -50,6 +50,10 @@ pub struct BindingFailure {
     /// `status.IsRejected()`: decides whether the AssignedPodDelete move
     /// happens before or after the failure handler (schedule_one.go:356-368).
     pub rejected: bool,
+    /// `FitError.Diagnosis.UnschedulablePlugins`: set when WaitOnPermit
+    /// rejects the pod (bindingCycle, schedule_one.go:302-314), which the
+    /// failure handler passes on to the queue. Empty for every other failure.
+    pub unschedulable_plugins: std::collections::HashSet<String>,
 }
 
 impl BindingFailure {
@@ -57,8 +61,18 @@ impl BindingFailure {
         Self {
             error: rusternetes_common::Error::Internal(msg),
             rejected: false,
+            unschedulable_plugins: Default::default(),
         }
     }
+}
+
+/// How the scheduling cycle ended, from `assume` through `RunPermitPlugins`.
+enum ReserveOutcome {
+    /// Assumed, Reserved and permitted (or waiting in Permit).
+    Assumed(Box<AssumedPod>),
+    /// A Permit plugin rejected the pod: upstream's `FitError` with the
+    /// rejecting plugin recorded in the diagnosis (schedule_one.go:242-252).
+    Rejected(Box<Diagnosis>),
 }
 
 /// Outcome of one scheduling cycle for `handleSchedulingFailure`.
@@ -765,9 +779,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     /// `handleAssumedPodDeletion` (eventhandlers.go:255-291): the deletion of
     /// an assumed pod starts. Its assumed resources are released at once,
     /// "PreBinding/Binding will continue, but is eventually expected to fail
-    /// as the pod does not exist in the kube-apiserver anymore". There is no
-    /// Permit, so there is no waiting pod to reject (`RejectWaitingPod`): the
-    /// pod is always forgotten here.
+    /// as the pod does not exist in the kube-apiserver anymore". A pod waiting
+    /// in Permit is rejected instead (`RejectWaitingPod`): its binding cycle
+    /// fails quickly and cleans itself up through `handleBindingCycleError`;
+    /// otherwise it is forgotten here.
     fn handle_assumed_pod_deletion(&self, queue: &PriorityQueue, pod: &Pod) {
         // "We must operate on the pod from the scheduler's cache, not the one
         // from the event."
@@ -775,8 +790,24 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             debug!(pod = %pod_key(pod), "Assumed pod was already forgotten");
             return;
         };
-        if let Err(e) = self.cache.forget_pod(&assumed) {
-            error!(error = %e, pod = %pod_key(pod), "Scheduler cache ForgetPod failed");
+        // "This shouldn't happen, because we only accept for scheduling the
+        // pods which specify a scheduler name that matches one of the
+        // profiles."
+        let profile = match self.profile_for(&assumed) {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, pod = %pod_key(pod), "Unable to get profile for pod");
+                return;
+            }
+        };
+        // "1. If the pod is waiting on WaitOnPermit, we reject it ...
+        // 2. If the pod is no longer waiting (e.g., it's in PreBind or Bind),
+        // we can't quickly reject it. We must explicitly remove it from the
+        // cache here to free up its assumed resources."
+        if !profile.framework.reject_waiting_pod(&assumed.metadata.uid) {
+            if let Err(e) = self.cache.forget_pod(&assumed) {
+                error!(error = %e, pod = %pod_key(pod), "Scheduler cache ForgetPod failed");
+            }
         }
         queue.move_all_to_active_or_backoff_queue(
             &EVENT_ASSIGNED_POD_DELETE,
@@ -984,8 +1015,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                         Some(this) => this.spawn_binding_cycle(&queue, p_info, *assumed),
                         None => {
                             // The scheduler is being dropped: bind inline.
-                            queue.done(&p_info.pod.metadata.uid);
-                            if let Err(f) = self.binding_cycle(&assumed).await {
+                            if let Err(f) = self.binding_cycle(&assumed, Some(&queue)).await {
                                 error!("Failed to bind pod {}: {}", key, f.error);
                                 self.abort_assumed(&assumed).await;
                             }
@@ -1176,16 +1206,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             .await;
         if let Some(node) = selected {
             let async_binding = self.weak_self.get().is_some_and(|w| w.strong_count() > 0);
-            let assumed = self
+            let assumed = match self
                 .assume_and_reserve(queue, pod, &node.metadata.name, cycle_state, async_binding)
-                .await?;
+                .await?
+            {
+                ReserveOutcome::Assumed(a) => *a,
+                ReserveOutcome::Rejected(diag) => {
+                    return Ok(ScheduleOutcome::Unschedulable(
+                        diag.unschedulable_plugins,
+                        diag.pending_plugins,
+                    ));
+                }
+            };
             if async_binding {
                 // The worker runs `bindingCycle` as a task and frees itself
                 // for the next pod (schedule_one.go:123).
                 return Ok(ScheduleOutcome::Assumed(Box::new(assumed)));
             }
             // Driven directly (no running scheduler): bind inline.
-            if let Err(f) = self.binding_cycle(&assumed).await {
+            if let Err(f) = self.binding_cycle(&assumed, None).await {
                 error!("Failed to bind pod {}/{} to node: {}", ns, name, f.error);
                 self.abort_assumed(&assumed).await;
                 // Return the error so the work queue retries with backoff
@@ -1647,7 +1686,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         node_name: &str,
         cycle_state: CycleState,
         strict_assume: bool,
-    ) -> rusternetes_common::Result<AssumedPod> {
+    ) -> rusternetes_common::Result<ReserveOutcome> {
         let profile = self
             .profile_for(&pod)
             .map_err(rusternetes_common::Error::Internal)?;
@@ -1695,11 +1734,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             }
             return Err(rusternetes_common::Error::Internal(status.message()));
         }
-        Ok(AssumedPod {
+
+        // Run "permit" plugins (schedule_one.go:234-256). A Wait is not a
+        // failure: the binding cycle blocks in WaitOnPermit. Anything else
+        // that is not Success unreserves and forgets the pod; a rejection
+        // becomes a FitError naming the plugin, any other status an error.
+        let permit = fw
+            .run_permit_plugins(&cycle_state, &pod, node_name, &handle)
+            .await;
+        if !permit.is_wait() && !permit.is_success() {
+            fw.run_reserve_plugins_unreserve(&cycle_state, &pod, node_name, &handle)
+                .await;
+            if assumed_ok {
+                if let Err(e) = self.cache.forget_pod(&assumed) {
+                    error!(error = %e, "Scheduler cache ForgetPod failed");
+                }
+            }
+            if permit.is_rejected() {
+                let mut diag = Diagnosis::default();
+                diag.set_node_code(node_name, permit.code());
+                diag.add_plugin_status(&permit);
+                return Ok(ReserveOutcome::Rejected(Box::new(diag)));
+            }
+            return Err(rusternetes_common::Error::Internal(permit.message()));
+        }
+        Ok(ReserveOutcome::Assumed(Box::new(AssumedPod {
             pod,
             node_name: node_name.to_string(),
             cycle_state,
-        })
+        })))
     }
 
     fn with_node(pod: &Pod, node_name: &str) -> Pod {
@@ -1711,9 +1774,19 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     }
 
     /// `bindingCycle` (schedule_one.go:269-343) from PreBindPreFlights on:
-    /// PreBind, then `bind` (`RunBindPlugins` + `finishBinding`). The caller
-    /// unreserves and forgets on `Err` (`handleBindingCycleError`).
-    async fn binding_cycle(&self, a: &AssumedPod) -> Result<(), BindingFailure> {
+    /// WaitOnPermit, PreBind, then `bind` (`RunBindPlugins` +
+    /// `finishBinding`), then PostBind. The caller unreserves and forgets on
+    /// `Err` (`handleBindingCycleError`).
+    ///
+    /// `done` is the scheduling queue to call `Done` on once the pod is past
+    /// Permit (:316-324: "Any failures after this point cannot lead to the Pod
+    /// being considered unschedulable"); `None` for a cycle the caller marks
+    /// done itself.
+    async fn binding_cycle(
+        &self,
+        a: &AssumedPod,
+        done: Option<&PriorityQueue>,
+    ) -> Result<(), BindingFailure> {
         let (pod, node_name) = (&a.pod, a.node_name.as_str());
         let mut cycle_state = a.cycle_state.clone();
         let profile = self.profile_for(pod).map_err(BindingFailure::error)?;
@@ -1739,11 +1812,35 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             // "Add NominatedNodeName to tell the external components (e.g.,
             // the cluster autoscaler) that the pod is about to be bound to the
             // node. We only do this when any of WaitOnPermit or PreBind will
-            // work": there is no Permit plugin object yet, so only PreBind.
-            if status.is_success() {
+            // work".
+            if status.is_success() || fw.will_wait_on_permit(pod) {
                 self.nominate_for_expectation(pod, node_name).await;
             }
         }
+
+        // "Run "permit" plugins": WaitOnPermit (:302-315). A rejection is a
+        // FitError naming the rejecting plugin; any other failure is returned
+        // as is.
+        let status = fw.wait_on_permit(pod).await;
+        if !status.is_success() {
+            let rejected = status.is_rejected();
+            return Err(BindingFailure {
+                error: rusternetes_common::Error::Internal(status.message()),
+                rejected,
+                unschedulable_plugins: if rejected {
+                    std::iter::once(status.plugin().to_string()).collect()
+                } else {
+                    Default::default()
+                },
+            });
+        }
+
+        // "We can call Done() here because we can free the cluster events
+        // stored in the scheduling queue sooner" (:316-324).
+        if let Some(queue) = done {
+            queue.done(&pod.metadata.uid);
+        }
+
         let status = fw
             .run_pre_bind_plugins(&cycle_state, pod, node_name, &handle)
             .await;
@@ -1751,6 +1848,7 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return Err(BindingFailure {
                 error: rusternetes_common::Error::Internal(status.message()),
                 rejected: status.is_rejected(),
+                unschedulable_plugins: Default::default(),
             });
         }
 
@@ -1774,9 +1872,13 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return Err(BindingFailure {
                 error: rusternetes_common::Error::Internal(msg),
                 rejected: status.is_rejected(),
+                unschedulable_plugins: Default::default(),
             });
         }
         self.finish_binding(pod, node_name).await;
+        // "Run "postbind" plugins" (:344).
+        fw.run_post_bind_plugins(&cycle_state, pod, node_name, &handle)
+            .await;
         Ok(())
     }
 
@@ -1833,13 +1935,9 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         p_info: QueuedPodInfo,
         assumed: AssumedPod,
     ) {
-        // "Any failures after this point cannot lead to the Pod being
-        // considered unschedulable ... We can call Done() here because we can
-        // free the cluster events stored in the scheduling queue sooner"
-        // (bindingCycle, schedule_one.go:316-324). No Permit runs, so this is
-        // the start of the cycle.
-        queue.done(&p_info.pod.metadata.uid);
-        let Err(failure) = self.binding_cycle(&assumed).await else {
+        // `Done` is called by the cycle itself once WaitOnPermit is past
+        // (bindingCycle, schedule_one.go:316-324).
+        let Err(failure) = self.binding_cycle(&assumed, Some(queue)).await else {
             return;
         };
         self.handle_binding_cycle_error(queue, p_info, &assumed, failure)
@@ -1882,9 +1980,10 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         if forgotten && !failure.rejected {
             mv(None);
         }
-        // `FailureHandler` (`handleSchedulingFailure`): not a FitError, so no
+        // `FailureHandler` (`handleSchedulingFailure`): only a WaitOnPermit
+        // rejection is a FitError, which records its plugin; otherwise no
         // plugins are recorded and the pod backs off.
-        p_info.unschedulable_plugins.clear();
+        p_info.unschedulable_plugins = failure.unschedulable_plugins;
         self.handle_scheduling_failure(queue, p_info).await;
         if forgotten && failure.rejected {
             mv(Some(&not_self));
@@ -2756,6 +2855,25 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         node_name: &str,
         victim: &Pod,
     ) -> rusternetes_common::Result<()> {
+        // `PreemptPod` (preemption.go:178-185; `ev.Handler` is the
+        // preemptor's framework): "If the victim is a
+        // WaitingPod, send a reject message to the PermitPlugin. Otherwise we
+        // should delete the victim."
+        if let Ok(profile) = self.profile_for(preemptor) {
+            if let Some(waiting_pod) = profile.framework.get_waiting_pod(&victim.metadata.uid) {
+                waiting_pod.reject(
+                    crate::framework_runtime::names::DEFAULT_PREEMPTION,
+                    "preempted",
+                );
+                debug!(
+                    preemptor = %pod_key(preemptor),
+                    waiting_pod = %pod_key(victim),
+                    node = node_name,
+                    "Preemptor pod rejected a waiting pod"
+                );
+                return Ok(());
+            }
+        }
         if !self.evict_pod(preemptor, victim).await? {
             return Ok(());
         }

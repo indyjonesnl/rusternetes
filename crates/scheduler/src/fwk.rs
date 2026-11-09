@@ -651,6 +651,31 @@ pub trait PreBindPlugin: Plugin {
     ) -> Status;
 }
 
+/// `fwk.PermitPlugin` (`interface.go:608-619`): called before a pod is bound
+/// (and before PreBind) to prevent or delay the binding.
+#[async_trait]
+pub trait PermitPlugin: Plugin {
+    /// `Permit`: Success, Wait together with a timeout (the framework caps it
+    /// at 15 minutes and waits only after the remaining plugins ran, given no
+    /// other plugin rejects the pod), or a rejection/error that fails the
+    /// pod. The pod is also rejected when the wait times out or the pod is
+    /// rejected while waiting.
+    async fn permit(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> (Status, std::time::Duration);
+}
+
+/// `fwk.PostBindPlugin` (`interface.go:597-606`): informational, called after
+/// a pod was successfully bound; the place to clean up per-pod state.
+#[async_trait]
+pub trait PostBindPlugin: Plugin {
+    async fn post_bind(&self, state: &CycleState, pod: &Pod, node_name: &str, handle: &dyn Handle);
+}
+
 /// `fwk.BindPlugin`: binds the pod to the chosen node.
 #[async_trait]
 pub trait BindPlugin: Plugin {

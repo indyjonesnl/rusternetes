@@ -26,6 +26,7 @@ pub mod signers;
 pub mod volume_assume;
 pub mod volume_bind;
 pub mod volume_binding;
+pub mod waiting_pods;
 
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;

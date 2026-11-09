@@ -18,9 +18,9 @@
 //! the pipeline consults to decide which stages run for a profile.
 
 use crate::fwk::{
-    BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PodSignature,
-    PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin, ReservePlugin, ScorePlugin,
-    SignPlugin, Status,
+    BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PermitPlugin,
+    PodSignature, PostBindPlugin, PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin,
+    ReservePlugin, ScorePlugin, SignPlugin, Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -511,6 +511,10 @@ pub struct ProfileSpec<'a> {
     pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
 }
 
+/// `maxTimeout` (framework.go:52): the longest a Permit plugin may make a pod
+/// wait.
+pub const MAX_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// A resolved profile framework: per-extension-point plugin lists (after
 /// MultiPoint expansion) and the score weights.
 #[derive(Debug, Clone, Default)]
@@ -535,6 +539,17 @@ pub struct Framework {
     /// `f.bindPlugins` (framework.go:72): the Bind plugin objects, in
     /// execution order.
     bind_plugin_objects: BindPluginObjects,
+    /// `f.permitPlugins` / `f.postBindPlugins` (framework.go:73-74): the
+    /// Permit and PostBind plugin objects, in execution order. No in-tree
+    /// plugin implements them yet (GangScheduling is not ported); embedders
+    /// and tests register them with [`Framework::with_permit_plugins`] /
+    /// [`Framework::with_post_bind_plugins`].
+    permit_plugin_objects: PermitPluginObjects,
+    post_bind_plugin_objects: PostBindPluginObjects,
+    /// `f.waitingPods` (framework.go:79): the pods waiting in Permit. Shared
+    /// by every clone of the framework, as upstream shares the one map of a
+    /// profile's framework.
+    waiting_pods: Arc<crate::waiting_pods::WaitingPodsMap>,
     /// `f.batchablePlugins` (framework.go:75): the signers of the
     /// PreFilter/Filter/PreScore/Score plugins, once per plugin name.
     batchable_plugins: SignPluginObjects,
@@ -560,6 +575,30 @@ pub struct Framework {
 pub struct BindPluginObjects(Vec<Arc<dyn BindPlugin>>);
 
 impl std::fmt::Debug for BindPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The Permit plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PermitPluginObjects(Vec<Arc<dyn PermitPlugin>>);
+
+impl std::fmt::Debug for PermitPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The PostBind plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PostBindPluginObjects(Vec<Arc<dyn PostBindPlugin>>);
+
+impl std::fmt::Debug for PostBindPluginObjects {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list()
             .entries(self.0.iter().map(|p| p.name()))
@@ -837,6 +876,152 @@ impl Framework {
             ));
         }
         status
+    }
+
+    /// This framework with `plugins` as its Permit plugin objects (upstream
+    /// registers them through the out-of-tree registry).
+    pub fn with_permit_plugins(mut self, plugins: Vec<Arc<dyn PermitPlugin>>) -> Self {
+        self.permit_plugin_objects = PermitPluginObjects(plugins);
+        self
+    }
+
+    /// This framework with `plugins` as its PostBind plugin objects.
+    pub fn with_post_bind_plugins(mut self, plugins: Vec<Arc<dyn PostBindPlugin>>) -> Self {
+        self.post_bind_plugin_objects = PostBindPluginObjects(plugins);
+        self
+    }
+
+    /// `RunPostBindPlugins` (framework.go:1562-1581): informational, every
+    /// plugin runs in order and nothing is returned.
+    pub async fn run_post_bind_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) {
+        for pl in &self.post_bind_plugin_objects.0 {
+            pl.post_bind(state, pod, node_name, handle).await;
+        }
+    }
+
+    /// `RunPermitPlugins` (framework.go:1676-1729). The plugins run in
+    /// order; a rejection is returned at once tagged with the plugin, any
+    /// other failure as `running Permit plugin "<name>": <err>`. A Wait
+    /// records the plugin's timeout, capped at [`MAX_PERMIT_TIMEOUT`]
+    /// (`maxTimeout`, :52), and the plugins after it still run. If any plugin
+    /// asked to wait and none rejected, the pod becomes a waiting pod (with a
+    /// timer per waiting plugin) and the result is a Wait status; the caller
+    /// then blocks in [`Framework::wait_on_permit`]. Success is
+    /// `Status::success()` (upstream's nil).
+    pub async fn run_permit_plugins(
+        &self,
+        state: &CycleState,
+        pod: &Pod,
+        node_name: &str,
+        handle: &dyn Handle,
+    ) -> Status {
+        let mut plugins_wait_time: HashMap<String, std::time::Duration> = HashMap::new();
+        let mut status_code = Code::Success;
+        for pl in &self.permit_plugin_objects.0 {
+            let (mut status, mut timeout) = pl.permit(state, pod, node_name, handle).await;
+            if status.is_success() {
+                continue;
+            }
+            if status.is_rejected() {
+                status.set_plugin(pl.name());
+                return status;
+            }
+            if status.is_wait() {
+                // "Not allowed to be greater than maxTimeout."
+                if timeout > MAX_PERMIT_TIMEOUT {
+                    timeout = MAX_PERMIT_TIMEOUT;
+                }
+                plugins_wait_time.insert(pl.name().to_string(), timeout);
+                status_code = Code::Wait;
+            } else {
+                let mut s = Status::from_error(format!(
+                    "running Permit plugin {:?}: {}",
+                    pl.name(),
+                    status.as_error().unwrap_or_default()
+                ));
+                s.set_plugin(pl.name());
+                return s;
+            }
+        }
+        if status_code == Code::Wait {
+            let waiting_pod = crate::waiting_pods::WaitingPod::new(pod.clone(), plugins_wait_time);
+            self.waiting_pods.add(waiting_pod);
+            let msg = format!(
+                "one or more plugins asked to wait and no plugin rejected pod {:?}",
+                pod.metadata.name
+            );
+            return Status::new(Code::Wait, vec![msg]);
+        }
+        Status::success()
+    }
+
+    /// `WillWaitOnPermit` (framework.go:1741-1743): whether the pod is a
+    /// waiting pod.
+    pub fn will_wait_on_permit(&self, pod: &Pod) -> bool {
+        self.waiting_pods.get(&pod.metadata.uid).is_some()
+    }
+
+    /// `WaitOnPermit` (framework.go:1746-1771): blocks, if the pod is a
+    /// waiting pod, until it is rejected or allowed; the waiting pod is
+    /// removed on return. A rejection is returned as is (tagged by whoever
+    /// rejected), any other failure as `waiting on permit for pod: <err>`.
+    pub async fn wait_on_permit(&self, pod: &Pod) -> Status {
+        let Some(waiting_pod) = self.waiting_pods.get(&pod.metadata.uid) else {
+            return Status::success();
+        };
+        // `defer f.waitingPods.remove(pod.UID)`
+        struct Remove<'a>(&'a crate::waiting_pods::WaitingPodsMap, &'a str);
+        impl Drop for Remove<'_> {
+            fn drop(&mut self) {
+                self.0.remove(self.1);
+            }
+        }
+        let _remove = Remove(&self.waiting_pods, &pod.metadata.uid);
+
+        let s = waiting_pod.recv().await;
+        if s.is_success() {
+            return Status::success();
+        }
+        if s.is_rejected() {
+            return s;
+        }
+        let mut out = Status::from_error(format!(
+            "waiting on permit for pod: {}",
+            s.as_error().unwrap_or_default()
+        ));
+        out.set_plugin(s.plugin());
+        out
+    }
+
+    /// `IterateOverWaitingPods` (framework.go:1780-1783).
+    pub fn iterate_over_waiting_pods(
+        &self,
+        callback: impl FnMut(&crate::waiting_pods::WaitingPod),
+    ) {
+        self.waiting_pods.iterate(callback);
+    }
+
+    /// `GetWaitingPod` (framework.go:1785-1791).
+    pub fn get_waiting_pod(&self, uid: &str) -> Option<Arc<crate::waiting_pods::WaitingPod>> {
+        self.waiting_pods.get(uid)
+    }
+
+    /// `RejectWaitingPod` (framework.go:1793-1800): rejects a waiting pod
+    /// with message "removed"; returns whether the pod is waiting.
+    pub fn reject_waiting_pod(&self, uid: &str) -> bool {
+        match self.waiting_pods.get(uid) {
+            Some(wp) => {
+                wp.reject("", "removed");
+                true
+            }
+            None => false,
+        }
     }
 
     /// `RunScorePlugins` (framework.go:1273-1382) over the Score plugin
