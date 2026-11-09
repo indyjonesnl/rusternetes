@@ -58,7 +58,7 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
 
         info!("Starting CertificateSigningRequest controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("certificate");
 
         // Upstream launches 5 workers per signer/approver over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

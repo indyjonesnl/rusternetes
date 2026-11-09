@@ -976,7 +976,7 @@ impl<S: Storage + 'static> SELinuxWarningController<S> {
     /// cache current.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         info!("Starting SELinux warning controller");
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("selinux_warning");
         tokio::spawn(self.clone().run_worker(queue.clone()));
 
         loop {

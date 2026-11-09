@@ -70,7 +70,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
         info!("Starting HorizontalPodAutoscaler controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("horizontalpodautoscaler");
 
         // Upstream launches `ConcurrentHorizontalPodAutoscalerSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

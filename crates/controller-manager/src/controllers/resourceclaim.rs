@@ -36,7 +36,7 @@ impl<S: Storage + 'static> ResourceClaimController<S> {
 
         info!("Starting ResourceClaim Controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("resource_claim");
 
         // N workers drain ONE shared queue; a key in flight is never handed to
         // a second worker (`wait.UntilWithContext(ctx, worker, time.Second)` x N).
