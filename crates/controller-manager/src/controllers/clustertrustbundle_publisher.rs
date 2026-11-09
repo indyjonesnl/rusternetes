@@ -49,6 +49,9 @@ use tracing::{error, info};
 pub const KUBE_APISERVER_SERVING_SIGNER_NAME: &str = "kubernetes.io/kube-apiserver-serving";
 /// The queue key upstream always uses (`p.queue.Add("")`, publisher.go:295).
 pub const QUEUE_KEY: &str = "";
+/// The queue name upstream registers its `workqueue_*` metrics under
+/// (publisher.go:244).
+pub const QUEUE_NAME: &str = "ca_cert_publisher_cluster_trust_bundles";
 /// Re-evaluation period standing in for the informer event pokes.
 pub const SYNC_PERIOD: Duration = Duration::from_secs(10);
 
@@ -179,7 +182,7 @@ impl<S: Storage + 'static> ClusterTrustBundlePublisher<S> {
     /// informer and CA-listener pokes.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting ClusterTrustBundle CA cert publisher controller");
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named(QUEUE_NAME);
         queue.add(QUEUE_KEY.to_string()).await;
 
         let poker = queue.clone();

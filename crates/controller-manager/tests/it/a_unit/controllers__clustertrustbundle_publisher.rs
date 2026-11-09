@@ -340,4 +340,30 @@ mod tests {
         queue.shutdown().await;
         assert!(!p.process_next_work_item(&queue).await);
     }
+
+    /// The publisher's queue records `workqueue_*` metrics under upstream's
+    /// queue name (publisher.go:244).
+    #[tokio::test]
+    async fn publisher_queue_is_named_like_upstream() {
+        assert_eq!(QUEUE_NAME, "ca_cert_publisher_cluster_trust_bundles");
+        let s = Arc::new(MemoryStorage::new());
+        let p = ClusterTrustBundlePublisher::new(s, TEST_SIGNER, test_ca_pem()).unwrap();
+        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        queue.add(QUEUE_KEY.to_string()).await;
+        assert!(p.process_next_work_item(&queue).await);
+
+        use prometheus::Encoder;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&prometheus::default_registry().gather(), &mut buf)
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(&format!("workqueue_adds_total{{name=\"{QUEUE_NAME}\"}} 1")),
+            "{text}"
+        );
+        assert!(text.contains(&format!(
+            "workqueue_work_duration_seconds_count{{name=\"{QUEUE_NAME}\"}} 1"
+        )));
+    }
 }

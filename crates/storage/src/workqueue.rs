@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
+use crate::workqueue_metrics::{QueueMetrics, UNFINISHED_WORK_UPDATE_PERIOD};
 use crate::WatchEvent;
 
 /// Sentinel key that triggers a full `reconcile_all()` instead of
@@ -85,6 +86,9 @@ pub struct WorkQueueInner {
     pub last_dequeued: HashMap<String, Instant>,
     /// Whether the queue has been shut down.
     pub shutdown: bool,
+    /// `workqueue_*` metrics; `None` for an unnamed queue (client-go
+    /// `newQueueMetrics`: an empty name selects `noMetrics`).
+    pub metrics: Option<QueueMetrics>,
 }
 
 /// Minimum interval between processing the same key. Prevents tight loops
@@ -105,8 +109,47 @@ impl WorkQueue {
         Self::with_config(WorkQueueConfig::default())
     }
 
+    /// A queue that records the `workqueue_*` metrics under `name`
+    /// (`workqueue.TypedRateLimitingQueueConfig{Name: name}`), see
+    /// [`crate::workqueue_metrics`]. Must be created inside a tokio runtime
+    /// to refresh the unfinished-work gauges; outside one they stay at 0.
+    pub fn named(name: &str) -> Self {
+        Self::named_with_config(name, WorkQueueConfig::default())
+    }
+
+    /// [`Self::named`] with custom rate limiting configuration.
+    pub fn named_with_config(name: &str, config: WorkQueueConfig) -> Self {
+        let q = Self::build(config, (!name.is_empty()).then(|| QueueMetrics::new(name)));
+        // `updateUnfinishedWorkLoop` is only started for a queue with metrics
+        // (queue.go:175-179).
+        if q.inner.try_lock().is_ok_and(|i| i.metrics.is_some()) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let weak = Arc::downgrade(&q.inner);
+                handle.spawn(async move {
+                    let mut tick = tokio::time::interval(UNFINISHED_WORK_UPDATE_PERIOD);
+                    loop {
+                        tick.tick().await;
+                        let Some(inner) = weak.upgrade() else { break };
+                        let mut inner = inner.lock().await;
+                        if inner.shutdown {
+                            break;
+                        }
+                        if let Some(m) = inner.metrics.as_mut() {
+                            m.update_unfinished_work();
+                        }
+                    }
+                });
+            }
+        }
+        q
+    }
+
     /// Create a new work queue with custom rate limiting configuration.
     pub fn with_config(config: WorkQueueConfig) -> Self {
+        Self::build(config, None)
+    }
+
+    fn build(config: WorkQueueConfig, metrics: Option<QueueMetrics>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(WorkQueueInner {
                 queue: VecDeque::new(),
@@ -116,6 +159,7 @@ impl WorkQueue {
                 delayed: HashMap::new(),
                 last_dequeued: HashMap::new(),
                 shutdown: false,
+                metrics,
             })),
             notify: Arc::new(Notify::new()),
             config: Arc::new(config),
@@ -132,6 +176,10 @@ impl WorkQueue {
         // If already queued, nothing to do
         if inner.dirty.contains(&key) {
             return;
+        }
+        // `q.metrics.add(item)` follows the dirty check (queue.go:230-235).
+        if let Some(m) = inner.metrics.as_mut() {
+            m.add(&key);
         }
         // Mark as dirty. If the key is currently being processed,
         // done() will see the dirty flag and re-queue it.
@@ -153,6 +201,11 @@ impl WorkQueue {
         let mut inner = self.inner.lock().await;
         if inner.shutdown {
             return;
+        }
+        // `q.metrics.retry()` precedes everything else in `AddAfter`
+        // (delaying_queue.go:255).
+        if let Some(m) = inner.metrics.as_ref() {
+            m.retry();
         }
         // Don't delay if already queued
         if inner.dirty.contains(&key) {
@@ -228,8 +281,13 @@ impl WorkQueue {
                     // `waitingLoop` hands the matured entry to `Add`
                     // (delaying_queue.go:305): a key being processed is only
                     // marked dirty, and `done()` re-queues it.
-                    if inner.dirty.insert(key.clone()) && !inner.processing.contains(&key) {
-                        inner.queue.push_back(key);
+                    if inner.dirty.insert(key.clone()) {
+                        if let Some(m) = inner.metrics.as_mut() {
+                            m.add(&key);
+                        }
+                        if !inner.processing.contains(&key) {
+                            inner.queue.push_back(key);
+                        }
                     }
                 }
 
@@ -238,6 +296,9 @@ impl WorkQueue {
                     inner.dirty.remove(&key);
                     inner.processing.insert(key.clone());
                     inner.last_dequeued.insert(key.clone(), Instant::now());
+                    if let Some(m) = inner.metrics.as_mut() {
+                        m.get(&key);
+                    }
                     return Some(key);
                 }
             }
@@ -276,6 +337,10 @@ impl WorkQueue {
     /// where status updates trigger immediate re-reconciliation).
     pub async fn done(&self, key: &str) {
         let mut inner = self.inner.lock().await;
+        // `q.metrics.done(item)` is the first thing `Done` does (queue.go:288).
+        if let Some(m) = inner.metrics.as_mut() {
+            m.done(key);
+        }
         inner.processing.remove(key);
         // If add() was called while we were processing, re-queue
         if inner.dirty.contains(key) {
@@ -288,6 +353,9 @@ impl WorkQueue {
                 if elapsed < MIN_REPROCESS_INTERVAL {
                     // Too soon — delay the re-queue
                     let remaining = MIN_REPROCESS_INTERVAL - elapsed;
+                    if let Some(m) = inner.metrics.as_mut() {
+                        m.defer();
+                    }
                     inner.dirty.remove(key);
                     inner.delayed.insert(key.to_string(), now + remaining);
                     drop(inner);

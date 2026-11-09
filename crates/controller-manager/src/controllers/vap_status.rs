@@ -73,7 +73,8 @@ impl<S: Storage + 'static> VapStatusController<S> {
     /// drain it.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting {CONTROLLER_NAME} controller");
-        let queue = WorkQueue::new();
+        // `Name: ControllerName` (controller.go:81).
+        let queue = WorkQueue::named(CONTROLLER_NAME);
         let me = Arc::clone(&self);
         spawn_workers(CONCURRENT_POLICY_SYNCS, &queue, move |q| {
             let me = Arc::clone(&me);

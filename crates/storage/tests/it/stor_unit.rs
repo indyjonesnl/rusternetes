@@ -18,3 +18,4 @@ mod preconditions;
 mod rhino;
 mod size_estimator;
 mod workqueue;
+mod workqueue_metrics;
