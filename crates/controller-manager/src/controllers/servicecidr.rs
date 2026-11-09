@@ -299,7 +299,9 @@ impl<S: Storage + 'static> ServiceCIDRController<S> {
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting ServiceCIDR controller");
 
-        let queue = WorkQueue::new();
+        // servicecidrs_controller.go:82 names the controller's queue
+        // `ipaddresses` (verbatim, however odd for a ServiceCIDR queue).
+        let queue = WorkQueue::named("ipaddresses");
         spawn_workers(CONCURRENT_SERVICE_CIDR_SYNCS, &queue, |worker_queue| {
             let worker_self = Arc::clone(&self);
             async move {

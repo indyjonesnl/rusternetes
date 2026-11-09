@@ -56,7 +56,8 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
     /// `Run`: start the workers, then enqueue on every ClusterRole event.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting ClusterRoleAggregator controller");
-        let queue = WorkQueue::new();
+        // clusterroleaggregation_controller.go:65.
+        let queue = WorkQueue::named("ClusterRoleAggregator");
         for _ in 0..WORKERS {
             let worker = Arc::clone(&self);
             let queue = queue.clone();
