@@ -503,9 +503,9 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// and enqueue them for reconciliation.
     /// When an endpoint changes, we enqueue it for mirroring (services without selectors).
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("endpoint_slice");
         // Separate queue for endpoints mirroring
-        let mirror_queue = WorkQueue::new();
+        let mirror_queue = WorkQueue::named("endpoint_slice_mirroring");
 
         // A pool of workers over one queue, as upstream does: `Run` starts
         // `workers` goroutines each looping `processNextServiceWorkItem` over

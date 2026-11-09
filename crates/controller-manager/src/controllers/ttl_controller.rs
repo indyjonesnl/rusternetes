@@ -38,7 +38,7 @@ impl<S: Storage + 'static> TTLController<S> {
     pub async fn run(self: Arc<Self>) {
         info!("Starting TTL Controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("ttlcontroller");
 
         // Upstream launches `ConcurrentTTLSyncs (ttl-after-finished)` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

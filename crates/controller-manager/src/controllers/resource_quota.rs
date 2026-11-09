@@ -202,7 +202,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
 
         info!("Starting ResourceQuota controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("resourcequota_primary");
 
         // Upstream launches `ConcurrentResourceQuotaSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);
