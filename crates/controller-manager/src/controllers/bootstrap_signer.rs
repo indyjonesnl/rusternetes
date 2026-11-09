@@ -18,13 +18,20 @@
 //! upstream, a signing failure is logged and the empty signature is still
 //! stored.
 //!
-//! Deviations (storage seam instead of informers + workqueue):
-//! - Upstream pokes a one-item workqueue from ConfigMap/Secret informer
-//!   events (no resync by default). The `Storage` trait has no event hook
-//!   here, so `run` re-evaluates every [`SYNC_PERIOD`]; `sign_config_map` is
-//!   idempotent and only writes on change, as upstream.
+//! Work loop ported 1:1: `syncQueue` is a rate-limited queue named
+//! `bootstrap_signer_queue` holding the single ConfigMap key
+//! `<namespace>/<name>` (`NewSigner`); `Run` services it with
+//! `serviceConfigMapQueue` (Get, `signConfigMap`, Done; the queue is only ever
+//! `Add`ed to, never `AddRateLimited`/`Forget`). `updateConfigMap` does not log
+//! Conflict or NotFound.
+//!
+//! Deviations (storage seam instead of informers):
+//! - Upstream pokes the queue from ConfigMap/Secret informer events (no resync
+//!   by default). The `Storage` trait has no event hook here, so `run` pokes it
+//!   every [`SYNC_PERIOD`]; `sign_config_map` is idempotent and only writes on
+//!   change, as upstream, and the queue collapses the pokes.
 //! - Upstream's `Update` carries the resourceVersion read from the lister;
-//!   the `Storage` seam updates by key. NotFound is swallowed like upstream.
+//!   the cloned ConfigMap carries it here too.
 //! - Upstream's informer filters secrets by type; here the `kube-system`
 //!   secrets are listed and filtered by type.
 
@@ -34,7 +41,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rusternetes_common::resources::{ConfigMap, Secret};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +65,8 @@ pub const NAMESPACE_PUBLIC: &str = "kube-public";
 pub const NAMESPACE_SYSTEM: &str = "kube-system";
 /// Re-evaluation period standing in for the informer event pokes.
 pub const SYNC_PERIOD: Duration = Duration::from_secs(10);
+/// `syncQueue`'s name (bootstrapsigner.go, `NewSigner`).
+pub const QUEUE_NAME: &str = "bootstrap_signer_queue";
 
 /// `SignerOptions` (`DefaultSignerOptions()` values by default).
 #[derive(Debug, Clone)]
@@ -139,13 +148,44 @@ impl<S: Storage + 'static> Signer<S> {
         Self { storage, options }
     }
 
-    /// `Run`: re-sign every [`SYNC_PERIOD`].
+    /// `configMapKey`: the one item the sync queue ever holds.
+    pub fn config_map_key(&self) -> String {
+        format!(
+            "{}/{}",
+            self.options.config_map_namespace, self.options.config_map_name
+        )
+    }
+
+    /// `Run`: poke the queue now and every [`SYNC_PERIOD`] (the informer event
+    /// pokes), and service it until it shuts down.
     pub async fn run(self: Arc<Self>) -> Result<()> {
         info!("Starting bootstrap signer controller");
-        loop {
-            self.sign_config_map(Utc::now()).await;
-            tokio::time::sleep(SYNC_PERIOD).await;
-        }
+        let queue = WorkQueue::named(QUEUE_NAME);
+        queue.add(self.config_map_key()).await;
+
+        let poker = queue.clone();
+        let key = self.config_map_key();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(SYNC_PERIOD).await;
+                poker.add(key.clone()).await;
+            }
+        });
+
+        while self.service_config_map_queue(&queue).await {}
+        info!("Shutting down bootstrap signer controller");
+        Ok(())
+    }
+
+    /// `serviceConfigMapQueue`: Get, sign, Done. `false` once the queue is shut
+    /// down (`quit`).
+    pub async fn service_config_map_queue(&self, queue: &WorkQueue) -> bool {
+        let Some(key) = queue.get().await else {
+            return false;
+        };
+        self.sign_config_map(Utc::now()).await;
+        queue.done(&key).await;
+        true
     }
 
     /// `getConfigMap`: `None` when absent (the resync catches up later).
@@ -271,7 +311,9 @@ impl<S: Storage + 'static> Signer<S> {
             &cm.metadata.name,
         );
         match self.storage.update(&key, cm).await {
-            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => {}
+            Ok(_)
+            | Err(rusternetes_common::Error::NotFound(_))
+            | Err(rusternetes_common::Error::Conflict(_)) => {}
             Err(e) => debug!("Error updating ConfigMap: {e}"),
         }
     }

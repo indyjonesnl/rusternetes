@@ -189,4 +189,39 @@ mod tests {
             SIG
         );
     }
+
+    /// `configMapKey` (bootstrapsigner.go `NewSigner`): `<namespace>/<name>`.
+    #[tokio::test]
+    async fn queue_key_is_the_config_map_key() {
+        let (signer, _st) = setup(None, &[]).await;
+        assert_eq!(signer.config_map_key(), "kube-public/cluster-info");
+        assert_eq!(QUEUE_NAME, "bootstrap_signer_queue");
+    }
+
+    /// `serviceConfigMapQueue`: one Get, `signConfigMap`, Done per item; the
+    /// queue has nothing left afterwards and a re-poke collapses into one.
+    #[tokio::test]
+    async fn service_queue_signs_then_marks_the_key_done() {
+        let mut s = new_token_secret(TEST_TOKEN_ID, "tokenSecret");
+        add_signing_usage(&mut s, "true");
+        let (signer, st) = setup(Some(new_config_map("", "")), &[s]).await;
+        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        queue.add(signer.config_map_key()).await;
+        queue.add(signer.config_map_key()).await; // collapsed
+        assert!(signer.service_config_map_queue(&queue).await);
+        assert_eq!(
+            stored_data(&st).await,
+            new_config_map(TEST_TOKEN_ID, SIG).data.unwrap()
+        );
+        assert_eq!(queue.len().await, 0);
+    }
+
+    /// `serviceConfigMapQueue` returns on `quit`.
+    #[tokio::test]
+    async fn service_queue_stops_when_the_queue_shuts_down() {
+        let (signer, _st) = setup(None, &[]).await;
+        let queue = rusternetes_storage::WorkQueue::new();
+        queue.shutdown().await;
+        assert!(!signer.service_config_map_queue(&queue).await);
+    }
 }
