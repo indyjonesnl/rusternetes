@@ -316,7 +316,14 @@ impl<S: Storage + 'static> StorageVersionGCController<S> {
     }
 
     /// Upstream `updateOrDeleteStorageVersion`.
-    async fn update_or_delete_storage_version(
+    ///
+    /// `UpdateStatus(ctx, sv, ...)` (gc_controller.go:299-300) writes only the
+    /// status of the object this controller read, with that object's
+    /// resourceVersion as a precondition: a concurrent writer makes it fail
+    /// with a Conflict, which the caller requeues and recomputes from a fresh
+    /// read. [`Storage::update_status_cas`] is that verb; a plain `update`
+    /// would overwrite the whole object, losing the concurrent change.
+    pub async fn update_or_delete_storage_version(
         &self,
         mut sv: StorageVersion,
         remaining: Vec<ServerStorageVersion>,
@@ -327,7 +334,7 @@ impl<S: Storage + 'static> StorageVersionGCController<S> {
         }
         sv.status.storage_versions = remaining;
         set_common_encoding_version(&mut sv);
-        self.storage.update(&key, &sv).await?;
+        self.storage.update_status_cas(&key, &sv).await?;
         Ok(())
     }
 }

@@ -222,4 +222,65 @@ mod tests {
         .await;
         assert_eq!(q.len().await, 1);
     }
+
+    /// `UpdateStatus` (gc_controller.go:299-300) carries the read object's
+    /// resourceVersion: a writer that got in between turns the update into a
+    /// Conflict and nothing is written, so the caller recomputes from a fresh
+    /// read instead of overwriting the newer object.
+    #[tokio::test]
+    async fn update_conflicts_when_the_storage_version_changed_since_it_was_read() {
+        let storage = setup(
+            &["id1"],
+            vec![ssv("id1", "v1"), ssv("id2", "v1")],
+            Some("v1"),
+        )
+        .await;
+        let c = StorageVersionGCController::new(storage.clone());
+
+        let stale = get_sv(&storage).await.unwrap();
+        // A concurrent writer (another apiserver recording its version).
+        let mut newer = stale.clone();
+        newer.status.storage_versions.push(ssv("id3", "v1"));
+        storage
+            .update_status_cas(&sv_key("k8s.test.resources"), &newer)
+            .await
+            .unwrap();
+
+        let err = c
+            .update_or_delete_storage_version(stale, vec![ssv("id1", "v1")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.downcast_ref::<Error>(), Some(Error::Conflict(_))),
+            "{err}"
+        );
+        let stored = get_sv(&storage).await.unwrap();
+        assert_eq!(stored.status.storage_versions.len(), 3, "nothing written");
+    }
+
+    /// `UpdateStatus` touches the status only: a non-status field changed on
+    /// the controller's copy is not written.
+    #[tokio::test]
+    async fn update_writes_the_status_only() {
+        let storage = setup(&["id1"], vec![ssv("id1", "v1"), ssv("id2", "v2")], None).await;
+        let c = StorageVersionGCController::new(storage.clone());
+
+        let mut sv = get_sv(&storage).await.unwrap();
+        sv.metadata.labels = Some(HashMap::from([("touched".to_string(), "yes".to_string())]));
+        c.update_or_delete_storage_version(sv, vec![ssv("id1", "v1")])
+            .await
+            .unwrap();
+
+        let stored = get_sv(&storage).await.unwrap();
+        assert_eq!(stored.status.storage_versions.len(), 1);
+        assert_eq!(stored.status.common_encoding_version.as_deref(), Some("v1"));
+        assert!(
+            stored
+                .metadata
+                .labels
+                .as_ref()
+                .is_none_or(|l| !l.contains_key("touched")),
+            "metadata is not part of UpdateStatus"
+        );
+    }
 }
