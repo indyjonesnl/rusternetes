@@ -26,6 +26,7 @@
 //! `--permit-address-sharing` are not offered.
 
 use super::authn::CaContent;
+use crate::request_header::{FrontProxyConnection, RequestHeaderConfig};
 use axum::Extension;
 use axum::Router;
 use axum_server::accept::Accept;
@@ -421,16 +422,57 @@ pub fn http2_settings(max_streams_per_connection: i32) -> (u32, u32, u32) {
     )
 }
 
+/// `x509.VerifyOptionsFn` (x509.go:229): the verifier over a CA bundle's
+/// *current* content, read per connection because the CA files reload on
+/// change. `None` while no bundle is loaded (`VerifyOptions` returning
+/// `false`).
+pub type VerifierFn = Arc<dyn Fn() -> Option<Arc<dyn ClientCertVerifier>> + Send + Sync>;
+
+/// What the acceptor needs to split a handshake-verified chain between the two
+/// authenticators that upstream keeps separate (`x509.Verifier` per CA,
+/// `pkg/kubeapiserver/authenticator/config.go:113-131`).
+#[derive(Clone)]
+struct FrontProxyTrust {
+    config: Arc<RequestHeaderConfig>,
+    request_header_ca: VerifierFn,
+    /// `None` when `--client-ca-file` is unset: x509 authentication is then
+    /// disabled (`config.ClientCAContentProvider != nil`, config.go:128).
+    client_ca: Option<VerifierFn>,
+}
+
+/// Whether `chain` (leaf first) verifies against the verifier `current`
+/// returns (`Certificate.Verify` with the presented intermediates,
+/// x509.go:235-250); no bundle loaded verifies nothing.
+fn chain_verifies(current: &VerifierFn, chain: &[Vec<u8>]) -> bool {
+    let Some(verifier) = current() else {
+        return false;
+    };
+    let Some((leaf, rest)) = chain.split_first() else {
+        return false;
+    };
+    let leaf = CertificateDer::from(leaf.as_slice());
+    let intermediates: Vec<CertificateDer<'_>> = rest
+        .iter()
+        .map(|c| CertificateDer::from(c.as_slice()))
+        .collect();
+    verifier
+        .verify_client_cert(&leaf, &intermediates, UnixTime::now())
+        .is_ok()
+}
+
 /// A TLS acceptor that injects the verified client-cert chain as a
 /// [`crate::PeerCertificates`] request extension (the equivalent of
 /// `req.TLS.PeerCertificates`).
 ///
-/// Shared by every plain-TLS server in the workspace (the kubelet re-exports
-/// it). The api-server keeps its own superset that also splits the chain
-/// between the client-CA and request-header authenticators.
+/// Shared by every TLS server in the workspace: the kubelet re-exports it and
+/// the api-server builds on it with [`PeerCertAcceptor::with_request_header`].
+/// The chain is the one rustls already verified against the configured client
+/// CA; without request-header authentication this acceptor performs no
+/// verification of its own. A client with no certificate gets an empty chain.
 #[derive(Clone)]
 pub struct PeerCertAcceptor {
     inner: RustlsAcceptor,
+    front_proxy: Option<FrontProxyTrust>,
 }
 
 impl PeerCertAcceptor {
@@ -438,7 +480,26 @@ impl PeerCertAcceptor {
     pub fn new(config: RustlsConfig) -> Self {
         Self {
             inner: RustlsAcceptor::new(config),
+            front_proxy: None,
         }
+    }
+
+    /// Enable request-header (front-proxy) authentication. The `RustlsConfig`
+    /// must trust the union of both CA bundles (the serving controller keeps it
+    /// current); this acceptor then decides, per connection, which
+    /// authenticator the presented chain is valid for.
+    pub fn with_request_header(
+        mut self,
+        config: Arc<RequestHeaderConfig>,
+        request_header_ca: VerifierFn,
+        client_ca: Option<VerifierFn>,
+    ) -> Self {
+        self.front_proxy = Some(FrontProxyTrust {
+            config,
+            request_header_ca,
+            client_ca,
+        });
+        self
     }
 }
 
@@ -447,21 +508,55 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Send + 'static,
 {
+    // Project the stream/service types through the wrapped acceptor + the
+    // Extension layers so we never have to name `TlsStream` / `AddExtension`.
     type Stream = <RustlsAcceptor as Accept<I, S>>::Stream;
-    type Service = <Extension<crate::PeerCertificates> as Layer<S>>::Service;
+    type Service = <Extension<Option<FrontProxyConnection>> as Layer<
+        <Extension<crate::PeerCertificates> as Layer<S>>::Service,
+    >>::Service;
     type Future = Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let inner = self.inner.clone();
+        let front_proxy = self.front_proxy.clone();
         Box::pin(async move {
             let (tls_stream, service) = inner.accept(stream, service).await?;
+
+            // `get_ref().1` is the rustls ServerConnection post-handshake; the
+            // chain it returns is already verified against the client CA. Copy
+            // the DER out so the extension is `'static` and rustls-free.
             let chain: Vec<Vec<u8>> = tls_stream
                 .get_ref()
                 .1
                 .peer_certificates()
                 .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
                 .unwrap_or_default();
-            let service = Extension(crate::PeerCertificates(Arc::new(chain))).layer(service);
+
+            // With front-proxy authentication the handshake trusted the union
+            // of both CA bundles, so the chain is re-verified per
+            // authenticator (x509.Verifier). `PeerCertificates` then carries
+            // only what the `--client-ca-file` x509 authenticator accepts.
+            let (peer_chain, connection) = match &front_proxy {
+                None => (chain, None),
+                Some(trust) => {
+                    let connection = FrontProxyConnection {
+                        config: trust.config.clone(),
+                        verified_by_request_header_ca: chain_verifies(
+                            &trust.request_header_ca,
+                            &chain,
+                        ),
+                        verified_by_client_ca: trust
+                            .client_ca
+                            .as_ref()
+                            .map(|v| chain_verifies(v, &chain)),
+                        presented: Arc::new(chain),
+                    };
+                    (connection.x509_chain(), Some(connection))
+                }
+            };
+
+            let service = Extension(crate::PeerCertificates(Arc::new(peer_chain))).layer(service);
+            let service = Extension(connection).layer(service);
             Ok((tls_stream, service))
         })
     }

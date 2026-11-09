@@ -277,8 +277,9 @@ pub fn mtls_acceptor(
     let acceptor = match (trust, request_header_ca) {
         (Some(t), Some(rh_ca)) => acceptor.with_request_header(
             t.config.clone(),
-            rh_ca,
-            client_ca.map(|c| c as Arc<dyn CaContentProvider>),
+            crate::peer_cert_acceptor::verifier_fn(rh_ca),
+            client_ca
+                .map(|c| crate::peer_cert_acceptor::verifier_fn(c as Arc<dyn CaContentProvider>)),
         ),
         _ => acceptor,
     };
