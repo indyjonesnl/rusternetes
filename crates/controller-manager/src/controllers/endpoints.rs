@@ -230,7 +230,7 @@ impl<S: Storage + 'static> EndpointsController<S> {
     /// When a pod changes, we find services whose selector matches the pod
     /// and enqueue them for reconciliation.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("endpoint");
 
         // Upstream launches `ConcurrentEndpointSyncs` workers over one shared queue
         // (`for i := 0; i < workers; i++ { go wait.UntilWithContext(ctx, worker, time.Second) }`);

@@ -153,7 +153,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     /// Watch-based run loop. Watches for serviceaccount changes and
     /// periodically resyncs every 30s.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("serviceaccount");
 
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);

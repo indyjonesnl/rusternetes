@@ -89,8 +89,8 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         Self {
             recorder: EventRecorder::new(Arc::clone(&storage)),
             storage,
-            queue: WorkQueue::new(),
-            recheck_queue: WorkQueue::new(),
+            queue: WorkQueue::named("disruption"),
+            recheck_queue: WorkQueue::named("disruption_recheck"),
         }
     }
 
@@ -1290,7 +1290,7 @@ impl<S: Storage + 'static> StalePodDisruptionController<S> {
 
     /// `stalePodDisruptionWorker` + the pod handlers' `enqueueStalePodDisruptionCleanup`.
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("stale_pod_disruption");
         let worker_self = Arc::clone(&self);
         let worker_queue = queue.clone();
         tokio::spawn(async move { worker_self.worker(worker_queue).await });

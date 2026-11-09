@@ -79,7 +79,7 @@ impl<S: Storage + 'static> PvProtectionController<S> {
         use futures::StreamExt;
         info!("Starting PV protection controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("pvprotection");
         let worker = self.clone();
         let wq = queue.clone();
         tokio::spawn(async move {

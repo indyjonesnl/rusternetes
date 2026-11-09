@@ -188,7 +188,7 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
         use futures::StreamExt;
         info!("Starting PVC protection controller");
 
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("pvcprotection");
         let worker = self.clone();
         let wq = queue.clone();
         tokio::spawn(async move {

@@ -184,7 +184,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
     /// a pool of [`CONCURRENT_NAMESPACE_SYNCS`] workers drains the queue with
     /// deduplication and exponential backoff on failures.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
+        let queue = WorkQueue::named("namespace");
 
         // One worker per upstream `ConcurrentNamespaceSyncs`
         // (pkg/controller/namespace/config/v1alpha1/defaults.go:38), all
