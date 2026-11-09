@@ -54,6 +54,7 @@ mod root_unit;
 mod runtime_prestop_exit_test;
 mod sandbox_lookup_isolation;
 mod server_extended_test;
+mod server_stats_volume_unit;
 mod sidecar_containers_test;
 mod static_pod_defaults_test;
 mod static_pods_test;

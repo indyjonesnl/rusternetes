@@ -396,6 +396,8 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_default()
         .effective_container_log_config();
+    // volumeStatsAggPeriod (None => upstream default 1m).
+    let volume_stats_agg_period = config_file.as_ref().and_then(|c| c.volume_stats_agg_period);
 
     // crashLoopBackOff.maxContainerRestartPeriod (None => 300s default).
     let crash_loop_backoff_max = config_file
@@ -680,6 +682,7 @@ async fn main() -> Result<()> {
         .with_crash_loop_backoff_max(crash_loop_backoff_max)
         .with_image_gc_policy(image_gc_policy)
         .with_container_log_config(container_log_config)
+        .with_volume_stats_agg_period(volume_stats_agg_period)
         .with_node_status_max_images(node_status_max_images),
     );
 
