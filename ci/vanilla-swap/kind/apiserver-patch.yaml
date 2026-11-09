@@ -63,6 +63,10 @@ template: |
           - "--requestheader-extra-headers-prefix=X-Remote-Extra-"
           # Default is AlwaysAllow like upstream (#3266); kubeadm passes this.
           - "--authorization-mode=Node,RBAC"
+          # Webhook and aggregated-API backends are dialed at their Endpoint
+          # address (NewEndpointServiceResolver), as every compose stack does
+          # (#4399/#4400 made the ClusterIP resolver the default).
+          - "--enable-aggregator-routing=true"
           - "--storage-backend=sqlite"
           - "--data-dir=/tmp/rusternetes/api-server.db"
         volumeMounts:
