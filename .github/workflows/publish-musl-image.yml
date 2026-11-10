@@ -81,10 +81,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          # The rhino in-tree submodule backs the `../../rhino` path-dep from
-          # crates/storage; without it cargo cannot resolve the workspace.
-          submodules: recursive
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3

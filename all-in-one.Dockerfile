@@ -84,13 +84,6 @@ ENV RUSTC_WRAPPER=sccache \
 
 WORKDIR /build
 
-# Copy the rhino submodule first (dependency). With rhino vendored in-tree as
-# rusternetes/rhino, it lands at /build/rusternetes/rhino so the relative path
-# `../../rhino` from /build/rusternetes/crates/storage resolves correctly.
-COPY rusternetes/rhino/Cargo.toml rusternetes/rhino/Cargo.lock rusternetes/rhino/build.rs ./rusternetes/rhino/
-COPY rusternetes/rhino/proto/ ./rusternetes/rhino/proto/
-COPY rusternetes/rhino/src/ ./rusternetes/rhino/src/
-
 # ----- PASS 1: dependency-only compile (cache-friendly) -----
 
 # Workspace manifest + lockfile.
@@ -159,7 +152,7 @@ RUN set -eux; \
 
 # Dummy bench files — see services.Dockerfile for the detailed rationale.
 # Path is rooted at /build/rusternetes because this Dockerfile's
-# workspace lives there (rhino sits next to it at /build/rhino).
+# workspace lives there.
 RUN mkdir -p /build/rusternetes/crates/common/benches \
  && echo "fn main(){}" > /build/rusternetes/crates/common/benches/regex_cache.rs \
  && mkdir -p /build/rusternetes/crates/storage/benches \

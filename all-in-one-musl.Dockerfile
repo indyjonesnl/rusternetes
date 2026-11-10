@@ -14,9 +14,8 @@
 # NATIVE runner and stitches the two into one multi-arch manifest; keep this
 # file arch-neutral (guarded by scripts/tests/test-dockerfile-multiarch.sh).
 #
-# Build context = repo root, so the rhino in-tree submodule at ./rhino resolves
-# the `../../rhino` path-dep from crates/storage. Check it out first:
-#   git submodule update --init rhino
+# Build context = repo root. The rhino dependency of crates/storage is a git
+# dependency pinned by commit, fetched by cargo during the build.
 #   docker build -f all-in-one-musl.Dockerfile -t rusternetes-all-in-one:musl .
 #
 # Unlike all-in-one.Dockerfile (glibc / debian-slim, ships iptables + the web

@@ -12,10 +12,8 @@
 # service binaries, so a `docker compose build` populates the BuildKit
 # cache once and reuses it across all six services.
 #
-# Build (rhino must be adjacent — same constraint services.Dockerfile
-# carries via the compose `additional_contexts: rhino: ../rhino` entry):
-#   docker build -f dns.Dockerfile --build-context rhino=../rhino \
-#       -t rusternetes-dns:dev .
+# Build:
+#   docker build -f dns.Dockerfile -t rusternetes-dns:dev .
 #
 # Run (against an etcd reachable from the container):
 #   docker run --rm -p 53:53/udp -p 53:53/tcp rusternetes-dns:dev \
@@ -53,14 +51,6 @@ ENV RUSTC_WRAPPER=sccache \
     CARGO_INCREMENTAL=0
 
 WORKDIR /app
-
-# Pull in the rhino submodule (named build context, pointed at the in-tree
-# `./rhino` submodule). crates/storage/Cargo.toml declares
-# `rhino = { path = "../../rhino", optional = true }` which from
-# /app/crates/storage resolves to /app/rhino, so land it there.
-# We need this even when building without the sqlite/redis features
-# because `cargo metadata` resolves all optional dependencies up-front.
-COPY --from=rhino . /app/rhino
 
 # Workspace manifest + lockfile.
 COPY Cargo.toml Cargo.lock* ./

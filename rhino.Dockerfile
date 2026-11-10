@@ -1,6 +1,10 @@
 # Dockerfile for Rhino - etcd-compatible gRPC server backed by SQLite
-# Builds rhino-server from the adjacent rhino repo.
+# Builds rhino-server from a pinned commit of github.com/indyjonesnl/rhino.
+# RHINO_REV is the same commit as the `rhino` git dependency in
+# crates/storage/Cargo.toml (scripts/check-rhino-rev.sh guards the pair).
 FROM rust:latest AS builder
+
+ARG RHINO_REV=5e07b3ca7d2b04456891d40f6a83e4e10cbcd075
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -10,22 +14,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# Copy manifests first for layer caching
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto/ proto/
-# Vendored, patched h2 referenced via [patch.crates-io] in Cargo.toml — must be
-# present before any cargo invocation so the patch path resolves during parse.
-COPY third_party/ third_party/
-
-# Stub source to cache dependency builds
-RUN mkdir -p src/bin && \
-    echo 'fn main() {}' > src/bin/server.rs && \
-    echo 'pub fn unused() {}' > src/lib.rs && \
-    cargo build --release --bin rhino-server 2>/dev/null || true
-
-# Copy actual source and force rebuild (touch ensures Cargo sees the change)
-COPY src/ src/
-RUN touch src/bin/server.rs src/lib.rs && cargo build --release --bin rhino-server
+# Fetch exactly the pinned commit. Rhino's own Cargo.toml carries the
+# [patch.crates-io] for its vendored h2 (third_party/), which only applies when
+# rhino is the build root, so rhino-server is built here from its own tree.
+RUN git init -q . \
+ && git fetch -q --depth 1 https://github.com/indyjonesnl/rhino.git "${RHINO_REV}" \
+ && git checkout -q FETCH_HEAD \
+ && cargo build --release --bin rhino-server
 
 FROM debian:sid-slim
 

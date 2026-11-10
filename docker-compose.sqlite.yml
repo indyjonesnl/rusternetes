@@ -8,18 +8,13 @@
 #   docker compose -f docker-compose.sqlite.yml build
 #   docker compose -f docker-compose.sqlite.yml up -d
 #   bash scripts/bootstrap-cluster.sh
-#
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
 
 services:
   # Rhino - etcd-compatible gRPC server backed by SQLite
   rhino:
     build:
-      context: ../rhino
-      dockerfile: ../rusternetes/rhino.Dockerfile
+      context: .
+      dockerfile: rhino.Dockerfile
     container_name: rusternetes-rhino
     ports:
       - "2379:2379"

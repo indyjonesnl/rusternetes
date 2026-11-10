@@ -52,12 +52,6 @@ bin="${component}"
 mkdir -p "$build_dir"
 
 # --- 1. static-musl Rusternetes binary --------------------------------------
-# The workspace path-deps require the rhino submodule to resolve, even for the
-# default (etcd) build that doesn't use it.
-if [ ! -f "$repo_root/rhino/Cargo.toml" ]; then
-  log "initializing rhino submodule (needed to resolve the workspace)"
-  ( cd "$repo_root" && git submodule update --init rhino )
-fi
 if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
   log "adding rust target $target"
   rustup target add "$target"

@@ -37,12 +37,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: api-server
-      additional_contexts:
-        # crates/storage/Cargo.toml declares rhino as `path = "../../rhino"`,
-        # which resolves outside the rusternetes build context. Expose the
-        # adjacent rhino checkout as a named context so each Dockerfile can
-        # `COPY --from=rhino` into the right spot.
-        rhino: ./rhino
     container_name: rusternetes-api-server
     # NET_ADMIN lets the entrypoint install a route to the pod CIDR
     # (10.244.0.0/16) via the containerd container, so the pod/service proxy
@@ -119,8 +113,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: scheduler
-      additional_contexts:
-        rhino: ./rhino
     image: rusternetes-scheduler:latest
 
   # Controller Manager — build-only. Runs in-cluster as a static pod on node-1
@@ -136,8 +128,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: controller-manager
-      additional_contexts:
-        rhino: ./rhino
     image: rusternetes-controller-manager:latest
 
   # Shared CRI runtime: containerd (CRI plugin) + crun. The kubelets talk to
@@ -172,8 +162,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
-      additional_contexts:
-        rhino: ./rhino
     container_name: rusternetes-kubelet
     privileged: true
     depends_on:
@@ -211,8 +199,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kubelet
-      additional_contexts:
-        rhino: ./rhino
     container_name: rusternetes-kubelet2
     privileged: true
     depends_on:
@@ -248,8 +234,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: kube-proxy
-      additional_contexts:
-        rhino: ./rhino
     container_name: rusternetes-kube-proxy
     privileged: true
     network_mode: "service:containerd"
@@ -295,8 +279,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: dns
-      additional_contexts:
-        rhino: ./rhino
 
 networks:
   rusternetes-net:

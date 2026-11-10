@@ -384,12 +384,9 @@ binary).
 - **A CRI runtime (containerd)** on every node that runs a kubelet — the kubelet
   drives it over CRI v1 gRPC at `CONTAINER_RUNTIME_ENDPOINT`. Docker or Podman is
   still used to run the compose stack of node containers.
-- **The Rhino submodule**, required for SQLite/Redis builds:
-  ```bash
-  git clone --recurse-submodules https://github.com/calfonso/rusternetes.git
-  # or, in an existing checkout:
-  git submodule update --init
-  ```
+- **Rhino** (SQLite/Redis storage) needs no setup: `crates/storage` depends on
+  a pinned commit of `indyjonesnl/rhino` and cargo fetches it with the other
+  dependencies.
 - A copy of `kubectl` (this project's, or upstream — the API is compatible).
 
 ### Run locally in Docker or Podman

@@ -7,11 +7,6 @@
 # Usage:
 #   podman compose -f compose.all-in-one.yml build
 #   podman compose -f compose.all-in-one.yml up -d
-#
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
 
 services:
   rusternetes:

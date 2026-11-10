@@ -15,9 +15,6 @@ WORKDIR /app
 # Copy workspace manifest
 COPY Cargo.toml Cargo.lock* ./
 
-# Vendored path dependency used by crates/storage.
-COPY rhino ./rhino
-
 # Copy all crate manifests + source in one shot. No per-crate manifest
 # pre-copy here: there is no intermediate `cargo build` before the source
 # copy below, so a layered manifest cache buys nothing. (The cache-layered

@@ -24,7 +24,11 @@ api-client = ["dep:rusternetes-client"]
 [dependencies]
 rusternetes-common = { path = "../common" }
 rusternetes-client = { path = "../client", optional = true }
-rhino = { path = "../../rhino", optional = true, default-features = false }
+# Pinned by commit; Cargo.lock holds the same rev. Bump both this and
+# `ARG RHINO_REV` in rhino.Dockerfile together (scripts/check-rhino-rev.sh
+# guards the pair). To hack on rhino locally, add an uncommitted
+# `[patch."https://github.com/indyjonesnl/rhino.git"]` pointing at a checkout.
+rhino = { git = "https://github.com/indyjonesnl/rhino.git", rev = "5e07b3ca7d2b04456891d40f6a83e4e10cbcd075", optional = true, default-features = false }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

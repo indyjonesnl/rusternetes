@@ -63,12 +63,9 @@ jobs:
     runs-on: arc-runner-set
     steps:
       - name: Checkout repository
-        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
-        # `../../rhino` path dep. submodules: recursive checks it out pinned.
         # fetch-depth: 0 gives the change-detection diff the PR base commit.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - name: Detect Rust-relevant changes
@@ -122,12 +119,9 @@ jobs:
     runs-on: arc-runner-set
     steps:
       - name: Checkout repository
-        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
-        # `../../rhino` path dep. submodules: recursive checks it out pinned.
         # fetch-depth: 0 gives the change-detection diff the PR base commit.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - name: Detect Rust-relevant changes
