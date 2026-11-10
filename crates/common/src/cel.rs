@@ -174,6 +174,45 @@ impl CELEvaluator {
         crate::cel_cost::eval_with_cost(program.expression(), &cel_context, opts)
     }
 
+    /// [`Self::evaluate_with_cost`] with `variables` resolved lazily through
+    /// `lazy` (`composition.go`, see [`crate::cel_cost::LazyVariables`]): the
+    /// context must not bind `variables` itself. The cost of the variables the
+    /// expression read is in `lazy` (`GetAndResetCost`), not in the returned
+    /// cost.
+    pub fn evaluate_with_cost_lazy(
+        &mut self,
+        expression: &str,
+        context: &CELContext,
+        opts: crate::cel_cost::CostOptions,
+        lazy: &crate::cel_cost::LazyVariables,
+    ) -> (
+        std::result::Result<Value, crate::cel_cost::CostEvalError>,
+        u64,
+    ) {
+        let program = match self.compiled(expression) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    Err(crate::cel_cost::CostEvalError::Exec(
+                        cel::ExecutionError::function_error("compile", e.to_string()),
+                    )),
+                    0,
+                )
+            }
+        };
+        let mut cel_context = cel_struct::new_context_for(program);
+        for (key, value) in &context.variables {
+            let _ = cel_context.add_variable(key.clone(), value.clone());
+        }
+        let (r, cost) = crate::cel_cost::eval_with_cost_lazy(
+            program.expression(),
+            &cel_context,
+            opts,
+            Some(lazy),
+        );
+        (r.map(|v| cel_struct::strip_type_markers(&v)), cost)
+    }
+
     /// Evaluate a MAP patch expression and run upstream's
     /// `CheckTypeNamesMatchFieldPathNames` on the result; a mismatch is
     /// `unexpected type name ...` (the caller adds `type mismatch: `).
