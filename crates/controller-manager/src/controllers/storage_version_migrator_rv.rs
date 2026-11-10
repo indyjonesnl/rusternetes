@@ -318,17 +318,9 @@ impl<S: Storage + 'static> ResourceVersionController<S> {
             .map_err(|e| anyhow!("error getting latest resourceVersion for {gvr}: {e}"))
     }
 
-    /// `resourceFor` (resourceversion.go:283-304): `ResourcesFor` with only
-    /// group and resource; a no-match is "does not exist".
+    /// `resourceFor` (resourceversion.go:283-304).
     async fn resource_for(&self, group: &str, resource: &str) -> Result<Option<Gvr>> {
-        let mapper = self.discovery.rest_mapper().await?;
-        match mapper.resources_for(&Gvr::new(group, "", resource)) {
-            Err(e) if e.is_no_match() => Ok(None),
-            Err(e) => Err(anyhow!("{e}")),
-            Ok(gvrs) => Ok(gvrs
-                .into_iter()
-                .find(|g| g.group == group && g.resource == resource)),
-        }
+        resource_for(self.discovery.as_ref(), group, resource).await
     }
 
     async fn resources_of(&self, gvr: &Gvr) -> Result<Option<Vec<ServedResource>>> {
@@ -384,7 +376,26 @@ impl<S: Storage + 'static> ResourceVersionController<S> {
     }
 }
 
-fn condition_true(svm: &StorageVersionMigration, ty: &str) -> bool {
+/// `resourceFor` (resourceversion.go:283-304): `ResourcesFor` with only group
+/// and resource; a no-match is "does not exist". Shared with the migration
+/// controller, which calls the same function (`storageversionmigrator.go:177`).
+pub async fn resource_for(
+    discovery: &dyn SvmDiscovery,
+    group: &str,
+    resource: &str,
+) -> Result<Option<Gvr>> {
+    let mapper = discovery.rest_mapper().await?;
+    match mapper.resources_for(&Gvr::new(group, "", resource)) {
+        Err(e) if e.is_no_match() => Ok(None),
+        Err(e) => Err(anyhow!("{e}")),
+        Ok(gvrs) => Ok(gvrs
+            .into_iter()
+            .find(|g| g.group == group && g.resource == resource)),
+    }
+}
+
+/// `meta.IsStatusConditionTrue`.
+pub fn condition_true(svm: &StorageVersionMigration, ty: &str) -> bool {
     svm.status
         .conditions
         .iter()
