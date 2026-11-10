@@ -1951,12 +1951,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Start Namespace controller (watch-based). Hand it the CA cert so it can
-    // (re)create kube-root-ca.crt in every namespace (read from pki_dir, the
-    // same dir the metrics/cert paths use above).
-    let ns_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
-    let namespace_controller =
-        Arc::new(NamespaceController::new(storage.clone()).with_ca_cert(ns_ca.clone()));
+    // Start Namespace controller (watch-based).
+    let namespace_controller = Arc::new(NamespaceController::new(storage.clone()));
     spawn_controller!("Namespace controller", leader_elector, {
         let controller = namespace_controller.clone();
         async move {
@@ -1965,6 +1961,33 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Start the root CA cert publisher (watch-based): keeps kube-root-ca.crt in
+    // every namespace (newRootCACertificatePublisherController,
+    // cmd/kube-controller-manager/app/certificates.go:263). The CA is read from
+    // pki_dir, the same dir the metrics/cert paths use above.
+    let ns_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
+    if let Some(root_ca) = ns_ca.clone().filter(|c| !c.is_empty()) {
+        let publisher = Arc::new(
+            crate::controllers::root_ca_cert_publisher::RootCACertPublisher::new(
+                storage.clone(),
+                root_ca,
+            ),
+        );
+        spawn_controller!("Root CA cert publisher", leader_elector, {
+            let controller = publisher.clone();
+            async move {
+                if let Err(e) = controller.run().await {
+                    tracing::error!("Root CA cert publisher error: {}", e);
+                }
+            }
+        });
+    } else {
+        tracing::warn!(
+            "Skipping root CA cert publisher: no CA at {}/ca.crt",
+            args.pki_dir
+        );
+    }
 
     // Start TaintEviction controller (watch-based)
     let taint_eviction_controller =
