@@ -65,7 +65,8 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
     /// a worker task reconciles one APIService at a time with deduplication
     /// and exponential backoff on failures.
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let queue = WorkQueue::new();
+        // apiservice_controller.go:67.
+        let queue = WorkQueue::named("APIServiceRegistrationController");
 
         // Spawn worker
         // N workers drain ONE shared queue; a key in flight is never handed to
