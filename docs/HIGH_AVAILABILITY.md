@@ -94,7 +94,7 @@ etcdctl --endpoints=http://localhost:2379 endpoint health
 
 **Health Endpoints**:
 - `/healthz` - Liveness probe (server running)
-- `/healthz/verbose` - Detailed health status
+- `/livez` - Liveness probe (`?verbose`, `?exclude=<check>`, `/livez/<check>`)
 - `/readyz` - Readiness probe (ready for traffic)
 - `/metrics` - Prometheus metrics
 
@@ -234,8 +234,9 @@ curl http://localhost:6443/healthz
 # Readiness check (is the server ready for traffic?)
 curl http://localhost:6443/readyz
 
-# Verbose health check
-curl http://localhost:6443/healthz/verbose
+# Verbose health check, and a single check
+curl "http://localhost:6443/readyz?verbose"
+curl http://localhost:6443/readyz/etcd-readiness
 ```
 
 Example response:

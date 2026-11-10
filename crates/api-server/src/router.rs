@@ -993,17 +993,11 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // Routes that don't require authentication
     let public_routes = Router::new()
         .route("/healthz", get(handlers::health::healthz))
-        .route("/healthz/verbose", get(handlers::health::healthz_verbose))
-        .route("/livez", get(handlers::health::healthz))
+        .route("/healthz/*name", get(handlers::health::healthz_check))
+        .route("/livez", get(handlers::health::livez))
+        .route("/livez/*name", get(handlers::health::livez_check))
         .route("/readyz", get(handlers::health::readyz))
-        .route(
-            "/healthz/poststarthook/*name",
-            get(handlers::health::post_start_hook_check),
-        )
-        .route(
-            "/readyz/poststarthook/*name",
-            get(handlers::health::post_start_hook_check),
-        )
+        .route("/readyz/*name", get(handlers::health::readyz_check))
         .route("/metrics", get(handlers::health::metrics))
         // OIDC discovery endpoints for service account issuer
         .route(
