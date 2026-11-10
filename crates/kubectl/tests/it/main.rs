@@ -11,6 +11,7 @@ mod apply_tests;
 mod auth_tests;
 mod command_tests;
 mod describe_tests;
+mod drain_tests;
 mod exec_attach_portforward_tests;
 mod info_commands_tests;
 mod kc_unit;

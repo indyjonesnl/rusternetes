@@ -219,6 +219,7 @@ mod tests {
                 reason: reason.into(),
                 message: format!("Error from server ({reason}): m"),
                 retry_after_seconds: None,
+                causes: Vec::new(),
             })
         };
         let ae = typed(409, "AlreadyExists");
@@ -247,6 +248,7 @@ mod tests {
                 reason: reason.into(),
                 message: message.into(),
                 retry_after_seconds: None,
+                causes: Vec::new(),
             })
         };
         // 409 with an unknown reason and an opaque message is a Conflict.

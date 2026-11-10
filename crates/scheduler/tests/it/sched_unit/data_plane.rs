@@ -37,6 +37,7 @@ mod tests {
             reason: "Conflict".into(),
             message: "Error from server (Conflict): pod already assigned".into(),
             retry_after_seconds: None,
+            causes: Vec::new(),
         });
         assert!(matches!(api_err_to_common(e), Error::Conflict(_)));
     }
@@ -53,6 +54,7 @@ mod tests {
                 reason: reason.into(),
                 message: message.into(),
                 retry_after_seconds: None,
+                causes: Vec::new(),
             })
         };
         assert!(matches!(

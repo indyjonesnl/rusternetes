@@ -129,6 +129,17 @@ fn format_status_error(
                         .and_then(|r| i32::try_from(r).ok())
                         .unwrap_or(0)
                 }),
+                // `Status.Details.Causes[].Type` (JSON `reason`).
+                causes: v
+                    .pointer("/details/causes")
+                    .and_then(|c| c.as_array())
+                    .map(|cs| {
+                        cs.iter()
+                            .filter_map(|c| c.get("reason").and_then(|r| r.as_str()))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
     }
@@ -139,6 +150,7 @@ fn format_status_error(
         // `NewGenericServerResponse` always sets Details, carrying the
         // `Retry-After` header (errors.go:511-523, request.go:1245-1246).
         retry_after_seconds: Some(retry_after),
+        causes: Vec::new(),
     })
 }
 

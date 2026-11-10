@@ -52,6 +52,8 @@ pub struct ApiStatusError {
     /// `Status.Details.RetryAfterSeconds`; `None` is `Details == nil`
     /// (no details at all), `Some(0)` is details without a delay.
     pub retry_after_seconds: Option<i32>,
+    /// `Status.Details.Causes[].Type` (JSON `reason`), for `HasStatusCause`.
+    pub causes: Vec<String>,
 }
 
 impl fmt::Display for ApiStatusError {
@@ -184,6 +186,15 @@ pub fn is_too_many_requests(err: &anyhow::Error) -> bool {
     reason == "TooManyRequests" || code == 429
 }
 
+/// `apierrors.HasStatusCause` (errors.go:92-109): the error carries a
+/// `Status.Details.Causes` entry of the given type. Finds the status anywhere
+/// in the chain (`errors.As`).
+pub fn has_status_cause(err: &anyhow::Error, name: &str) -> bool {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<ApiStatusError>())
+        .is_some_and(|s| s.causes.iter().any(|c| c == name))
+}
+
 /// `IsUnsupportedMediaType` (errors.go:607-615).
 pub fn is_unsupported_media_type(err: &anyhow::Error) -> bool {
     reason_or_code(err, "UnsupportedMediaType", 415)
@@ -199,6 +210,7 @@ mod tests {
             reason: reason.into(),
             message: "m".into(),
             retry_after_seconds: None,
+            causes: Vec::new(),
         })
         .context("outer")
     }
@@ -267,6 +279,7 @@ mod tests {
             reason: reason.into(),
             message: "m".into(),
             retry_after_seconds: secs,
+            causes: Vec::new(),
         })
         .context("outer")
     }
