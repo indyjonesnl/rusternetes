@@ -475,8 +475,9 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
     /// already run `run_once`. Rusternetes has no informers in the
     /// api-server, so the handlers read the storage watch instead.
     pub fn spawn_workers(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
-        let svc_queue = WorkQueue::new();
-        let ip_queue = WorkQueue::new();
+        // `Name: "services"` / `Name: "ipaddresses"` (repairip.go:140-146).
+        let svc_queue = WorkQueue::named("services");
+        let ip_queue = WorkQueue::named("ipaddresses");
         let mut handles = vec![
             self.clone()
                 .spawn_event_handler("/registry/services/", svc_queue.clone()),
