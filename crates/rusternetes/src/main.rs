@@ -95,6 +95,19 @@ struct Args {
     #[arg(long, default_value_t = 10257)]
     controller_manager_metrics_port: u16,
 
+    /// Sustained requests/second EACH embedded controller's api client may
+    /// send (upstream `--kube-api-qps`, default 20:
+    /// `pkg/controller/apis/config/v1alpha1/defaults.go:59`). One limiter per
+    /// controller, not shared (#1863); same flag and default as the
+    /// standalone controller-manager. `<= 0` disables client-side throttling.
+    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_QPS)]
+    kube_api_qps: f64,
+
+    /// Burst each embedded controller's api client may send at once (upstream
+    /// `--kube-api-burst`, default 30: `defaults.go:62`).
+    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_BURST)]
+    kube_api_burst: f64,
+
     /// Run the CSI half of the AttachDetachController (#3048). Off by default;
     /// enable together with `--csi-attacher`.
     #[arg(long = "attach-detach-controller", default_value_t = false)]
@@ -606,6 +619,10 @@ async fn async_main() -> Result<()> {
     // rather than the StorageBackend directly.
     let cm_client = Arc::new(
         rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+            // The SKELETON: `run_with_api` clones it once per controller and
+            // each clone gets its own limiter at this QPS/burst
+            // (`clientbuilder/client_builder.go:40-47`).
+            .with_rate_limit(args.kube_api_qps, args.kube_api_burst)
             // `rest.SetKubernetesDefaults`; each controller's clone appends
             // its name (`AddUserAgent`).
             .with_default_user_agent(
