@@ -655,6 +655,40 @@ mod tests {
     }
 }
 
+/// Upstream-argv fixture (#3908 / #1882): the real kubeadm argv must parse
+/// with the expected effective values.
+#[cfg(test)]
+mod upstream_argv_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn fixture_argv(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn kubeadm_kube_scheduler_argv_parses() {
+        let argv = fixture_argv(include_str!(
+            "../tests/fixtures/kubeadm-kube-scheduler.args"
+        ));
+        let args = Args::try_parse_from(&argv).expect("kubeadm argv must parse");
+        assert_eq!(
+            args.kubeconfig.as_deref(),
+            Some("/etc/kubernetes/scheduler.conf")
+        );
+        let le = args.leader_election_settings().unwrap();
+        assert!(le.enabled);
+        assert_eq!(le.lease_duration, Duration::from_secs(15));
+        let c = component_secure_serving(&args);
+        assert_eq!(c.secure_serving.bind_port, 10259);
+        assert_eq!(c.secure_serving.bind_address.to_string(), "127.0.0.1");
+    }
+}
+
 #[cfg(test)]
 mod secure_serving_flag_tests {
     use super::*;

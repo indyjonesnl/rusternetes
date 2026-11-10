@@ -1,0 +1,10 @@
+# argv of kubeadm's kube-scheduler static pod (v1.35), one token per line,
+# `#` lines ignored. Source:
+# cmd/kubeadm/app/phases/controlplane/manifests.go getSchedulerCommand
+# (:370-383).
+kube-scheduler
+--authentication-kubeconfig=/etc/kubernetes/scheduler.conf
+--authorization-kubeconfig=/etc/kubernetes/scheduler.conf
+--bind-address=127.0.0.1
+--kubeconfig=/etc/kubernetes/scheduler.conf
+--leader-elect=true
