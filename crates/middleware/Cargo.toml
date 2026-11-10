@@ -21,6 +21,8 @@ axum = { workspace = true, features = ["ws"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+url = "2.5.8"
 uuid.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
