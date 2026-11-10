@@ -2,6 +2,19 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// `ShutdownGracePeriodByPodPriority` (pkg/kubelet/apis/config/types.go:798-804):
+/// the shutdown grace period for pods whose priority falls in this band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownGracePeriodByPodPriority {
+    /// `priority` is the priority value associated with the shutdown grace period.
+    #[serde(default)]
+    pub priority: i32,
+    /// `shutdownGracePeriodSeconds` is the shutdown grace period in seconds.
+    #[serde(default)]
+    pub shutdown_grace_period_seconds: i64,
+}
+
 /// KubeletConfiguration contains the configuration for the Kubelet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +219,12 @@ pub struct KubeletConfiguration {
         with = "rusternetes_common::go_duration::option_serde"
     )]
     pub shutdown_grace_period_critical_pods: Option<std::time::Duration>,
+
+    /// `shutdownGracePeriodByPodPriority` (`[]ShutdownGracePeriodByPodPriority`,
+    /// pkg/kubelet/apis/config/types.go:798-804). Consumed by
+    /// `nodeshutdown::new_manager`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_grace_period_by_pod_priority: Option<Vec<ShutdownGracePeriodByPodPriority>>,
 
     /// `cpuCFSQuotaPeriod` (`*metav1.Duration`, upstream default 100ms).
     #[serde(
@@ -460,6 +479,7 @@ impl Default for KubeletConfiguration {
             container_log_max_workers: None,
             shutdown_grace_period: None,
             shutdown_grace_period_critical_pods: None,
+            shutdown_grace_period_by_pod_priority: None,
             cpu_cfs_quota_period: None,
             authentication: None,
             authorization: None,

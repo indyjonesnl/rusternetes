@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod node_ip;
 pub mod node_log_query;
 pub mod node_status;
+pub mod nodeshutdown;
 pub mod pluginmanager;
 pub mod pod_dirs;
 pub mod pod_status;
