@@ -74,6 +74,7 @@ pub mod storage_class;
 pub mod storage_list_watch;
 pub mod storage_version_migrator;
 pub mod storage_version_migrator_rv;
+pub mod storage_version_migrator_svm;
 pub mod storageversiongc;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
