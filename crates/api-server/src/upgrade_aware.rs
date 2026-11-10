@@ -42,7 +42,9 @@ use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use rusternetes_common::auth::UserInfo;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, warn};
@@ -422,6 +424,113 @@ async fn connect(
     Ok(sender)
 }
 
+/// `idleConnsPerHost` of client-go's transport cache (`transport/cache.go`).
+const IDLE_CONNS_PER_HOST: usize = 25;
+
+/// `utilnet.SetTransportDefaults`' `IdleConnTimeout` (`http.DefaultTransport`).
+const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Bound on cached transports. client-go's `tlsCache` is unbounded (its keys
+/// are few: one per distinct `transport.Config`); here the APIService set is
+/// user-controlled, so a full cache is dropped (connections close on drop)
+/// rather than grown.
+const MAX_CACHED_TRANSPORTS: usize = 256;
+
+type PooledClient = hyper_util::client::legacy::Client<TimedConnector, Body>;
+
+/// `tlsCacheKey` (`transport/cache.go`): everything that shapes the TLS
+/// config or the dial function. The front-proxy client identity is part of
+/// it, so a rotated certificate gets a fresh transport.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TransportKey {
+    scheme: &'static str,
+    server_name: Option<String>,
+    insecure: bool,
+    ca_bundle: Option<Vec<u8>>,
+    identity: Option<Vec<u8>>,
+    /// Address of the shared `DialerCreator`; 0 is the direct dialer.
+    dialer: usize,
+}
+
+static TRANSPORTS: std::sync::LazyLock<std::sync::Mutex<HashMap<TransportKey, PooledClient>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The egress connector bounded by [`DIAL_TIMEOUT`] (the transport's dialer
+/// `Timeout`).
+#[derive(Clone)]
+struct TimedConnector(crate::egress_http::EgressConnector);
+
+impl tower::Service<hyper::Uri> for TimedConnector {
+    type Response = crate::egress_http::EgressIo;
+    type Error = std::io::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Self::Response>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let mut inner = self.0.clone();
+        Box::pin(async move {
+            tokio::time::timeout(DIAL_TIMEOUT, tower::Service::call(&mut inner, uri))
+                .await
+                .map_err(|_| std::io::Error::other("dial timeout"))?
+        })
+    }
+}
+
+/// The cached transport for `target` (`tlsCache.get`): one connection pool
+/// per distinct config, so requests reuse backend connections instead of
+/// dialing and handshaking each time.
+fn pooled_client(
+    target: &AggregatorTarget,
+    dialer: Option<Dialer>,
+) -> Result<PooledClient, String> {
+    let identity = crate::handlers::aggregator::current_proxy_client_identity_pem();
+    let key = TransportKey {
+        scheme: scheme_static(target.scheme),
+        server_name: target.server_name.clone(),
+        insecure: target.insecure_skip_tls_verify,
+        ca_bundle: target.ca_bundle.clone(),
+        identity,
+        dialer: match &dialer {
+            Some(Dialer::Proxy(d)) => Arc::as_ptr(d) as usize,
+            _ => 0,
+        },
+    };
+    let mut cache = TRANSPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = cache.get(&key) {
+        return Ok(c.clone());
+    }
+    let tls = crate::handlers::aggregator::proxy_tls_config(target)
+        .map_err(|e| format!("aggregator client error: {e}"))?;
+    let connector = TimedConnector(crate::egress_http::EgressConnector::new(
+        dialer.unwrap_or(Dialer::Direct),
+        tls,
+        target.server_name.clone(),
+    ));
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .pool_idle_timeout(IDLE_CONN_TIMEOUT)
+        .pool_max_idle_per_host(IDLE_CONNS_PER_HOST)
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        .build(connector);
+    if cache.len() >= MAX_CACHED_TRANSPORTS {
+        cache.clear();
+    }
+    cache.insert(key, client.clone());
+    Ok(client)
+}
+
+/// Live transports in the cache (test seam).
+pub fn cached_transport_count() -> usize {
+    TRANSPORTS.lock().map(|c| c.len()).unwrap_or(0)
+}
+
 /// `ReverseProxy` with the `Transport` wrapper and, when requested, the
 /// redirect-rejecting `ModifyResponse`.
 #[allow(clippy::too_many_arguments)]
@@ -439,8 +548,8 @@ async fn reverse_proxy(
     // `errors.NewServiceUnavailable("error trying to reach service: ...")`,
     // written by `responder.Error`.
     let unreachable = |e: String| responder_error(&format!("error trying to reach service: {e}"));
-    let mut sender = match connect(target, host, dialer).await {
-        Ok(s) => s,
+    let client = match pooled_client(target, dialer) {
+        Ok(c) => c,
         Err(e) => {
             warn!("aggregator proxy: {e}");
             return unreachable(e);
@@ -448,14 +557,14 @@ async fn reverse_proxy(
     };
     let mut out = match hyper::Request::builder()
         .method(method)
-        .uri(path_and_query)
+        .uri(format!("{}://{}{}", target.scheme, host, path_and_query))
         .body(body)
     {
         Ok(r) => r,
         Err(e) => return unreachable(e.to_string()),
     };
     *out.headers_mut() = headers;
-    let resp = match sender.send_request(out).await {
+    let resp = match client.request(out).await {
         Ok(r) => r,
         Err(e) => {
             warn!("aggregator proxy: {e}");

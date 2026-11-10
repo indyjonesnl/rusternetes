@@ -1046,4 +1046,48 @@ mod upgrade_aware_proxy {
         assert!(text.starts_with("HTTP/1.1 403"), "{text}");
         assert!(text.ends_with("nope"));
     }
+
+    // client-go `tlsCache`: one pooled transport per config, so sequential
+    // requests reuse the backend connection (one accept, not one per request).
+    #[tokio::test]
+    async fn sequential_requests_reuse_one_backend_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // Keep-alive: answer every request head until EOF.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        while let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            buf.drain(..i + 4);
+                            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                            if sock.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let user = test_user("alice", &[], &[]).user;
+        for _ in 0..3 {
+            let req = Request::builder()
+                .uri("/apis/x.io/v1/things")
+                .body(Body::empty())
+                .unwrap();
+            let resp = serve_proxy_with(&target(addr), &user, req, None, true).await;
+            assert_eq!(resp.status(), 200);
+            assert_eq!(body_string(resp).await, "ok");
+        }
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
