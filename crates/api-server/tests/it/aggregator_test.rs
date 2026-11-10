@@ -779,7 +779,9 @@ mod upgrade_aware_proxy {
     use axum::body::Body;
     use axum::extract::Request;
     use axum::response::Response;
-    use rusternetes_api_server::upgrade_aware::{serve_proxy_with, set_auth_proxy_headers};
+    use rusternetes_api_server::upgrade_aware::{
+        cached_transport_count, serve_proxy_with, set_auth_proxy_headers,
+    };
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1089,5 +1091,39 @@ mod upgrade_aware_proxy {
             assert_eq!(body_string(resp).await, "ok");
         }
         assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // client-go `tlsTransportCache.transports` is an unbounded map with no
+    // eviction (transport/cache.go): distinct configs are never dropped.
+    #[tokio::test]
+    async fn transport_cache_is_unbounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut chunk = [0u8; 1024];
+                    let _ = sock.read(&mut chunk).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        let user = test_user("alice", &[], &[]).user;
+        let before = cached_transport_count();
+        for i in 0..300 {
+            let mut t = target(addr);
+            t.server_name = Some(format!("svc-{i}.cache-test.svc"));
+            let req = Request::builder()
+                .uri("/apis/x.io/v1/things")
+                .body(Body::empty())
+                .unwrap();
+            let resp = serve_proxy_with(&t, &user, req, None, true).await;
+            assert_eq!(resp.status(), 200);
+        }
+        assert!(cached_transport_count() >= before + 300);
     }
 }
