@@ -30,9 +30,10 @@
 //! - Known gap, tracked on #3925: `rewriteResponse` (`text/html` link
 //!   rewriting, which needs an HTML tokenizer) is not ported yet; the
 //!   `Location` rewrite of `Transport.RoundTrip` is.
-//! - `X-Forwarded-For` is only added when the serving stack provides the peer
-//!   address as axum `ConnectInfo<SocketAddr>`, as Go does when `RemoteAddr`
-//!   parses.
+//! - `X-Forwarded-For` is only added when the request carries the peer address
+//!   as axum `ConnectInfo<SocketAddr>`, as Go does when `RemoteAddr` parses.
+//!   Every api-server listener provides it through
+//!   `rusternetes_api_server::serve_service`.
 
 use crate::egress_selector::Dialer;
 use crate::handlers::aggregator::AggregatorTarget;
