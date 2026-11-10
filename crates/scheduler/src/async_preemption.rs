@@ -24,6 +24,7 @@
 //! observed yet is still running, which is what a lister hit without a
 //! deletion timestamp reports.
 
+use crate::fwk::{Code, Status};
 use crate::queue::scheduling_queue::PreEnqueuePlugin;
 use rusternetes_common::resources::Pod;
 use std::collections::{HashMap, HashSet};
@@ -159,17 +160,20 @@ impl PreEnqueuePlugin for DefaultPreemptionPreEnqueue {
 
     /// `if !pl.fts.EnableAsyncPreemption { return nil }`, then
     /// `UnschedulableAndUnresolvable` while the pod runs its preemption.
-    fn pre_enqueue(&self, pod: &Pod) -> Result<(), String> {
+    fn pre_enqueue(&self, pod: &Pod) -> Status {
         if !async_preemption_enabled() {
-            return Ok(());
+            return Status::success();
         }
         if self
             .state
             .is_pod_running_preemption(&crate::advanced::pod_key(pod))
         {
-            return Err("waiting for the preemption for this pod to be finished".to_string());
+            return Status::new(
+                Code::UnschedulableAndUnresolvable,
+                vec!["waiting for the preemption for this pod to be finished".to_string()],
+            );
         }
-        Ok(())
+        Status::success()
     }
 }
 

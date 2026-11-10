@@ -7,7 +7,7 @@
 
 use rusternetes_common::resources::{Pod, PodSpec};
 use rusternetes_scheduler::framework_runtime::{ExtensionPoint, PluginInstance, Registry};
-use rusternetes_scheduler::fwk::{Plugin, QueueSortPlugin};
+use rusternetes_scheduler::fwk::{Code, Plugin, QueueSortPlugin, Status};
 use rusternetes_scheduler::queue::scheduling_gates::build_pre_enqueue_plugin_map;
 use rusternetes_scheduler::queue::scheduling_queue::{
     PreEnqueuePlugin, PriorityQueue, PriorityQueueOptions, QueuedPodInfo,
@@ -39,7 +39,7 @@ impl PreEnqueuePlugin for HoldLabelGate {
     fn name(&self) -> &str {
         "HoldLabelGate"
     }
-    fn pre_enqueue(&self, pod: &Pod) -> Result<(), String> {
+    fn pre_enqueue(&self, pod: &Pod) -> Status {
         let held = pod
             .metadata
             .labels
@@ -47,9 +47,9 @@ impl PreEnqueuePlugin for HoldLabelGate {
             .and_then(|l| l.get("hold"))
             .is_some_and(|v| v == "true");
         if held {
-            Err("pod is on hold".to_string())
+            Status::new(Code::Unschedulable, vec!["pod is on hold".to_string()])
         } else {
-            Ok(())
+            Status::success()
         }
     }
 }

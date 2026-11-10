@@ -9,6 +9,7 @@
 use super::scheduling_queue::{PreEnqueuePlugin, PreEnqueuePluginMap};
 use crate::async_preemption::{AsyncPreemption, DefaultPreemptionPreEnqueue};
 use crate::framework_runtime::{names, ExtensionPoint};
+use crate::fwk::{Code, Status};
 use crate::profile::Profile;
 use rusternetes_common::resources::Pod;
 use std::sync::Arc;
@@ -24,17 +25,20 @@ impl PreEnqueuePlugin for SchedulingGates {
 
     /// `PreEnqueue` (`scheduling_gates.go:43-51`): UnschedulableAndUnresolvable
     /// while the pod carries gates.
-    fn pre_enqueue(&self, pod: &Pod) -> Result<(), String> {
+    fn pre_enqueue(&self, pod: &Pod) -> Status {
         let gates = match pod.spec.as_ref().and_then(|s| s.scheduling_gates.as_ref()) {
             Some(g) if !g.is_empty() => g,
-            _ => return Ok(()),
+            _ => return Status::success(),
         };
         // Go's `%v` of a []string: `[foo bar]`.
         let names: Vec<&str> = gates.iter().map(|g| g.name.as_str()).collect();
-        Err(format!(
-            "waiting for scheduling gates: [{}]",
-            names.join(" ")
-        ))
+        Status::new(
+            Code::UnschedulableAndUnresolvable,
+            vec![format!(
+                "waiting for scheduling gates: [{}]",
+                names.join(" ")
+            )],
+        )
     }
 }
 
