@@ -39,7 +39,7 @@ mod __parent {
         statefulset::StatefulSetController,
         storage_class::StorageClassController,
         storageversiongc::StorageVersionGCController,
-        ttl_controller::TTLController,
+        ttl_after_finished::TTLAfterFinishedController,
         volume_expansion::VolumeExpansionController,
         volume_snapshot::VolumeSnapshotController,
         vpa::VerticalPodAutoscalerController,

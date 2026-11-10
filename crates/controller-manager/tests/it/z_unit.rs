@@ -41,7 +41,6 @@ mod controllers__storageversiongc;
 mod controllers__taint_eviction;
 mod controllers__taint_eviction_timed_workers;
 mod controllers__trigger_time_tracker;
-mod controllers__ttl_controller;
 mod controllers__typed_workqueue;
 mod controllers__vac_protection;
 mod controllers__volume_data_source_validator;

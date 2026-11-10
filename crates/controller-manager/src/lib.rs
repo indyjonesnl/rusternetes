@@ -37,7 +37,7 @@ use controllers::{
     statefulset::StatefulSetController,
     storage_class::StorageClassController,
     storageversiongc::StorageVersionGCController,
-    ttl_controller::TTLController,
+    ttl_after_finished::TTLAfterFinishedController,
     vac_protection::VacProtectionController,
     volume_expansion::VolumeExpansionController,
     volume_snapshot::VolumeSnapshotController,
@@ -543,8 +543,10 @@ where
 
     let s = storage_for("TTL");
     handles.push(tokio::spawn(async move {
-        let c = Arc::new(TTLController::new(s));
-        c.run().await;
+        let c = Arc::new(TTLAfterFinishedController::new(s));
+        if let Err(e) = c.run().await {
+            error!("TTL after finished controller error: {}", e);
+        }
     }));
 
     let s = storage_for("PodDisruptionBudget");

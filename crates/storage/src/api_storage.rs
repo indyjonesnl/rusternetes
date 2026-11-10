@@ -860,6 +860,35 @@ impl Storage for ApiStorage {
         }
     }
 
+    /// `DeleteOptions{PropagationPolicy: Foreground, Preconditions}` on a real
+    /// DELETE: the api-server's `Store.Delete` adds the `foregroundDeletion`
+    /// finalizer (`updateForGCFinalizers`) and the garbage collector finishes
+    /// the job. No `gracePeriodSeconds` override, as a client sends it.
+    async fn delete_foreground_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &crate::Preconditions,
+    ) -> Result<()> {
+        let path = self.object_path(key).await?;
+        let body = preconditions.to_delete_options();
+        let query = vec![("propagationPolicy".to_string(), "Foreground".to_string())];
+        let status = self
+            .client
+            .delete_with_options(&path, &query, Some(&body))
+            .await
+            .map_err(|e| Error::Storage(format!("{e:#}")))?;
+        match status.as_u16() {
+            s if (200..300).contains(&s) => Ok(()),
+            404 => Err(Error::NotFound(format!("{key} not found"))),
+            409 => Err(Error::Conflict(format!(
+                "delete {key} failed its preconditions: HTTP 409"
+            ))),
+            _ => Err(Error::Storage(format!(
+                "foreground delete {key} failed: HTTP {status}"
+            ))),
+        }
+    }
+
     /// Graceful delete: a plain DELETE with no `gracePeriodSeconds` override,
     /// so the api-server terminates the object on its own terms. Controllers
     /// that used to stamp `deletionTimestamp` themselves must come through

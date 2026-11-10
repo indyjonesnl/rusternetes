@@ -331,6 +331,57 @@ pub trait Storage: Send + Sync {
         self.delete(key).await
     }
 
+    /// `Delete` with `metav1.DeleteOptions{PropagationPolicy: Foreground,
+    /// Preconditions}`, as a client sends it (e.g.
+    /// `pkg/controller/ttlafterfinished/ttlafterfinished_controller.go:processJob`,
+    /// `policy := metav1.DeletePropagationForeground` + `Preconditions{UID}`).
+    ///
+    /// The api-server's registry `Store.Delete` does not remove a foreground
+    /// delete's object: `updateForGCFinalizers`
+    /// (`staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:1030-1090`)
+    /// swaps the `orphan` finalizer for `foregroundDeletion`
+    /// (`deletionFinalizersForGarbageCollection`, `:976-1004`) and stamps
+    /// `deletionTimestamp`; the garbage collector then deletes the dependents and
+    /// removes the finalizer. Direct backends have no api-server in the path, so
+    /// the default emulates that write, compare-and-swapped on the
+    /// `resourceVersion` it read; `ApiStorage` overrides it with a real DELETE.
+    async fn delete_foreground_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        let mut obj: serde_json::Value = self.get(key).await?;
+        preconditions.check(key, &obj)?;
+        let Some(metadata) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+            return self.delete(key).await;
+        };
+        let mut finalizers: Vec<serde_json::Value> = metadata
+            .get("finalizers")
+            .and_then(|f| f.as_array())
+            .cloned()
+            .unwrap_or_default();
+        finalizers.retain(|f| f.as_str() != Some("orphan"));
+        let already = finalizers
+            .iter()
+            .any(|f| f.as_str() == Some("foregroundDeletion"));
+        if already && metadata.contains_key("deletionTimestamp") {
+            // Deletion is already in progress with the same finalizers.
+            return Ok(());
+        }
+        if !already {
+            finalizers.push(serde_json::Value::String("foregroundDeletion".into()));
+        }
+        metadata.insert("finalizers".into(), serde_json::Value::Array(finalizers));
+        metadata.entry("deletionTimestamp").or_insert_with(|| {
+            serde_json::Value::String(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            )
+        });
+        metadata.insert("deletionGracePeriodSeconds".into(), 0.into());
+        self.update::<serde_json::Value>(key, &obj).await?;
+        Ok(())
+    }
+
     /// Delete a resource the way a CLIENT would: hand the deletion to the
     /// server and let it apply its own semantics — for pods, graceful
     /// termination (stamp `deletionTimestamp`, let the kubelet drain, remove
@@ -1121,6 +1172,16 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
         (**self).delete_with_preconditions(key, preconditions).await
     }
 
+    async fn delete_foreground_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        (**self)
+            .delete_foreground_with_preconditions(key, preconditions)
+            .await
+    }
+
     async fn delete_gracefully(&self, key: &str) -> Result<()> {
         (**self).delete_gracefully(key).await
     }
@@ -1803,6 +1864,37 @@ impl Storage for StorageBackend {
                 #[cfg(feature = "api-client")]
                 StorageBackend::Api(s) => {
                     Storage::delete_with_preconditions(s, key, preconditions).await
+                }
+            }
+        })
+        .await
+    }
+
+    async fn delete_foreground_with_preconditions(
+        &self,
+        key: &str,
+        preconditions: &Preconditions,
+    ) -> Result<()> {
+        cancellable(async {
+            match self {
+                StorageBackend::Etcd(s) => {
+                    Storage::delete_foreground_with_preconditions(s, key, preconditions).await
+                }
+                #[cfg(feature = "sqlite")]
+                StorageBackend::Sqlite(s) => {
+                    Storage::delete_foreground_with_preconditions(s, key, preconditions).await
+                }
+                #[cfg(feature = "redis")]
+                StorageBackend::Redis(s) => {
+                    Storage::delete_foreground_with_preconditions(s, key, preconditions).await
+                }
+                StorageBackend::Memory(s) => {
+                    Storage::delete_foreground_with_preconditions(s.as_ref(), key, preconditions)
+                        .await
+                }
+                #[cfg(feature = "api-client")]
+                StorageBackend::Api(s) => {
+                    Storage::delete_foreground_with_preconditions(s, key, preconditions).await
                 }
             }
         })
