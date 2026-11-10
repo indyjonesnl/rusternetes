@@ -38,6 +38,9 @@ pub struct Profile {
     pub plugins: Option<Plugins>,
     /// `cfg.PluginConfig[].Name`, for `NewFramework`'s duplicate-config check.
     pub plugin_config_names: Vec<String>,
+    /// `cfg.PluginConfig[].Args` by plugin name, as JSON, for the factories of
+    /// out-of-tree plugins (`pluginConfig[name]`, framework.go:340-345).
+    pub plugin_args: std::collections::HashMap<String, serde_json::Value>,
     /// `f.ListPlugins().QueueSort.Enabled[0].Name`, filled in by
     /// [`Map::new_map`] from the built framework.
     pub queue_sort: String,
@@ -85,6 +88,7 @@ impl Profile {
             scheduler_name: scheduler_name.to_string(),
             plugins: Some(merge_plugins(default_plugins(), None)),
             plugin_config_names: Vec::new(),
+            plugin_args: std::collections::HashMap::new(),
             queue_sort: DEFAULT_QUEUE_SORT.to_string(),
             queue_sort_args: None,
             volume_bind_timeout: crate::volume_bind::DEFAULT_BIND_TIMEOUT,
@@ -123,6 +127,7 @@ impl Profile {
                 pod_topology_spread: Some(&self.pod_topology_spread),
                 volume_shape: Some(&self.volume_shape),
                 fit_ignored: Some(&self.fit_ignored),
+                plugin_args: Some(&self.plugin_args),
             },
         )
     }
