@@ -121,7 +121,34 @@ pub fn eval_with_cost(
     ctx: &Context,
     opts: CostOptions,
 ) -> (Result<Value, CostEvalError>, u64) {
-    let mut tracker = Tracker { cost: 0, opts };
+    eval_with_cost_lazy(expr, ctx, opts, None)
+}
+
+/// [`eval_with_cost`] with the `variables` of the activation resolved lazily
+/// through `lazy` (see [`LazyVariables`]).
+pub fn eval_with_cost_lazy(
+    expr: &IdedExpr,
+    ctx: &Context,
+    opts: CostOptions,
+    lazy: Option<&LazyVariables>,
+) -> (Result<Value, CostEvalError>, u64) {
+    let visible = lazy.map_or(0, |l| l.defs.len());
+    eval_visible(expr, ctx, opts, lazy, visible)
+}
+
+fn eval_visible(
+    expr: &IdedExpr,
+    ctx: &Context,
+    opts: CostOptions,
+    lazy: Option<&LazyVariables>,
+    visible: usize,
+) -> (Result<Value, CostEvalError>, u64) {
+    let mut tracker = Tracker {
+        cost: 0,
+        opts,
+        lazy,
+        visible,
+    };
     // The `cel` interpreter panics on a few inputs (`Expr::Struct`); never
     // propagate that out of an admission request.
     let r = catch_unwind(AssertUnwindSafe(|| tracker.walk(expr, ctx))).unwrap_or_else(|_| {
@@ -135,9 +162,161 @@ pub fn eval_with_cost(
 
 /// `CostTracker`: `cost` is `CostTracker.cost`, `opts` its `Limit` and
 /// `presenceTestHasCost`.
-struct Tracker {
+struct Tracker<'a> {
     cost: u64,
     opts: CostOptions,
+    /// The lazily composited `variables` of the activation, if any.
+    lazy: Option<&'a LazyVariables>,
+    /// How many of `lazy`'s variables this expression can see: a variable
+    /// is compiled against the ones declared before it
+    /// (`CompileAndStoreVariable` adds each field to `MapType` after
+    /// compiling it), an ordinary expression against all of them.
+    visible: usize,
+}
+
+/// The lazily evaluated, memoized `variables` map of an activation.
+///
+/// Ported from `staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/
+/// composition.go` (`compositionContext.Variables`, `variableAccessor.Callback`)
+/// over `staging/src/k8s.io/apiserver/pkg/cel/lazy/lazy.go` (`MapValue`):
+///
+/// * a variable is evaluated the first time an expression reads it
+///   (`MapValue.resolveField`) and the result, error included, is kept for
+///   the rest of the activation (`values`);
+/// * its actual cost is reported to the composition context (`reportCost`)
+///   and charged to the budget by the caller (`GetAndResetCost`, see
+///   [`LazyVariables::get_and_reset_cost`] and [`charge_budget`]);
+/// * a failure is the value `composited variable %q fails to evaluate: %v` /
+///   `... fails to compile: %v`, an error only for the expression that reads it.
+///
+/// One `LazyVariables` is one activation (`CreateActivation`): the
+/// validations of a policy share one, the `messageExpression`s and the
+/// `auditAnnotations` (separate `ForInput` calls) each get their own.
+///
+/// The `cel` crate resolves identifiers to a `Value`, which cannot be lazy,
+/// so [`Tracker::walk`] intercepts `variables.<name>` / `variables["<name>"]`
+/// and evaluates `<name>` first.
+pub struct LazyVariables {
+    /// `(name, expression)` in declaration order.
+    defs: Vec<(String, String)>,
+    /// The activation's other variables (`object`, `request`, ...).
+    base: std::collections::HashMap<String, Value>,
+    state: std::sync::Mutex<LazyState>,
+}
+
+#[derive(Default)]
+struct LazyState {
+    values: std::collections::HashMap<String, Result<Value, String>>,
+    accumulated_cost: i64,
+}
+
+impl LazyVariables {
+    /// `defs` are `spec.variables` as `(name, expression)`; `base` the
+    /// activation's variables other than `variables`.
+    pub fn new(
+        defs: Vec<(String, String)>,
+        base: std::collections::HashMap<String, Value>,
+    ) -> Self {
+        LazyVariables {
+            defs,
+            base,
+            state: std::sync::Mutex::new(LazyState::default()),
+        }
+    }
+
+    /// `compositionContext.GetAndResetCost`.
+    pub fn get_and_reset_cost(&self) -> i64 {
+        let mut st = self.state.lock().unwrap();
+        std::mem::take(&mut st.accumulated_cost)
+    }
+
+    /// How many variables have been evaluated so far.
+    pub fn evaluated_count(&self) -> usize {
+        self.state.lock().unwrap().values.len()
+    }
+
+    /// `MapValue.resolveField` for `name`, among the first `visible`
+    /// variables: evaluate it once and report its cost.
+    fn ensure(&self, name: &str, visible: usize, opts: CostOptions) {
+        let Some(idx) = self.defs[..visible].iter().position(|(n, _)| n == name) else {
+            return;
+        };
+        if self.state.lock().unwrap().values.contains_key(name) {
+            return;
+        }
+        let (_, expression) = &self.defs[idx];
+        // `variableAccessor.Callback`
+        let (result, cost) = match crate::cel_struct::compile(expression) {
+            Err(e) => (
+                Err(format!(
+                    "composited variable {name:?} fails to compile: {e}"
+                )),
+                0,
+            ),
+            Ok(prog) => {
+                let mut ctx = crate::cel_struct::new_context_for(&prog);
+                for (k, v) in &self.base {
+                    let _ = ctx.add_variable(k.clone(), v.clone());
+                }
+                let (r, cost) = eval_visible(prog.expression(), &ctx, opts, Some(self), idx);
+                (
+                    r.map_err(|e| format!("composited variable {name:?} fails to evaluate: {e}")),
+                    cost,
+                )
+            }
+        };
+        let mut st = self.state.lock().unwrap();
+        // `reportCost`; `cost > MaxInt64` is clamped
+        st.accumulated_cost = st
+            .accumulated_cost
+            .saturating_add(i64::try_from(cost).unwrap_or(i64::MAX));
+        st.values.insert(name.to_string(), result);
+    }
+
+    fn lookup(&self, name: &str) -> Option<Result<Value, String>> {
+        self.state.lock().unwrap().values.get(name).cloned()
+    }
+
+    /// The map of the evaluated variables a scope binds `variables` to.
+    fn bound_map(&self) -> Value {
+        let st = self.state.lock().unwrap();
+        let map = st
+            .values
+            .iter()
+            .filter_map(|(k, v)| Some((Key::from(k.as_str()), v.as_ref().ok()?.clone())))
+            .collect();
+        Value::Map(cel::objects::Map {
+            map: std::sync::Arc::new(map),
+        })
+    }
+}
+
+/// Hidden identifier a [`LazyVariables`] map is bound to for one access.
+const LAZY_VARIABLES_IDENT: &str = "@variables";
+
+/// The name read by `variables.<name>` / `variables["<name>"]` (also the
+/// presence test), when `e` is one.
+fn lazy_access(e: &IdedExpr) -> Option<String> {
+    let is_vars = |x: &IdedExpr| matches!(&x.expr, Expr::Ident(n) if n == "variables");
+    match &e.expr {
+        Expr::Select(s) if is_vars(&s.operand) => Some(s.field.clone()),
+        Expr::Call(c) if is_index(c) && is_vars(&c.args[0]) => match &c.args[1].expr {
+            Expr::Literal(LiteralValue::String(k)) => Some(k.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `e` with the `variables` operand renamed to the hidden identifier.
+fn rename_variables_operand(e: &IdedExpr) -> IdedExpr {
+    let mut out = e.clone();
+    match &mut out.expr {
+        Expr::Select(s) => *s.operand = ident(LAZY_VARIABLES_IDENT.to_string()),
+        Expr::Call(c) => c.args[0] = ident(LAZY_VARIABLES_IDENT.to_string()),
+        _ => {}
+    }
+    out
 }
 
 fn ident(name: String) -> IdedExpr {
@@ -262,7 +441,7 @@ fn key_value(k: &Key) -> Value {
     }
 }
 
-impl Tracker {
+impl Tracker<'_> {
     /// The cost increment of `Observe` followed by its limit check
     /// (`runtimecost.go` `if tracker.Limit != nil && tracker.cost > *tracker.Limit`).
     fn add(&mut self, n: u64) -> Result<(), CostEvalError> {
@@ -276,6 +455,48 @@ impl Tracker {
     /// Evaluate `e`, accumulating what cel-go's `Observe` would have for every
     /// node the evaluation reaches.
     fn walk(&mut self, e: &IdedExpr, ctx: &Context) -> R {
+        if let Some(lazy) = self.lazy {
+            if let Some(name) = lazy_access(e) {
+                // `MapValue.Find`: evaluate the field on first access; an
+                // unknown name is `no such key` from the lookup.
+                lazy.ensure(&name, self.visible, self.opts);
+                let mut scope = ctx.new_inner_scope();
+                scope.add_variable_from_value(LAZY_VARIABLES_IDENT, lazy.bound_map());
+                if let Some(Err(msg)) = lazy.lookup(&name) {
+                    // The attribute and its qualifier are observed; the
+                    // qualifier yields the error value.
+                    self.add(SELECT_AND_IDENT_COST)?;
+                    self.add(SELECT_AND_IDENT_COST)?;
+                    return Err(CostEvalError::Exec(ExecutionError::function_error(
+                        "variables",
+                        msg,
+                    )));
+                }
+                return self.walk_node(&rename_variables_operand(e), &scope);
+            }
+            if matches!(&e.expr, Expr::Ident(n) if n == "variables") {
+                // The whole map (`Iterator.Next` evaluates every field).
+                for (name, _) in &lazy.defs[..self.visible] {
+                    lazy.ensure(name, self.visible, self.opts);
+                }
+                let mut scope = ctx.new_inner_scope();
+                scope.add_variable_from_value("variables", lazy.bound_map());
+                self.add(SELECT_AND_IDENT_COST)?;
+                for (name, _) in &lazy.defs[..self.visible] {
+                    if let Some(Err(msg)) = lazy.lookup(name) {
+                        return Err(CostEvalError::Exec(ExecutionError::function_error(
+                            "variables",
+                            msg,
+                        )));
+                    }
+                }
+                return resolve(&scope, e);
+            }
+        }
+        self.walk_node(e, ctx)
+    }
+
+    fn walk_node(&mut self, e: &IdedExpr, ctx: &Context) -> R {
         if is_const(e) {
             // `InterpretableConst`: zero cost.
             return resolve(ctx, e);

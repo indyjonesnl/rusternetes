@@ -53,8 +53,9 @@
 use rusternetes_common::admission::AdmissionRequest;
 use rusternetes_common::cel::{CELContext, CELEvaluator};
 use rusternetes_common::cel_cost::{
-    charge_budget, BudgetError, CostOptions, MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES,
-    RUNTIME_CEL_COST_BUDGET, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
+    charge_budget, BudgetError, CostOptions, LazyVariables,
+    MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES, RUNTIME_CEL_COST_BUDGET,
+    RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
 };
 use rusternetes_common::resources::MatchCondition;
 use serde_json::Value;
@@ -352,62 +353,18 @@ pub struct ValidationItem<'a> {
     pub message: Option<&'a str>,
 }
 
-/// The cost of each `spec.variables[*]` evaluation, charged lazily.
-///
-/// Upstream composes variables lazily (`cel/composition.go`
-/// `variableAccessor.Callback`): a variable is evaluated, and its actual cost
-/// reported (`reportCost`), the first time an expression resolves it, and
-/// `evaluationActivation.Evaluate` (`activation.go:132-141`) charges the
-/// accumulated cost (`GetAndResetCost`) against the filter's budget. Here
-/// variables are evaluated eagerly, so the recorded cost is charged on the
-/// first expression that references the variable (directly, or through
-/// another variable's expression). Deviation: upstream's laziness also
-/// follows `&&`/`||`/`?:` short-circuiting; this counts a textual reference.
-#[derive(Default)]
-pub struct VariableCosts {
-    entries: std::collections::HashMap<String, (u64, Vec<String>)>,
-    charged: std::collections::HashSet<String>,
-}
+/// The `spec.variables` of a policy as `(name, expression)` in declaration
+/// order (`CompileAndStoreVariables` skips none; a blank name or expression
+/// cannot be stored, registry validation rejects them).
+pub type VariableDefs = [(String, String)];
 
-fn referenced_variables(expression: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for (i, _) in expression.match_indices("variables.") {
-        let rest = &expression[i + "variables.".len()..];
-        let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        if end > 0 {
-            names.push(rest[..end].to_string());
-        }
-    }
-    names
-}
-
-impl VariableCosts {
-    /// Record the actual cost of evaluating variable `name`.
-    pub fn record(&mut self, name: &str, expression: &str, cost: u64) {
-        self.entries
-            .insert(name.to_string(), (cost, referenced_variables(expression)));
-    }
-
-    /// `compositionCtx.GetAndResetCost()` for `expression`: the cost of every
-    /// not-yet-charged variable it reaches.
-    pub fn composition_cost(&mut self, expression: &str) -> i64 {
-        let mut total: i64 = 0;
-        let mut pending = referenced_variables(expression);
-        while let Some(name) = pending.pop() {
-            if self.charged.contains(&name) {
-                continue;
-            }
-            let Some((cost, deps)) = self.entries.get(&name) else {
-                continue;
-            };
-            total = total.saturating_add(i64::try_from(*cost).unwrap_or(i64::MAX));
-            pending.extend(deps.iter().cloned());
-            self.charged.insert(name);
-        }
-        total
-    }
+/// `CreateActivation` + `compositionCtx.Variables(va)` (`activation.go:75-78`):
+/// the lazily composited `variables` of one activation over `context`'s
+/// variables. See [`rusternetes_common::cel_cost::LazyVariables`].
+fn new_activation(variables: &VariableDefs, context: &CELContext) -> LazyVariables {
+    let mut base = context.variables.clone();
+    base.remove("variables");
+    LazyVariables::new(variables.to_vec(), base)
 }
 
 /// `evaluationActivation.Evaluate` (`activation.go:132-189`) for one
@@ -417,15 +374,14 @@ fn evaluate_charged(
     evaluator: &mut CELEvaluator,
     expression: &str,
     context: &CELContext,
-    variables: &mut VariableCosts,
+    activation: &LazyVariables,
     remaining: i64,
 ) -> Result<(Result<cel::Value, String>, i64), BudgetError> {
-    let (value, cost) = evaluator.evaluate_with_cost(expression, context, CostOptions::default());
-    let remaining = charge_budget(
-        Some(variables.composition_cost(expression)),
-        cost,
-        remaining,
-    )?;
+    let (value, cost) =
+        evaluator.evaluate_with_cost_lazy(expression, context, CostOptions::default(), activation);
+    // `compositionCtx.GetAndResetCost()`: the variables this expression read
+    // for the first time.
+    let remaining = charge_budget(Some(activation.get_and_reset_cost()), cost, remaining)?;
     Ok((
         value.map_err(|e| format!("expression '{expression}' resulted in error: {e}")),
         remaining,
@@ -450,16 +406,42 @@ pub fn validate_budgeted(
     evaluator: &mut CELEvaluator,
     context: &CELContext,
     message_context: &CELContext,
-    variables: &mut VariableCosts,
+    variables: &VariableDefs,
 ) -> Result<Vec<ValidationOutcome>, String> {
-    let mut remaining = RUNTIME_CEL_COST_BUDGET;
+    validate_with_budget(
+        items,
+        evaluator,
+        context,
+        message_context,
+        variables,
+        RUNTIME_CEL_COST_BUDGET,
+    )
+}
+
+/// [`validate_budgeted`] with the `runtimeCELCostBudget` argument of
+/// `ConditionEvaluator.ForInput` (`dispatcher.go:220` passes
+/// `celconfig.RuntimeCELCostBudget`).
+pub fn validate_with_budget(
+    items: &[ValidationItem<'_>],
+    evaluator: &mut CELEvaluator,
+    context: &CELContext,
+    message_context: &CELContext,
+    variables: &VariableDefs,
+    runtime_cel_cost_budget: i64,
+) -> Result<Vec<ValidationOutcome>, String> {
+    let mut remaining = runtime_cel_cost_budget;
+    // One activation per `ForInput`: the validations share their lazily
+    // evaluated variables; the messageExpressions (`messageFilter.ForInput`,
+    // :128) get their own, so a variable they read is evaluated and charged
+    // again.
+    let activation = new_activation(variables, context);
     let mut results = Vec::with_capacity(items.len());
     for item in items {
         let (value, left) = evaluate_charged(
             evaluator,
             item.expression.trim(),
             context,
-            variables,
+            &activation,
             remaining,
         )
         .map_err(|e| e.detail)?;
@@ -470,13 +452,20 @@ pub fn validate_budgeted(
     // `messageFilter.ForInput` (:128): `err` is kept, not returned.
     let mut messages: Vec<Option<Result<cel::Value, String>>> = Vec::with_capacity(items.len());
     let mut message_budget_error: Option<String> = None;
+    let message_activation = new_activation(variables, message_context);
     for item in items {
         let expr = item.message_expression.map(str::trim).unwrap_or("");
         if expr.is_empty() {
             messages.push(None);
             continue;
         }
-        match evaluate_charged(evaluator, expr, message_context, variables, remaining) {
+        match evaluate_charged(
+            evaluator,
+            expr,
+            message_context,
+            &message_activation,
+            remaining,
+        ) {
             Ok((value, left)) => {
                 remaining = left;
                 messages.push(Some(value));
@@ -539,13 +528,14 @@ pub fn audit_annotations_budgeted(
     items: &[(&str, &str)],
     evaluator: &mut CELEvaluator,
     context: &CELContext,
-    variables: &mut VariableCosts,
+    variables: &VariableDefs,
 ) -> Result<Vec<AuditAnnotationOutcome>, String> {
     let mut remaining = RUNTIME_CEL_COST_BUDGET;
+    let activation = new_activation(variables, context);
     let mut out = Vec::with_capacity(items.len());
     for (key, expr) in items {
         let expr = expr.trim();
-        let (value, left) = evaluate_charged(evaluator, expr, context, variables, remaining)
+        let (value, left) = evaluate_charged(evaluator, expr, context, &activation, remaining)
             .map_err(|e| e.detail)?;
         remaining = left;
         out.push(match value {

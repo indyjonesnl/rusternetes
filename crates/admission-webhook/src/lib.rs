@@ -2521,62 +2521,24 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 );
             }
 
-            // Evaluate spec.variables, building a "variables" Map for CEL access.
-            // CEL expressions reference variables as `variables.NAME`, which means
-            // "variables" must be a Map variable in the CEL context.
-            let mut variable_costs = crate::cel_evaluators::VariableCosts::default();
-            if let Some(vars) = policy
+            // `spec.variables` are composited lazily per activation
+            // (`cel/composition.go`, `cel_evaluators::validate_budgeted`):
+            // each is evaluated the first time an expression reads it.
+            let variable_defs: Vec<(String, String)> = policy
                 .get("spec")
                 .and_then(|s| s.get("variables"))
                 .and_then(|v| v.as_array())
-            {
-                let mut var_map: std::collections::HashMap<cel::objects::Key, cel::objects::Value> =
-                    std::collections::HashMap::new();
-                for var_def in vars {
-                    let var_name = var_def.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let var_expr = var_def
-                        .get("expression")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("");
-                    if var_name.is_empty() || var_expr.is_empty() {
-                        continue;
-                    }
-                    // Evaluate the variable expression and add to the variables map
-                    let (var_result, var_cost) = evaluator.evaluate_with_cost(
-                        var_expr,
-                        &context,
-                        rusternetes_common::cel_cost::CostOptions::default(),
-                    );
-                    // Charged to the budget when first referenced, see `VariableCosts`.
-                    variable_costs.record(var_name, var_expr, var_cost);
-                    match var_result {
-                        Ok(val) => {
-                            var_map.insert(
-                                cel::objects::Key::String(std::sync::Arc::new(
-                                    var_name.to_string(),
-                                )),
-                                val,
-                            );
-                            // Re-add the updated variables map to context after each variable
-                            // so later variables can reference earlier ones
-                            context.add_variable(
-                                "variables".to_string(),
-                                cel::objects::Value::Map(cel::objects::Map {
-                                    map: std::sync::Arc::new(var_map.clone()),
-                                }),
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "CEL variable {} evaluation error for policy {}: {}",
-                                var_name,
-                                policy_name,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+                .map(|vars| {
+                    vars.iter()
+                        .filter_map(|v| {
+                            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let expr = v.get("expression").and_then(|e| e.as_str()).unwrap_or("");
+                            (!name.is_empty() && !expr.is_empty())
+                                .then(|| (name.to_string(), expr.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
             // `messageExpression` is compiled with `HasAuthorizer: false`
             // (plugin.go:119) and bound without it (validator.go:105, 122).
@@ -2648,14 +2610,14 @@ impl<S: Storage> AdmissionWebhookManager<S> {
                 &mut evaluator,
                 &context,
                 &message_context,
-                &mut variable_costs,
+                &variable_defs,
             )
             .and_then(|outcomes| {
                 crate::cel_evaluators::audit_annotations_budgeted(
                     &audit_items,
                     &mut evaluator,
                     &context,
-                    &mut variable_costs,
+                    &variable_defs,
                 )
                 .map(|audits| (outcomes, audits))
             });
