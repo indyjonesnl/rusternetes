@@ -79,7 +79,7 @@ pub mod storageversiongc;
 pub mod taint_eviction;
 pub mod taint_eviction_timed_workers;
 pub mod trigger_time_tracker;
-pub mod ttl_controller;
+pub mod ttl_after_finished;
 pub mod typed_workqueue;
 pub mod uid_precondition_double;
 pub mod vac_protection;

@@ -87,7 +87,7 @@ mod status_subresource_guard;
 mod storage_version_migrator_rv_test;
 mod storage_version_migrator_svm_test;
 mod storageclass_controller_test;
-mod ttl_controller_test;
+mod ttl_after_finished_test;
 mod update_carries_stored_identity_guard_test;
 mod vap_status_controller_test;
 mod volume_data_source_validator_test;

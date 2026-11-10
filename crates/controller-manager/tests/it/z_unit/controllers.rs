@@ -228,14 +228,20 @@ mod worker_pool_tests {
             "jobs",
             12,
             |i| {
+                // Finished with an expired TTL: every worker re-reads the Job
+                // from the API (`processJob`'s fresh `Get`) before deleting.
                 json!({
                     "apiVersion": "batch/v1", "kind": "Job", "metadata": meta(i),
-                    "spec": {"template": template(), "ttlSecondsAfterFinished": 1000}
+                    "spec": {"template": template(), "ttlSecondsAfterFinished": 0},
+                    "status": {"conditions": [{
+                        "type": "Complete", "status": "True",
+                        "lastTransitionTime": "2020-01-01T00:00:00Z"
+                    }]}
                 })
             },
             |s| async move {
-                Arc::new(
-                    rusternetes_controller_manager::controllers::ttl_controller::TTLController::new(
+                let _ = Arc::new(
+                    rusternetes_controller_manager::controllers::ttl_after_finished::TTLAfterFinishedController::new(
                         s,
                     ),
                 )
