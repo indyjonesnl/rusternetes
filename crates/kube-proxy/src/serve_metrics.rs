@@ -11,7 +11,7 @@ mod exposition;
 mod health;
 
 pub use configz::ConfigRegistry;
-pub use health::ProxyHealthServer;
+pub use health::{ProxyHealth, ProxyHealthServer};
 
 use axum::{
     extract::{RawQuery, State},

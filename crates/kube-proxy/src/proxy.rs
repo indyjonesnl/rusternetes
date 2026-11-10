@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
-use crate::iptables::IptablesManager;
+use crate::iptables::{IpFamily, IptablesManager};
+use crate::service_health::ServiceHealthServer;
+use crate::svc_maps::{health_check_node_ports, local_ready_endpoints};
 
 /// KubeProxy manages service networking through iptables rules.
 ///
@@ -22,6 +24,9 @@ pub struct KubeProxy<S: Storage> {
     /// K8s uses iptables-restore for atomic updates; we approximate by skipping
     /// sync when state hasn't changed, eliminating the flush gap.
     last_sync_hash: u64,
+    /// `proxier.serviceHealthServer` (iptables/proxier.go:171). `None` until
+    /// the diagnostics listeners are set up.
+    service_health_server: Option<Arc<dyn ServiceHealthServer>>,
 }
 
 impl<S: Storage> KubeProxy<S> {
@@ -39,7 +44,34 @@ impl<S: Storage> KubeProxy<S> {
             iptables,
             node_name,
             last_sync_hash: 0,
+            service_health_server: None,
         })
+    }
+
+    /// Install the healthCheckNodePort server (`NewServiceHealthServer`,
+    /// iptables/proxier.go:267).
+    pub fn set_service_health_server(&mut self, server: Arc<dyn ServiceHealthServer>) {
+        self.service_health_server = Some(server);
+    }
+
+    /// The tail of `syncProxyRules` (iptables/proxier.go:1527-1535): update
+    /// service healthchecks. The endpoints list might include services that
+    /// are not "OnlyLocal", but the services list will not, and the
+    /// serviceHealthServer will just drop those endpoints.
+    fn sync_service_health(&self, services: &[Service], slices: &[EndpointSlice]) {
+        let Some(server) = &self.service_health_server else {
+            return;
+        };
+        if let Err(err) = server.sync_services(&health_check_node_ports(services, IpFamily::V4)) {
+            error!("Error syncing healthcheck services: {err}");
+        }
+        if let Err(err) = server.sync_endpoints(&local_ready_endpoints(
+            slices,
+            &self.node_name,
+            IpFamily::V4,
+        )) {
+            error!("Error syncing healthcheck endpoints: {err}");
+        }
     }
 
     /// Sync all services and their endpoints
@@ -229,6 +261,9 @@ impl<S: Storage> KubeProxy<S> {
 
         if current_hash == self.last_sync_hash {
             debug!("Kube-proxy: state unchanged, skipping sync");
+            // The previous sync succeeded; upstream re-reports health state
+            // on every sync (iptables/proxier.go:1527-1535).
+            self.sync_service_health(&services, &all_endpointslices);
             return Ok(());
         }
 
@@ -277,6 +312,9 @@ impl<S: Storage> KubeProxy<S> {
         // (iptables/proxier.go:1497-1506,1521-1522). Cache only successful
         // state, so a failed retry cannot masquerade as a successful no-op.
         self.last_sync_hash = current_hash;
+
+        // iptables/proxier.go:1527-1535, after Healthz.Updated.
+        self.sync_service_health(&services, &all_endpointslices);
 
         debug!("Kube-proxy sync completed");
         Ok(())
