@@ -271,6 +271,24 @@ impl ApiClient {
         self
     }
 
+    /// This client with its rate limit multiplied: QPS by `qps_factor`, burst
+    /// by `burst_factor`, on a fresh limiter. An unthrottled client stays
+    /// unthrottled. Upstream scales a config the same way
+    /// (`nsKubeconfig.QPS *= 20; nsKubeconfig.Burst *= 100`,
+    /// `cmd/kube-controller-manager/app/core.go:646-647`).
+    pub fn with_scaled_rate_limit(mut self, qps_factor: f64, burst_factor: f64) -> Self {
+        let (qps, burst) = (self.limiter.qps(), self.limiter.burst());
+        if qps > 0.0 {
+            self.limiter = Arc::new(RateLimiter::new(qps * qps_factor, burst * burst_factor));
+        }
+        self
+    }
+
+    /// This client's configured burst.
+    pub fn burst(&self) -> f64 {
+        self.limiter.burst()
+    }
+
     /// This client's configured sustained QPS (`<= 0` means unthrottled).
     pub fn qps(&self) -> f64 {
         self.limiter.qps()

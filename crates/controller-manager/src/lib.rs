@@ -216,9 +216,26 @@ pub async fn run_with_api(
 /// (`staging/src/k8s.io/controller-manager/pkg/clientbuilder/client_builder.go:40-47`),
 /// where QPS/Burst (`--kube-api-qps` / `--kube-api-burst`, default 20/30:
 /// `pkg/controller/apis/config/v1alpha1/defaults.go:59,62`) apply per client.
+///
+/// The namespace controller's client is scaled up, as upstream's is
+/// (`newNamespaceController`, `cmd/kube-controller-manager/app/core.go:637-657`):
+/// "the namespace cleanup controller is very chatty ... the ratelimiter
+/// negatively affects its speed", so `QPS *= 20; Burst *= 100`.
 pub fn controller_client(skeleton: &ApiClient, name: &str) -> Arc<ApiClient> {
-    Arc::new(skeleton.for_controller(name))
+    let client = skeleton.for_controller(name);
+    Arc::new(if name == NAMESPACE_CONTROLLER_CLIENT {
+        client.with_scaled_rate_limit(NAMESPACE_QPS_FACTOR, NAMESPACE_BURST_FACTOR)
+    } else {
+        client
+    })
 }
+
+/// The `storage_for` name the namespace controller is built under.
+pub const NAMESPACE_CONTROLLER_CLIENT: &str = "Namespace";
+/// `nsKubeconfig.QPS *= 20` (`cmd/kube-controller-manager/app/core.go:646`).
+pub const NAMESPACE_QPS_FACTOR: f64 = 20.0;
+/// `nsKubeconfig.Burst *= 100` (`cmd/kube-controller-manager/app/core.go:647`).
+pub const NAMESPACE_BURST_FACTOR: f64 = 100.0;
 
 /// Spawn all controllers as tokio tasks and wait for ctrl-c. Generic over the
 /// storage seam so the SAME controllers run against either a real
@@ -664,7 +681,7 @@ where
         }
     }));
 
-    let s = storage_for("Namespace");
+    let s = storage_for(NAMESPACE_CONTROLLER_CLIENT);
     let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {
         let c = Arc::new(NamespaceController::new(s).with_ca_cert(ns_ca));
