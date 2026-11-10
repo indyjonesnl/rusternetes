@@ -63,7 +63,6 @@ pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resource_quota;
 pub mod resourceclaim;
-pub mod root_ca_cert_publisher;
 pub mod selinux_warning;
 pub mod service;
 pub mod serviceaccount;

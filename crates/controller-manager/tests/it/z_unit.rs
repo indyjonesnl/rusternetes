@@ -26,7 +26,6 @@ mod controllers__replicaset;
 mod controllers__replicationcontroller;
 mod controllers__resource_quota;
 mod controllers__resourceclaim;
-mod controllers__root_ca_cert_publisher;
 mod controllers__selinux_warning;
 mod controllers__selinux_warning__cache;
 mod controllers__selinux_warning__events;
