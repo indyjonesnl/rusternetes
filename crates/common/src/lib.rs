@@ -71,6 +71,7 @@ pub mod service_ip_ranges;
 pub mod serviceaccount;
 pub mod signal;
 pub mod statusz;
+pub mod storage_value;
 pub mod tls;
 pub mod tolerations;
 pub mod tracing;
