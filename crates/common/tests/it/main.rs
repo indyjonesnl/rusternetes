@@ -43,6 +43,7 @@ mod roundtrip_rbac_storage;
 mod sa_external_tokens_test;
 mod secret_data_roundtrip_test;
 mod servicecidr_test;
+mod storage_value_transformer;
 mod validation_configmap;
 mod validation_controllerrevision;
 mod validation_cronjob;
