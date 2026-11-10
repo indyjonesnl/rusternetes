@@ -62,14 +62,20 @@ pub fn build_pre_enqueue_plugin_map_with_preemption<'a>(
             .plugins_at(ExtensionPoint::PreEnqueue)
             .iter()
             .filter_map(|name| match name.as_str() {
-                names::SCHEDULING_GATES => {
-                    Some(Arc::new(SchedulingGates) as Arc<dyn PreEnqueuePlugin>)
-                }
+                // DefaultPreemption's PreEnqueue needs the shared
+                // async-preemption state, so it is built here.
                 names::DEFAULT_PREEMPTION => preemption.map(|state| {
                     Arc::new(DefaultPreemptionPreEnqueue::new(Arc::clone(state)))
                         as Arc<dyn PreEnqueuePlugin>
                 }),
-                _ => None,
+                // SchedulingGates and out-of-tree plugins are the framework's
+                // objects (`profile.PreEnqueuePlugins()`, scheduler.go:390).
+                n => p
+                    .framework
+                    .pre_enqueue_plugins()
+                    .iter()
+                    .find(|pl| pl.name() == n)
+                    .cloned(),
             })
             .collect();
         map.insert(p.scheduler_name.clone(), plugins);

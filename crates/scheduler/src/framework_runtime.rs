@@ -20,7 +20,7 @@
 use crate::fwk::{
     BindPlugin, Code, CycleState, FilterPlugin, Handle, NodeInfo, NodeScore, PermitPlugin,
     PodSignature, PostBindPlugin, PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin,
-    ReservePlugin, ScorePlugin, SignPlugin, Status,
+    QueueSortPlugin, ReservePlugin, ScorePlugin, SignPlugin, Status,
 };
 use rusternetes_common::feature_gates::{self, Feature};
 use rusternetes_common::resources::pod::NodeAffinity;
@@ -382,6 +382,8 @@ fn merge_plugin_set(default_set: &PluginSet, custom_set: &PluginSet) -> PluginSe
 /// factory hands the framework one trait object per point).
 #[derive(Clone, Default)]
 pub struct PluginInstance {
+    pub queue_sort: Option<Arc<dyn QueueSortPlugin>>,
+    pub pre_enqueue: Option<Arc<dyn crate::queue::scheduling_queue::PreEnqueuePlugin>>,
     pub pre_filter: Option<Arc<dyn PreFilterPlugin>>,
     pub filter: Option<Arc<dyn FilterPlugin>>,
     pub pre_score: Option<Arc<dyn PreScorePlugin>>,
@@ -398,7 +400,9 @@ impl PluginInstance {
     fn can_carry(&self, ep: ExtensionPoint) -> bool {
         matches!(
             ep,
-            ExtensionPoint::PreFilter
+            ExtensionPoint::QueueSort
+                | ExtensionPoint::PreEnqueue
+                | ExtensionPoint::PreFilter
                 | ExtensionPoint::Filter
                 | ExtensionPoint::PreScore
                 | ExtensionPoint::Score
@@ -412,6 +416,8 @@ impl PluginInstance {
 
     fn implements(&self, ep: ExtensionPoint) -> bool {
         match ep {
+            ExtensionPoint::QueueSort => self.queue_sort.is_some(),
+            ExtensionPoint::PreEnqueue => self.pre_enqueue.is_some(),
             ExtensionPoint::PreFilter => self.pre_filter.is_some(),
             ExtensionPoint::Filter => self.filter.is_some(),
             ExtensionPoint::PreScore => self.pre_score.is_some(),
@@ -519,8 +525,8 @@ impl Registry {
 
     /// `Registry.Register` with a factory: add an out-of-tree plugin whose
     /// objects come from `factory` (`WithFrameworkOutOfTreeRegistry`). The
-    /// extension points must be ones a [`PluginInstance`] can carry; QueueSort,
-    /// PreEnqueue and PostFilter plugins are not pluggable out of tree yet.
+    /// extension points must be ones a [`PluginInstance`] can carry; PostFilter
+    /// plugins are not pluggable out of tree yet.
     pub fn register_factory(
         &mut self,
         name: &str,
@@ -620,6 +626,9 @@ pub const MAX_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// MultiPoint expansion) and the score weights.
 #[derive(Debug, Clone, Default)]
 pub struct Framework {
+    /// `f.queueSortPlugins` / `f.preEnqueuePlugins` (framework.go:62-64).
+    queue_sort_plugin_objects: QueueSortPluginObjects,
+    pre_enqueue_plugin_objects: PreEnqueuePluginObjects,
     /// `f.filterPlugins` (framework.go:68): the Filter plugin objects, in
     /// execution order. Only plugins that are objects (see
     /// [`crate::in_tree::new_filter_plugin`]) appear here; the others still
@@ -669,6 +678,30 @@ pub struct Framework {
     /// (`shouldHaveEnqueueExtensions`, framework.go:663-671), in
     /// `fillEnqueueExtensions` order.
     enqueue_extensions: Vec<String>,
+}
+
+/// The QueueSort plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct QueueSortPluginObjects(Vec<Arc<dyn QueueSortPlugin>>);
+
+impl std::fmt::Debug for QueueSortPluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
+}
+
+/// The PreEnqueue plugin objects of a [`Framework`].
+#[derive(Clone, Default)]
+pub struct PreEnqueuePluginObjects(Vec<Arc<dyn crate::queue::scheduling_queue::PreEnqueuePlugin>>);
+
+impl std::fmt::Debug for PreEnqueuePluginObjects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|p| p.name()))
+            .finish()
+    }
 }
 
 /// The Bind plugin objects of a [`Framework`].
@@ -1561,6 +1594,26 @@ impl Framework {
         &self.enqueue_extensions
     }
 
+    /// `PreEnqueuePlugins` (framework.go:731-734): the PreEnqueue plugin
+    /// objects the framework instantiated (SchedulingGates and out-of-tree
+    /// plugins; DefaultPreemption's needs the async-preemption state and is
+    /// added by `build_pre_enqueue_plugin_map_with_preemption`).
+    pub fn pre_enqueue_plugins(
+        &self,
+    ) -> &[Arc<dyn crate::queue::scheduling_queue::PreEnqueuePlugin>] {
+        &self.pre_enqueue_plugin_objects.0
+    }
+
+    /// `QueueSortFunc` (framework.go:741-755): the first (only) QueueSort
+    /// plugin's `Less`. Panics, as upstream, when none is registered.
+    pub fn queue_sort_func(&self) -> crate::queue::scheduling_queue::LessFn {
+        let Some(pl) = self.queue_sort_plugin_objects.0.first() else {
+            panic!("No QueueSort plugin is registered in the frameworkImpl.");
+        };
+        let pl = Arc::clone(pl);
+        Arc::new(move |a, b| pl.less(a, b))
+    }
+
     /// Plugins configured at `ep`, in execution order.
     pub fn plugins_at(&self, ep: ExtensionPoint) -> &[String] {
         self.lists.get(&ep).map(Vec::as_slice).unwrap_or(&[])
@@ -1757,6 +1810,30 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
         }
     }
     let ext = |name: &str| external.get(name);
+    f.queue_sort_plugin_objects = QueueSortPluginObjects(
+        f.plugins_at(ExtensionPoint::QueueSort)
+            .iter()
+            .filter_map(|name| match name.as_str() {
+                names::PRIORITY_SORT => {
+                    Some(Arc::new(crate::queue::scheduling_queue::PrioritySort)
+                        as Arc<dyn QueueSortPlugin>)
+                }
+                _ => ext(name).and_then(|p| p.queue_sort.clone()),
+            })
+            .collect(),
+    );
+    f.pre_enqueue_plugin_objects = PreEnqueuePluginObjects(
+        f.plugins_at(ExtensionPoint::PreEnqueue)
+            .iter()
+            .filter_map(|name| match name.as_str() {
+                names::SCHEDULING_GATES => {
+                    Some(Arc::new(crate::queue::scheduling_gates::SchedulingGates)
+                        as Arc<dyn crate::queue::scheduling_queue::PreEnqueuePlugin>)
+                }
+                _ => ext(name).and_then(|p| p.pre_enqueue.clone()),
+            })
+            .collect(),
+    );
     // Instantiate the Filter plugins that are objects, in list order.
     f.filter_plugin_objects = FilterPluginObjects(
         f.plugins_at(ExtensionPoint::Filter)

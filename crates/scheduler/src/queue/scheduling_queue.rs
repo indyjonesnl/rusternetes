@@ -185,12 +185,30 @@ use crate::profile::pod_scheduler_name;
 /// `fwk.LessFunc`.
 pub type LessFn = Arc<dyn Fn(&QueuedPodInfo, &QueuedPodInfo) -> bool + Send + Sync>;
 
-/// `queuesort.PrioritySort.Less` (`plugins/queuesort/priority_sort.go:44-48`).
-pub fn priority_sort_less() -> LessFn {
-    Arc::new(|a: &QueuedPodInfo, b: &QueuedPodInfo| {
+/// `queuesort.PrioritySort` (`plugins/queuesort/priority_sort.go:30-56`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrioritySort;
+
+impl crate::fwk::Plugin for PrioritySort {
+    fn name(&self) -> &'static str {
+        crate::framework_runtime::names::PRIORITY_SORT
+    }
+}
+
+impl crate::fwk::QueueSortPlugin for PrioritySort {
+    /// `Less` (`priority_sort.go:44-48`): higher priority first, then the
+    /// earlier timestamp.
+    fn less(&self, a: &QueuedPodInfo, b: &QueuedPodInfo) -> bool {
         let p = |i: &QueuedPodInfo| i.pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
         let (p1, p2) = (p(a), p(b));
         p1 > p2 || (p1 == p2 && a.timestamp < b.timestamp)
+    }
+}
+
+/// `PrioritySort.Less` as a [`LessFn`].
+pub fn priority_sort_less() -> LessFn {
+    Arc::new(|a: &QueuedPodInfo, b: &QueuedPodInfo| {
+        crate::fwk::QueueSortPlugin::less(&PrioritySort, a, b)
     })
 }
 

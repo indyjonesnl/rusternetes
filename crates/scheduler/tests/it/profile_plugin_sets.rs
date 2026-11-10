@@ -403,8 +403,8 @@ profiles:
 
     let err = r
         .register_factory(
-            "Sorter",
-            &[ExtensionPoint::QueueSort],
+            "Post",
+            &[ExtensionPoint::PostFilter],
             Arc::new(|_| Ok(PluginInstance::default())),
         )
         .unwrap_err();

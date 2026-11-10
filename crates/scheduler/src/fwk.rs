@@ -393,6 +393,18 @@ pub trait Plugin: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// `fwk.QueueSortPlugin` (`staging/.../framework/interface.go`): the order of
+/// pods in the scheduling queue's activeQ. Only one QueueSort plugin can be
+/// enabled per profile and all profiles must agree on it.
+pub trait QueueSortPlugin: Plugin {
+    /// `Less`: whether `a` sorts before `b`.
+    fn less(
+        &self,
+        a: &crate::queue::scheduling_queue::QueuedPodInfo,
+        b: &crate::queue::scheduling_queue::QueuedPodInfo,
+    ) -> bool;
+}
+
 /// `fwk.FilterPlugin`: a node that fails is not a candidate for the pod.
 #[async_trait]
 pub trait FilterPlugin: Plugin {
