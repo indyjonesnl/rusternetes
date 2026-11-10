@@ -133,9 +133,8 @@ pub struct ControllerManagerConfig {
     /// Metrics client config for the HPA controller. When `None`,
     /// `HttpMetricsConfig::default()` is used (api-server:6443 + /etc/kubernetes/pki).
     pub metrics_config: Option<HttpMetricsConfig>,
-    /// Cluster CA cert PEM, threaded to the namespace controller so it can
-    /// (re)create `kube-root-ca.crt` in every namespace. `None` falls back to
-    /// the legacy cert-file paths.
+    /// Cluster CA cert PEM, threaded to the root CA cert publisher, which
+    /// keeps `kube-root-ca.crt` in every namespace. `None` disables it.
     pub ca_cert_pem: Option<String>,
     /// Node-IPAM config (pod-CIDR allocation). `None` disables it, matching
     /// upstream `--allocate-node-cidrs=false`.
@@ -682,13 +681,25 @@ where
     }));
 
     let s = storage_for(NAMESPACE_CONTROLLER_CLIENT);
-    let ns_ca = config.ca_cert_pem.clone();
     handles.push(tokio::spawn(async move {
-        let c = Arc::new(NamespaceController::new(s).with_ca_cert(ns_ca));
+        let c = Arc::new(NamespaceController::new(s));
         if let Err(e) = c.run().await {
             error!("Namespace controller error: {}", e);
         }
     }));
+
+    // newRootCACertificatePublisherController
+    // (cmd/kube-controller-manager/app/certificates.go:263).
+    if let Some(root_ca) = config.ca_cert_pem.clone().filter(|c| !c.is_empty()) {
+        let s = storage_for("RootCACertPublisher");
+        handles.push(tokio::spawn(async move {
+            let c =
+                Arc::new(controllers::root_ca_cert_publisher::RootCACertPublisher::new(s, root_ca));
+            if let Err(e) = c.run().await {
+                error!("Root CA cert publisher error: {}", e);
+            }
+        }));
+    }
 
     let s = storage_for("TaintEviction");
     handles.push(tokio::spawn(async move {
