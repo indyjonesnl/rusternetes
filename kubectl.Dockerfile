@@ -58,11 +58,6 @@ ENV RUSTC_WRAPPER=sccache \
 
 WORKDIR /app
 
-# Pull in the adjacent rhino crate (named build context in compose.yml).
-# kubectl itself doesn't use rhino, but the workspace manifest references it
-# transitively via crates/storage, so cargo metadata fails without it.
-COPY --from=rhino . /app/rhino
-
 # ----- PASS 1: dependency-only compile (cache-friendly) -----
 
 COPY Cargo.toml Cargo.lock* ./

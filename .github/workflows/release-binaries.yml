@@ -74,9 +74,6 @@ jobs:
         with:
           # On a dispatch, build the tag being released, not the dispatch ref.
           ref: ${{ github.event.inputs.tag || github.ref }}
-          # rhino is the in-tree submodule: path-dep of crates/storage AND the
-          # source of rhino-server.
-          submodules: recursive
 
       - name: Build static binaries (release profile)
         run: |

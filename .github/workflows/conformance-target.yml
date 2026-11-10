@@ -89,8 +89,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       # Resolve `local` to an EMPTY image-tag, which is how
       # ci/actions/bring-up-cluster is told to compile this ref instead of

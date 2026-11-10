@@ -10,22 +10,22 @@
 #
 # Not an image: the final stage is `scratch` holding just the three binaries,
 # meant to be exported with `--output type=local`:
-#   git submodule update --init rhino
 #   docker buildx build -f release-binaries.Dockerfile --target artifacts \
 #     --output type=local,dest=out .
 # Output (names are the on-disk build names; the release workflow renames them):
 #   out/api-server  out/kubelet  out/rhino-server
 #
-# rhino is a git submodule (indyjonesnl/rhino) EXCLUDED from the workspace
-# (root Cargo.toml `exclude`), with its own Cargo.lock and a `[patch.crates-io]`
-# for a vendored h2, so it is built from its own directory. Its binary is
-# `rhino-server` (rhino/Cargo.toml [[bin]]).
+# rhino (indyjonesnl/rhino) has its own Cargo.lock and a `[patch.crates-io]` for
+# a vendored h2, which only applies when it is the build root, so rhino-server
+# is built from a checkout of the pinned commit (RHINO_REV, the same commit as
+# the git dependency in crates/storage/Cargo.toml; scripts/check-rhino-rev.sh
+# guards the pair). Its binary is `rhino-server` (rhino [[bin]]).
 
 FROM rust:1.99-alpine AS builder
 
 # Same toolchain set as all-in-one-musl.Dockerfile (ring, bundled SQLite,
 # mimalloc, tonic/prost codegen).
-RUN apk add --no-cache build-base musl-dev perl protoc protobuf-dev
+RUN apk add --no-cache build-base musl-dev perl protoc protobuf-dev git
 
 WORKDIR /build
 COPY . .
@@ -49,10 +49,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && mkdir -p /out \
  && cp target/release/api-server target/release/kubelet /out/
 
+ARG RHINO_REV=5e07b3ca7d2b04456891d40f6a83e4e10cbcd075
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/rhino/target \
-    cd rhino \
+    mkdir -p /build/rhino && cd /build/rhino \
+ && git init -q . \
+ && git fetch -q --depth 1 https://github.com/indyjonesnl/rhino.git "${RHINO_REV}" \
+ && git checkout -q FETCH_HEAD \
  && cargo build --release --bin rhino-server \
  && strip target/release/rhino-server \
  && cp target/release/rhino-server /out/

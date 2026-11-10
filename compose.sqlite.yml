@@ -7,11 +7,6 @@
 #   podman compose -f compose.sqlite.yml build
 #   podman compose -f compose.sqlite.yml up -d
 #   bash scripts/bootstrap-cluster.sh
-#
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
 
 # Per-build sccache toggle for the services.Dockerfile cargo-builder stage.
 # CI (GITHUB_ACTIONS=true) -> USE_SCCACHE=1 -> sccache (prior behavior, no
@@ -31,8 +26,8 @@ services:
   # Rhino - etcd-compatible gRPC server backed by SQLite
   rhino:
     build:
-      context: ./rhino
-      dockerfile: ../rhino.Dockerfile
+      context: .
+      dockerfile: rhino.Dockerfile
     container_name: rusternetes-rhino
     restart: unless-stopped
     ports:
@@ -60,8 +55,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: api-server
     container_name: rusternetes-api-server
@@ -143,8 +136,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: scheduler
     image: rusternetes-scheduler:latest
@@ -159,8 +150,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: controller-manager
     image: rusternetes-controller-manager:latest
@@ -230,8 +219,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet
@@ -291,8 +278,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet2
@@ -332,8 +317,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: kube-proxy
     container_name: rusternetes-kube-proxy
@@ -366,8 +349,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: kube-proxy
     container_name: rusternetes-kube-proxy2
@@ -404,8 +385,6 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: dns
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
 
 networks:

@@ -73,12 +73,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: api-server
     container_name: rusternetes-api-server
@@ -160,12 +154,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: scheduler
     image: rusternetes-scheduler:latest
@@ -180,12 +168,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: controller-manager
     image: rusternetes-controller-manager:latest
@@ -255,12 +237,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet
@@ -317,12 +293,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: kubelet
     container_name: rusternetes-kubelet2
@@ -362,12 +332,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: kube-proxy
     container_name: rusternetes-kube-proxy
@@ -400,12 +364,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
       target: kube-proxy
     container_name: rusternetes-kube-proxy2
@@ -442,12 +400,6 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: dns
-      additional_contexts:
-        # Required even though this stack never runs rhino:
-        # services.Dockerfile COPYs this context unconditionally so cargo can
-        # resolve the `rhino = { path = "../../rhino" }` dep in
-        # crates/storage/Cargo.toml. Removing it breaks the build.
-        rhino: ./rhino
       args: *sccache-args
 
 networks:

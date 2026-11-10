@@ -157,12 +157,6 @@ ENV SCCACHE_DIR=/sccache \
 
 WORKDIR /app
 
-# Pull in the rhino submodule (named build context in compose.yml, pointed at
-# the in-tree `./rhino` submodule). crates/storage/Cargo.toml declares
-# `rhino = { path = "../../rhino", ... }` which from /app/crates/storage
-# resolves to /app/rhino, so land it there.
-COPY --from=rhino . /app/rhino
-
 # ----- PASS 1: dependency-only compile (cache-friendly) -----
 
 # Workspace manifest + lockfile (rare changes, dep-graph layer cache

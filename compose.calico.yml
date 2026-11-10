@@ -33,8 +33,8 @@ x-node-build: &node-build
 services:
   rhino:
     build:
-      context: ./rhino
-      dockerfile: ../rhino.Dockerfile
+      context: .
+      dockerfile: rhino.Dockerfile
     container_name: rusternetes-rhino
     restart: unless-stopped
     ports:
@@ -55,8 +55,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: api-server
     image: isolated-work-api-server:latest
@@ -170,8 +168,6 @@ services:
     build:
       context: .
       dockerfile: services.Dockerfile
-      additional_contexts:
-        rhino: ./rhino
       args: *sccache-args
       target: kube-proxy
     image: isolated-work-kube-proxy:latest

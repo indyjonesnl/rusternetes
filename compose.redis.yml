@@ -7,11 +7,6 @@
 #   podman compose -f compose.redis.yml build
 #   podman compose -f compose.redis.yml up -d
 #   bash scripts/bootstrap-cluster.sh
-#
-# Requires the rhino repo adjacent to this one:
-#   dev/
-#     rusternetes/   (this repo)
-#     rhino/         (https://github.com/calfonso/rhino)
 
 services:
   # Redis - backing store for rhino
@@ -34,8 +29,8 @@ services:
   # Rhino - etcd-compatible gRPC server backed by Redis
   rhino:
     build:
-      context: ./rhino
-      dockerfile: ../rhino.Dockerfile
+      context: .
+      dockerfile: rhino.Dockerfile
     container_name: rusternetes-rhino
     ports:
       - "2379:2379"
@@ -63,8 +58,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: api-server
     container_name: rusternetes-api-server
     # NET_ADMIN lets the entrypoint install a route to the pod CIDR
@@ -138,8 +131,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: scheduler
     image: rusternetes-scheduler:latest
 
@@ -155,8 +146,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: controller-manager
     image: rusternetes-controller-manager:latest
 
@@ -191,8 +180,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet
     privileged: true
@@ -228,8 +215,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: kubelet
     container_name: rusternetes-kubelet2
     privileged: true
@@ -264,8 +249,6 @@ services:
       dockerfile: services.Dockerfile
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-      additional_contexts:
-        rhino: ./rhino
       target: kube-proxy
     container_name: rusternetes-kube-proxy
     privileged: true
@@ -306,8 +289,6 @@ services:
       args:
         RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
       target: dns
-      additional_contexts:
-        rhino: ./rhino
 
 networks:
   rusternetes-net:

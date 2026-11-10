@@ -46,8 +46,6 @@ on:
       # The storage crate's error mapping comes from rusternetes-common, and
       # the contract assertions match on those variants.
       - "crates/common/**"
-      # rhino is the storage crate's `../../rhino` path dep.
-      - "rhino"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/storage-contract.yml"
@@ -55,7 +53,6 @@ on:
     paths:
       - "crates/storage/**"
       - "crates/common/**"
-      - "rhino"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/storage-contract.yml"
@@ -85,11 +82,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - name: Checkout repository
-        # rhino is an in-tree submodule (./rhino) resolving the storage crate's
-        # `../../rhino` path dep; without it `cargo metadata` fails outright.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: recursive
 
       - name: Tool prereqs (fail fast on missing — no apt-get install)
         # `docker info` (not just `command -v docker`) is the real check: it

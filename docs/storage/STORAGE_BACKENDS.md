@@ -42,15 +42,9 @@ podman compose -f compose.sqlite.yml up -d
 bash scripts/bootstrap-cluster.sh
 ```
 
-This mode uses `Dockerfile.rhino` to build the rhino-server container and
-requires the [rhino](https://github.com/calfonso/rhino) repo adjacent to
-this one:
-
-```
-dev/
-  rusternetes/   (this repo)
-  rhino/         (https://github.com/calfonso/rhino)
-```
+This mode uses `rhino.Dockerfile` to build the rhino-server container from a
+pinned commit of [rhino](https://github.com/indyjonesnl/rhino); nothing needs
+to be checked out next to this repo.
 
 ### 3. Normal mode with Redis via rhino
 
@@ -493,14 +487,8 @@ Watch streams work via rhino's poll loop (1-second intervals).
 
 ## Rhino Library Dependency (embedded mode)
 
-Rhino is included as a local path dependency in the storage crate. This
-requires the following directory layout:
-
-```
-dev/
-  rusternetes/    # this repo
-  rhino/          # https://github.com/calfonso/rhino
-```
+Rhino is a git dependency of the storage crate, pinned by commit in
+`crates/storage/Cargo.toml` and resolved by cargo like any other dependency.
 
 Rhino provides four database backends (SQLite, Redis, PostgreSQL, MySQL) behind
 its `Backend` trait. Rusternetes uses `SqliteBackend` and `RedisBackend`.

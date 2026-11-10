@@ -38,11 +38,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout repository
-        # rhino is an in-tree submodule (./rhino) that the storage crate's
-        # `../../rhino` path dep needs on disk for `cargo metadata`.
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: recursive
 
       - name: Tool prereqs (fail fast on missing — no apt-get install)
         # Per project convention: self-hosted runner does not get sudo / apt-get

@@ -69,11 +69,6 @@ phase_preflight() {
   done
   ok "tools present: docker helm kubectl curl jq"
 
-  if [ ! -d "$PROJECT_ROOT/../rhino" ]; then
-    die "expected rhino checkout at $PROJECT_ROOT/../rhino — clone calfonso/rhino there before running"
-  fi
-  ok "rhino sibling crate present"
-
   if ss -ltnH 2>/dev/null | grep -q -E ':6443\s' ; then
     die "port 6443 is already in use — stop the existing process / cluster first"
   fi
