@@ -307,7 +307,11 @@ impl<S: Storage + 'static> PVBinderController<S> {
 
         info!("Starting PV/PVC Binder Controller");
 
-        let queue = WorkQueue::new();
+        // `claimQueue` / `volumeQueue` (pv_controller_base.go:91-92): one
+        // queue per kind, each drained by its own worker (`claimWorker` /
+        // `volumeWorker`, :466-545).
+        let queue = WorkQueue::named("claims");
+        let volume_queue = WorkQueue::named("volumes");
 
         let worker_queue = queue.clone();
         let worker_self = Arc::clone(&self);
@@ -315,8 +319,17 @@ impl<S: Storage + 'static> PVBinderController<S> {
             worker_self.worker(worker_queue).await;
         });
 
+        let volume_worker_queue = volume_queue.clone();
+        let volume_worker_claims = queue.clone();
+        let volume_worker_self = Arc::clone(&self);
+        tokio::spawn(async move {
+            volume_worker_self
+                .volume_worker(volume_worker_queue, volume_worker_claims)
+                .await;
+        });
+
         loop {
-            self.enqueue_all(&queue).await;
+            self.enqueue_all(&queue, &volume_queue).await;
 
             let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", None);
             let watch_result = self.storage.watch(&prefix).await;
@@ -352,9 +365,9 @@ impl<S: Storage + 'static> PVBinderController<S> {
                                 // `deleteClaim` (pv_controller_base.go:273-295):
                                 // "sync the volume when its claim is deleted"
                                 // so its Release does not wait for the resync.
-                                if matches!(ev, rusternetes_storage::WatchEvent::Deleted(..)) {
-                                    if let Err(e) = self.sync_volumes(&queue).await {
-                                        error!("PV sync after claim deletion failed: {}", e);
+                                if let rusternetes_storage::WatchEvent::Deleted(_, prev) = &ev {
+                                    if let Some(volume) = deleted_claim_volume_key(prev) {
+                                        volume_queue.add(volume).await;
                                     }
                                 }
                                 let key = extract_key(&ev);
@@ -372,10 +385,16 @@ impl<S: Storage + 'static> PVBinderController<S> {
                     }
                     event = pv_watch.next() => {
                         match event {
-                            Some(Ok(_)) => {
-                                if let Err(e) = self.sync_volumes(&queue).await {
-                                    error!("PV availability pass failed: {}", e);
+                            Some(Ok(ev)) => {
+                                // `deleteVolume` (pv_controller_base.go:228-243):
+                                // "sync the claim when its volume is deleted"
+                                // so its Lost status does not wait for the resync.
+                                if let rusternetes_storage::WatchEvent::Deleted(_, prev) = &ev {
+                                    if let Some(claim) = deleted_volume_claim_key(prev) {
+                                        queue.add(claim).await;
+                                    }
                                 }
+                                volume_queue.add(extract_key(&ev)).await;
                             }
                             Some(Err(e)) => {
                                 tracing::warn!("PV watch error: {}, reconnecting", e);
@@ -388,7 +407,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
                         }
                     }
                     _ = resync.tick() => {
-                        self.enqueue_all(&queue).await;
+                        self.enqueue_all(&queue, &volume_queue).await;
                     }
                 }
             }
@@ -428,10 +447,43 @@ impl<S: Storage + 'static> PVBinderController<S> {
         }
     }
 
-    async fn enqueue_all(&self, queue: &WorkQueue) {
-        // Volume side of the sync (upstream syncVolume).
-        if let Err(e) = self.sync_volumes(queue).await {
-            error!("PV availability pass failed: {}", e);
+    /// `volumeWorker` (pv_controller_base.go:497-545): sync the volume a key
+    /// names. `syncVolume` errors are logged and left to the next event or
+    /// resync (`updateVolume` returns nothing to requeue on); a volume that
+    /// is gone was handled by the `deleteVolume` step in the watch loop.
+    async fn volume_worker(&self, queue: WorkQueue, claim_queue: WorkQueue) {
+        while let Some(key) = queue.get().await {
+            let name = key.strip_prefix("persistentvolumes/").unwrap_or(&key);
+            let storage_key = build_key("persistentvolumes", None, name);
+            match self.storage.get::<PersistentVolume>(&storage_key).await {
+                Ok(pv) => {
+                    if let Err(e) = self.sync_volume(pv, &claim_queue).await {
+                        error!("Failed to sync PV {}: {}", name, e);
+                    }
+                }
+                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(e) => error!("Failed to get PV {}: {}", name, e),
+            }
+            queue.forget(&key).await;
+            queue.done(&key).await;
+        }
+    }
+
+    async fn enqueue_all(&self, queue: &WorkQueue, volume_queue: &WorkQueue) {
+        // Volume side of the sync (upstream syncVolume), via the volume queue.
+        match self
+            .storage
+            .list::<PersistentVolume>("/registry/persistentvolumes/")
+            .await
+        {
+            Ok(items) => {
+                for item in &items {
+                    volume_queue
+                        .add(format!("persistentvolumes/{}", item.metadata.name))
+                        .await;
+                }
+            }
+            Err(e) => error!("Failed to list persistentvolumes for enqueue: {}", e),
         }
         match self
             .storage
@@ -2301,4 +2353,21 @@ fn requirement_matches(value: Option<&str>, operator: &str, values: Option<&[Str
         }
         _ => false,
     }
+}
+
+/// `deleteClaim`'s target (pv_controller_base.go:273-295): the volume key of a
+/// deleted claim's `spec.volumeName`, when it was bound.
+pub fn deleted_claim_volume_key(prev: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(prev).ok()?;
+    let name = v.pointer("/spec/volumeName")?.as_str()?;
+    (!name.is_empty()).then(|| format!("persistentvolumes/{name}"))
+}
+
+/// `deleteVolume`'s target (pv_controller_base.go:228-243): the claim key of a
+/// deleted volume's `spec.claimRef` (`claimrefToClaimKey`).
+pub fn deleted_volume_claim_key(prev: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(prev).ok()?;
+    let name = v.pointer("/spec/claimRef/name")?.as_str()?;
+    let ns = v.pointer("/spec/claimRef/namespace")?.as_str()?;
+    Some(format!("persistentvolumeclaims/{ns}/{name}"))
 }
