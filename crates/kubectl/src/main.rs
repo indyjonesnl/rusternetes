@@ -510,42 +510,114 @@ enum Commands {
         overwrite: bool,
     },
 
-    /// Drain a node in preparation for maintenance
+    /// Drain node in preparation for maintenance
+    ///
+    /// The given node will be marked unschedulable to prevent new pods from
+    /// arriving. 'drain' evicts the pods if the API server supports eviction.
+    /// Otherwise, it will use normal DELETE to delete the pods. The 'drain'
+    /// evicts or deletes all pods except mirror pods (which cannot be deleted
+    /// through the API server). If there are daemon set-managed pods, drain
+    /// will not proceed without --ignore-daemonsets, and regardless it will not
+    /// delete any daemon set-managed pods, because those pods would be
+    /// immediately replaced by the daemon set controller, which ignores
+    /// unschedulable markings. If there are any pods that are neither mirror
+    /// pods nor managed by a replication controller, replica set, daemon set,
+    /// stateful set, or job, then drain will not delete any pods unless you use
+    /// --force. --force will also allow deletion to proceed if the managing
+    /// resource of one or more pods is missing.
+    ///
+    /// 'drain' waits for graceful termination. You should not operate on the
+    /// machine until the command completes.
+    ///
+    /// When you are ready to put the node back into service, use kubectl
+    /// uncordon, which will make the node schedulable again.
     Drain {
-        /// Node name
-        node_name: String,
+        /// Node name(s)
+        nodes: Vec<String>,
 
-        /// Continue even if there are pods not managed by a controller
+        /// Continue even if there are pods that do not declare a controller.
         #[arg(long)]
         force: bool,
 
-        /// Ignore DaemonSet-managed pods
+        /// Ignore DaemonSet-managed pods.
         #[arg(long)]
         ignore_daemonsets: bool,
 
-        /// Continue even if there are pods using emptyDir
+        /// Continue even if there are pods using emptyDir (local data that
+        /// will be deleted when the node is drained).
         #[arg(long)]
         delete_emptydir_data: bool,
 
-        /// Grace period in seconds for pod termination
-        #[arg(long)]
-        grace_period: Option<i64>,
+        /// Period of time in seconds given to each pod to terminate
+        /// gracefully. If negative, the default value specified in the pod
+        /// will be used.
+        #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
+        grace_period: i64,
 
-        /// Timeout in seconds to wait for drain to complete
+        /// The length of time to wait before giving up, zero means infinite
+        #[arg(long, default_value = "0s", value_parser = commands::drain::parse_go_duration)]
+        timeout: std::time::Duration,
+
+        /// Label selector to filter pods on the node
+        #[arg(long, default_value = "")]
+        pod_selector: String,
+
+        /// Force drain to use delete, even if eviction is supported. This will
+        /// bypass checking PodDisruptionBudgets, use with caution.
         #[arg(long)]
-        timeout: Option<u64>,
+        disable_eviction: bool,
+
+        /// If pod DeletionTimestamp older than N seconds, skip waiting for the
+        /// pod. Seconds must be greater than 0 to skip.
+        #[arg(long, default_value_t = 0)]
+        skip_wait_for_delete_timeout: i64,
+
+        /// Return large lists in chunks rather than all at once. Pass 0 to
+        /// disable.
+        #[arg(long, default_value_t = 500)]
+        chunk_size: i64,
+
+        /// Must be "none", "server", or "client". If client strategy, only
+        /// print the object that would be sent, without sending it. If server
+        /// strategy, submit server-side request without persisting the
+        /// resource.
+        #[arg(long, default_value = "none", num_args = 0..=1, default_missing_value = "unchanged", require_equals = true)]
+        dry_run: String,
+
+        /// Selector (label query) to filter on, supports '=', '==', '!=',
+        /// 'in', 'notin'.
+        #[arg(short = 'l', long)]
+        selector: Option<String>,
     },
 
     /// Mark node as unschedulable
     Cordon {
-        /// Node name
-        node_name: String,
+        /// Node name(s)
+        nodes: Vec<String>,
+
+        /// Must be "none", "server", or "client".
+        #[arg(long, default_value = "none", num_args = 0..=1, default_missing_value = "unchanged", require_equals = true)]
+        dry_run: String,
+
+        /// Selector (label query) to filter on, supports '=', '==', '!=',
+        /// 'in', 'notin'.
+        #[arg(short = 'l', long)]
+        selector: Option<String>,
     },
 
     /// Mark node as schedulable
     Uncordon {
-        /// Node name
-        node_name: String,
+        /// Node name(s)
+        nodes: Vec<String>,
+
+        /// Must be "none", "server", or "client".
+        #[arg(long, default_value = "none", num_args = 0..=1, default_missing_value = "unchanged", require_equals = true)]
+        dry_run: String,
+
+        /// Selector (label query) to filter on, supports '=', '==', '!=',
+        /// 'in', 'notin'.
+        #[arg(short = 'l', long)]
+        selector: Option<String>,
     },
 
     /// Rollout management commands
@@ -1502,29 +1574,57 @@ async fn main() -> Result<()> {
             commands::taint::execute(&client, &node_name, &taints, overwrite).await?;
         }
         Commands::Drain {
-            node_name,
+            nodes,
             force,
             ignore_daemonsets,
             delete_emptydir_data,
             grace_period,
             timeout,
+            pod_selector,
+            disable_eviction,
+            skip_wait_for_delete_timeout,
+            chunk_size,
+            dry_run,
+            selector,
         } => {
-            commands::drain::execute_drain(
-                &client,
-                &node_name,
+            let flags = commands::drain::DrainFlags {
                 force,
                 ignore_daemonsets,
                 delete_emptydir_data,
                 grace_period,
                 timeout,
-            )
-            .await?;
+                pod_selector,
+                disable_eviction,
+                skip_wait_for_delete_timeout,
+                chunk_size,
+                dry_run,
+                selector,
+            };
+            commands::drain::execute_drain(&client, &nodes, &flags).await?;
         }
-        Commands::Cordon { node_name } => {
-            commands::drain::execute_cordon(&client, &node_name).await?;
+        Commands::Cordon {
+            nodes,
+            dry_run,
+            selector,
+        } => {
+            let flags = commands::drain::DrainFlags {
+                dry_run,
+                selector,
+                ..Default::default()
+            };
+            commands::drain::execute_cordon(&client, &nodes, &flags).await?;
         }
-        Commands::Uncordon { node_name } => {
-            commands::drain::execute_uncordon(&client, &node_name).await?;
+        Commands::Uncordon {
+            nodes,
+            dry_run,
+            selector,
+        } => {
+            let flags = commands::drain::DrainFlags {
+                dry_run,
+                selector,
+                ..Default::default()
+            };
+            commands::drain::execute_uncordon(&client, &nodes, &flags).await?;
         }
         Commands::Rollout { command } => {
             commands::rollout::execute(&client, command, &default_namespace).await?;

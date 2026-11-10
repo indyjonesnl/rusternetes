@@ -18,7 +18,6 @@ mod commands__debug;
 mod commands__delete;
 mod commands__describe;
 mod commands__diff;
-mod commands__drain;
 mod commands__edit;
 mod commands__events;
 mod commands__exec;
