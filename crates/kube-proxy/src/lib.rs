@@ -2,6 +2,8 @@ pub mod iptables;
 pub mod node_net;
 pub mod proxy;
 pub mod serve_metrics;
+pub mod service_health;
+pub mod svc_maps;
 
 use futures::StreamExt;
 use proxy::KubeProxy;
@@ -139,6 +141,17 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
     health.watch_node(Arc::clone(&storage), config.node_name.clone());
     // SyncLoop reports its initial update before it begins (proxier.go:533-535).
     health.updated("IPv4");
+    // iptables/proxier.go:267 NewServiceHealthServer(nodeName, recorder,
+    // nodePortAddresses, healthzServer); no recorder or --nodeport-addresses
+    // yet, so listen on 0.0.0.0 (the MatchAll default).
+    kube_proxy.lock().await.set_service_health_server(Arc::new(
+        service_health::new_std_service_health_server(
+            &config.node_name,
+            None,
+            vec![std::net::IpAddr::from([0, 0, 0, 0])],
+            Arc::new(health.clone()),
+        ),
+    ));
     let (errors, mut diagnostic_errors) = tokio::sync::mpsc::unbounded_channel();
     let errors = diagnostics.bind_address_hard_fail.then_some(errors);
     health.serve_with_errors(diagnostics.healthz_bind_address, errors.clone());

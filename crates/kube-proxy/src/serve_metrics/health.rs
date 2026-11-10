@@ -30,14 +30,29 @@ struct ProxierHealth {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProxyHealth {
+pub struct ProxyHealth {
     last_updated: String,
     current_time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_eligible: Option<bool>,
-    healthy: bool,
+    pub healthy: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     status: BTreeMap<String, ProxierHealth>,
+}
+
+impl ProxyHealth {
+    /// A `ProxyHealth` carrying only `healthy`, as upstream's
+    /// `fakeProxyHealthChecker.Health` builds (healthcheck_test.go:143-146).
+    #[cfg(test)]
+    pub(crate) fn for_test(healthy: bool) -> Self {
+        Self {
+            last_updated: String::new(),
+            current_time: String::new(),
+            node_eligible: None,
+            healthy,
+            status: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -93,7 +108,7 @@ impl ProxyHealthServer {
         self.state.lock().expect("proxy health lock poisoned").node = node;
     }
 
-    fn health(&self) -> ProxyHealth {
+    pub(crate) fn health(&self) -> ProxyHealth {
         let state = self.state.lock().expect("proxy health lock poisoned");
         let now = (self.clock)();
         // Upstream iterates lastUpdatedMap, even when queuedMap contains an
