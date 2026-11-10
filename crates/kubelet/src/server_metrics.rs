@@ -72,6 +72,24 @@ pub static HTTP_INFLIGHT_REQUESTS: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("valid http inflight gauge definition")
 });
 
+/// `GracefulShutdownStartTime` (pkg/kubelet/metrics/metrics.go:790-798).
+pub static GRACEFUL_SHUTDOWN_START_TIME: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    prometheus::Gauge::with_opts(Opts::new(
+        format!("{KUBELET_SUBSYSTEM}_graceful_shutdown_start_time_seconds"),
+        "[ALPHA] Last graceful shutdown start time since unix epoch in seconds",
+    ))
+    .expect("valid graceful shutdown start time gauge definition")
+});
+
+/// `GracefulShutdownEndTime` (pkg/kubelet/metrics/metrics.go:800-808).
+pub static GRACEFUL_SHUTDOWN_END_TIME: LazyLock<prometheus::Gauge> = LazyLock::new(|| {
+    prometheus::Gauge::with_opts(Opts::new(
+        format!("{KUBELET_SUBSYSTEM}_graceful_shutdown_end_time_seconds"),
+        "[ALPHA] Last graceful shutdown end time since unix epoch in seconds",
+    ))
+    .expect("valid graceful shutdown end time gauge definition")
+});
+
 static REGISTER_METRICS: Once = Once::new();
 
 /// `Register` (`metrics.go:84-91`): `registerMetrics.Do(...)` over the same
@@ -89,6 +107,17 @@ pub fn register() {
         prometheus::default_registry()
             .register(Box::new(VOLUME_STAT_CAL_DURATION.clone()))
             .expect("volume stat histogram registered once");
+        // metrics.go:1281-1285.
+        if rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::GracefulNodeShutdown,
+        ) && rusternetes_common::feature_gates::enabled(
+            rusternetes_common::feature_gates::Feature::GracefulNodeShutdownBasedOnPodPriority,
+        ) {
+            r.register(Box::new(GRACEFUL_SHUTDOWN_START_TIME.clone()))
+                .expect("graceful shutdown start gauge registered once");
+            r.register(Box::new(GRACEFUL_SHUTDOWN_END_TIME.clone()))
+                .expect("graceful shutdown end gauge registered once");
+        }
     });
 }
 
