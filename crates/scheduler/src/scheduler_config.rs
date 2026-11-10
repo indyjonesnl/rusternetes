@@ -812,7 +812,11 @@ pub fn volume_binding_args_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
 ) -> Result<VolumeBindingArgs, String> {
-    let (resolved, _) = resolve_profiles(doc, storage_capacity_scoring)?;
+    let (resolved, _) = resolve_profiles(
+        doc,
+        storage_capacity_scoring,
+        &crate::framework_runtime::Registry::in_tree(),
+    )?;
     let (_, args) = resolved
         .into_iter()
         .next()
@@ -827,8 +831,26 @@ pub fn profiles_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
 ) -> Result<crate::profile::Map, String> {
-    let (resolved, global_percentage) = resolve_profiles(doc, storage_capacity_scoring)?;
-    let mut m = crate::profile::Map::new_map(resolved.into_iter().map(|(p, _)| p).collect())?;
+    profiles_from_config_with_registry(
+        doc,
+        storage_capacity_scoring,
+        &crate::framework_runtime::Registry::in_tree(),
+    )
+}
+
+/// [`profiles_from_config`] over `registry`, the in-tree registry merged with
+/// the embedder's out-of-tree one (`scheduler.New` with
+/// `WithFrameworkOutOfTreeRegistry`, scheduler.go).
+pub fn profiles_from_config_with_registry(
+    doc: &str,
+    storage_capacity_scoring: bool,
+    registry: &crate::framework_runtime::Registry,
+) -> Result<crate::profile::Map, String> {
+    let (resolved, global_percentage) = resolve_profiles(doc, storage_capacity_scoring, registry)?;
+    let mut m = crate::profile::Map::new_map_with_registry(
+        resolved.into_iter().map(|(p, _)| p).collect(),
+        registry,
+    )?;
     m.percentage_of_nodes_to_score = global_percentage;
     Ok(m)
 }
@@ -841,6 +863,7 @@ pub fn profiles_from_config(
 fn resolve_profiles(
     doc: &str,
     storage_capacity_scoring: bool,
+    registry: &crate::framework_runtime::Registry,
 ) -> Result<(Vec<(crate::profile::Profile, VolumeBindingArgs)>, i32), String> {
     let mut cfg: KubeSchedulerConfiguration =
         serde_yaml::from_str(doc).map_err(|e| format!("invalid scheduler config: {e}"))?;
@@ -882,6 +905,14 @@ fn resolve_profiles(
         let mut p = crate::profile::Profile::named(&name).with_volume_binding_args(&args);
         p.plugins = Some(plugins);
         p.plugin_config_names = plugin_config_names;
+        p.plugin_args = profile
+            .plugin_config
+            .iter()
+            .filter_map(|pc| {
+                let args = serde_json::to_value(pc.args.as_ref()?).ok()?;
+                Some((pc.name.clone(), args))
+            })
+            .collect();
         p.percentage_of_nodes_to_score = profile.percentage_of_nodes_to_score;
         // Plugin args consumed at runtime (`New*` constructors): the
         // validated, defaulted args of the profile's pluginConfig entries.
@@ -940,7 +971,7 @@ fn resolve_profiles(
         // The queue sort plugin of the resolved framework; `Map::new_map`
         // reports a framework that fails to build.
         let queue_sort = crate::framework_runtime::new_framework(
-            &crate::framework_runtime::Registry::in_tree(),
+            registry,
             &crate::framework_runtime::ProfileSpec {
                 scheduler_name: &name,
                 plugins: p.plugins.as_ref(),
@@ -953,6 +984,7 @@ fn resolve_profiles(
                 pod_topology_spread: Some(&p.pod_topology_spread),
                 volume_shape: Some(&p.volume_shape),
                 fit_ignored: Some(&p.fit_ignored),
+                plugin_args: Some(&p.plugin_args),
             },
         )
         .ok()

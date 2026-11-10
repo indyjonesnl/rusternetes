@@ -376,11 +376,81 @@ fn merge_plugin_set(default_set: &PluginSet, custom_set: &PluginSet) -> PluginSe
 // Registry (plugins/registry.go NewInTreeRegistry)
 // ---------------------------------------------------------------------------
 
+/// The plugin a [`PluginFactory`] builds: one object per extension point the
+/// plugin implements (Go returns one `fwk.Plugin` and type-asserts it per
+/// extension point, `updatePluginList`; Rust has no such downcast, so the
+/// factory hands the framework one trait object per point).
+#[derive(Clone, Default)]
+pub struct PluginInstance {
+    pub pre_filter: Option<Arc<dyn PreFilterPlugin>>,
+    pub filter: Option<Arc<dyn FilterPlugin>>,
+    pub pre_score: Option<Arc<dyn PreScorePlugin>>,
+    pub score: Option<Arc<dyn ScorePlugin>>,
+    pub reserve: Option<Arc<dyn ReservePlugin>>,
+    pub pre_bind: Option<Arc<dyn PreBindPlugin>>,
+    pub permit: Option<Arc<dyn PermitPlugin>>,
+    pub post_bind: Option<Arc<dyn PostBindPlugin>>,
+    pub bind: Option<Arc<dyn BindPlugin>>,
+}
+
+impl PluginInstance {
+    /// Whether an instance has a slot for `ep`.
+    fn can_carry(&self, ep: ExtensionPoint) -> bool {
+        matches!(
+            ep,
+            ExtensionPoint::PreFilter
+                | ExtensionPoint::Filter
+                | ExtensionPoint::PreScore
+                | ExtensionPoint::Score
+                | ExtensionPoint::Reserve
+                | ExtensionPoint::PreBind
+                | ExtensionPoint::Permit
+                | ExtensionPoint::PostBind
+                | ExtensionPoint::Bind
+        )
+    }
+
+    fn implements(&self, ep: ExtensionPoint) -> bool {
+        match ep {
+            ExtensionPoint::PreFilter => self.pre_filter.is_some(),
+            ExtensionPoint::Filter => self.filter.is_some(),
+            ExtensionPoint::PreScore => self.pre_score.is_some(),
+            ExtensionPoint::Score => self.score.is_some(),
+            ExtensionPoint::Reserve => self.reserve.is_some(),
+            ExtensionPoint::PreBind => self.pre_bind.is_some(),
+            ExtensionPoint::Permit => self.permit.is_some(),
+            ExtensionPoint::PostBind => self.post_bind.is_some(),
+            ExtensionPoint::Bind => self.bind.is_some(),
+            _ => false,
+        }
+    }
+}
+
+/// `runtime.PluginFactory` (registry.go): builds a plugin from its
+/// `pluginConfig` args (`None` when the profile has no entry for it).
+/// Deviation: upstream also passes the `fwk.Handle`; Rusternetes plugin
+/// objects receive their [`Handle`] per call instead.
+pub type PluginFactory =
+    Arc<dyn Fn(Option<&serde_json::Value>) -> Result<PluginInstance, String> + Send + Sync>;
+
 /// `runtime.Registry`: plugin name -> the extension points the plugin
-/// implements (what Go checks with `reflect.Type.Implements`).
-#[derive(Debug, Clone, Default)]
+/// implements (what Go checks with `reflect.Type.Implements`), plus the
+/// factories of the plugins registered out of tree
+/// (`WithFrameworkOutOfTreeRegistry`). In-tree plugins are built by
+/// `crate::in_tree`'s `new_*_plugin` constructors.
+#[derive(Clone, Default)]
 pub struct Registry {
     pub plugins: HashMap<String, HashSet<ExtensionPoint>>,
+    factories: HashMap<String, PluginFactory>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("plugins", &self.plugins)
+            .field("factories", &self.factories.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Registry {
@@ -447,11 +517,36 @@ impl Registry {
         Ok(())
     }
 
+    /// `Registry.Register` with a factory: add an out-of-tree plugin whose
+    /// objects come from `factory` (`WithFrameworkOutOfTreeRegistry`). The
+    /// extension points must be ones a [`PluginInstance`] can carry; QueueSort,
+    /// PreEnqueue and PostFilter plugins are not pluggable out of tree yet.
+    pub fn register_factory(
+        &mut self,
+        name: &str,
+        points: &[ExtensionPoint],
+        factory: PluginFactory,
+    ) -> Result<(), String> {
+        if let Some(ep) = points
+            .iter()
+            .find(|ep| !PluginInstance::default().can_carry(**ep))
+        {
+            return Err(format!(
+                "plugin {name} cannot be registered out of tree at {}",
+                ep.interface_name()
+            ));
+        }
+        self.register(name, points)?;
+        self.factories.insert(name.to_string(), factory);
+        Ok(())
+    }
+
     /// `Registry.Unregister`: remove a plugin, or fail if none has that name.
     pub fn unregister(&mut self, name: &str) -> Result<(), String> {
         if self.plugins.remove(name).is_none() {
             return Err(format!("no plugin named {name} exists"));
         }
+        self.factories.remove(name);
         Ok(())
     }
 
@@ -466,6 +561,9 @@ impl Registry {
                 return Err(format!("a plugin named {name} already exists"));
             }
             self.plugins.insert(name.clone(), points.clone());
+            if let Some(factory) = other.factories.get(name) {
+                self.factories.insert(name.clone(), factory.clone());
+            }
         }
         Ok(())
     }
@@ -509,6 +607,9 @@ pub struct ProfileSpec<'a> {
     pub fit_ignored: Option<&'a crate::in_tree::FitIgnoredResources>,
     /// `VolumeBindingArgs.Shape`, handed to the VolumeBinding score plugin.
     pub volume_shape: Option<&'a [crate::volume_binding::FunctionShapePoint]>,
+    /// `profile.PluginConfig[].Args` by plugin name, handed to the out-of-tree
+    /// plugin factories (`pluginConfig[name]`, framework.go:340-345,384).
+    pub plugin_args: Option<&'a HashMap<String, serde_json::Value>>,
 }
 
 /// `maxTimeout` (framework.go:52): the longest a Permit plugin may make a pod
@@ -1629,48 +1730,108 @@ pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framewor
             ));
         }
     }
+    // Instantiate the out-of-tree plugins the profile needs, once per name
+    // (framework.go:376-393: `factory(ctx, args, f)`, "initializing plugin
+    // %q"); Go ranges a map, so sort for a stable error order.
+    let mut external: HashMap<String, PluginInstance> = HashMap::new();
+    {
+        let mut names: Vec<&str> = plugins_map
+            .keys()
+            .copied()
+            .filter(|n| r.factories.contains_key(*n))
+            .collect();
+        names.sort_unstable();
+        for name in names {
+            let args = profile.plugin_args.and_then(|m| m.get(name));
+            let instance = (r.factories[name])(args)
+                .map_err(|e| format!("initializing plugin {name:?}: {e}"))?;
+            for ep in &plugins_map[name].clone() {
+                if !instance.implements(*ep) {
+                    return Err(format!(
+                        "initializing plugin {name:?}: registered at {} but the plugin does not implement it",
+                        ep.interface_name()
+                    ));
+                }
+            }
+            external.insert(name.to_string(), instance);
+        }
+    }
+    let ext = |name: &str| external.get(name);
     // Instantiate the Filter plugins that are objects, in list order.
     f.filter_plugin_objects = FilterPluginObjects(
         f.plugins_at(ExtensionPoint::Filter)
             .iter()
-            .filter_map(|name| crate::in_tree::new_filter_plugin(name, &plugin_args(profile)))
+            .filter_map(|name| {
+                crate::in_tree::new_filter_plugin(name, &plugin_args(profile))
+                    .or_else(|| ext(name).and_then(|p| p.filter.clone()))
+            })
             .collect(),
     );
     // The PreFilter plugins that are objects, in list order.
     f.pre_filter_plugin_objects = PreFilterPluginObjects(
         f.plugins_at(ExtensionPoint::PreFilter)
             .iter()
-            .filter_map(|name| crate::in_tree::new_pre_filter_plugin(name, &plugin_args(profile)))
+            .filter_map(|name| {
+                crate::in_tree::new_pre_filter_plugin(name, &plugin_args(profile))
+                    .or_else(|| ext(name).and_then(|p| p.pre_filter.clone()))
+            })
             .collect(),
     );
     f.pre_score_plugin_objects = PreScorePluginObjects(
         f.plugins_at(ExtensionPoint::PreScore)
             .iter()
-            .filter_map(|name| crate::in_tree::new_pre_score_plugin(name, &plugin_args(profile)))
+            .filter_map(|name| {
+                crate::in_tree::new_pre_score_plugin(name, &plugin_args(profile))
+                    .or_else(|| ext(name).and_then(|p| p.pre_score.clone()))
+            })
             .collect(),
     );
     f.score_plugin_objects = ScorePluginObjects(
         f.plugins_at(ExtensionPoint::Score)
             .iter()
-            .filter_map(|name| crate::in_tree::new_score_plugin(name, &plugin_args(profile)))
+            .filter_map(|name| {
+                crate::in_tree::new_score_plugin(name, &plugin_args(profile))
+                    .or_else(|| ext(name).and_then(|p| p.score.clone()))
+            })
             .collect(),
     );
     f.reserve_plugin_objects = ReservePluginObjects(
         f.plugins_at(ExtensionPoint::Reserve)
             .iter()
-            .filter_map(|name| crate::in_tree::new_reserve_plugin(name))
+            .filter_map(|name| {
+                crate::in_tree::new_reserve_plugin(name)
+                    .or_else(|| ext(name).and_then(|p| p.reserve.clone()))
+            })
             .collect(),
     );
     f.pre_bind_plugin_objects = PreBindPluginObjects(
         f.plugins_at(ExtensionPoint::PreBind)
             .iter()
-            .filter_map(|name| crate::in_tree::new_pre_bind_plugin(name))
+            .filter_map(|name| {
+                crate::in_tree::new_pre_bind_plugin(name)
+                    .or_else(|| ext(name).and_then(|p| p.pre_bind.clone()))
+            })
             .collect(),
     );
     f.bind_plugin_objects = BindPluginObjects(
         f.plugins_at(ExtensionPoint::Bind)
             .iter()
-            .filter_map(|name| crate::in_tree::new_bind_plugin(name))
+            .filter_map(|name| {
+                crate::in_tree::new_bind_plugin(name)
+                    .or_else(|| ext(name).and_then(|p| p.bind.clone()))
+            })
+            .collect(),
+    );
+    f.permit_plugin_objects = PermitPluginObjects(
+        f.plugins_at(ExtensionPoint::Permit)
+            .iter()
+            .filter_map(|name| ext(name).and_then(|p| p.permit.clone()))
+            .collect(),
+    );
+    f.post_bind_plugin_objects = PostBindPluginObjects(
+        f.plugins_at(ExtensionPoint::PostBind)
+            .iter()
+            .filter_map(|name| ext(name).and_then(|p| p.post_bind.clone()))
             .collect(),
     );
     f.compute_batchable_plugins();
