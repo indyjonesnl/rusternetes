@@ -1056,18 +1056,22 @@ async fn main() -> Result<()> {
         if let Some((acceptor, _ca_reload)) = mtls {
             let mut server = axum_server::bind(addr).acceptor(acceptor);
             apply_http2_tuning!(server);
-            server.serve(app.into_make_service()).await?;
+            server
+                .serve(rusternetes_api_server::serve_service(app))
+                .await?;
         } else {
             let mut server =
                 axum_server::bind_rustls(addr, plain_config.expect("set when no client CA"));
             apply_http2_tuning!(server);
-            server.serve(app.into_make_service()).await?;
+            server
+                .serve(rusternetes_api_server::serve_service(app))
+                .await?;
         }
     } else {
         info!("TLS disabled - starting HTTP server (not recommended for production)");
         info!("API Server listening on {}", args.bind_address);
         let listener = tokio::net::TcpListener::bind(&args.bind_address).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, rusternetes_api_server::serve_service(app)).await?;
     }
 
     Ok(())

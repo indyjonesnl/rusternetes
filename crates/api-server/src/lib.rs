@@ -437,6 +437,19 @@ pub fn log_openid_metadata_status(token_manager: &TokenManager) {
     }
 }
 
+/// The make-service every api-server listener serves the router with: it
+/// makes the peer address available to handlers as
+/// `ConnectInfo<SocketAddr>`, the analogue of `http.Request.RemoteAddr`
+/// (`net/http` fills it per connection). Consumers: the aggregator proxy's
+/// `X-Forwarded-For` (`upgradeaware.go` `ServeHTTP`/`tryUpgrade` append the
+/// client IP when `req.RemoteAddr` parses).
+pub fn serve_service(
+    app: axum::Router,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, std::net::SocketAddr>
+{
+    app.into_make_service_with_connect_info::<std::net::SocketAddr>()
+}
+
 /// The process-wide options both entry points (this crate's `run` and the
 /// standalone `api-server` binary) install before serving, so a flag cannot
 /// take effect in one and be ignored in the other:
@@ -675,7 +688,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
                 .initial_stream_window_size(256 * 1024)
                 .initial_connection_window_size(256 * 1024 * 100)
                 .max_concurrent_streams(250);
-            server.serve(app.into_make_service()).await?;
+            server.serve(serve_service(app)).await?;
         } else {
             let mut server =
                 axum_server::bind_rustls(addr, plain_config.expect("set when no client CA"));
@@ -685,7 +698,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
                 .initial_stream_window_size(256 * 1024)
                 .initial_connection_window_size(256 * 1024 * 100)
                 .max_concurrent_streams(250);
-            server.serve(app.into_make_service()).await?;
+            server.serve(serve_service(app)).await?;
         }
     } else {
         info!(
@@ -693,7 +706,7 @@ pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> a
             config.bind_address
         );
         let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, serve_service(app)).await?;
     }
 
     Ok(())

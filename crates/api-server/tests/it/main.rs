@@ -345,6 +345,7 @@ mod secret_consumption_test;
 mod secret_generic_store_test;
 mod secret_handler_test;
 mod secret_update_type_validation_test;
+mod serve_connect_info_test;
 mod service_cluster_ip_allocation_test;
 mod service_create_init_ip_fields_test;
 mod service_dual_stack_test;
