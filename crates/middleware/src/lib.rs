@@ -1,4 +1,5 @@
 pub mod cbor;
+pub mod negotiated_error;
 pub mod request_header;
 pub mod response;
 pub mod secure_serving;

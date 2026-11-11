@@ -19,19 +19,22 @@
 //! request as a non-resource request with `Path = URL.Path` and
 //! `Verb = lower(Method)`; that is all [`authorizer_attributes`] needs.
 //!
-//! Deliberate reductions: responses are always JSON (the negotiated YAML and
-//! protobuf encodings of `ErrorNegotiated` are not produced),
-//! `WithHTTPLogging` (V(3) request logs) is not ported, and neither is the
+//! The 401 and 403 bodies are written by `ErrorNegotiated`
+//! ([`crate::negotiated_error`]): json / yaml / protobuf per the request's
+//! `Accept` header (#3532).
+//!
+//! Not ported yet: `WithHTTPLogging` (V(3) request logs) and the
 //! `UnauthenticatedHTTP2DOSMitigation` `Connection: close` for HTTP/2.
 
 use super::authn::{
     clear_authentication_headers, AuthRequest, RequestAuthenticator, ALL_UNAUTHENTICATED,
     ANONYMOUS_USER,
 };
+use crate::negotiated_error::{error_negotiated, respond_with_error};
 use crate::PeerCertificates;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::Response;
 use axum::Router;
@@ -39,6 +42,7 @@ use futures::FutureExt;
 use rusternetes_common::auth::UserInfo;
 use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
 use rusternetes_common::error::Error;
+use rusternetes_common::types::Status;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -157,14 +161,10 @@ pub fn is_anonymous_user(u: &UserInfo) -> bool {
     u.username == ANONYMOUS_USER || u.groups.iter().any(|g| g == ALL_UNAUTHENTICATED)
 }
 
-fn json_response(code: u16, body: &serde_json::Value, extra: &[(&str, &str)]) -> Response {
-    let mut b = Response::builder()
-        .status(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-        .header("content-type", "application/json");
-    for (k, v) in extra {
-        b = b.header(*k, *v);
-    }
-    b.body(Body::from(format!("{body}\n"))).unwrap()
+/// The `metav1.Status` a `*_status` helper built, as the typed object
+/// `ErrorNegotiated` serializes.
+fn to_status(body: serde_json::Value) -> Status {
+    serde_json::from_value(body).expect("a Status built by this module deserializes")
 }
 
 /// `http.Error`.
@@ -194,6 +194,8 @@ pub async fn authentication_middleware(
 ) -> Response {
     let (mut parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
+    let query = parts.uri.query().map(str::to_owned);
+    let request_headers = parts.headers.clone();
     let peer_certs: Vec<Vec<u8>> = parts
         .extensions
         .get::<PeerCertificates>()
@@ -212,7 +214,13 @@ pub async fn authentication_middleware(
             if let Err(e) = other {
                 tracing::error!("Unable to authenticate the request: {e}");
             }
-            return json_response(401, &unauthorized_status(), &[]);
+            // `Unauthorized` (authentication.go:127-140):
+            // `ErrorNegotiated(NewUnauthorized("Unauthorized"), ...)`.
+            return error_negotiated(
+                &to_status(unauthorized_status()),
+                &request_headers,
+                query.as_deref(),
+            );
         }
     };
     // authorization header is not required anymore in case of a successful authentication.
@@ -236,6 +244,8 @@ pub async fn authorization_middleware(
     next: Next,
 ) -> Response {
     let user = req.extensions().get::<AuthenticatedUser>().cloned();
+    let headers: HeaderMap = req.headers().clone();
+    let query = req.uri().query().map(str::to_owned);
     let attributes =
         authorizer_attributes(user.as_ref().map(|u| &u.0), req.method(), req.uri().path());
     match authz.authorize(&attributes).await {
@@ -244,10 +254,11 @@ pub async fn authorization_middleware(
         Ok(Decision::Allow) => next.run(req).await,
         Ok(Decision::Deny(reason)) => {
             tracing::debug!("Forbidden: URI {} reason {reason}", req.uri());
-            json_response(
-                403,
-                &forbidden_status(&attributes, &reason),
-                &[("x-content-type-options", "nosniff")],
+            // `Forbidden` (errors.go:36-38) -> `RespondWithError`.
+            respond_with_error(
+                &to_status(forbidden_status(&attributes, &reason)),
+                &headers,
+                query.as_deref(),
             )
         }
         Err(e) => {

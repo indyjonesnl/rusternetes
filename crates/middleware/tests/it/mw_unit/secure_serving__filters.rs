@@ -353,6 +353,89 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
+    fn get_req_accept(path: &str, accept: &str) -> Request {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("accept", accept)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // errors.go:36-43 (`Forbidden` -> `RespondWithError` -> `ErrorNegotiated`):
+    // the 403 body follows the request's Accept header.
+    #[tokio::test]
+    async fn authorization_denial_is_negotiated() {
+        let make = || {
+            let authz: Arc<dyn Authorizer> = Arc::new(Authz(|_a: &RequestAttributes| {
+                Ok(Decision::Deny("no rule".into()))
+            }));
+            build_handler_chain(
+                app(Arc::new(AtomicUsize::new(0))),
+                Some(authz),
+                Some(allow_authn()),
+            )
+        };
+        let (status, headers, body) =
+            call(make(), get_req_accept("/metrics", "application/yaml")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(headers["content-type"], "application/yaml");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let v: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(v["reason"].as_str(), Some("Forbidden"));
+        assert_eq!(v["code"].as_u64(), Some(403));
+
+        let resp = make()
+            .oneshot(get_req_accept(
+                "/metrics",
+                "application/vnd.kubernetes.protobuf",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()["content-type"],
+            "application/vnd.kubernetes.protobuf"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..4], b"k8s\0");
+    }
+
+    // authentication.go:127-140 (`Unauthorized` -> `ErrorNegotiated`).
+    #[tokio::test]
+    async fn unauthorized_is_negotiated() {
+        let make = || {
+            let authn: Arc<dyn RequestAuthenticator> =
+                Arc::new(Authn(|_r: &mut AuthRequest<'_>| Ok(None)));
+            build_handler_chain(app(Arc::new(AtomicUsize::new(0))), None, Some(authn))
+        };
+        let (status, headers, body) =
+            call(make(), get_req_accept("/metrics", "application/yaml")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers["content-type"], "application/yaml");
+        // `Unauthorized` goes straight to `ErrorNegotiated`: no nosniff.
+        assert!(!headers.contains_key("x-content-type-options"));
+        let v: serde_yaml::Value = serde_yaml::from_str(&body).unwrap();
+        assert_eq!(v["reason"].as_str(), Some("Unauthorized"));
+        assert_eq!(v["message"].as_str(), Some("Unauthorized"));
+
+        let resp = make()
+            .oneshot(get_req_accept(
+                "/metrics",
+                "application/vnd.kubernetes.protobuf",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..4], b"k8s\0");
+
+        // An unnegotiable Accept still yields the 401 as raw JSON (writers.go:335-340).
+        let (status, headers, _b) = call(make(), get_req_accept("/metrics", "text/html")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers["content-type"], "application/json");
+    }
+
     // authorization.go:84-89: an error is a 500 `Internal Server Error: "<uri>": <err>`.
     #[tokio::test]
     async fn authorization_error_is_an_internal_error() {
