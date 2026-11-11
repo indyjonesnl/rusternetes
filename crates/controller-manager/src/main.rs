@@ -52,7 +52,6 @@ use controllers::{
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
 };
-use rusternetes_common::cloud_provider::CloudProvider;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -334,17 +333,16 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     pv_recycler_timeout_increment_hostpath: i32,
 
-    /// Cloud provider (aws, gcp, azure, or none)
+    /// Upstream `--cloud-provider` (`cloud-provider/options/cloudprovider.go:37`).
+    /// In-tree providers are disabled since v1.31 (KEP-2395): only `external`
+    /// (or empty) is accepted, anything else is rejected at startup
+    /// (`cmd/kube-controller-manager/app/options/options.go:480-483`).
     #[arg(long)]
     cloud_provider: Option<String>,
 
-    /// Cluster name for cloud provider resources
+    /// Cluster name (`--cluster-name`).
     #[arg(long, default_value = "rusternetes")]
     cluster_name: String,
-
-    /// Cloud provider region
-    #[arg(long)]
-    cloud_region: Option<String>,
 
     /// Enable leader election (for HA)
     #[arg(long)]
@@ -976,6 +974,14 @@ async fn main() -> Result<()> {
     for flag in args.ignored_upstream_flags() {
         warn!("{flag} is accepted for upstream argv compatibility and ignored (not implemented)");
     }
+    if let Some(name) = args.cloud_provider.as_deref() {
+        // options.go:480-483 `cloudprovider.ErrorForDisabledProvider`.
+        if !name.is_empty() && name != "external" {
+            anyhow::bail!(
+                "cloud provider {name:?} was specified, but built-in cloud providers are disabled. Please set --cloud-provider=external and migrate to an external cloud provider"
+            );
+        }
+    }
     let le = args
         .leader_election_settings()
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -1021,58 +1027,6 @@ async fn main() -> Result<()> {
         }
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
-
-    // Initialize cloud provider if configured
-    #[cfg(feature = "cloud-providers")]
-    let cloud_provider: Option<Arc<dyn CloudProvider>> = {
-        if let Some(provider_str) = &args.cloud_provider {
-            use rusternetes_common::cloud_provider::CloudProviderType;
-
-            let provider_type = CloudProviderType::from_str(provider_str)
-                .ok_or_else(|| anyhow::anyhow!("Invalid cloud provider: {}", provider_str))?;
-
-            if provider_type != CloudProviderType::None {
-                let mut config = std::collections::HashMap::new();
-                if let Some(region) = &args.cloud_region {
-                    config.insert("region".to_string(), region.clone());
-                }
-
-                info!("Initializing {} cloud provider", provider_type.as_str());
-                let provider = rusternetes_cloud_providers::create_provider(
-                    provider_type,
-                    args.cluster_name.clone(),
-                    config,
-                )
-                .await?;
-                Some(provider)
-            } else {
-                None
-            }
-        } else {
-            // Auto-detect cloud provider
-            let detected = rusternetes_cloud_providers::detect_cloud_provider();
-            if detected != rusternetes_common::cloud_provider::CloudProviderType::None {
-                info!("Auto-detected cloud provider: {}", detected.as_str());
-                let mut config = std::collections::HashMap::new();
-                if let Some(region) = &args.cloud_region {
-                    config.insert("region".to_string(), region.clone());
-                }
-                let provider = rusternetes_cloud_providers::create_provider(
-                    detected,
-                    args.cluster_name.clone(),
-                    config,
-                )
-                .await
-                .ok();
-                provider
-            } else {
-                None
-            }
-        }
-    };
-
-    #[cfg(not(feature = "cloud-providers"))]
-    let cloud_provider: Option<Arc<dyn CloudProvider>> = None;
 
     // Initialize leader election if enabled
     let leader_elector = if le.enabled {
@@ -1191,7 +1145,6 @@ async fn main() -> Result<()> {
     // Start LoadBalancer controller
     let lb_controller = Arc::new(LoadBalancerController::new(
         storage.clone(),
-        cloud_provider.clone(),
         args.cluster_name.clone(),
         args.sync_interval,
     ));

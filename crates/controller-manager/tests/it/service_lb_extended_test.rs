@@ -2,14 +2,13 @@
 //!
 //! Mirror layer for upstream `kubernetes/test/e2e/network/service.go` cases
 //! beyond the basic ClusterIP/NodePort/LoadBalancer happy paths covered by
-//! `service_controller_test.rs`, `service_lb_endpoints_test.rs`, and
-//! `loadbalancer_status_lifecycle_test.rs`.
+//! `service_controller_test.rs` and `service_lb_endpoints_test.rs`.
 //!
 //! Tests in this file fall into two buckets:
 //!
 //!   1. Behavior that should already work and is asserted directly
 //!      (publishNotReadyAddresses end-to-end via the EndpointsController,
-//!      LoadBalancer external IP assignment via a stub CloudProvider, and
+//!      LoadBalancer ingress from registered node addresses, and
 //!      a single-stack IPv4 baseline that does not depend on dual-stack
 //!      family allocation).
 //!
@@ -20,11 +19,6 @@
 //!      tests with a one-line reason so they can be unignored as each
 //!      feature lands.
 
-use async_trait::async_trait;
-use rusternetes_common::cloud_provider::{
-    CloudProvider, LoadBalancerIngress as CloudIngress, LoadBalancerService as CloudLBService,
-    LoadBalancerStatus as CloudLBStatus,
-};
 use rusternetes_common::resources::{
     Container, ContainerStatus, Endpoints, IPFamily, IPFamilyPolicy, IntOrString, Node,
     NodeAddress, NodeStatus, Pod, PodCondition, PodSpec, PodStatus, Service,
@@ -235,48 +229,6 @@ fn make_pod(
     }
 }
 
-/// Cloud provider that records the most recent `ensure_load_balancer` call
-/// and returns a deterministic ingress IP plus the requested node-port so
-/// callers can assert end-to-end propagation into `status.loadBalancer`.
-struct ExternalIpCloudProvider {
-    ip: String,
-}
-
-#[async_trait]
-impl CloudProvider for ExternalIpCloudProvider {
-    async fn ensure_load_balancer(
-        &self,
-        _service: &CloudLBService,
-    ) -> rusternetes_common::Result<CloudLBStatus> {
-        Ok(CloudLBStatus {
-            ingress: vec![CloudIngress {
-                ip: Some(self.ip.clone()),
-                hostname: None,
-            }],
-        })
-    }
-
-    async fn delete_load_balancer(
-        &self,
-        _service_namespace: &str,
-        _service_name: &str,
-    ) -> rusternetes_common::Result<()> {
-        Ok(())
-    }
-
-    async fn get_load_balancer_status(
-        &self,
-        _service_namespace: &str,
-        _service_name: &str,
-    ) -> rusternetes_common::Result<Option<CloudLBStatus>> {
-        Ok(None)
-    }
-
-    fn name(&self) -> &str {
-        "external-ip-stub"
-    }
-}
-
 // ---------------------------------------------------------------------------
 // publishNotReadyAddresses — passes today
 // ---------------------------------------------------------------------------
@@ -423,59 +375,15 @@ async fn test_service_default_excludes_not_ready_pod_from_ready_addresses() {
 // LoadBalancer external IP assignment — passes today
 // ---------------------------------------------------------------------------
 
-/// Upstream `e2e/network/service.go` "should be able to create LoadBalancer
-/// Service with external IPs": a cloud provider returning an ingress IP
-/// must end up in `status.loadBalancer.ingress[0].ip`, and downgrading to
-/// ClusterIP-only must not leave that status around (the LB controller
-/// only touches LB-type services).
-#[tokio::test]
-async fn test_loadbalancer_external_ip_assignment_propagates_to_status() {
-    let storage = setup_test().await;
-    let provider: Arc<dyn CloudProvider> = Arc::new(ExternalIpCloudProvider {
-        ip: "198.51.100.7".to_string(),
-    });
-    let controller = LoadBalancerController::new(
-        storage.clone(),
-        Some(provider),
-        "rusternetes-test".to_string(),
-        30,
-    );
-
-    let mut svc = make_service("lb-external-ip", "default", HashMap::new());
-    svc.spec.service_type = Some(ServiceType::LoadBalancer);
-    svc.spec.cluster_ip = Some("10.96.10.10".to_string());
-    svc.spec.ports[0].node_port = Some(31080);
-
-    let key = build_key("services", Some("default"), "lb-external-ip");
-    storage.create(&key, &svc).await.unwrap();
-
-    controller.reconcile_all().await.unwrap();
-
-    let after: Service = storage.get(&key).await.unwrap();
-    let lb = after
-        .status
-        .as_ref()
-        .and_then(|s| s.load_balancer.as_ref())
-        .expect("status.loadBalancer must be populated after cloud-provider reconcile");
-    assert_eq!(lb.ingress.len(), 1, "expected one ingress entry");
-    assert_eq!(
-        lb.ingress[0].ip.as_deref(),
-        Some("198.51.100.7"),
-        "ingress IP must come from the cloud provider"
-    );
-}
-
 // ---------------------------------------------------------------------------
-// LoadBalancer + multiple nodes — passes today, ensures the cloud-provider
+// LoadBalancer + multiple nodes — passes today, ensures the controller
 // path consumes node InternalIPs (the data feeding the upstream e2e
 // "should have session affinity work for LoadBalancer service with ESIPP=Local"
 // check-list — without this the controller has no nodes to register).
 // ---------------------------------------------------------------------------
 
-/// Without explicit node addresses, the LB controller may still publish
-/// a stub status (covered by `service_lb_endpoints_test.rs`). This test
-/// asserts the cloud-provider path observes the `InternalIP` from any
-/// registered Node so the cloud provider could target a real backend.
+/// The LB controller publishes the `InternalIP` of a registered Node as
+/// the ingress address (no in-tree cloud provider, as in k3s).
 #[tokio::test]
 async fn test_loadbalancer_assignment_uses_registered_node_internal_ips() {
     let storage = setup_test().await;
@@ -501,15 +409,8 @@ async fn test_loadbalancer_assignment_uses_registered_node_internal_ips() {
         storage.create(&key, &node).await.unwrap();
     }
 
-    let provider: Arc<dyn CloudProvider> = Arc::new(ExternalIpCloudProvider {
-        ip: "198.51.100.8".to_string(),
-    });
-    let controller = LoadBalancerController::new(
-        storage.clone(),
-        Some(provider),
-        "rusternetes-test".to_string(),
-        30,
-    );
+    let controller =
+        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
 
     let mut svc = make_service("lb-with-nodes", "default", HashMap::new());
     svc.spec.service_type = Some(ServiceType::LoadBalancer);
@@ -527,7 +428,14 @@ async fn test_loadbalancer_assignment_uses_registered_node_internal_ips() {
         .as_ref()
         .and_then(|s| s.load_balancer.as_ref())
         .expect("status.loadBalancer populated when nodes are present");
-    assert_eq!(lb.ingress[0].ip.as_deref(), Some("198.51.100.8"));
+    assert!(
+        matches!(
+            lb.ingress[0].ip.as_deref(),
+            Some("10.0.0.11") | Some("10.0.0.12")
+        ),
+        "ingress must be a registered node InternalIP, got {:?}",
+        lb.ingress[0].ip
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -828,20 +736,13 @@ async fn test_service_topology_keys_emit_for_zone_hints() {
 /// every backing pod is `Ready=False`, the controller must either keep
 /// `status.loadBalancer.ingress` empty or surface a Warning Event named
 /// `LoadBalancerSourceUnhealthy`. Neither happens today — the controller
-/// blindly trusts the cloud provider's return value.
+/// trusted a provider's return value (that path is gone).
 #[tokio::test]
 async fn test_loadbalancer_health_check_gates_status_on_endpoint_readiness() {
     let storage = setup_test().await;
     let endpoints_controller = EndpointsController::new(storage.clone());
-    let provider: Arc<dyn CloudProvider> = Arc::new(ExternalIpCloudProvider {
-        ip: "198.51.100.99".to_string(),
-    });
-    let lb_controller = LoadBalancerController::new(
-        storage.clone(),
-        Some(provider),
-        "rusternetes-test".to_string(),
-        30,
-    );
+    let lb_controller =
+        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
 
     let mut selector = HashMap::new();
     selector.insert("app".to_string(), "lb-health".to_string());

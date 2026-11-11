@@ -278,14 +278,11 @@ where
     let mut handles = Vec::new();
 
     // No leader election in all-in-one mode — single instance
-    let cloud_provider: Option<Arc<dyn rusternetes_common::cloud_provider::CloudProvider>> = None;
-
     // Spawn all controllers
     let s = storage_for("LoadBalancer");
     handles.push(tokio::spawn(async move {
         let c = Arc::new(LoadBalancerController::new(
             s,
-            cloud_provider,
             "rusternetes".to_string(),
             interval,
         ));

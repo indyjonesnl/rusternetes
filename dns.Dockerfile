@@ -61,7 +61,6 @@ COPY Cargo.toml Cargo.lock* ./
 # parses every member manifest, so all 19 must be present here.
 COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
-COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
@@ -97,7 +96,7 @@ COPY crates/common/build.rs     crates/common/build.rs
 # Dummy sources so `cargo build` can resolve the workspace before the
 # real source COPY further down.
 RUN set -eux; \
-    for c in client common controller-core storage cloud-providers streamproxy cel-checker csi test_support; do \
+    for c in client common controller-core storage streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -125,7 +124,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cargo clean --profile release-fast \
         -p rusternetes-api-server \
         -p rusternetes-client \
-        -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-cel-checker \
         -p rusternetes-controller-manager \

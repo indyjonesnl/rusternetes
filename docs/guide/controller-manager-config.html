@@ -86,7 +86,6 @@
           <li><a href="authentication.html">Authentication</a></li>
           <li><a href="monitoring.html">Monitoring</a></li>
           <li><a href="troubleshooting.html">Troubleshooting</a></li>
-          <li><a href="cloud-providers.html">Cloud Providers</a></li>
         </ul>
       </div>
 
@@ -160,20 +159,14 @@
           <tr>
             <td><code>--cloud-provider</code></td>
             <td>String</td>
-            <td><em>auto-detected</em></td>
-            <td>Cloud provider: <code>aws</code>, <code>gcp</code>, <code>azure</code>, or <code>none</code></td>
+            <td>&mdash;</td>
+            <td>Empty or <code>external</code>; in-tree providers are not supported (as in upstream v1.31+)</td>
           </tr>
           <tr>
             <td><code>--cluster-name</code></td>
             <td>String</td>
             <td><code>rusternetes</code></td>
-            <td>Cluster name for cloud provider resources</td>
-          </tr>
-          <tr>
-            <td><code>--cloud-region</code></td>
-            <td>String</td>
-            <td>&mdash;</td>
-            <td>Cloud provider region</td>
+            <td>Cluster name</td>
           </tr>
           <tr>
             <td><code>--enable-leader-election</code></td>
@@ -215,12 +208,6 @@
 rusternetes-controller-manager \
   <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span> \
   <span class="flag">--sync-interval</span> <span class="value">5</span>
-
-<span class="comment"># With cloud provider</span>
-rusternetes-controller-manager \
-  <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span> \
-  <span class="flag">--cloud-provider</span> <span class="value">aws</span> \
-  <span class="flag">--cloud-region</span> <span class="value">us-east-1</span>
 
 <span class="comment"># HA with leader election</span>
 rusternetes-controller-manager \
@@ -357,7 +344,7 @@ rusternetes-controller-manager \
           <tr>
             <td>23</td>
             <td><code>LoadBalancer</code></td>
-            <td>Provisions external load balancers via cloud provider</td>
+            <td>Publishes node-address ingress for LoadBalancer Services</td>
           </tr>
           <tr>
             <td>24</td>

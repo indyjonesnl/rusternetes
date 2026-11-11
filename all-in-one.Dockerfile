@@ -28,7 +28,7 @@
 # resolve the workspace; the dummy/real-src blocks only need the crates the
 # all-in-one binary actually compiles. scripts/tests/test-dockerfile-crate-
 # enumeration.sh enforces the manifest block stays complete:
-#   admission-webhook, api-server, client, cloud-providers, common,
+#   admission-webhook, api-server, client, common,
 #   controller-manager, cri, discovery, dns, kubectl, kubelet, kube-proxy,
 #   middleware, protobuf, rusternetes, scheduler, storage,
 #   test_support
@@ -92,7 +92,6 @@ COPY rusternetes/Cargo.toml rusternetes/Cargo.lock* ./rusternetes/
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
 COPY rusternetes/crates/admission-webhook/Cargo.toml  ./rusternetes/crates/admission-webhook/Cargo.toml
 COPY rusternetes/crates/api-server/Cargo.toml         ./rusternetes/crates/api-server/Cargo.toml
-COPY rusternetes/crates/cloud-providers/Cargo.toml    ./rusternetes/crates/cloud-providers/Cargo.toml
 COPY rusternetes/crates/client/Cargo.toml             ./rusternetes/crates/client/Cargo.toml
 COPY rusternetes/crates/common/Cargo.toml             ./rusternetes/crates/common/Cargo.toml
 COPY rusternetes/crates/controller-manager/Cargo.toml ./rusternetes/crates/controller-manager/Cargo.toml
@@ -131,14 +130,14 @@ COPY rusternetes/crates/kubelet/build.rs     ./rusternetes/crates/kubelet/build.
 COPY rusternetes/crates/kubelet/proto        ./rusternetes/crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
-#   - lib only:   common, controller-core, storage, cloud-providers, protobuf,
+#   - lib only:   common, controller-core, storage, protobuf,
 #                 middleware, admission-webhook, discovery, cri
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet,
 #                 kube-proxy, scheduler
 RUN set -eux; \
     cd /build/rusternetes; \
-    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
+    for c in client common controller-core storage protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -179,7 +178,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-admission-webhook \
         -p rusternetes-api-server \
         -p rusternetes-client \
-        -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-cel-checker \
         -p rusternetes-controller-manager \
@@ -205,7 +203,6 @@ COPY rusternetes/crates/admission-webhook/src    ./crates/admission-webhook/src
 COPY rusternetes/crates/api-server/src           ./crates/api-server/src
 COPY rusternetes/crates/api-server/openapi       ./crates/api-server/openapi
 COPY rusternetes/crates/api-server/tests         ./crates/api-server/tests
-COPY rusternetes/crates/cloud-providers/src      ./crates/cloud-providers/src
 COPY rusternetes/crates/client/src               ./crates/client/src
 COPY rusternetes/crates/common/src               ./crates/common/src
 COPY rusternetes/crates/cel-checker/src               ./crates/cel-checker/src

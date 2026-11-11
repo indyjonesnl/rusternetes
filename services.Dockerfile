@@ -60,7 +60,7 @@
 # unique to itself, then break the moment someone changes its source.
 #
 # Current workspace members (Cargo.toml [workspace] members):
-#   api-server, cloud-providers, common, controller-manager, dns,
+#   api-server, common, controller-manager, dns,
 #   kubectl, kubelet, kube-proxy, rusternetes, scheduler,
 #   storage
 
@@ -165,12 +165,11 @@ COPY Cargo.toml Cargo.lock* ./
 
 # CRATE-ENUMERATION (1/3): one COPY per crate's Cargo.toml.
 # Must mirror `[workspace] members` in Cargo.toml.
-# Crates: api-server, cloud-providers, common, controller-manager, dns,
+# Crates: api-server, common, controller-manager, dns,
 #         kubectl, kubelet, kube-proxy, rusternetes, scheduler,
 #         storage
 COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
-COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
@@ -211,13 +210,13 @@ COPY crates/kubelet/proto        crates/kubelet/proto
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate. Lib vs
 # bin choice MUST match each Cargo.toml's [lib] + [[bin]] entries.
-#   - lib only:   common, controller-core, storage, cloud-providers, cri, test_support
+#   - lib only:   common, controller-core, storage, cri, test_support
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, dns, kubelet, kube-proxy,
 #                 scheduler
 # `echo "fn main(){}"` in every main.rs; empty lib.rs is fine.
 RUN set -eux; \
-    for c in client common controller-core storage cloud-providers protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
+    for c in client common controller-core storage protobuf middleware admission-webhook discovery cri streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -268,7 +267,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p rusternetes-admission-webhook \
         -p rusternetes-api-server \
         -p rusternetes-client \
-        -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-cel-checker \
         -p rusternetes-cri \
@@ -300,7 +298,6 @@ COPY crates/admission-webhook/src    crates/admission-webhook/src
 COPY crates/api-server/src           crates/api-server/src
 COPY crates/api-server/openapi       crates/api-server/openapi
 COPY crates/api-server/tests         crates/api-server/tests
-COPY crates/cloud-providers/src      crates/cloud-providers/src
 COPY crates/middleware/src           crates/middleware/src
 COPY crates/protobuf/src             crates/protobuf/src
 COPY crates/client/src               crates/client/src

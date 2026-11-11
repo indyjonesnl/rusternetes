@@ -30,7 +30,6 @@ Rusternetes is a Cargo workspace with 10 crates (216,000+ lines of Rust, 3,100+ 
 | `crates/kube-proxy` | iptables-based service routing (host network mode) |
 | `crates/scheduler` | Pod scheduling with affinity, taints, priority/preemption plugins |
 | `crates/kubectl` | CLI tool |
-| `crates/cloud-providers` | AWS/GCP/Azure integrations |
 | `crates/rusternetes` | All-in-one binary (all components as concurrent tokio tasks) |
 
 ## Build and Test

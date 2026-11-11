@@ -15,7 +15,6 @@ mod cel_cost;
 mod cel_dra;
 mod cel_env;
 mod cel_versions;
-mod cloud_provider;
 mod clusterauthenticationtrust;
 mod compat_version_metrics;
 mod compatibility;

@@ -65,7 +65,7 @@ native Rust binaries:
 | **All-in-one** | `rusternetes` | Every component above as concurrent async tasks in one process, with embedded storage |
 
 Shared resource types, error mapping, and utilities live in the `common` crate;
-storage backends live in `storage`; cloud integrations in `cloud-providers`.
+storage backends live in `storage`.
 
 The same binaries run in every deployment mode — full multi-container cluster,
 SQLite/Redis-backed cluster, or single-process all-in-one. Only the wiring and
@@ -210,9 +210,8 @@ rusternetes-controller-manager [OPTIONS]
 | `--data-dir` | `./data/rusternetes.db` | SQLite path |
 | `--log-level` | `info` | Log level |
 | `--sync-interval` | `5` | Controller sync interval (seconds) |
-| `--cloud-provider` | — | `aws`, `gcp`, `azure`, or none |
-| `--cluster-name` | `rusternetes` | Cluster name for cloud resources |
-| `--cloud-region` | — | Cloud provider region |
+| `--cloud-provider` | — | Empty or `external` (in-tree providers are not supported) |
+| `--cluster-name` | `rusternetes` | Cluster name |
 | `--enable-leader-election` | `false` | Enable leader election (HA) |
 | `--leader-election-identity` | — | Unique identity per instance |
 | `--leader-election-resource-namespace` | `kube-system` | Namespace of the leader-election Lease |
