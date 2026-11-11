@@ -3500,6 +3500,55 @@ mod tests {
         assert_eq!(ready.status, "False");
     }
 
+    /// restartPolicy Never completion keeps the prior kubelet conditions and
+    /// the site's `adjust` marks Ready/ContainersReady False (PodCompleted);
+    /// the phase is the one computed from the exit codes (#3901).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn never_completion_adjusts_ready_conditions() {
+        use rusternetes_kubelet::kubelet::TerminalStatus;
+        use rusternetes_storage::{Storage, StorageBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(StorageBackend::new_memory());
+        let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
+        let mut pod = terminal_test_pod("n4", "uid-n4", Phase::Running);
+        pod.status.as_mut().unwrap().reason = None;
+        pod.status.as_mut().unwrap().message = None;
+        let key = "/registry/pods/default/n4";
+        storage.create(key, &pod).await.unwrap();
+
+        k.publish_terminal_status(
+            &pod,
+            TerminalStatus {
+                phase: Phase::Succeeded,
+                message: Some("Pod completed successfully".to_string()),
+                refresh_init_containers: true,
+                ..Default::default()
+            },
+            |status| {
+                if let Some(ref mut conditions) = status.conditions {
+                    for c in conditions.iter_mut() {
+                        if c.condition_type == "Ready" || c.condition_type == "ContainersReady" {
+                            c.status = "False".to_string();
+                            c.reason = Some("PodCompleted".to_string());
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+
+        let st = storage.get::<Pod>(key).await.unwrap().status.unwrap();
+        assert_eq!(st.phase, Some(Phase::Succeeded));
+        assert_eq!(st.message.as_deref(), Some("Pod completed successfully"));
+        for c in st.conditions.unwrap() {
+            if c.condition_type == "Ready" || c.condition_type == "ContainersReady" {
+                assert_eq!(c.status, "False");
+                assert_eq!(c.reason.as_deref(), Some("PodCompleted"));
+            }
+        }
+    }
+
     /// A completion computed as Succeeded never rewrites a stored Failed pod,
     /// and a recreated same-name pod is not written at all.
     #[tokio::test]

@@ -5254,37 +5254,36 @@ impl Kubelet {
                                     "Pod completed successfully".to_string()
                                 };
 
-                                let key = build_key("pods", Some(namespace), pod_name);
-                                let mut new_pod: Pod = match self.storage.get(&key).await {
-                                    Ok(p) => p,
-                                    _ => pod.clone(),
-                                };
-                                let original = new_pod.clone();
-                                // Refresh init container statuses for terminal pod
-                                let init_container_statuses =
-                                    self.get_init_container_statuses(&new_pod).await;
-                                if let Some(ref mut status) = new_pod.status {
-                                    status.phase = Some(terminal_phase);
-                                    status.message = Some(message);
-                                    status.container_statuses = Some(container_statuses);
-                                    if init_container_statuses.is_some() {
-                                        status.init_container_statuses = init_container_statuses;
-                                    }
-                                    // Update conditions — terminated pod is not Ready
-                                    if let Some(ref mut conditions) = status.conditions {
-                                        for c in conditions.iter_mut() {
-                                            if c.condition_type == "Ready"
-                                                || c.condition_type == "ContainersReady"
-                                            {
-                                                c.status = "False".to_string();
-                                                c.reason = Some("PodCompleted".to_string());
+                                // Refresh init container statuses so completed init containers
+                                // have ready=true in the final pod status.
+                                // K8s ref: pkg/kubelet/prober/prober_manager.go — UpdatePodStatus
+                                // Phase/message/statuses go through generateAPIPodStatus
+                                // (kubelet_pods.go:1889-2020) and only the incarnation with
+                                // the worker's UID is written (status_manager.go:1051-1060).
+                                self.publish_terminal_status(
+                                    pod,
+                                    TerminalStatus {
+                                        phase: terminal_phase,
+                                        message: Some(message),
+                                        container_statuses: Some(container_statuses),
+                                        refresh_init_containers: true,
+                                        ..Default::default()
+                                    },
+                                    |status| {
+                                        // Update conditions — terminated pod is not Ready
+                                        if let Some(ref mut conditions) = status.conditions {
+                                            for c in conditions.iter_mut() {
+                                                if c.condition_type == "Ready"
+                                                    || c.condition_type == "ContainersReady"
+                                                {
+                                                    c.status = "False".to_string();
+                                                    c.reason = Some("PodCompleted".to_string());
+                                                }
                                             }
                                         }
-                                    }
-                                }
-                                if !pod_status_equal(&original, &new_pod) {
-                                    let _ = self.storage.update_status(&key, &new_pod).await;
-                                }
+                                    },
+                                )
+                                .await;
                                 return Ok(());
                             }
 
