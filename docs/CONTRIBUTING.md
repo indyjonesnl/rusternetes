@@ -156,7 +156,6 @@ The e2e log is written to `/tmp/sonobuoy/results/e2e.log` inside the e2e contain
 | `scheduler` | Pod scheduling with affinity, taints, tolerations, preemption |
 | `kubectl` | CLI tool |
 | `rusternetes` | All-in-one binary (all components as tokio tasks, embedded SQLite or Redis) |
-| `cloud-providers` | AWS, GCP, and Azure integrations |
 
 ## Code Style
 

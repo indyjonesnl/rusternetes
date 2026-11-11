@@ -252,12 +252,8 @@ async fn test_endpoints_cleaned_up_after_service_deletion() {
 #[tokio::test]
 async fn test_loadbalancer_status_populated_without_cloud_provider() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller = LoadBalancerController::new(
-        storage.clone(),
-        None, // no cloud provider — typical for conformance
-        "rusternetes-test".to_string(),
-        30,
-    );
+    let controller =
+        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
 
     let svc = make_lb_service("lb-svc", "default");
     let svc_key = build_key("services", Some("default"), "lb-svc");

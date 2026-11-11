@@ -13,7 +13,7 @@
 # resolve the workspace; the dummy/real-src blocks only need the crates the
 # kubectl binary actually compiles. scripts/tests/test-dockerfile-crate-
 # enumeration.sh enforces the manifest block stays complete:
-#   admission-webhook, api-server, client, cloud-providers, common,
+#   admission-webhook, api-server, client, common,
 #   controller-manager, cri, discovery, dns, kubectl, kubelet, kube-proxy,
 #   middleware, protobuf, rusternetes, scheduler, storage,
 #   test_support
@@ -67,7 +67,6 @@ COPY Cargo.toml Cargo.lock* ./
 # cargo still parses every member manifest, so all 19 must be present here.
 COPY crates/admission-webhook/Cargo.toml  crates/admission-webhook/Cargo.toml
 COPY crates/api-server/Cargo.toml         crates/api-server/Cargo.toml
-COPY crates/cloud-providers/Cargo.toml    crates/cloud-providers/Cargo.toml
 COPY crates/client/Cargo.toml             crates/client/Cargo.toml
 COPY crates/common/Cargo.toml             crates/common/Cargo.toml
 COPY crates/controller-manager/Cargo.toml crates/controller-manager/Cargo.toml
@@ -102,12 +101,12 @@ COPY crates/kubelet/proto        crates/kubelet/proto
 COPY crates/common/build.rs     crates/common/build.rs
 
 # CRATE-ENUMERATION (2/3): dummy lib.rs / main.rs per crate.
-#   - lib only:   common, controller-core, storage, cloud-providers
+#   - lib only:   common, controller-core, storage
 #   - bin only:   kubectl, rusternetes
 #   - lib + bin:  api-server, controller-manager, kubelet, kube-proxy,
 #                 scheduler
 RUN set -eux; \
-    for c in client common controller-core storage cloud-providers streamproxy cel-checker csi test_support; do \
+    for c in client common controller-core storage streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
     for c in kubectl rusternetes; do \
@@ -134,7 +133,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cargo clean --profile release-fast \
         -p rusternetes-api-server \
         -p rusternetes-client \
-        -p rusternetes-cloud-providers \
         -p rusternetes-common \
         -p rusternetes-cel-checker \
         -p rusternetes-controller-manager \
@@ -153,7 +151,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY crates/api-server/src           crates/api-server/src
 COPY crates/api-server/openapi       crates/api-server/openapi
 COPY crates/api-server/tests         crates/api-server/tests
-COPY crates/cloud-providers/src      crates/cloud-providers/src
 COPY crates/client/src               crates/client/src
 COPY crates/common/src               crates/common/src
 COPY crates/cel-checker/src               crates/cel-checker/src

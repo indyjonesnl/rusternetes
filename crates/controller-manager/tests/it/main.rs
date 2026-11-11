@@ -54,7 +54,6 @@ mod job_extended_test;
 mod job_success_policy_test;
 mod job_tracking_finalizer_test;
 mod kubelet_double;
-mod loadbalancer_status_lifecycle_test;
 mod namespace_client_rate_limit;
 mod namespace_controller_test;
 mod networkpolicy_controller_test;

@@ -35,7 +35,6 @@
     // Operations
     { title: 'Monitoring', section: 'Operations', url: 'monitoring.html', keywords: 'metrics prometheus tracing health healthz livez readyz' },
     { title: 'Troubleshooting', section: 'Operations', url: 'troubleshooting.html', keywords: 'troubleshoot debug error fix connection refused watch dns pending' },
-    { title: 'Cloud Providers', section: 'Operations', url: 'cloud-providers.html', keywords: 'aws gcp azure cloud provider loadbalancer nlb' },
     // Reference
     { title: 'API Reference', section: 'Reference', url: 'api-reference.html', keywords: 'api endpoint resource type group version route handler' },
     { title: 'Conformance', section: 'Reference', url: 'conformance.html', keywords: 'conformance test sonobuoy e2e pass fail kubernetes' },

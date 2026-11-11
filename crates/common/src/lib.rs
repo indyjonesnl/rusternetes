@@ -22,7 +22,6 @@ pub mod cel_policy_types;
 pub mod cel_schema_types;
 pub mod cel_struct;
 pub mod cel_versions;
-pub mod cloud_provider;
 pub mod clusterauthenticationtrust;
 pub mod compat_version_metrics;
 pub mod compatibility;

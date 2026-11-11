@@ -30,7 +30,6 @@ rusternetes-controller-core = { path = "../controller-core" }
 rusternetes-discovery = { path = "../discovery" }
 # gRPC status codes for the CSI provisioner (`isInfeasibleError`).
 tonic.workspace = true
-rusternetes-cloud-providers = { path = "../cloud-providers", optional = true }
 tokio.workspace = true
 fnv = "1.0"
 serde.workspace = true
@@ -76,8 +75,3 @@ mimalloc = ["dep:mimalloc"]
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
-cloud-providers = ["rusternetes-cloud-providers"]
-aws = ["cloud-providers", "rusternetes-cloud-providers/aws"]
-gcp = ["cloud-providers", "rusternetes-cloud-providers/gcp"]
-azure = ["cloud-providers", "rusternetes-cloud-providers/azure"]
-all-cloud-providers = ["aws", "gcp", "azure"]

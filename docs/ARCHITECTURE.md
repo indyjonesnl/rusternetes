@@ -80,7 +80,6 @@ rusternetes/
     kubelet/               # Node agent, CRI runtime (containerd + crun), CNI framework
     kube-proxy/            # iptables service routing, host network mode
     kubectl/               # CLI tool (get, create, apply, delete, logs, exec, ...)
-    cloud-providers/       # AWS/GCP/Azure integrations
     rusternetes/           # All-in-one binary (all components as tokio tasks)
   scripts/                 # Cluster bootstrap, cert generation, conformance runner
   docs/                    # Architecture, conformance, development guides
@@ -301,11 +300,6 @@ Supports YAML/JSON input, tabular/JSON/YAML output, `--namespace` and
 `--all-namespaces`, label selectors (`-l`), field selectors
 (`--field-selector`), watch mode (`-w`), multi-document YAML, and kubeconfig
 for cluster connection.
-
-### cloud-providers
-
-AWS, GCP, and Azure integration modules for cloud-native load balancer
-provisioning, storage backends, and node management.
 
 ---
 

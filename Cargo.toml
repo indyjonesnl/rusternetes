@@ -16,7 +16,6 @@ members = [
     "crates/admission-webhook",
     "crates/storage",
     "crates/client",
-    "crates/cloud-providers",
     "crates/dns",
     "crates/rusternetes",
     "crates/test_support",
@@ -70,11 +69,6 @@ x509-parser = "0.16" # X.509 certificate parsing
 pem = "3.0" # PEM format encoding/decoding
 base64 = "0.22" # Base64 encoding/decoding
 serial_test = "3.0" # Serialize tests that modify global state
-
-# Cloud provider SDKs
-aws-config = "1.1"
-aws-sdk-elasticloadbalancingv2 = "1.14"
-aws-sdk-ec2 = "1.30"
 
 [profile.dev]
 # Default `debug = 2` (full DWARF) inflates target/debug to ~80GB on this
