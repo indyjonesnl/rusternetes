@@ -430,20 +430,17 @@ const IDLE_CONNS_PER_HOST: usize = 25;
 /// `utilnet.SetTransportDefaults`' `IdleConnTimeout` (`http.DefaultTransport`).
 const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Bound on cached transports. client-go's `tlsCache` is unbounded (its keys
-/// are few: one per distinct `transport.Config`); here the APIService set is
-/// user-controlled, so a full cache is dropped (connections close on drop)
-/// rather than grown.
-const MAX_CACHED_TRANSPORTS: usize = 256;
-
 type PooledClient = hyper_util::client::legacy::Client<TimedConnector, Body>;
 
-/// `tlsCacheKey` (`transport/cache.go`): everything that shapes the TLS
-/// config or the dial function. The front-proxy client identity is part of
-/// it, so a rotated certificate gets a fresh transport.
+/// `tlsCacheKey` (client-go `transport/cache.go`): `insecure`, `caData`,
+/// `certData`/`keyData` (one PEM here), `serverName` and the `dial` holder.
+/// The URL scheme is not a field: the TLS config does not depend on it.
+/// `certFile`/`keyFile`, `nextProtos`, `disableCompression` and `getCert` are
+/// constant for the aggregator's `transport.Config` (handler_proxy.go:221-230),
+/// and `Config.Proxy` is never set, so every config is cacheable
+/// (`tlsConfigKey`'s `c.Proxy != nil` branch does not apply).
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TransportKey {
-    scheme: &'static str,
     server_name: Option<String>,
     insecure: bool,
     ca_bundle: Option<Vec<u8>>,
@@ -485,7 +482,7 @@ impl tower::Service<hyper::Uri> for TimedConnector {
 }
 
 /// The cached transport for `target` (`tlsCache.get`): one connection pool
-/// per distinct config, so requests reuse backend connections instead of
+/// per distinct config (unbounded, as `tlsTransportCache.transports` is), so requests reuse backend connections instead of
 /// dialing and handshaking each time.
 fn pooled_client(
     target: &AggregatorTarget,
@@ -493,7 +490,6 @@ fn pooled_client(
 ) -> Result<PooledClient, String> {
     let identity = crate::handlers::aggregator::current_proxy_client_identity_pem();
     let key = TransportKey {
-        scheme: scheme_static(target.scheme),
         server_name: target.server_name.clone(),
         insecure: target.insecure_skip_tls_verify,
         ca_bundle: target.ca_bundle.clone(),
@@ -519,9 +515,6 @@ fn pooled_client(
         .pool_max_idle_per_host(IDLE_CONNS_PER_HOST)
         .pool_timer(hyper_util::rt::TokioTimer::new())
         .build(connector);
-    if cache.len() >= MAX_CACHED_TRANSPORTS {
-        cache.clear();
-    }
     cache.insert(key, client.clone());
     Ok(client)
 }
