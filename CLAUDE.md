@@ -2,9 +2,37 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project goal — k3s (Go) → Rusternetes (Rust)
+
+Rusternetes is a Rust rewrite of **k3s**: Kubernetes release-1.35 packaged as a
+lightweight, single-binary distribution, with the in-tree cloud provider
+implementations (AWS, GCP, Azure) dropped. Conformance is unchanged: the target
+is still the full CNCF conformance suite (Hydrophone / Sonobuoy), which k3s
+itself passes.
+
+What "k3s parity" means in practice:
+
+- **Kubernetes behaviour** (API semantics, controllers, kubelet, scheduler,
+  kube-proxy, RBAC, validation) still comes from `../kubernetes`
+  (`release-1.35`). k3s vendors that code; there is nothing different to port.
+- **Distribution behaviour** (single binary, embedded datastore, bundled
+  addons, bootstrap, node registration, the embedded cloud-controller) comes
+  from `../k3s` (tag `v1.35.9+k3s1`). Read it the same way you read upstream
+  Kubernetes: first, whole mechanism, cite it.
+- **No in-tree cloud providers.** There is no AWS/GCP/Azure code, crate, feature
+  flag or SDK dependency. Like k3s, `--cloud-provider=external` is the only mode.
+  Node addresses, provider IDs and `type: LoadBalancer` are served by a small
+  built-in provider modelled on k3s `pkg/cloudprovider` (`InstancesV2` that
+  always reports the node as existing, `k3s://<node>` provider IDs, ServiceLB),
+  on top of the `k8s.io/cloud-provider` controller framework. Do not add a
+  provider for a hosted cloud; that is an out-of-tree concern, as it is for k3s.
+
+The rule below applies unchanged; it now reads "k3s, then the Kubernetes it
+vendors".
+
 ## Upstream-first — port, do NOT reinvent (MANDATORY)
 
-Rusternetes reimplements Kubernetes. **Almost every behavior you need already
+Rusternetes reimplements k3s, and so the Kubernetes it vendors. **Almost every behavior you need already
 exists in a battle-tested upstream implementation.** Before designing ANY
 non-trivial logic — an authorizer rule, a bootstrap step, a controller loop, a
 validation, a CRI/CNI/CSI call sequence, a default, an error string, a status
@@ -154,9 +182,14 @@ failing batch must report. Neither is inferable from the implementation alone.
   for api-server, kubelet, scheduler, controller-manager, kube-proxy, RBAC,
   validation, bootstrap policy, conformance expectations. Pinned to the target
   version.
+- **`../k3s`** — k3s `v1.35.9+k3s1`, the distribution Rusternetes is a Rust
+  rewrite of. Source of truth for packaging, bundled addons, the embedded
+  cloud-controller (`pkg/cloudprovider`: node metadata + ServiceLB), datastore
+  wiring and server/agent bootstrap. Clone with
+  `git clone --depth 1 --branch 'v1.35.9+k3s1' https://github.com/k3s-io/k3s.git ../k3s`.
 - **`../containerd`**, **`../containerd-rs`** — CRI runtime + a Rust CRI client
   to mirror for kubelet↔runtime work.
-- **k3s / k0s / rke2 / kind** — distributions that *embed or ship the upstream
+- **k0s / rke2 / kind** — other distributions that *embed or ship the upstream
   kube-apiserver/kubelet/etc.* Consult them (via `gh`/web or a clone) for how a
   real distro wires bootstrap, addons (CNI, kube-proxy, CoreDNS), node
   registration, and cluster bring-up. They rarely reimplement core behavior —
@@ -273,7 +306,7 @@ symlink.
 
 ## Architecture
 
-Rust reimplementation of Kubernetes. Workspace with 10 crates:
+Rust reimplementation of k3s (Kubernetes without in-tree cloud providers). Workspace crates:
 
 - **`common`** - Shared resource types (Pod, Deployment, Service, etc.), error types, utilities. All resource structs live in `src/resources/`. Error type in `src/error.rs` maps to Kubernetes StatusReason and implements Axum's `IntoResponse`.
 - **`api-server`** - Axum-based REST API. Routes in `src/router.rs` (~9400 lines). One handler file per resource type in `src/handlers/`. State in `src/state.rs` holds storage, auth, IP allocator, webhook manager, watch cache.
@@ -283,7 +316,6 @@ Rust reimplementation of Kubernetes. Workspace with 10 crates:
 - **`kube-proxy`** - iptables-based service routing. Runs in host network mode. Reads both Endpoints and EndpointSlices.
 - **`scheduler`** - Pod scheduling with affinity, taints/tolerations, priority/preemption. Plugins in `src/plugins/`.
 - **`kubectl`** - CLI tool. Commands in `src/commands/`.
-- **`cloud-providers`** - AWS/GCP/Azure integrations.
 - **`rusternetes`** - All-in-one binary. Spawns api-server, scheduler, controller-manager, kubelet, and kube-proxy as concurrent tokio tasks sharing one `StorageBackend`. Defaults to embedded SQLite. Supports `--storage-backend redis --redis-url redis://host:6379` for Redis via rhino.
 
 ## Key Conventions
