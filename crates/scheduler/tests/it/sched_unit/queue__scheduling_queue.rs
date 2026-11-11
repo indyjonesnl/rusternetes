@@ -524,12 +524,15 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn pre_enqueue(&self, pod: &Pod) -> Result<(), String> {
+        fn pre_enqueue(&self, pod: &Pod) -> rusternetes_scheduler::fwk::Status {
             let labels = pod.metadata.labels.clone().unwrap_or_default();
             if self.allow.iter().any(|a| labels.contains_key(*a)) {
-                Ok(())
+                rusternetes_scheduler::fwk::Status::success()
             } else {
-                Err(format!("pod is gated by {}", self.name))
+                rusternetes_scheduler::fwk::Status::new(
+                    rusternetes_scheduler::fwk::Code::Unschedulable,
+                    vec![format!("pod is gated by {}", self.name)],
+                )
             }
         }
     }

@@ -483,8 +483,15 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         // `unionedGVKs` (scheduler.go:635-647) decides which resource
         // handlers `addAllEventHandlers` installs below.
         let gvk_map = crate::resource_events::unioned_gvks(&queueing_hint_map);
+        // `profiles[options.profiles[0].SchedulerName].QueueSortFunc()`
+        // (scheduler.go:407); every profile agrees on it (validated in
+        // `Map::new_map`).
         let queue = PriorityQueue::new(
-            priority_sort_less(),
+            self.profiles
+                .profiles()
+                .next()
+                .map(|p| p.framework.queue_sort_func())
+                .unwrap_or_else(priority_sort_less),
             PriorityQueueOptions {
                 queueing_hint_map,
                 // `WithPreEnqueuePluginMap` (scheduler.go:388-414): gated pods

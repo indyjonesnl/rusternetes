@@ -128,14 +128,17 @@ mod tests {
         let state = AsyncPreemption::new();
         let pl = DefaultPreemptionPreEnqueue::new(Arc::clone(&state));
         let preemptor = pod("p", "p-uid", "", 100);
-        assert_eq!(pl.pre_enqueue(&preemptor), Ok(()));
+        assert!(pl.pre_enqueue(&preemptor).is_success());
         state.start("p-uid");
         assert_eq!(
             pl.pre_enqueue(&preemptor),
-            Err("waiting for the preemption for this pod to be finished".to_string())
+            rusternetes_scheduler::fwk::Status::new(
+                rusternetes_scheduler::fwk::Code::UnschedulableAndUnresolvable,
+                vec!["waiting for the preemption for this pod to be finished".to_string()]
+            )
         );
         state.finish("p-uid");
-        assert_eq!(pl.pre_enqueue(&preemptor), Ok(()));
+        assert!(pl.pre_enqueue(&preemptor).is_success());
     }
 
     /// The default profile enables DefaultPreemption at PreEnqueue after

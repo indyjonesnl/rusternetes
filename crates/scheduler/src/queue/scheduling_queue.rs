@@ -45,6 +45,7 @@
 use super::events::*;
 use super::heap::Heap;
 use super::nominator::{NominatingInfo, Nominator, PodLister, PodRef};
+use crate::fwk::{Code, Status};
 use rusternetes_common::resources::Pod;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -76,8 +77,9 @@ pub type PreEnqueueCheck<'a> = &'a dyn Fn(&Pod) -> bool;
 /// unschedulableQ.
 pub trait PreEnqueuePlugin: Send + Sync {
     fn name(&self) -> &str;
-    /// `Err(message)` is an Unschedulable status.
-    fn pre_enqueue(&self, pod: &Pod) -> Result<(), String>;
+    /// `PreEnqueue(ctx, pod) *fwk.Status`: Success (Go's nil) lets the pod
+    /// into activeQ; any other code gates it.
+    fn pre_enqueue(&self, pod: &Pod) -> Status;
 }
 
 /// Clock abstraction (`k8s.io/utils/clock`) so tests can step time.
@@ -185,12 +187,30 @@ use crate::profile::pod_scheduler_name;
 /// `fwk.LessFunc`.
 pub type LessFn = Arc<dyn Fn(&QueuedPodInfo, &QueuedPodInfo) -> bool + Send + Sync>;
 
-/// `queuesort.PrioritySort.Less` (`plugins/queuesort/priority_sort.go:44-48`).
-pub fn priority_sort_less() -> LessFn {
-    Arc::new(|a: &QueuedPodInfo, b: &QueuedPodInfo| {
+/// `queuesort.PrioritySort` (`plugins/queuesort/priority_sort.go:30-56`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PrioritySort;
+
+impl crate::fwk::Plugin for PrioritySort {
+    fn name(&self) -> &'static str {
+        crate::framework_runtime::names::PRIORITY_SORT
+    }
+}
+
+impl crate::fwk::QueueSortPlugin for PrioritySort {
+    /// `Less` (`priority_sort.go:44-48`): higher priority first, then the
+    /// earlier timestamp.
+    fn less(&self, a: &QueuedPodInfo, b: &QueuedPodInfo) -> bool {
         let p = |i: &QueuedPodInfo| i.pod.spec.as_ref().and_then(|s| s.priority).unwrap_or(0);
         let (p1, p2) = (p(a), p(b));
         p1 > p2 || (p1 == p2 && a.timestamp < b.timestamp)
+    }
+}
+
+/// `PrioritySort.Less` as a [`LessFn`].
+pub fn priority_sort_less() -> LessFn {
+    Arc::new(|a: &QueuedPodInfo, b: &QueuedPodInfo| {
+        crate::fwk::QueueSortPlugin::less(&PrioritySort, a, b)
     })
 }
 
@@ -609,7 +629,10 @@ impl PriorityQueue {
         if !gating_plugin.is_empty() {
             // Run the gating plugin first
             if let Some(pl) = plugins.iter().find(|p| p.name() == gating_plugin) {
-                if self.run_pre_enqueue_plugin(pl.as_ref(), p_info).is_err() {
+                if !self
+                    .run_pre_enqueue_plugin(pl.as_ref(), p_info)
+                    .is_success()
+                {
                     // No need to iterate other plugins
                     return;
                 }
@@ -620,7 +643,10 @@ impl PriorityQueue {
                 // should be run already above.
                 continue;
             }
-            if self.run_pre_enqueue_plugin(pl.as_ref(), p_info).is_err() {
+            if !self
+                .run_pre_enqueue_plugin(pl.as_ref(), p_info)
+                .is_success()
+            {
                 // No need to iterate other plugins
                 return;
             }
@@ -634,17 +660,26 @@ impl PriorityQueue {
         &self,
         pl: &dyn PreEnqueuePlugin,
         p_info: &mut QueuedPodInfo,
-    ) -> Result<(), String> {
+    ) -> Status {
         let s = pl.pre_enqueue(&p_info.pod);
-        if let Err(msg) = &s {
-            p_info.unschedulable_plugins.insert(pl.name().to_string());
-            debug!(pod = %pod_key(&p_info.pod), plugin = pl.name(), status = %msg, "Status after running PreEnqueue plugin");
-            p_info.gating_plugin = pl.name().to_string();
-            p_info.gating_plugin_events = self
-                .plugin_to_events_map
-                .get(pl.name())
-                .cloned()
-                .unwrap_or_default();
+        if s.is_success() {
+            // No need to change GatingPlugin; it's overwritten by the next
+            // PreEnqueue plugin if they gate this pod, or it's overwritten
+            // with an empty string if all PreEnqueue plugins pass.
+            return s;
+        }
+        p_info.unschedulable_plugins.insert(pl.name().to_string());
+        p_info.gating_plugin = pl.name().to_string();
+        p_info.gating_plugin_events = self
+            .plugin_to_events_map
+            .get(pl.name())
+            .cloned()
+            .unwrap_or_default();
+        if s.code() == Code::Error {
+            // `utilruntime.HandleErrorWithContext(.., s.AsError(), "Unexpected error running PreEnqueue plugin", ..)`
+            error!(pod = %pod_key(&p_info.pod), plugin = pl.name(), error = %s.as_error().unwrap_or_default(), "Unexpected error running PreEnqueue plugin");
+        } else {
+            debug!(pod = %pod_key(&p_info.pod), plugin = pl.name(), status = %s.message(), "Status after running PreEnqueue plugin");
         }
         s
     }

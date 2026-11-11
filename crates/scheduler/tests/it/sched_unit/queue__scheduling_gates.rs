@@ -35,13 +35,16 @@ mod tests {
     #[test]
     fn test_pre_enqueue() {
         let pl = SchedulingGates;
-        assert_eq!(pl.pre_enqueue(&pod_with_gates(None)), Ok(()));
+        assert!(pl.pre_enqueue(&pod_with_gates(None)).is_success());
         assert_eq!(
             pl.pre_enqueue(&pod_with_gates(Some(&["foo", "bar"]))),
-            Err("waiting for scheduling gates: [foo bar]".to_string())
+            rusternetes_scheduler::fwk::Status::new(
+                rusternetes_scheduler::fwk::Code::UnschedulableAndUnresolvable,
+                vec!["waiting for scheduling gates: [foo bar]".to_string()]
+            )
         );
         // An empty (non-nil) list carries no gates.
-        assert_eq!(pl.pre_enqueue(&pod_with_gates(Some(&[]))), Ok(()));
+        assert!(pl.pre_enqueue(&pod_with_gates(Some(&[]))).is_success());
     }
 
     /// `profile.PreEnqueuePlugins()` over the default plugin set.
