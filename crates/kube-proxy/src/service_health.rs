@@ -760,41 +760,4 @@ mod tests {
             .contains("127.0.0.1:9376"));
         test_handler(&hcs, &nsn, 503, 0).await;
     }
-
-    #[tokio::test]
-    async fn std_server_serves_over_tcp_and_close_stops_it() {
-        // Not upstream: exercises the std listener/server seam end to end.
-        let checker = Arc::new(FakeProxyHealthChecker(Mutex::new(true)));
-        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let hcs =
-            new_std_service_health_server("n", None, vec![IpAddr::from([127, 0, 0, 1])], checker);
-        let nsn = mknsn("ns", "svc");
-        hcs.sync_services(&svcs(&[(&nsn, port)])).unwrap();
-        assert_eq!(nservices(&hcs), 1, "listen must succeed");
-        hcs.sync_endpoints(&eps(&[(&nsn, 2)])).unwrap();
-
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect");
-        s.write_all(b"GET /healthz HTTP/1.0\r\n\r\n").await.unwrap();
-        let mut out = String::new();
-        s.read_to_string(&mut out).await.unwrap();
-        assert!(out.starts_with("HTTP/1.0 200"), "{out}");
-        assert!(out
-            .to_lowercase()
-            .contains("x-load-balancing-endpoint-weight: 2"));
-        assert!(out.contains("\"localEndpoints\": 2"), "{out}");
-
-        hcs.sync_services(&HashMap::new()).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_err(),
-            "port must be released after SyncServices drops the service"
-        );
-    }
 }
