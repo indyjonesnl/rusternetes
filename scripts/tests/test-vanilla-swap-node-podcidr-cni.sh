@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regression test for #1648: the vanilla-swap join-worker (kubelet) leg must
-# drive the rusternetes node's CNI from the node's node-ipam spec.podCIDR, not
+# drive the k3rs node's CNI from the node's node-ipam spec.podCIDR, not
 # the CRI image's baked cluster-wide 10.244.0.0/16 conflist.
 #
 # Mechanism ported from this repo's compose stack (#1691, compose.sqlite.yml):

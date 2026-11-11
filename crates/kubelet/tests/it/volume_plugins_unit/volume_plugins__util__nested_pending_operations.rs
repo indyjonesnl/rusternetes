@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::volume_plugins::util::exponential_backoff::{
+    pub use k3rs_kubelet::volume_plugins::util::exponential_backoff::{
         ExponentialBackoff, ExponentialBackoffError,
     };
     pub use std::future::Future;
@@ -14,7 +14,7 @@ mod tests {
     //! Ports of `nestedpendingoperations_test.go`.
 
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::nested_pending_operations::*;
+    use k3rs_kubelet::volume_plugins::util::nested_pending_operations::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
 

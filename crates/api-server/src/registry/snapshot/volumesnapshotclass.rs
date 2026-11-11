@@ -7,12 +7,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::resources::VolumeSnapshotClass;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::validation::volumesnapshot::validate_volume_snapshot_class;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_prefix, Storage, StorageBackend};
+use k3rs_common::resources::VolumeSnapshotClass;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_common::validation::volumesnapshot::validate_volume_snapshot_class;
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_prefix, Storage, StorageBackend};
 
 use super::{same_json, GROUP};
 use crate::registry::generic::store::{

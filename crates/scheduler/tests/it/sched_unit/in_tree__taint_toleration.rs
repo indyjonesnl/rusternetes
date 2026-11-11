@@ -1,7 +1,7 @@
 //! `TestTaintTolerationFilter` cases (`plugins/tainttoleration/taint_toleration_test.go`).
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo};
-use rusternetes_scheduler::in_tree::TaintToleration;
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo};
+use k3rs_scheduler::in_tree::TaintToleration;
 use serde_json::json;
 
 async fn passes(tolerations: serde_json::Value, taints: serde_json::Value) -> Option<String> {

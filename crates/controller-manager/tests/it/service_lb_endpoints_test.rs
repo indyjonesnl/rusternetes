@@ -12,16 +12,16 @@
 //!   4. The api-server proxy subresource path resolver must find a pod IP via
 //!      Endpoints when EndpointSlices are not yet mirrored.
 
-use rusternetes_common::resources::service::LoadBalancerIngress;
-use rusternetes_common::resources::{
+use k3rs_common::resources::service::LoadBalancerIngress;
+use k3rs_common::resources::{
     Container, ContainerStatus, EndpointAddress, EndpointPort, EndpointSubset, Endpoints,
     IntOrString, Pod, PodCondition, PodSpec, PodStatus, Service, ServicePort, ServiceSpec,
     ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_controller_manager::controllers::loadbalancer::LoadBalancerController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_controller_manager::controllers::loadbalancer::LoadBalancerController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -252,8 +252,7 @@ async fn test_endpoints_cleaned_up_after_service_deletion() {
 #[tokio::test]
 async fn test_loadbalancer_status_populated_without_cloud_provider() {
     let storage = Arc::new(MemoryStorage::new());
-    let controller =
-        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
+    let controller = LoadBalancerController::new(storage.clone(), "k3rs-test".to_string(), 30);
 
     let svc = make_lb_service("lb-svc", "default");
     let svc_key = build_key("services", Some("default"), "lb-svc");

@@ -18,7 +18,7 @@
 //! }
 //! ```
 
-use rusternetes_kubelet::cri_runtime::runtime::{
+use k3rs_kubelet::cri_runtime::runtime::{
     sandbox_filter_by_namespaced_name, sandbox_filter_by_uid,
 };
 
@@ -53,7 +53,7 @@ fn uid_filter_selects_on_uid_only() {
 /// reuse a running sandbox instead of creating one.
 #[test]
 fn uid_filter_can_narrow_to_ready_sandboxes() {
-    let ready = rusternetes_cri::v1::PodSandboxState::SandboxReady as i32;
+    let ready = k3rs_cri::v1::PodSandboxState::SandboxReady as i32;
     let filter = sandbox_filter_by_uid("uid-1", Some(ready));
 
     assert_eq!(

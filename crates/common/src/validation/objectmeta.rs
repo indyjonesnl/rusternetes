@@ -1,4 +1,4 @@
-//! Rusternetes port of upstream
+//! k3rs port of upstream
 //! `k8s.io/apimachinery/pkg/api/validation/objectmeta.go` (release-1.35).
 //!
 //! Mirrors the upstream structure: validators return [`ErrorList`] (a

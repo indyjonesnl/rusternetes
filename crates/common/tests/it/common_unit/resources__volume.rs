@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::serde_helpers::empty_string_as_none;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::resources::serde_helpers::empty_string_as_none;
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::volume::*;
+    use k3rs_common::resources::volume::*;
 
     // #2562: upstream's volumeMode / reclaimPolicy / volumeBindingMode are
     // pointers (core/v1/types.go:427,578; storage/v1/types.go:56,73), so a
@@ -61,7 +61,7 @@ mod tests {
             "reclaimPolicy": "", "volumeBindingMode": ""
         }))
         .unwrap();
-        let errs = rusternetes_common::validation::storageclass::validate_storage_class(&sc);
+        let errs = k3rs_common::validation::storageclass::validate_storage_class(&sc);
         let fields: Vec<String> = errs.iter().map(|e| e.field.to_string()).collect();
         assert!(
             fields.contains(&"volumeBindingMode".to_string()),

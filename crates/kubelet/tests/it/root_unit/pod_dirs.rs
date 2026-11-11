@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pod_dirs::*;
+    use k3rs_kubelet::pod_dirs::*;
 
     #[test]
     fn a_volume_dir_follows_the_upstream_layout() {
@@ -60,7 +60,7 @@ mod tests {
 
 mod volumes_from_pod_dir_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pod_dirs::*;
+    use k3rs_kubelet::pod_dirs::*;
 
     /// `getVolumesFromPodDir` (`reconstruct_common.go:191-240`): one entry per
     /// `<pod>/volumes/<escaped plugin>/<volume>`, plugin name unescaped; a pod

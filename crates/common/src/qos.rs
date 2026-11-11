@@ -149,7 +149,7 @@ pub fn get_pod_qos(pod: &Pod) -> QoSClass {
 /// `ComputePodQOS` never looks at limits when filling `requests` — it relies on
 /// `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:164-192`) having copied
 /// limits into unset requests at admission, which is why a limits-only
-/// container is Guaranteed upstream. Rusternetes applies that pass in the same
+/// container is Guaranteed upstream. k3rs applies that pass in the same
 /// two places upstream does — pod create and static-pod decode, via
 /// [`crate::defaults::default_pod_requests_from_limits`] (#1738) — so
 /// re-applying it here is normally a no-op. It is re-applied to a local copy

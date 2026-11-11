@@ -429,7 +429,7 @@ fn validate_deployment_spec(
     // first validates the selector structure, then emits
     // Invalid("empty selector is invalid for deployment") when both matchLabels
     // and matchExpressions are empty. (The `Required` "nil selector" arm cannot
-    // happen here — `LabelSelector` is non-optional in rusternetes.)
+    // happen here — `LabelSelector` is non-optional in k3rs.)
     if selector_is_empty(&spec.selector) {
         errs.extend(validate_label_selector(
             &spec.selector,

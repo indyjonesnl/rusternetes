@@ -5,7 +5,7 @@
 //! existing tests seed resources with `json!(...)`, while giving porting code
 //! precise control over malformed inputs.
 
-use rusternetes_common::resources::{Node, NodeStatus};
+use k3rs_common::resources::{Node, NodeStatus};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::HashMap;

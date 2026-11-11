@@ -23,7 +23,7 @@ pub mod devicetaintrule;
 pub mod external_metrics;
 pub mod list_options;
 pub mod metric_selectors;
-pub use rusternetes_discovery as discovery;
+pub use k3rs_discovery as discovery;
 pub mod aggregator;
 pub mod apiservice;
 pub mod endpoints;
@@ -145,10 +145,10 @@ pub fn list_resource_version<T: serde::Serialize>(items: &[T]) -> String {
 /// `getResp.Header.Revision`), so the RV is the revision the snapshot was
 /// taken at by construction. Taking the max restores that invariant here.
 pub async fn list_collection_resource_version<T: serde::Serialize>(
-    storage: &rusternetes_storage::StorageBackend,
+    storage: &k3rs_storage::StorageBackend,
     items: &[T],
 ) -> String {
-    use rusternetes_storage::Storage;
+    use k3rs_storage::Storage;
     let current = match storage.current_revision().await {
         Ok(rev) if rev > 0 => Some(rev),
         _ => None,
@@ -164,13 +164,13 @@ pub async fn list_collection_resource_version<T: serde::Serialize>(
 /// the store (#2814).
 pub fn validate_synthesized_list_options(
     params: &std::collections::HashMap<String, String>,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     let errs = list_options::validate_list_options(params);
     if errs.is_empty() {
         return Ok(());
     }
     // `NewInvalid(meta.k8s.io ListOptions, "", errs)`, as `prepare_list`.
-    Err(rusternetes_common::Error::new_invalid(
+    Err(k3rs_common::Error::new_invalid(
         "meta.k8s.io",
         "ListOptions",
         "",
@@ -182,9 +182,7 @@ pub fn validate_synthesized_list_options(
 /// the response is the revision the items were read at (#3078). Lives here,
 /// with the other sanctioned revision readers, because the list-handler guard
 /// forbids list functions from touching `current_revision()` themselves.
-pub async fn list_snapshot_revision<S: rusternetes_storage::Storage + ?Sized>(
-    storage: &S,
-) -> Option<i64> {
+pub async fn list_snapshot_revision<S: k3rs_storage::Storage + ?Sized>(storage: &S) -> Option<i64> {
     match storage.current_revision().await {
         Ok(rev) if rev > 0 => Some(rev),
         _ => None,

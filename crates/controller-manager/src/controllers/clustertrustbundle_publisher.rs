@@ -26,20 +26,20 @@
 //!   is upstream's loop: one key (`""`) on a rate-limiting queue, a failed
 //!   sync is requeued with `AddRateLimited` (per-item exponential backoff,
 //!   5ms to 1000s) and a successful one `Forget`s it. The queue is the shared
-//!   [`rusternetes_storage::WorkQueue`] (its limiter has no overall bucket;
+//!   [`k3rs_storage::WorkQueue`] (its limiter has no overall bucket;
 //!   with a single key the 10 qps bucket of
 //!   `DefaultTypedControllerRateLimiter` can never bind).
 //! - Upstream picks the first of v1beta1 / v1alpha1 by discovery
-//!   (certificates.go:326-345). Rusternetes stores one internal
+//!   (certificates.go:326-345). k3rs stores one internal
 //!   ClusterTrustBundle shape (served as v1beta1), so no discovery step.
 //! - The field-selector filtered informer (`spec.signerName=<signer>`) becomes
 //!   a list of all bundles filtered by `spec.signerName` in memory.
 
 use anyhow::{anyhow, Result};
+use k3rs_common::resources::ClusterTrustBundle;
+use k3rs_common::Error;
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use prometheus::{HistogramVec, IntCounterVec};
-use rusternetes_common::resources::ClusterTrustBundle;
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};

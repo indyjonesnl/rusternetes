@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::Secret;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::secret::{validate_secret, validate_secret_update};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Secret;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::secret::{validate_secret, validate_secret_update};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -57,7 +57,7 @@ fn warnings_for_secret(secret: &Secret) -> Vec<String> {
             .map(Vec::as_slice)
             .unwrap_or_default()
     };
-    match rusternetes_common::tls::x509_key_pair(value(TLS_CERT_KEY), value(TLS_PRIVATE_KEY_KEY)) {
+    match k3rs_common::tls::x509_key_pair(value(TLS_CERT_KEY), value(TLS_PRIVATE_KEY_KEY)) {
         Ok(()) => Vec::new(),
         Err(e) => vec![e],
     }

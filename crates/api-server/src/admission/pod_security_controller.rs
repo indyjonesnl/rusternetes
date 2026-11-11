@@ -12,9 +12,9 @@
 use super::pod_security_api::{self as api, Level, LevelVersion};
 use super::pod_security_policy::aggregate_check_results;
 use super::{pod_security_registry, PodSecurityAdmission, PodSecurityOutcome};
-use rusternetes_common::resources::pod::PodSpec;
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::Storage;
+use k3rs_common::resources::pod::PodSpec;
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::Storage;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -107,9 +107,9 @@ impl PodSecurityAdmission {
         if self.exemptions.exempt_user(username) {
             return annotated("exempt", "user".into());
         }
-        let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
+        let ns_key = k3rs_storage::build_key("namespaces", None, namespace);
         let labels = match storage
-            .get::<rusternetes_common::resources::Namespace>(&ns_key)
+            .get::<k3rs_common::resources::Namespace>(&ns_key)
             .await
         {
             Ok(ns) => ns.metadata.labels,

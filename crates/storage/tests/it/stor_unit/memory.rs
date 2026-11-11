@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{Storage, WatchEvent, WatchStream};
     pub use serde::{de::DeserializeOwned, Serialize};
     pub use std::collections::HashMap;
     pub use std::collections::VecDeque;
@@ -14,7 +14,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::memory::*;
+    use k3rs_storage::memory::*;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -396,14 +396,14 @@ mod tests {
         assert!(st.estimated_average_object_size_bytes > 0);
         assert_eq!(
             s.stats("/registry/none/").await.unwrap(),
-            rusternetes_storage::ResourceStats::default()
+            k3rs_storage::ResourceStats::default()
         );
     }
 }
 
 mod preconditions_tests {
     use super::__parent::*;
-    use rusternetes_storage::memory::*;
+    use k3rs_storage::memory::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delete_with_preconditions_suite() {

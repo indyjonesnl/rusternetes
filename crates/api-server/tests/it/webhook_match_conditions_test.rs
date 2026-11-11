@@ -14,7 +14,7 @@
 //! treats a whitespace-only `expression` as `Required` — none of which the
 //! ad-hoc loop did.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const VALIDATING: &str = "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations";

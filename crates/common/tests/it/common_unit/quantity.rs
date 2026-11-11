@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::quantity::*;
+    use k3rs_common::quantity::*;
 
     fn parse(s: &str) -> Quantity {
         Quantity::parse(s).unwrap_or_else(|e| panic!("parse({s:?}) failed: {e}"))

@@ -3,14 +3,12 @@
 //! volume attachments reach the graph through list+watch, deletes remove
 //! their edges, and a decision follows.
 
-use rusternetes_api_server::node_graph_populator;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::node_graph::NodeGraph;
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::authz::{
-    NodeAuthorizer, NodeAuthorizerFeatures, Opinion, RequestAttributes,
-};
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_api_server::node_graph_populator;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::node_graph::NodeGraph;
+use k3rs_common::authz::Authorizer;
+use k3rs_common::authz::{NodeAuthorizer, NodeAuthorizerFeatures, Opinion, RequestAttributes};
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;

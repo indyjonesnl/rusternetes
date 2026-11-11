@@ -4,7 +4,7 @@
 //! `Admit`, `Validate`, `shouldIgnore`, `shouldAutomount`,
 //! `enforceMountableSecrets`, `getServiceAccount`, `limitSecretReferences`,
 //! `limitEphemeralContainerSecretReferences` and `mountServiceAccountToken`
-//! (the last lives in `rusternetes_common::serviceaccount`, shared with the
+//! (the last lives in `k3rs_common::serviceaccount`, shared with the
 //! controllers that write pods straight to storage). The `NewForbidden`
 //! wrapping is done by the chain in `endpoints/handlers/admission.rs`.
 
@@ -12,9 +12,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusternetes_common::resources::pod::{Container, EnvFromSource, EnvVar, PodSpec};
-use rusternetes_common::resources::{Pod, ServiceAccount};
-use rusternetes_storage::Storage;
+use k3rs_common::resources::pod::{Container, EnvFromSource, EnvVar, PodSpec};
+use k3rs_common::resources::{Pod, ServiceAccount};
+use k3rs_storage::Storage;
 
 /// `DefaultServiceAccountName` (admission.go:46).
 pub const DEFAULT_SERVICE_ACCOUNT_NAME: &str = "default";
@@ -100,7 +100,7 @@ pub async fn get_service_account_with<S: Storage>(
     name: &str,
     retry_interval: Option<Duration>,
 ) -> Result<ServiceAccount, String> {
-    let key = rusternetes_storage::build_key("serviceaccounts", Some(namespace), name);
+    let key = k3rs_storage::build_key("serviceaccounts", Some(namespace), name);
     let attempts = if name == DEFAULT_SERVICE_ACCOUNT_NAME {
         10
     } else {
@@ -114,7 +114,7 @@ pub async fn get_service_account_with<S: Storage>(
         }
         match storage.get::<ServiceAccount>(&key).await {
             Ok(sa) => return Ok(sa),
-            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e.to_string()),
         }
     }

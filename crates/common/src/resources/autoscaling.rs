@@ -25,7 +25,7 @@
 //! API. It ships as a CRD from `kubernetes/autoscaler`
 //! (`vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1/types.go`), so
 //! there is no Go validator to port — a CRD's fields are checked by its
-//! OpenAPI schema. Rusternetes serves no VPA route; the only reader is
+//! OpenAPI schema. k3rs serves no VPA route; the only reader is
 //! `controller-manager/src/controllers/vpa.rs`, which does
 //! `list::<VerticalPodAutoscaler>("/registry/verticalpodautoscalers/")`. A
 //! stored object missing one field made that decode fail and the controller

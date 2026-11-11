@@ -3,7 +3,7 @@
 //! wrapper — not hoist the inner DaemonSet from `data.raw` to the top level.
 //! (decode_k8s_resource alone is correct; the bug is the cascade preferring an
 //! extract that digs into the nested k8s\0-Unknown inside data.raw.)
-use rusternetes_middleware::decode_k8s_protobuf_request_body;
+use k3rs_middleware::decode_k8s_protobuf_request_body;
 
 #[test]
 fn controllerrevision_request_decodes_with_data() {

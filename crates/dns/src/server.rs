@@ -353,7 +353,7 @@ mod tests {
     use crate::zone::CLUSTER_ZONE;
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{DNSClass, Name, RecordType};
-    use rusternetes_common::resources::{Service, ServiceSpec, ServiceType};
+    use k3rs_common::resources::{Service, ServiceSpec, ServiceType};
     use std::str::FromStr;
 
     fn cluster_ip_svc(name: &str, ns: &str, ip: &str) -> Service {

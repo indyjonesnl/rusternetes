@@ -8,8 +8,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_common::cel::CELEvaluator;
-use rusternetes_common::cel_struct::{self, TypeCheck};
+use k3rs_common::cel::CELEvaluator;
+use k3rs_common::cel_struct::{self, TypeCheck};
 use serde_json::{Map, Value};
 
 use super::policy_json_patch::evaluate_expression_budgeted;
@@ -134,7 +134,7 @@ pub fn apply_structured_merge_diff(original: &Value, patch: &Value) -> Result<Va
 fn undeclared_field(original: &Value, merged: &Value, patch: &Value) -> Option<String> {
     let unknown = |v: &Value| -> Option<Vec<String>> {
         use crate::handlers::validation::find_unknown_fields_via_schema as f;
-        use rusternetes_common::resources as r;
+        use k3rs_common::resources as r;
         let kind = patch.get("kind")?.as_str()?;
         let api = patch.get("apiVersion")?.as_str()?;
         Some(match (api, kind) {

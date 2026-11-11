@@ -2,15 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::csi::CSINode;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::csi::CSINode;
+    pub use k3rs_common::resources::volume::{
         NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, TopologySelectorTerm,
         VolumeNodeAffinity,
     };
-    pub use rusternetes_common::resources::Node;
-    pub use rusternetes_common::Error;
-    pub use rusternetes_csi::proto::{Topology, TopologyRequirement};
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_common::resources::Node;
+    pub use k3rs_common::Error;
+    pub use k3rs_csi::proto::{Topology, TopologyRequirement};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::cmp::Ordering;
     pub use std::collections::{BTreeSet, HashMap, HashSet};
     pub use std::sync::Mutex;
@@ -18,11 +18,11 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::csi::{CSINodeDriver, CSINodeSpec};
-    use rusternetes_common::resources::volume::TopologySelectorLabelRequirement;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_controller_manager::controllers::csi_topology::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::csi::{CSINodeDriver, CSINodeSpec};
+    use k3rs_common::resources::volume::TopologySelectorLabelRequirement;
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::csi_topology::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     const DRIVER: &str = "com.example.csi/driver";
     const ZONE: &str = "com.example.csi/zone";

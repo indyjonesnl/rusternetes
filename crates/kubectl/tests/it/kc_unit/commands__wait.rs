@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::{ApiClient, GetError};
+    pub use k3rs_client::http::{ApiClient, GetError};
     pub use serde_json::Value;
     pub use std::time::{Duration, Instant};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::wait::*;
+    use k3rs_kubectl::commands::wait::*;
 
     #[test]
     fn test_parse_condition_bare() {

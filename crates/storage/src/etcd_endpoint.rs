@@ -14,7 +14,7 @@
 //! tonic `Endpoint`), so [`UnixBridge`] terminates a loopback TCP listener and
 //! splices each connection onto the socket. Parsing is the upstream one.
 
-use rusternetes_common::{Error, Result};
+use k3rs_common::{Error, Result};
 use std::path::PathBuf;
 use tokio::net::{TcpListener, UnixStream};
 

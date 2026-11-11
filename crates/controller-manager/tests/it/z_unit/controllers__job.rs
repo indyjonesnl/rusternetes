@@ -4,28 +4,28 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::workloads::{
+    pub use k3rs_common::resources::workloads::{
         Job, JobCondition, JobStatus, SuccessPolicy, UncountedTerminatedPods,
     };
-    pub use rusternetes_common::resources::{Pod, PodStatus};
-    pub use rusternetes_common::types::{OwnerReference, Phase};
-    pub use rusternetes_controller_manager::controllers::controller_utils::{
+    pub use k3rs_common::resources::{Pod, PodStatus};
+    pub use k3rs_common::types::{OwnerReference, Phase};
+    pub use k3rs_controller_manager::controllers::controller_utils::{
         is_pod_ready, sort_active_pods,
     };
-    pub use rusternetes_controller_manager::controllers::expectations::ControllerExpectations;
-    pub use rusternetes_controller_manager::controllers::job_tracking::{
+    pub use k3rs_controller_manager::controllers::expectations::ControllerExpectations;
+    pub use k3rs_controller_manager::controllers::job_tracking::{
         clean_uncounted_pods_without_finalizers, has_job_tracking_finalizer, push_uncounted_failed,
         push_uncounted_succeeded, remove_tracking_finalizer, uncounted_has_failed,
         uncounted_has_succeeded, FinalizerExpectations, JOB_TRACKING_FINALIZER,
     };
-    pub use rusternetes_controller_manager::controllers::pod_informer::{
+    pub use k3rs_controller_manager::controllers::pod_informer::{
         ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer,
     };
-    pub use rusternetes_controller_manager::controllers::replicationcontroller::{
+    pub use k3rs_controller_manager::controllers::replicationcontroller::{
         generate_pod_name, slow_start_batches_capped, MAX_NAME_GENERATION_CREATE_ATTEMPTS,
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -35,14 +35,14 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::workloads::{Job, JobSpec, PodTemplateSpec};
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::workloads::{Job, JobSpec, PodTemplateSpec};
+    use k3rs_common::resources::{
         Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
         ContainerStatus, Pod, PodCondition, PodSpec, PodStatus,
     };
-    use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-    use rusternetes_controller_manager::controllers::job::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+    use k3rs_controller_manager::controllers::job::*;
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashMap;
 
     fn test_container() -> Container {
@@ -533,7 +533,7 @@ mod tests {
             .create_pod(&job, "default", 0, false, None)
             .await
             .unwrap_err();
-        assert!(rusternetes_controller_manager::controllers::is_already_exists_anyhow(&err));
+        assert!(k3rs_controller_manager::controllers::is_already_exists_anyhow(&err));
         let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
         assert!(pods.is_empty());
     }
@@ -545,9 +545,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = JobController::new(storage.clone());
 
-        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        let mut sa = k3rs_common::resources::ServiceAccount::new("default", "default");
         sa.image_pull_secrets = Some(vec![
-            rusternetes_common::resources::service_account::LocalObjectReference {
+            k3rs_common::resources::service_account::LocalObjectReference {
                 name: "regcred".to_string(),
             },
         ]);
@@ -1299,7 +1299,7 @@ mod tests {
             2,
         );
         if let Some(ref mut st) = pod2.status {
-            st.conditions = Some(vec![rusternetes_common::resources::PodCondition {
+            st.conditions = Some(vec![k3rs_common::resources::PodCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
                 reason: None,
@@ -1596,7 +1596,7 @@ mod tests {
         // Set up a selector with controller-uid (like the API server auto-generates)
         let mut match_labels = HashMap::new();
         match_labels.insert("controller-uid".to_string(), job_uid.to_string());
-        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+        job.spec.selector = Some(k3rs_common::types::LabelSelector {
             match_labels: Some(match_labels),
             match_expressions: None,
         });
@@ -1679,7 +1679,7 @@ mod tests {
         job.metadata.uid = job_uid.to_string();
         let mut match_labels = HashMap::new();
         match_labels.insert("controller-uid".to_string(), job_uid.to_string());
-        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+        job.spec.selector = Some(k3rs_common::types::LabelSelector {
             match_labels: Some(match_labels),
             match_expressions: None,
         });
@@ -1758,7 +1758,7 @@ mod tests {
         job.metadata.uid = job_uid.to_string();
         let mut match_labels = HashMap::new();
         match_labels.insert("controller-uid".to_string(), job_uid.to_string());
-        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+        job.spec.selector = Some(k3rs_common::types::LabelSelector {
             match_labels: Some(match_labels),
             match_expressions: None,
         });
@@ -2223,7 +2223,7 @@ mod tests {
 
     fn job_with_selector(name: &str) -> Job {
         let mut job = make_job(name, "default", 4, 2);
-        job.spec.selector = Some(rusternetes_common::types::LabelSelector {
+        job.spec.selector = Some(k3rs_common::types::LabelSelector {
             match_labels: Some(HashMap::from([("job-name".to_string(), name.to_string())])),
             match_expressions: None,
         });
@@ -2964,7 +2964,7 @@ mod tests {
         }
     }
 
-    type CResult<T> = std::result::Result<T, rusternetes_common::Error>;
+    type CResult<T> = std::result::Result<T, k3rs_common::Error>;
 
     #[async_trait::async_trait]
     impl Storage for PartialDrainStorage {
@@ -2985,7 +2985,7 @@ mod tests {
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             if self.refuse(key) {
-                return Err(rusternetes_common::Error::Internal(
+                return Err(k3rs_common::Error::Internal(
                     "injected pod update failure".into(),
                 ));
             }
@@ -3008,14 +3008,14 @@ mod tests {
         {
             self.inner.list(prefix).await
         }
-        async fn watch(&self, prefix: &str) -> CResult<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> CResult<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
         async fn watch_from_revision(
             &self,
             prefix: &str,
             revision: i64,
-        ) -> CResult<rusternetes_storage::WatchStream> {
+        ) -> CResult<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
         async fn current_revision(&self) -> CResult<i64> {
@@ -3521,7 +3521,7 @@ mod tests {
         );
         let pods = live_pods(&storage).await;
         for pod in &pods {
-            let ev = rusternetes_storage::WatchEvent::Added(
+            let ev = k3rs_storage::WatchEvent::Added(
                 format!("pods/default/{}", pod.metadata.name),
                 serde_json::to_string(pod).unwrap(),
             );
@@ -3557,7 +3557,7 @@ mod tests {
         controller.reconcile(&mut job).await.unwrap();
         assert!(!controller.expectations.satisfied("default/sus2"));
         let gone: Pod = storage.get("/registry/pods/default/p1").await.unwrap();
-        let ev = rusternetes_storage::WatchEvent::Modified(
+        let ev = k3rs_storage::WatchEvent::Modified(
             "pods/default/p1".to_string(),
             serde_json::to_string(&gone).unwrap(),
         );
@@ -3566,7 +3566,7 @@ mod tests {
     }
 
     // ---- #3869: the pod handlers on the shared pod informer ----------------
-    use rusternetes_controller_manager::controllers::pod_informer::apply_pod_observation;
+    use k3rs_controller_manager::controllers::pod_informer::apply_pod_observation;
     //
     // Ports of `TestAddPod*`/`TestUpdatePod*`/`TestDeletePod*`-style cases
     // (job_controller_test.go) and the handler bodies they pin
@@ -3577,7 +3577,7 @@ mod tests {
     async fn deliver(
         controller: &JobController<MemoryStorage>,
         queue: &WorkQueue,
-        event: rusternetes_storage::WatchEvent,
+        event: k3rs_storage::WatchEvent,
     ) {
         if let Some(observation) = controller.pod_informer.cache().on_event(&event) {
             apply_pod_observation(controller, queue, &observation).await;
@@ -3585,9 +3585,9 @@ mod tests {
     }
 
     fn pod_event(
-        kind: fn(String, String) -> rusternetes_storage::WatchEvent,
+        kind: fn(String, String) -> k3rs_storage::WatchEvent,
         pod: &Pod,
-    ) -> rusternetes_storage::WatchEvent {
+    ) -> k3rs_storage::WatchEvent {
         kind(
             format!("/registry/pods/default/{}", pod.metadata.name),
             serde_json::to_string(pod).unwrap(),
@@ -3637,7 +3637,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         drain(&queue, Duration::from_millis(1500)).await;
@@ -3650,7 +3650,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+            pod_event(k3rs_storage::WatchEvent::Modified, &pod),
         )
         .await;
 
@@ -3677,7 +3677,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         controller
@@ -3687,7 +3687,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+            pod_event(k3rs_storage::WatchEvent::Modified, &pod),
         )
         .await;
         assert_eq!(
@@ -3715,7 +3715,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Deleted, &pod),
+            pod_event(k3rs_storage::WatchEvent::Deleted, &pod),
         )
         .await;
         assert!(controller.expectations.satisfied("default/fd"));
@@ -3741,7 +3741,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         controller
@@ -3755,7 +3755,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+            pod_event(k3rs_storage::WatchEvent::Modified, &pod),
         )
         .await;
         assert!(controller.expectations.satisfied("default/ft"));
@@ -3799,7 +3799,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Modified, &pod),
+            pod_event(k3rs_storage::WatchEvent::Modified, &pod),
         )
         .await;
         assert!(
@@ -3828,7 +3828,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         // `enqueueOrphanPod` only enqueues (:630-641); the orphanWorker
@@ -3866,7 +3866,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         assert_eq!(
@@ -3913,7 +3913,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         assert!(!controller.expectations.satisfied("default/uid"));
@@ -3930,7 +3930,7 @@ mod tests {
         deliver(
             &controller,
             &queue,
-            pod_event(rusternetes_storage::WatchEvent::Added, &pod),
+            pod_event(k3rs_storage::WatchEvent::Added, &pod),
         )
         .await;
         assert!(
@@ -3972,7 +3972,7 @@ mod tests {
         p.spec.as_mut().unwrap().node_name = node.map(str::to_string);
         if ready {
             p.status.as_mut().unwrap().conditions =
-                Some(vec![rusternetes_common::resources::pod::PodCondition {
+                Some(vec![k3rs_common::resources::pod::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,

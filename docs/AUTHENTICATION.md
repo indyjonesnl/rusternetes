@@ -1,10 +1,10 @@
-# Rūsternetes Authentication & Authorization Guide
+# k3rs Authentication & Authorization Guide
 
-This guide covers how to configure authentication and authorization in rusternetes, how to create user tokens, and how to move from insecure development mode to a properly secured cluster.
+This guide covers how to configure authentication and authorization in k3rs, how to create user tokens, and how to move from insecure development mode to a properly secured cluster.
 
 ## The Problem: `--skip-auth`
 
-By default, rusternetes runs with `--skip-auth` enabled. This means:
+By default, k3rs runs with `--skip-auth` enabled. This means:
 
 - Every request is treated as coming from `admin` in the `system:masters` group
 - No tokens are required
@@ -40,15 +40,15 @@ The API server needs an RSA key pair for signing and validating JWT tokens. Thes
 
 ```bash
 # Generate RSA key pair
-mkdir -p .rusternetes/certs
-openssl genrsa -out .rusternetes/certs/sa.key 2048
-openssl rsa -in .rusternetes/certs/sa.key -pubout -out .rusternetes/certs/sa.pub
+mkdir -p .k3rs/certs
+openssl genrsa -out .k3rs/certs/sa.key 2048
+openssl rsa -in .k3rs/certs/sa.key -pubout -out .k3rs/certs/sa.pub
 ```
 
 The API server searches for keys in these locations (in order):
 1. `/etc/kubernetes/pki/sa.key` + `sa.pub`
-2. `~/.rusternetes/certs/sa.key` + `sa.pub`
-3. `~/.rusternetes/keys/sa-signing-key.pem` + `sa-signing-key.pub`
+2. `~/.k3rs/certs/sa.key` + `sa.pub`
+3. `~/.k3rs/keys/sa-signing-key.pem` + `sa-signing-key.pub`
 
 If no RSA keys are found, it falls back to HMAC-SHA256 using the `--jwt-secret` value.
 
@@ -57,7 +57,7 @@ If no RSA keys are found, it falls back to HMAC-SHA256 using the `--jwt-secret` 
 Before disabling skip-auth, create an admin ServiceAccount so you can authenticate after the switch.
 
 ```bash
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 
 # Create an admin ServiceAccount
 kubectl create serviceaccount cluster-admin -n kube-system
@@ -104,8 +104,8 @@ Update your kubeconfig to use the token:
 ```bash
 TOKEN=$(kubectl get secret cluster-admin-token -n kube-system -o jsonpath='{.data.token}' | base64 -d)
 
-kubectl config set-credentials rusternetes-admin --token="$TOKEN"
-kubectl config set-context rusternetes --user=rusternetes-admin
+kubectl config set-credentials k3rs-admin --token="$TOKEN"
+kubectl config set-context k3rs --user=k3rs-admin
 ```
 
 ### Step 4: Restart without `--skip-auth`
@@ -122,7 +122,7 @@ podman compose up -d api-server
 **All-in-one binary:**
 
 ```bash
-rusternetes --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
+k3rs --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
 ```
 
 **Verify:** `curl -k https://localhost:6443/api/v1/pods` should return 401/403.
@@ -136,7 +136,7 @@ The primary token type. Signed with RS256 (RSA + SHA256) for OIDC compatibility,
 JWT claims include:
 - `sub`: `system:serviceaccount:<namespace>:<name>`
 - `iss`: `https://kubernetes.default.svc.cluster.local`
-- `aud`: `["rusternetes"]`
+- `aud`: `["k3rs"]`
 - `kubernetes.io`: namespace, serviceaccount name/uid, optional pod/node binding
 
 Tokens are validated against the signing key on every request.
@@ -176,7 +176,7 @@ The `system:masters` group always gets full access (like the `admin` user in ski
 
 ### Built-in ClusterRoles
 
-Rusternetes bootstraps with the standard Kubernetes ClusterRoles:
+k3rs bootstraps with the standard Kubernetes ClusterRoles:
 
 | ClusterRole | Access |
 |-------------|--------|
@@ -219,17 +219,17 @@ When the web console is enabled (`--console-dir`), authentication depends on the
 | `--skip-auth` | Open to anyone — no token needed |
 | Auth enabled | Console loads but API calls require a valid token |
 
-In auth-enabled mode, the console reads a JWT from the browser's `sessionStorage` (key: `rusternetes-token`) and sends it as a `Bearer` token on all API requests. You can set this manually in the browser console:
+In auth-enabled mode, the console reads a JWT from the browser's `sessionStorage` (key: `k3rs-token`) and sends it as a `Bearer` token on all API requests. You can set this manually in the browser console:
 
 ```javascript
-sessionStorage.setItem('rusternetes-token', '<your-jwt-token>');
+sessionStorage.setItem('k3rs-token', '<your-jwt-token>');
 ```
 
 A login page that prompts for a token and stores it in sessionStorage is planned but not yet implemented.
 
 ## Security Checklist
 
-Before exposing a rusternetes cluster to a network:
+Before exposing a k3rs cluster to a network:
 
 - [ ] Remove `--skip-auth` from the API server command and pass `--authorization-mode=Node,RBAC` (the default is `AlwaysAllow`)
 - [ ] Generate RSA signing keys for ServiceAccount tokens
@@ -241,14 +241,14 @@ Before exposing a rusternetes cluster to a network:
 
 ## Client Certificate Authentication (mTLS)
 
-Rusternetes supports mutual TLS for client certificate authentication, just like real Kubernetes. When `--client-ca-file` is set, the TLS layer requires clients to present a certificate signed by the specified CA.
+k3rs supports mutual TLS for client certificate authentication, just like real Kubernetes. When `--client-ca-file` is set, the TLS layer requires clients to present a certificate signed by the specified CA.
 
 ### Setup
 
 ```bash
 # Generate a CA
 openssl genrsa -out ca.key 2048
-openssl req -new -x509 -key ca.key -out ca.crt -days 3650 -subj "/CN=rusternetes-ca"
+openssl req -new -x509 -key ca.key -out ca.crt -days 3650 -subj "/CN=k3rs-ca"
 
 # Generate a client certificate for an admin user
 # CN becomes the username, O becomes a group
@@ -257,7 +257,7 @@ openssl req -new -key admin.key -out admin.csr -subj "/CN=admin/O=system:masters
 openssl x509 -req -in admin.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out admin.crt -days 365
 
 # Start the API server with client CA
-rusternetes \
+k3rs \
   --tls \
   --tls-cert-file server.crt \
   --tls-key-file server.key \
@@ -281,7 +281,7 @@ The `--client-ca-file` flag tells the API server to require client certificates 
 |------|---------|-------------|
 | `--skip-auth` | `true` (all-in-one) / `false` (standalone) | Skip authentication and authorization |
 | `--authorization-mode` | `AlwaysAllow` | Ordered, comma-delimited authorizers: AlwaysAllow,AlwaysDeny,ABAC,Webhook,RBAC,Node. Pass `Node,RBAC` for a secured cluster |
-| `--jwt-secret` | `rusternetes-secret-change-in-production` | HMAC secret for JWT signing (fallback when no RSA keys) |
+| `--jwt-secret` | `k3rs-secret-change-in-production` | HMAC secret for JWT signing (fallback when no RSA keys) |
 | `--tls` | `false` | Enable TLS/HTTPS |
 | `--tls-cert-file` | — | Path to TLS certificate (PEM) |
 | `--tls-key-file` | — | Path to TLS private key (PEM) |
@@ -293,8 +293,8 @@ The `--client-ca-file` flag tells the API server to require client certificates 
 The TokenManager searches for RSA keys in this order:
 
 1. `/etc/kubernetes/pki/sa.key` + `sa.pub` (Docker Compose / production)
-2. `~/.rusternetes/certs/sa.key` + `sa.pub` (local development)
-3. `~/.rusternetes/keys/sa-signing-key.pem` + `sa-signing-key.pub` (legacy)
+2. `~/.k3rs/certs/sa.key` + `sa.pub` (local development)
+3. `~/.k3rs/keys/sa-signing-key.pem` + `sa-signing-key.pub` (legacy)
 
 If none are found, HMAC-SHA256 is used with the `--jwt-secret` value. RSA is strongly preferred because it enables OIDC token verification by external systems (the public key can be distributed without exposing the signing secret).
 
@@ -305,4 +305,4 @@ These authentication methods have framework code in the codebase but are not yet
 - **OIDC Token Validation** — `OIDCTokenValidator` in `crates/common/src/auth.rs` can validate tokens against an external OIDC provider's JWKS endpoint
 - **Webhook Token Authentication** — `WebhookTokenAuthenticator` in `crates/common/src/auth.rs` can delegate token validation to an external webhook
 - **Client Certificate Identity Extraction** — mTLS enforcement works via `--client-ca-file`, but CN/O fields from the client certificate are not yet extracted into UserInfo for RBAC decisions. The plumbing exists in `UserInfo::from_client_cert()` but needs to be connected to the TLS connection layer.
-- **Static Token File** — Not implemented; K8s supports a `--token-auth-file` CSV but rusternetes does not
+- **Static Token File** — Not implemented; K8s supports a `--token-auth-file` CSV but k3rs does not

@@ -3,23 +3,23 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         ingress::{HTTPIngressPath, IngressBackend, IngressRule, IngressSpec, IngressTLS},
         Ingress, IngressClass, Secret, Service,
     };
-    pub use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+    pub use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info, warn};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::ingress::{
+    use k3rs_common::resources::ingress::{
         HTTPIngressRuleValue, IngressServiceBackend, ServiceBackendPort,
     };
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::ingress::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::ingress::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_validate_path_type_valid() {
@@ -211,7 +211,7 @@ mod tests {
         };
 
         let ingress = Ingress {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Ingress".to_string(),
                 api_version: "networking.k8s.io/v1".to_string(),
             },
@@ -225,7 +225,7 @@ mod tests {
         };
 
         // Create the IngressClass "nginx" so validation passes
-        use rusternetes_common::resources::IngressClass;
+        use k3rs_common::resources::IngressClass;
         let class_key = build_key("ingressclasses", None, "nginx");
         storage
             .create(&class_key, &IngressClass::new("nginx"))

@@ -3,9 +3,9 @@
 //! Tests all CRUD operations, edge cases, and error handling for serviceaccounts.
 //! ServiceAccount provides an identity for processes running in a Pod.
 
-use rusternetes_common::resources::{LocalObjectReference, ObjectReference, ServiceAccount};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{LocalObjectReference, ObjectReference, ServiceAccount};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -373,7 +373,7 @@ async fn test_sa_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut sa = create_test_sa("test-owner", "default");
-    sa.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    sa.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "v1".to_string(),
         kind: "Namespace".to_string(),
         name: "default".to_string(),

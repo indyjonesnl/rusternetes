@@ -1,21 +1,21 @@
 # GHCR image-name overlay for the compose.node-conformance.yml single-node
 # stack. Same images as compose.ghcr.yml — both stacks build identical
 # services.Dockerfile targets. Consumed by scripts/run-node-conformance.sh
-# when RUSTERNETES_IMAGE_TAG is set (pull instead of build, with fallback).
+# when K3RS_IMAGE_TAG is set (pull instead of build, with fallback).
 # Keep in sync with compose.node-conformance.yml —
 # scripts/tests/test-ghcr-overlays.sh enforces it.
 
 services:
   rhino:
-    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${K3RS_IMAGE_TAG:-main}"
   api-server:
-    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${K3RS_IMAGE_TAG:-main}"
   kubelet:
-    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${K3RS_IMAGE_TAG:-main}"
   scheduler:
-    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${K3RS_IMAGE_TAG:-main}"
   controller-manager:
-    image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${K3RS_IMAGE_TAG:-main}"
   # CRI runtime image (containerd + crun + CNI) the kubelet talks to.
   containerd:
-    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${K3RS_IMAGE_TAG:-main}"

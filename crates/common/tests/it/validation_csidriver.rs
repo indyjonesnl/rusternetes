@@ -1,8 +1,8 @@
 //! Tests for CSIDriver validation (port of upstream `ValidateCSIDriver`).
 
-use rusternetes_common::resources::csi::{CSIDriver, CSIDriverSpec, TokenRequest};
-use rusternetes_common::validation::csidriver::validate_csi_driver;
-use rusternetes_common::validation::field::ErrorType;
+use k3rs_common::resources::csi::{CSIDriver, CSIDriverSpec, TokenRequest};
+use k3rs_common::validation::csidriver::validate_csi_driver;
+use k3rs_common::validation::field::ErrorType;
 
 fn driver(spec: CSIDriverSpec) -> CSIDriver {
     let mut d = CSIDriver {
@@ -36,7 +36,7 @@ fn tr(audience: &str, expiration: Option<i64>) -> TokenRequest {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field_substr: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field_substr: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field_substr))
 }
 

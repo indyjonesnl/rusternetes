@@ -11,10 +11,10 @@ use crate::fwk::{
 };
 use crate::signers;
 use async_trait::async_trait;
-use rusternetes_common::resources::pod::{
+use k3rs_common::resources::pod::{
     NodeAffinity, NodeSelector, PreferredSchedulingTerm, Toleration,
 };
-use rusternetes_common::resources::{Node, Pod, Taint};
+use k3rs_common::resources::{Node, Pod, Taint};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -392,7 +392,7 @@ impl RequiredNodeAffinity {
             }
         }
         match &self.required_affinity {
-            Some(required) => rusternetes_common::affinity::matches_node_selector(node, required),
+            Some(required) => k3rs_common::affinity::matches_node_selector(node, required),
             None => true,
         }
     }
@@ -516,7 +516,7 @@ impl FilterPlugin for NodeAffinityPlugin {
     async fn filter(&self, state: &CycleState, pod: &Pod, node_info: &NodeInfo<'_>) -> Status {
         let node = node_info.node();
         if let Some(added) = &self.added_node_selector {
-            if !rusternetes_common::affinity::matches_node_selector(node, added) {
+            if !k3rs_common::affinity::matches_node_selector(node, added) {
                 return Status::new(
                     Code::UnschedulableAndUnresolvable,
                     vec![ERR_REASON_ENFORCED.to_string()],
@@ -630,7 +630,7 @@ impl FitIgnoredResources {
     /// The skip in `fitsRequest` (fit.go:710-718): only extended resources
     /// can be ignored.
     fn ignores(&self, name: &str) -> bool {
-        if !rusternetes_common::quota::is_extended_resource_name(name) {
+        if !k3rs_common::quota::is_extended_resource_name(name) {
             return false;
         }
         // rName is guaranteed to have a slash due to API validation.
@@ -655,8 +655,7 @@ impl Plugin for NodeResourcesFit {
 pub(crate) fn counts_against_node(pod: &Pod) -> bool {
     !matches!(
         pod.status.as_ref().and_then(|s| s.phase.as_ref()),
-        Some(rusternetes_common::types::Phase::Succeeded)
-            | Some(rusternetes_common::types::Phase::Failed)
+        Some(k3rs_common::types::Phase::Succeeded) | Some(k3rs_common::types::Phase::Failed)
     )
 }
 
@@ -1322,13 +1321,12 @@ const DYNAMIC_RESOURCES_STATE_KEY: &str = "PreFilterDynamicResources";
 /// `dynamicresources.stateData`: the pod's resolved claims, and the
 /// ResourceSlices when an allocated claim has devices to place.
 struct DynamicResourcesState {
-    claims: Vec<rusternetes_common::resources::ResourceClaim>,
-    slices: Vec<rusternetes_common::resources::ResourceSlice>,
+    claims: Vec<k3rs_common::resources::ResourceClaim>,
+    slices: Vec<k3rs_common::resources::ResourceSlice>,
     /// `state.claims.set(index, claim)` (dynamicresources.go:1100-1101): the
     /// claims as PreBind updated them, for Unreserve.
-    updated: std::sync::Mutex<
-        std::collections::HashMap<usize, rusternetes_common::resources::ResourceClaim>,
-    >,
+    updated:
+        std::sync::Mutex<std::collections::HashMap<usize, k3rs_common::resources::ResourceClaim>>,
 }
 
 /// `dynamicresources.DynamicResources` (`plugins/dynamicresources/dynamicresources.go`):
@@ -1337,7 +1335,7 @@ struct DynamicResourcesState {
 /// any; Filter (:631-) rejects a node outside an allocated claim's node
 /// selector.
 ///
-/// Deviations: Rusternetes has no structured-parameters allocator, so an
+/// Deviations: k3rs has no structured-parameters allocator, so an
 /// unallocated claim cannot be satisfied and rejects every node
 /// ("cannot allocate all claims"), and an allocated claim's devices must be
 /// advertised by a ResourceSlice of the node (driver, pool, device). A
@@ -1497,7 +1495,7 @@ impl ReservePlugin for DynamicResources {
 const CLAIM_UPDATE_ATTEMPTS: usize = 5;
 
 /// `resourceclaim.IsReservedForPod`.
-fn is_reserved_for_pod(pod: &Pod, claim: &rusternetes_common::resources::ResourceClaim) -> bool {
+fn is_reserved_for_pod(pod: &Pod, claim: &k3rs_common::resources::ResourceClaim) -> bool {
     claim
         .status
         .as_ref()
@@ -1551,11 +1549,11 @@ impl PreBindPlugin for DynamicResources {
 /// tell us with a non-conflict error if this isn't possible." On a conflict
 /// the latest claim is fetched and the update retried.
 async fn bind_claim(
-    claim: &rusternetes_common::resources::ResourceClaim,
+    claim: &k3rs_common::resources::ResourceClaim,
     pod: &Pod,
     handle: &dyn Handle,
-) -> Result<rusternetes_common::resources::ResourceClaim, String> {
-    use rusternetes_common::resources::dra::ResourceClaimConsumerReference;
+) -> Result<k3rs_common::resources::ResourceClaim, String> {
+    use k3rs_common::resources::dra::ResourceClaimConsumerReference;
     let ns = claim.metadata.namespace.as_deref().unwrap_or("default");
     let mut claim = claim.clone();
     let mut refresh = false;
@@ -1623,7 +1621,7 @@ impl FilterPlugin for DynamicResources {
             };
             // This node selector only gets set if the claim is allocated.
             if let Some(selector) = &allocation.node_selector {
-                if !rusternetes_common::affinity::matches_node_selector(node, selector) {
+                if !k3rs_common::affinity::matches_node_selector(node, selector) {
                     return Status::new(
                         Code::UnschedulableAndUnresolvable,
                         vec!["resourceclaim not available on the node".to_string()],
@@ -1719,9 +1717,8 @@ impl SignPlugin for NodePorts {
 /// DRAExtendedResource is on because the request then depends on the
 /// DeviceClasses.
 fn resources_fragment(pod: &Pod) -> (Vec<SignFragment>, Status) {
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::DRAExtendedResource,
-    ) {
+    if k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::DRAExtendedResource)
+    {
         return (
             Vec::new(),
             Status::new(
@@ -1954,8 +1951,7 @@ fn preferred_terms_score(terms: &[PreferredSchedulingTerm], node: &Node) -> i64 
     terms
         .iter()
         .filter(|t| {
-            t.weight != 0
-                && rusternetes_common::affinity::matches_node_selector_term(node, &t.preference)
+            t.weight != 0 && k3rs_common::affinity::matches_node_selector_term(node, &t.preference)
         })
         .map(|t| i64::from(t.weight))
         .sum()
@@ -2394,9 +2390,7 @@ impl VolumeBindingScore {
 }
 
 fn storage_capacity_scoring() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
-    )
+    k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::StorageCapacityScoring)
 }
 
 impl Plugin for VolumeBindingScore {

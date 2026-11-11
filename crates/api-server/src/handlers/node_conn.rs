@@ -3,7 +3,7 @@
 /// Extracted from `proxy.rs` so that Tasks 6 and 7 (exec/attach/logs routing)
 /// can reuse the same InternalIP→ExternalIP fallback, advertised-port lookup,
 /// and scheme selection without duplicating the logic.
-use rusternetes_common::resources::Node;
+use k3rs_common::resources::Node;
 
 /// Resolved kubelet connection parameters for a node.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,12 +28,9 @@ pub struct NodeConn {
 /// 2. `status.daemonEndpoints.kubeletEndpoint.port` — advertised by the kubelet.
 /// 3. 10250 — the Kubernetes default.
 ///
-/// Returns `Err(rusternetes_common::Error::NotFound)` when the node has no
+/// Returns `Err(k3rs_common::Error::NotFound)` when the node has no
 /// usable address.
-pub fn node_conn(
-    node: &Node,
-    port_override: Option<u16>,
-) -> Result<NodeConn, rusternetes_common::Error> {
+pub fn node_conn(node: &Node, port_override: Option<u16>) -> Result<NodeConn, k3rs_common::Error> {
     let host = node
         .status
         .as_ref()
@@ -46,7 +43,7 @@ pub fn node_conn(
         })
         .map(|a| a.address.clone())
         .ok_or_else(|| {
-            rusternetes_common::Error::NotFound(format!(
+            k3rs_common::Error::NotFound(format!(
                 "No address found for node {}",
                 node.metadata.name,
             ))

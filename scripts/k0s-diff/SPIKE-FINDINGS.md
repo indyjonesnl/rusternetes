@@ -35,7 +35,7 @@ CRI to containerd-rs and launches **no containerd of its own**.
   DB at `/var/lib/k0s/db/state.db` (WAL). kine listens on
   `unix:///run/k0s/kine/kine.sock:2379`; the apiserver uses
   `--etcd-servers=unix:/run/k0s/kine/kine.sock:2379`. Because kine exposes the
-  etcd v3 gRPC API, the later **v1 variant (rusternetes-api-server) can point
+  etcd v3 gRPC API, the later **v1 variant (k3rs-api-server) can point
   its `--etcd_servers` at kine's endpoint** (`/run/k0s/kine/kine.sock`) — no
   separate etcd needed. kine runs in-process/supervised, so it is **NOT a
   kube-system pod**; the pod-Ready gate covers only the real workloads.
@@ -50,7 +50,7 @@ CRI to containerd-rs and launches **no containerd of its own**.
    mount/pid namespaces — the kubelet references pod bundles, netns and mounts
    that containerd-rs/crun create; a separate compose service cannot see them.
    Every prior working k0s+containerd-rs stack in this monorepo
-   (`rustified-kubernetes-stack/`, `rusternetes-m1/`) bakes the runtime into the
+   (`rustified-kubernetes-stack/`, `k3rs-m1/`) bakes the runtime into the
    node image for this reason. This is the "simplest wiring that works" the task
    ambiguity note allows.
 2. **`kuberouter` CNI, NOT `flannel/vxlan` from the repo `k0s-config.yaml`.**
@@ -135,7 +135,7 @@ Verified live on v0 — the staged `kube-apiserver` (85881016 B) carries the
 **identical** mtime (`1781605209`, 2026-06-16 10:20:09 UTC) as `/usr/local/bin/k0s`.
 
 **Consequence / the v1–v4 override mechanism (used now).** Pre-stage the
-Rusternetes shim at `/var/lib/k0s/bin/<name>` BEFORE `k0s controller` starts,
+k3rs shim at `/var/lib/k0s/bin/<name>` BEFORE `k0s controller` starts,
 padded (NUL, via `truncate`) to exactly `originalSize` and stamped
 (`touch -r /usr/local/bin/k0s`) with the k0s exe's mtime. k0s then treats it as
 "up to date", skips extraction, and execs the shim verbatim — surviving every
@@ -162,22 +162,22 @@ output for the downstream shim tasks:
 
 **Recommendation — baked custom image per variant (v1–v4).** Because k0s
 re-extracts staged binaries from its *embedded* assets before every launch, the
-only reliable place to inject a Rusternetes replacement is to defeat that
+only reliable place to inject a k3rs replacement is to defeat that
 extraction, and the robust way is a per-variant node image. Two candidate
 implementations for the swap task to pick between (both need one confirmatory
 experiment, tracked below):
 
 - **(preferred) Interpose at the exec, not the file.** Wrap so k0s launches the
-  Rusternetes binary even though it re-extracts the Go one — e.g. bake the
-  Rusternetes component elsewhere and make `k0s`'s supervised path resolve to
-  it. The Rusternetes components run in "API mode" via `--kubeconfig` against
+  k3rs binary even though it re-extracts the Go one — e.g. bake the
+  k3rs component elsewhere and make `k0s`'s supervised path resolve to
+  it. The k3rs components run in "API mode" via `--kubeconfig` against
   the k0s api-server (kubeconfigs enumerated below), so the shim needs the
   component's kubeconfig + the config file k0s generated (paths below), not the
   raw Go argv verbatim in all cases.
-- **(fallback) External-process topology.** Run the Rusternetes component as a
+- **(fallback) External-process topology.** Run the k3rs component as a
   separate process/container against the k0s api-server and neutralize k0s's own
   copy. k0s has no per-component disable flag, so this only cleanly applies to
-  api-server (v1: run Rusternetes api-server externally, point k0s workers at it,
+  api-server (v1: run k3rs api-server externally, point k0s workers at it,
   the way the prior stacks point k0s at external rhino/etcd).
 
 **Open question for the swap task (must confirm before writing v1–v4):** whether

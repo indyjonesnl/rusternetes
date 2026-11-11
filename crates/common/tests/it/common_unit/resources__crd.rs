@@ -2,19 +2,19 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::types::ObjectMeta;
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::crd::*;
+    use k3rs_common::resources::crd::*;
 
     #[test]
     fn test_jsonschema_items_accepts_cbor_struct_form() {
         // A vnd.kubernetes CBOR client (1.35) sends `items` in the Go struct
-        // form `{"schema": {...}}` (transcoded to JSON by rusternetes), not the
+        // form `{"schema": {...}}` (transcoded to JSON by k3rs), not the
         // JSON-inlined form. Both must decode to the same Schema, and the inner
         // schema's fields must be preserved (regression: the old untagged derive
         // parsed it as an empty schema and strict validation rejected
@@ -213,7 +213,7 @@ mod tests {
         });
 
         // Deserialize to typed struct
-        let crd: rusternetes_common::resources::CustomResourceDefinition =
+        let crd: k3rs_common::resources::CustomResourceDefinition =
             serde_json::from_value(crd_json).expect("Failed to deserialize CRD");
 
         // Check that enum values are preserved in the typed struct

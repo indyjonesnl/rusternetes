@@ -24,7 +24,7 @@ use axum::{
     response::Response,
 };
 use chrono::Utc;
-use rusternetes_common::audit::{
+use k3rs_common::audit::{
     AuditBackend, AuditEvent, AuditLevel, AuditStage, ObjectReference, ResponseStatus, UserInfo,
 };
 use serde::Deserialize;
@@ -491,7 +491,7 @@ pub fn request_info(method: &Method, path: &str, query: Option<&str>) -> Attribu
 /// selector yields `None`, as `DecodeParameters` failing leaves
 /// `opts.FieldSelector` nil (requestinfo.go:225-232).
 pub fn field_selector_exact_match(query: &str, field: &str) -> Option<String> {
-    use rusternetes_common::field_selector::{FieldOperator, FieldSelector};
+    use k3rs_common::field_selector::{FieldOperator, FieldSelector};
     let raw = url::form_urlencoded::parse(query.as_bytes())
         .find(|(k, _)| k == "fieldSelector")?
         .1;
@@ -565,7 +565,7 @@ impl AuditContext {
     /// record each non-zero layer latency plus the request total.
     fn write_latency_to_annotation(
         &self,
-        trackers: Option<&rusternetes_common::latency_trackers::LatencyTrackers>,
+        trackers: Option<&k3rs_common::latency_trackers::LatencyTrackers>,
     ) {
         const THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
         let received = match self.inner.lock() {
@@ -576,14 +576,14 @@ impl AuditContext {
         if latency <= THRESHOLD {
             return;
         }
-        let mut layer = match trackers.map(rusternetes_common::latency_trackers::annotations_from) {
+        let mut layer = match trackers.map(k3rs_common::latency_trackers::annotations_from) {
             Some(l) if !l.is_empty() => l,
             // "latency tracking is not enabled for this request"
             _ => return,
         };
         layer.push((
             "apiserver.latency.k8s.io/total".to_string(),
-            rusternetes_common::go_duration::format_go_duration(latency.as_nanos() as i64),
+            k3rs_common::go_duration::format_go_duration(latency.as_nanos() as i64),
         ));
         self.add_annotations(&layer);
     }
@@ -991,15 +991,15 @@ fn new_audit_context(
 pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Response {
     let effective = req
         .extensions()
-        .get::<rusternetes_middleware::AuthContext>()
+        .get::<k3rs_middleware::AuthContext>()
         .map(|c| c.user.clone())
-        .unwrap_or_else(rusternetes_common::auth::UserInfo::anonymous);
+        .unwrap_or_else(k3rs_common::auth::UserInfo::anonymous);
     // Upstream's audit filter sits before the impersonation filter, so the
     // event's user (and the policy's) is the real caller; the impersonated
     // identity is added by `LogImpersonatedUser` once impersonation ran.
     let impersonated = req
         .extensions()
-        .get::<rusternetes_middleware::AuthImpersonator>()
+        .get::<k3rs_middleware::AuthImpersonator>()
         .map(|i| (i.0.clone(), effective.clone()));
     let user = impersonated
         .as_ref()
@@ -1033,7 +1033,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     // (e.g. `authentication.k8s.io/legacy-token*`, legacy.go:143-170).
     if let Some(a) = req
         .extensions()
-        .get::<rusternetes_middleware::AuthAuditAnnotations>()
+        .get::<k3rs_middleware::AuthAuditAnnotations>()
     {
         ac.add_annotations(&a.0);
     }
@@ -1067,9 +1067,9 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     // The error writer (`Error::into_response`) cannot reach this crate's
     // audit context; it hands the Status it serialized over as a response
     // extension, recorded here exactly as `LogResponseObject` would have.
-    if let Some(rusternetes_common::audit::AuditResponseObject(obj)) =
+    if let Some(k3rs_common::audit::AuditResponseObject(obj)) =
         resp.extensions_mut()
-            .remove::<rusternetes_common::audit::AuditResponseObject>()
+            .remove::<k3rs_common::audit::AuditResponseObject>()
     {
         ac.log_response_object(&obj);
     }
@@ -1080,7 +1080,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
     }
     // The trackers are the outer filter's; capture them now because the body
     // is polled (and the event finalised) outside this task-local scope.
-    let trackers = rusternetes_common::latency_trackers::latency_trackers_from_context();
+    let trackers = k3rs_common::latency_trackers::latency_trackers_from_context();
     // Watch/proxy are long-running: ResponseComplete is written when the
     // handler returns, as before. An empty body (HEAD, 204) has no write to
     // wait for and completes at once.
@@ -1112,7 +1112,7 @@ pub async fn with_audit(cfg: Arc<AuditConfig>, req: Request, next: Next) -> Resp
 /// the ResponseComplete event.
 async fn finish_audit(
     ac: &AuditContext,
-    trackers: Option<&rusternetes_common::latency_trackers::LatencyTrackers>,
+    trackers: Option<&k3rs_common::latency_trackers::LatencyTrackers>,
 ) {
     ac.write_latency_to_annotation(trackers);
     ac.process_event_stage(AuditStage::ResponseComplete).await;
@@ -1120,7 +1120,7 @@ async fn finish_audit(
 
 struct Finalizer {
     ac: Arc<AuditContext>,
-    trackers: Option<Arc<rusternetes_common::latency_trackers::LatencyTrackers>>,
+    trackers: Option<Arc<k3rs_common::latency_trackers::LatencyTrackers>>,
     /// When the previous frame was handed to the connection; the time until
     /// the next poll (or the drop) is the connection's write of it, the
     /// `writeLatencyTracker.Write` interval.
@@ -1226,7 +1226,7 @@ pub async fn audit_failed_request(
     method: &Method,
     uri: &axum::http::Uri,
     headers: &axum::http::HeaderMap,
-    status: &rusternetes_common::types::Status,
+    status: &k3rs_common::types::Status,
     failed: Response,
 ) -> Response {
     match AUDIT.get() {
@@ -1245,7 +1245,7 @@ pub async fn with_failed_request_audit(
     method: &Method,
     uri: &axum::http::Uri,
     headers: &axum::http::HeaderMap,
-    status: &rusternetes_common::types::Status,
+    status: &k3rs_common::types::Status,
     mut failed: Response,
 ) -> Response {
     let mut attrs = request_info(method, uri.path(), uri.query());

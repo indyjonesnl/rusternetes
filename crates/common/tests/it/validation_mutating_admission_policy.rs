@@ -4,10 +4,10 @@
 //! `TestValidateMutatingAdmissionPolicyBinding` (:5556); checks at
 //! `validation.go:1372-1537`.
 
-use rusternetes_common::resources::mutating_admission_policy::{
+use k3rs_common::resources::mutating_admission_policy::{
     MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
 };
-use rusternetes_common::validation::mutating_admission_policy::{
+use k3rs_common::validation::mutating_admission_policy::{
     set_defaults_mutating_admission_policy, set_defaults_mutating_admission_policy_binding,
     validate_mutating_admission_policy, validate_mutating_admission_policy_binding,
 };

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Compose Cluster with etcd - Rūsternetes</title>
+  <title>Compose Cluster with etcd - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Compose Cluster with etcd</h1>
       <p class="lead">
-        The full cluster deployment runs each Rūsternetes component as a separate container,
+        The full cluster deployment runs each k3rs component as a separate container,
         backed by etcd for distributed state storage. This is the production-recommended deployment
         mode and the configuration used for conformance testing.
       </p>
@@ -128,47 +128,47 @@
             <td><code>etcd</code></td>
             <td><code>quay.io/coreos/etcd:v3.5</code></td>
             <td>2379 (client), 2380 (peer)</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>Distributed key-value store for all cluster state</td>
           </tr>
           <tr>
             <td><code>api-server</code></td>
-            <td><code>rusternetes-api-server</code></td>
+            <td><code>k3rs-api-server</code></td>
             <td>6443 (HTTPS)</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>REST API with TLS, RBAC, webhooks, watch</td>
           </tr>
           <tr>
             <td><code>scheduler</code></td>
-            <td><code>rusternetes-scheduler</code></td>
+            <td><code>k3rs-scheduler</code></td>
             <td>&mdash;</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>Pod scheduling with affinity, taints, priority</td>
           </tr>
           <tr>
             <td><code>controller-manager</code></td>
-            <td><code>rusternetes-controller-manager</code></td>
+            <td><code>k3rs-controller-manager</code></td>
             <td>&mdash;</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>31 reconciliation controllers</td>
           </tr>
           <tr>
             <td><code>node-1</code></td>
-            <td><code>rusternetes-kubelet</code></td>
+            <td><code>k3rs-kubelet</code></td>
             <td>10250 (metrics)</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>Kubelet managing pod containers on node 1</td>
           </tr>
           <tr>
             <td><code>node-2</code></td>
-            <td><code>rusternetes-kubelet</code></td>
+            <td><code>k3rs-kubelet</code></td>
             <td>10251 (metrics)</td>
-            <td>rusternetes-net</td>
+            <td>k3rs-net</td>
             <td>Kubelet managing pod containers on node 2</td>
           </tr>
           <tr>
             <td><code>kube-proxy</code></td>
-            <td><code>rusternetes-kube-proxy</code></td>
+            <td><code>k3rs-kube-proxy</code></td>
             <td>&mdash;</td>
             <td>host</td>
             <td>iptables-based service routing (requires <code>CAP_NET_ADMIN</code>)</td>
@@ -243,7 +243,7 @@
           <tr>
             <td><code>KUBELET_VOLUMES_PATH</code></td>
             <td>Absolute path on the host where pod volumes are stored. This directory is bind-mounted into the kubelet containers. Must be an absolute path.</td>
-            <td><code>/home/user/rusternetes/.rusternetes/volumes</code></td>
+            <td><code>/home/user/k3rs/.k3rs/volumes</code></td>
           </tr>
         </tbody>
       </table>
@@ -261,7 +261,7 @@
           <tr>
             <td><code>RUST_LOG</code></td>
             <td><code>info</code></td>
-            <td>Log level for all Rust components. Accepts <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>. Can be per-crate: <code>rusternetes_api_server=debug,info</code>.</td>
+            <td>Log level for all Rust components. Accepts <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>. Can be per-crate: <code>k3rs_api_server=debug,info</code>.</td>
           </tr>
           <tr>
             <td><code>DOCKER_HOST</code></td>
@@ -320,7 +320,7 @@
 
       <h2>Network</h2>
       <p>
-        All services (except kube-proxy) communicate over the <code>rusternetes-net</code> bridge network.
+        All services (except kube-proxy) communicate over the <code>k3rs-net</code> bridge network.
         The container runtime assigns IPs from the bridge subnet (typically <code>172.18.0.0/16</code>). The TLS
         certificates include SANs for these container bridge IPs so that internal component-to-API-server
         communication works over HTTPS.
@@ -335,9 +335,9 @@
         </div>
         <code>
 networks:
-  rusternetes-net:
+  k3rs-net:
     driver: bridge
-    name: rusternetes-net
+    name: k3rs-net
 </code>
       </pre>
 
@@ -353,7 +353,7 @@ networks:
         </div>
         <code>
 <span class="comment"># Must be an absolute path</span>
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 mkdir -p $KUBELET_VOLUMES_PATH
 </code>
       </pre>
@@ -433,7 +433,7 @@ bash scripts/bootstrap-cluster.sh
         </div>
         <code>
 <span class="comment"># Set kubeconfig</span>
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 
 <span class="comment"># Check nodes</span>
 kubectl get nodes
@@ -509,10 +509,10 @@ podman compose -f compose.yml up -d node-1
 podman compose -f compose.yml down
 
 <span class="comment"># Remove etcd data for a fresh start</span>
-podman volume rm rusternetes_etcd-data 2>/dev/null
+podman volume rm k3rs_etcd-data 2>/dev/null
 
 <span class="comment"># Remove pod volumes</span>
-rm -rf .rusternetes/volumes/*
+rm -rf .k3rs/volumes/*
 
 <span class="comment"># Rebuild and start fresh</span>
 podman compose -f compose.yml build
@@ -611,7 +611,7 @@ podman compose -f compose.yml exec etcd etcdctl get /registry/ <span class="flag
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

@@ -1,10 +1,10 @@
 // Integration tests for Volume Snapshot Controller
 // Note: These tests use in-memory storage for fast, isolated testing
 
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::volume_snapshot::VolumeSnapshotController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::volume::*;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::volume_snapshot::VolumeSnapshotController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -128,7 +128,7 @@ async fn test_snapshot_content_auto_creation() {
             api_version: "snapshot.storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("test-snapclass"),
-        driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+        driver: "k3rs.io/hostpath-snapshotter".to_string(),
         parameters: None,
         deletion_policy: DeletionPolicy::Delete,
     };
@@ -181,7 +181,7 @@ async fn test_snapshot_content_auto_creation() {
 
     assert!(content.is_ok(), "VolumeSnapshotContent should be created");
     let content = content.unwrap();
-    assert_eq!(content.spec.driver, "rusternetes.io/hostpath-snapshotter");
+    assert_eq!(content.spec.driver, "k3rs.io/hostpath-snapshotter");
     assert_eq!(content.spec.deletion_policy, DeletionPolicy::Delete);
 
     // Verify VolumeSnapshot status was updated
@@ -201,7 +201,7 @@ async fn test_snapshot_deletion_with_delete_policy() {
             api_version: "snapshot.storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("delete-policy-class"),
-        driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+        driver: "k3rs.io/hostpath-snapshotter".to_string(),
         parameters: None,
         deletion_policy: DeletionPolicy::Delete,
     };
@@ -278,7 +278,7 @@ async fn test_snapshot_deletion_with_retain_policy() {
             api_version: "snapshot.storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("retain-policy-class"),
-        driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+        driver: "k3rs.io/hostpath-snapshotter".to_string(),
         parameters: None,
         deletion_policy: DeletionPolicy::Retain,
     };
@@ -355,7 +355,7 @@ async fn test_snapshot_without_bound_pvc_fails() {
             api_version: "snapshot.storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("test-class-unbound"),
-        driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+        driver: "k3rs.io/hostpath-snapshotter".to_string(),
         parameters: None,
         deletion_policy: DeletionPolicy::Delete,
     };

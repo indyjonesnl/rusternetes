@@ -9,7 +9,7 @@
 #![cfg(feature = "sqlite")]
 
 use futures::StreamExt;
-use rusternetes_storage::{Storage, StorageBackend, StorageConfig, WatchEvent};
+use k3rs_storage::{Storage, StorageBackend, StorageConfig, WatchEvent};
 use std::time::Duration;
 
 #[tokio::test]

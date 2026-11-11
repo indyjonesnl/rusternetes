@@ -12,7 +12,7 @@
 //! ported in `handlers/list_options.rs`; this file pins that EVERY list route
 //! applies it, not just pods/configmaps/podtemplates.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 const LIST_URLS: &[&str] = &[
     "/api/v1/configmaps",

@@ -9,7 +9,7 @@
 //! `pkg/controller/disruption/disruption.go` `writePdbStatus`).
 
 use super::fixtures::{pod, pod_key};
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use serde_json::Value;
 
 /// Row 1: the caller's resourceVersion is current -> the status lands.
@@ -45,7 +45,7 @@ pub async fn run_test_update_status_cas<S: Storage>(storage: &S) {
         .await
         .expect_err("a status write from a superseded resourceVersion must be rejected");
     assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
+        matches!(err, k3rs_common::Error::Conflict(_)),
         "expected Conflict for a superseded resourceVersion, got {err:?}"
     );
     let after: Value = storage.get(&key).await.expect("get failed");
@@ -88,7 +88,7 @@ where
             match handle.await.expect("writer task panicked") {
                 Ok(_) => winners.push(writer),
                 Err(e) => assert!(
-                    matches!(e, rusternetes_common::Error::Conflict(_)),
+                    matches!(e, k3rs_common::Error::Conflict(_)),
                     "round {round}: writer {writer} must lose with Conflict, got {e:?}"
                 ),
             }

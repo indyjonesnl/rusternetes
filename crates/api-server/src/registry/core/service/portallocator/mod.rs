@@ -9,8 +9,8 @@ pub mod repair;
 
 use std::fmt;
 
-use rusternetes_common::resources::rangeallocation::RangeAllocation;
-use rusternetes_common::Error;
+use k3rs_common::resources::rangeallocation::RangeAllocation;
+use k3rs_common::Error;
 
 use super::allocator::{AllocationBitmap, AllocatorWithOffsetFactory, InMemory, Interface};
 
@@ -140,10 +140,7 @@ pub struct PortAllocator {
 
 impl PortAllocator {
     /// `New` (allocator.go:65-83): the backing store comes from `factory`.
-    pub fn new(
-        pr: PortRange,
-        factory: AllocatorWithOffsetFactory,
-    ) -> rusternetes_common::Result<Self> {
+    pub fn new(pr: PortRange, factory: AllocatorWithOffsetFactory) -> k3rs_common::Result<Self> {
         let alloc = factory(pr.size, pr.to_string(), calculate_range_offset(pr))?;
         Ok(Self {
             port_range: pr,

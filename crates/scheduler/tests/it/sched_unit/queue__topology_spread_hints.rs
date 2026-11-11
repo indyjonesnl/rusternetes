@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{Node, Pod};
-    pub use rusternetes_common::types::{
+    pub use k3rs_common::resources::{Node, Pod};
+    pub use k3rs_common::types::{
         label_selector_as_selector, LabelSelector, LabelSelectorRequirement, Selector,
     };
-    pub use rusternetes_scheduler::queue::events::*;
+    pub use k3rs_scheduler::queue::events::*;
     pub use std::collections::HashMap;
     pub use tracing::debug;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::topology_spread_hints::*;
+    use k3rs_scheduler::queue::topology_spread_hints::*;
     use serde_json::{json, Value};
 
     fn obj<T: Send + Sync + 'static>(t: T) -> Box<EventObject> {

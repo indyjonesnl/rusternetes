@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::field_selector::*;
+    use k3rs_common::field_selector::*;
     use serde_json::json;
 
     #[test]

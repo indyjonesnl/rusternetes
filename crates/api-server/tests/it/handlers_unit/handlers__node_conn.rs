@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Node;
+    pub use k3rs_common::resources::Node;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::node_conn::*;
-    use rusternetes_common::resources::{
+    use k3rs_api_server::handlers::node_conn::*;
+    use k3rs_common::resources::{
         DaemonEndpoint, Node, NodeAddress, NodeDaemonEndpoints, NodeStatus,
     };
 
@@ -80,7 +80,7 @@ mod tests {
         let node = make_node(vec![], None);
         let err = node_conn(&node, None).unwrap_err();
         assert!(
-            matches!(err, rusternetes_common::Error::NotFound(_)),
+            matches!(err, k3rs_common::Error::NotFound(_)),
             "expected NotFound, got: {err:?}"
         );
     }
@@ -89,7 +89,7 @@ mod tests {
     fn no_status_returns_not_found() {
         let node = Node::new("bare-node");
         let err = node_conn(&node, None).unwrap_err();
-        assert!(matches!(err, rusternetes_common::Error::NotFound(_)));
+        assert!(matches!(err, k3rs_common::Error::NotFound(_)));
     }
 
     #[test]

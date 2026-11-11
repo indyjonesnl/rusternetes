@@ -4,10 +4,10 @@
 //! (kube-aggregator/pkg/apiserver/resolvers.go,
 //! cmd/kube-apiserver/app/server.go:283).
 
-use rusternetes_api_server::service_resolver::{
+use k3rs_api_server::service_resolver::{
     resolve_cluster, resolve_endpoint, Routing, ServiceResolver,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -18,7 +18,7 @@ async fn put_service(storage: &MemoryStorage, spec: Value) {
         "spec": spec,
     });
     storage
-        .create::<rusternetes_common::resources::Service>(
+        .create::<k3rs_common::resources::Service>(
             &build_key("services", Some("one"), "alfa"),
             &serde_json::from_value(svc).unwrap(),
         )
@@ -49,7 +49,7 @@ async fn put_slice(
         "ports": ports,
     });
     storage
-        .create::<rusternetes_common::resources::EndpointSlice>(
+        .create::<k3rs_common::resources::EndpointSlice>(
             &build_key("endpointslices", Some(ns), &format!("{svc}-{suffix}")),
             &serde_json::from_value(slice).unwrap(),
         )
@@ -314,9 +314,9 @@ fn routing_flag_picks_the_resolver() {
 // `EgressSelectorOptions.Validate` does (egress_selector.go:80).
 #[test]
 fn install_server_options_rejects_an_unreadable_egress_config() {
-    let cfg = rusternetes_api_server::ApiServerConfig {
+    let cfg = k3rs_api_server::ApiServerConfig {
         egress_selector_config_file: "/nonexistent/egress-selector.yaml".into(),
         ..Default::default()
     };
-    assert!(rusternetes_api_server::install_server_options(&cfg).is_err());
+    assert!(k3rs_api_server::install_server_options(&cfg).is_err());
 }

@@ -9,7 +9,7 @@
 //! `AdmissionToValidateObjectUpdateFunc` / `AdmissionToValidateObjectDeleteFunc`
 //! (registry/rest/rest.go) and runs on the fully formed object.
 //!
-//! Of those plugins Rusternetes implements the two webhook plugins,
+//! Of those plugins k3rs implements the two webhook plugins,
 //! ValidatingAdmissionPolicy and ResourceQuota
 //! ([`crate::admission::resourcequota`]). MutatingAdmissionPolicy is wired
 //! ahead of the mutating webhooks behind `Feature::MutatingAdmissionPolicy`
@@ -26,16 +26,16 @@
 //! [`Admission::validate_pod`] runs PodSecurity and the pod ResourceQuota.
 
 use async_trait::async_trait;
-use rusternetes_common::admission::{
+use k3rs_common::admission::{
     self, AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
 };
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-use rusternetes_common::resources::{
+use k3rs_common::auth::UserInfo;
+use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+use k3rs_common::resources::{
     CertificateSigningRequest, ClusterTrustBundle, PersistentVolumeClaim, Pod, PriorityClass,
 };
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 
 use super::rest::{authorize, RequestScope};
 use crate::admission::caching_authorizer::new_caching_authorizer;
@@ -46,7 +46,7 @@ use crate::registry::rest::{
     GroupResource, Object, RequestContext, TransformFunc, ValidateObject, ValidateObjectUpdate,
 };
 use crate::state::ApiServerState;
-use rusternetes_admission_webhook::cel_evaluators::VapAuthorizer;
+use k3rs_admission_webhook::cel_evaluators::VapAuthorizer;
 use std::sync::Arc;
 
 /// One request's view of the admission chain: upstream's `admission.Interface`
@@ -75,8 +75,8 @@ fn denied(reason: &str) -> Error {
 /// object's metadata or a JSON view of it, which is all this exposes. The
 /// public entry points stay generic and are thin wrappers over it.
 pub trait AdmissionObject: Send + Sync {
-    fn meta(&self) -> &rusternetes_common::types::ObjectMeta;
-    fn meta_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta;
+    fn meta(&self) -> &k3rs_common::types::ObjectMeta;
+    fn meta_mut(&mut self) -> &mut k3rs_common::types::ObjectMeta;
     fn to_json(&self) -> serde_json::Result<serde_json::Value>;
     /// Replace the object with `value` decoded as its own type; on error the
     /// object is left as it was.
@@ -84,10 +84,10 @@ pub trait AdmissionObject: Send + Sync {
 }
 
 impl<T: Object> AdmissionObject for T {
-    fn meta(&self) -> &rusternetes_common::types::ObjectMeta {
+    fn meta(&self) -> &k3rs_common::types::ObjectMeta {
         HasMetadata::metadata(self)
     }
-    fn meta_mut(&mut self) -> &mut rusternetes_common::types::ObjectMeta {
+    fn meta_mut(&mut self) -> &mut k3rs_common::types::ObjectMeta {
         HasMetadata::metadata_mut(self)
     }
     fn to_json(&self) -> serde_json::Result<serde_json::Value> {
@@ -189,7 +189,7 @@ impl Admission<'_> {
     async fn runtime_class_for(
         &self,
         pod: &Pod,
-    ) -> Result<Option<rusternetes_common::resources::RuntimeClass>> {
+    ) -> Result<Option<k3rs_common::resources::RuntimeClass>> {
         let Some(name) = pod
             .spec
             .as_ref()
@@ -197,11 +197,11 @@ impl Admission<'_> {
         else {
             return Ok(None);
         };
-        let key = rusternetes_storage::build_key("runtimeclasses", None, name);
+        let key = k3rs_storage::build_key("runtimeclasses", None, name);
         match self
             .state
             .storage
-            .get::<rusternetes_common::resources::RuntimeClass>(&key)
+            .get::<k3rs_common::resources::RuntimeClass>(&key)
             .await
         {
             Ok(rc) => Ok(Some(rc)),
@@ -236,7 +236,7 @@ impl Admission<'_> {
         // storage/recast frames), overflowing the stack of an unoptimised
         // build. Upstream's decorator is a plain call frame per plugin
         // (metrics.go:89-113), never part of the chain's own frame.
-        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+        k3rs_admission_webhook::admission_metrics::with_controller_metrics(
             name,
             op,
             step_type,
@@ -260,7 +260,7 @@ impl Admission<'_> {
         obj: &mut dyn AdmissionObject,
         old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
+        use k3rs_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
         let mut pod: Option<Pod> = if self.is_core("pods") {
             Some(recast_obj(&*obj)?)
         } else {
@@ -294,7 +294,7 @@ impl Admission<'_> {
                 if create && namespace.is_some() {
                     crate::handlers::node_restriction::admit_pod_create(
                         &**storage,
-                        &rusternetes_middleware::AuthContext {
+                        &k3rs_middleware::AuthContext {
                             user: self.user.clone(),
                         },
                         pod,
@@ -304,11 +304,11 @@ impl Admission<'_> {
             } else if self.resource.group == "certificates.k8s.io"
                 && self.resource.resource == "podcertificaterequests"
             {
-                let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+                let pcr: k3rs_common::resources::podcertificaterequest::PodCertificateRequest =
                     recast_obj(&*obj)?;
                 crate::handlers::node_restriction::admit_pod_certificate_request(
                     &**storage,
-                    &rusternetes_middleware::AuthContext {
+                    &k3rs_middleware::AuthContext {
                         user: self.user.clone(),
                     },
                     create,
@@ -331,7 +331,7 @@ impl Admission<'_> {
         // NodeRestriction in `AllOrderedPlugins`.
         self.plugin("TaintNodesByCondition", op, ADMIT, async {
             if self.is_core("nodes") {
-                let mut node: rusternetes_common::resources::Node = recast_obj(&*obj)?;
+                let mut node: k3rs_common::resources::Node = recast_obj(&*obj)?;
                 builtin_plugins::node_taint_admit(&mut node);
                 assign(&mut *obj, &node)?;
             }
@@ -343,11 +343,8 @@ impl Admission<'_> {
         self.plugin("LimitRanger", op, ADMIT, async {
             if let (Some(pod), Some(namespace), true) = (pod.as_mut(), namespace, create) {
                 let name = pod.metadata.name.clone();
-                let limit_ranges: Vec<rusternetes_common::resources::LimitRange> = storage
-                    .list(&rusternetes_storage::build_prefix(
-                        "limitranges",
-                        Some(namespace),
-                    ))
+                let limit_ranges: Vec<k3rs_common::resources::LimitRange> = storage
+                    .list(&k3rs_storage::build_prefix("limitranges", Some(namespace)))
                     .await
                     .unwrap_or_default();
                 match crate::admission::apply_limit_range_with(pod, &limit_ranges) {
@@ -404,7 +401,7 @@ impl Admission<'_> {
             if let Some(pod) = pod.as_mut() {
                 if *op == Operation::Update || (create && namespace.is_some()) {
                     if let Some(spec) = pod.spec.as_mut() {
-                        rusternetes_common::tolerations::add_default_tolerations(spec);
+                        k3rs_common::tolerations::add_default_tolerations(spec);
                     }
                 }
             }
@@ -478,7 +475,7 @@ impl Admission<'_> {
                 if let Some(finalizer) = storage_object_in_use_protection::finalizer_for(
                     &self.resource.group,
                     &self.resource.resource,
-                    rusternetes_common::feature_gates::gate_enabled("VolumeAttributesClass")
+                    k3rs_common::feature_gates::gate_enabled("VolumeAttributesClass")
                         .unwrap_or(false),
                 ) {
                     storage_object_in_use_protection::add_protection_finalizer(
@@ -499,8 +496,8 @@ impl Admission<'_> {
             let (Some(pod), Some(_), true) = (pod.as_mut(), namespace, create) else {
                 return Ok(());
             };
-            if !rusternetes_common::feature_gates::enabled(
-                rusternetes_common::feature_gates::Feature::PodTopologyLabelsAdmission,
+            if !k3rs_common::feature_gates::enabled(
+                k3rs_common::feature_gates::Feature::PodTopologyLabelsAdmission,
             ) {
                 return Ok(());
             }
@@ -544,7 +541,7 @@ impl Admission<'_> {
                 && self.resource.resource == "ingresses"
                 && self.subresource.is_none()
             {
-                let mut ingress: rusternetes_common::resources::Ingress = recast_obj(&*obj)?;
+                let mut ingress: k3rs_common::resources::Ingress = recast_obj(&*obj)?;
                 builtin_plugins::default_ingress_class(storage, &mut ingress).await?;
                 assign(&mut *obj, &ingress)?;
             }
@@ -569,7 +566,7 @@ impl Admission<'_> {
         obj: Option<&dyn AdmissionObject>,
         old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
+        use k3rs_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
         // NamespaceExists.Validate (exists/admission.go:55-86), registered for
         // Create, Update and Delete; it follows NamespaceLifecycle in
         // `AllOrderedPlugins` (plugins.go:69-72), ahead of the other
@@ -801,7 +798,7 @@ impl Admission<'_> {
         obj: Option<&dyn AdmissionObject>,
         old: Option<&dyn AdmissionObject>,
     ) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
+        use k3rs_admission_webhook::admission_metrics::STEP_VALIDATE as VALIDATE;
         let Some(obj) = obj else {
             return Ok(());
         };
@@ -837,8 +834,8 @@ impl Admission<'_> {
         .await?;
         self.plugin("DenyServiceExternalIPs", op, VALIDATE, async {
             if self.is_core("services") {
-                let svc: rusternetes_common::resources::Service = recast_obj(obj)?;
-                let old: Option<rusternetes_common::resources::Service> =
+                let svc: k3rs_common::resources::Service = recast_obj(obj)?;
+                let old: Option<k3rs_common::resources::Service> =
                     old.map(recast_obj).transpose()?;
                 builtin_plugins::deny_service_external_ips(&svc, old.as_ref())?;
             }
@@ -859,7 +856,7 @@ impl Admission<'_> {
         let Some(plugin) = erl::installed() else {
             return Ok(());
         };
-        let event: Option<rusternetes_common::resources::Event> = if self.is_core("events") {
+        let event: Option<k3rs_common::resources::Event> = if self.is_core("events") {
             obj.map(recast_obj).transpose()?
         } else {
             None
@@ -1134,13 +1131,12 @@ impl Admission<'_> {
         if let (Operation::Create | Operation::Update, Some(obj), true) =
             (op, obj, self.is_core("namespaces"))
         {
-            let ns: rusternetes_common::resources::Namespace = recast_obj(obj)?;
-            let old_ns: Option<rusternetes_common::resources::Namespace> =
-                if *op == Operation::Update {
-                    old.map(recast_obj).transpose()?
-                } else {
-                    None
-                };
+            let ns: k3rs_common::resources::Namespace = recast_obj(obj)?;
+            let old_ns: Option<k3rs_common::resources::Namespace> = if *op == Operation::Update {
+                old.map(recast_obj).transpose()?
+            } else {
+                None
+            };
             for w in crate::admission::PodSecurityAdmission::new()
                 .validate_namespace(&self.state.storage, &ns, old_ns.as_ref())
                 .await?
@@ -1252,10 +1248,10 @@ impl Admission<'_> {
         };
         // `WithControllerMetrics(plugin, "MutatingAdmissionPolicy")`
         // (metrics.go:63-66, :89-100).
-        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+        k3rs_admission_webhook::admission_metrics::with_controller_metrics(
             "MutatingAdmissionPolicy",
             op,
-            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            k3rs_admission_webhook::admission_metrics::STEP_ADMIT,
             plugin.admit(&mut attr, reinvocation.clone()),
         )
         .await?;
@@ -1266,7 +1262,7 @@ impl Admission<'_> {
                 // customresource_handler.go:1240-1249), where the patch is
                 // applied rather than by the final conversion.
                 if !self.resource.group.is_empty() {
-                    let key = rusternetes_storage::build_key(
+                    let key = k3rs_storage::build_key(
                         "customresourcedefinitions",
                         None,
                         &format!("{}.{}", self.resource.resource, self.resource.group),
@@ -1274,10 +1270,10 @@ impl Admission<'_> {
                     if let Ok(crd) = self
                         .state
                         .storage
-                        .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+                        .get::<k3rs_common::resources::CustomResourceDefinition>(&key)
                         .await
                     {
-                        rusternetes_common::resources::crd::default_custom_resource_value(
+                        k3rs_common::resources::crd::default_custom_resource_value(
                             &crd,
                             &self.resource.version,
                             &mut after,
@@ -1322,9 +1318,9 @@ impl Admission<'_> {
         // (apiserver/pkg/server/options/admission.go:179): the whole admit
         // phase, both reinvoker passes included, is one `step` observation.
         let step_op = op.clone();
-        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+        k3rs_admission_webhook::admission_metrics::with_step_metrics(
             &step_op,
-            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            k3rs_admission_webhook::admission_metrics::STEP_ADMIT,
             self.admit_reinvoking(op, obj, old),
         )
         .await
@@ -1442,12 +1438,12 @@ impl Admission<'_> {
     }
 
     async fn admit_delete_dyn(&self, old: &dyn AdmissionObject) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::{with_step_metrics, STEP_ADMIT};
+        use k3rs_admission_webhook::admission_metrics::{with_step_metrics, STEP_ADMIT};
         with_step_metrics(&Operation::Delete, STEP_ADMIT, self.admit_delete_chain(old)).await
     }
 
     async fn admit_delete_chain(&self, old: &dyn AdmissionObject) -> Result<()> {
-        use rusternetes_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
+        use k3rs_admission_webhook::admission_metrics::STEP_ADMIT as ADMIT;
         let op = Operation::Delete;
         // NodeRestriction.Admit on a pod DELETE (admission.go:257-270); it
         // is an Admit-only plugin.
@@ -1455,7 +1451,7 @@ impl Admission<'_> {
             if self.is_core("pods") {
                 let pod: Pod = recast_obj(old)?;
                 crate::handlers::node_restriction::admit_pod_delete(
-                    &rusternetes_middleware::AuthContext {
+                    &k3rs_middleware::AuthContext {
                         user: self.user.clone(),
                     },
                     &pod,
@@ -1472,7 +1468,7 @@ impl Admission<'_> {
             return self.admit_delete_deny(old.meta());
         }
         let name = old.meta().name.clone();
-        let mut webhook_ctx = rusternetes_admission_webhook::WebhookReinvokeContext::default();
+        let mut webhook_ctx = k3rs_admission_webhook::WebhookReinvokeContext::default();
         let (response, _, _) = self
             .state
             .webhook_manager
@@ -1497,7 +1493,7 @@ impl Admission<'_> {
     }
 
     /// AlwaysDeny is last in `AllOrderedPlugins`, after the webhooks.
-    fn admit_delete_deny(&self, meta: &rusternetes_common::types::ObjectMeta) -> Result<()> {
+    fn admit_delete_deny(&self, meta: &k3rs_common::types::ObjectMeta) -> Result<()> {
         if plugin_enabled("AlwaysDeny") {
             return Err(self.always_deny(meta));
         }
@@ -1531,9 +1527,9 @@ impl Admission<'_> {
     ) -> Result<()> {
         // `WithStepMetrics` (admission.go:179), the validate phase.
         let step_op = op.clone();
-        rusternetes_admission_webhook::admission_metrics::with_step_metrics(
+        k3rs_admission_webhook::admission_metrics::with_step_metrics(
             &step_op,
-            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            k3rs_admission_webhook::admission_metrics::STEP_VALIDATE,
             self.validate_chain(ctx, op, obj, old),
         )
         .await
@@ -1556,7 +1552,7 @@ impl Admission<'_> {
             .map(|o| o.meta().name.clone())
             .unwrap_or_default();
         let deny = plugin_enabled("AlwaysDeny").then(|| {
-            let default = rusternetes_common::types::ObjectMeta::default();
+            let default = k3rs_common::types::ObjectMeta::default();
             self.always_deny(obj.or(old).map(|o| o.meta()).unwrap_or(&default))
         });
         let obj = obj.map(to_value).transpose()?;
@@ -1616,7 +1612,7 @@ impl Admission<'_> {
     }
 
     /// `alwaysDeny`'s `NewForbidden` (deny/admission.go:46-54).
-    fn always_deny(&self, meta: &rusternetes_common::types::ObjectMeta) -> Error {
+    fn always_deny(&self, meta: &k3rs_common::types::ObjectMeta) -> Error {
         builtin_plugins::always_deny(
             &GroupResource::new(&self.resource.group, &self.resource.resource).to_string(),
             &builtin_plugins::attr_name(meta),
@@ -1640,10 +1636,10 @@ impl Admission<'_> {
             return self.evaluate_quota(op, name, obj, old).await;
         }
         let observed_op = op.clone();
-        rusternetes_admission_webhook::admission_metrics::with_controller_metrics(
+        k3rs_admission_webhook::admission_metrics::with_controller_metrics(
             "ResourceQuota",
             &observed_op,
-            rusternetes_admission_webhook::admission_metrics::STEP_VALIDATE,
+            k3rs_admission_webhook::admission_metrics::STEP_VALIDATE,
             self.evaluate_quota(op, name, obj, old),
         )
         .await

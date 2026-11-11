@@ -20,11 +20,11 @@ use axum::{
     Extension,
 };
 use futures::TryStreamExt as _;
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     Error, Result,
 };
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -99,10 +99,10 @@ pub fn parse_exec_query(raw_query: &str) -> ExecQuery {
             match key {
                 "command" => command.push(value),
                 "container" => container = Some(value),
-                "stdin" => stdin = rusternetes_common::query::k8s_query_bool(&value),
-                "stdout" => stdout = rusternetes_common::query::k8s_query_bool(&value),
-                "stderr" => stderr = rusternetes_common::query::k8s_query_bool(&value),
-                "tty" => tty = rusternetes_common::query::k8s_query_bool(&value),
+                "stdin" => stdin = k3rs_common::query::k8s_query_bool(&value),
+                "stdout" => stdout = k3rs_common::query::k8s_query_bool(&value),
+                "stderr" => stderr = k3rs_common::query::k8s_query_bool(&value),
+                "tty" => tty = k3rs_common::query::k8s_query_bool(&value),
                 _ => {}
             }
         }
@@ -249,7 +249,7 @@ fn generic_server_response(code: StatusCode, pod_name: &str) -> Response {
     };
 
     let message = format!("{message} ( pods/log {pod_name})");
-    let details = rusternetes_common::types::StatusDetails {
+    let details = k3rs_common::types::StatusDetails {
         name: Some(pod_name.to_string()),
         group: None,
         kind: Some("pods/log".to_string()),
@@ -259,7 +259,7 @@ fn generic_server_response(code: StatusCode, pod_name: &str) -> Response {
     };
     (
         code,
-        crate::audit::json_response(rusternetes_common::types::Status::failure_with_details(
+        crate::audit::json_response(k3rs_common::types::Status::failure_with_details(
             message,
             reason,
             code.as_u16(),
@@ -322,8 +322,8 @@ pub async fn get_logs(
     });
 
     // Load the pod to verify it exists and resolve container + node.
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+    let pod_key = k3rs_storage::build_key("pods", Some(&namespace), &name);
+    let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     // Resolve container name (default to first container).
     let container = if let Some(c) = container_name {
@@ -351,8 +351,8 @@ pub async fn get_logs(
         .to_string();
 
     // Resolve kubelet connection parameters from the node.
-    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
-    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
     let conn = node_conn(&node, None)?;
 
     // Build the upstream-faithful kubelet containerLogs URL.
@@ -403,7 +403,7 @@ pub async fn get_logs(
         // deferred `MonitorRequest`) across it, as `proxy_upgrade` does.
         let hold = req
             .extensions()
-            .get::<rusternetes_streamproxy::ConnectionHold>()
+            .get::<k3rs_streamproxy::ConnectionHold>()
             .cloned();
         return Ok(ws
             .protocols(streaming::LOG_WS_PROTOCOLS)
@@ -424,7 +424,7 @@ pub async fn get_logs(
 
 /// Fetch the kubelet `containerLogs` stream over plain HTTP and expose it as a
 /// byte stream for pumping over a websocket. Used only by the websocket log
-/// path; the non-upgrade path uses `rusternetes_streamproxy::proxy_stream`.
+/// path; the non-upgrade path uses `k3rs_streamproxy::proxy_stream`.
 ///
 /// The kubelet handles all `follow`/`tailLines`/`limitBytes`/`sinceSeconds`
 /// query parameters server-side — they are already baked into `target_url`.
@@ -438,9 +438,9 @@ type LogByteStream = std::pin::Pin<
 
 /// Load the api-server's kubelet client identity (kubeadm
 /// `apiserver-kubelet-client` cert+key) as a reqwest [`Identity`], if present.
-/// Mirrors [`rusternetes_streamproxy::tls`]'s connector loading — same paths,
+/// Mirrors [`k3rs_streamproxy::tls`]'s connector loading — same paths,
 /// same trust model — but for the reqwest client used by the websocket log
-/// fetch. Returns `None` when the files are absent (rusternetes' own cluster).
+/// fetch. Returns `None` when the files are absent (k3rs' own cluster).
 fn load_kubelet_client_identity() -> Option<reqwest::Identity> {
     const CERT: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.crt";
     const KEY: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.key";
@@ -472,7 +472,7 @@ pub fn kubelet_dialer() -> Option<crate::egress_selector::Dialer> {
 fn kubelet_egress_connector(
     dialer: crate::egress_selector::Dialer,
 ) -> Result<crate::egress_http::EgressConnector> {
-    let identity = rusternetes_streamproxy::kubelet_client_identity_pem();
+    let identity = k3rs_streamproxy::kubelet_client_identity_pem();
     let tls = crate::egress_http::tls_client_config(None, true, identity.as_deref())
         .map_err(|e| Error::Internal(format!("failed to build kubelet client: {e}")))?;
     Ok(crate::egress_http::EgressConnector::new(dialer, tls, None))
@@ -489,9 +489,9 @@ pub async fn proxy_kubelet_upgrade(
     dialer: Option<crate::egress_selector::Dialer>,
 ) -> Response {
     match dialer {
-        None => rusternetes_streamproxy::proxy_upgrade(target, req).await,
+        None => k3rs_streamproxy::proxy_upgrade(target, req).await,
         Some(d) => match kubelet_egress_connector(d) {
-            Ok(c) => rusternetes_streamproxy::proxy_upgrade_with(target, req, c).await,
+            Ok(c) => k3rs_streamproxy::proxy_upgrade_with(target, req, c).await,
             Err(e) => {
                 tracing::warn!("kubelet upgrade proxy: {e}");
                 bad_gateway()
@@ -507,9 +507,9 @@ pub async fn proxy_kubelet_stream(
     dialer: Option<crate::egress_selector::Dialer>,
 ) -> Response {
     match dialer {
-        None => rusternetes_streamproxy::proxy_stream(target, req).await,
+        None => k3rs_streamproxy::proxy_stream(target, req).await,
         Some(d) => match kubelet_egress_connector(d) {
-            Ok(c) => rusternetes_streamproxy::proxy_stream_with(target, req, c).await,
+            Ok(c) => k3rs_streamproxy::proxy_stream_with(target, req, c).await,
             Err(e) => {
                 tracing::warn!("kubelet stream proxy: {e}");
                 bad_gateway()
@@ -584,7 +584,7 @@ pub async fn fetch_kubelet_log_stream(
     // Present the kubeadm `apiserver-kubelet-client` cert when it exists, so a
     // vanilla kubelet (`--anonymous-auth=false`) authenticates the api-server's
     // websocket log fetch instead of returning 401 (#1670). Absent on
-    // rusternetes' own cluster, whose kubelet needs no client cert.
+    // k3rs' own cluster, whose kubelet needs no client cert.
     if let Some(identity) = load_kubelet_client_identity() {
         builder = builder.identity(identity);
     }
@@ -716,9 +716,9 @@ pub async fn run_connect_admission(
     namespace: &str,
     name: &str,
     options: serde_json::Value,
-    user: &rusternetes_common::admission::UserInfo,
+    user: &k3rs_common::admission::UserInfo,
 ) -> Result<serde_json::Value> {
-    use rusternetes_common::admission::{
+    use k3rs_common::admission::{
         AdmissionResponse, GroupVersionKind, GroupVersionResource, Operation,
     };
     let gvk = GroupVersionKind {
@@ -731,9 +731,7 @@ pub async fn run_connect_admission(
         version: "v1".to_string(),
         resource: resource.to_string(),
     };
-    use rusternetes_admission_webhook::admission_metrics::{
-        with_step_metrics, STEP_ADMIT, STEP_VALIDATE,
-    };
+    use k3rs_admission_webhook::admission_metrics::{with_step_metrics, STEP_ADMIT, STEP_VALIDATE};
     // `WithStepMetrics` wraps the whole chain (server/options/admission.go:179),
     // so each phase is one step observation, `rejected` being `err != nil`.
     let options = with_step_metrics(&Operation::Connect, STEP_ADMIT, async {
@@ -804,7 +802,7 @@ pub async fn exec(
     info!("Exec {}/{}: cmd={:?}", namespace, name, query.command);
 
     // Save user info for webhook check before auth moves ownership
-    let webhook_user_info = rusternetes_common::admission::UserInfo {
+    let webhook_user_info = k3rs_common::admission::UserInfo {
         username: auth_ctx.user.username.clone(),
         uid: auth_ctx.user.uid.clone(),
         groups: auth_ctx.user.groups.clone(),
@@ -859,8 +857,8 @@ pub async fn exec(
     };
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+    let pod_key = k3rs_storage::build_key("pods", Some(&namespace), &name);
+    let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     let node_name = pod
         .spec
@@ -887,8 +885,8 @@ pub async fn exec(
     };
 
     // Fetch the node and resolve kubelet connection parameters.
-    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
-    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
     let conn = node_conn(&node, None)?;
 
     // Build the upstream-faithful kubelet exec URL.
@@ -927,7 +925,7 @@ pub async fn attach(
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
     // Save user info for webhook check before auth moves ownership
-    let webhook_user_info = rusternetes_common::admission::UserInfo {
+    let webhook_user_info = k3rs_common::admission::UserInfo {
         username: auth_ctx.user.username.clone(),
         uid: auth_ctx.user.uid.clone(),
         groups: auth_ctx.user.groups.clone(),
@@ -980,8 +978,8 @@ pub async fn attach(
     };
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+    let pod_key = k3rs_storage::build_key("pods", Some(&namespace), &name);
+    let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     let node_name = pod
         .spec
@@ -1008,8 +1006,8 @@ pub async fn attach(
     };
 
     // Fetch the node and resolve kubelet connection parameters.
-    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
-    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
     let conn = node_conn(&node, None)?;
 
     // Build the upstream-faithful kubelet attach URL.
@@ -1109,7 +1107,7 @@ pub async fn portforward(
 
     let raw_query = req.uri().query().unwrap_or("").to_string();
 
-    let webhook_user_info = rusternetes_common::admission::UserInfo {
+    let webhook_user_info = k3rs_common::admission::UserInfo {
         username: auth_ctx.user.username.clone(),
         uid: auth_ctx.user.uid.clone(),
         groups: auth_ctx.user.groups.clone(),
@@ -1167,8 +1165,8 @@ pub async fn portforward(
     }
 
     // Fetch the pod and require spec.nodeName (upstream: 400 if unset).
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+    let pod_key = k3rs_storage::build_key("pods", Some(&namespace), &name);
+    let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     let node_name = pod
         .spec
@@ -1178,8 +1176,8 @@ pub async fn portforward(
         .ok_or_else(|| Error::BadRequest(format!("pod {} does not have a host assigned", name)))?
         .to_string();
 
-    let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
-    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None::<&str>, &node_name);
+    let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
     let conn = node_conn(&node, None)?;
 
     let target_url = build_kubelet_portforward_url(&conn, &namespace, &name, &stream_query);
@@ -1199,7 +1197,7 @@ pub(crate) const GUARANTEED_QOS_POD_CPU_RESIZE: &str = "GuaranteedQoSPodCPUResiz
 
 /// Returns `true` if `pod` is Guaranteed-QoS.
 ///
-/// Delegates to [`rusternetes_common::qos::get_pod_qos`], the port of
+/// Delegates to [`k3rs_common::qos::get_pod_qos`], the port of
 /// `pkg/apis/core/v1/helper/qos/qos.go::GetPodQOS`. Upstream's gate reads the
 /// **published** class off the pod being resized
 /// (`guaranteed_cpu_resize.go:64`, `oldPodInfo.Status.QOSClass !=
@@ -1210,16 +1208,16 @@ pub(crate) const GUARANTEED_QOS_POD_CPU_RESIZE: &str = "GuaranteedQoSPodCPUResiz
 /// only, quantities compared as strings — is gone: a pod whose init container
 /// declares no limits is `Burstable`, so the CPU-resize gate must not fire for
 /// it.
-fn is_guaranteed_qos(pod: &rusternetes_common::resources::Pod) -> bool {
-    rusternetes_common::qos::get_pod_qos(pod) == rusternetes_common::qos::QoSClass::Guaranteed
+fn is_guaranteed_qos(pod: &k3rs_common::resources::Pod) -> bool {
+    k3rs_common::qos::get_pod_qos(pod) == k3rs_common::qos::QoSClass::Guaranteed
 }
 
 /// Returns `true` if the CPU resource request OR limit differs between any
 /// matching container in `desired` vs `current`. The match is by container
 /// name; missing-on-one-side counts as a change.
 fn resize_changes_cpu(
-    current: &rusternetes_common::resources::Pod,
-    desired: &rusternetes_common::resources::Pod,
+    current: &k3rs_common::resources::Pod,
+    desired: &k3rs_common::resources::Pod,
 ) -> bool {
     let (Some(cur_spec), Some(des_spec)) = (current.spec.as_ref(), desired.spec.as_ref()) else {
         return false;
@@ -1282,10 +1280,10 @@ fn resize_changes_cpu(
 ///    feature \"GuaranteedQoSPodCPUResize\""
 pub(crate) async fn check_node_declared_features_for_resize<S: Storage>(
     storage: &S,
-    current: &rusternetes_common::resources::Pod,
-    desired: &rusternetes_common::resources::Pod,
+    current: &k3rs_common::resources::Pod,
+    desired: &k3rs_common::resources::Pod,
 ) -> Result<()> {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
 
     // Both gates must be on. Mirrors upstream's
     // `if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures)
@@ -1312,8 +1310,8 @@ pub(crate) async fn check_node_declared_features_for_resize<S: Storage>(
         return Ok(());
     };
 
-    let node_key = rusternetes_storage::build_key("nodes", None, node_name);
-    let node: rusternetes_common::resources::Node = match storage.get(&node_key).await {
+    let node_key = k3rs_storage::build_key("nodes", None, node_name);
+    let node: k3rs_common::resources::Node = match storage.get(&node_key).await {
         Ok(n) => n,
         // Missing node: upstream's NodeRestriction admission allows the
         // request through and lets the scheduler / node controller catch up.

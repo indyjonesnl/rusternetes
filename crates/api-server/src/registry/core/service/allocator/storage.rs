@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::resources::rangeallocation::RangeAllocation;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::resources::rangeallocation::RangeAllocation;
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 use tokio::sync::Mutex;
 
 use super::{AllocationBitmap, Interface};

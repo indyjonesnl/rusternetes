@@ -23,7 +23,7 @@ use crate::volume_plugins::plugin::{BlockVolumeMapper, DeviceMounter, Mounter, O
 use crate::volume_plugins::util::operation_executor::{MarkVolumeOpts, VolumeMountState};
 use crate::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
 use anyhow::{anyhow, Context, Result};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -427,9 +427,9 @@ impl Reconciler {
                 .clear();
             return;
         };
-        let key = rusternetes_storage::build_key("nodes", None, self.node_name());
-        let node: rusternetes_common::resources::Node =
-            match rusternetes_storage::Storage::get(storage.as_ref(), &key).await {
+        let key = k3rs_storage::build_key("nodes", None, self.node_name());
+        let node: k3rs_common::resources::Node =
+            match k3rs_storage::Storage::get(storage.as_ref(), &key).await {
                 Ok(node) => node,
                 Err(e) => {
                     // This may repeat few times per second until kubelet is able

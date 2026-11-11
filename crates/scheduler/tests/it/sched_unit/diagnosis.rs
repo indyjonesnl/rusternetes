@@ -5,7 +5,7 @@ mod __parent {}
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::diagnosis::*;
+    use k3rs_scheduler::diagnosis::*;
 
     #[test]
     fn prefilter_msg_only() {
@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn node_codes_default_to_the_absent_nodes_status() {
-        use rusternetes_scheduler::fwk::Code;
+        use k3rs_scheduler::fwk::Code;
         // `NewDefaultNodeToStatus` (interface.go:42-44).
         let mut d = Diagnosis::default();
         assert_eq!(d.node_code("n"), Code::UnschedulableAndUnresolvable);
@@ -69,7 +69,7 @@ mod tests {
     /// nothing.
     #[test]
     fn add_plugin_status_records_pending_plugins() {
-        use rusternetes_scheduler::fwk::{Code, Status};
+        use k3rs_scheduler::fwk::{Code, Status};
         let status = |code: Code, plugin: &str| {
             let mut s = Status::new(code, vec!["why".to_string()]);
             s.set_plugin(plugin);

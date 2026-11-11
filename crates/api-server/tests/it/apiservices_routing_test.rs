@@ -12,7 +12,7 @@
 //! PR #78) which had to work around the bug by seeding APIServices through
 //! the storage layer instead.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn make_test_state() -> TestApiServer {

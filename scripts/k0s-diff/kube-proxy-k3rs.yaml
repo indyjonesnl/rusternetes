@@ -1,5 +1,5 @@
 # v5 workload swap: point the kube-system kube-proxy DaemonSet at
-# rusternetes-kube-proxy.
+# k3rs-kube-proxy.
 #
 # Applied by run-variant.sh (v5) AFTER the all-Go stack passes the smoke gate.
 # `kubectl apply` updates the existing k0s "kube-proxy" DaemonSet in place — the
@@ -11,19 +11,19 @@
 #   securityContext.privileged — grants CAP_NET_ADMIN (+ everything) for iptables
 #                                and the xtables lock; kept from stock k0s.
 #   the xtables-lock / lib-modules hostPath mounts and the kube-proxy configmap
-#   mount (carries the CA-bearing kubeconfig rusternetes-kube-proxy reads).
+#   mount (carries the CA-bearing kubeconfig k3rs-kube-proxy reads).
 #
 # What changes:
-#   image/command -> rusternetes-kube-proxy (placeholder, sed-substituted at
+#   image/command -> k3rs-kube-proxy (placeholder, sed-substituted at
 #                    apply time with the local-registry ref).
-#   args          -> the rusternetes-kube-proxy CLI (crates/kube-proxy/src/main.rs):
+#   args          -> the k3rs-kube-proxy CLI (crates/kube-proxy/src/main.rs):
 #                      --node-name=$(NODE_NAME)
 #                      --api-server-url=https://localhost:6443  (hostNetwork =>
 #                        localhost is the k0s container; api-server listens :6443)
 #                      --kubeconfig=/var/lib/kube-proxy/kubeconfig.conf  (CA + server)
 #                      --cluster-cidr / --node-port-range matched to the apiserver
 #
-# KNOWN CAPABILITY GAP (documented, expected to 401): rusternetes-kube-proxy's
+# KNOWN CAPABILITY GAP (documented, expected to 401): k3rs-kube-proxy's
 # API mode builds its ApiClient with token=None (main.rs ~L113) and its
 # kubeconfig loader extracts ONLY the CA — it has no path to present the pod's
 # ServiceAccount bearer token (nor a client cert). Against k0s's api-server
@@ -65,10 +65,10 @@ spec:
         operator: Exists
       containers:
       - name: kube-proxy
-        image: __RUSTERNETES_KUBE_PROXY_IMAGE__
+        image: __K3RS_KUBE_PROXY_IMAGE__
         imagePullPolicy: Always
         command:
-        - /usr/local/bin/rusternetes-kube-proxy
+        - /usr/local/bin/k3rs-kube-proxy
         args:
         - --node-name=$(NODE_NAME)
         - --api-server-url=https://localhost:6443

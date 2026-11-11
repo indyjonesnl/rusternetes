@@ -13,7 +13,7 @@
 //!   `MetricValue{DescribedObject, Metric MetricIdentifier{Name, Selector},
 //!   Timestamp, WindowSeconds, Value}`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CM: &str = "/apis/custom.metrics.k8s.io/v1beta2";

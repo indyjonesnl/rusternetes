@@ -8,10 +8,10 @@
 //! which this file does not shadow.
 //!
 //! Exercises the pure decision function
-//! [`rusternetes_kubelet::lifecycle::should_restart_container`]: given a
+//! [`k3rs_kubelet::lifecycle::should_restart_container`]: given a
 //! `restartPolicy` and an exit code, should the kubelet restart the container?
 
-use rusternetes_kubelet::lifecycle::should_restart_container;
+use k3rs_kubelet::lifecycle::should_restart_container;
 
 #[test]
 fn always_restarts_on_clean_exit() {

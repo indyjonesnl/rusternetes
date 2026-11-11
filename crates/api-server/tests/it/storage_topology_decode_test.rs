@@ -15,7 +15,7 @@
 //!    `modifyVolumeStatus.status` were required at decode time, so a body
 //!    upstream answers with 422 got serde's 400.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn storage_class(name: &str, allowed_topologies: Value) -> Value {
@@ -192,7 +192,7 @@ async fn a_storage_body_upstream_accepts_is_written() {
 /// — so an absent one must decode rather than fail the request.
 #[tokio::test]
 async fn a_modify_volume_status_without_a_status_decodes() {
-    use rusternetes_common::resources::volume::ModifyVolumeStatus;
+    use k3rs_common::resources::volume::ModifyVolumeStatus;
 
     let decoded: ModifyVolumeStatus =
         serde_json::from_value(json!({ "targetVolumeAttributesClassName": "gold" }))

@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Decision, RequestAttributes};
-use rusternetes_common::dump::decode_request_body;
-use rusternetes_common::types::OwnerReference;
-use rusternetes_common::{Error, Result};
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Decision, RequestAttributes};
+use k3rs_common::dump::decode_request_body;
+use k3rs_common::types::OwnerReference;
+use k3rs_common::{Error, Result};
 use serde::Serialize;
 
 use crate::registry::rest::{Object, RequestContext, RestStorage};
@@ -399,7 +399,7 @@ pub fn respond<B: Serialize>(status: StatusCode, body: &B, ctx: &RequestContext)
     // `TrackSerializeResponseObjectLatency` (responsewriters/writers.go:354)
     // times the serializer call.
     let mut response =
-        rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+        k3rs_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
             (status, headers, Json(body)).into_response()
         });
     if status.is_success() {
@@ -454,7 +454,7 @@ pub(crate) fn respond_object<T: Object>(
 /// (endpoints/handlers/response.go): a client that negotiates
 /// `application/vnd.kubernetes.protobuf` gets the object in the protobuf
 /// envelope instead of JSON. Only successful responses are re-encoded; an
-/// error Status stays JSON, as every rusternetes error does today.
+/// error Status stays JSON, as every k3rs error does today.
 pub async fn negotiate(headers: &HeaderMap, response: Response) -> Response {
     use crate::response::{encode_native_or_wrapped, negotiate_content_type, ContentType};
 
@@ -472,10 +472,9 @@ pub async fn negotiate(headers: &HeaderMap, response: Response) -> Response {
     let type_meta: serde_json::Value = serde_json::from_slice(&json).unwrap_or_default();
     let api_version = type_meta["apiVersion"].as_str().unwrap_or_default();
     let kind = type_meta["kind"].as_str().unwrap_or_default();
-    let bytes =
-        rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
-            encode_native_or_wrapped(&json, api_version, kind)
-        });
+    let bytes = k3rs_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+        encode_native_or_wrapped(&json, api_version, kind)
+    });
     parts.headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(ContentType::Protobuf.mime_type()),

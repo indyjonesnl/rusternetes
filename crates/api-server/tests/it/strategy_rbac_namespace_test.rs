@@ -14,7 +14,7 @@
 //! Upstream's registry strategy tests exercise `PrepareForCreate`,
 //! `PrepareForUpdate`, and `ValidateUpdate` against in-memory objects. We do
 //! not run that Go code directly — instead we drive the equivalent contracts
-//! through the in-process Axum router so that any rusternetes handler that
+//! through the in-process Axum router so that any k3rs handler that
 //! forgets a defaulting step or an immutability fence trips a black-box HTTP
 //! assertion here.
 //!
@@ -40,14 +40,14 @@
 //! - Role / ClusterRole: rules round-trip; ClusterRole `aggregationRule` round-trip.
 //! - RoleBinding / ClusterRoleBinding: `subjects` mutation allowed (the rest
 //!   of the strategy contract for `roleRef` immutability is exercised against
-//!   upstream parity only where rusternetes implements it; see PR body for
+//!   upstream parity only where k3rs implements it; see PR body for
 //!   the deferred bugs).
 
 #![allow(clippy::too_many_lines)]
 
 use axum::http::Method;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -717,7 +717,7 @@ async fn test_rolebinding_strategy_subjects_update_allowed() {
 async fn test_rolebinding_strategy_role_ref_immutable() {
     // Upstream `pkg/registry/rbac/rolebinding/strategy.go::ValidateUpdate`
     // checks `apivalidation.ValidateImmutableField(newRoleBinding.RoleRef, …)`.
-    // rusternetes' `handlers::rbac::update_rolebinding` writes through to
+    // k3rs' `handlers::rbac::update_rolebinding` writes through to
     // storage without comparing roleRef. This test pins the contract for the
     // future fence.
     let (_mem, router) = spawn_router();

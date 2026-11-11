@@ -10,16 +10,16 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::resources::RoleBinding;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::authz::Authorizer;
+use k3rs_common::resources::RoleBinding;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_is_path_segment, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_common::validation::rbac::{
+use k3rs_common::validation::rbac::{
     default_role_binding, validate_role_binding, validate_role_binding_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use super::policybased::{PolicyBased, RoleBindingPolicyBased};
 use super::rule::DefaultRuleResolver;

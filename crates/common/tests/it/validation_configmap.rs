@@ -1,7 +1,7 @@
 //! Tests for ConfigMap validation (port of upstream `ValidateConfigMap`).
 
-use rusternetes_common::resources::ConfigMap;
-use rusternetes_common::validation::configmap::validate_config_map;
+use k3rs_common::resources::ConfigMap;
+use k3rs_common::validation::configmap::validate_config_map;
 use std::collections::HashMap;
 
 fn cm() -> ConfigMap {
@@ -13,7 +13,7 @@ fn cm() -> ConfigMap {
 fn named(name: &str, namespace: &str) -> ConfigMap {
     ConfigMap {
         type_meta: Default::default(),
-        metadata: rusternetes_common::types::ObjectMeta {
+        metadata: k3rs_common::types::ObjectMeta {
             name: name.to_string(),
             namespace: Some(namespace.to_string()),
             ..Default::default()
@@ -89,7 +89,7 @@ fn empty_configmap_ok() {
 
 #[test]
 fn oversize_configmap_rejected() {
-    use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
+    use k3rs_common::validation::configmap::MAX_SECRET_SIZE;
     let mut c = cm();
     let mut d = HashMap::new();
     // Split the payload across data + binaryData to prove the cap is on the
@@ -102,7 +102,7 @@ fn oversize_configmap_rejected() {
     let errs = validate_config_map(&c);
     assert!(
         errs.iter()
-            .any(|e| e.error_type == rusternetes_common::validation::field::ErrorType::TooLong),
+            .any(|e| e.error_type == k3rs_common::validation::field::ErrorType::TooLong),
         "expected a TooLong error, got: {:?}",
         errs
     );
@@ -110,7 +110,7 @@ fn oversize_configmap_rejected() {
 
 #[test]
 fn at_limit_configmap_ok() {
-    use rusternetes_common::validation::configmap::MAX_SECRET_SIZE;
+    use k3rs_common::validation::configmap::MAX_SECRET_SIZE;
     let mut c = cm();
     let mut d = HashMap::new();
     d.insert("a".to_string(), "x".repeat(MAX_SECRET_SIZE));
@@ -118,7 +118,7 @@ fn at_limit_configmap_ok() {
     // Exactly at the limit is allowed (upstream uses `>`, not `>=`).
     assert!(validate_config_map(&c)
         .iter()
-        .all(|e| e.error_type != rusternetes_common::validation::field::ErrorType::TooLong));
+        .all(|e| e.error_type != k3rs_common::validation::field::ErrorType::TooLong));
 }
 
 // The ObjectMeta cases of upstream `TestValidateConfigMap`: emptyName,

@@ -12,13 +12,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::IPAddress,
     List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -162,10 +162,10 @@ pub async fn list_ipaddresses(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<IPAddress>(
             state,
@@ -186,7 +186,7 @@ pub async fn list_ipaddresses(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 

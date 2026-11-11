@@ -3,15 +3,15 @@
 
 mod __parent {
     pub use chrono::{DateTime, Duration, Utc};
-    pub use rusternetes_common::resources::{HPAScalingRules, HorizontalPodAutoscalerBehavior};
+    pub use k3rs_common::resources::{HPAScalingRules, HorizontalPodAutoscalerBehavior};
     pub use std::collections::HashMap;
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::HPAScalingPolicy;
-    use rusternetes_controller_manager::controllers::hpa_behavior::*;
+    use k3rs_common::resources::HPAScalingPolicy;
+    use k3rs_controller_manager::controllers::hpa_behavior::*;
 
     fn rules(select: &str, policies: Vec<HPAScalingPolicy>) -> HPAScalingRules {
         HPAScalingRules {

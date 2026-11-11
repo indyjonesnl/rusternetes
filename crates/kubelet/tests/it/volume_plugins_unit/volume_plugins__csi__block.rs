@@ -4,21 +4,21 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::{PersistentVolumeAccessMode, Pod, VolumeAttachment};
-    pub use rusternetes_kubelet::volume_plugins::csi::metrics::new_metrics_csi;
-    pub use rusternetes_kubelet::volume_plugins::csi::{
+    pub use k3rs_common::resources::{PersistentVolumeAccessMode, Pod, VolumeAttachment};
+    pub use k3rs_kubelet::volume_plugins::csi::metrics::new_metrics_csi;
+    pub use k3rs_kubelet::volume_plugins::csi::{
         get_attachment_name, get_credentials_from_secret, load_volume_data, make_dir_0750,
         pv_source_from_spec, remove_mount_dir, save_volume_data, transient, vol_data_key,
         CsiPlugin, VolumeLifecycleMode,
     };
-    pub use rusternetes_kubelet::volume_plugins::csi_client::FS_TYPE_BLOCK_NAME;
-    pub use rusternetes_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
+    pub use k3rs_kubelet::volume_plugins::csi_client::FS_TYPE_BLOCK_NAME;
+    pub use k3rs_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
+    pub use k3rs_kubelet::volume_plugins::plugin::{
         BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper, CustomBlockVolumeMapper,
         CustomBlockVolumeUnmapper, Metrics, MetricsProvider, OwnedSpec, Spec,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::types::is_operation_finished_error;
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_kubelet::volume_plugins::util::types::is_operation_finished_error;
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use std::collections::HashMap;
     pub use std::path::{Path, PathBuf};
     pub use std::sync::Arc;
@@ -38,15 +38,15 @@ mod tests {
 
     use super::__parent::*;
     use crate::csi_fake::{serve, FakeDriver};
-    use rusternetes_common::resources::{PersistentVolume, Secret, Volume};
-    use rusternetes_kubelet::volume_plugins::csi::block::*;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::node_service_capability::rpc::Type as Cap;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
-    use rusternetes_kubelet::volume_plugins::csi_client::CsiError;
-    use rusternetes_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister;
-    use rusternetes_kubelet::volume_plugins::csi_drivers_store::{csi_drivers, Driver};
-    use rusternetes_kubelet::volume_plugins::{KubeletVolumeHost, VolumePlugin};
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::{PersistentVolume, Secret, Volume};
+    use k3rs_kubelet::volume_plugins::csi::block::*;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::node_service_capability::rpc::Type as Cap;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
+    use k3rs_kubelet::volume_plugins::csi_client::CsiError;
+    use k3rs_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister;
+    use k3rs_kubelet::volume_plugins::csi_drivers_store::{csi_drivers, Driver};
+    use k3rs_kubelet::volume_plugins::{KubeletVolumeHost, VolumePlugin};
+    use k3rs_storage::MemoryStorage;
     use serde_json::json;
 
     struct Fx {
@@ -89,7 +89,7 @@ mod tests {
             KubeletVolumeHost::new_for_tests(
                 root,
                 Some(storage.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_node_name("node-1")
@@ -520,7 +520,7 @@ mod tests {
     /// metrics are the driver's `NodeGetVolumeStats` for that path.
     #[tokio::test(flavor = "multi_thread")]
     async fn mapper_metrics_come_from_node_get_volume_stats() {
-        use rusternetes_kubelet::volume_plugins::csi_client::proto::{
+        use k3rs_kubelet::volume_plugins::csi_client::proto::{
             volume_usage::Unit, NodeGetVolumeStatsResponse, VolumeUsage,
         };
         let f = fx(

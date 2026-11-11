@@ -9,8 +9,8 @@
 
 use crate::volume_plugins::plugin::{BlockVolumeMapper, Mounter, OwnedSpec};
 use crate::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::Pod;
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::Pod;
 use std::fmt;
 use std::sync::Arc;
 use std::time::SystemTime;

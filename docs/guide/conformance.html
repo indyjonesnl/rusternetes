@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Conformance Status - Rūsternetes</title>
+  <title>Conformance Status - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Conformance Status</h1>
       <p class="lead">
-        Rūsternetes is tested against the official Kubernetes v1.35 conformance suite via Sonobuoy.
+        k3rs is tested against the official Kubernetes v1.35 conformance suite via Sonobuoy.
         Current pass rate: 398 of 441 tests (90.2%), with fixes coded for all 43 remaining failures.
       </p>
 
@@ -235,9 +235,9 @@
 
       <h3>Prerequisites</h3>
       <ul>
-        <li>A running Rūsternetes cluster (Docker Compose or all-in-one)</li>
+        <li>A running k3rs cluster (Docker Compose or all-in-one)</li>
         <li>The cluster must be bootstrapped: <code>bash scripts/bootstrap-cluster.sh</code></li>
-        <li><code>KUBECONFIG</code> set to <code>~/.kube/rusternetes-config</code></li>
+        <li><code>KUBECONFIG</code> set to <code>~/.kube/k3rs-config</code></li>
       </ul>
 
       <h3>Start the conformance suite</h3>
@@ -361,7 +361,7 @@ podman compose -f compose.yml exec e2e tail <span class="flag">-f</span> /tmp/so
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

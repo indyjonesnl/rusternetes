@@ -6,9 +6,9 @@
 //! `MemoryStorage` has no kubelet, so tests that drive `reconcile_all()` by
 //! hand and then expect the pod to be gone replay that step here.
 
-use rusternetes_common::resources::Pod;
-use rusternetes_controller_manager::controllers::job::JobController;
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_common::resources::Pod;
+use k3rs_controller_manager::controllers::job::JobController;
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 /// Physically delete every pod (any namespace) that carries a

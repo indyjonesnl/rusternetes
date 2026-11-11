@@ -2,12 +2,12 @@
 # Sourced helper for parallel conformance agents.
 #
 # Each agent owns:
-#   * a privileged docker:dind sidecar (`rusternetes-agent-N-dind`),
-#   * its own dockerd state under /tmp/rusternetes-agent-N/{sock,data},
+#   * a privileged docker:dind sidecar (`k3rs-agent-N-dind`),
+#   * its own dockerd state under /tmp/k3rs-agent-N/{sock,data},
 #   * a host port 1644N → dind 6443 publish so kubectl on the host
 #     reaches that agent's api-server,
-#   * a workdir (usually a git worktree) whose .rusternetes/certs and
-#     .rusternetes/volumes are bind-mounted into the dind.
+#   * a workdir (usually a git worktree) whose .k3rs/certs and
+#     .k3rs/volumes are bind-mounted into the dind.
 #
 # Two agents pointed at the SAME workdir will trample each other's
 # certs and kubelet-volumes. Use one worktree per agent (the /batch
@@ -42,12 +42,12 @@ AGENT_IMAGES_TAR="${AGENT_CACHE_DIR}/images.tar"
 # through `docker exec ${DIND_NAME} ...` instead of a bind-mounted sock.
 
 # Per-agent artefacts inside the workdir (so /batch worktrees pick them up).
-AGENT_ARTIFACT_DIR="${AGENT_WORKDIR}/.rusternetes/agents/${AGENT_ID}"
+AGENT_ARTIFACT_DIR="${AGENT_WORKDIR}/.k3rs/agents/${AGENT_ID}"
 AGENT_KUBECONFIG="${AGENT_ARTIFACT_DIR}/kubeconfig"
 AGENT_RESULTS_DIR="${AGENT_ARTIFACT_DIR}/results"
 AGENT_LOG="${AGENT_ARTIFACT_DIR}/up.log"
 
-DIND_NAME="rusternetes-agent-${AGENT_ID}-dind"
+DIND_NAME="k3rs-agent-${AGENT_ID}-dind"
 DIND_IMAGE="docker:28-dind"
 API_HOST_PORT=$((16443 + AGENT_ID))
 

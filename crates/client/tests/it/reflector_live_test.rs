@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::BoxStream;
-use rusternetes_client::http::ApiClient;
-use rusternetes_client::reflector::{ApiListWatch, ListWatch, Reflector, WatchItem};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_client::reflector::{ApiListWatch, ListWatch, Reflector, WatchItem};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::watch;

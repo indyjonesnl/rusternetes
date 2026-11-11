@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusternetes_common::resources::LimitRange;
-use rusternetes_storage::{build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::LimitRange;
+use k3rs_storage::{build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -10,7 +10,7 @@ use tracing::{debug, error, info};
 ///
 /// NOTE: In upstream Kubernetes, LimitRange enforcement (defaulting,
 /// min/max checks, ratio constraints) lives in the `LimitRanger` admission
-/// plugin — *not* in a background controller. Rusternetes already has a
+/// plugin — *not* in a background controller. k3rs already has a
 /// `LimitRangerController` admission stub in
 /// `crates/common/src/admission.rs` for that path.
 ///

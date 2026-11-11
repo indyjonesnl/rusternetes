@@ -19,8 +19,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use rusternetes_common::resources::CustomResourceDefinition;
-use rusternetes_common::validation::crd::CUSTOM_RESOURCE_CLEANUP_FINALIZER;
+use k3rs_common::resources::CustomResourceDefinition;
+use k3rs_common::validation::crd::CUSTOM_RESOURCE_CLEANUP_FINALIZER;
 use tokio::sync::Notify;
 
 use super::condition_controllers::remove_crd_condition;

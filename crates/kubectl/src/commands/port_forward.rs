@@ -1,6 +1,6 @@
 use crate::websocket;
 use anyhow::Result;
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 
 /// Forward one or more local ports to a pod
 pub async fn execute(

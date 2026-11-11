@@ -1,12 +1,12 @@
 //! `common.SchemaDeclType` (schemas.go) over `JSONSchemaProps`, and the typed
 //! CRD rule environment of the shadow checker run.
 
-use rusternetes_cel_checker::DType;
-use rusternetes_common::cel_checker_shadow::{check_expression, SelfScope};
-use rusternetes_common::cel_schema_types::schema_decl_type;
-use rusternetes_common::cel_versions::{EnvSet, EnvType};
-use rusternetes_common::feature_gates::Version;
-use rusternetes_common::resources::crd::JSONSchemaProps;
+use k3rs_cel_checker::DType;
+use k3rs_common::cel_checker_shadow::{check_expression, SelfScope};
+use k3rs_common::cel_schema_types::schema_decl_type;
+use k3rs_common::cel_versions::{EnvSet, EnvType};
+use k3rs_common::feature_gates::Version;
+use k3rs_common::resources::crd::JSONSchemaProps;
 use serde_json::json;
 
 fn schema(v: serde_json::Value) -> JSONSchemaProps {

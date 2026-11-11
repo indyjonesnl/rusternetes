@@ -4,20 +4,18 @@
 
 use std::sync::Arc;
 
-use rusternetes_api_server::admission::plugins::EnabledForTest;
-use rusternetes_api_server::admission::runtime_class::{
-    set_overhead, set_scheduling, validate_overhead,
-};
-use rusternetes_api_server::endpoints::handlers::admission::Admission;
-use rusternetes_api_server::registry::rest::RequestContext;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-use rusternetes_common::auth::{TokenManager, UserInfo};
-use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer};
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::resources::{Pod, RuntimeClass};
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{Storage, StorageBackend};
+use k3rs_api_server::admission::plugins::EnabledForTest;
+use k3rs_api_server::admission::runtime_class::{set_overhead, set_scheduling, validate_overhead};
+use k3rs_api_server::endpoints::handlers::admission::Admission;
+use k3rs_api_server::registry::rest::RequestContext;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+use k3rs_common::auth::{TokenManager, UserInfo};
+use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer};
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::resources::{Pod, RuntimeClass};
+use k3rs_common::{Error, Result};
+use k3rs_storage::{Storage, StorageBackend};
 use serde_json::{json, Value};
 
 fn rc(v: Value) -> RuntimeClass {

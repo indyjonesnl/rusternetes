@@ -5,11 +5,11 @@
 use base64::Engine;
 use chrono::{DateTime, TimeZone, Utc};
 use ed25519_dalek::pkcs8::EncodePublicKey;
+use k3rs_common::resources::podcertificaterequest::*;
+use k3rs_common::types::Condition;
+use k3rs_common::validation::podcertificaterequest::*;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use rcgen::{CertificateParams, KeyPair, SubjectPublicKeyInfo, PKCS_ECDSA_P256_SHA256};
-use rusternetes_common::resources::podcertificaterequest::*;
-use rusternetes_common::types::Condition;
-use rusternetes_common::validation::podcertificaterequest::*;
 use sha2::{Digest, Sha256};
 
 const RSA3072_PUB: &str = "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAtaPQUBH2vZp6eIn3LYa4+WxDGb2fziig6Gkt4/fR/LqGupuHIfjxR7p+nhB6dFH6D3aetTF/UaYOsQWXZ/BkYQSqepHtbPQVousNoXdxri3R7QwuDVHKYEQ7/nJiDQ6Qe/n0Jx4qKLqbZw9zxwdhYRTS5j0k/zEBzk8a4R31cT9Mi1EJMCOSOtn2jHTthf0BThItUspv+GwRZffMu4GedOg7C/asaHnay+1J6STxAWeWRX10p5tRzFgrhT+rrkvrm6Bdbrb4F3hWXvOWySpXJBxztdEz76AmPGZLTMRcdiTaxRaga8zLGx2sI2v0HErZIi+636rMYldjV87wB10NE3rL1zycgg2sChQb8YqAcsBK8n186p0pfzLdBB79e9oilimeAZyBsh/L7W2Kwiz1KmHnES9YaKTbQbX2hUoMJd+03ZLeNIs1ESGY3xKxmg/N6OgjxEqbsAxV1WIF+SME7tMyVKxnqFsPHLFqAu2oL4CUTQTmEv1fCMENfgmkDwUBAgMBAAE=";
@@ -101,11 +101,11 @@ fn valid() -> PodCertificateRequest {
     pcr(k, s)
 }
 
-fn msgs(errs: &[rusternetes_common::validation::field::Error]) -> Vec<String> {
+fn msgs(errs: &[k3rs_common::validation::field::Error]) -> Vec<String> {
     errs.iter().map(|e| e.to_string()).collect()
 }
 
-fn assert_has(errs: &[rusternetes_common::validation::field::Error], needle: &str) {
+fn assert_has(errs: &[k3rs_common::validation::field::Error], needle: &str) {
     let m = msgs(errs);
     assert!(
         m.iter().any(|e| e.contains(needle)),

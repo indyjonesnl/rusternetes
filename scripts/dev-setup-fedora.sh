@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# Rusternetes Development Setup for Fedora Linux
+# k3rs Development Setup for Fedora Linux
 #
-# This script sets up a local development environment for Rusternetes on Fedora/RHEL/CentOS.
+# This script sets up a local development environment for k3rs on Fedora/RHEL/CentOS.
 # Unlike the production installer, this script:
 # - Uses --skip-auth for easier development
 # - Sets up convenient aliases and environment variables
@@ -45,7 +45,7 @@ CREATE_SYSTEMD=true
 SKIP_BUILD=false
 USE_HA=false
 CURRENT_USER=${SUDO_USER:-$USER}
-PROJECT_DIR="/home/$CURRENT_USER/rusternetes"
+PROJECT_DIR="/home/$CURRENT_USER/k3rs"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -116,7 +116,7 @@ check_root() {
 display_banner() {
     echo
     echo "=============================================="
-    echo "  Rusternetes Development Setup - Fedora"
+    echo "  k3rs Development Setup - Fedora"
     echo "=============================================="
     echo "User: $CURRENT_USER"
     echo "Project: $PROJECT_DIR"
@@ -308,7 +308,7 @@ configure_firewall() {
 
 # Clone or update repository
 setup_repository() {
-    log_step "Setting up Rusternetes repository..."
+    log_step "Setting up k3rs repository..."
 
     if [[ -d "$PROJECT_DIR" ]]; then
         log_info "Repository already exists at $PROJECT_DIR"
@@ -318,8 +318,8 @@ setup_repository() {
         log_warn "Project directory not found at $PROJECT_DIR"
         echo "Please clone the repository manually:"
         echo "  cd /home/$CURRENT_USER"
-        echo "  git clone https://github.com/yourusername/rusternetes.git"
-        echo "  cd rusternetes"
+        echo "  git clone https://github.com/yourusername/k3rs.git"
+        echo "  cd k3rs"
         return 1
     fi
 
@@ -359,9 +359,9 @@ build_images() {
     cd "$PROJECT_DIR"
 
     # Set volumes path
-    export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+    export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
     mkdir -p "$KUBELET_VOLUMES_PATH"
-    chown -R "$CURRENT_USER:$CURRENT_USER" "$PROJECT_DIR/.rusternetes"
+    chown -R "$CURRENT_USER:$CURRENT_USER" "$PROJECT_DIR/.k3rs"
 
     # Choose compose file
     local COMPOSE_FILE="docker-compose.yml"
@@ -402,9 +402,9 @@ create_dev_helpers() {
     # Start script
     cat > "$HELPER_DIR/start.sh" <<EOF
 #!/bin/bash
-# Start Rusternetes development cluster
+# Start k3rs development cluster
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE up -d
 echo "Cluster started. Use './dev/logs.sh' to view logs"
 EOF
@@ -412,9 +412,9 @@ EOF
     # Stop script
     cat > "$HELPER_DIR/stop.sh" <<EOF
 #!/bin/bash
-# Stop Rusternetes development cluster
+# Stop k3rs development cluster
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE down
 echo "Cluster stopped"
 EOF
@@ -422,9 +422,9 @@ EOF
     # Restart script
     cat > "$HELPER_DIR/restart.sh" <<EOF
 #!/bin/bash
-# Restart Rusternetes development cluster
+# Restart k3rs development cluster
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE restart
 echo "Cluster restarted"
 EOF
@@ -434,7 +434,7 @@ EOF
 #!/bin/bash
 # View cluster logs
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE logs -f "\$@"
 EOF
 
@@ -443,7 +443,7 @@ EOF
 #!/bin/bash
 # Check cluster status
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 echo "=== Container Status ==="
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE ps
 echo
@@ -456,11 +456,11 @@ EOF
 #!/bin/bash
 # Clean and restart cluster (fresh start)
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 echo "Stopping cluster..."
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE down -v
 echo "Cleaning volumes..."
-${COMPOSE_SUDO}rm -rf "$PROJECT_DIR/.rusternetes/volumes"/*
+${COMPOSE_SUDO}rm -rf "$PROJECT_DIR/.k3rs/volumes"/*
 echo "Starting fresh cluster..."
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE up -d
 echo "Cluster cleaned and restarted"
@@ -471,7 +471,7 @@ EOF
 #!/bin/bash
 # Bootstrap cluster with ServiceAccounts, tokens, and CoreDNS
 cd "$PROJECT_DIR"
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ./scripts/bootstrap-cluster.sh
 EOF
 
@@ -483,7 +483,7 @@ cd "$PROJECT_DIR"
 echo "Building Rust binaries..."
 cargo build --release
 echo "Building container images..."
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 ${COMPOSE_SUDO}KUBELET_VOLUMES_PATH=\$KUBELET_VOLUMES_PATH $COMPOSE_CMD -f $COMPOSE_FILE build
 echo "Rebuild complete. Use './dev/restart.sh' to apply changes"
 EOF
@@ -509,14 +509,14 @@ create_env_file() {
     log_step "Creating environment configuration..."
 
     cat > "$PROJECT_DIR/.env.dev" <<EOF
-# Rusternetes Development Environment
+# k3rs Development Environment
 # Source this file: source .env.dev
 
 # Container runtime
 export CONTAINER_RUNTIME=$([ "$USE_DOCKER" == "true" ] && echo "docker" || echo "podman")
 
 # Volumes path
-export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.rusternetes/volumes"
+export KUBELET_VOLUMES_PATH="$PROJECT_DIR/.k3rs/volumes"
 
 # Compose file
 export COMPOSE_FILE="$([ "$USE_HA" == "true" ] && echo "docker-compose.ha.yml" || echo "docker-compose.yml")"
@@ -553,7 +553,7 @@ cluster-rebuild() {
     cd "$PROJECT_DIR" && ./.dev/rebuild.sh
 }
 
-echo "Rusternetes development environment loaded"
+echo "k3rs development environment loaded"
 echo "Commands: cluster-start, cluster-stop, cluster-logs, cluster-status, cluster-clean, cluster-bootstrap, cluster-rebuild"
 echo "Kubectl alias: k (e.g., 'k get pods -A')"
 EOF
@@ -563,7 +563,7 @@ EOF
     # Add to .bashrc if not already there
     if ! grep -q 'source.*\.env\.dev' "/home/$CURRENT_USER/.bashrc"; then
         echo "" >> "/home/$CURRENT_USER/.bashrc"
-        echo "# Rusternetes development environment" >> "/home/$CURRENT_USER/.bashrc"
+        echo "# k3rs development environment" >> "/home/$CURRENT_USER/.bashrc"
         echo "if [ -f $PROJECT_DIR/.env.dev ]; then" >> "/home/$CURRENT_USER/.bashrc"
         echo "    source $PROJECT_DIR/.env.dev" >> "/home/$CURRENT_USER/.bashrc"
         echo "fi" >> "/home/$CURRENT_USER/.bashrc"
@@ -592,9 +592,9 @@ create_systemd_service() {
         COMPOSE_CMD="docker-compose"
     fi
 
-    cat > /etc/systemd/system/rusternetes-dev.service <<EOF
+    cat > /etc/systemd/system/k3rs-dev.service <<EOF
 [Unit]
-Description=Rusternetes Development Cluster
+Description=k3rs Development Cluster
 After=network-online.target
 Wants=network-online.target
 $([ "$USE_DOCKER" == "true" ] && echo "After=docker.service" || echo "")
@@ -604,7 +604,7 @@ $([ "$USE_DOCKER" == "true" ] && echo "Requires=docker.service" || echo "")
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$PROJECT_DIR
-Environment="KUBELET_VOLUMES_PATH=$PROJECT_DIR/.rusternetes/volumes"
+Environment="KUBELET_VOLUMES_PATH=$PROJECT_DIR/.k3rs/volumes"
 ExecStart=/usr/bin/$COMPOSE_CMD -f $COMPOSE_FILE up -d
 ExecStop=/usr/bin/$COMPOSE_CMD -f $COMPOSE_FILE down
 User=root
@@ -615,10 +615,10 @@ EOF
 
     systemctl daemon-reload
 
-    log_info "Systemd service created: rusternetes-dev.service"
-    log_dev "Enable auto-start: sudo systemctl enable rusternetes-dev"
-    log_dev "Start now: sudo systemctl start rusternetes-dev"
-    log_dev "Check status: sudo systemctl status rusternetes-dev"
+    log_info "Systemd service created: k3rs-dev.service"
+    log_dev "Enable auto-start: sudo systemctl enable k3rs-dev"
+    log_dev "Start now: sudo systemctl start k3rs-dev"
+    log_dev "Check status: sudo systemctl status k3rs-dev"
 }
 
 # Display completion message
@@ -628,7 +628,7 @@ display_completion() {
     echo "  Development Setup Complete!"
     echo "=============================================="
     echo
-    echo -e "${GREEN}Rusternetes development environment is ready!${NC}"
+    echo -e "${GREEN}k3rs development environment is ready!${NC}"
     echo
     echo "Project location: $PROJECT_DIR"
     echo
@@ -663,9 +663,9 @@ display_completion() {
     echo
     if [[ "$CREATE_SYSTEMD" == "true" ]]; then
         echo -e "${CYAN}Systemd Service (Optional):${NC}"
-        echo "  sudo systemctl enable rusternetes-dev  # Auto-start on boot"
-        echo "  sudo systemctl start rusternetes-dev   # Start now"
-        echo "  sudo systemctl status rusternetes-dev  # Check status"
+        echo "  sudo systemctl enable k3rs-dev  # Auto-start on boot"
+        echo "  sudo systemctl start k3rs-dev   # Start now"
+        echo "  sudo systemctl status k3rs-dev  # Check status"
         echo
     fi
     echo -e "${CYAN}Development Features:${NC}"
@@ -687,7 +687,7 @@ display_completion() {
 
 # Main setup flow
 main() {
-    log_info "Starting Rusternetes development setup for Fedora..."
+    log_info "Starting k3rs development setup for Fedora..."
 
     check_root
     display_banner

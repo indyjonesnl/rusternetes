@@ -11,7 +11,7 @@
 //! into `DELETED`.
 
 use futures::StreamExt;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::timeout;

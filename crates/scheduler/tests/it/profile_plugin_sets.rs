@@ -16,15 +16,13 @@
 //!   stays as a second shape.
 
 use async_trait::async_trait;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::framework_runtime::{ExtensionPoint, PluginInstance, Registry};
-use rusternetes_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Plugin, Status};
-use rusternetes_scheduler::profile::Map;
-use rusternetes_scheduler::scheduler::Scheduler;
-use rusternetes_scheduler::scheduler_config::{
-    profiles_from_config, profiles_from_config_with_registry,
-};
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::framework_runtime::{ExtensionPoint, PluginInstance, Registry};
+use k3rs_scheduler::fwk::{Code, CycleState, FilterPlugin, NodeInfo, Plugin, Status};
+use k3rs_scheduler::profile::Map;
+use k3rs_scheduler::scheduler::Scheduler;
+use k3rs_scheduler::scheduler_config::{profiles_from_config, profiles_from_config_with_registry};
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use serde_json::json;
 use std::sync::Arc;
 

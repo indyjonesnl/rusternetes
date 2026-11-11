@@ -11,7 +11,7 @@
 //! :812), a library below apiserver; the apiserver patch handler
 //! (`smpPatcher.applyPatchToCurrentObject`,
 //! apiserver/pkg/endpoints/handlers/patch.go:446) only calls it. Moved
-//! verbatim from `rusternetes-api-server`; behaviour unchanged.
+//! verbatim from `k3rs-api-server`; behaviour unchanged.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

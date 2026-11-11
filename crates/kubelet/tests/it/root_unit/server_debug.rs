@@ -7,7 +7,7 @@ mod __parent {
     pub use axum::response::{IntoResponse, Response};
     pub use axum::routing::any;
     pub use axum::Router;
-    pub use rusternetes_kubelet::server::disabled_endpoint;
+    pub use k3rs_kubelet::server::disabled_endpoint;
     pub use std::sync::Arc;
 }
 
@@ -15,7 +15,7 @@ mod tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_kubelet::server_debug::*;
+    use k3rs_kubelet::server_debug::*;
     use tower::ServiceExt;
 
     async fn call(app: &Router, method: &str, path: &str, body: &str) -> (StatusCode, String) {

@@ -17,15 +17,13 @@
 //! target. The privileged live-socket dial itself belongs to the cluster e2e
 //! suite, not this unit test.
 
-use rusternetes_common::resources::endpointslice::EndpointPort as ESEndpointPort;
-use rusternetes_common::resources::{
+use k3rs_common::resources::endpointslice::EndpointPort as ESEndpointPort;
+use k3rs_common::resources::{
     Container, ContainerPort, Endpoint, EndpointConditions, EndpointSlice, IntOrString, Pod,
     PodSpec, PodStatus, Service, ServicePort, ServiceSpec, ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kube_proxy::iptables::{
-    IptablesManager, DEFAULT_CLUSTER_CIDR, DEFAULT_NODEPORT_RANGE,
-};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kube_proxy::iptables::{IptablesManager, DEFAULT_CLUSTER_CIDR, DEFAULT_NODEPORT_RANGE};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -682,13 +680,13 @@ async fn services_endpoints_same_port_different_protocols_iptables() {
 
     // TCP service ClusterIP DNAT rule must be present.
     assert!(
-        rules.contains("-A RUSTERNETES-SERVICES -d 10.97.0.1/32"),
+        rules.contains("-A K3RS-SERVICES -d 10.97.0.1/32"),
         "TCP ClusterIP rule missing: {}",
         rules
     );
     // UDP service ClusterIP DNAT rule must be present.
     assert!(
-        rules.contains("-A RUSTERNETES-SERVICES -d 10.97.0.2/32"),
+        rules.contains("-A K3RS-SERVICES -d 10.97.0.2/32"),
         "UDP ClusterIP rule missing: {}",
         rules
     );
@@ -859,12 +857,12 @@ async fn services_functioning_nodeport_iptables_rules_present() {
         .await;
 
     assert!(
-        rules.contains("-A RUSTERNETES-SERVICES -d 10.97.1.1/32"),
+        rules.contains("-A K3RS-SERVICES -d 10.97.1.1/32"),
         "NodePort SERVICES chain rule: {}",
         rules
     );
     assert!(
-        rules.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 31234"),
+        rules.contains("-A K3RS-NODEPORTS -p tcp --dport 31234"),
         "NodePort NODEPORTS chain rule: {}",
         rules
     );

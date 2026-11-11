@@ -1,9 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::resources::{Namespace, NamespaceCondition, NamespaceStatus, Pod};
-use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::{Namespace, NamespaceCondition, NamespaceStatus, Pod};
+use k3rs_common::types::Phase;
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1056,7 +1056,7 @@ impl<S: Storage + 'static> NamespaceController<S> {
                 // override, so the server picks the default (graceful) period;
                 // a grace-0 hard delete here diverged (#2729).
                 if let Err(e) = self.storage.delete_gracefully(&key).await {
-                    if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                    if !matches!(e, k3rs_common::Error::NotFound(_)) {
                         warn!(
                             "Failed to delete {}/{}/{}: {}",
                             resource_type, namespace, name, e

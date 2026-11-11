@@ -11,7 +11,7 @@
 //! library arrives, and is replaced, at which Kubernetes version.
 //!
 //! This is the typed counterpart of the name-only model in
-//! `rusternetes_common::cel_versions`, which a later slice replaces with it.
+//! `k3rs_common::cel_versions`, which a later slice replaces with it.
 //! Options that declare nothing the checker looks at (`EagerlyValidateDeclarations`,
 //! `DefaultUTCTimeZone`, the cost options, the AST validators other than
 //! homogeneous aggregate literals) are not modelled.

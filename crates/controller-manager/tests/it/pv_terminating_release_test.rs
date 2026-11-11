@@ -5,9 +5,9 @@
 //! (`pvprotection/pv_protection_controller.go` `isBeingUsed`) keeps a Bound
 //! volume's finalizer, so skipping terminating volumes left the PV forever.
 
-use rusternetes_common::resources::volume::{PersistentVolume, PersistentVolumePhase};
-use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WorkQueue};
+use k3rs_common::resources::volume::{PersistentVolume, PersistentVolumePhase};
+use k3rs_controller_manager::controllers::pv_binder::PVBinderController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WorkQueue};
 use serde_json::json;
 use std::sync::Arc;
 

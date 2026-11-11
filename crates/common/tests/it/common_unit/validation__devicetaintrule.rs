@@ -2,26 +2,26 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::devicetaintrule::{
+    pub use k3rs_common::resources::devicetaintrule::{
         DeviceTaintRule, DeviceTaintRuleSpec, DeviceTaintSelector,
         DEVICE_TAINT_RULE_STATUS_MAX_CONDITIONS,
     };
-    pub use rusternetes_common::validation::csinode::validate_csi_driver_name;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::validate_conditions;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::csinode::validate_csi_driver_name;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::validate_conditions;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::resourceslice::{
+    pub use k3rs_common::validation::resourceslice::{
         validate_device_name, validate_device_taint, validate_pool_name,
     };
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::dra::{DeviceTaint, DeviceTaintEffect};
-    use rusternetes_common::types::Condition;
-    use rusternetes_common::validation::devicetaintrule::*;
+    use k3rs_common::resources::dra::{DeviceTaint, DeviceTaintEffect};
+    use k3rs_common::types::Condition;
+    use k3rs_common::validation::devicetaintrule::*;
 
     fn agg(errs: &ErrorList) -> String {
         errs.iter()

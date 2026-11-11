@@ -2,17 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::mutating_admission_policy::{
+    pub use k3rs_common::resources::mutating_admission_policy::{
         MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
         MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
         ReinvocationPolicyType,
     };
-    pub use rusternetes_common::resources::validating_admission_policy::{
-        FailurePolicy, MatchResources,
-    };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
-    pub use rusternetes_common::validation::validating_admission_policy::{
+    pub use k3rs_common::resources::validating_admission_policy::{FailurePolicy, MatchResources};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
+    pub use k3rs_common::validation::validating_admission_policy::{
         operation_str, set_defaults_match_resources, validate_match_conditions,
         validate_match_resources, validate_param_kind, validate_param_ref, validate_variable,
     };
@@ -21,7 +19,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::mutating_admission_policy::*;
+    use k3rs_common::validation::mutating_admission_policy::*;
     use serde_json::json;
 
     fn policy(spec: serde_json::Value) -> MutatingAdmissionPolicy {

@@ -3,13 +3,13 @@ use super::replicationcontroller::slow_start_batches_capped;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
 };
-use rusternetes_common::types::{
+use k3rs_common::types::{
     label_selector_as_selector, ObjectMeta, OwnerReference, Phase, Selector, TypeMeta,
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1236,7 +1236,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     );
                     deleted += 1;
                 }
-                Err(rusternetes_common::Error::NotFound(_)) => {
+                Err(k3rs_common::Error::NotFound(_)) => {
                     deleted += 1; // already gone, count it
                 }
                 Err(e) => {
@@ -1259,7 +1259,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     fn volume_claim_template_volumes(
         statefulset: &StatefulSet,
         ordinal: i32,
-    ) -> Vec<rusternetes_common::resources::Volume> {
+    ) -> Vec<k3rs_common::resources::Volume> {
         let Some(templates) = statefulset.spec.volume_claim_templates.as_ref() else {
             return Vec::new();
         };
@@ -1285,7 +1285,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     /// `storageClassName`, matching the api-server's DefaultStorageClass
     /// admission. `namespace` is accepted only for log context.
     async fn default_storage_class_name(&self, namespace: &str) -> Option<String> {
-        let storage_classes: Vec<rusternetes_common::resources::StorageClass> = self
+        let storage_classes: Vec<k3rs_common::resources::StorageClass> = self
             .storage
             .list("/registry/storageclasses/")
             .await
@@ -1463,7 +1463,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
                     "PVC retention (whenScaled=Delete): deleted PVC {} for StatefulSet {}/{}",
                     pvc_name, namespace, ss_name
                 ),
-                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(k3rs_common::Error::NotFound(_)) => {}
                 Err(e) => {
                     warn!(
                         "PVC retention: failed to delete PVC {} for {}/{}: {}",
@@ -1483,7 +1483,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
     /// arbitrary order (HashMap has no guaranteed iteration order), producing
     /// non-deterministic output. Converting to Value first normalizes all maps
     /// into BTreeMap-backed serde_json::Map, which iterates in sorted key order.
-    pub fn compute_revision(template: &rusternetes_common::resources::PodTemplateSpec) -> String {
+    pub fn compute_revision(template: &k3rs_common::resources::PodTemplateSpec) -> String {
         use sha2::{Digest, Sha256};
         // Convert to Value first to normalize HashMap ordering to sorted BTreeMap
         let value = serde_json::to_value(template).unwrap_or_default();
@@ -1532,7 +1532,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         let revision = Self::compute_revision(&statefulset.spec.template);
         labels.insert("controller-revision-hash".to_string(), revision);
 
-        let mut metadata = rusternetes_common::types::ObjectMeta::new(pod_name.clone())
+        let mut metadata = k3rs_common::types::ObjectMeta::new(pod_name.clone())
             .with_namespace(namespace.to_string())
             .with_labels(labels)
             .with_owner_reference(OwnerReference {
@@ -1580,10 +1580,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
         // DefaultTolerationSeconds admission (#442): controllers bypass the
         // api-server admission path that adds these NoExecute tolerations.
-        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
+        k3rs_common::tolerations::add_default_tolerations(&mut pod_spec);
 
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1614,7 +1614,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         match self.storage.create(&key, &pod).await {
             Ok(_) => Ok(()),
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+            Err(k3rs_common::Error::AlreadyExists(_)) => {
                 debug!("Pod {} already exists, skipping creation", pod_name);
                 Ok(())
             }
@@ -1629,7 +1629,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         statefulset: &StatefulSet,
         ordinal: i32,
         namespace: &str,
-        template: &rusternetes_common::resources::PodTemplateSpec,
+        template: &k3rs_common::resources::PodTemplateSpec,
         revision: &str,
     ) -> Result<()> {
         let statefulset_name = &statefulset.metadata.name;
@@ -1647,7 +1647,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         );
         labels.insert("controller-revision-hash".to_string(), revision.to_string());
 
-        let mut metadata = rusternetes_common::types::ObjectMeta::new(pod_name.clone())
+        let mut metadata = k3rs_common::types::ObjectMeta::new(pod_name.clone())
             .with_namespace(namespace.to_string())
             .with_labels(labels)
             .with_owner_reference(OwnerReference {
@@ -1691,10 +1691,10 @@ impl<S: Storage + 'static> StatefulSetController<S> {
 
         // DefaultTolerationSeconds admission (#442): controllers bypass the
         // api-server admission path that adds these NoExecute tolerations.
-        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
+        k3rs_common::tolerations::add_default_tolerations(&mut pod_spec);
 
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1725,7 +1725,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         let key = format!("/registry/pods/{}/{}", namespace, pod_name);
         match self.storage.create(&key, &pod).await {
             Ok(_) => Ok(()),
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+            Err(k3rs_common::Error::AlreadyExists(_)) => {
                 debug!("Pod {} already exists, skipping creation", pod_name);
                 Ok(())
             }
@@ -1739,7 +1739,7 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         namespace: &str,
         statefulset_name: &str,
         revision_hash: &str,
-    ) -> Option<rusternetes_common::resources::PodTemplateSpec> {
+    ) -> Option<k3rs_common::resources::PodTemplateSpec> {
         // ControllerRevision names follow the pattern: {ss-name}-{revision-hash-prefix}
         let cr_name = format!(
             "{}-{}",
@@ -1749,9 +1749,8 @@ impl<S: Storage + 'static> StatefulSetController<S> {
         let cr_key = format!("/registry/controllerrevisions/{}/{}", namespace, cr_name);
         if let Ok(cr) = self.storage.get::<serde_json::Value>(&cr_key).await {
             if let Some(data) = cr.get("data") {
-                if let Ok(template) = serde_json::from_value::<
-                    rusternetes_common::resources::PodTemplateSpec,
-                >(data.clone())
+                if let Ok(template) =
+                    serde_json::from_value::<k3rs_common::resources::PodTemplateSpec>(data.clone())
                 {
                     return Some(template);
                 }

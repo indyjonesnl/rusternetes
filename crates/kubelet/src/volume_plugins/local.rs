@@ -17,7 +17,7 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{EventType, Pod};
+use k3rs_common::resources::{EventType, Pod};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -170,10 +170,7 @@ impl LocalPlugin {
 /// read-only flag. Only the PV arm exists.
 fn get_volume_source<'a>(
     spec: &'a Spec<'_>,
-) -> Result<(
-    &'a rusternetes_common::resources::volume::LocalVolumeSource,
-    bool,
-)> {
+) -> Result<(&'a k3rs_common::resources::volume::LocalVolumeSource, bool)> {
     match spec.persistent_volume.and_then(|pv| pv.spec.local.as_ref()) {
         Some(l) => Ok((l, spec.read_only)),
         None => bail!("Spec does not reference a Local volume type"),

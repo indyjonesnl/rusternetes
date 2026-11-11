@@ -5,7 +5,7 @@
 //!   always sends `nanos = 0`, `MicroTime.ProtoMicroTime` truncates to micros.
 //! * `IntOrString` (`apimachinery/pkg/util/intstr/generated.pb.go`) writes
 //!   `type`, `intVal`, `strVal` unconditionally.
-use rusternetes_protobuf::PROTO_REGISTRY;
+use k3rs_protobuf::PROTO_REGISTRY;
 use serde_json::json;
 
 #[test]

@@ -16,14 +16,14 @@
 //!   within a run. With no cache, the order is instead a fixed pseudo-random
 //!   permutation seeded once per process, which is what the comment describes.
 //! * ClusterTrustBundles are read as the typed
-//!   `rusternetes_common::resources::ClusterTrustBundle` (certificates.k8s.io
+//!   `k3rs_common::resources::ClusterTrustBundle` (certificates.k8s.io
 //!   v1beta1). `m.ctbHandlers.GetSignerName(ctb)` (`:260`) is its
 //!   `spec.signerName`, `GetTrustBundle` its `spec.trustBundle`.
 
 use anyhow::{anyhow, Result};
-use rusternetes_common::resources::ClusterTrustBundle;
-use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::resources::ClusterTrustBundle;
+use k3rs_common::types::{label_selector_as_selector, LabelSelector};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::collections::BTreeSet;
 use std::hash::BuildHasher;
 use std::sync::OnceLock;
@@ -43,7 +43,7 @@ pub async fn get_trust_anchors_by_name<S: Storage + ?Sized>(
     let ctb: ClusterTrustBundle = match storage.get(&build_key(RESOURCE, None, name)).await {
         Ok(v) => v,
         // `k8serrors.IsNotFound(err) && allowMissing` (`:208-211`).
-        Err(rusternetes_common::Error::NotFound(_)) if allow_missing => return Ok(Vec::new()),
+        Err(k3rs_common::Error::NotFound(_)) if allow_missing => return Ok(Vec::new()),
         Err(e) => return Err(anyhow!("while getting ClusterTrustBundle: {e}")),
     };
     Ok(normalize_trust_anchors(&[ctb.spec.trust_bundle]))

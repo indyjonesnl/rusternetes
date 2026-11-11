@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde_json::{json, Value};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::taint::*;
+    use k3rs_kubectl::commands::taint::*;
 
     #[test]
     fn test_parse_taint_with_value_and_effect() {

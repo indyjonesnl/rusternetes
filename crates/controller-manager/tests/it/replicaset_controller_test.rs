@@ -1,10 +1,10 @@
-use rusternetes_common::resources::pod::PodCondition;
-use rusternetes_common::resources::{
+use k3rs_common::resources::pod::PodCondition;
+use k3rs_common::resources::{
     Container, Pod, PodSpec, PodStatus, PodTemplateSpec, ReplicaSet, ReplicaSetSpec,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

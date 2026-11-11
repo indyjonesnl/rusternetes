@@ -6,12 +6,12 @@
 // 2. Rollover: when a deployment is updated while existing pods exist (e.g. from
 //    a ReplicationController), the new RS is created with > 0 replicas.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, OwnerReference, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

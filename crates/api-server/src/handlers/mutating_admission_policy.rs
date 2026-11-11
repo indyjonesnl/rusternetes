@@ -9,7 +9,7 @@
 //! registers the storage only when `admissionregistration.k8s.io/v1beta1` is
 //! enabled (`pkg/registry/admissionregistration/rest/storage_apiserver.go:187-
 //! 205`), a group-version that is in `betaAPIGroupVersionsDisabledByDefault`
-//! (`pkg/controlplane/instance.go`). Rusternetes has no `--runtime-config`, so
+//! (`pkg/controlplane/instance.go`). k3rs has no `--runtime-config`, so
 //! the gate stands in for it, as `ClusterTrustBundle` does for
 //! `certificates.k8s.io/v1beta1`; with it off every verb is a 404.
 
@@ -24,14 +24,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     feature_gates::{enabled, Feature},
     resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding},
     Error, List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::sync::Arc;
 
 /// The 404 of a resource whose storage was not installed because the

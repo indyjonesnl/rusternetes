@@ -19,7 +19,7 @@
 //! `root_ca_cert_publisher_sync_total` / `_sync_duration_seconds` metrics
 //! keyed by status code (`recordMetrics`).
 //!
-//! The two informers are `rusternetes_client::reflector::Reflector`s (list once,
+//! The two informers are `k3rs_client::reflector::Reflector`s (list once,
 //! resume the watch from the last resourceVersion, serve reads from an
 //! in-memory store) over the [`Storage`] trait via
 //! `storage_list_watch::StorageListWatch`; `syncNamespace` reads the
@@ -42,11 +42,11 @@
 
 use crate::controllers::storage_list_watch::StorageListWatch;
 use anyhow::Result;
+use k3rs_client::reflector::{Reflector, StoreEvent};
+use k3rs_common::resources::Namespace;
+use k3rs_common::Error;
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use prometheus::{HistogramVec, IntCounterVec};
-use rusternetes_client::reflector::{Reflector, StoreEvent};
-use rusternetes_common::resources::Namespace;
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
 use serde_json::{json, Value};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -136,7 +136,7 @@ fn namespace_key(ns: &Namespace) -> String {
 }
 
 fn is_active(ns: &Namespace) -> bool {
-    use rusternetes_common::types::Phase;
+    use k3rs_common::types::Phase;
     !matches!(
         ns.status.as_ref().and_then(|s| s.phase.as_ref()),
         Some(p) if *p != Phase::Active

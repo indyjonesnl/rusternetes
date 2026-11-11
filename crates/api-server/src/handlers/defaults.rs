@@ -1,6 +1,6 @@
-use rusternetes_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
-use rusternetes_common::resources::policy::IntOrString;
-use rusternetes_common::resources::workloads::{
+use k3rs_common::resources::deployment::{DeploymentStrategy, RollingUpdateDeployment};
+use k3rs_common::resources::policy::IntOrString;
+use k3rs_common::resources::workloads::{
     DaemonSetUpdateStrategy, RollingUpdateDaemonSet, RollingUpdateStatefulSetStrategy,
     StatefulSetUpdateStrategy,
 };
@@ -13,7 +13,7 @@ use rusternetes_common::resources::workloads::{
 ///
 /// K8s ref: pkg/apis/core/v1/defaults.go
 /// K8s ref: pkg/apis/apps/v1/defaults.go
-use rusternetes_common::resources::PodSpec;
+use k3rs_common::resources::PodSpec;
 
 /// Returns `true` when an `Option<String>` is `None` or `Some("")`.
 /// Mirrors the upstream Go check `if obj.<Field> == ""` for non-pointer
@@ -44,8 +44,7 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
     // This matters for byte-level comparisons like DaemonSet ControllerRevision Match().
     // K8s ref: pkg/apis/core/v1/defaults.go:222-224
     if spec.security_context.is_none() {
-        spec.security_context =
-            Some(rusternetes_common::resources::pod::PodSecurityContext::default());
+        spec.security_context = Some(k3rs_common::resources::pod::PodSecurityContext::default());
     }
 
     // K8s: SetDefaults_Container (runs on all containers in the spec)
@@ -80,8 +79,8 @@ pub fn apply_pod_spec_defaults(spec: &mut PodSpec) {
 /// (`if ptr.AllPtrFieldsNil(&obj.VolumeSource)`). PodSecurity's
 /// restricted-volumes check relies on this (upstream test fixture
 /// `volume0` "implicit empty dir").
-fn apply_volume_default_source(vol: &mut rusternetes_common::resources::pod::Volume) {
-    use rusternetes_common::resources::pod::{EmptyDirVolumeSource, LegacyVolumeSources};
+fn apply_volume_default_source(vol: &mut k3rs_common::resources::pod::Volume) {
+    use k3rs_common::resources::pod::{EmptyDirVolumeSource, LegacyVolumeSources};
     let none = vol.empty_dir.is_none()
         && vol.host_path.is_none()
         && vol.config_map.is_none()
@@ -105,10 +104,10 @@ fn apply_volume_default_source(vol: &mut rusternetes_common::resources::pod::Vol
 
 /// Default `defaultMode` (0644) on the volume sources that carry it, mirroring
 /// the per-source `SetDefaults_*VolumeSource` functions (pkg/apis/core/v1).
-fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volume) {
+fn apply_volume_default_mode(vol: &mut k3rs_common::resources::pod::Volume) {
     const DEFAULT_MODE: i32 = 0o644;
     // rbd/azureDisk/scaleIO arms (zz_generated.defaults.go:224-290)
-    rusternetes_common::resources::pv_sources::apply_legacy_volume_source_defaults(
+    k3rs_common::resources::pv_sources::apply_legacy_volume_source_defaults(
         &mut vol.legacy_sources,
     );
     if let Some(s) = vol.secret.as_mut() {
@@ -132,9 +131,7 @@ fn apply_volume_default_mode(vol: &mut rusternetes_common::resources::pod::Volum
 /// `EphemeralContainerCommon`/`Container` shared defaulting in
 /// SetDefaults_PodSpec: terminationMessagePath/Policy, imagePullPolicy and
 /// port protocol. (Ephemeral containers have no probes.)
-fn apply_ephemeral_container_defaults(
-    ec: &mut rusternetes_common::resources::pod::EphemeralContainer,
-) {
+fn apply_ephemeral_container_defaults(ec: &mut k3rs_common::resources::pod::EphemeralContainer) {
     if ec.termination_message_path.is_none() {
         ec.termination_message_path = Some("/dev/termination-log".to_string());
     }
@@ -159,7 +156,7 @@ fn apply_ephemeral_container_defaults(
 
 /// Apply K8s defaults to a Container.
 /// Matches SetDefaults_Container from pkg/apis/core/v1/defaults.go
-pub fn apply_container_defaults(container: &mut rusternetes_common::resources::Container) {
+pub fn apply_container_defaults(container: &mut k3rs_common::resources::Container) {
     if container.termination_message_path.is_none() {
         container.termination_message_path = Some("/dev/termination-log".to_string());
     }
@@ -229,7 +226,7 @@ pub fn apply_container_defaults(container: &mut rusternetes_common::resources::C
 
 /// Default an `HTTPGetAction`'s `path` (→ `/`) and `scheme` (→ `HTTP`).
 /// Matches SetDefaults_HTTPGetAction from pkg/apis/core/v1/defaults.go.
-fn apply_http_get_defaults(hg: &mut rusternetes_common::resources::pod::HTTPGetAction) {
+fn apply_http_get_defaults(hg: &mut k3rs_common::resources::pod::HTTPGetAction) {
     if hg.path.as_deref().unwrap_or("").is_empty() {
         hg.path = Some("/".to_string());
     }
@@ -240,7 +237,7 @@ fn apply_http_get_defaults(hg: &mut rusternetes_common::resources::pod::HTTPGetA
 
 /// Apply K8s defaults to a Probe.
 /// Matches SetDefaults_Probe from pkg/apis/core/v1/defaults.go
-fn apply_probe_defaults(probe: &mut rusternetes_common::resources::pod::Probe) {
+fn apply_probe_defaults(probe: &mut k3rs_common::resources::pod::Probe) {
     if probe.timeout_seconds.is_none() || probe.timeout_seconds == Some(0) {
         probe.timeout_seconds = Some(1);
     }
@@ -275,7 +272,7 @@ fn apply_probe_defaults(probe: &mut rusternetes_common::resources::pod::Probe) {
 ///   want this defaulting semantic to take place on a v1.Pod and not a
 ///   v1.PodTemplate" (defaults.go:166-167).
 ///
-/// The resource pass itself lives in `rusternetes_common::defaults` because the
+/// The resource pass itself lives in `k3rs_common::defaults` because the
 /// api-server is not the only decoder of a `v1.Pod` — the kubelet's static-pod
 /// reader needs the identical defaulting, and upstream gets it there for free by
 /// decoding through the scheme (`pkg/kubelet/config/common.go:122`).
@@ -286,18 +283,18 @@ pub fn apply_pod_defaults(spec: &mut PodSpec) {
     if spec.enable_service_links.is_none() {
         spec.enable_service_links = Some(true);
     }
-    rusternetes_common::defaults::default_pod_requests_from_limits(spec);
+    k3rs_common::defaults::default_pod_requests_from_limits(spec);
 }
 
 /// Apply K8s defaults to a PodTemplateSpec (used by workload resources).
 /// This is called for DaemonSet, Deployment, StatefulSet, ReplicaSet, Job, CronJob.
-pub fn apply_pod_template_defaults(template: &mut rusternetes_common::resources::PodTemplateSpec) {
+pub fn apply_pod_template_defaults(template: &mut k3rs_common::resources::PodTemplateSpec) {
     apply_pod_spec_defaults(&mut template.spec);
 }
 
 /// Apply DaemonSet-specific defaults.
 /// Matches SetDefaults_DaemonSet from pkg/apis/apps/v1/defaults.go
-pub fn apply_daemonset_defaults(ds: &mut rusternetes_common::resources::DaemonSet) {
+pub fn apply_daemonset_defaults(ds: &mut k3rs_common::resources::DaemonSet) {
     if ds.spec.update_strategy.is_none() {
         ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
             strategy_type: Some("RollingUpdate".to_string()),
@@ -334,7 +331,7 @@ pub fn apply_daemonset_defaults(ds: &mut rusternetes_common::resources::DaemonSe
 
 /// Apply Deployment-specific defaults.
 /// Matches SetDefaults_Deployment from pkg/apis/apps/v1/defaults.go
-pub fn apply_deployment_defaults(deploy: &mut rusternetes_common::resources::Deployment) {
+pub fn apply_deployment_defaults(deploy: &mut k3rs_common::resources::Deployment) {
     if deploy.spec.replicas.is_none() {
         deploy.spec.replicas = Some(1);
     }
@@ -377,7 +374,7 @@ pub fn apply_deployment_defaults(deploy: &mut rusternetes_common::resources::Dep
 
 /// Apply StatefulSet-specific defaults.
 /// Matches SetDefaults_StatefulSet from pkg/apis/apps/v1/defaults.go
-pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::StatefulSet) {
+pub fn apply_statefulset_defaults(ss: &mut k3rs_common::resources::StatefulSet) {
     if ss.spec.pod_management_policy.is_none() {
         ss.spec.pod_management_policy = Some("OrderedReady".to_string());
     }
@@ -415,7 +412,7 @@ pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::Statef
     // SetDefaults_StatefulSet: persistentVolumeClaimRetentionPolicy defaults to
     // a struct with whenDeleted=Retain and whenScaled=Retain.
     {
-        use rusternetes_common::resources::workloads::StatefulSetPersistentVolumeClaimRetentionPolicy;
+        use k3rs_common::resources::workloads::StatefulSetPersistentVolumeClaimRetentionPolicy;
         let policy = ss
             .spec
             .persistent_volume_claim_retention_policy
@@ -435,7 +432,7 @@ pub fn apply_statefulset_defaults(ss: &mut rusternetes_common::resources::Statef
 
 /// Apply ReplicaSet-specific defaults.
 /// Matches SetDefaults_ReplicaSet from pkg/apis/apps/v1/defaults.go
-pub fn apply_replicaset_defaults(rs: &mut rusternetes_common::resources::ReplicaSet) {
+pub fn apply_replicaset_defaults(rs: &mut k3rs_common::resources::ReplicaSet) {
     // ReplicaSet.spec.replicas defaults via serde `default = "default_one_replica"`,
     // so no need to set here. Apply pod template defaults.
     apply_pod_template_defaults(&mut rs.spec.template);
@@ -443,7 +440,7 @@ pub fn apply_replicaset_defaults(rs: &mut rusternetes_common::resources::Replica
 
 /// Apply Job-specific defaults.
 /// Matches SetDefaults_Job from pkg/apis/batch/v1/defaults.go
-pub fn apply_job_defaults(job: &mut rusternetes_common::resources::Job) {
+pub fn apply_job_defaults(job: &mut k3rs_common::resources::Job) {
     apply_job_defaults_to_spec(&mut job.spec);
 
     // K8s: copy template labels to job labels if job has no labels
@@ -467,7 +464,7 @@ pub fn apply_job_defaults(job: &mut rusternetes_common::resources::Job) {
 
 /// Apply CronJob-specific defaults.
 /// Matches SetDefaults_CronJob from pkg/apis/batch/v1/defaults.go
-pub fn apply_cronjob_defaults(cj: &mut rusternetes_common::resources::CronJob) {
+pub fn apply_cronjob_defaults(cj: &mut k3rs_common::resources::CronJob) {
     if cj.spec.concurrency_policy.is_none() {
         cj.spec.concurrency_policy = Some("Allow".to_string());
     }
@@ -485,7 +482,7 @@ pub fn apply_cronjob_defaults(cj: &mut rusternetes_common::resources::CronJob) {
 }
 
 /// Apply Job spec defaults (without the Job-level wrapper)
-fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec) {
+fn apply_job_defaults_to_spec(spec: &mut k3rs_common::resources::JobSpec) {
     if spec.completions.is_none() && spec.parallelism.is_none() {
         spec.completions = Some(1);
         spec.parallelism = Some(1);
@@ -533,11 +530,10 @@ fn apply_job_defaults_to_spec(spec: &mut rusternetes_common::resources::JobSpec)
 /// nil new value and falsely reject an update that omits volumeMode.
 /// K8s ref: pkg/apis/core/v1/defaults.go SetDefaults_PersistentVolumeClaimSpec.
 pub fn apply_pvc_spec_defaults(
-    spec: &mut rusternetes_common::resources::volume::PersistentVolumeClaimSpec,
+    spec: &mut k3rs_common::resources::volume::PersistentVolumeClaimSpec,
 ) {
     if spec.volume_mode.is_none() {
-        spec.volume_mode =
-            Some(rusternetes_common::resources::volume::PersistentVolumeMode::Filesystem);
+        spec.volume_mode = Some(k3rs_common::resources::volume::PersistentVolumeMode::Filesystem);
     }
 }
 
@@ -545,7 +541,7 @@ pub fn apply_pvc_spec_defaults(
 /// every item. Only `Container` items are defaulted: a missing default limit
 /// comes from `max`, a missing default request from the default limit, and
 /// then from `min`.
-pub fn apply_limit_range_defaults(lr: &mut rusternetes_common::resources::LimitRange) {
+pub fn apply_limit_range_defaults(lr: &mut k3rs_common::resources::LimitRange) {
     for item in &mut lr.spec.limits {
         if item.item_type != "Container" {
             continue;
@@ -579,7 +575,7 @@ pub fn apply_limit_range_defaults(lr: &mut rusternetes_common::resources::LimitR
 /// the declarative `replicas` default of 1, and the pod template's defaults.
 /// An absent selector and absent labels come from the template's labels.
 pub fn apply_replicationcontroller_defaults(
-    rc: &mut rusternetes_common::resources::ReplicationController,
+    rc: &mut k3rs_common::resources::ReplicationController,
 ) {
     if rc.spec.replicas.is_none() {
         rc.spec.replicas = Some(1);
@@ -605,8 +601,8 @@ pub fn apply_replicationcontroller_defaults(
 const DEFAULT_CLIENT_IP_SERVICE_AFFINITY_SECONDS: i32 = 10800;
 
 /// `SetDefaults_Service` (pkg/apis/core/v1/defaults.go:106-162).
-pub fn apply_service_defaults(svc: &mut rusternetes_common::resources::Service) {
-    use rusternetes_common::resources::{
+pub fn apply_service_defaults(svc: &mut k3rs_common::resources::Service) {
+    use k3rs_common::resources::{
         ClientIPConfig, ServiceExternalTrafficPolicy, ServiceInternalTrafficPolicy, ServiceType,
         SessionAffinityConfig,
     };
@@ -648,7 +644,7 @@ pub fn apply_service_defaults(svc: &mut rusternetes_common::resources::Service) 
             sp.target_port = Some(IntOrString::Int(i32::from(sp.port)));
         }
     }
-    if rusternetes_common::validation::service::externally_accessible(svc)
+    if k3rs_common::validation::service::externally_accessible(svc)
         && svc.spec.external_traffic_policy.is_none()
     {
         svc.spec.external_traffic_policy = Some(ServiceExternalTrafficPolicy::Cluster);

@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_storage::WatchEvent;
+    pub use k3rs_storage::WatchEvent;
     pub use std::collections::{HashMap, HashSet, VecDeque};
     pub use std::sync::Arc;
     pub use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::workqueue::*;
+    use k3rs_storage::workqueue::*;
 
     #[tokio::test]
     async fn test_add_and_get() {

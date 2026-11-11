@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::plugin::*;
+    use k3rs_kubectl::commands::plugin::*;
     use std::io::Write;
 
     #[test]

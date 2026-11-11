@@ -1,17 +1,15 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-use rusternetes_common::resources::volume::VolumeSnapshotContentSource;
-use rusternetes_common::resources::{
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+use k3rs_common::resources::volume::VolumeSnapshotContentSource;
+use k3rs_common::resources::{
     DeletionPolicy, EventSource, EventType, PersistentVolume, PersistentVolumeClaim,
     VolumeSnapshot, VolumeSnapshotClass, VolumeSnapshotContent, VolumeSnapshotContentSpec,
     VolumeSnapshotContentStatus, VolumeSnapshotStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{
-    build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue,
-};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -59,7 +57,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("volumesnapshots", None);
+            let prefix = k3rs_storage::build_prefix("volumesnapshots", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -348,7 +346,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
     /// no-op.
     ///
     /// Not ported: the `IsVolumeGroupSnapshotMember` short-circuit (`:1475`) —
-    /// Rusternetes has no VolumeGroupSnapshot.
+    /// k3rs has no VolumeGroupSnapshot.
     async fn set_default_snapshot_class(&self, vs: &VolumeSnapshot) -> Result<Option<String>> {
         if vs.spec.source.volume_snapshot_content_name.is_some() {
             return Ok(None);
@@ -497,7 +495,7 @@ impl<S: Storage + 'static> VolumeSnapshotController<S> {
         // For now, we only support our own hostpath snapshotter
         matches!(
             driver,
-            "rusternetes.io/hostpath-snapshotter" | "hostpath-snapshotter"
+            "k3rs.io/hostpath-snapshotter" | "hostpath-snapshotter"
         )
     }
 

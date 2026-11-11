@@ -11,19 +11,17 @@ mod __parent {}
 /// 3. Controllers skip reconciliation when being deleted
 /// 4. The full cascade chain works end-to-end (owner deleted → GC removes dependents)
 mod tests {
-    use rusternetes_common::resources::workloads::{
+    use k3rs_common::resources::workloads::{
         DaemonSet, DaemonSetSpec, Job, JobSpec, ReplicaSet, ReplicaSetSpec, StatefulSet,
         StatefulSetSpec,
     };
-    use rusternetes_common::resources::{
-        Endpoints, Node, NodeStatus, Pod, PodSpec, PodTemplateSpec,
-    };
-    use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
-    use rusternetes_controller_manager::controllers::{
+    use k3rs_common::resources::{Endpoints, Node, NodeStatus, Pod, PodSpec, PodTemplateSpec};
+    use k3rs_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
+    use k3rs_controller_manager::controllers::{
         daemonset::DaemonSetController, garbage_collector::GarbageCollector, job::JobController,
         statefulset::StatefulSetController,
     };
-    use rusternetes_storage::{memory::MemoryStorage, Storage};
+    use k3rs_storage::{memory::MemoryStorage, Storage};
     use std::sync::Arc;
 
     // ── helpers ───────────────────────────────────────────────────────────────

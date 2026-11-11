@@ -4,7 +4,7 @@
 //! - DNS subdomain names (RFC 1123): lowercase alphanumeric, '-', '.', max 253 chars
 //! - DNS label names: lowercase alphanumeric, '-', max 63 chars
 
-use rusternetes_common::Error;
+use k3rs_common::Error;
 use std::collections::{HashMap, HashSet};
 
 /// Find duplicate JSON keys at any nesting level of a JSON object string.
@@ -760,5 +760,5 @@ pub fn format_warning_header(warning_text: &str) -> String {
 }
 
 // Server-side name generation (metadata.generateName) is applied centrally by
-// `rusternetes_middleware::generate_name_middleware` for every create request
+// `k3rs_middleware::generate_name_middleware` for every create request
 // (#1052), so per-handler helpers are no longer needed here.

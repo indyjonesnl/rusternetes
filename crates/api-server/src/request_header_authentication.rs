@@ -11,11 +11,11 @@
 //!
 //! Where the authenticator sits in the chain is
 //! `pkg/kubeapiserver/authenticator/config.go:113-131`: request-header first,
-//! then x509, then bearer tokens (see `rusternetes_middleware::auth_middleware`).
+//! then x509, then bearer tokens (see `k3rs_middleware::auth_middleware`).
 
 use std::sync::Arc;
 
-use rusternetes_middleware::request_header::RequestHeaderConfig;
+use k3rs_middleware::request_header::RequestHeaderConfig;
 
 /// `RequestHeaderAuthenticationOptions` as command-line flags. Shared by the
 /// `api-server` and all-in-one binaries (#3414).
@@ -146,7 +146,7 @@ impl RequestHeaderAuthenticationArgs {
         if let Some(client_ca) = client_ca_file.filter(|c| !c.is_empty()) {
             if !self.client_ca_file.is_empty() && self.allowed_names.is_empty() {
                 if let Ok(true) =
-                    rusternetes_common::tls::ca_files_overlap(client_ca, &self.client_ca_file)
+                    k3rs_common::tls::ca_files_overlap(client_ca, &self.client_ca_file)
                 {
                     errs.push("--requestheader-client-ca-file and --client-ca-file contain overlapping certificates; --requestheader-allowed-names must be specified to ensure regular client certificates cannot set authenticating proxy headers for arbitrary users".to_string());
                 }
@@ -236,7 +236,7 @@ pub struct CaReload {
 ///
 /// Must be called inside a tokio runtime (the watch tasks are spawned here).
 pub fn mtls_acceptor(
-    tls_config: rusternetes_common::tls::TlsConfig,
+    tls_config: k3rs_common::tls::TlsConfig,
     client_ca_file: Option<&str>,
     trust: Option<&RequestHeaderTrust>,
 ) -> anyhow::Result<(crate::peer_cert_acceptor::PeerCertAcceptor, CaReload)> {

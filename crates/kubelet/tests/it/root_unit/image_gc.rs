@@ -4,8 +4,8 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use chrono::{DateTime, TimeZone, Utc};
+    pub use k3rs_common::feature_gates::{enabled, Feature};
     pub use prometheus::{IntCounterVec, Opts};
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::{Arc, LazyLock, Mutex, Once};
     pub use std::time::Duration;
@@ -14,7 +14,7 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::Duration as CDuration;
-    use rusternetes_kubelet::image_gc::*;
+    use k3rs_kubelet::image_gc::*;
     use serial_test::serial;
 
     // ---- fakes (containertest.FakeRuntime, statstest.MockProvider, record.FakeRecorder)
@@ -226,10 +226,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn detect_images_initial_detect_with_runtime_handler_in_image_cri_api() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            Feature::RuntimeClassInImageCriApi,
-            true,
-        );
+        let _g = k3rs_common::feature_gates::with_feature(Feature::RuntimeClassInImageCriApi, true);
         let (m, rt, _) = manager(ImageGcPolicy::default(), MockStats::none());
         rt.set_images(vec![
             make_image_with_handler(0, 1024, ""),
@@ -674,7 +671,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn image_volume_mounts_count_as_in_use() {
-        let _g = rusternetes_common::feature_gates::with_feature(Feature::ImageVolume, true);
+        let _g = k3rs_common::feature_gates::with_feature(Feature::ImageVolume, true);
         let (m, rt, _) = manager(ImageGcPolicy::default(), MockStats::none());
         rt.set_images(vec![make_image(0, 1024), make_image(1, 2048)]);
         rt.set_pods(vec![make_container(1)]);

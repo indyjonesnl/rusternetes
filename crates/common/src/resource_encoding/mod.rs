@@ -19,7 +19,7 @@
 //!
 //! Reduction: upstream asks a `runtime.Scheme` about registered kinds and the
 //! `APILifecycleIntroduced()` method generated into each versioned type by
-//! `prerelease-lifecycle-gen`. Rusternetes has no Go scheme, so [`Scheme`]
+//! `prerelease-lifecycle-gen`. k3rs has no Go scheme, so [`Scheme`]
 //! carries the same facts as data: the group version priority order from each
 //! `pkg/apis/<group>/install/install.go` `SetVersionPriority`, the kinds each
 //! `staging/src/k8s.io/api/<group>/<version>/register.go` registers, and the

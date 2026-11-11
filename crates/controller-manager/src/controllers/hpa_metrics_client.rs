@@ -7,10 +7,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use k3rs_common::quantity::parse_resource_value;
+use k3rs_common::resources::CrossVersionObjectReference;
+use k3rs_common::types::LabelSelector;
 use reqwest::Client;
-use rusternetes_common::quantity::parse_resource_value;
-use rusternetes_common::resources::CrossVersionObjectReference;
-use rusternetes_common::types::LabelSelector;
 use std::collections::HashMap;
 
 /// Per-pod metric reading. `value` is the raw metric in milli-units for cpu
@@ -612,7 +612,7 @@ pub fn metric_milli_value(q: &str) -> i64 {
 
 /// Strict `Quantity.MilliValue()` (rounded up away from zero, saturating).
 pub fn parse_milli(q: &str) -> Option<i64> {
-    let v = rusternetes_common::quantity::Quantity::parse(q.trim())
+    let v = k3rs_common::quantity::Quantity::parse(q.trim())
         .ok()?
         .milli_value();
     Some(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
@@ -621,7 +621,7 @@ pub fn parse_milli(q: &str) -> Option<i64> {
 /// `resource.NewMilliQuantity(v, resource.DecimalSI).String()`, as
 /// `horizontal.go:563,572,598,719,739` build `status.currentMetrics` values.
 pub fn format_milli_quantity(v: i64) -> String {
-    use rusternetes_common::quantity::{Format, Quantity};
+    use k3rs_common::quantity::{Format, Quantity};
     Quantity::from_milli_value(v, Format::DecimalSI).canonical_string()
 }
 

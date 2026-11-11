@@ -7,7 +7,7 @@
 //! (`endpoints/handlers/watch.go`), where Go's net/http chooses the framing.
 //! Here the framing is read off raw bytes over a loopback socket.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 
 /// Display cluster information
 pub async fn execute(client: &ApiClient, dump: bool) -> Result<()> {

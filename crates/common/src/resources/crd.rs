@@ -436,7 +436,7 @@ pub struct JSONSchemaProps {
 /// the struct form (`{schema: {...}}` / `{jSONSchemas: [...]}`) that
 /// vnd.kubernetes CBOR clients emit — k8s CBOR-encodes this type as its Go
 /// struct (protobuf field names `schema` / `jSONSchemas`) rather than inlining
-/// it, and rusternetes transcodes that CBOR to JSON before typed decode. See
+/// it, and k3rs transcodes that CBOR to JSON before typed decode. See
 /// [`deserialize_schema_or_array`].
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
@@ -476,7 +476,7 @@ pub enum JSONSchemaPropsOrStringArray {
 // Upstream defines custom JSON marshalers that *inline* the value, but its CBOR
 // marshalers (pre-1.36) fall back to the Go struct shape, so a CBOR request
 // body carries e.g. `items: {schema: {...}}` instead of `items: {type: ...}`.
-// rusternetes transcodes incoming CBOR to JSON, so by the time we decode we may
+// k3rs transcodes incoming CBOR to JSON, so by the time we decode we may
 // see either shape. A plain `#[serde(untagged)]` derive only understood the
 // inline shape and silently parsed the struct shape as an (empty) inline
 // schema, which then tripped strict field validation with a spurious

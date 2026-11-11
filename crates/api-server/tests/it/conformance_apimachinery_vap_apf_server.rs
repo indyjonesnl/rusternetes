@@ -45,8 +45,8 @@
 //! audited.
 //!
 
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -760,9 +760,9 @@ async fn apf_should_support_flow_schema_api_operations() {
 /// that the watch handler uses to parse the query parameter.
 #[tokio::test]
 async fn watchers_should_restart_from_last_resource_version_observed() {
-    use rusternetes_api_server::handlers::watch::normalize_resource_version;
-    use rusternetes_common::resources::ConfigMap;
-    use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
+    use k3rs_api_server::handlers::watch::normalize_resource_version;
+    use k3rs_common::resources::ConfigMap;
+    use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
     use std::time::Duration;
     use tokio::time::timeout;
     use tokio_stream::StreamExt;
@@ -928,8 +928,8 @@ async fn table_transformation_should_return_406_for_backend_without_metadata() {
 /// `conformance_apimachinery_watch_chunking_gc.rs`.
 #[tokio::test]
 async fn chunking_should_continue_from_last_key_after_compaction() {
-    use rusternetes_common::resources::ConfigMap;
-    use rusternetes_storage::{build_key, decode_default_token, Storage, INCONSISTENT_CONTINUE_RV};
+    use k3rs_common::resources::ConfigMap;
+    use k3rs_storage::{build_key, decode_default_token, Storage, INCONSISTENT_CONTINUE_RV};
 
     let storage = Arc::new(MemoryStorage::new());
     for n in ["a", "b", "c", "d"] {
@@ -960,9 +960,7 @@ async fn chunking_should_continue_from_last_key_after_compaction() {
         .expect_err("compacted strict token must be rejected");
     assert_eq!(err.reason(), "Gone", "must still map to 410 Gone");
     let fresh = match &err {
-        rusternetes_common::Error::GoneWithContinue { continue_token, .. } => {
-            continue_token.clone()
-        }
+        k3rs_common::Error::GoneWithContinue { continue_token, .. } => continue_token.clone(),
         other => panic!("expected GoneWithContinue, got {other:?}"),
     };
     assert_eq!(

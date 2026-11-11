@@ -2,7 +2,7 @@
 # Vanilla-cluster single-module swap harness — driver.
 #
 # Stand up an UNMODIFIED upstream Kubernetes cluster (kind) and swap in exactly
-# ONE rusternetes component, then run a test subset scoped to that component.
+# ONE k3rs component, then run a test subset scoped to that component.
 # Because every other participant is known-good upstream software, any failure
 # is attributable to the single swapped module.
 #
@@ -175,7 +175,7 @@ print(len(out))
 fi
 
 # --- load a locally-built image into the kind nodes ------------------------
-# A static-pod / daemonset swap references the rusternetes image by name; the
+# A static-pod / daemonset swap references the k3rs image by name; the
 # node's containerd must have it. CI publishes :main to ghcr and lets the node
 # pull, but a local run builds the image and it exists only in the host docker
 # daemon. Load it into the kind nodes when present (no-op otherwise, so CI's
@@ -192,7 +192,7 @@ fi
 # --- swap the one module ---------------------------------------------------
 vs_apply_swap "$CLUSTER" "$KUBECONFIG_FILE"
 
-# --- post-swap guard: exactly one rusternetes image ------------------------
+# --- post-swap guard: exactly one k3rs image ------------------------
 vs_guard_cluster "$CLUSTER" "$KUBECONFIG_FILE"
 
 # --- readiness: distinguish "did not come up" from a test failure ----------

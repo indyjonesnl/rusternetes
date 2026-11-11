@@ -2,38 +2,36 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::pv_sources::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::pv_sources::{
         AzureDiskVolumeSource, AzureFilePersistentVolumeSource, CephFSPersistentVolumeSource,
         CinderPersistentVolumeSource, FlexPersistentVolumeSource, FlockerVolumeSource,
         GlusterfsPersistentVolumeSource, PhotonPersistentDiskVolumeSource, PortworxVolumeSource,
         QuobyteVolumeSource, RBDPersistentVolumeSource, ScaleIOPersistentVolumeSource,
         StorageOSPersistentVolumeSource, VsphereVirtualDiskVolumeSource,
     };
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::volume::{
         AWSElasticBlockStoreVolumeSource, CSIVolumeSource, FCVolumeSource,
         GCEPersistentDiskVolumeSource, HostPathType, HostPathVolumeSource, ISCSIVolumeSource,
         LocalVolumeSource, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
         PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeMode,
         PersistentVolumeReclaimPolicy, PersistentVolumeSpec, SecretReference, VolumeNodeAffinity,
     };
-    pub use rusternetes_common::validation::csinode::validate_csi_driver_name;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::csinode::validate_csi_driver_name;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_namespace_name, validate_object_meta,
         validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::pod::{
-        validate_nfs_volume_source, validate_node_selector,
-    };
+    pub use k3rs_common::validation::pod::{validate_nfs_volume_source, validate_node_selector};
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
 }
 
 mod create_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::persistentvolume::*;
+    use k3rs_common::validation::persistentvolume::*;
 
     fn pv(json: serde_json::Value) -> PersistentVolume {
         serde_json::from_value(json).unwrap()
@@ -232,7 +230,7 @@ mod create_tests {
 
 mod update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::persistentvolume::*;
+    use k3rs_common::validation::persistentvolume::*;
 
     fn pv(json: serde_json::Value) -> PersistentVolume {
         serde_json::from_value(json).unwrap()
@@ -305,10 +303,9 @@ mod update_tests {
     fn changed_volume_mode_rejected() {
         let mut old = hostpath_pv("/data");
         old.spec.volume_mode =
-            Some(rusternetes_common::resources::volume::PersistentVolumeMode::Filesystem);
+            Some(k3rs_common::resources::volume::PersistentVolumeMode::Filesystem);
         let mut new = hostpath_pv("/data");
-        new.spec.volume_mode =
-            Some(rusternetes_common::resources::volume::PersistentVolumeMode::Block);
+        new.spec.volume_mode = Some(k3rs_common::resources::volume::PersistentVolumeMode::Block);
         let errs = validate_persistent_volume_update(&new, &old);
         assert!(
             errs.iter()
@@ -402,7 +399,7 @@ mod update_tests {
 /// (`pkg/apis/core/validation/validation_test.go:114`, `:740`).
 mod all_sources_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::persistentvolume::*;
+    use k3rs_common::validation::persistentvolume::*;
 
     fn pv_with(source: serde_json::Value) -> PersistentVolume {
         let mut v = serde_json::json!({

@@ -7,9 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusternetes_common::resources::{EventSource, EventType, ObjectReference, Service};
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{EventRecorder, Storage};
+use k3rs_common::resources::{EventSource, EventType, ObjectReference, Service};
+use k3rs_common::{Error, Result};
+use k3rs_storage::{EventRecorder, Storage};
 use tracing::{error, warn};
 
 use super::{PortAllocator, PortError, PortRange};

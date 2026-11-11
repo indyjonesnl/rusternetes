@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
 }
 
 mod tests {

@@ -4,7 +4,7 @@
 //! locations (the `cel` 0.13 parser drops them).
 
 use cel::parser::Parser;
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::{
     check, Container, DType, Env, MapProvider, NoLocations, Options, VariableDecl,
 };
 use std::sync::Arc;
@@ -406,9 +406,9 @@ fn optional_syntax() {
 
 #[test]
 fn error_display_string() {
-    let e = rusternetes_cel_checker::CheckError {
+    let e = k3rs_cel_checker::CheckError {
         expr_id: 1,
-        location: Some(rusternetes_cel_checker::Location {
+        location: Some(k3rs_cel_checker::Location {
             line: 1,
             column: 25,
         }),

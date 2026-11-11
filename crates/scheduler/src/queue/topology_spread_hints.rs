@@ -24,8 +24,8 @@
 //! this returns.
 
 use super::events::*;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_common::types::{
+use k3rs_common::resources::{Node, Pod};
+use k3rs_common::types::{
     label_selector_as_selector, LabelSelector, LabelSelectorRequirement, Selector,
 };
 use std::collections::HashMap;

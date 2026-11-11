@@ -4,18 +4,16 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::pod_warnings::get_warnings_for_pod_template;
-use rusternetes_common::resources::{
-    Scale, ScaleSpec, ScaleStatus, StatefulSet, StatefulSetStatus,
-};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_common::validation::apps::{
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::pod_warnings::get_warnings_for_pod_template;
+use k3rs_common::resources::{Scale, ScaleSpec, ScaleStatus, StatefulSet, StatefulSetStatus};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::validation::apps::{
     validate_statefulset, validate_statefulset_status_update, validate_statefulset_update,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::core::persistentvolumeclaim::get_warnings_for_persistent_volume_claim_spec;
 use crate::registry::generic::Store;
@@ -45,7 +43,7 @@ fn max_unavailable_in_use(ss: Option<&StatefulSet>) -> bool {
 /// `rollingUpdate.maxUnavailable` is dropped unless the stored object already
 /// uses it.
 fn drop_disabled_fields(new: &mut StatefulSet, old: Option<&StatefulSet>) {
-    rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+    k3rs_common::pod_drop_disabled::drop_disabled_template_fields(
         &mut new.spec.template,
         old.map(|o| &o.spec.template),
     );

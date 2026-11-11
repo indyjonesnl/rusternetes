@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>API Server Configuration - Rūsternetes</title>
+  <title>API Server Configuration - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -104,7 +104,7 @@
       <p class="breadcrumb">Configuration &rsaquo; API Server</p>
       <h1>API Server Configuration</h1>
       <p class="lead">
-        The API server is the central hub of the Rūsternetes cluster. It exposes the Kubernetes
+        The API server is the central hub of the k3rs cluster. It exposes the Kubernetes
         REST API over HTTPS using Axum with 76 handlers and a 2500-line router.
       </p>
 
@@ -141,7 +141,7 @@
           <tr>
             <td><code>--jwt-secret</code></td>
             <td>String</td>
-            <td><code>rusternetes-secret-change-in-production</code></td>
+            <td><code>k3rs-secret-change-in-production</code></td>
             <td>HMAC fallback secret for SA tokens (RS256 preferred when SA keys exist)</td>
           </tr>
           <tr>
@@ -189,7 +189,7 @@
           <tr>
             <td><code>--data-dir</code></td>
             <td>String</td>
-            <td><code>./data/rusternetes.db</code></td>
+            <td><code>./data/k3rs.db</code></td>
             <td>SQLite database path (only used with <code>--storage-backend=sqlite</code>)</td>
           </tr>
           <tr>
@@ -217,26 +217,26 @@
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Production with etcd and TLS certificates</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--tls</span> \
-  <span class="flag">--tls-cert-file</span> <span class="value">/etc/rusternetes/certs/api-server.crt</span> \
-  <span class="flag">--tls-key-file</span> <span class="value">/etc/rusternetes/certs/api-server.key</span> \
+  <span class="flag">--tls-cert-file</span> <span class="value">/etc/k3rs/certs/api-server.crt</span> \
+  <span class="flag">--tls-key-file</span> <span class="value">/etc/k3rs/certs/api-server.key</span> \
   <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span>
 
 <span class="comment"># Development with self-signed cert</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--tls</span> \
   <span class="flag">--tls-self-signed</span> \
   <span class="flag">--skip-auth</span>
 
 <span class="comment"># SQLite backend (no external dependencies)</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--storage-backend</span> <span class="value">sqlite</span> \
-  <span class="flag">--data-dir</span> <span class="value">./data/rusternetes.db</span> \
+  <span class="flag">--data-dir</span> <span class="value">./data/k3rs.db</span> \
   <span class="flag">--tls</span> <span class="flag">--tls-self-signed</span>
 
 <span class="comment"># Redis backend (via rhino gRPC)</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--storage-backend</span> <span class="value">redis</span> \
   <span class="flag">--redis-url</span> <span class="value">redis://localhost:6379</span> \
   <span class="flag">--tls</span> <span class="flag">--tls-self-signed</span></code>
@@ -311,7 +311,7 @@ rusternetes-api-server \
           </tr>
           <tr>
             <td>Organization</td>
-            <td>Rūsternetes</td>
+            <td>k3rs</td>
           </tr>
           <tr>
             <td>Country</td>
@@ -338,7 +338,7 @@ rusternetes-api-server \
       <h2>Authentication</h2>
       <p>
         The API server uses RS256 JWT tokens for ServiceAccount authentication. It automatically
-        detects RSA keys at <code>.rusternetes/certs/sa.key</code> and <code>sa.pub</code>. If
+        detects RSA keys at <code>.k3rs/certs/sa.key</code> and <code>sa.pub</code>. If
         RSA keys are not found, it falls back to HMAC HS256 using the <code>--jwt-secret</code> value.
       </p>
 
@@ -376,7 +376,7 @@ rusternetes-api-server \
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

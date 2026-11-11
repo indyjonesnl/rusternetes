@@ -2,8 +2,8 @@
 //
 // Provides common logic for filtering resources by field selectors and label selectors
 
-use rusternetes_common::field_selector::FieldSelector;
-use rusternetes_common::label_selector::LabelSelector;
+use k3rs_common::field_selector::FieldSelector;
+use k3rs_common::label_selector::LabelSelector;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -14,10 +14,10 @@ use std::collections::HashMap;
 pub fn apply_field_selector<T: Serialize>(
     resources: &mut Vec<T>,
     params: &HashMap<String, String>,
-) -> Result<(), rusternetes_common::Error> {
+) -> Result<(), k3rs_common::Error> {
     if let Some(field_selector_str) = params.get("fieldSelector") {
         let selector = FieldSelector::parse(field_selector_str).map_err(|e| {
-            rusternetes_common::Error::InvalidResource(format!("Invalid field selector: {}", e))
+            k3rs_common::Error::InvalidResource(format!("Invalid field selector: {}", e))
         })?;
 
         if !selector.is_empty() {
@@ -38,10 +38,9 @@ pub fn apply_field_selector<T: Serialize>(
 /// the selector themselves (custom/external metrics).
 pub fn validate_label_selector_param(
     params: &HashMap<String, String>,
-) -> Result<(), rusternetes_common::Error> {
+) -> Result<(), k3rs_common::Error> {
     if let Some(s) = params.get("labelSelector") {
-        LabelSelector::parse(s)
-            .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+        LabelSelector::parse(s).map_err(|e| k3rs_common::Error::BadRequest(e.to_string()))?;
     }
     Ok(())
 }
@@ -55,10 +54,10 @@ pub fn validate_label_selector_param(
 pub fn apply_label_selector<T: Serialize>(
     resources: &mut Vec<T>,
     params: &HashMap<String, String>,
-) -> Result<(), rusternetes_common::Error> {
+) -> Result<(), k3rs_common::Error> {
     if let Some(label_selector_str) = params.get("labelSelector") {
         let selector = LabelSelector::parse(label_selector_str)
-            .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+            .map_err(|e| k3rs_common::Error::BadRequest(e.to_string()))?;
 
         if !selector.is_empty() {
             resources.retain(|resource| {
@@ -79,9 +78,9 @@ pub fn apply_label_selector<T: Serialize>(
 pub fn apply_label_selector_direct(
     labels_list: &mut Vec<(usize, &Option<HashMap<String, String>>)>,
     label_selector_str: &str,
-) -> Result<Vec<usize>, rusternetes_common::Error> {
+) -> Result<Vec<usize>, k3rs_common::Error> {
     let selector = LabelSelector::parse(label_selector_str)
-        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+        .map_err(|e| k3rs_common::Error::BadRequest(e.to_string()))?;
 
     let mut keep = Vec::new();
     for (idx, labels) in labels_list {
@@ -107,7 +106,7 @@ pub fn apply_label_selector_direct(
 pub fn apply_selectors<T: Serialize>(
     resources: &mut Vec<T>,
     params: &HashMap<String, String>,
-) -> Result<(), rusternetes_common::Error> {
+) -> Result<(), k3rs_common::Error> {
     let has_field_selector = params.get("fieldSelector").is_some_and(|s| !s.is_empty());
     let has_label_selector = params.get("labelSelector").is_some_and(|s| !s.is_empty());
 
@@ -119,7 +118,7 @@ pub fn apply_selectors<T: Serialize>(
     let field_selector = if has_field_selector {
         Some(
             FieldSelector::parse(params.get("fieldSelector").unwrap()).map_err(|e| {
-                rusternetes_common::Error::InvalidResource(format!("Invalid field selector: {}", e))
+                k3rs_common::Error::InvalidResource(format!("Invalid field selector: {}", e))
             })?,
         )
     } else {
@@ -129,7 +128,7 @@ pub fn apply_selectors<T: Serialize>(
     let label_selector = if has_label_selector {
         Some(
             LabelSelector::parse(params.get("labelSelector").unwrap())
-                .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?,
+                .map_err(|e| k3rs_common::Error::BadRequest(e.to_string()))?,
         )
     } else {
         None

@@ -27,7 +27,7 @@
 //! K8s ref: `k8s.io/api/core/v1/generated.proto:1137` (release-1.35):
 //!   `map<string, .k8s.io...Quantity> allocatedResources = 10;`
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::{json, Value};
 
 /// Encode an unsigned varint per protobuf spec.
@@ -147,7 +147,7 @@ fn container_status_allocated_resources_survives_json_proto_round_trip() {
 /// middleware), and confirm `allocated_resources` is populated.
 #[test]
 fn container_status_allocated_resources_round_trips_through_typed_struct() {
-    use rusternetes_common::resources::ContainerStatus;
+    use k3rs_common::resources::ContainerStatus;
 
     let registry = ProtoRegistry::new();
 

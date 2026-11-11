@@ -1,5 +1,5 @@
 #!/bin/bash
-# Conformance test progress monitor for Rusternetes
+# Conformance test progress monitor for k3rs
 # Parses e2e container logs to show real-time pass/fail counts
 # since sonobuoy's built-in progress reporting doesn't work with K8s v1.35
 #
@@ -111,7 +111,7 @@ print(f'{passed}|{failed}|{remaining}|{total}|{pct}|{1 if completed else 0}|{las
 "
 }
 
-echo "=== Rusternetes Conformance Progress Monitor ==="
+echo "=== k3rs Conformance Progress Monitor ==="
 echo "Polling every ${INTERVAL}s (pass interval as arg to change)"
 echo ""
 

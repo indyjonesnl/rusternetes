@@ -3,8 +3,8 @@
 //! unit test for either; these pin the format string.
 
 use chrono::{TimeZone, Utc};
-use rusternetes_api_server::audit_format::*;
-use rusternetes_common::audit::{
+use k3rs_api_server::audit_format::*;
+use k3rs_common::audit::{
     AuditEvent, AuditLevel, AuditStage, ObjectReference, ResponseStatus, UserInfo,
 };
 

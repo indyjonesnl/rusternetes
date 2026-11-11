@@ -2,7 +2,7 @@
 //! `staging/src/k8s.io/component-helpers/auth/rbac/validation/policy_comparator.go`:
 //! whether one set of `PolicyRule`s covers another.
 
-use rusternetes_common::resources::PolicyRule;
+use k3rs_common::resources::PolicyRule;
 
 /// `rbacv1.VerbAll` / `rbacv1.APIGroupAll` / `rbacv1.ResourceAll`.
 const ALL: &str = "*";

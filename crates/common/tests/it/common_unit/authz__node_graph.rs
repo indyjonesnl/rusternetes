@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+    pub use k3rs_common::resources::{PersistentVolume, Pod};
     pub use prometheus::{register, HistogramOpts, HistogramVec};
-    pub use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-    pub use rusternetes_common::resources::{PersistentVolume, Pod};
     pub use serde_json::Value;
     pub use std::collections::{BTreeSet, HashMap, HashSet};
     pub use std::sync::{LazyLock, RwLock};
@@ -18,7 +18,7 @@ pub mod tests {
     //! `pkg/api/v1/persistentvolume/util.go` that feed `AddPod` / `AddPV`.
 
     use super::__parent::*;
-    use rusternetes_common::authz::node_graph::*;
+    use k3rs_common::authz::node_graph::*;
     use serde_json::json;
     use std::collections::BTreeMap;
 

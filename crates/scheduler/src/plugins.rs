@@ -8,7 +8,7 @@ use crate::advanced::{
 };
 use crate::framework::*;
 use async_trait::async_trait;
-use rusternetes_common::resources::{Node, Pod};
+use k3rs_common::resources::{Node, Pod};
 use std::collections::HashMap;
 
 /// K8s treats an empty string and an unset field as equivalent for toleration

@@ -3,22 +3,22 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::{
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::{
         AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
     };
-    pub use rusternetes_common::resources::{NonResourceRule, ResourceRule};
-    pub use rusternetes_common::{Error, Result};
+    pub use k3rs_common::resources::{NonResourceRule, ResourceRule};
+    pub use k3rs_common::{Error, Result};
     pub use std::collections::{BTreeMap, HashMap};
     pub use std::sync::{Arc, Mutex};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::caching_authorizer::*;
-    use rusternetes_common::field_selector::FieldSelector;
-    use rusternetes_common::label_selector::LabelSelector;
-    use rusternetes_common::Error;
+    use k3rs_api_server::admission::caching_authorizer::*;
+    use k3rs_common::field_selector::FieldSelector;
+    use k3rs_common::label_selector::LabelSelector;
+    use k3rs_common::Error;
     use std::collections::VecDeque;
 
     struct Scripted {
@@ -42,8 +42,8 @@ mod tests {
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-            Ok(rusternetes_common::authz::UserRulesOutcome::default())
+        ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+            Ok(k3rs_common::authz::UserRulesOutcome::default())
         }
     }
 
@@ -223,8 +223,8 @@ mod tests {
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-                Ok(rusternetes_common::authz::UserRulesOutcome::default())
+            ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+                Ok(k3rs_common::authz::UserRulesOutcome::default())
             }
         }
         let inner = Arc::new(Op(Mutex::new(0)));

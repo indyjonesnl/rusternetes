@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::tracing::*;
+    use k3rs_common::tracing::*;
 
     #[test]
     fn verbosity_maps_to_levels() {

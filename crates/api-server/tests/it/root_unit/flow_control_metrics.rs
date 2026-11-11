@@ -14,9 +14,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
+    use k3rs_api_server::flow_control_metrics::*;
     use prometheus::core::Collector;
     use prometheus::proto::MetricFamily;
-    use rusternetes_api_server::flow_control_metrics::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Instant;

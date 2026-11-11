@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use std::fs;
     pub use std::path::Path;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::cp::*;
+    use k3rs_kubectl::commands::cp::*;
 
     #[test]
     fn test_parse_copy_spec_from_pod() {

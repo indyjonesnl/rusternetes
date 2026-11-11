@@ -15,7 +15,7 @@
 //! Where this differs from upstream: `resolver.ResourceResolver`
 //! (`resolver/resolver.go:30-61`) asks the discovery client for the resource
 //! serving a kind. [`resolve_resource`] asks the same discovery documents the
-//! api-server serves (`rusternetes_discovery::resolve_kind_to_resource`) for
+//! api-server serves (`k3rs_discovery::resolve_kind_to_resource`) for
 //! the built-in kinds and reads the CustomResourceDefinitions in storage for
 //! the rest. A kind it cannot resolve is authorized on resource `*`, which is
 //! what upstream does when `Resolve` fails.
@@ -26,16 +26,16 @@
 //! mutating twins' likewise) and `BeforeCreate`/`BeforeUpdate` wrap the list
 //! (rest/create.go, rest/update.go; errors.go `NewInvalid`).
 
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::resources::validating_admission_policy::{ParamKind, ParamRef};
-use rusternetes_common::resources::{
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_common::resources::validating_admission_policy::{ParamKind, ParamRef};
+use k3rs_common::resources::{
     CustomResourceDefinition, MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
     ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
 };
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::Result;
-use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::Result;
+use k3rs_storage::{build_key, build_prefix, Storage, StorageBackend};
 
 use crate::registry::rbac::escalation_check::escalation_allowed;
 use crate::registry::rest::RequestContext;
@@ -108,7 +108,7 @@ async fn resolve_resource(
     version: &str,
     kind: &str,
 ) -> Option<String> {
-    if let Some(resource) = rusternetes_discovery::resolve_kind_to_resource(group, version, kind) {
+    if let Some(resource) = k3rs_discovery::resolve_kind_to_resource(group, version, kind) {
         return Some(resource);
     }
     let prefix = build_prefix("customresourcedefinitions", None);

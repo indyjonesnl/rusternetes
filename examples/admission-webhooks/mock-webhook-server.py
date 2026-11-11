@@ -3,7 +3,7 @@
 Mock Webhook Server for Testing Admission Webhooks
 
 This is a simple webhook server that demonstrates how to handle
-AdmissionReview requests from the Rusternetes API server.
+AdmissionReview requests from the k3rs API server.
 
 Usage:
     python3 mock-webhook-server.py [--port PORT] [--mode MODE]

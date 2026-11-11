@@ -9,7 +9,7 @@
 //! `group`/`kind`/`namespace`/`name` patterns and lengths).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const GRANTS: &str = "/apis/gateway.networking.k8s.io/v1beta1/namespaces/default/referencegrants";

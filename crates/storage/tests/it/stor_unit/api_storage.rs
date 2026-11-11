@@ -4,14 +4,14 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use futures::StreamExt;
-    pub use rusternetes_client::api_status::{
+    pub use k3rs_client::api_status::{
         is_already_exists, is_bad_request, is_conflict, is_forbidden, is_gone, is_invalid,
         is_not_found, is_resource_expired, is_unsupported_media_type,
     };
-    pub use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
-    pub use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+    pub use k3rs_client::http::{ApiClient, GetError, KubernetesList};
+    pub use k3rs_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{Storage, WatchEvent, WatchStream};
     pub use serde::{de::DeserializeOwned, Serialize};
     pub use serde_json::Value;
     pub use std::collections::HashMap;
@@ -21,7 +21,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::api_storage::*;
+    use k3rs_storage::api_storage::*;
 
     /// Resolve a built-in object key through the static table + pure builder,
     /// mirroring the old free-fn `object_path` for test purposes.
@@ -167,7 +167,7 @@ mod tests {
     /// 410 with no reason is expired, and the rendered text is irrelevant.
     #[test]
     fn is_expired_error_uses_typed_status() {
-        use rusternetes_client::api_status::ApiStatusError;
+        use k3rs_client::api_status::ApiStatusError;
         let typed = |code: u16, reason: &str, message: &str| {
             anyhow::Error::new(ApiStatusError {
                 code,
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn map_write_err_maps_unsupported_media_type() {
-        let e = anyhow::Error::new(rusternetes_client::api_status::ApiStatusError {
+        let e = anyhow::Error::new(k3rs_client::api_status::ApiStatusError {
             code: 415,
             reason: "UnsupportedMediaType".into(),
             message: "Error from server (UnsupportedMediaType): Apply not supported".into(),
@@ -236,7 +236,7 @@ mod tests {
 
     async fn post_err(status: &'static str, body: &'static str) -> Error {
         let url = spawn_status_server(status, body).await;
-        let client = rusternetes_client::http::ApiClient::new(&url, true, None).unwrap();
+        let client = k3rs_client::http::ApiClient::new(&url, true, None).unwrap();
         let e = client
             .post::<_, Value>("/api/v1/x", &serde_json::json!({}))
             .await
@@ -341,7 +341,7 @@ mod tests {
 
     // ---- update_status optimistic-concurrency retry (#1638) ----------------
     //
-    // Regression for #1638: running the rusternetes kubelet (API mode) against
+    // Regression for #1638: running the k3rs kubelet (API mode) against
     // a *vanilla* api-server, the node status write 409s when a concurrent
     // writer (node-lifecycle controller) bumps the node's resourceVersion
     // between our GET and the /status PUT. `ApiStorage::update_status` must
@@ -375,7 +375,7 @@ mod tests {
                 let req_line = req.lines().next().unwrap_or("").to_string();
                 let is_put_status = req_line.starts_with("PUT") && req_line.contains("/status");
 
-                let node = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"rusternetes-node","resourceVersion":"1"},"status":{}}"#;
+                let node = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"k3rs-node","resourceVersion":"1"},"status":{}}"#;
 
                 if is_put_status {
                     let n = counter.fetch_add(1, Ordering::SeqCst);
@@ -446,12 +446,12 @@ mod tests {
         let node = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
-            "metadata": {"name": "rusternetes-node"},
+            "metadata": {"name": "k3rs-node"},
             "status": {"conditions": [{"type": "Ready", "status": "True"}]}
         });
 
         let result: Result<Value> = storage
-            .update_status("/registry/nodes/rusternetes-node", &node)
+            .update_status("/registry/nodes/k3rs-node", &node)
             .await;
 
         assert!(
@@ -477,10 +477,10 @@ mod tests {
         let storage = ApiStorage::new(client);
         let node = serde_json::json!({
             "apiVersion": "v1", "kind": "Node",
-            "metadata": {"name": "rusternetes-node"}, "status": {}
+            "metadata": {"name": "k3rs-node"}, "status": {}
         });
         let result: Result<Value> = storage
-            .update_with_ttl("/registry/nodes/rusternetes-node", &node, 3600)
+            .update_with_ttl("/registry/nodes/k3rs-node", &node, 3600)
             .await;
         assert!(
             result.is_ok(),
@@ -498,11 +498,11 @@ mod tests {
 
         let node = serde_json::json!({
             "apiVersion": "v1", "kind": "Node",
-            "metadata": {"name": "rusternetes-node"}, "status": {}
+            "metadata": {"name": "k3rs-node"}, "status": {}
         });
 
         let result: Result<Value> = storage
-            .update_status("/registry/nodes/rusternetes-node", &node)
+            .update_status("/registry/nodes/k3rs-node", &node)
             .await;
 
         assert!(

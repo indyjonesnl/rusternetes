@@ -3,7 +3,7 @@
 //! (metadata = 1, items = 2, per each group's generated.proto in
 //! crates/api-server/proto/upstream/v1.35/k8s.io/api/). Refs #3057.
 
-use rusternetes_protobuf::{FieldType, ProtoRegistry};
+use k3rs_protobuf::{FieldType, ProtoRegistry};
 
 /// (list message, item message as the registry resolves it).
 const LISTS: &[(&str, &str)] = &[

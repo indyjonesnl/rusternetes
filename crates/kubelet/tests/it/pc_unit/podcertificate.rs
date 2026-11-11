@@ -5,14 +5,14 @@ mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
     pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    pub use rand::Rng;
-    pub use rusternetes_common::resources::pod::PodCertificateProjection;
-    pub use rusternetes_common::resources::podcertificaterequest::{
+    pub use k3rs_common::resources::pod::PodCertificateProjection;
+    pub use k3rs_common::resources::podcertificaterequest::{
         PodCertificateRequest, CONDITION_TYPE_DENIED, CONDITION_TYPE_FAILED, CONDITION_TYPE_ISSUED,
     };
-    pub use rusternetes_common::resources::{EventType, Node, Pod, ServiceAccount};
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+    pub use k3rs_common::resources::{EventType, Node, Pod, ServiceAccount};
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+    pub use rand::Rng;
     pub use sha2::{Digest, Sha256};
     pub use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
     pub use std::sync::{Arc, Mutex as StdMutex};
@@ -29,10 +29,10 @@ mod tests {
     //! drive.
 
     use super::__parent::*;
-    use rusternetes_common::resources::{PodSpec, Volume};
-    use rusternetes_common::types::{Condition, ObjectMeta, TypeMeta};
-    use rusternetes_kubelet::podcertificate::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_common::resources::{PodSpec, Volume};
+    use k3rs_common::types::{Condition, ObjectMeta, TypeMeta};
+    use k3rs_kubelet::podcertificate::*;
+    use k3rs_storage::StorageBackend;
 
     struct FakeClock(StdMutex<DateTime<Utc>>);
 
@@ -429,7 +429,7 @@ mod tests {
             f.mgr.handle_projection(&key()).await.unwrap();
             assert_eq!(list_pcrs(&f.storage).await.len(), 1);
 
-            let events: Vec<rusternetes_common::resources::Event> =
+            let events: Vec<k3rs_common::resources::Event> =
                 f.storage.list("/registry/events/").await.unwrap();
             assert!(
                 events
@@ -454,7 +454,7 @@ mod tests {
         // A second pass in WaitRefresh must not repeat the events (:674, :681).
         f.mgr.handle_projection(&key()).await.unwrap();
 
-        let events: Vec<rusternetes_common::resources::Event> =
+        let events: Vec<k3rs_common::resources::Event> =
             f.storage.list("/registry/events/").await.unwrap();
         let count = |r: &str| events.iter().filter(|e| e.reason == r).count();
         assert_eq!(count("CertificateOverdueForRefresh"), 1);
@@ -624,7 +624,7 @@ mod tests {
     /// consumer half of the pair.
     #[tokio::test]
     async fn generated_proofs_verify_for_every_key_type() {
-        use rusternetes_common::validation::podcertificaterequest::validate_pod_certificate_request_create;
+        use k3rs_common::validation::podcertificaterequest::validate_pod_certificate_request_create;
         for kt in ["ED25519", "ECDSAP256", "ECDSAP384", "ECDSAP521", "RSA3072"] {
             let f = fixture(kt).await;
             f.mgr.handle_projection(&key()).await.unwrap();

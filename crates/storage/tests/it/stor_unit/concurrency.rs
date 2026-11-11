@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::Error;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::concurrency::*;
+    use k3rs_storage::concurrency::*;
     use serde_json::json;
 
     #[test]

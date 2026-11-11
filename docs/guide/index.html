@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Documentation - Rūsternetes</title>
+  <title>Documentation - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -101,7 +101,7 @@
     <div class="doc-overlay"></div>
 
     <main class="doc-content">
-      <h1>Rūsternetes Documentation</h1>
+      <h1>k3rs Documentation</h1>
       <p class="lead">
         A ground-up reimplementation of Kubernetes in Rust. 216,000+ lines across 10 crates.
         31 controllers. 3,100+ tests. 91% conformance pass rate.
@@ -109,7 +109,7 @@
 
       <h2>Web Console</h2>
       <p>
-        Rūsternetes includes a built-in web console for real-time cluster management, topology visualization,
+        k3rs includes a built-in web console for real-time cluster management, topology visualization,
         and resource monitoring. Served directly from the API server &mdash; deploys automatically with the cluster.
         <a href="console.html" style="color: var(--rust);">Full documentation &rarr;</a>
       </p>
@@ -241,7 +241,7 @@
 
       <h2>Architecture</h2>
       <p>
-        Rūsternetes follows the standard Kubernetes architecture with five core components,
+        k3rs follows the standard Kubernetes architecture with five core components,
         all written in safe Rust. They can run as separate containers in a cluster or as
         concurrent tokio tasks in a single process.
       </p>
@@ -296,7 +296,8 @@
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p>k3rs is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by k3s, SUSE, Rancher, or the CNCF. k3s is a trademark of its respective owners; the name k3rs only describes the goal of reimplementing k3s in Rust. k3rs derives from <a href="https://github.com/calfonso/rusternetes">calfonso/rusternetes</a> (Apache-2.0).</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

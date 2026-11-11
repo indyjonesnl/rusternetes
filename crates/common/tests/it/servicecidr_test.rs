@@ -6,10 +6,10 @@
 // 3. Dual-stack CIDR configurations
 // 4. ServiceCIDR status and conditions
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ServiceCIDR, ServiceCIDRCondition, ServiceCIDRSpec, ServiceCIDRStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 
 fn create_servicecidr(name: &str, cidrs: Vec<String>) -> ServiceCIDR {
     ServiceCIDR {

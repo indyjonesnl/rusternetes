@@ -10,7 +10,7 @@
 # at build time (/opt/k0s-diff/kube-apiserver.real), so the cluster stays a
 # healthy all-Go control plane. If the log file appears AND the cluster comes
 # up green, the interposition mechanism is proven transparent — only then is it
-# safe to swap in the real rusternetes adapter (shims/kube-apiserver).
+# safe to swap in the real k3rs adapter (shims/kube-apiserver).
 set -eu
 
 # k0s runs the apiserver as the unprivileged `kube-api` user, which cannot write

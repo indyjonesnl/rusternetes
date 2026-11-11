@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.6
 # Fully static (musl) all-in-one image — the "scratch/distroless" target of #1041.
 #
-# Produces a zero-OS-dependency, statically-linked `rusternetes` binary on a
+# Produces a zero-OS-dependency, statically-linked `k3rs` binary on a
 # bare `scratch` base, built with the mimalloc global allocator
 # (`--features mimalloc`). mimalloc is MANDATORY for a musl build: musl's
 # default allocator is ~10x slower under multi-threaded lock contention and
-# would regress the all-in-one's throughput (see crates/rusternetes/Cargo.toml).
+# would regress the all-in-one's throughput (see crates/k3rs/Cargo.toml).
 #
 # Arches: linux/amd64 + linux/arm64. Nothing here is arch-specific — the
 # builder is Alpine, so the host target IS the build target and no cross-compile
@@ -16,7 +16,7 @@
 #
 # Build context = repo root. The rhino dependency of crates/storage is a git
 # dependency pinned by commit, fetched by cargo during the build.
-#   docker build -f all-in-one-musl.Dockerfile -t rusternetes-all-in-one:musl .
+#   docker build -f all-in-one-musl.Dockerfile -t k3rs-all-in-one:musl .
 #
 # Unlike all-in-one.Dockerfile (glibc / debian-slim, ships iptables + the web
 # console), this image is deliberately minimal: no shell, no libc, no iptables.
@@ -43,8 +43,8 @@ COPY . .
 
 # `.git` is excluded from the context, so the version banner's SHA comes from a
 # build-arg (common/build.rs falls back to "unknown" when empty).
-ARG RUSTERNETES_GIT_SHA=""
-ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
+ARG K3RS_GIT_SHA=""
+ENV K3RS_GIT_SHA=${K3RS_GIT_SHA}
 
 # Regular `release` profile — this is a shipped artefact, not the compile-speed
 # `release-fast` the compose images use. `sqlite` is on via default features;
@@ -55,9 +55,9 @@ ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --features mimalloc -p rusternetes \
- && strip target/release/rusternetes \
- && cp target/release/rusternetes /rusternetes
+    cargo build --release --features mimalloc -p k3rs \
+ && strip target/release/k3rs \
+ && cp target/release/k3rs /k3rs
 
 # ── Runtime: scratch — the fully static musl binary needs no libc, no shell,
 #    nothing. Only the CA-cert bundle is copied in (outbound TLS roots). This
@@ -66,11 +66,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM scratch
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /rusternetes /rusternetes
+COPY --from=builder /k3rs /k3rs
 
 # 6443 = API server (TLS), 10250 = kubelet.
 EXPOSE 6443 10250
 
-ENTRYPOINT ["/rusternetes"]
+ENTRYPOINT ["/k3rs"]
 # Embedded SQLite, TLS on, in-process kube-proxy off (no iptables here).
 CMD ["--storage-backend", "sqlite", "--tls", "--disable-proxy"]

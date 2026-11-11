@@ -36,7 +36,7 @@
 //!
 //! [DNS-Based Service Discovery]: https://github.com/kubernetes/dns/blob/master/docs/specification.md
 
-use rusternetes_common::resources::{EndpointSlice, Pod, Service, ServiceType};
+use k3rs_common::resources::{EndpointSlice, Pod, Service, ServiceType};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -521,7 +521,7 @@ pub fn ip_to_arpa(ip: IpAddr) -> String {
     }
 }
 
-fn endpoint_ready(endpoint: &rusternetes_common::resources::Endpoint) -> bool {
+fn endpoint_ready(endpoint: &k3rs_common::resources::Endpoint) -> bool {
     match &endpoint.conditions {
         Some(c) => c.ready.unwrap_or(true),
         // No conditions block = treat as ready (matches kube-proxy
@@ -535,7 +535,7 @@ fn endpoint_ready(endpoint: &rusternetes_common::resources::Endpoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         Endpoint, EndpointConditions, PodIP, PodSpec, PodStatus, ServicePort, ServiceSpec,
     };
     use std::collections::HashMap as Map;

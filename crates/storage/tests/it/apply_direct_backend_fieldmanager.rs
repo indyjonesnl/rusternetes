@@ -8,7 +8,7 @@
 //! (sigs.k8s.io/structured-merge-diff/v6/merge/update.go:209-254); conditions
 //! merge by `type` (`+listType=map`, `+listMapKey=type`).
 
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_storage::{MemoryStorage, Storage};
 use serde_json::{json, Value};
 
 #[tokio::test]

@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{ContainerImage, Node, NodeCondition, NodeStatus};
-    pub use rusternetes_kubelet::image_gc::Image;
+    pub use k3rs_common::resources::{ContainerImage, Node, NodeCondition, NodeStatus};
+    pub use k3rs_kubelet::image_gc::Image;
     pub use serde_json::Value;
     pub use std::time::{Duration, Instant};
 }
@@ -154,7 +154,7 @@ mod tests {
 
     use super::__parent::*;
     use chrono::{DateTime, Duration as CDur, TimeZone, Utc};
-    use rusternetes_kubelet::node_status::*;
+    use k3rs_kubelet::node_status::*;
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2015, 1, 1, 12, 0, 0).unwrap()
@@ -286,7 +286,7 @@ mod tests {
     // for v1.Node (patch.go diffMaps/diffLists; $setElementOrder on every
     // changed merge list).
 
-    use rusternetes_common::resources::{NodeAddress, NodeSpec};
+    use k3rs_common::resources::{NodeAddress, NodeSpec};
     use serde_json::json;
 
     fn node(c: Vec<NodeCondition>) -> Node {

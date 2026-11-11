@@ -2,28 +2,28 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::resources::storageversionmigration::{
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::resources::storageversionmigration::{
         StorageVersionMigration, StorageVersionMigrationStatus,
     };
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::storageversionmigration::{
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::storageversionmigration::{
         validate_storage_version_migration, validate_storage_version_migration_status_update,
         validate_storage_version_migration_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::storagemigration::storageversionmigration::*;
-    use rusternetes_common::types::Condition;
+    use k3rs_api_server::registry::storagemigration::storageversionmigration::*;
+    use k3rs_common::types::Condition;
 
     fn paths(rf: &ResetFields) -> Vec<Vec<String>> {
         let mut v = rf.for_version(API_VERSION).to_vec();

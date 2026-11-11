@@ -4,7 +4,7 @@
 //! `HandlesSchedulerName`, `cfgValidator.validate`, and of
 //! `Scheduler.frameworkForPod` (`pkg/scheduler/schedule_one.go:390-396`).
 //!
-//! Rusternetes has no per-profile plugin objects: the filter/score pipeline is
+//! k3rs has no per-profile plugin objects: the filter/score pipeline is
 //! compiled in. A [`Profile`] therefore carries the per-profile state the
 //! runtime actually consumes (`VolumeBindingArgs`, the event recorder's
 //! reporting controller = `schedulerName`), the resolved [`Framework`]
@@ -18,8 +18,8 @@ use crate::framework_runtime::{
 };
 use crate::scheduler_config::VolumeBindingArgs;
 use crate::volume_binding::{self, FunctionShapePoint};
-use rusternetes_common::resources::pod::NodeAffinity;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::pod::NodeAffinity;
+use k3rs_common::resources::Pod;
 use std::collections::HashMap;
 use std::time::Duration;
 

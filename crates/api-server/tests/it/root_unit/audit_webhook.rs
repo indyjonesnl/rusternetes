@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::authorization_webhook::WebhookClientConfig;
-    pub use rusternetes_common::audit::{AuditBackend, AuditEvent};
-    pub use rusternetes_common::wait::Backoff;
+    pub use k3rs_api_server::authorization_webhook::WebhookClientConfig;
+    pub use k3rs_common::audit::{AuditBackend, AuditEvent};
+    pub use k3rs_common::wait::Backoff;
     pub use serde::Serialize;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -17,8 +17,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::audit_webhook::*;
-    use rusternetes_common::audit::{AuditLevel, AuditStage, UserInfo};
+    use k3rs_api_server::audit_webhook::*;
+    use k3rs_common::audit::{AuditLevel, AuditStage, UserInfo};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 

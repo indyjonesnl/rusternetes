@@ -15,7 +15,7 @@
 //! attachment is marked attached, no finalizer, no RPC).
 //!
 //! In-tree PVs are translated to CSI with the shared csi-translation-lib port
-//! (`rusternetes_common::csi_translation`, #3047).
+//! (`k3rs_common::csi_translation`, #3047).
 //!
 //! `ReconcileVA` (`--reconcile-sync`, `csi_handler.go:122-210`) compares the
 //! driver's `ListVolumes` published nodes (only for a driver reporting
@@ -32,24 +32,18 @@ use super::csi_provisioner::to_csi_access_mode;
 use super::pvc_protection::update_or_reap;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::resources::csi::{
-    CSINode, VolumeAttachment, VolumeAttachmentStatus, VolumeError,
-};
-use rusternetes_common::resources::volume::{
-    CSIVolumeSource, PersistentVolumeMode, PersistentVolumeSpec,
-};
-use rusternetes_common::resources::{PersistentVolume, Secret};
-use rusternetes_csi::controller_client::{
-    ControllerError, CsiControllerClient, DriverCapabilities,
-};
-use rusternetes_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
-use rusternetes_csi::proto::plugin_capability::service::Type as PluginService;
-use rusternetes_csi::proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
-use rusternetes_csi::proto::{
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::resources::csi::{CSINode, VolumeAttachment, VolumeAttachmentStatus, VolumeError};
+use k3rs_common::resources::volume::{CSIVolumeSource, PersistentVolumeMode, PersistentVolumeSpec};
+use k3rs_common::resources::{PersistentVolume, Secret};
+use k3rs_csi::controller_client::{ControllerError, CsiControllerClient, DriverCapabilities};
+use k3rs_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
+use k3rs_csi::proto::plugin_capability::service::Type as PluginService;
+use k3rs_csi::proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
+use k3rs_csi::proto::{
     ControllerPublishVolumeRequest, ControllerUnpublishVolumeRequest, VolumeCapability,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -752,7 +746,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
         let key = Self::va_key(name);
         let mut va: VolumeAttachment = match self.storage.get(&key).await {
             Ok(v) => v,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         let finalizer = finalizer_name(&self.driver_name);
@@ -778,7 +772,7 @@ impl<S: Storage + 'static> CsiAttacher<S> {
             Ok(_) => Ok(()),
             // "The VolumeAttachment does not have any finalizer, it might
             // have been deleted by the API server."
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }

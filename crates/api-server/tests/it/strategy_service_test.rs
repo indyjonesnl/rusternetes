@@ -5,7 +5,7 @@
 //! https://github.com/kubernetes/kubernetes/blob/release-1.35/pkg/registry/core/service/strategy_test.go
 //!
 //! Upstream's strategy tests exercise the registry-layer defaulting and
-//! immutability rules that fire on CREATE / UPDATE. Rusternetes does not
+//! immutability rules that fire on CREATE / UPDATE. k3rs does not
 //! separate "strategy" from "handler" — the same logic lives in
 //! `crates/api-server/src/handlers/service.rs`. This file pins those rules at
 //! the HTTP edge using the in-process Axum router pattern from
@@ -32,8 +32,8 @@
 //! recorded without breaking the green build.
 
 use axum::http::Method;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

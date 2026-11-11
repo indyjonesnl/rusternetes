@@ -1,12 +1,12 @@
 //! Tests for PriorityLevelConfiguration validation (upstream APF).
 
-use rusternetes_common::resources::flowcontrol::{
+use k3rs_common::resources::flowcontrol::{
     ExemptPriorityLevelConfiguration, LimitResponse, LimitResponseType,
     LimitedPriorityLevelConfiguration, PriorityLevelConfiguration, PriorityLevelConfigurationSpec,
     PriorityLevelType, QueuingConfiguration,
 };
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::prioritylevelconfiguration::validate_priority_level_configuration;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::prioritylevelconfiguration::validate_priority_level_configuration;
 
 fn plc(name: &str, spec: PriorityLevelConfigurationSpec) -> PriorityLevelConfiguration {
     let mut p = PriorityLevelConfiguration {
@@ -33,7 +33,7 @@ fn limited_reject() -> LimitedPriorityLevelConfiguration {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field))
 }
 
@@ -256,7 +256,7 @@ fn exempt_lendable_percent_out_of_range_rejected() {
 
 // ---- mandatory-object spec equality (validation.go:364-390) ----
 
-use rusternetes_common::validation::flowcontrol_bootstrap::{
+use k3rs_common::validation::flowcontrol_bootstrap::{
     mandatory_priority_level_configuration, MANDATORY_PRIORITY_LEVEL_NAMES,
 };
 

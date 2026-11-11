@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::LimitRange;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::limitrange::validate_limit_range;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::LimitRange;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::limitrange::validate_limit_range;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

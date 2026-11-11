@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::affinity::matches_node_selector;
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::affinity::matches_node_selector;
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::resources::volume::{
         PersistentVolumeClaimPhase, PersistentVolumeMode, PersistentVolumePhase,
         TopologySelectorTerm, VolumeBindingMode,
     };
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         CSIDriver, CSINode, CSIStorageCapacity, Node, PersistentVolume, PersistentVolumeClaim, Pod,
         StorageClass, Volume,
     };
-    pub use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
+    pub use k3rs_common::types::{label_selector_as_selector, LabelSelector};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::volume_binding::*;
+    use k3rs_scheduler::volume_binding::*;
     use serde_json::{json, Value};
 
     fn pod(volumes: Value) -> Pod {

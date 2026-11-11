@@ -8,8 +8,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
-    use rusternetes_storage::latency::*;
+    use k3rs_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+    use k3rs_storage::latency::*;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -43,7 +43,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_busy_tracks_each_attempt_but_not_backoff() {
-        use rusternetes_storage::busy::{retry_busy, RetryPolicy};
+        use k3rs_storage::busy::{retry_busy, RetryPolicy};
         let t = Arc::new(LatencyTrackers::new());
         let mut n = 0;
         let r: Result<(), String> = with_latency_trackers(t.clone(), async {

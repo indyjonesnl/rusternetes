@@ -2,25 +2,25 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::admission_webhook::{
+    pub use k3rs_common::resources::admission_webhook::{
         FailurePolicy, LabelSelector as WebhookLabelSelector, MatchCondition, MatchPolicy,
         MutatingWebhook, MutatingWebhookConfiguration, ReinvocationPolicy, RuleWithOperations,
         SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
     };
-    pub use rusternetes_common::resources::WebhookClientConfig;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::resources::WebhookClientConfig;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1035_label, is_dns1123_subdomain, validate_label_selector,
         LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::validating_admission_policy::validate_match_conditions;
-    pub use rusternetes_common::validation::validating_admission_policy::PreexistingExpressions;
+    pub use k3rs_common::validation::validating_admission_policy::validate_match_conditions;
+    pub use k3rs_common::validation::validating_admission_policy::PreexistingExpressions;
     pub use std::collections::HashSet;
 }
 
 mod deep_validation_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::webhookconfiguration::*;
+    use k3rs_common::validation::webhookconfiguration::*;
 
     fn p() -> Path {
         Path::new("clientConfig")
@@ -104,7 +104,7 @@ mod deep_validation_tests {
 
 mod match_condition_update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::webhookconfiguration::*;
+    use k3rs_common::validation::webhookconfiguration::*;
     use serde_json::json;
 
     fn config(conditions: serde_json::Value) -> ValidatingWebhookConfiguration {

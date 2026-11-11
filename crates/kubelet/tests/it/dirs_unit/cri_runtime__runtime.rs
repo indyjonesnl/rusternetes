@@ -3,17 +3,15 @@
 
 mod __parent {
     pub use chrono::Utc;
-    pub use rusternetes_common::resources::pod::{
+    pub use k3rs_common::resources::pod::{
         Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
         ContainerStateWaiting, ContainerStatus, Pod, Probe,
     };
-    pub use rusternetes_common::resources::{ConfigMap, Secret, Service};
-    pub use rusternetes_cri::{v1, CriClient, CriError};
-    pub use rusternetes_kubelet::cri_runtime::{image_volume_metrics, probe, status, translate};
-    pub use rusternetes_kubelet::server_metrics_endpoints::{
-        observe_probe, ProbeResult, ProbeType,
-    };
-    pub use rusternetes_storage::{build_prefix, Storage};
+    pub use k3rs_common::resources::{ConfigMap, Secret, Service};
+    pub use k3rs_cri::{v1, CriClient, CriError};
+    pub use k3rs_kubelet::cri_runtime::{image_volume_metrics, probe, status, translate};
+    pub use k3rs_kubelet::server_metrics_endpoints::{observe_probe, ProbeResult, ProbeType};
+    pub use k3rs_storage::{build_prefix, Storage};
     pub use std::path::Path;
     pub use std::sync::{Arc, Mutex};
     pub use tracing::{debug, warn};
@@ -21,13 +19,13 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::HTTPGetAction;
-    use rusternetes_common::resources::pod::PodSpec;
-    use rusternetes_common::resources::pod::PodStatus;
-    use rusternetes_common::resources::policy::IntOrString;
-    use rusternetes_common::resources::Event;
-    use rusternetes_kubelet::cri_runtime::runtime::*;
-    use rusternetes_storage::{Storage, StorageBackend};
+    use k3rs_common::resources::pod::HTTPGetAction;
+    use k3rs_common::resources::pod::PodSpec;
+    use k3rs_common::resources::pod::PodStatus;
+    use k3rs_common::resources::policy::IntOrString;
+    use k3rs_common::resources::Event;
+    use k3rs_kubelet::cri_runtime::runtime::*;
+    use k3rs_storage::{Storage, StorageBackend};
     use std::collections::HashMap;
 
     /// Regression for the in-place-resize specs: the resize was silently
@@ -57,7 +55,7 @@ mod tests {
     fn resize_values_floor_tiny_cpu_like_the_create_path() {
         let container = Container {
             name: "c1".to_string(),
-            resources: Some(rusternetes_common::types::ResourceRequirements {
+            resources: Some(k3rs_common::types::ResourceRequirements {
                 requests: Some(HashMap::from([("cpu".to_string(), "1m".to_string())])),
                 limits: Some(HashMap::from([("cpu".to_string(), "5m".to_string())])),
                 claims: None,
@@ -312,12 +310,10 @@ mod tests {
 
     #[tokio::test]
     async fn apply_readiness_updates_restartable_init_sidecars_only() {
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .expect("runtime handle is lazy and should not dial during construction");
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .expect("runtime handle is lazy and should not dial during construction");
         let plain_init = Container {
             name: "plain-init".to_string(),
             image: "busybox".to_string(),
@@ -481,14 +477,12 @@ mod tests {
         let port =
             spawn_lifecycle_hook_http_server("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 .await;
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap();
         let (pod, container) = lifecycle_test_pod_and_container();
-        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+        let handler = k3rs_common::resources::pod::LifecycleHandler {
             exec: None,
             http_get: Some(HTTPGetAction {
                 path: Some("/echo?msg=poststart".to_string()),
@@ -512,14 +506,12 @@ mod tests {
         let port =
             spawn_lifecycle_hook_http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await;
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap();
         let (pod, container) = lifecycle_test_pod_and_container();
-        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+        let handler = k3rs_common::resources::pod::LifecycleHandler {
             exec: None,
             http_get: Some(HTTPGetAction {
                 path: Some("/echo?msg=prestop".to_string()),
@@ -604,14 +596,12 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_https_hook_reaches_real_tls_server() {
         let (port, rx) = spawn_lifecycle_hook_https_server().await;
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap();
         let (pod, container) = lifecycle_test_pod_and_container();
-        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+        let handler = k3rs_common::resources::pod::LifecycleHandler {
             exec: None,
             http_get: Some(HTTPGetAction {
                 path: Some("/echo?msg=prestop".to_string()),
@@ -642,12 +632,10 @@ mod tests {
     #[tokio::test]
     async fn http_probe_follows_local_redirect_to_final_failure() {
         let port = spawn_http_probe_redirect_server().await;
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap();
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap();
         let container = probe_test_container();
         let pod = Pod::new(
             "http-local-redirect",
@@ -672,13 +660,11 @@ mod tests {
     async fn http_probe_non_local_redirect_is_warning_success() {
         let port = spawn_http_probe_redirect_server().await;
         let storage = Arc::new(StorageBackend::new_memory());
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_event_recorder(Arc::clone(&storage));
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_event_recorder(Arc::clone(&storage));
         let container = probe_test_container();
         let mut pod = Pod::new(
             "http-nonlocal-redirect",
@@ -699,16 +685,13 @@ mod tests {
             healthy,
             "different-host redirects terminate with warning but count as success"
         );
-        let obj = rusternetes_kubelet::events::container_object_reference(&pod, &container.name);
+        let obj = k3rs_kubelet::events::container_object_reference(&pod, &container.name);
         let key = format!(
             "/registry/events/default/{}",
-            Event::generate_name(&obj, rusternetes_kubelet::events::CONTAINER_PROBE_WARNING)
+            Event::generate_name(&obj, k3rs_kubelet::events::CONTAINER_PROBE_WARNING)
         );
         let event: Event = storage.get(&key).await.expect("warning event recorded");
-        assert_eq!(
-            event.reason,
-            rusternetes_kubelet::events::CONTAINER_PROBE_WARNING
-        );
+        assert_eq!(event.reason, k3rs_kubelet::events::CONTAINER_PROBE_WARNING);
         assert!(event
             .message
             .contains("Probe terminated redirects, Response body:"));
@@ -774,7 +757,7 @@ mod tests {
     fn read_log_tail_parses_cri_framing_and_limits_lines() {
         // Upstream readLastStringFromContainerLogs strips CRI log framing before
         // returning the tail (pkg/kubelet/kuberuntime/kuberuntime_container.go:591).
-        // read_log_tail must do the same via rusternetes_cri::stream::read_log_file.
+        // read_log_tail must do the same via k3rs_cri::stream::read_log_file.
         let dir = tempfile::tempdir().unwrap();
 
         // CRI-formatted log: only the message part after stripping framing should appear.
@@ -858,21 +841,19 @@ mod tests {
     ///       v1.EventTypeNormal, events.StartedContainer, "Container started")
     #[tokio::test]
     async fn started_event_is_emitted_via_emit_event_and_visible_to_conformance_watcher() {
-        use rusternetes_common::resources::pod::PodSpec;
+        use k3rs_common::resources::pod::PodSpec;
 
         let storage = Arc::new(StorageBackend::new_memory());
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_event_recorder(Arc::clone(&storage));
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_event_recorder(Arc::clone(&storage));
 
         let mut pod = Pod::new(
             "sysctl-test",
             PodSpec {
-                containers: vec![rusternetes_common::resources::pod::Container {
+                containers: vec![k3rs_common::resources::pod::Container {
                     name: "app".to_string(),
                     image: "busybox".to_string(),
                     ..Default::default()
@@ -890,18 +871,18 @@ mod tests {
             .emit_event(
                 &pod,
                 Some("app"),
-                rusternetes_kubelet::events::STARTED_CONTAINER,
-                rusternetes_common::resources::EventType::Normal,
+                k3rs_kubelet::events::STARTED_CONTAINER,
+                k3rs_common::resources::EventType::Normal,
                 "Started container app",
             )
             .await;
 
         // Verify the event is visible to a WaitForErrorEventOrSuccess-style watcher:
         // search for a "Started" reason event on this pod.
-        let obj = rusternetes_kubelet::events::container_object_reference(&pod, "app");
+        let obj = k3rs_kubelet::events::container_object_reference(&pod, "app");
         let key = format!(
             "/registry/events/default/{}",
-            Event::generate_name(&obj, rusternetes_kubelet::events::STARTED_CONTAINER)
+            Event::generate_name(&obj, k3rs_kubelet::events::STARTED_CONTAINER)
         );
         let ev: Event = storage.get(&key).await.expect(
             "Started event must be present so WaitForErrorEventOrSuccess can return; \
@@ -909,13 +890,10 @@ mod tests {
         );
         assert_eq!(
             ev.reason,
-            rusternetes_kubelet::events::STARTED_CONTAINER,
+            k3rs_kubelet::events::STARTED_CONTAINER,
             "reason must be \"Started\""
         );
-        assert_eq!(
-            ev.event_type,
-            rusternetes_common::resources::EventType::Normal
-        );
+        assert_eq!(ev.event_type, k3rs_common::resources::EventType::Normal);
         // Container-scoped: fieldPath must identify the specific container.
         assert_eq!(
             ev.involved_object.field_path.as_deref(),
@@ -928,21 +906,19 @@ mod tests {
     ///   m.recordContainerEvent(…, events.CreatedContainer, "Container created")
     #[tokio::test]
     async fn created_event_is_emitted_via_emit_event() {
-        use rusternetes_common::resources::pod::PodSpec;
+        use k3rs_common::resources::pod::PodSpec;
 
         let storage = Arc::new(StorageBackend::new_memory());
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_event_recorder(Arc::clone(&storage));
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_event_recorder(Arc::clone(&storage));
 
         let mut pod = Pod::new(
             "sysctl-created",
             PodSpec {
-                containers: vec![rusternetes_common::resources::pod::Container {
+                containers: vec![k3rs_common::resources::pod::Container {
                     name: "app".to_string(),
                     image: "busybox".to_string(),
                     ..Default::default()
@@ -957,26 +933,23 @@ mod tests {
             .emit_event(
                 &pod,
                 Some("app"),
-                rusternetes_kubelet::events::CREATED_CONTAINER,
-                rusternetes_common::resources::EventType::Normal,
+                k3rs_kubelet::events::CREATED_CONTAINER,
+                k3rs_common::resources::EventType::Normal,
                 "Created container app",
             )
             .await;
 
-        let obj = rusternetes_kubelet::events::container_object_reference(&pod, "app");
+        let obj = k3rs_kubelet::events::container_object_reference(&pod, "app");
         let key = format!(
             "/registry/events/default/{}",
-            Event::generate_name(&obj, rusternetes_kubelet::events::CREATED_CONTAINER)
+            Event::generate_name(&obj, k3rs_kubelet::events::CREATED_CONTAINER)
         );
         let ev: Event = storage
             .get(&key)
             .await
             .expect("Created event must be present");
-        assert_eq!(ev.reason, rusternetes_kubelet::events::CREATED_CONTAINER);
-        assert_eq!(
-            ev.event_type,
-            rusternetes_common::resources::EventType::Normal
-        );
+        assert_eq!(ev.reason, k3rs_kubelet::events::CREATED_CONTAINER);
+        assert_eq!(ev.event_type, k3rs_common::resources::EventType::Normal);
     }
 
     /// #1554: a failed postStart lifecycle hook must kill the container and
@@ -992,27 +965,25 @@ mod tests {
     /// via `?` to fail the start.
     #[tokio::test]
     async fn sandbox_handler_resolves_pod_runtime_class() {
-        use rusternetes_common::resources::RuntimeClass;
+        use k3rs_common::resources::RuntimeClass;
         let storage = Arc::new(StorageBackend::new_memory());
         storage
             .create(
-                &rusternetes_storage::build_key("runtimeclasses", None, "gvisor"),
+                &k3rs_storage::build_key("runtimeclasses", None, "gvisor"),
                 &RuntimeClass::new("gvisor", "runsc"),
             )
             .await
             .unwrap();
-        let vm = rusternetes_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
-            "/tmp/rusternetes-test-vols".to_string(),
+        let vm = k3rs_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
+            "/tmp/k3rs-test-vols".to_string(),
             Some(storage),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        let rt = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_volumes(vm);
+        let rt =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_volumes(vm);
         let mk = |rc: Option<&str>| {
             Pod::new(
                 "p",
@@ -1042,28 +1013,26 @@ mod tests {
     /// `EnsureImageExists` (`images/image_manager.go:194`).
     #[tokio::test]
     async fn image_runtime_handler_follows_gate_and_pod_class() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
-        use rusternetes_common::resources::RuntimeClass;
+        use k3rs_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::resources::RuntimeClass;
         let storage = Arc::new(StorageBackend::new_memory());
         storage
             .create(
-                &rusternetes_storage::build_key("runtimeclasses", None, "gvisor"),
+                &k3rs_storage::build_key("runtimeclasses", None, "gvisor"),
                 &RuntimeClass::new("gvisor", "runsc"),
             )
             .await
             .unwrap();
-        let vm = rusternetes_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
-            "/tmp/rusternetes-test-vols".to_string(),
+        let vm = k3rs_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
+            "/tmp/k3rs-test-vols".to_string(),
             Some(storage),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
-        let rt = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_volumes(vm);
+        let rt =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_volumes(vm);
         let mk = |rc: Option<&str>| {
             Pod::new(
                 "p",
@@ -1106,17 +1075,15 @@ mod tests {
 
     #[tokio::test]
     async fn pod_dns_empty_resolv_conf_uses_node_ip_family_for_localhost() {
-        use rusternetes_common::resources::pod::PodSpec;
+        use k3rs_common::resources::pod::PodSpec;
         // dns.go:431-447: --resolv-conf="" appends ::1 per IPv6 node IP and
         // 127.0.0.1 per IPv4 node IP.
-        let rt = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_resolv_conf("")
-        .with_node_ips(vec!["fd00::1".to_string()]);
+        let rt =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_resolv_conf("")
+                .with_node_ips(vec!["fd00::1".to_string()]);
         let pod = Pod::new(
             "p",
             PodSpec {
@@ -1130,21 +1097,19 @@ mod tests {
 
     #[tokio::test]
     async fn failed_post_start_hook_emits_event_and_returns_error() {
-        use rusternetes_common::resources::pod::PodSpec;
+        use k3rs_common::resources::pod::PodSpec;
 
         let storage = Arc::new(StorageBackend::new_memory());
-        let runtime = CriContainerRuntime::connect(
-            "/tmp/rusternetes-test-missing-cri.sock",
-            "/tmp/rusternetes-test-logs",
-        )
-        .await
-        .unwrap()
-        .with_event_recorder(Arc::clone(&storage));
+        let runtime =
+            CriContainerRuntime::connect("/tmp/k3rs-test-missing-cri.sock", "/tmp/k3rs-test-logs")
+                .await
+                .unwrap()
+                .with_event_recorder(Arc::clone(&storage));
 
         let mut pod = Pod::new(
             "poststart-fail",
             PodSpec {
-                containers: vec![rusternetes_common::resources::pod::Container {
+                containers: vec![k3rs_common::resources::pod::Container {
                     name: "app".to_string(),
                     image: "busybox".to_string(),
                     ..Default::default()
@@ -1178,23 +1143,17 @@ mod tests {
 
         // A FailedPostStartHook Warning event was recorded, with the generic
         // message (upstream keeps the handler error out to avoid secret leaks).
-        let obj = rusternetes_kubelet::events::container_object_reference(&pod, "app");
+        let obj = k3rs_kubelet::events::container_object_reference(&pod, "app");
         let key = format!(
             "/registry/events/default/{}",
-            Event::generate_name(&obj, rusternetes_kubelet::events::FAILED_POST_START_HOOK)
+            Event::generate_name(&obj, k3rs_kubelet::events::FAILED_POST_START_HOOK)
         );
         let ev: Event = storage
             .get(&key)
             .await
             .expect("FailedPostStartHook event must be recorded");
-        assert_eq!(
-            ev.reason,
-            rusternetes_kubelet::events::FAILED_POST_START_HOOK
-        );
-        assert_eq!(
-            ev.event_type,
-            rusternetes_common::resources::EventType::Warning
-        );
+        assert_eq!(ev.reason, k3rs_kubelet::events::FAILED_POST_START_HOOK);
+        assert_eq!(ev.event_type, k3rs_common::resources::EventType::Warning);
         assert_eq!(
             ev.message, "PostStartHook failed",
             "message must be generic (no handler output) so a hook can't leak secrets"
@@ -1317,7 +1276,7 @@ mod tests {
     ///   equivalent is the outer `tokio::time::timeout(HANDLER_TIMEOUT, exec_sync)`.
     #[tokio::test(start_paused = true)]
     async fn exec_lifecycle_hook_returns_error_when_cri_hangs() {
-        use rusternetes_common::resources::pod::ExecAction;
+        use k3rs_common::resources::pod::ExecAction;
         use std::time::Duration;
         use tokio::io::AsyncReadExt;
 
@@ -1342,12 +1301,12 @@ mod tests {
         });
 
         let runtime =
-            CriContainerRuntime::connect(sock_path.to_str().unwrap(), "/tmp/rusternetes-test-logs")
+            CriContainerRuntime::connect(sock_path.to_str().unwrap(), "/tmp/k3rs-test-logs")
                 .await
                 .unwrap();
 
         let (pod, container) = lifecycle_test_pod_and_container();
-        let handler = rusternetes_common::resources::pod::LifecycleHandler {
+        let handler = k3rs_common::resources::pod::LifecycleHandler {
             exec: Some(ExecAction {
                 command: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
             }),
@@ -1396,7 +1355,7 @@ mod tests {
     /// (`kuberuntime_manager_test.go:3717-3783`).
     #[test]
     fn to_kube_container_image_volumes_cases() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let spec1 = v1::ImageSpec {
             image: "image-1".into(),
             ..Default::default()
@@ -1470,12 +1429,12 @@ mod tests {
     /// reason, with upstream's message.
     #[test]
     fn a_never_pull_failure_keeps_its_type_and_message() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let mut pulls = ImageVolumePulls::new();
         pulls.insert(
             "volume-2".into(),
             Err(Arc::new(anyhow::Error::new(
-                rusternetes_kubelet::lifecycle::ImageNeverPullError {
+                k3rs_kubelet::lifecycle::ImageNeverPullError {
                     image: "image".into(),
                 },
             ))),
@@ -1498,7 +1457,7 @@ mod tests {
             r#"Container image "image" is not present with pull policy of Never"#
         );
         assert_eq!(
-            rusternetes_kubelet::lifecycle::reason_from_anyhow(&err),
+            k3rs_kubelet::lifecycle::reason_from_anyhow(&err),
             Some("ErrImageNeverPull")
         );
     }

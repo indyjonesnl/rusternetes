@@ -3,9 +3,9 @@
 //! Mirrors the core of upstream `ValidateHorizontalPodAutoscalerSpec`
 //! (`pkg/apis/autoscaling/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::autoscaling::HorizontalPodAutoscaler;
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::hpa::validate_horizontal_pod_autoscaler;
+use k3rs_common::resources::autoscaling::HorizontalPodAutoscaler;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::hpa::validate_horizontal_pod_autoscaler;
 use serde_json::json;
 
 fn hpa(spec: serde_json::Value) -> HorizontalPodAutoscaler {

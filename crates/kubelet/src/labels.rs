@@ -15,7 +15,7 @@
 //!   containers belonging to a different pod UID are treated as not-this-pod's
 //!   and killed.
 
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::HashMap;
 
 /// `io.kubernetes.pod.name` — the pod's `metadata.name`.

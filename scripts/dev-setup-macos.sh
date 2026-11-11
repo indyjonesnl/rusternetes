@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Rusternetes Development Environment Setup Script
+# k3rs Development Environment Setup Script
 # This script helps set up a local development environment using Docker on macOS
 
 set -e
@@ -13,7 +13,7 @@ NC='\033[0m' # No Color
 
 print_header() {
     echo -e "${BOLD}${GREEN}======================================${NC}"
-    echo -e "${BOLD}${GREEN}  Rusternetes Development Setup${NC}"
+    echo -e "${BOLD}${GREEN}  k3rs Development Setup${NC}"
     echo -e "${BOLD}${GREEN}======================================${NC}"
 }
 
@@ -117,26 +117,26 @@ if [ -z "$KUBELET_VOLUMES_PATH" ]; then
     echo "This environment variable is required for the cluster to function properly."
     echo "It must be set to an absolute path where kubelet will store volume data."
     echo ""
-    echo "Recommended path: $(pwd)/.rusternetes/volumes"
+    echo "Recommended path: $(pwd)/.k3rs/volumes"
     echo ""
     read -p "Would you like to set it now? [Y/n]: " set_env
     set_env=${set_env:-Y}
 
     if [ "$set_env" = "Y" ] || [ "$set_env" = "y" ]; then
-        KUBELET_VOLUMES_PATH="$(pwd)/.rusternetes/volumes"
+        KUBELET_VOLUMES_PATH="$(pwd)/.k3rs/volumes"
         export KUBELET_VOLUMES_PATH
         print_success "KUBELET_VOLUMES_PATH set to: $KUBELET_VOLUMES_PATH"
         echo ""
         print_warning "This is only set for this session!"
         echo ""
         echo "To make it permanent, add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo "  export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes"
+        echo "  export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes"
         echo ""
     else
         print_error "KUBELET_VOLUMES_PATH must be set before starting the cluster!"
         echo ""
         echo "Set it manually with:"
-        echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes"
+        echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.k3rs/volumes"
         echo ""
         echo "Then run this script again or start the cluster with:"
         echo "  make dev-up"
@@ -185,12 +185,12 @@ case $choice in
         if [ -z "$KUBELET_VOLUMES_PATH" ]; then
             print_error "KUBELET_VOLUMES_PATH is not set!"
             echo "Please restart this script to set it, or set it manually:"
-            echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes"
+            echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.k3rs/volumes"
             exit 1
         fi
 
         # Generate TLS certificates if they don't exist
-        if [ ! -f ".rusternetes/certs/api-server.crt" ] || [ ! -f ".rusternetes/certs/api-server.key" ]; then
+        if [ ! -f ".k3rs/certs/api-server.crt" ] || [ ! -f ".k3rs/certs/api-server.key" ]; then
             print_step "Generating TLS certificates for API server..."
             ./scripts/generate-certs.sh
             print_success "TLS certificates generated!"
@@ -219,7 +219,7 @@ case $choice in
         read -p "This will remove all containers, volumes, and images. Continue? [y/N]: " confirm
         if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
             $COMPOSE_CMD down -v
-            $CONTAINER_RUNTIME rmi $(podman images "rusternetes*" -q) 2>/dev/null || true
+            $CONTAINER_RUNTIME rmi $(podman images "k3rs*" -q) 2>/dev/null || true
             print_success "Cleanup complete!"
         else
             echo "Cleanup cancelled."
@@ -247,12 +247,12 @@ case $choice in
         if [ -z "$KUBELET_VOLUMES_PATH" ]; then
             print_error "KUBELET_VOLUMES_PATH is not set!"
             echo "Please restart this script to set it, or set it manually:"
-            echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes"
+            echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.k3rs/volumes"
             exit 1
         fi
 
         # Generate TLS certificates if they don't exist
-        if [ ! -f ".rusternetes/certs/api-server.crt" ] || [ ! -f ".rusternetes/certs/api-server.key" ]; then
+        if [ ! -f ".k3rs/certs/api-server.crt" ] || [ ! -f ".k3rs/certs/api-server.key" ]; then
             print_step "Generating TLS certificates for API server..."
             ./scripts/generate-certs.sh
             print_success "TLS certificates generated!"

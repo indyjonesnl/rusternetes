@@ -6,7 +6,7 @@
 //! are value types, so absent and zero are the same thing.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";
 

@@ -28,15 +28,15 @@
 //! - StorageClass lifecycle serde / lifecycle mirror.
 //! - VolumeAttachment status serde round-trip.
 
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::{
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::{
     CSIDriver, CSIDriverSpec, CSINode, CSINodeDriver, CSINodeSpec, CSIStorageCapacity,
     VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec, VolumeAttachmentStatus,
     VolumeAttributesClass,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::pv_binder::PVBinderController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -557,10 +557,10 @@ fn csinode_lifecycle_serde_round_trip() {
 /// loss.
 #[test]
 fn csi_inline_volume_source_round_trips_through_serde() {
-    let vol = rusternetes_common::resources::Volume {
+    let vol = k3rs_common::resources::Volume {
         legacy_sources: Default::default(),
         name: "csi-inline-vol".to_string(),
-        csi: Some(rusternetes_common::resources::csi::CSIVolumeSource {
+        csi: Some(k3rs_common::resources::csi::CSIVolumeSource {
             driver: "csi.example.com".to_string(),
             volume_handle: Some("vol-handle-abc".to_string()),
             read_only: Some(false),
@@ -594,7 +594,7 @@ fn csi_inline_volume_source_round_trips_through_serde() {
         json.contains("\"csi.example.com\""),
         "driver name must round-trip"
     );
-    let parsed: rusternetes_common::resources::Volume = serde_json::from_str(&json).unwrap();
+    let parsed: k3rs_common::resources::Volume = serde_json::from_str(&json).unwrap();
     let csi_src = parsed.csi.unwrap();
     assert_eq!(csi_src.driver, "csi.example.com");
     assert_eq!(csi_src.volume_handle.as_deref(), Some("vol-handle-abc"));
@@ -627,10 +627,10 @@ fn csidriver_lifecycle_serde_round_trip() {
         spec: CSIDriverSpec {
             attach_required: Some(true),
             pod_info_on_mount: Some(false),
-            fs_group_policy: Some(rusternetes_common::resources::FSGroupPolicy::File),
+            fs_group_policy: Some(k3rs_common::resources::FSGroupPolicy::File),
             storage_capacity: Some(false),
             volume_lifecycle_modes: Some(vec![
-                rusternetes_common::resources::csi::VolumeLifecycleMode::Persistent,
+                k3rs_common::resources::csi::VolumeLifecycleMode::Persistent,
             ]),
             token_requests: None,
             requires_republish: None,

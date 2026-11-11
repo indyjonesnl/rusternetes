@@ -3,15 +3,15 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_kubelet::server_metrics::collect_volume_stat_cal_duration;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_kubelet::server_metrics::collect_volume_stat_cal_duration;
+    pub use k3rs_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
     pub use std::time::Instant;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::metrics_statfs::*;
+    use k3rs_kubelet::volume_plugins::metrics_statfs::*;
 
     fn code(e: &anyhow::Error) -> Option<MetricsErrorCode> {
         e.downcast_ref::<MetricsError>().map(|m| m.code)
@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn get_metrics_statfs_observes_volume_stat_duration() {
         let _ = MetricsStatFs::new("").get_metrics();
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains(
             "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"statfs\"}"
         ));

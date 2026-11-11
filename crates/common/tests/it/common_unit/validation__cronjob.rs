@@ -2,20 +2,20 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::resources::{CronJob, CronJobSpec};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::job::validate_job_template_spec;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::{CronJob, CronJobSpec};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::job::validate_job_template_spec;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_nonnegative_field, validate_object_meta,
         validate_object_meta_update,
     };
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
 }
 
 mod time_zone_tests {
-    use rusternetes_common::validation::cronjob::validate_time_zone;
-    use rusternetes_common::validation::field::Path;
+    use k3rs_common::validation::cronjob::validate_time_zone;
+    use k3rs_common::validation::field::Path;
 
     fn check(tz: Option<&str>) -> Vec<String> {
         validate_time_zone(tz, &Path::new("spec").child("timeZone"))
@@ -69,7 +69,7 @@ mod time_zone_tests {
 }
 
 mod parse_schedule_tests {
-    use rusternetes_common::validation::cronjob::parse_schedule;
+    use k3rs_common::validation::cronjob::parse_schedule;
 
     #[test]
     fn an_inline_tz_prefix_is_stripped() {
@@ -82,10 +82,8 @@ mod parse_schedule_tests {
 }
 
 mod update_tests {
-    use rusternetes_common::resources::CronJob;
-    use rusternetes_common::validation::cronjob::{
-        validate_cron_job_create, validate_cron_job_update,
-    };
+    use k3rs_common::resources::CronJob;
+    use k3rs_common::validation::cronjob::{validate_cron_job_create, validate_cron_job_update};
 
     fn cron_job(name: &str) -> CronJob {
         serde_json::from_value(serde_json::json!({
@@ -106,7 +104,7 @@ mod update_tests {
         .unwrap()
     }
 
-    fn fields(errs: &[rusternetes_common::validation::field::Error]) -> Vec<String> {
+    fn fields(errs: &[k3rs_common::validation::field::Error]) -> Vec<String> {
         errs.iter()
             .map(|e| format!("{}: {}", e.field, e.detail))
             .collect()

@@ -2,7 +2,7 @@
 //! ValidatePodBinding). An unsupported kind is rejected; "Node" / empty work.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

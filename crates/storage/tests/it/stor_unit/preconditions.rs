@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::{Error, Result};
+    pub use k3rs_common::{Error, Result};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::preconditions::*;
+    use k3rs_storage::preconditions::*;
     use serde_json::json;
 
     #[test]

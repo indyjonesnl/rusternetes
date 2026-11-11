@@ -5,22 +5,20 @@ mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Duration, Utc};
     pub use futures::StreamExt;
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::node::Taint;
-    pub use rusternetes_common::resources::{
-        Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus,
-    };
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_controller_manager::controllers::node_lifecycle_metrics;
-    pub use rusternetes_controller_manager::controllers::node_lifecycle_queue::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::node::Taint;
+    pub use k3rs_common::resources::{Lease, Node, NodeCondition, NodeStatus, Pod, PodStatus};
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_controller_manager::controllers::node_lifecycle_metrics;
+    pub use k3rs_controller_manager::controllers::node_lifecycle_queue::{
         RateLimitedTimedQueue, RateLimiter, TimedValue, EVICTION_RATE_LIMITER_BURST,
         NODE_EVICTION_PERIOD,
     };
-    pub use rusternetes_controller_manager::controllers::node_lifecycle_zone::{
+    pub use k3rs_controller_manager::controllers::node_lifecycle_zone::{
         get_zone_key, EvictionConfig, ZoneState,
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info, warn};
@@ -28,9 +26,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_controller_manager::controllers::node::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::node::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_node_controller_creation() {
@@ -473,7 +471,7 @@ mod tests {
     }
 
     fn lease_at(name: &str, renew: chrono::DateTime<Utc>) -> Lease {
-        use rusternetes_common::resources::LeaseSpec;
+        use k3rs_common::resources::LeaseSpec;
         Lease {
             type_meta: TypeMeta {
                 kind: "Lease".to_string(),
@@ -938,7 +936,7 @@ mod tests {
     /// expected values follow its formulas verbatim.
     #[tokio::test]
     async fn monitor_publishes_zone_metrics() {
-        use rusternetes_controller_manager::controllers::node_lifecycle_metrics as m;
+        use k3rs_controller_manager::controllers::node_lifecycle_metrics as m;
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::with_eviction_config(storage.clone(), fast_config());
         put(&storage, &c, &znode("m0", "metrics-zone-a", "True", 0)).await;
@@ -964,7 +962,7 @@ mod tests {
     /// one eviction for the node's zone.
     #[tokio::test]
     async fn tainting_pass_counts_evictions() {
-        use rusternetes_controller_manager::controllers::node_lifecycle_metrics as m;
+        use k3rs_controller_manager::controllers::node_lifecycle_metrics as m;
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::with_eviction_config(storage.clone(), fast_config());
         put(
@@ -983,7 +981,7 @@ mod tests {
     /// size 0, health 100, unhealthy 0.
     #[tokio::test]
     async fn emptied_zone_metrics_reset() {
-        use rusternetes_controller_manager::controllers::node_lifecycle_metrics as m;
+        use k3rs_controller_manager::controllers::node_lifecycle_metrics as m;
         let storage = Arc::new(MemoryStorage::new());
         let c = NodeController::with_eviction_config(storage.clone(), fast_config());
         put(

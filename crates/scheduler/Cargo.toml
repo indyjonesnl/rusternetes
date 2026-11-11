@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-scheduler"
+name = "k3rs-scheduler"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_scheduler"
+name = "k3rs_scheduler"
 path = "src/lib.rs"
 # Unit tests live in tests/it: a second compilation of the lib as a test
 # target costs as much as the lib itself.
@@ -19,16 +19,16 @@ path = "src/main.rs"
 [features]
 mimalloc = ["dep:mimalloc"]
 default = []
-sqlite = ["rusternetes-storage/sqlite"]
-redis = ["rusternetes-storage/redis"]
+sqlite = ["k3rs-storage/sqlite"]
+redis = ["k3rs-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
-rusternetes-storage = { path = "../storage" }
-rusternetes-client = { path = "../client" }
+k3rs-common = { path = "../common", features = ["axum-support", "clap-support"] }
+k3rs-storage = { path = "../storage" }
+k3rs-client = { path = "../client" }
 # secure serving + delegated authn/authz for /metrics, /statusz, /flagz (#3437)
-rusternetes-middleware = { path = "../middleware" }
+k3rs-middleware = { path = "../middleware" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -51,7 +51,7 @@ serial_test = { workspace = true }
 # `ReplicaSetController` reconcile loop against the same `MemoryStorage`
 # the scheduler mutates. Listed dev-only so the production scheduler binary
 # stays decoupled from the controller-manager crate.
-rusternetes-controller-manager = { path = "../controller-manager" }
+k3rs-controller-manager = { path = "../controller-manager" }
 # Shared resource-fixture builders (e.g. `node_with_resources`), default
 # feature only — the api-server harness is not needed here.
-rusternetes-test-support = { path = "../test_support" }
+k3rs-test-support = { path = "../test_support" }

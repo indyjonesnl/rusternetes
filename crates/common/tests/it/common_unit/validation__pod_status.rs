@@ -2,29 +2,27 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
-    pub use rusternetes_common::resources::pod::{
+    pub use k3rs_common::feature_gates::{enabled, Feature};
+    pub use k3rs_common::resources::pod::{
         ContainerRestartRule, ContainerState, ContainerStateTerminated, ContainerStatus,
         PodCondition, PodIP,
     };
-    pub use rusternetes_common::resources::{Binding, Container, Pod, PodSpec};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::{Binding, Container, Pod, PodSpec};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_immutable_field, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::pod_options::{
+    pub use k3rs_common::validation::pod_options::{
         get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
     };
-    pub use rusternetes_common::validation::service::{
-        is_valid_ip_for_legacy_field, parse_ip_sloppy,
-    };
+    pub use k3rs_common::validation::service::{is_valid_ip_for_legacy_field, parse_ip_sloppy};
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::pod_status::*;
+    use k3rs_common::validation::pod_status::*;
 
     fn pod(extra_spec: serde_json::Value, status: serde_json::Value) -> Pod {
         let mut body = serde_json::json!({

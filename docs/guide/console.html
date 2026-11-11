@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Web Console - Rūsternetes</title>
+  <title>Web Console - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -106,7 +106,7 @@
       <p class="lead">
         A built-in web dashboard served directly from the API server &mdash; no proxy, no separate deployment,
         no external dependencies. Browse workloads, nodes, networking, storage, RBAC, and events in real time.
-        Supports multi-cluster management for fleets of rusternetes instances.
+        Supports multi-cluster management for fleets of k3rs instances.
       </p>
 
       <div class="admonition tip">
@@ -210,9 +210,9 @@ cd console
 npm install
 npm run build
 
-<span class="c"># Start rusternetes with the console enabled</span>
+<span class="c"># Start k3rs with the console enabled</span>
 cd ..
-./target/release/rusternetes --console-dir ./console/dist
+./target/release/k3rs --console-dir ./console/dist
 
 <span class="c"># Open in browser</span>
 open https://localhost:6443/console/</code>
@@ -230,7 +230,7 @@ open https://localhost:6443/console/</code>
           <span class="code-lang">Terminal</span>
         </div>
         <code><span class="c"># Terminal 1: start the API server (no --console-dir needed)</span>
-./target/release/rusternetes
+./target/release/k3rs
 
 <span class="c"># Terminal 2: start the console dev server</span>
 cd console
@@ -369,7 +369,7 @@ npm run dev
 
       <h2>Multi-Cluster</h2>
 
-      <p>The console includes a <strong>fleet mode</strong> for managing multiple rusternetes clusters
+      <p>The console includes a <strong>fleet mode</strong> for managing multiple k3rs clusters
          from a single browser tab.</p>
 
       <h3>How It Works</h3>
@@ -388,7 +388,7 @@ npm run dev
           <span class="code-dot green"></span>
           <span class="code-lang">Multi-Cluster Architecture</span>
         </div>
-        <code>Browser &rarr; rusternetes-hub (Axum)
+        <code>Browser &rarr; k3rs-hub (Axum)
               ├── /api/v1/...               Local cluster API
               ├── /console/                 SPA static files
               └── /clusters/{id}/api/...    Proxy to remote cluster</code>
@@ -488,7 +488,7 @@ npm run build</code>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

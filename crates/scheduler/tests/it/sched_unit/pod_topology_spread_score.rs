@@ -2,19 +2,19 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::TopologySpreadConstraint;
-    pub use rusternetes_common::resources::{Node, Pod};
-    pub use rusternetes_common::types::{
+    pub use k3rs_common::resources::pod::TopologySpreadConstraint;
+    pub use k3rs_common::resources::{Node, Pod};
+    pub use k3rs_common::types::{
         label_selector_as_selector, LabelSelector, LabelSelectorRequirement, Phase, Selector,
     };
-    pub use rusternetes_scheduler::queue::topology_spread_hints::merge_label_set_with_selector;
-    pub use rusternetes_scheduler::score::MAX_NODE_SCORE;
+    pub use k3rs_scheduler::queue::topology_spread_hints::merge_label_set_with_selector;
+    pub use k3rs_scheduler::score::MAX_NODE_SCORE;
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::pod_topology_spread_score::*;
+    use k3rs_scheduler::pod_topology_spread_score::*;
     use serde_json::{json, Value};
 
     fn node(name: &str, labels: Value, taints: Option<Value>) -> Node {

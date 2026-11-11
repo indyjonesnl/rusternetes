@@ -5,14 +5,14 @@ mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Utc};
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::{
         EventSource, EventType, Node, Pod, PodCondition, Taint, Toleration,
     };
-    pub use rusternetes_controller_manager::controllers::taint_eviction_timed_workers::{
+    pub use k3rs_controller_manager::controllers::taint_eviction_timed_workers::{
         TimedWorkerQueue, WorkArgs,
     };
-    pub use rusternetes_storage::{
+    pub use k3rs_storage::{
         build_key, build_prefix, EventRecorder, Storage, WatchEvent, WorkQueue,
     };
     pub use std::collections::HashMap;
@@ -27,8 +27,8 @@ mod tests {
     //! The fake clientset's "patch"/"delete" actions become: the pod gaining a
     //! `DisruptionTarget` condition (status patch) and being deleted.
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::taint_eviction::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::taint_eviction::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::json;
 
     fn pod(name: &str, node: &str) -> Pod {
@@ -430,8 +430,8 @@ mod tests {
         for phase in ["Succeeded", "Failed"] {
             let mut p = pod("pod1", "node1");
             p.status.as_mut().unwrap().phase = Some(match phase {
-                "Succeeded" => rusternetes_common::types::Phase::Succeeded,
-                _ => rusternetes_common::types::Phase::Failed,
+                "Succeeded" => k3rs_common::types::Phase::Succeeded,
+                _ => k3rs_common::types::Phase::Failed,
             });
             let f = Fixture::new(vec![p]).await;
             let n = node("node1", &[1]);
@@ -721,7 +721,7 @@ mod tests {
         .await;
         ctl.emit_event("test", "other", "Cancelling deletion of Pod test/other")
             .await;
-        let events: Vec<rusternetes_common::resources::Event> =
+        let events: Vec<k3rs_common::resources::Event> =
             storage.list("/registry/events/test/").await.unwrap();
         let msgs: Vec<String> = events.iter().map(|e| e.message.clone()).collect();
         assert!(
@@ -773,7 +773,7 @@ mod tests {
     /// storage that stalls node reads must not block a node on another shard.
     #[tokio::test]
     async fn node_updates_run_on_more_than_one_worker() {
-        use rusternetes_controller_manager::controllers::worker_pool::test_support::StallStorage;
+        use k3rs_controller_manager::controllers::worker_pool::test_support::StallStorage;
         // Pick two node names that land on different shards.
         let a = "node-a".to_string();
         let b = (0..64)

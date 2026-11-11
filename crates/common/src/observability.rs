@@ -24,8 +24,7 @@ pub struct ApiServerMetrics {
 impl ApiServerMetrics {
     pub fn new(registry: &Registry) -> Result<Self, prometheus::Error> {
         let requests_total = CounterVec::new(
-            Opts::new("api_requests_total", "Total number of API requests")
-                .namespace("rusternetes"),
+            Opts::new("api_requests_total", "Total number of API requests").namespace("k3rs"),
             &["method", "path", "status"],
         )?;
 
@@ -34,7 +33,7 @@ impl ApiServerMetrics {
                 "api_request_duration_seconds",
                 "API request duration in seconds",
             )
-            .namespace("rusternetes")
+            .namespace("k3rs")
             .buckets(vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             ]),
@@ -44,7 +43,7 @@ impl ApiServerMetrics {
         let requests_active = Gauge::new("api_requests_active", "Number of active API requests")?;
 
         let errors_total = CounterVec::new(
-            Opts::new("api_errors_total", "Total number of API errors").namespace("rusternetes"),
+            Opts::new("api_errors_total", "Total number of API errors").namespace("k3rs"),
             &["type"],
         )?;
 
@@ -91,7 +90,7 @@ impl SchedulerMetrics {
                 "scheduling_attempts_total",
                 "Total number of scheduling attempts",
             )
-            .namespace("rusternetes"),
+            .namespace("k3rs"),
             &["result"],
         )?;
 
@@ -100,7 +99,7 @@ impl SchedulerMetrics {
                 "scheduling_duration_seconds",
                 "Scheduling duration in seconds",
             )
-            .namespace("rusternetes")
+            .namespace("k3rs")
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
         )?;
 
@@ -114,7 +113,7 @@ impl SchedulerMetrics {
                 "scheduling_failures_total",
                 "Total number of scheduling failures",
             )
-            .namespace("rusternetes"),
+            .namespace("k3rs"),
             &["reason"],
         )?;
 
@@ -162,7 +161,7 @@ impl KubeletMetrics {
                 "containers_started_total",
                 "Total number of containers started",
             )
-            .namespace("rusternetes"),
+            .namespace("k3rs"),
             &["container", "pod", "namespace"],
         )?;
 
@@ -171,7 +170,7 @@ impl KubeletMetrics {
                 "container_failures_total",
                 "Total number of container failures",
             )
-            .namespace("rusternetes"),
+            .namespace("k3rs"),
             &["container", "pod", "namespace", "reason"],
         )?;
 
@@ -182,17 +181,17 @@ impl KubeletMetrics {
                 "container_start_duration_seconds",
                 "Container start duration in seconds",
             )
-            .namespace("rusternetes")
+            .namespace("k3rs")
             .buckets(vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]),
         )?;
 
         let node_capacity = GaugeVec::new(
-            Opts::new("node_capacity", "Node capacity").namespace("rusternetes"),
+            Opts::new("node_capacity", "Node capacity").namespace("k3rs"),
             &["resource"],
         )?;
 
         let node_allocatable = GaugeVec::new(
-            Opts::new("node_allocatable", "Node allocatable resources").namespace("rusternetes"),
+            Opts::new("node_allocatable", "Node allocatable resources").namespace("k3rs"),
             &["resource"],
         )?;
 
@@ -236,7 +235,7 @@ impl StorageMetrics {
                 "storage_operations_total",
                 "Total number of storage operations",
             )
-            .namespace("rusternetes"),
+            .namespace("k3rs"),
             &["operation", "resource_type"],
         )?;
 
@@ -245,19 +244,18 @@ impl StorageMetrics {
                 "storage_operation_duration_seconds",
                 "Storage operation duration in seconds",
             )
-            .namespace("rusternetes")
+            .namespace("k3rs")
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
             &["operation", "resource_type"],
         )?;
 
         let errors_total = CounterVec::new(
-            Opts::new("storage_errors_total", "Total number of storage errors")
-                .namespace("rusternetes"),
+            Opts::new("storage_errors_total", "Total number of storage errors").namespace("k3rs"),
             &["operation", "resource_type"],
         )?;
 
         let objects_count = GaugeVec::new(
-            Opts::new("storage_objects_count", "Number of stored objects").namespace("rusternetes"),
+            Opts::new("storage_objects_count", "Number of stored objects").namespace("k3rs"),
             &["resource_type", "namespace"],
         )?;
 

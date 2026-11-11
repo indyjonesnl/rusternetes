@@ -19,7 +19,7 @@
 //! - `NetworkPolicy` (podSelector, ingress + egress, ipBlock, namespaceSelector, named ports)
 //! - `EndpointSlice` (IPv4/IPv6/FQDN, multi-port, topology hints)
 
-use rusternetes_common::resources::{EndpointSlice, Ingress, IngressClass, NetworkPolicy};
+use k3rs_common::resources::{EndpointSlice, Ingress, IngressClass, NetworkPolicy};
 
 // ---------- helpers ----------
 

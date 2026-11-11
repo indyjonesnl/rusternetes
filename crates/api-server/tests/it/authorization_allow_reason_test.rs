@@ -7,16 +7,16 @@ use axum::{
     routing::get,
     Router,
 };
-use rusternetes_api_server::{
+use k3rs_api_server::{
     authorization_filter::with_authorization, request_scope::request_info_middleware,
 };
-use rusternetes_common::{
+use k3rs_common::{
     auth::UserInfo,
     authz::{AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes},
     latency_trackers::{with_latency_trackers, LatencyTrackers},
     Result,
 };
-use rusternetes_middleware::AuthContext;
+use k3rs_middleware::AuthContext;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -37,15 +37,15 @@ impl Authorizer for AllowWithError {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 
 #[tokio::test]
 async fn allow_with_error_survives_union_and_instrumentation_and_tracks_latency() {
-    use rusternetes_common::authz::UnionAuthorizer;
-    let instrumented = rusternetes_api_server::authorization_metrics::instrumented_authorizer(
+    use k3rs_common::authz::UnionAuthorizer;
+    let instrumented = k3rs_api_server::authorization_metrics::instrumented_authorizer(
         "RBAC",
         "partial",
         Arc::new(AllowWithError),
@@ -86,7 +86,7 @@ async fn allow_with_error_survives_union_and_instrumentation_and_tracks_latency(
 // ABAC's successful reason is deliberately empty, per abac.go:229-235.
 #[tokio::test]
 async fn abac_reasons_remain_empty_on_allow_and_exact_on_no_match() {
-    use rusternetes_api_server::abac::{Policy, PolicyList, PolicySpec};
+    use k3rs_api_server::abac::{Policy, PolicyList, PolicySpec};
     let policies = PolicyList(vec![Policy {
         spec: PolicySpec {
             user: "alice".into(),
@@ -124,9 +124,9 @@ async fn abac_reasons_remain_empty_on_allow_and_exact_on_no_match() {
 // adapters for the legacy APIs, rather than separately reauthorizing.
 #[tokio::test]
 async fn cached_outcome_is_shared_with_legacy_adapters() {
-    let cache = rusternetes_api_server::admission::caching_authorizer::new_caching_authorizer(
-        Arc::new(AllowWithError),
-    );
+    let cache = k3rs_api_server::admission::caching_authorizer::new_caching_authorizer(Arc::new(
+        AllowWithError,
+    ));
     let attrs = RequestAttributes::new(UserInfo::anonymous(), "get", "pods");
     let outcome = cache.authorize_outcome(&attrs).await.unwrap();
     assert_eq!(cache.authorize(&attrs).await.unwrap(), Decision::Allow);
@@ -141,7 +141,7 @@ async fn cached_outcome_is_shared_with_legacy_adapters() {
 // when called via legacy adapters in this Rust implementation.
 #[tokio::test]
 async fn instrumented_legacy_adapters_share_the_outcome_path() {
-    let authorizer = rusternetes_api_server::authorization_metrics::instrumented_authorizer(
+    let authorizer = k3rs_api_server::authorization_metrics::instrumented_authorizer(
         "RBAC",
         "legacy-outcome",
         Arc::new(AllowWithError),
@@ -157,7 +157,7 @@ async fn instrumented_legacy_adapters_share_the_outcome_path() {
 // pkg/kubeapiserver/authorizer/reload.go:78-79 forwards the full tuple.
 #[tokio::test]
 async fn reloadable_legacy_adapters_share_the_outcome_path() {
-    use rusternetes_api_server::{
+    use k3rs_api_server::{
         authorization_config::AuthorizationConfiguration,
         authorization_reload::{ChainBuilder, ReloadableAuthorizer},
     };

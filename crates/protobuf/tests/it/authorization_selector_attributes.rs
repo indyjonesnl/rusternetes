@@ -10,7 +10,7 @@
 //! ResourceAttributes: optional FieldSelectorAttributes fieldSelector = 8;
 //!                     optional LabelSelectorAttributes labelSelector = 9;
 //! ```
-use rusternetes_protobuf::ProtoRegistry;
+use k3rs_protobuf::ProtoRegistry;
 
 fn len_field(tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut v = vec![tag, payload.len() as u8];

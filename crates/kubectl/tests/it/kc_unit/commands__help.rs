@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::help::*;
+    use k3rs_kubectl::commands::help::*;
 
     #[derive(clap::Parser)]
     #[command(name = "test-cli")]

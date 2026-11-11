@@ -17,11 +17,11 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use k3rs_common::admission::Operation;
+use k3rs_common::Result;
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{LabelPair, Metric, MetricFamily, MetricType, Summary};
 use prometheus::{register, HistogramOpts, HistogramVec, IntCounterVec, Opts};
-use rusternetes_common::admission::Operation;
-use rusternetes_common::Result;
 
 const NAMESPACE: &str = "apiserver";
 const SUBSYSTEM: &str = "admission";
@@ -676,7 +676,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let rejected: Result<()> = with_controller_metrics("ctl-a", &op, STEP_VALIDATE, async {
-            Err(rusternetes_common::Error::Forbidden("no".into()))
+            Err(k3rs_common::Error::Forbidden("no".into()))
         })
         .await;
         assert!(rejected.is_err());

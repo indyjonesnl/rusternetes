@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
+use k3rs_common::feature_gates::{enabled, Feature};
 use prometheus::{IntCounterVec, Opts};
-use rusternetes_common::feature_gates::{enabled, Feature};
 
 /// `ImageGCPeriod` (`pkg/kubelet/kubelet.go:230`): how often `GarbageCollect` runs.
 pub const IMAGE_GC_PERIOD: Duration = Duration::from_secs(5 * 60);

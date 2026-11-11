@@ -2,15 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::field_selector::FieldSelector;
-    pub use rusternetes_common::label_selector::LabelSelector;
+    pub use k3rs_common::field_selector::FieldSelector;
+    pub use k3rs_common::label_selector::LabelSelector;
     pub use serde::Serialize;
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::filtering::*;
+    use k3rs_api_server::handlers::filtering::*;
 
     #[derive(Serialize)]
     struct TestResource {
@@ -185,14 +185,11 @@ mod tests {
             let mut resources: Vec<serde_json::Value> = Vec::new();
             let err = apply_label_selector(&mut resources, &params).unwrap_err();
             assert!(
-                matches!(&err, rusternetes_common::Error::BadRequest(m) if m.starts_with("unable to parse requirement: ")),
+                matches!(&err, k3rs_common::Error::BadRequest(m) if m.starts_with("unable to parse requirement: ")),
                 "{bad:?}: {err:?}"
             );
             let err = apply_selectors(&mut resources, &params).unwrap_err();
-            assert!(
-                matches!(err, rusternetes_common::Error::BadRequest(_)),
-                "{bad:?}"
-            );
+            assert!(matches!(err, k3rs_common::Error::BadRequest(_)), "{bad:?}");
         }
     }
 }

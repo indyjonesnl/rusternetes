@@ -12,7 +12,7 @@
 //!
 //! The limiter is `flowcontrol.NewTokenBucketRateLimiterWithClock`
 //! (`staging/src/k8s.io/client-go/util/flowcontrol/throttle.go`), backed here
-//! by [`rusternetes_common::event_correlator::TokenBucket`] (a port of
+//! by [`k3rs_common::event_correlator::TokenBucket`] (a port of
 //! `x/time/rate.Limiter.AllowN`), the same limiter the client-side event spam
 //! filter uses; the LRU is [`LruExpireCache`] with an entry TTL that never
 //! elapses, which is `k8s.io/utils/lru.Cache`.
@@ -21,11 +21,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::event_correlator::TokenBucket;
-use rusternetes_common::lru_expire_cache::LruExpireCache;
-use rusternetes_common::resources::Event;
-use rusternetes_common::validation::field;
-use rusternetes_common::Error;
+use k3rs_common::event_correlator::TokenBucket;
+use k3rs_common::lru_expire_cache::LruExpireCache;
+use k3rs_common::resources::Event;
+use k3rs_common::validation::field;
+use k3rs_common::Error;
 use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_NAME: &str = "EventRateLimit";

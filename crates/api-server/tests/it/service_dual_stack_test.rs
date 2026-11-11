@@ -5,7 +5,7 @@
 //! service/storage/alloc.go:340-451, 699-752) allocate and release per family.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SVCS: &str = "/api/v1/namespaces/default/services";

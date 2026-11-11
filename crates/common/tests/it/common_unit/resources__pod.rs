@@ -2,15 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
     pub use serde::{Deserialize, Deserializer, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::*;
+    use k3rs_common::resources::pod::*;
 
     /// #2453/#2454: Go's struct holds several states at once and encodes
     /// them all back (core/v1/types.go:3300 `ContainerState`).
@@ -866,7 +866,7 @@ mod tests {
                         resource_name: "cpu".to_string(),
                         restart_policy: "NotRequired".to_string(),
                     }]),
-                    resources: Some(rusternetes_common::types::ResourceRequirements {
+                    resources: Some(k3rs_common::types::ResourceRequirements {
                         requests: Some({
                             let mut m = HashMap::new();
                             m.insert("cpu".to_string(), "500m".to_string());
@@ -971,7 +971,7 @@ mod tests {
                     started: Some(true),
                     allocated_resources: Some(alloc.clone()),
                     allocated_resources_status: None,
-                    resources: Some(rusternetes_common::types::ResourceRequirements {
+                    resources: Some(k3rs_common::types::ResourceRequirements {
                         requests: Some({
                             let mut m = HashMap::new();
                             m.insert("cpu".to_string(), "250m".to_string());
@@ -1288,7 +1288,7 @@ mod tests {
     /// and re-encode unchanged.
     #[test]
     fn volume_gce_and_ebs_sources_are_typed() {
-        use rusternetes_common::resources::volume::{
+        use k3rs_common::resources::volume::{
             AWSElasticBlockStoreVolumeSource, GCEPersistentDiskVolumeSource,
         };
         let src = serde_json::json!({

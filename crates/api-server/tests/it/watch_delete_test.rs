@@ -6,7 +6,7 @@
 //! "should complete a service status lifecycle" where the watcher must see
 //! the DELETED event after a service is deleted.
 
-use rusternetes_api_server::handlers::watch::{build_delete_fallback_json, extract_rv_from_json};
+use k3rs_api_server::handlers::watch::{build_delete_fallback_json, extract_rv_from_json};
 
 /// Test that extract_rv_from_json extracts resourceVersion from valid JSON.
 #[test]

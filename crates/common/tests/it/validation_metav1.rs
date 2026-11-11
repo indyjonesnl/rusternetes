@@ -1,11 +1,11 @@
-//! Mirror of upstream `metav1` validation tests for `rusternetes-common`.
+//! Mirror of upstream `metav1` validation tests for `k3rs-common`.
 //!
 //! Source (release-1.35): <https://github.com/kubernetes/kubernetes/blob/release-1.35/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/validation/validation_test.go>
 //!
 //! Each `#[test]` mirrors one `func Test*` from the upstream Go file and
 //! keeps the original name so the table of contents lines up 1:1. The
-//! validator entry points live in `rusternetes_common::validation::metav1`
-//! and the field-path / error types in `rusternetes_common::validation::field`.
+//! validator entry points live in `k3rs_common::validation::metav1`
+//! and the field-path / error types in `k3rs_common::validation::field`.
 //!
 //! Originally landed RED (see PR #168). Flipped GREEN once the validators
 //! arrived under `crates/common/src/validation/`.
@@ -20,17 +20,17 @@
 
 use std::collections::HashMap;
 
-use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-use rusternetes_common::types::{
+use k3rs_common::deletion::{DeleteOptions, Preconditions};
+use k3rs_common::types::{
     Condition, DeletionPropagation, LabelSelector, LabelSelectorRequirement, ManagedFieldsEntry,
 };
-use rusternetes_common::validation::field::Path;
-use rusternetes_common::validation::metav1::{
+use k3rs_common::validation::field::Path;
+use k3rs_common::validation::metav1::{
     validate_conditions, validate_delete_options, validate_dry_run, validate_field_manager,
     validate_label_selector, validate_labels, validate_managed_fields, validate_patch_options,
     LabelSelectorValidationOptions, PatchOptions, APPLY_CBOR_PATCH_TYPE, APPLY_YAML_PATCH_TYPE,
 };
-use rusternetes_common::validation::metav1::{
+use k3rs_common::validation::metav1::{
     validate_create_options, validate_update_options, CreateOptions, UpdateOptions,
 };
 

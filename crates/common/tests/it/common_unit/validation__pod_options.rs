@@ -2,20 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::quota::{
-        is_hugepage_resource_name, is_hugepage_resource_value_divisible,
-    };
-    pub use rusternetes_common::resources::pod::{EnvFromSource, EnvVar, PodSpec};
-    pub use rusternetes_common::resources::workloads::PodTemplateSpec;
-    pub use rusternetes_common::types::LabelSelector;
-    pub use rusternetes_common::validation::field::Path;
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::feature_gates::{enabled, Feature};
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::quota::{is_hugepage_resource_name, is_hugepage_resource_value_divisible};
+    pub use k3rs_common::resources::pod::{EnvFromSource, EnvVar, PodSpec};
+    pub use k3rs_common::resources::workloads::PodTemplateSpec;
+    pub use k3rs_common::types::LabelSelector;
+    pub use k3rs_common::validation::field::Path;
+    pub use k3rs_common::validation::metav1::{
         is_env_var_name, is_relaxed_env_var_name, is_valid_label_value, validate_label_selector,
         LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::pod::{
+    pub use k3rs_common::validation::pod::{
         allow_taint_toleration_comparison_operators, get_sysctl_namespace,
         validate_local_non_reserved_path, validate_match_label_keys,
         validate_match_label_keys_and_mismatch_label_keys, validate_pod_affinity_term_selector,
@@ -26,7 +24,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::pod_options::*;
+    use k3rs_common::validation::pod_options::*;
     use serde_json::json;
 
     fn spec(v: serde_json::Value) -> PodSpec {
@@ -91,11 +89,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn env_options_from_old_spec_when_gates_off() {
-        let _a = rusternetes_common::feature_gates::with_feature(
+        let _a = k3rs_common::feature_gates::with_feature(
             Feature::RelaxedEnvironmentVariableValidation,
             false,
         );
-        let _b = rusternetes_common::feature_gates::with_feature(Feature::EnvFiles, false);
+        let _b = k3rs_common::feature_gates::with_feature(Feature::EnvFiles, false);
         let with_env = |env: serde_json::Value| {
             spec(json!({"containers": [{"name": "c", "image": "i", "env": env}]}))
         };
@@ -197,7 +195,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn allow_pod_lifecycle_sleep_action_zero_value_option() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let g = with_feature(Feature::PodLifecycleSleepActionAllowZero, true);
         let cases = [
             spec(json!({})),
@@ -248,15 +246,11 @@ mod tests {
     }
 
     fn host_users_errors(spec: &PodSpec, opts: &PodValidationOptions) -> Vec<String> {
-        rusternetes_common::validation::pod::validate_pod_spec_with_options(
-            spec,
-            &Path::new("spec"),
-            opts,
-        )
-        .iter()
-        .map(|e| e.to_string())
-        .filter(|e| e.contains("`hostUsers` is false"))
-        .collect()
+        k3rs_common::validation::pod::validate_pod_spec_with_options(spec, &Path::new("spec"), opts)
+            .iter()
+            .map(|e| e.to_string())
+            .filter(|e| e.contains("`hostUsers` is false"))
+            .collect()
     }
 
     fn vol_dev(key: &str) -> serde_json::Value {
@@ -395,7 +389,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn user_namespaces_host_network_support_gate() {
-        let _g = rusternetes_common::feature_gates::with_feature(
+        let _g = k3rs_common::feature_gates::with_feature(
             Feature::UserNamespacesHostNetworkSupport,
             true,
         );
@@ -478,7 +472,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn allow_sidecar_resize_policy_option() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let rp = json!([{"resourceName": "cpu", "restartPolicy": "NotRequired"}]);
         let side = |rp: &serde_json::Value| json!({"name": "s", "image": "i", "restartPolicy": "Always", "resizePolicy": rp});
         let plain = |rp: &serde_json::Value| json!({"name": "p", "image": "i", "resizePolicy": rp});
@@ -517,7 +511,7 @@ mod tests {
     /// resizePolicy is `Invalid`; with it on, no error from this rule.
     #[test]
     fn sidecar_resize_policy_rule() {
-        use rusternetes_common::validation::pod::validate_pod_spec_with_options;
+        use k3rs_common::validation::pod::validate_pod_spec_with_options;
         let s = init_spec(
             json!([{"name": "s", "image": "i", "restartPolicy": "Always",
             "terminationMessagePolicy": "File", "imagePullPolicy": "Always",
@@ -546,7 +540,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_level_resources_options_follow_gates() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         for gate in [true, false] {
             let _a = with_feature(Feature::PodLevelResources, gate);
             let _b = with_feature(Feature::InPlacePodLevelResourcesVerticalScaling, gate);
@@ -566,7 +560,7 @@ mod tests {
     /// `PodLevelResourcesEnabled`.
     #[test]
     fn pod_level_resources_rule_is_gated() {
-        use rusternetes_common::validation::pod::validate_pod_spec_with_options;
+        use k3rs_common::validation::pod::validate_pod_spec_with_options;
         let s = spec(json!({
             "containers": [{"name": "c", "image": "i",
                 "terminationMessagePolicy": "File", "imagePullPolicy": "Always"}],
@@ -594,7 +588,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn allow_only_recursive_se_linux_change_policy_option() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let g = with_feature(Feature::SELinuxMount, true);
         assert!(!opts(None).allow_only_recursive_se_linux_change_policy);
         assert!(!opts(Some(&spec(json!({})))).allow_only_recursive_se_linux_change_policy);
@@ -617,7 +611,7 @@ mod tests {
     /// `TestValidateSELinuxChangePolicy` cases (validation_test.go:27884).
     #[test]
     fn se_linux_change_policy_rule() {
-        use rusternetes_common::validation::pod::validate_pod_spec_with_options;
+        use k3rs_common::validation::pod::validate_pod_spec_with_options;
         let errs = |policy: &str, only_recursive: bool| -> Vec<String> {
             let o = PodValidationOptions {
                 allow_only_recursive_se_linux_change_policy: only_recursive,

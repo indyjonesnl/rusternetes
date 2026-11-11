@@ -1,7 +1,7 @@
 //! Cases ported from pkg/proxy/healthcheck/healthcheck_test.go:474-943.
 use axum::{body::Body, http::Request};
-use rusternetes_common::resources::Node;
-use rusternetes_kube_proxy::serve_metrics::ProxyHealthServer;
+use k3rs_common::resources::Node;
+use k3rs_kube_proxy::serve_metrics::ProxyHealthServer;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tower::ServiceExt;

@@ -5,7 +5,7 @@
 //! pod should be possible to delete [NodeConformance] [Conformance]`
 //! (test/e2e/common/node/kubelet.go:135) issues a plain
 //! `podClient.Delete(name, metav1.DeleteOptions{})` — no preconditions, no
-//! resourceVersion — and fails the spec on ANY error. Against rusternetes it
+//! resourceVersion — and fails the spec on ANY error. Against k3rs it
 //! got (run 33078268480, 2026-08-27):
 //!
 //! ```text
@@ -32,8 +32,8 @@
 //! `MemoryStorage::inject_conflicts(n)` makes the next `n` `update()` calls
 //! return `Error::Conflict`, standing in for that concurrent writer.
 
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn pod(name: &str) -> Value {

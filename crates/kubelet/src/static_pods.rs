@@ -6,7 +6,7 @@
 //! pkg/kubelet/types/pod_update.go (config annotations).
 
 use anyhow::{bail, Context, Result};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
@@ -100,10 +100,10 @@ fn finish_decoded_pod(mut pod: Pod, file_name: &str) -> Result<Pod> {
     // defaulted spec, exactly as upstream hashes the decoded-and-defaulted pod:
     // the manifest's own bytes are not the identity, the effective spec is.
     if let Some(spec) = pod.spec.as_mut() {
-        rusternetes_common::defaults::default_pod_requests_from_limits(spec);
+        k3rs_common::defaults::default_pod_requests_from_limits(spec);
         // `SetDefaults_*VolumeSource` defaultMode (the kubelet's downwardAPI
         // `CollectData` errors on nil).
-        rusternetes_common::defaults::default_volume_source_modes(spec);
+        k3rs_common::defaults::default_volume_source_modes(spec);
     }
 
     Ok(pod)
@@ -236,7 +236,7 @@ pub fn load_static_pods(dir: &Path, node_name: &str) -> Vec<Pod> {
     pods
 }
 
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_storage::{build_key, build_prefix, Storage};
 
 /// Project `desired` static pods into storage as mirror pods and delete
 /// stale mirrors for this node. Never touches non-mirror pods.

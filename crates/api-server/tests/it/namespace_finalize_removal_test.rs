@@ -13,7 +13,7 @@
 //! release-1.35): `ShouldDeleteNamespaceDuringUpdate` =
 //! `len(ns.Spec.Finalizers) == 0 && genericregistry.ShouldDeleteDuringUpdate(...)`
 //! — the object is removed on the finalize/update path once finalizers drain
-//! and `DeletionTimestamp` is set. rusternetes keeps the namespace lifecycle
+//! and `DeletionTimestamp` is set. k3rs keeps the namespace lifecycle
 //! finalizer in `spec.finalizers` (matching upstream
 //! `namespaceStrategy.PrepareForCreate`; the namespace controller's
 //! `finalized()` check reads `spec.Finalizers`), so this mirror checks the
@@ -25,10 +25,10 @@
 //! (not just the backend) is exercised.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
-// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// Harness: `TestApiServer` (k3rs-test-support) — `build_router` on
 // `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 
 /// DELETE marks the namespace Terminating and keeps it (the `kubernetes`

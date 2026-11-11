@@ -6,10 +6,10 @@
 use std::process::Command;
 
 fn help() -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_rusternetes"))
+    let out = Command::new(env!("CARGO_BIN_EXE_k3rs"))
         .arg("--help")
         .output()
-        .expect("spawn rusternetes binary");
+        .expect("spawn k3rs binary");
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -31,9 +31,9 @@ fn help_lists_the_flags_with_upstream_defaults() {
 
 #[test]
 fn rejects_a_non_numeric_qps() {
-    let out = Command::new(env!("CARGO_BIN_EXE_rusternetes"))
+    let out = Command::new(env!("CARGO_BIN_EXE_k3rs"))
         .arg("--kube-api-qps=fast")
         .output()
-        .expect("spawn rusternetes binary");
+        .expect("spawn k3rs binary");
     assert!(!out.status.success());
 }

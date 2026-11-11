@@ -3,15 +3,15 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::node_authorizer::{NodeAuthorizer, NodeAuthorizerFeatures};
-    pub use rusternetes_common::authz::reasons::{
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::node_authorizer::{NodeAuthorizer, NodeAuthorizerFeatures};
+    pub use k3rs_common::authz::reasons::{
         aggregate_errors, applicable_subject, describe_subject, quoted,
     };
-    pub use rusternetes_common::error::Result;
-    pub use rusternetes_common::field_selector::{FieldRequirement, FieldSelector};
-    pub use rusternetes_common::label_selector::{LabelRequirement, LabelSelector};
-    pub use rusternetes_common::resources::rbac::{
+    pub use k3rs_common::error::Result;
+    pub use k3rs_common::field_selector::{FieldRequirement, FieldSelector};
+    pub use k3rs_common::label_selector::{LabelRequirement, LabelSelector};
+    pub use k3rs_common::resources::rbac::{
         ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, Subject,
     };
     pub use serde::de::DeserializeOwned;
@@ -20,7 +20,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::authz::*;
+    use k3rs_common::authz::*;
 
     fn selector_attrs(field: &str, label: &str) -> RequestAttributes {
         let mut a = RequestAttributes::new(
@@ -110,7 +110,7 @@ mod tests {
         where
             T: DeserializeOwned + Send + Sync,
         {
-            Err(rusternetes_common::error::Error::NotFound(key.to_string()))
+            Err(k3rs_common::error::Error::NotFound(key.to_string()))
         }
         async fn list<T>(&self, _ns: Option<&str>) -> Result<Vec<T>>
         where
@@ -123,7 +123,7 @@ mod tests {
     /// A kubelet's own pod watch, verbatim: cluster-scoped LIST of pods with a
     /// `spec.nodeName` field selector, as `system:node:<name>`.
     ///
-    /// A vanilla kind kubelet against a swapped rusternetes api-server was denied
+    /// A vanilla kind kubelet against a swapped k3rs api-server was denied
     /// this and therefore never started a single pod:
     ///
     ///   Failed to watch: failed to list *v1.Pod: Node vs-apisrv-dbg-worker is not
@@ -192,7 +192,7 @@ mod tests {
 
     /// Upstream NodeRules grants pods create/delete outright and constrains them
     /// in NodeRestriction admission instead (policy.go:215-217). This asserted
-    /// the opposite while rusternetes had no such plugin (#1721); it does now
+    /// the opposite while k3rs had no such plugin (#1721); it does now
     /// (api-server `handlers::node_restriction`), which is what lets a kubelet
     /// delete the mirror pod of a static pod (#1906).
     #[tokio::test]
@@ -340,8 +340,8 @@ mod tests {
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-            Ok(rusternetes_common::authz::UserRulesOutcome::default())
+        ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+            Ok(k3rs_common::authz::UserRulesOutcome::default())
         }
     }
 
@@ -418,8 +418,8 @@ mod tests {
     }
 
     struct RulesMock(
-        Vec<rusternetes_common::resources::ResourceRule>,
-        Vec<rusternetes_common::resources::NonResourceRule>,
+        Vec<k3rs_common::resources::ResourceRule>,
+        Vec<k3rs_common::resources::NonResourceRule>,
     );
 
     #[async_trait]
@@ -431,8 +431,8 @@ mod tests {
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-            Ok(rusternetes_common::authz::UserRulesOutcome {
+        ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+            Ok(k3rs_common::authz::UserRulesOutcome {
                 resource_rules: self.0.clone(),
                 non_resource_rules: self.1.clone(),
                 ..Default::default()
@@ -445,7 +445,7 @@ mod tests {
     /// `unionAuthzRulesHandler.RulesFor` concatenates rules in order.
     #[tokio::test]
     async fn union_rules_concatenate_in_order() {
-        use rusternetes_common::resources::{NonResourceRule, ResourceRule};
+        use k3rs_common::resources::{NonResourceRule, ResourceRule};
         let s = |v: &[&str]| Some(v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         let rr = |verbs: &[&str], res: &[&str], names: Option<&[&str]>| ResourceRule {
             verbs: verbs.iter().map(|x| x.to_string()).collect(),
@@ -496,8 +496,8 @@ mod tests {
     /// does not hide the rules of the others.
     #[tokio::test]
     async fn union_rules_outcome_aggregates_errors_and_incomplete() {
-        use rusternetes_common::authz::UserRulesOutcome;
-        use rusternetes_common::resources::ResourceRule;
+        use k3rs_common::authz::UserRulesOutcome;
+        use k3rs_common::resources::ResourceRule;
         struct Outcome(UserRulesOutcome);
         #[async_trait]
         impl Authorizer for Outcome {
@@ -567,11 +567,9 @@ mod tests {
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-                Ok(rusternetes_common::authz::UserRulesOutcome {
-                    error: Some(
-                        rusternetes_common::Error::Internal("list failed".into()).to_string(),
-                    ),
+            ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+                Ok(k3rs_common::authz::UserRulesOutcome {
+                    error: Some(k3rs_common::Error::Internal("list failed".into()).to_string()),
                     ..Default::default()
                 })
             }
@@ -680,14 +678,12 @@ mod allow_reason_tests {
     //! Cases from rbac/rbac_test.go:147-269, validation/rule_test.go (appliesTo),
     //! authorization/union/union_test.go, with reason text asserted from the sources.
     use super::__parent::*;
-    use rusternetes_common::authz::*;
-    use rusternetes_common::resources::rbac::RoleRef;
+    use k3rs_common::authz::*;
+    use k3rs_common::resources::rbac::RoleRef;
     use serde::Serialize;
 
     fn node_authorizer() -> NodeAuthorizer {
-        NodeAuthorizer::new(Arc::new(
-            rusternetes_common::authz::node_graph::NodeGraph::new(),
-        ))
+        NodeAuthorizer::new(Arc::new(k3rs_common::authz::node_graph::NodeGraph::new()))
     }
 
     #[derive(Default)]
@@ -727,7 +723,7 @@ mod allow_reason_tests {
                 }
                 _ => panic!("unexpected kind {kind}"),
             }
-            Err(rusternetes_common::Error::NotFound(format!(
+            Err(k3rs_common::Error::NotFound(format!(
                 "missing {kind} {key}"
             )))
         }
@@ -738,7 +734,7 @@ mod allow_reason_tests {
             match std::any::type_name::<T>().rsplit("::").next().unwrap() {
                 "RoleBinding" => {
                     if let Some(error) = &self.role_list_error {
-                        return Err(rusternetes_common::Error::Authorization(error.clone()));
+                        return Err(k3rs_common::Error::Authorization(error.clone()));
                     }
                     convert(
                         self.bindings
@@ -749,7 +745,7 @@ mod allow_reason_tests {
                 }
                 "ClusterRoleBinding" => {
                     if let Some(error) = &self.cluster_list_error {
-                        return Err(rusternetes_common::Error::Authorization(error.clone()));
+                        return Err(k3rs_common::Error::Authorization(error.clone()));
                     }
                     convert(&self.cluster_bindings)
                 }
@@ -906,8 +902,8 @@ mod allow_reason_tests {
             &self,
             _: &UserInfo,
             _: &str,
-        ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-            Ok(rusternetes_common::authz::UserRulesOutcome::default())
+        ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+            Ok(k3rs_common::authz::UserRulesOutcome::default())
         }
     }
 

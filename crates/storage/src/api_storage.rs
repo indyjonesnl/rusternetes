@@ -14,7 +14,7 @@
 //! - `update_status` → PUT to the `/status` subresource (grafted onto a fresh
 //!   GET so a stale caller cannot clobber spec, mirroring the storage impl);
 //! - `watch` → the api-server's `?watch=true` JSON-lines stream, re-keyed to
-//!   the `/registry/...` form [`rusternetes_storage::extract_key`] expects, and
+//!   the `/registry/...` form [`k3rs_storage::extract_key`] expects, and
 //!   **shared**: all controllers watching the same resource type fan out from a
 //!   single upstream connection via a broadcast (#1138).
 //!
@@ -42,13 +42,13 @@
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use futures::StreamExt;
-use rusternetes_client::api_status::{
+use k3rs_client::api_status::{
     is_already_exists, is_bad_request, is_conflict, is_forbidden, is_gone, is_invalid,
     is_not_found, is_resource_expired, is_unsupported_media_type,
 };
-use rusternetes_client::http::{ApiClient, GetError, KubernetesList};
-use rusternetes_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
-use rusternetes_common::{Error, Result};
+use k3rs_client::http::{ApiClient, GetError, KubernetesList};
+use k3rs_client::watch::{watch_stream, WatchEvent as ClientWatchEvent};
+use k3rs_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

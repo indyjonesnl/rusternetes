@@ -1,20 +1,20 @@
-# Static-pod swap recipe: kube-apiserver -> rusternetes api-server.
+# Static-pod swap recipe: kube-apiserver -> k3rs api-server.
 #
 # Same mechanism as scheduler-patch.yaml / controller-manager-patch.yaml: when a
 # recipe carries a `template:` block, vs_swap_static_pod() renders it (VS_IMAGE)
 # and writes it over /etc/kubernetes/manifests/kube-apiserver.yaml inside the
 # control-plane node, so the node kubelet restarts that one static pod as the
-# rusternetes api-server. Everything else in the control plane stays vanilla.
+# k3rs api-server. Everything else in the control plane stays vanilla.
 #
 # A template (not the image-only rewrite) is REQUIRED here: the vanilla static
 # pod's `command:` is `[kube-apiserver, --<28 kubeadm flags>]`, but a pod
-# `command:` overrides the image ENTRYPOINT and the rusternetes image ships
+# `command:` overrides the image ENTRYPOINT and the k3rs image ships
 # `/app/api-server` (not `kube-apiserver`) — so the image-rewrite path fails with
-# `exec: "kube-apiserver": executable file not found`. The rusternetes api-server
+# `exec: "kube-apiserver": executable file not found`. The k3rs api-server
 # also parses flags with clap (rejects unknown flags), so it cannot inherit
 # kubeadm's flag set; the template passes ONLY the flags it supports.
 #
-# The rusternetes api-server authenticates in-cluster clients (kubelet,
+# The k3rs api-server authenticates in-cluster clients (kubelet,
 # kube-proxy, kubectl) by x509 client cert against kubeadm's cluster CA
 # (--client-ca-file) and serves TLS with kubeadm's apiserver serving cert.
 #
@@ -24,7 +24,7 @@
 #     vanilla kubelet/scheduler/CM/kube-proxy must re-register against it, and
 #     the api-server's bootstrap seeds the `kubernetes` Service + default RBAC.
 #     REQUIRES the image be built with `--features sqlite` (the default
-#     `cargo build -p rusternetes-api-server` is etcd-only and silently ignores
+#     `cargo build -p k3rs-api-server` is etcd-only and silently ignores
 #     `--storage-backend=sqlite`).
 #   * ServiceAccount tokens: the api-server verifies HS256 (--jwt-secret), not
 #     the RS256 tokens kubeadm's signer issued (no --service-account-key-file
@@ -40,7 +40,7 @@ template: |
     labels:
       component: kube-apiserver
       tier: control-plane
-      rusternetes.io/module-under-test: api-server
+      k3rs.io/module-under-test: api-server
   spec:
     hostNetwork: true
     priorityClassName: system-node-critical
@@ -64,13 +64,13 @@ template: |
           # Default is AlwaysAllow like upstream (#3266); kubeadm passes this.
           - "--authorization-mode=Node,RBAC"
           - "--storage-backend=sqlite"
-          - "--data-dir=/tmp/rusternetes/api-server.db"
+          - "--data-dir=/tmp/k3rs/api-server.db"
         volumeMounts:
           - name: pki
             mountPath: /etc/kubernetes/pki
             readOnly: true
           - name: data
-            mountPath: /tmp/rusternetes
+            mountPath: /tmp/k3rs
     volumes:
       - name: pki
         hostPath:

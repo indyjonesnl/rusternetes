@@ -8,8 +8,8 @@
 //! plugin/pkg/admission/certificates/ctbattest/admission{,_test}.go.
 
 use axum::http::StatusCode;
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CTB: &str = "/apis/certificates.k8s.io/v1beta1/clustertrustbundles";
@@ -271,19 +271,19 @@ async fn list_filters_on_signer_name_field_and_labels() {
 
 mod attest {
     use super::*;
-    use rusternetes_common::{
+    use k3rs_common::{
         resources::{
             ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, ServiceAccount, Subject,
         },
         types::{ObjectMeta, TypeMeta},
     };
-    use rusternetes_storage::{build_key, Storage};
+    use k3rs_storage::{build_key, Storage};
 
     const SECRET: &[u8] = b"ctb-attest-secret";
 
     fn token(uid: &str) -> String {
         let now = chrono::Utc::now();
-        let claims = rusternetes_common::auth::ServiceAccountClaims {
+        let claims = k3rs_common::auth::ServiceAccountClaims {
             sub: "system:serviceaccount:kube-system:ctb-user".to_string(),
             namespace: "kube-system".to_string(),
             uid: uid.to_string(),
@@ -291,9 +291,9 @@ mod attest {
             exp: (now + chrono::Duration::hours(1)).timestamp(),
             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
             aud: vec!["https://kubernetes.default.svc".to_string()],
-            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+            kubernetes: Some(k3rs_common::auth::KubernetesClaims {
                 namespace: "kube-system".to_string(),
-                svcacct: rusternetes_common::auth::KubeRef {
+                svcacct: k3rs_common::auth::KubeRef {
                     name: "ctb-user".to_string(),
                     uid: uid.to_string(),
                 },
@@ -308,7 +308,7 @@ mod attest {
             node_uid: None,
             jti: String::new(),
         };
-        rusternetes_common::auth::TokenManager::new(SECRET)
+        k3rs_common::auth::TokenManager::new(SECRET)
             .generate_token(claims)
             .unwrap()
     }
@@ -488,11 +488,8 @@ mod attest {
         let (api, token) = setup(vec![]).await;
         let c1 = pem("a", true);
         // Stored out of band, as a migration or a prior grant would leave it.
-        let obj = rusternetes_common::resources::ClusterTrustBundle::new(
-            "k8s.io:foo:a",
-            "k8s.io/foo",
-            &c1,
-        );
+        let obj =
+            k3rs_common::resources::ClusterTrustBundle::new("k8s.io:foo:a", "k8s.io/foo", &c1);
         api.storage
             .create(
                 &build_key("clustertrustbundles", None, "k8s.io:foo:a"),

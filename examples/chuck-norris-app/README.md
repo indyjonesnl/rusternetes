@@ -1,6 +1,6 @@
 # Chuck Norris Joke App
 
-A web application that serves random Chuck Norris jokes, deployed on Rūsternetes. Demonstrates:
+A web application that serves random Chuck Norris jokes, deployed on k3rs. Demonstrates:
 
 - **Deployment** with multiple replicas
 - **Service** with ClusterIP load balancing
@@ -10,7 +10,7 @@ A web application that serves random Chuck Norris jokes, deployed on Rūsternete
 ## Deploy
 
 ```bash
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 
 kubectl apply -f examples/chuck-norris-app/namespace.yaml
 kubectl apply -f examples/chuck-norris-app/configmap.yaml

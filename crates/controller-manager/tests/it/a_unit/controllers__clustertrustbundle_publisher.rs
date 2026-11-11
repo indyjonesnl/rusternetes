@@ -3,10 +3,10 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
+    pub use k3rs_common::resources::ClusterTrustBundle;
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use prometheus::{HistogramVec, IntCounterVec};
-    pub use rusternetes_common::resources::ClusterTrustBundle;
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
     pub use sha2::{Digest, Sha256};
     pub use std::sync::{Arc, LazyLock};
     pub use std::time::{Duration, Instant};
@@ -15,8 +15,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::clustertrustbundle_publisher::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::clustertrustbundle_publisher::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     const TEST_SIGNER: &str = "test.test/testSigner";
 
@@ -259,7 +259,7 @@ mod tests {
     /// before/after delta is exact even with the process-wide registry.
     #[test]
     fn sync_counter_records_the_api_status_code() {
-        use rusternetes_common::types::Status;
+        use k3rs_common::types::Status;
         let cases: Vec<(&str, Result<(), Error>, &str)> = vec![
             ("nil error", Ok(()), "200"),
             ("not found", Err(Error::NotFound("x".into())), "404"),
@@ -313,7 +313,7 @@ mod tests {
         s.inject_conflicts(1);
         let p = ClusterTrustBundlePublisher::new(s.clone(), TEST_SIGNER, &ca).unwrap();
 
-        let queue = rusternetes_storage::WorkQueue::new();
+        let queue = k3rs_storage::WorkQueue::new();
         queue.add(QUEUE_KEY.to_string()).await;
 
         // First pass: the injected conflict fails the sync.
@@ -336,7 +336,7 @@ mod tests {
     async fn worker_stops_when_the_queue_shuts_down() {
         let s = Arc::new(MemoryStorage::new());
         let p = ClusterTrustBundlePublisher::new(s, TEST_SIGNER, test_ca_pem()).unwrap();
-        let queue = rusternetes_storage::WorkQueue::new();
+        let queue = k3rs_storage::WorkQueue::new();
         queue.shutdown().await;
         assert!(!p.process_next_work_item(&queue).await);
     }
@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(QUEUE_NAME, "ca_cert_publisher_cluster_trust_bundles");
         let s = Arc::new(MemoryStorage::new());
         let p = ClusterTrustBundlePublisher::new(s, TEST_SIGNER, test_ca_pem()).unwrap();
-        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        let queue = k3rs_storage::WorkQueue::named(QUEUE_NAME);
         queue.add(QUEUE_KEY.to_string()).await;
         assert!(p.process_next_work_item(&queue).await);
 

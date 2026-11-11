@@ -9,20 +9,20 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
-use rusternetes_common::cel_mutation_types::{observe_expression, PolicyExpression};
-use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
-use rusternetes_common::resources::mutating_admission_policy::PatchType;
-use rusternetes_common::resources::MutatingAdmissionPolicy;
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::mutating_admission_policy::{
+use k3rs_common::authz::Authorizer;
+use k3rs_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+use k3rs_common::cel_mutation_types::{observe_expression, PolicyExpression};
+use k3rs_common::cel_versions::{self, EnvSet, EnvType};
+use k3rs_common::resources::mutating_admission_policy::PatchType;
+use k3rs_common::resources::MutatingAdmissionPolicy;
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::mutating_admission_policy::{
     find_mutating_policy_preexisting_expressions,
     ignore_mutating_admission_policy_match_conditions, set_defaults_mutating_admission_policy,
     validate_mutating_admission_policy, PreexistingExpressions,
 };
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_storage::StorageBackend;
 
 use super::authz::{authorize_mutating_param_kind, ParamAuthz};
 use crate::registry::generic::Store;
@@ -116,12 +116,12 @@ struct Policy<'a> {
 /// shape rules, and is not compiled.
 ///
 /// The environments are the three upstream builds, see
-/// [`rusternetes_common::cel_env`] for what of the cel-go checker the `cel`
+/// [`k3rs_common::cel_env`] for what of the cel-go checker the `cel`
 /// crate lets this port (declarations, `variables` fields, `Object` /
 /// `JSONPatch` type names, the output type of the unambiguous shapes) and what
 /// it does not (type inference). `environment.StoredExpressions`, which
 /// `preexistingExpressions` selects, gates library versions
-/// ([`rusternetes_common::cel_versions`]): see [`compile_error`].
+/// ([`k3rs_common::cel_versions`]): see [`compile_error`].
 fn compile_errors(
     obj: &MutatingAdmissionPolicy,
     ignore_match_conditions: bool,

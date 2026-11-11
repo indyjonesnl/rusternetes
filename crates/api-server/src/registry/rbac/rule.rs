@@ -5,12 +5,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::{
+use k3rs_common::auth::UserInfo;
+use k3rs_common::resources::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_key, build_prefix, Storage};
 
 use super::policy_compact::{compact_rules, compact_string, quote_strings};
 use super::policy_comparator::covers;

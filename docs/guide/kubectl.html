@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>kubectl Reference - Rūsternetes</title>
+  <title>kubectl Reference - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>kubectl Reference</h1>
       <p class="lead">
-        Comprehensive reference for all kubectl commands supported by Rūsternetes. Grouped by
+        Comprehensive reference for all kubectl commands supported by k3rs. Grouped by
         category with key flags and examples.
       </p>
 
@@ -115,7 +115,7 @@
           <tr><th>Flag</th><th>Description</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>--kubeconfig</code></td><td>Path to kubeconfig file. Default <code>~/.kube/config</code>. For Rusternetes: <code>~/.kube/rusternetes-config</code>.</td></tr>
+          <tr><td><code>--kubeconfig</code></td><td>Path to kubeconfig file. Default <code>~/.kube/config</code>. For k3rs: <code>~/.kube/k3rs-config</code>.</td></tr>
           <tr><td><code>--context</code></td><td>Kubeconfig context to use.</td></tr>
           <tr><td><code>--server</code> / <code>-s</code></td><td>API server URL (overrides kubeconfig).</td></tr>
           <tr><td><code>--token</code></td><td>Bearer token for authentication.</td></tr>
@@ -826,11 +826,11 @@ kubectl config view <span class="flag">--flatten</span>  <span class="comment">#
 <span class="comment"># Contexts</span>
 kubectl config current-context
 kubectl config get-contexts
-kubectl config use-context <span class="value">rusternetes</span>
+kubectl config use-context <span class="value">k3rs</span>
 
 <span class="comment"># Set values</span>
-kubectl config set <span class="value">current-context</span> <span class="value">rusternetes</span>
-kubectl config set-cluster <span class="value">rusternetes</span> <span class="flag">--server=</span><span class="value">https://localhost:6443</span>
+kubectl config set <span class="value">current-context</span> <span class="value">k3rs</span>
+kubectl config set-cluster <span class="value">k3rs</span> <span class="flag">--server=</span><span class="value">https://localhost:6443</span>
 kubectl config set-credentials <span class="value">admin</span> <span class="flag">--token=</span><span class="value">mytoken</span>
 
 <span class="comment"># Unset values</span>
@@ -1082,7 +1082,7 @@ kubectl get nodes <span class="flag">-o</span> <span class="value">jsonpath='{.i
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Node;
+    pub use k3rs_common::resources::Node;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::node_lifecycle_zone::*;
+    use k3rs_controller_manager::controllers::node_lifecycle_zone::*;
 
     fn cfg() -> EvictionConfig {
         EvictionConfig::default()
@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn zone_key_prefers_beta_labels_and_is_empty_without_topology() {
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
         let mut node = Node {
             type_meta: TypeMeta::default(),
             metadata: ObjectMeta::new("n"),

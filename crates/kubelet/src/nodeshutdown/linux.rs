@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use rusternetes_common::resources::ObjectReference;
+use k3rs_common::resources::ObjectReference;
 
 use super::storage::{timestamp, LocalStorage, State, Storage};
 use super::systemd::InhibitLock;
@@ -84,8 +84,8 @@ pub struct ManagerImpl {
 
 /// `NewManager` (:79-111).
 pub fn new_manager(conf: &Config) -> Arc<dyn Manager> {
-    if !rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::GracefulNodeShutdown,
+    if !k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::GracefulNodeShutdown,
     ) {
         return Arc::new(ManagerStub);
     }
@@ -106,8 +106,8 @@ pub fn new_manager(conf: &Config) -> Arc<dyn Manager> {
         dbus_con: Mutex::new(None),
         inhibit_lock: Mutex::new(InhibitLock(0)),
         node_shutting_down_now: Mutex::new(false),
-        enable_metrics: rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::GracefulNodeShutdownBasedOnPodPriority,
+        enable_metrics: k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::GracefulNodeShutdownBasedOnPodPriority,
         ),
         storage: Some(Box::new(LocalStorage {
             path: PathBuf::from(&conf.state_directory).join(LOCAL_STORAGE_STATE_FILE),
@@ -461,5 +461,5 @@ impl ManagerImpl {
 
 /// `time.Duration.String()` for whole-second-or-finer durations.
 fn go_duration(d: Duration) -> String {
-    rusternetes_common::go_duration::format_go_duration(d.as_nanos() as i64)
+    k3rs_common::go_duration::format_go_duration(d.as_nanos() as i64)
 }

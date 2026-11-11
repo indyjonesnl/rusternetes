@@ -1,6 +1,6 @@
-# Rusternetes Scripts
+# k3rs Scripts
 
-This directory contains scripts for development setup, production deployment, and testing of Rusternetes.
+This directory contains scripts for development setup, production deployment, and testing of k3rs.
 
 ## Script Categories
 
@@ -22,7 +22,7 @@ Automated development environment setup for macOS with Docker Desktop.
 - Installs Homebrew (if needed)
 - Installs Rust toolchain
 - Installs Docker Desktop
-- Builds Rusternetes binaries and images
+- Builds k3rs binaries and images
 - Creates helper scripts
 - Production-ready workflow
 
@@ -67,7 +67,7 @@ sudo ./scripts/installers/fedora-install.sh [--docker] [--ha]
 ```
 
 **Features:**
-- Installs to `/opt/rusternetes`
+- Installs to `/opt/k3rs`
 - Creates systemd service
 - Production-ready configuration
 

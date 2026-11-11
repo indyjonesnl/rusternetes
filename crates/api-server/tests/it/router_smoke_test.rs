@@ -8,7 +8,7 @@
 ///
 /// If either duplicate is reintroduced, `build_router` will panic and this
 /// test will fail with a panic message from axum.
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 #[tokio::test]
 async fn router_builds_without_duplicate_route_panic() {

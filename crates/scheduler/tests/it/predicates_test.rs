@@ -5,15 +5,15 @@
 //! - PodToleratesNodeTaints with `Exists` operator and empty value (TaintTolerationPlugin)
 //! - HostPort conflict avoidance (HostPortPlugin)
 
-use rusternetes_common::resources::node::{NodeSpec, NodeStatus, Taint};
-use rusternetes_common::resources::pod::{
+use k3rs_common::resources::node::{NodeSpec, NodeStatus, Taint};
+use k3rs_common::resources::pod::{
     Affinity, Container, ContainerPort, NodeAffinity, NodeSelector, NodeSelectorRequirement,
     NodeSelectorTerm, PodSpec, PodStatus, Toleration,
 };
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_common::types::Phase;
-use rusternetes_scheduler::framework::{CycleState, FilterPlugin, FrameworkHandle};
-use rusternetes_scheduler::plugins::{HostPortPlugin, NodeAffinityPlugin, TaintTolerationPlugin};
+use k3rs_common::resources::{Node, Pod};
+use k3rs_common::types::Phase;
+use k3rs_scheduler::framework::{CycleState, FilterPlugin, FrameworkHandle};
+use k3rs_scheduler::plugins::{HostPortPlugin, NodeAffinityPlugin, TaintTolerationPlugin};
 use std::collections::HashMap;
 
 // ---------- Helpers ----------

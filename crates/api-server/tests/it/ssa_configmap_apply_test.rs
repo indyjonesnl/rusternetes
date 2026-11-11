@@ -15,7 +15,7 @@
 //! bearer token is required.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn make_state() -> TestApiServer {

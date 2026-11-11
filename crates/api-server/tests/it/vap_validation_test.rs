@@ -14,7 +14,7 @@
 //! `validateValidatingAdmissionPolicyBindingSpec` (`:1181`) and
 //! `validateParamRef` (`:1198`).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const POLICIES: &str = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies";

@@ -1,11 +1,11 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CertificateSigningRequest, CertificateSigningRequestCondition, CertificateSigningRequestStatus,
     KeyUsage,
 };
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -73,7 +73,7 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("certificatesigningrequests", None);
+            let prefix = k3rs_storage::build_prefix("certificatesigningrequests", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -462,7 +462,7 @@ impl<S: Storage + 'static> CertificateSigningRequestController<S> {
     /// Validate CSR spec
     pub fn validate_csr_spec(
         &self,
-        spec: &rusternetes_common::resources::CertificateSigningRequestSpec,
+        spec: &k3rs_common::resources::CertificateSigningRequestSpec,
     ) -> Result<()> {
         // Validate request is present
         if spec.request.is_empty() {

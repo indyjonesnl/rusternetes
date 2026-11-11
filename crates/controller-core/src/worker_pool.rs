@@ -18,7 +18,7 @@
 //! The per-controller counts are the upstream `Concurrent*Syncs` defaults,
 //! cited at each constant.
 
-use rusternetes_storage::WorkQueue;
+use k3rs_storage::WorkQueue;
 use std::future::Future;
 
 /// Spawn `workers` tasks that each run `make_worker(queue.clone())`.

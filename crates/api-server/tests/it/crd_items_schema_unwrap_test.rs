@@ -4,7 +4,7 @@
 //! serialization). OpenAPI v2 expects "items" to be a direct schema object.
 //! The fix in ecb67b7 unwraps that wrapper inside strip_false_extensions.
 
-use rusternetes_api_server::handlers::openapi::strip_false_extensions;
+use k3rs_api_server::handlers::openapi::strip_false_extensions;
 
 /// Verify that items wrapped as {"schema": {...}} are unwrapped to the inner schema.
 /// This is the shape produced by Go's JSONSchemaPropsOrArray serialization when a CRD

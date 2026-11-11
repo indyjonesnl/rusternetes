@@ -23,14 +23,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::dump::decode_request_body;
-use rusternetes_common::{
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::dump::decode_request_body;
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     resources::{Event, EventList, EventV1, EventV1List},
     Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -109,7 +109,7 @@ fn request_body(
         Err(e) => {
             return Err(decode_request_body::<EventV1>(body)
                 .err()
-                .unwrap_or_else(|| rusternetes_common::Error::BadRequest(e.to_string())))
+                .unwrap_or_else(|| k3rs_common::Error::BadRequest(e.to_string())))
         }
     };
     if let Some(api_version) = value
@@ -118,7 +118,7 @@ fn request_body(
         .filter(|v| !v.is_empty())
     {
         if api_version != "events.k8s.io/v1" {
-            return Err(rusternetes_common::Error::BadRequest(format!(
+            return Err(k3rs_common::Error::BadRequest(format!(
                 "the API version in the data ({api_version}) does not match the expected API version (events.k8s.io/v1)"
             )));
         }
@@ -129,13 +129,12 @@ fn request_body(
     // create.go:116-148 decodes into the versioned object first.
     let warnings = crate::handlers::validation::validate_strict_fields(params, body, &v1)?;
     let mut core = serde_json::to_value(v1.into_core())
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+        .map_err(|e| k3rs_common::Error::Internal(e.to_string()))?;
     // The scope's decode checks the body's apiVersion against the served one;
     // `convert_to_internal` stamps the stored (core) version back on.
     core["apiVersion"] = serde_json::json!("events.k8s.io/v1");
     let bytes = Bytes::from(
-        serde_json::to_vec(&core)
-            .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?,
+        serde_json::to_vec(&core).map_err(|e| k3rs_common::Error::Internal(e.to_string()))?,
     );
     Ok((bytes, warnings))
 }
@@ -162,7 +161,7 @@ async fn response(served: Served, response: Response) -> Result<Response> {
     let (mut parts, body) = response.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
-        .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+        .map_err(|e| k3rs_common::Error::Internal(e.to_string()))?;
     let converted = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(mut value) => match value.get("kind").and_then(|k| k.as_str()) {
             Some("Event") => Some(event::core_event_json_to_events_v1(&value)),
@@ -359,10 +358,10 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Event>(
             state,
@@ -385,7 +384,7 @@ pub async fn list(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -402,7 +401,7 @@ pub async fn list(
     Ok(crate::audit::json_response(EventList {
         api_version: "v1".to_string(),
         kind: "EventList".to_string(),
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items: events,
     })
     .into_response())
@@ -432,10 +431,10 @@ pub async fn list_all(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Event>(
             state,
@@ -455,7 +454,7 @@ pub async fn list_all(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -472,7 +471,7 @@ pub async fn list_all(
     Ok(crate::audit::json_response(EventList {
         api_version: "v1".to_string(),
         kind: "EventList".to_string(),
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items: events,
     })
     .into_response())
@@ -506,10 +505,10 @@ pub async fn list_events_v1(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         // The stored object is the core Event; the client asked for
         // `events.k8s.io/v1`. Convert every streamed object the way upstream's
@@ -540,7 +539,7 @@ pub async fn list_events_v1(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -557,7 +556,7 @@ pub async fn list_events_v1(
     Ok(crate::audit::json_response(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items: events.iter().map(Event::to_events_v1).collect(),
     })
     .into_response())
@@ -586,10 +585,10 @@ pub async fn list_all_events_v1(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Event>(
             state,
@@ -607,7 +606,7 @@ pub async fn list_all_events_v1(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -624,7 +623,7 @@ pub async fn list_all_events_v1(
     Ok(crate::audit::json_response(EventV1List {
         api_version: "events.k8s.io/v1".to_string(),
         kind: "EventList".to_string(),
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items: events.iter().map(Event::to_events_v1).collect(),
     })
     .into_response())

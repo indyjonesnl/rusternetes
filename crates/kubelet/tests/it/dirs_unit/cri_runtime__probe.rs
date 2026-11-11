@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::Container;
-    pub use rusternetes_common::resources::policy::IntOrString;
+    pub use k3rs_common::resources::pod::Container;
+    pub use k3rs_common::resources::policy::IntOrString;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::ContainerPort;
-    use rusternetes_kubelet::cri_runtime::probe::*;
+    use k3rs_common::resources::pod::ContainerPort;
+    use k3rs_kubelet::cri_runtime::probe::*;
 
     fn container_with_named_port() -> Container {
         Container {

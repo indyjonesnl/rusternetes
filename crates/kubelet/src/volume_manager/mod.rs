@@ -19,8 +19,8 @@ use crate::volume_plugins::plugin::VolumePlugin;
 use crate::volume_plugins::util::selinux::Translator;
 use crate::volume_plugins::util::types::UniquePodName;
 use crate::volume_plugins::VolumePluginMgr;
-use rusternetes_common::resources::Pod;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Pod;
+use k3rs_storage::StorageBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -256,8 +256,8 @@ impl VolumeManager {
         unattached.sort();
         let not_in_dsw = self.volumes_not_in_dsw(&pod_name, &expected);
 
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::MutableCSINodeAllocatableCount,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::MutableCSINodeAllocatableCount,
         ) {
             for volume_to_mount in &unattached_to_mount {
                 let spec = volume_to_mount.volume_spec.as_spec();

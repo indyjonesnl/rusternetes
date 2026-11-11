@@ -51,12 +51,12 @@
 //! impersonation is wired and exercised by
 //! `self_subject_review_reflects_the_impersonated_identity`.
 
-use rusternetes_common::{
+use k3rs_common::{
     resources::ServiceAccount,
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1588,7 +1588,7 @@ async fn token_request_audience_is_reflected_in_token_review() {
 /// pkg/serviceaccount/openidmetadata.go) instead of a hardcoded issuer.
 #[tokio::test]
 async fn oidc_discovery_reflects_configured_issuer_jwks_uri_and_keys_3684() {
-    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    use k3rs_common::auth::{ServiceAccountOptions, TokenManager};
     let fixtures = format!("{}/../common/tests/fixtures/sa", env!("CARGO_MANIFEST_DIR"));
     let tm = TokenManager::new(b"oidc-secret")
         .with_service_account_options(&ServiceAccountOptions {
@@ -1624,7 +1624,7 @@ async fn oidc_discovery_reflects_configured_issuer_jwks_uri_and_keys_3684() {
 /// issuer without `--service-account-jwks-uri` advertises the external address.
 #[tokio::test]
 async fn oidc_discovery_endpoints_are_absent_when_the_provider_is_refused_3725() {
-    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    use k3rs_common::auth::{ServiceAccountOptions, TokenManager};
     let fixtures = format!("{}/../common/tests/fixtures/sa", env!("CARGO_MANIFEST_DIR"));
     let manager = |issuer: &str| {
         TokenManager::new(b"oidc-secret")

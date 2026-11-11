@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
-    pub use rusternetes_common::flagz::{self, NamedFlagSetsReader};
-    pub use rusternetes_common::statusz;
+    pub use k3rs_common::feature_gates::{enabled, Feature};
+    pub use k3rs_common::flagz::{self, NamedFlagSetsReader};
+    pub use k3rs_common::statusz;
     pub use std::sync::OnceLock;
 }
 
@@ -12,8 +12,8 @@ mod tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_api_server::zpages::*;
-    use rusternetes_common::feature_gates::with_feature;
+    use k3rs_api_server::zpages::*;
+    use k3rs_common::feature_gates::with_feature;
     use serial_test::serial;
     use tower::ServiceExt;
 

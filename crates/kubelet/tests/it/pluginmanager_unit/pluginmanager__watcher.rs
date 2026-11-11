@@ -4,7 +4,7 @@
 mod __parent {
     pub use futures_util::StreamExt;
     pub use inotify::{Inotify, WatchDescriptor, WatchMask, Watches};
-    pub use rusternetes_kubelet::pluginmanager::cache::DesiredStateOfWorld;
+    pub use k3rs_kubelet::pluginmanager::cache::DesiredStateOfWorld;
     pub use std::collections::HashMap;
     pub use std::os::unix::fs::FileTypeExt;
     pub use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pluginmanager::watcher::*;
+    use k3rs_kubelet::pluginmanager::watcher::*;
     use std::os::unix::net::UnixListener;
     use std::time::Duration;
 

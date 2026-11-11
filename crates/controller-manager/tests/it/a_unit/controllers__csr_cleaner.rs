@@ -4,10 +4,10 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         CertificateSigningRequest, CertificateSigningRequestCondition,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tracing::{error, info};
@@ -15,10 +15,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::CertificateSigningRequestStatus;
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::csr_cleaner::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::CertificateSigningRequestStatus;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::csr_cleaner::*;
+    use k3rs_storage::MemoryStorage;
 
     // Verbatim from cleaner_test.go:34-65.
     const EXPIRED_CERT: &str = "-----BEGIN CERTIFICATE-----

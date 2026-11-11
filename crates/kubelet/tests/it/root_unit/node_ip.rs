@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::node_ip::*;
+    use k3rs_kubelet::node_ip::*;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -68,7 +68,7 @@ mod tests {
     // pkg/util/node/node_test.go TestGetNodeHostIPs
     #[test]
     fn get_node_host_ips_cases() {
-        let a = |t: &str, v: &str| rusternetes_common::resources::NodeAddress {
+        let a = |t: &str, v: &str| k3rs_common::resources::NodeAddress {
             address_type: t.to_string(),
             address: v.to_string(),
         };
@@ -405,7 +405,7 @@ mod tests {
 
     // ---- setters_test.go TestNodeAddress (cloud-provider cases) ----
 
-    type TestNode = rusternetes_common::resources::Node;
+    type TestNode = k3rs_common::resources::Node;
 
     fn setter_node(annotations: Option<&[(&str, &str)]>, existing: Option<&str>) -> TestNode {
         let mut n = TestNode::new("test-node");
@@ -416,7 +416,7 @@ mod tests {
         });
         let status = n.status.get_or_insert_with(Default::default);
         status.addresses = Some(match existing {
-            Some(a) => vec![rusternetes_common::resources::NodeAddress {
+            Some(a) => vec![k3rs_common::resources::NodeAddress {
                 address_type: String::new(),
                 address: a.to_string(),
             }],
@@ -644,11 +644,11 @@ mod tests {
         assert!(addrs_of(&n).is_empty());
     }
 
-    fn status() -> rusternetes_common::resources::pod::PodStatus {
+    fn status() -> k3rs_common::resources::pod::PodStatus {
         Default::default()
     }
 
-    fn pod_ips(s: &rusternetes_common::resources::pod::PodStatus) -> Vec<String> {
+    fn pod_ips(s: &k3rs_common::resources::pod::PodStatus) -> Vec<String> {
         s.pod_i_ps
             .clone()
             .unwrap_or_default()
@@ -660,7 +660,7 @@ mod tests {
     // kubelet_pods_test.go TestGenerateAPIPodStatusHostNetworkPodIPs
     #[test]
     fn host_network_pod_ips_inherit_node_ips() {
-        use rusternetes_common::resources::pod::PodIP;
+        use k3rs_common::resources::pod::PodIP;
         // (node host IPs, CRI pod IPs, expected PodIPs)
         let cases: Vec<(Vec<&str>, Vec<&str>, Vec<&str>)> = vec![
             (vec!["10.0.0.1"], vec![], vec!["10.0.0.1"]),
@@ -707,7 +707,7 @@ mod tests {
     // pod IPs are immutable once set; only the secondary is added (#105320)
     #[test]
     fn host_network_pod_ips_immutable_but_gain_secondary() {
-        use rusternetes_common::resources::pod::PodIP;
+        use k3rs_common::resources::pod::PodIP;
         let mut s = status();
         s.pod_ip = Some("10.0.0.1".into());
         s.pod_i_ps = Some(vec![PodIP {

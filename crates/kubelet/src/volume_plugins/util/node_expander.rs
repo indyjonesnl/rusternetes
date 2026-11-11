@@ -27,12 +27,12 @@ use crate::volume_plugins::util::types::{
     is_operation_not_supported_error, NODE_EXPANSION_NOT_REQUIRED,
 };
 use anyhow::{anyhow, Error};
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::volume::{
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::volume::{
     PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeClaim,
 };
-use rusternetes_common::resources::{EventSource, EventType, ObjectReference};
-use rusternetes_storage::{EventRecorder, Storage};
+use k3rs_common::resources::{EventSource, EventType, ObjectReference};
+use k3rs_storage::{EventRecorder, Storage};
 use tracing::{debug, error, info};
 
 /// Port of `nodeResizeOperationOpts` (`operation_generator.go:152-159`).

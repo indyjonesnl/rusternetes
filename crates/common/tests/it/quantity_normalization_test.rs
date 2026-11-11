@@ -11,7 +11,7 @@
 //! always producing `"0"` for the zero value regardless of the suffix
 //! used on input.
 //!
-//! Rusternetes now ships a [`Quantity`] newtype that mirrors that
+//! k3rs now ships a [`Quantity`] newtype that mirrors that
 //! behaviour exactly. The tests below exercise the parser and
 //! canonical encoder directly. Pod-routed cases stay because the
 //! decode path (`deserialize_quantity_map`) shares the same parser
@@ -33,8 +33,8 @@
 //!   k8s.io/apimachinery/pkg/api/resource/quantity_test.go
 //!   TestQuantityParse, TestQuantityCanonicalize, TestQuantityRoundTrip
 
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::Pod;
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::Pod;
 use serde_json::{json, Value};
 
 // ---- helpers ---------------------------------------------------------

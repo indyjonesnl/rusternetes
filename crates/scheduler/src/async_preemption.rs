@@ -26,7 +26,7 @@
 
 use crate::fwk::{Code, Status};
 use crate::queue::scheduling_queue::PreEnqueuePlugin;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -180,5 +180,5 @@ impl PreEnqueuePlugin for DefaultPreemptionPreEnqueue {
 /// `utilfeature.DefaultFeatureGate.Enabled(features.SchedulerAsyncPreemption)`
 /// (`EnableAsyncPreemption`, Beta, default on in 1.35).
 pub fn async_preemption_enabled() -> bool {
-    rusternetes_common::feature_gates::gate_enabled("SchedulerAsyncPreemption").unwrap_or(false)
+    k3rs_common::feature_gates::gate_enabled("SchedulerAsyncPreemption").unwrap_or(false)
 }

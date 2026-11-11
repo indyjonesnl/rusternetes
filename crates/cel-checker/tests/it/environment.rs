@@ -4,7 +4,7 @@
 //! compatibility test (`library_compatibility_test.go`).
 
 use cel::parser::Parser;
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::{
     check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations, VariableDecl,
     Version,
 };

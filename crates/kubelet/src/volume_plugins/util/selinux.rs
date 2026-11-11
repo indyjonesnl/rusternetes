@@ -5,9 +5,9 @@ use crate::go_selinux_label::Labeler;
 use crate::volume_plugins::plugin::Spec;
 use crate::volume_plugins::registry::VolumePluginMgr;
 use crate::volume_plugins::util::contains_access_mode;
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::resources::pod::{PodSecurityContext, SELinuxOptions};
-use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::resources::pod::{PodSecurityContext, SELinuxOptions};
+use k3rs_common::resources::volume::PersistentVolumeAccessMode;
 use std::collections::BTreeSet;
 
 /// Port of `SELinuxLabelTranslator` (`pkg/volume/util/selinux.go:34-44`).

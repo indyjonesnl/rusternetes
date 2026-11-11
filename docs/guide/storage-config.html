@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Storage Backends - Rūsternetes</title>
+  <title>Storage Backends - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -104,7 +104,7 @@
       <p class="breadcrumb">Configuration &rsaquo; Storage Backends</p>
       <h1>Storage Backends</h1>
       <p class="lead">
-        Rūsternetes supports four storage backends: etcd for production clusters, SQLite
+        k3rs supports four storage backends: etcd for production clusters, SQLite
         and Redis (via rhino) for lightweight deployments, and an in-memory backend for testing.
         All backends implement the same <code>Storage</code> trait.
       </p>
@@ -195,14 +195,14 @@
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Start with etcd (default)</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--storage-backend</span> <span class="value">etcd</span> \
   <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span></code>
       </pre>
 
       <h3>etcd Configuration</h3>
       <p>
-        etcd itself is configured separately. Recommended settings for Rūsternetes:
+        etcd itself is configured separately. Recommended settings for k3rs:
       </p>
 
       <table>
@@ -277,9 +277,9 @@ rusternetes-api-server \
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># All-in-one with embedded SQLite</span>
-rusternetes \
+k3rs \
   <span class="flag">--storage-backend</span> <span class="value">sqlite</span> \
-  <span class="flag">--data-dir</span> <span class="value">./data/rusternetes.db</span></code>
+  <span class="flag">--data-dir</span> <span class="value">./data/k3rs.db</span></code>
       </pre>
 
       <table>
@@ -347,7 +347,7 @@ podman compose -f compose.sqlite.yml up -d</code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># All-in-one with embedded Redis backend</span>
-rusternetes \
+k3rs \
   <span class="flag">--storage-backend</span> <span class="value">redis</span> \
   <span class="flag">--redis-url</span> <span class="value">redis://localhost:6379</span></code>
       </pre>
@@ -557,7 +557,7 @@ async fn test_create_pod() {
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

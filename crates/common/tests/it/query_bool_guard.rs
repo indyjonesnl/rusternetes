@@ -1,5 +1,5 @@
 //! Guard: every boolean QUERY PARAMETER must be decoded with
-//! `rusternetes_common::query::k8s_query_bool`, never a hand-rolled
+//! `k3rs_common::query::k8s_query_bool`, never a hand-rolled
 //! comparison or a strict `parse::<bool>()`.
 //!
 //! This exists because the same defect kept being fixed in one place and
@@ -128,7 +128,7 @@ fn bool_query_params_use_the_shared_decoder() {
     assert!(
         offenders.is_empty(),
         "these decode a boolean QUERY PARAMETER with a narrow rule instead of \
-         rusternetes_common::query::k8s_query_bool.\n\nUpstream \
+         k3rs_common::query::k8s_query_bool.\n\nUpstream \
          (apimachinery/pkg/runtime/conversion.go:79-95) treats ONLY absence, \
          \"0\" and a case-insensitive \"false\" as false; every other value, \
          including \"1\", \"t\", \"yes\" and \"\", is true. A `parse::<bool>()` \
@@ -160,7 +160,7 @@ fn the_guard_actually_detects_a_regression() {
     );
 
     let unrelated = r#"
-        let debug = std::env::var("RUSTERNETES_DEBUG")
+        let debug = std::env::var("K3RS_DEBUG")
             .ok()
             .and_then(|v| v.parse::<bool>().ok());
         let is_default = ann.get("storageclass.kubernetes.io/is-default-class") == Some("true");

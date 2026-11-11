@@ -14,7 +14,7 @@
 //! rejects (`ValidateIngressClassSpec`, `validateIngressBackend`,
 //! `pkg/apis/core/validation/events.go`).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn ingress(rule: Value) -> Value {
@@ -209,7 +209,7 @@ async fn a_body_upstream_accepts_is_written() {
 /// `EventList.Items` is a plain slice, so an absent key is `nil`, not an error.
 #[tokio::test]
 async fn a_list_without_items_decodes() {
-    use rusternetes_common::resources::event::{EventList, EventV1List};
+    use k3rs_common::resources::event::{EventList, EventV1List};
 
     let list: EventList = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "EventList"

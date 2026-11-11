@@ -5,7 +5,7 @@
 # so the host target IS <arch>-unknown-linux-musl and crt-static links a fully
 # static binary with no `--target` and no cross C toolchain. `mimalloc` is
 # MANDATORY on musl (musl's allocator is ~10x slower under multi-threaded lock
-# contention), so it is enabled on both rusternetes components. Keep this file
+# contention), so it is enabled on both k3rs components. Keep this file
 # arch-neutral (see scripts/tests/test-dockerfile-multiarch.sh for the pattern).
 #
 # Not an image: the final stage is `scratch` holding just the three binaries,
@@ -32,8 +32,8 @@ COPY . .
 
 # `.git` is excluded from the context; the version banner's SHA comes from a
 # build-arg (common/build.rs falls back to "unknown" when empty).
-ARG RUSTERNETES_GIT_SHA=""
-ENV RUSTERNETES_GIT_SHA=${RUSTERNETES_GIT_SHA}
+ARG K3RS_GIT_SHA=""
+ENV K3RS_GIT_SHA=${K3RS_GIT_SHA}
 
 # Shipped artefacts: the regular `release` profile (lto=thin, codegen-units=1),
 # not the compile-speed `release-fast`. The consumer runs api-server against
@@ -42,9 +42,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release \
-      -p rusternetes-api-server -p rusternetes-kubelet \
+      -p k3rs-api-server -p k3rs-kubelet \
       --bin api-server --bin kubelet \
-      --features rusternetes-api-server/mimalloc,rusternetes-kubelet/mimalloc \
+      --features k3rs-api-server/mimalloc,k3rs-kubelet/mimalloc \
  && strip target/release/api-server target/release/kubelet \
  && mkdir -p /out \
  && cp target/release/api-server target/release/kubelet /out/

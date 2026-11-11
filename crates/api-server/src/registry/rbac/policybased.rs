@@ -18,11 +18,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::resources::{
+use k3rs_common::authz::Authorizer;
+use k3rs_common::resources::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef,
 };
-use rusternetes_common::{Error, Result};
+use k3rs_common::{Error, Result};
 
 use super::escalation_check::{
     binding_authorized, escalation_allowed, is_only_mutating_gc_fields, role_escalation_authorized,

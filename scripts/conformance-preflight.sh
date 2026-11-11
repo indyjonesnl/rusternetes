@@ -11,8 +11,8 @@
 #     Pending forever while bootstrap-cluster.sh still exits 0. A 406-spec run
 #     against a cluster with no scheduler looks like ~400 product bugs.
 #   * CONTROL_PLANE_IMAGE_REGISTRY unset on the prebuilt-image path — bootstrap
-#     templates `rusternetes-<component>:latest`, which the containerd image
-#     store cannot resolve, so the same pods (and rusternetes-dns) never start.
+#     templates `k3rs-<component>:latest`, which the containerd image
+#     store cannot resolve, so the same pods (and k3rs-dns) never start.
 #   * A host over the kubelet's imagefs eviction threshold — hydrophone's
 #     e2e-conformance-test pod is evicted ("Pod evicted due to resource
 #     pressure: ImageFsAvailable") after the run has already logged
@@ -44,11 +44,11 @@
 #
 # Flags:
 #   --kubeconfig PATH   Override kubeconfig (default: $KUBECONFIG or
-#                       ~/.kube/rusternetes-config)
+#                       ~/.kube/k3rs-config)
 #   --certs-path PATH   Host-absolute certs dir expected inside the kubelet
-#                       (default: $CERTS_PATH, else <repo>/.rusternetes/certs)
+#                       (default: $CERTS_PATH, else <repo>/.k3rs/certs)
 #   --kubelet NAME      Kubelet container to inspect for the certs mount
-#                       (default: rusternetes-kubelet; 'none' skips the
+#                       (default: k3rs-kubelet; 'none' skips the
 #                       assertion — the containers are addressed by name on the
 #                       local daemon, so a cluster that is not this compose
 #                       stack must opt out rather than inspect someone else's)
@@ -60,14 +60,14 @@
 #                       named after the kind control-plane node.
 #   --dns-deployment NAME
 #                       kube-system Deployment that must have a ready replica
-#                       (default: rusternetes-dns; 'none' skips the assertion,
+#                       (default: k3rs-dns; 'none' skips the assertion,
 #                       e.g. a kind cluster serving DNS from CoreDNS)
 #   --sandbox-image REF Image whose pull is exercised
 #                       (default: registry.k8s.io/pause:3.10.1)
 #   --skip-image-pull   Skip only the image-pull assertion (offline work)
 #   --storage-container NAME
 #                       Container holding the storage backend, inspected for
-#                       size (default: rusternetes-rhino; 'none' or absent =
+#                       size (default: k3rs-rhino; 'none' or absent =
 #                       skipped, which is the etcd/remote case)
 #   --max-storage-mb N  Refuse to run when state.db + WAL exceed N MB
 #                       (default: 256; one full suite on a fresh cluster grows
@@ -96,24 +96,24 @@ SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
-KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
-CERTS_PATH_EXPECTED="${CERTS_PATH:-$REPO_ROOT/.rusternetes/certs}"
-KUBELET_CONTAINER="rusternetes-kubelet"
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
+CERTS_PATH_EXPECTED="${CERTS_PATH:-$REPO_ROOT/.k3rs/certs}"
+KUBELET_CONTAINER="k3rs-kubelet"
 CONTROL_PLANE_PODS="kube-scheduler-node-1,kube-controller-manager-node-1"
-DNS_DEPLOYMENT="rusternetes-dns"
+DNS_DEPLOYMENT="k3rs-dns"
 SANDBOX_IMAGE="registry.k8s.io/pause:3.10.1"
 SKIP_IMAGE_PULL=0
-STORAGE_CONTAINER="rusternetes-rhino"
+STORAGE_CONTAINER="k3rs-rhino"
 MAX_STORAGE_MB=256
 MAX_COMPACTION_LAG=10000
 SKIP_NODE_IMAGE_CHECK=0
 # Per-node compose service pairs that MUST run the same build. Each entry is
 # "node-1 container:node-2 container:binary path". containerd/containerd2 are
-# absent deliberately: they pin `image: rusternetes-containerd:latest` in the
+# absent deliberately: they pin `image: k3rs-containerd:latest` in the
 # compose file, so both nodes resolve one tag and cannot drift.
 NODE_SERVICE_PAIRS=(
-    "rusternetes-kubelet:rusternetes-kubelet2:/app/kubelet"
-    "rusternetes-kube-proxy:rusternetes-kube-proxy2:/app/kube-proxy"
+    "k3rs-kubelet:k3rs-kubelet2:/app/kubelet"
+    "k3rs-kube-proxy:k3rs-kube-proxy2:/app/kube-proxy"
 )
 BUDGET_SECONDS=60
 
@@ -191,7 +191,7 @@ fi
 #    The names are a compose-stack fact, not a universal one: vanilla-swap
 #    (#1629) runs this preflight against a kind cluster whose mirror pods are
 #    kube-<component>-<kind-node>, and a cluster whose control plane is none of
-#    rusternetes' business passes 'none'.
+#    k3rs' business passes 'none'.
 if [ "$CONTROL_PLANE_PODS" = "none" ] || [ -z "$CONTROL_PLANE_PODS" ]; then
     pass "control-plane static-pod assertion skipped (--control-plane-pods none)"
 else
@@ -208,7 +208,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Cluster DNS has a ready backend. rusternetes-dns is a kube-system
+# 3. Cluster DNS has a ready backend. k3rs-dns is a kube-system
 #    Deployment (not CoreDNS); without it every DNS-dependent spec times out.
 #    --dns-deployment names a different one (kind serves DNS from CoreDNS).
 # ---------------------------------------------------------------------------
@@ -338,8 +338,8 @@ else
         if [ "$sum_first" = "$sum_second" ]; then
             pass "$first and $second run the same $binary (${sum_first:0:12})"
         else
-            svc_first="${first#rusternetes-}"
-            svc_second="${second#rusternetes-}"
+            svc_first="${first#k3rs-}"
+            svc_second="${second#k3rs-}"
             fail "$first and $second run DIFFERENT $binary (${sum_first:0:12} vs ${sum_second:0:12}) — rebuild both ('compose build $svc_first $svc_second') and recreate them, or the node the scheduler picks decides the result"
         fi
     done

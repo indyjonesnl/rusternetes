@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::endpoints_tracker::*;
+    use k3rs_controller_manager::controllers::endpoints_tracker::*;
 
     /// Port of `TestStaleEndpointsTracker` (`endpoints_tracker_test.go:30-60`).
     #[test]

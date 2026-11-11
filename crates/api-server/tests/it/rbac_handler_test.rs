@@ -3,17 +3,17 @@
 //! Tests all CRUD operations for Roles, RoleBindings, ClusterRoles, and ClusterRoleBindings
 //! This is security-critical functionality requiring comprehensive test coverage
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 // Helper function to create test Role
 fn create_test_role(name: &str, namespace: &str) -> Role {
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     Role {
         type_meta: TypeMeta {
             kind: "Role".to_string(),
@@ -36,7 +36,7 @@ fn create_test_role(name: &str, namespace: &str) -> Role {
 
 // Helper function to create test RoleBinding
 fn create_test_rolebinding(name: &str, namespace: &str, role_name: &str) -> RoleBinding {
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     RoleBinding {
         type_meta: TypeMeta {
             kind: "RoleBinding".to_string(),
@@ -63,7 +63,7 @@ fn create_test_rolebinding(name: &str, namespace: &str, role_name: &str) -> Role
 
 // Helper function to create test ClusterRole
 fn create_test_clusterrole(name: &str) -> ClusterRole {
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     ClusterRole {
         type_meta: TypeMeta {
             kind: "ClusterRole".to_string(),
@@ -87,7 +87,7 @@ fn create_test_clusterrole(name: &str) -> ClusterRole {
 
 // Helper function to create test ClusterRoleBinding
 fn create_test_clusterrolebinding(name: &str, role_name: &str) -> ClusterRoleBinding {
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     ClusterRoleBinding {
         type_meta: TypeMeta {
             kind: "ClusterRoleBinding".to_string(),
@@ -177,7 +177,7 @@ async fn test_role_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify it's deleted
-    let result: rusternetes_common::Result<Role> = storage.get(&key).await;
+    let result: k3rs_common::Result<Role> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -246,7 +246,7 @@ async fn test_role_with_multiple_rules() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-role-multi-rules";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let role = Role {
         type_meta: TypeMeta {
             kind: "Role".to_string(),
@@ -302,7 +302,7 @@ async fn test_role_with_resource_names() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-role-resource-names";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let role = Role {
         type_meta: TypeMeta {
             kind: "Role".to_string(),
@@ -357,7 +357,7 @@ async fn test_rolebinding_with_multiple_subjects() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-rb-multi-subjects";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let rb = RoleBinding {
         type_meta: TypeMeta {
             kind: "RoleBinding".to_string(),
@@ -412,7 +412,7 @@ async fn test_rolebinding_referencing_clusterrole() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-rb-clusterrole-ref";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let rb = RoleBinding {
         type_meta: TypeMeta {
             kind: "RoleBinding".to_string(),
@@ -497,7 +497,7 @@ async fn test_clusterrole_list() {
 async fn test_clusterrole_with_non_resource_urls() {
     let storage = Arc::new(MemoryStorage::new());
 
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let cr = ClusterRole {
         type_meta: TypeMeta {
             kind: "ClusterRole".to_string(),
@@ -544,7 +544,7 @@ async fn test_clusterrole_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify deleted
-    let result: rusternetes_common::Result<ClusterRole> = storage.get(&key).await;
+    let result: k3rs_common::Result<ClusterRole> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -571,7 +571,7 @@ async fn test_clusterrolebinding_create_and_get() {
 async fn test_clusterrolebinding_with_multiple_subjects() {
     let storage = Arc::new(MemoryStorage::new());
 
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let crb = ClusterRoleBinding {
         type_meta: TypeMeta {
             kind: "ClusterRoleBinding".to_string(),
@@ -643,7 +643,7 @@ async fn test_role_with_empty_rules() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-empty-rules";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let role = Role {
         type_meta: TypeMeta {
             kind: "Role".to_string(),
@@ -671,7 +671,7 @@ async fn test_rolebinding_without_subjects() {
     let storage = Arc::new(MemoryStorage::new());
 
     let namespace = "test-no-subjects";
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let rb = RoleBinding {
         type_meta: TypeMeta {
             kind: "RoleBinding".to_string(),
@@ -737,7 +737,7 @@ async fn test_role_with_labels_and_annotations() {
 async fn test_clusterrole_with_wildcard_permissions() {
     let storage = Arc::new(MemoryStorage::new());
 
-    use rusternetes_common::types::TypeMeta;
+    use k3rs_common::types::TypeMeta;
     let cr = ClusterRole {
         type_meta: TypeMeta {
             kind: "ClusterRole".to_string(),

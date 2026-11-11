@@ -3,11 +3,11 @@
 //! Mirrors upstream `ValidateReplicaSetSpec`
 //! (`pkg/apis/apps/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::workloads::{ReplicaSet, ReplicaSetStatus};
-use rusternetes_common::validation::apps::{
+use k3rs_common::resources::workloads::{ReplicaSet, ReplicaSetStatus};
+use k3rs_common::validation::apps::{
     validate_replicaset, validate_replicaset_status_update, validate_replicaset_update,
 };
-use rusternetes_common::validation::field::ErrorType;
+use k3rs_common::validation::field::ErrorType;
 use serde_json::json;
 
 /// Build a ReplicaSet from a spec JSON fragment (metadata is fixed).
@@ -96,7 +96,7 @@ fn template_labels_must_match_selector() {
     );
 }
 
-fn aggregate(errs: &[rusternetes_common::validation::field::Error]) -> String {
+fn aggregate(errs: &[k3rs_common::validation::field::Error]) -> String {
     errs.iter()
         .map(|e| e.to_string())
         .collect::<Vec<_>>()

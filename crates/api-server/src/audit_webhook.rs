@@ -18,8 +18,8 @@
 
 use crate::authorization_webhook::WebhookClientConfig;
 use async_trait::async_trait;
-use rusternetes_common::audit::{AuditBackend, AuditEvent, ResponseStatus, UserInfo};
-use rusternetes_common::wait::Backoff;
+use k3rs_common::audit::{AuditBackend, AuditEvent, ResponseStatus, UserInfo};
+use k3rs_common::wait::Backoff;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;

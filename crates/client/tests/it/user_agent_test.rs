@@ -2,7 +2,7 @@
 //! (controller-manager `clientbuilder/client_builder.go:46`) appends the
 //! controller name to the default agent (`rest/config.go:626-630`).
 
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

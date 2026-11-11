@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::pod_security_api::{
+    pub use k3rs_api_server::admission::pod_security_api::{
         self as api, Level, LevelVersion, Policy,
     };
-    pub use rusternetes_api_server::admission::pod_security_policy::aggregate_check_results;
-    pub use rusternetes_api_server::admission::{pod_security_registry, PodSecurityAdmission};
-    pub use rusternetes_common::resources::{Namespace, Pod};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_api_server::admission::pod_security_policy::aggregate_check_results;
+    pub use k3rs_api_server::admission::{pod_security_registry, PodSecurityAdmission};
+    pub use k3rs_common::resources::{Namespace, Pod};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::Storage;
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::Arc;
     pub use std::time::{Duration, Instant};
@@ -17,9 +17,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_namespace::*;
-    use rusternetes_api_server::admission::PodSecurityExemptions;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::admission::pod_security_namespace::*;
+    use k3rs_api_server::admission::PodSecurityExemptions;
+    use k3rs_storage::MemoryStorage;
 
     fn ns(name: &str, labels: &[(&str, &str)]) -> Namespace {
         let labels: HashMap<String, String> = labels
@@ -55,7 +55,7 @@ mod tests {
     async fn store(pods: Vec<Pod>) -> Arc<MemoryStorage> {
         let s = Arc::new(MemoryStorage::new());
         for p in pods {
-            let key = rusternetes_storage::build_key("pods", Some("ns"), &p.metadata.name);
+            let key = k3rs_storage::build_key("pods", Some("ns"), &p.metadata.name);
             s.create(&key, &p).await.unwrap();
         }
         s

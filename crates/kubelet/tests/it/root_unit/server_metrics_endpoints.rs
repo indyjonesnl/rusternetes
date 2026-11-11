@@ -19,7 +19,7 @@ mod tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_kubelet::server_metrics_endpoints::*;
+    use k3rs_kubelet::server_metrics_endpoints::*;
     use tower::ServiceExt;
 
     async fn call(method: &str, path: &str) -> (StatusCode, String) {

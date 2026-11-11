@@ -1,11 +1,11 @@
 //! Filter cases of `TestNodeAffinity` (`plugins/nodeaffinity/node_affinity_test.go`)
 //! and the added-affinity cases of `TestNodeAffinityPriority`/`TestNodeAffinity`.
-use rusternetes_common::resources::pod::NodeAffinity;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{
+use k3rs_common::resources::pod::NodeAffinity;
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{
     Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin, PreFilterResult, Status,
 };
-use rusternetes_scheduler::in_tree::{
+use k3rs_scheduler::in_tree::{
     NodeAffinityPlugin, ERR_REASON_CONFLICT, ERR_REASON_ENFORCED, ERR_REASON_POD,
 };
 use serde_json::{json, Value};

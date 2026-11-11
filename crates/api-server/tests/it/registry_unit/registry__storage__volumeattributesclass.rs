@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::csi::VolumeAttributesClass;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::volumeattributesclass::{
+    pub use k3rs_common::resources::csi::VolumeAttributesClass;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::volumeattributesclass::{
         validate_volume_attributes_class, validate_volume_attributes_class_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::storage::volumeattributesclass::*;
+    use k3rs_api_server::registry::storage::volumeattributesclass::*;
 
     fn vac(driver: &str, param: &str) -> VolumeAttributesClass {
         serde_json::from_value(serde_json::json!({

@@ -18,13 +18,11 @@
 
 use std::time::Instant;
 
-use rusternetes_common::admission::AdmissionRequest;
-use rusternetes_common::cel::CELEvaluator;
-use rusternetes_common::cel_cost::{
-    charge_budget, CostOptions, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
-};
-use rusternetes_common::resources::admission_webhook::MatchCondition;
-use rusternetes_common::resources::FailurePolicy;
+use k3rs_common::admission::AdmissionRequest;
+use k3rs_common::cel::CELEvaluator;
+use k3rs_common::cel_cost::{charge_budget, CostOptions, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS};
+use k3rs_common::resources::admission_webhook::MatchCondition;
+use k3rs_common::resources::FailurePolicy;
 
 use crate::admission_metrics::{
     observe_match_condition_eval_error, observe_match_condition_evaluation_time,
@@ -227,7 +225,7 @@ fn match_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::admission::{GroupVersionKind, UserInfo};
+    use k3rs_common::admission::{GroupVersionKind, UserInfo};
 
     #[test]
     fn forbidden_message_matches_new_forbidden() {
@@ -250,7 +248,7 @@ mod tests {
 
     fn request() -> AdmissionRequest {
         crate::build_admission_request_for_match(
-            &rusternetes_common::admission::Operation::Create,
+            &k3rs_common::admission::Operation::Create,
             &GroupVersionKind {
                 group: String::new(),
                 version: "v1".into(),

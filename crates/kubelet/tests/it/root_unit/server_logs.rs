@@ -18,7 +18,7 @@ mod tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use rusternetes_kubelet::server_logs::*;
+    use k3rs_kubelet::server_logs::*;
     use tower::ServiceExt;
 
     async fn call(app: &Router, method: Method, path: &str) -> (u16, String, Option<String>) {
@@ -129,9 +129,9 @@ mod tests {
     // v1beta1/defaults.go:122-124,280-282: nil => true.
     #[test]
     fn config_defaults_enable_handlers() {
-        let c = rusternetes_kubelet::config::KubeletConfiguration::default();
+        let c = k3rs_kubelet::config::KubeletConfiguration::default();
         assert!(c.debugging_handlers_enabled() && c.system_log_handler_enabled());
-        let c: rusternetes_kubelet::config::KubeletConfiguration =
+        let c: k3rs_kubelet::config::KubeletConfiguration =
             serde_yaml::from_str("enableDebuggingHandlers: false\nenableSystemLogHandler: false\n")
                 .unwrap();
         assert!(!c.debugging_handlers_enabled() && !c.system_log_handler_enabled());
@@ -259,8 +259,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn config_validation_for_system_log_query() {
-        use rusternetes_common::feature_gates::{reset_to_defaults, set_from_str};
-        use rusternetes_kubelet::config::KubeletConfiguration;
+        use k3rs_common::feature_gates::{reset_to_defaults, set_from_str};
+        use k3rs_kubelet::config::KubeletConfiguration;
         reset_to_defaults();
         let cfg = |y: &str| -> KubeletConfiguration {
             serde_yaml::from_str(&format!(

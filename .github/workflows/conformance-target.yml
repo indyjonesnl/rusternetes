@@ -81,7 +81,7 @@ jobs:
     permissions:
       contents: write
     # A full SIG [Conformance] slice is much bigger than a single feature focus,
-    # and every failing spec (rusternetes is not yet 100%) burns its per-test
+    # and every failing spec (k3rs is not yet 100%) burns its per-test
     # ginkgo timeout — so this needs the old canary's ~300-min budget, not the
     # 90 min that timed out every SIG run → "cancelled" (#1616). Feature targets
     # are small and finish well inside this ceiling.

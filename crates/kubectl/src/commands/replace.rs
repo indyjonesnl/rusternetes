@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use serde::Deserialize;
 use std::fs;
 use std::io::{self, Read};

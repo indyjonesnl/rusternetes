@@ -2,28 +2,28 @@
 //! `staging/src/k8s.io/kube-aggregator/pkg/registry/apiservice/strategy.go`
 //! and `.../apiservice/etcd/etcd.go`, with the validation of
 //! `pkg/apis/apiregistration/validation/validation.go` (in
-//! `rusternetes_common::validation::apiservice`).
+//! `k3rs_common::validation::apiservice`).
 //!
 //! Not modelled: `GetResetFields` (managed-fields reset sets), `WarningsOn*`
 //! (both return nil upstream), and `MatchAPIService` /
 //! `ToSelectableFields`, which are the generic `metadata.name` field selector
 //! the list handler already serves.
 //!
-//! `REST.Categories` (etcd.go:75-78) is served by `rusternetes_discovery`
+//! `REST.Categories` (etcd.go:75-78) is served by `k3rs_discovery`
 //! (`api-extensions`) and `REST.ConvertToTable` (etcd.go:82-120) by
-//! `rusternetes_middleware::table::printer_columns` / `printer_row_cells`.
+//! `k3rs_middleware::table::printer_columns` / `printer_row_cells`.
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::apiregistration::{
+use k3rs_common::resources::apiregistration::{
     new_local_available_condition, set_api_service_condition, set_defaults_api_service,
 };
-use rusternetes_common::resources::APIService;
-use rusternetes_common::validation::apiservice::{
+use k3rs_common::resources::APIService;
+use k3rs_common::validation::apiservice::{
     validate_api_service, validate_api_service_status_update, validate_api_service_update,
 };
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

@@ -10,7 +10,7 @@
 //! fails while any *started* informer has not synced.
 //!
 //! The informer itself is the workspace's one reflector,
-//! [`rusternetes_client::reflector::Reflector`] (list + watch from the list's
+//! [`k3rs_client::reflector::Reflector`] (list + watch from the list's
 //! resourceVersion, keyed store, `HasSynced`, re-list on any watch error),
 //! also used by the scheduler; [`StorageListWatch`] is its `ListWatch` over
 //! the storage backend, where the api-server's `ApiListWatch` is over HTTP.
@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use rusternetes_client::reflector::{ListWatch, Reflector, WatchItem};
-use rusternetes_client::watch::WatchEvent as ClientWatchEvent;
-use rusternetes_storage::{build_prefix, Storage, StorageBackend, WatchEvent};
+use k3rs_client::reflector::{ListWatch, Reflector, WatchItem};
+use k3rs_client::watch::WatchEvent as ClientWatchEvent;
+use k3rs_storage::{build_prefix, Storage, StorageBackend, WatchEvent};
 use serde_json::Value;
 
 /// `cache.MetaNamespaceKeyFunc`.

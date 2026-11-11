@@ -5,7 +5,7 @@
 //! bind-mounted directory. Soft-skips without Docker (same contract as
 //! `etcd_rpc_subset.rs`).
 
-use rusternetes_storage::{etcd::EtcdStorage, Storage};
+use k3rs_storage::{etcd::EtcdStorage, Storage};
 use serde_json::json;
 use testcontainers::{
     core::{Mount, WaitFor},

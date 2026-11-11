@@ -245,7 +245,7 @@ pub fn key_func(name: &str, namespace: &str, tr: &TokenRequest) -> String {
     )
 }
 
-/// The `getToken` of this kubelet (Rusternetes-specific; upstream's is a
+/// The `getToken` of this kubelet (k3rs-specific; upstream's is a
 /// clientset `CreateToken`, `token_manager.go:60-69`).
 ///
 /// A TokenRequest to the api-server through `storage` binds the token to the
@@ -256,8 +256,8 @@ pub fn key_func(name: &str, namespace: &str, tr: &TokenRequest) -> String {
 /// backends, whose co-located api-server trusts our key) is the token
 /// self-minted with `signer`, with the pod's node resolved from storage.
 pub fn storage_token_source(
-    storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-    signer: rusternetes_common::auth::TokenManager,
+    storage: Option<Arc<k3rs_storage::StorageBackend>>,
+    signer: k3rs_common::auth::TokenManager,
 ) -> GetTokenFn {
     Arc::new(move |name, namespace, tr| {
         let storage = storage.clone();
@@ -269,13 +269,13 @@ pub fn storage_token_source(
 }
 
 async fn request_token(
-    storage: Option<&rusternetes_storage::StorageBackend>,
-    signer: &rusternetes_common::auth::TokenManager,
+    storage: Option<&k3rs_storage::StorageBackend>,
+    signer: &k3rs_common::auth::TokenManager,
     sa_name: &str,
     namespace: &str,
     mut tr: TokenRequest,
 ) -> Result<TokenRequest> {
-    use rusternetes_storage::{build_key, Storage};
+    use k3rs_storage::{build_key, Storage};
 
     let expiration_seconds = tr
         .spec
@@ -315,7 +315,7 @@ async fn request_token(
     // Self-mint fallback (storage-direct backends).
     let sa_uid = match storage {
         Some(st) => st
-            .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
+            .get::<k3rs_common::resources::ServiceAccount>(&build_key(
                 "serviceaccounts",
                 Some(namespace),
                 sa_name,
@@ -327,11 +327,11 @@ async fn request_token(
     };
     // TokenRequest defaults an empty audience list to the api-server's
     // `--api-audiences` (`pkg/registry/core/serviceaccount/storage/token.go`
-    // `TokenREST.Create`), so use those, else "rusternetes".
+    // `TokenREST.Create`), so use those, else "k3rs".
     let audiences = if !tr.spec.audiences.is_empty() {
         tr.spec.audiences.clone()
     } else if signer.api_audiences().is_empty() {
-        vec!["rusternetes".to_string()]
+        vec!["k3rs".to_string()]
     } else {
         signer.api_audiences().to_vec()
     };
@@ -341,11 +341,7 @@ async fn request_token(
         .unwrap_or_default();
     let node_name = match (storage, bound.is_some()) {
         (Some(st), true) => st
-            .get::<rusternetes_common::resources::Pod>(&build_key(
-                "pods",
-                Some(namespace),
-                &pod_name,
-            ))
+            .get::<k3rs_common::resources::Pod>(&build_key("pods", Some(namespace), &pod_name))
             .await
             .ok()
             .and_then(|p| p.spec.and_then(|s| s.node_name)),
@@ -364,7 +360,7 @@ async fn request_token(
         _ => None,
     };
     let exp = now.timestamp() + expiration_seconds;
-    let claims = rusternetes_common::auth::ServiceAccountClaims {
+    let claims = k3rs_common::auth::ServiceAccountClaims {
         sub: format!("system:serviceaccount:{namespace}:{sa_name}"),
         namespace: namespace.to_string(),
         uid: sa_uid.clone(),
@@ -372,22 +368,20 @@ async fn request_token(
         exp,
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
         aud: audiences,
-        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+        kubernetes: Some(k3rs_common::auth::KubernetesClaims {
             namespace: namespace.to_string(),
-            svcacct: rusternetes_common::auth::KubeRef {
+            svcacct: k3rs_common::auth::KubeRef {
                 name: sa_name.to_string(),
                 uid: sa_uid,
             },
-            pod: bound.as_ref().map(|_| rusternetes_common::auth::KubeRef {
+            pod: bound.as_ref().map(|_| k3rs_common::auth::KubeRef {
                 name: pod_name.clone(),
                 uid: pod_uid.clone(),
             }),
-            node: node_name
-                .as_ref()
-                .map(|nn| rusternetes_common::auth::KubeRef {
-                    name: nn.clone(),
-                    uid: node_uid.clone().unwrap_or_default(),
-                }),
+            node: node_name.as_ref().map(|nn| k3rs_common::auth::KubeRef {
+                name: nn.clone(),
+                uid: node_uid.clone().unwrap_or_default(),
+            }),
             secret: None,
             warnafter: None,
         }),

@@ -28,7 +28,7 @@
 //! upstream `generated.proto` field numbers, mirroring the style used in
 //! `conformance_configmap_envfrom_prefixes_test.rs`.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::Value;
 
 // --- low-level wire-format helpers --------------------------------------

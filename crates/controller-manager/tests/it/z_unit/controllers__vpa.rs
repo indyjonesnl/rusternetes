@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::quantity::parse_resource_value;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::quantity::parse_resource_value;
+    pub use k3rs_common::resources::{
         Deployment, Pod, RecommendedContainerResources, RecommendedPodResources, ReplicaSet,
         StatefulSet, VerticalPodAutoscaler, VerticalPodAutoscalerStatus,
     };
-    pub use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+    pub use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tokio::time::Duration;
@@ -17,7 +17,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::vpa::*;
+    use k3rs_controller_manager::controllers::vpa::*;
 
     #[test]
     fn test_parse_cpu_string() {

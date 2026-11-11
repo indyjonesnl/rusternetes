@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{self, Version};
+    pub use k3rs_common::feature_gates::{self, Version};
     pub use std::collections::BTreeMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::compatibility::*;
-    use rusternetes_common::feature_gates::{self, Feature};
+    use k3rs_common::compatibility::*;
+    use k3rs_common::feature_gates::{self, Feature};
     use serial_test::serial;
 
     fn v(major: u32, minor: u32) -> Version {
@@ -441,8 +441,8 @@ mod tests {
         assert!(!cmd.is_empty() && !cmd.contains('/'), "{ua}");
         assert!(rest.starts_with("v1.35.0 (linux/"), "{ua}");
         assert!(
-            rest.ends_with("/amd64) kubernetes/rustern")
-                || rest.ends_with("/arm64) kubernetes/rustern"),
+            rest.ends_with("/amd64) kubernetes/k3rs-v0")
+                || rest.ends_with("/arm64) kubernetes/k3rs-v0"),
             "{ua}"
         );
     }

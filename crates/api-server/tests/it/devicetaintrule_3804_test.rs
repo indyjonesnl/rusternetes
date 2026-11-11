@@ -8,8 +8,8 @@
 //! `pkg/apis/resource/v1alpha3/defaults.go` (`SetDefaults_DeviceTaint`).
 
 use axum::http::StatusCode;
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const DTR: &str = "/apis/resource.k8s.io/v1alpha3/devicetaintrules";

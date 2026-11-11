@@ -1,10 +1,10 @@
-//! Translate a rusternetes [`Pod`] into CRI v1 sandbox and container configs.
+//! Translate a k3rs [`Pod`] into CRI v1 sandbox and container configs.
 //!
 //! These are pure functions — they take a `Pod` (and, for containers, a
 //! resolved image ref and a volume-name → host-path map) and produce the
 //! `runtime.v1` config messages the CRI runtime expects. Keeping them pure makes
 //! the Pod→CRI mapping unit-testable without a running runtime, and isolates the
-//! single place where rusternetes' resource model meets the CRI wire model.
+//! single place where k3rs' resource model meets the CRI wire model.
 //!
 //! Scope: the fields needed to launch a pod — metadata, labels, namespaces,
 //! command/args/env, ports, resources, mounts, and the linux security context.
@@ -19,10 +19,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use rusternetes_common::quantity::parse_resource_value;
-use rusternetes_common::resources::pod::{Container, Pod};
-use rusternetes_common::resources::{ConfigMap, Secret, Service};
-use rusternetes_cri::v1;
+use k3rs_common::quantity::parse_resource_value;
+use k3rs_common::resources::pod::{Container, Pod};
+use k3rs_common::resources::{ConfigMap, Secret, Service};
+use k3rs_cri::v1;
 
 /// Well-known CRI metadata label keys the runtime indexes sandboxes/containers
 /// by. They mirror the keys the upstream kubelet sets so `crictl`/tools work.
@@ -54,7 +54,7 @@ fn host_network(pod: &Pod) -> bool {
 /// Build the sandbox-level namespace options (host vs pod network/pid/ipc).
 fn namespace_options(pod: &Pod) -> v1::NamespaceOption {
     let spec = pod.spec.as_ref();
-    let host = |f: fn(&rusternetes_common::resources::pod::PodSpec) -> Option<bool>| {
+    let host = |f: fn(&k3rs_common::resources::pod::PodSpec) -> Option<bool>| {
         spec.and_then(f).unwrap_or(false)
     };
     let mode = |on: bool| {
@@ -264,7 +264,7 @@ pub fn read_host_dns_config(path: &str) -> Result<v1::DnsConfig, String> {
 /// appended. Each option renders as `name` or `name:value`.
 fn merge_dns_options(
     base: Vec<String>,
-    extra: &[rusternetes_common::resources::pod::PodDNSConfigOption],
+    extra: &[k3rs_common::resources::pod::PodDNSConfigOption],
 ) -> Vec<String> {
     let opt_name = |s: &str| s.split(':').next().unwrap_or(s).to_string();
     let mut out = base;
@@ -818,7 +818,7 @@ fn validate_resolved_sub_path(sub_path: &str) -> Result<(), String> {
 /// (`pkg/kubelet/kubelet_pods.go:308-325`). Returns `None` when the mount has
 /// no subPath at all.
 pub(crate) fn resolve_sub_path(
-    vm: &rusternetes_common::resources::VolumeMount,
+    vm: &k3rs_common::resources::VolumeMount,
     env: &HashMap<String, String>,
 ) -> Result<Option<String>, String> {
     let mut sub_path = vm
@@ -982,8 +982,8 @@ pub fn pod_field_value(pod: &Pod, field_path: &str) -> Option<String> {
 }
 
 /// Render a [`Phase`] to its Kubernetes string form (`status.phase` fieldRef).
-fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
-    use rusternetes_common::types::Phase;
+fn phase_str(phase: &k3rs_common::types::Phase) -> String {
+    use k3rs_common::types::Phase;
     match phase {
         Phase::Pending => "Pending",
         Phase::Running => "Running",
@@ -1012,7 +1012,7 @@ fn phase_str(phase: &rusternetes_common::types::Phase) -> String {
 /// `validateContainerResourceFieldSelector` is what actually rejects these.
 pub fn container_resource_value(
     container: &Container,
-    sel: &rusternetes_common::resources::ResourceFieldSelector,
+    sel: &k3rs_common::resources::ResourceFieldSelector,
     node_allocatable: Option<&HashMap<String, String>>,
 ) -> Option<String> {
     crate::downward_api::resolve_container_resource_in(container, sel, node_allocatable).ok()
@@ -1110,7 +1110,7 @@ fn translate_mount_propagation(mode: Option<&str>) -> i32 {
 /// `recursiveReadOnly` becomes the CRI `Mount.recursive_read_only` boolean.
 /// Error strings are upstream's verbatim.
 pub fn resolve_recursive_read_only(
-    vm: &rusternetes_common::resources::pod::VolumeMount,
+    vm: &k3rs_common::resources::pod::VolumeMount,
     runtime_supports_rro: bool,
 ) -> Result<bool, String> {
     let mode = match vm.recursive_read_only.as_deref() {
@@ -1216,8 +1216,8 @@ pub fn mounts_with(
     for vm in vms.iter() {
         // `if imageVolumes != nil && ImageVolume enabled { image =
         // imageVolumes[mount.Name] }` (`kubelet_pods.go:327-330`).
-        let image = if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::ImageVolume,
+        let image = if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::ImageVolume,
         ) {
             image_volumes.get(&vm.name)
         } else {
@@ -1343,7 +1343,7 @@ fn milli_cpu_to_quota(milli_cpu: i64, period: i64) -> i64 {
 pub fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResources> {
     let req = container.resources.as_ref();
     let cpu_of = |which: fn(
-        &rusternetes_common::types::ResourceRequirements,
+        &k3rs_common::types::ResourceRequirements,
     ) -> &Option<HashMap<String, String>>| {
         req.and_then(|r| which(r).as_ref())
             .and_then(|m| m.get("cpu"))
@@ -1384,7 +1384,7 @@ pub fn linux_resources(container: &Container) -> Option<v1::LinuxContainerResour
 /// through as-is (the translate layer is path-pure and has no kubelet root);
 /// RuntimeDefault/Unconfined — the common cases — need no path.
 fn seccomp_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
-    use rusternetes_common::resources::pod::SeccompProfile;
+    use k3rs_common::resources::pod::SeccompProfile;
     let scmp: &SeccompProfile = container
         .security_context
         .as_ref()
@@ -1423,7 +1423,7 @@ fn seccomp_security_profile(pod: &Pod, container: &Container) -> Option<v1::Secu
 /// `SecurityProfile`, not the deprecated `apparmor_profile` string (that exists
 /// solely for runtimes older than the CRI-v1 containerd we target).
 fn apparmor_security_profile(pod: &Pod, container: &Container) -> Option<v1::SecurityProfile> {
-    use rusternetes_common::resources::pod::AppArmorProfile;
+    use k3rs_common::resources::pod::AppArmorProfile;
     let profile: &AppArmorProfile = container
         .security_context
         .as_ref()

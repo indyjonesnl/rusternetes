@@ -38,8 +38,8 @@
 //! from the initial value through several scale steps (down to 0, back up) and
 //! asserts each step is reflected in the stored object.
 
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

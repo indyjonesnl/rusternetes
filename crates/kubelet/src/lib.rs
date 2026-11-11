@@ -61,7 +61,7 @@ pub mod volumes;
 pub use kubelet::PodWorkerState;
 
 use config::KubeletConfiguration;
-use rusternetes_storage::{Storage, StorageBackend};
+use k3rs_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::info;
 
@@ -86,7 +86,7 @@ pub struct KubeletConfig {
     /// options, so the storage-direct token fallback signs with the same key
     /// and issuer (all-in-one only; see
     /// [`kubelet::service_account_token_manager`]).
-    pub service_account: rusternetes_common::auth::ServiceAccountOptions,
+    pub service_account: k3rs_common::auth::ServiceAccountOptions,
 }
 
 impl Default for KubeletConfig {
@@ -96,7 +96,7 @@ impl Default for KubeletConfig {
             volume_dir: "./volumes".to_string(),
             cluster_dns: "10.96.0.10".to_string(),
             cluster_domain: "cluster.local".to_string(),
-            network: "rusternetes-network".to_string(),
+            network: "k3rs-network".to_string(),
             sync_interval: 3,
             metrics_port: 10250,
             kubernetes_service_host: "10.96.0.1".to_string(),
@@ -113,10 +113,7 @@ impl Default for KubeletConfig {
 /// This is the main entry point for embedding the kubelet in the all-in-one binary.
 /// Starts the kubelet sync loop and metrics server, blocks until shutdown.
 pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow::Result<()> {
-    info!(
-        "Starting Rusternetes Kubelet for node: {}",
-        config.node_name
-    );
+    info!("Starting k3rs Kubelet for node: {}", config.node_name);
 
     // RunKubelet: ParseNodeIPArgument + NewMainKubelet's cloud-provider gate
     // (server.go:1216-1222, kubelet.go:461-464, 619).
@@ -138,7 +135,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
 
     // Discover cluster DNS if not hardcoded
     let cluster_dns = {
-        use rusternetes_common::resources::Service;
+        use k3rs_common::resources::Service;
         match storage
             .get::<Service>("/registry/services/kube-system/kube-dns")
             .await
@@ -157,7 +154,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
 
     // Metrics server
     let metrics =
-        Arc::new(rusternetes_common::observability::MetricsRegistry::new().with_kubelet_metrics()?);
+        Arc::new(k3rs_common::observability::MetricsRegistry::new().with_kubelet_metrics()?);
     let metrics_clone = metrics.clone();
 
     let kubelet_config = KubeletConfiguration {

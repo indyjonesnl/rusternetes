@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Troubleshooting - Rūsternetes</title>
+  <title>Troubleshooting - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -297,7 +297,7 @@ kubectl get sc <span class="flag">-o</span> jsonpath='{.items[?(@.metadata.annot
       </p>
       <p>
         <strong>Cause:</strong> Another process (minikube, kind, a real Kubernetes cluster, or
-        a previous Rūsternetes instance) is already listening on the same port.
+        a previous k3rs instance) is already listening on the same port.
       </p>
       <p><strong>Fix:</strong></p>
 
@@ -317,7 +317,7 @@ lsof <span class="flag">-i</span> :2379
 <span class="comment"># Find what is using port 6379 (Redis)</span>
 lsof <span class="flag">-i</span> :6379
 
-<span class="comment"># Stop a previous Rūsternetes cluster</span>
+<span class="comment"># Stop a previous k3rs cluster</span>
 podman compose -f compose.yml down
 
 <span class="comment"># Or change the port mapping in compose.yml</span>
@@ -347,11 +347,11 @@ podman compose -f compose.yml ps
 podman compose -f compose.yml logs api-server
 
 <span class="comment"># Verify TLS certs exist</span>
-ls -la .rusternetes/certs/
+ls -la .k3rs/certs/
 
 <span class="comment"># Verify KUBECONFIG is set</span>
 echo $KUBECONFIG
-<span class="comment"># Should be: ~/.kube/rusternetes-config</span>
+<span class="comment"># Should be: ~/.kube/k3rs-config</span>
 
 <span class="comment"># Full restart</span>
 podman compose -f compose.yml down
@@ -374,7 +374,7 @@ bash scripts/bootstrap-cluster.sh</code>
         <li>Allocate more CPUs and memory to your container runtime</li>
         <li>Rebuild only the changed service: <code>podman compose -f compose.yml build api-server</code></li>
         <li>Build natively for faster iteration: <code>cargo build</code></li>
-        <li>Use <code>cargo test -p rusternetes-kubelet</code> to test a single crate instead of the entire workspace</li>
+        <li>Use <code>cargo test -p k3rs-kubelet</code> to test a single crate instead of the entire workspace</li>
       </ul>
 
       <h2>Podman: permission denied</h2>
@@ -484,7 +484,7 @@ podman compose -f compose.redis.yml exec redis redis-cli ping</code>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

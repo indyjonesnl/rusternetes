@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>High Availability - Rūsternetes</title>
+  <title>High Availability - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>High Availability</h1>
       <p class="lead">
-        Run Rūsternetes in a highly available configuration with a 3-node etcd cluster, leader
+        Run k3rs in a highly available configuration with a 3-node etcd cluster, leader
         election for the scheduler and controller manager, and multiple API server instances
         behind a load balancer. Tolerate the loss of any single component without cluster downtime.
       </p>
@@ -189,7 +189,7 @@ services:
       - <span class="flag">--listen-peer-urls</span>=<span class="value">http://0.0.0.0:2380</span>
       - <span class="flag">--initial-advertise-peer-urls</span>=<span class="value">http://etcd-1:2380</span>
       - <span class="flag">--initial-cluster</span>=<span class="value">etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380</span>
-      - <span class="flag">--initial-cluster-token</span>=<span class="value">rusternetes-etcd-cluster</span>
+      - <span class="flag">--initial-cluster-token</span>=<span class="value">k3rs-etcd-cluster</span>
       - <span class="flag">--initial-cluster-state</span>=<span class="value">new</span>
       - <span class="flag">--auto-compaction-retention</span>=<span class="value">10m</span>
       - <span class="flag">--quota-backend-bytes</span>=<span class="value">8589934592</span>
@@ -197,7 +197,7 @@ services:
     volumes:
       - etcd-1-data:/etcd-data
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   etcd-2:
     image: quay.io/coreos/etcd:v3.5
@@ -210,7 +210,7 @@ services:
       - <span class="flag">--listen-peer-urls</span>=<span class="value">http://0.0.0.0:2380</span>
       - <span class="flag">--initial-advertise-peer-urls</span>=<span class="value">http://etcd-2:2380</span>
       - <span class="flag">--initial-cluster</span>=<span class="value">etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380</span>
-      - <span class="flag">--initial-cluster-token</span>=<span class="value">rusternetes-etcd-cluster</span>
+      - <span class="flag">--initial-cluster-token</span>=<span class="value">k3rs-etcd-cluster</span>
       - <span class="flag">--initial-cluster-state</span>=<span class="value">new</span>
       - <span class="flag">--auto-compaction-retention</span>=<span class="value">10m</span>
       - <span class="flag">--quota-backend-bytes</span>=<span class="value">8589934592</span>
@@ -218,7 +218,7 @@ services:
     volumes:
       - etcd-2-data:/etcd-data
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   etcd-3:
     image: quay.io/coreos/etcd:v3.5
@@ -231,7 +231,7 @@ services:
       - <span class="flag">--listen-peer-urls</span>=<span class="value">http://0.0.0.0:2380</span>
       - <span class="flag">--initial-advertise-peer-urls</span>=<span class="value">http://etcd-3:2380</span>
       - <span class="flag">--initial-cluster</span>=<span class="value">etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380</span>
-      - <span class="flag">--initial-cluster-token</span>=<span class="value">rusternetes-etcd-cluster</span>
+      - <span class="flag">--initial-cluster-token</span>=<span class="value">k3rs-etcd-cluster</span>
       - <span class="flag">--initial-cluster-state</span>=<span class="value">new</span>
       - <span class="flag">--auto-compaction-retention</span>=<span class="value">10m</span>
       - <span class="flag">--quota-backend-bytes</span>=<span class="value">8589934592</span>
@@ -239,7 +239,7 @@ services:
     volumes:
       - etcd-3-data:/etcd-data
     networks:
-      - rusternetes-net
+      - k3rs-net
 
 volumes:
   etcd-1-data:
@@ -283,7 +283,7 @@ volumes:
         <tbody>
           <tr>
             <td><code>initial-cluster-token</code></td>
-            <td><code>rusternetes-etcd-cluster</code></td>
+            <td><code>k3rs-etcd-cluster</code></td>
             <td>Unique token to distinguish this cluster from other etcd clusters on the same network. All members must use the same token.</td>
           </tr>
           <tr>
@@ -351,7 +351,7 @@ volumes:
           <tr>
             <td><code><span class="flag">--leader-election-lock-key</span></code></td>
             <td>String</td>
-            <td><code><span class="value">"/rusternetes/scheduler/leader"</span></code></td>
+            <td><code><span class="value">"/k3rs/scheduler/leader"</span></code></td>
             <td>etcd key used for the leader election lease. All scheduler instances must use the same key to compete for the same lock.</td>
           </tr>
           <tr>
@@ -394,7 +394,7 @@ volumes:
           <tr>
             <td><code><span class="flag">--leader-election-lock-key</span></code></td>
             <td>String</td>
-            <td><code><span class="value">"/rusternetes/controller-manager/leader"</span></code></td>
+            <td><code><span class="value">"/k3rs/controller-manager/leader"</span></code></td>
             <td>etcd key for the controller manager leader lease.</td>
           </tr>
           <tr>
@@ -419,11 +419,11 @@ volumes:
           <span class="code-title">lock key format</span>
         </div>
         <code>
-/rusternetes/{component}/leader
+/k3rs/{component}/leader
 
 <span class="comment"># Examples:</span>
-/rusternetes/scheduler/leader
-/rusternetes/controller-manager/leader
+/k3rs/scheduler/leader
+/k3rs/controller-manager/leader
 </code>
       </pre>
 
@@ -464,7 +464,7 @@ volumes:
         <div class="admonition-title">TIP</div>
         <p>
           You can check which instance is the current leader by reading the lease key from etcd:
-          <code>etcdctl get /rusternetes/scheduler/leader</code>. The value contains the leader's
+          <code>etcdctl get /k3rs/scheduler/leader</code>. The value contains the leader's
           identity string and lease expiration timestamp.
         </p>
       </div>
@@ -480,26 +480,26 @@ volumes:
         </div>
         <code>
   scheduler-1:
-    image: rusternetes-scheduler
+    image: k3rs-scheduler
     command:
       - <span class="flag">--etcd-servers</span>=<span class="value">http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379</span>
       - <span class="flag">--enable-leader-election</span>
       - <span class="flag">--leader-election-identity</span>=<span class="value">scheduler-1</span>
-      - <span class="flag">--leader-election-lock-key</span>=<span class="value">/rusternetes/scheduler/leader</span>
+      - <span class="flag">--leader-election-lock-key</span>=<span class="value">/k3rs/scheduler/leader</span>
       - <span class="flag">--leader-election-lease-duration</span>=<span class="value">15s</span>
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   scheduler-2:
-    image: rusternetes-scheduler
+    image: k3rs-scheduler
     command:
       - <span class="flag">--etcd-servers</span>=<span class="value">http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379</span>
       - <span class="flag">--enable-leader-election</span>
       - <span class="flag">--leader-election-identity</span>=<span class="value">scheduler-2</span>
-      - <span class="flag">--leader-election-lock-key</span>=<span class="value">/rusternetes/scheduler/leader</span>
+      - <span class="flag">--leader-election-lock-key</span>=<span class="value">/k3rs/scheduler/leader</span>
       - <span class="flag">--leader-election-lease-duration</span>=<span class="value">15s</span>
     networks:
-      - rusternetes-net
+      - k3rs-net
 </code>
       </pre>
 
@@ -566,31 +566,31 @@ backend api-servers
         </div>
         <code>
   api-server-1:
-    image: rusternetes-api-server
+    image: k3rs-api-server
     environment:
       - ETCD_SERVERS=http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379
     volumes:
-      - .rusternetes/certs:/certs:ro
+      - .k3rs/certs:/certs:ro
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   api-server-2:
-    image: rusternetes-api-server
+    image: k3rs-api-server
     environment:
       - ETCD_SERVERS=http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379
     volumes:
-      - .rusternetes/certs:/certs:ro
+      - .k3rs/certs:/certs:ro
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   api-server-3:
-    image: rusternetes-api-server
+    image: k3rs-api-server
     environment:
       - ETCD_SERVERS=http://etcd-1:2379,http://etcd-2:2379,http://etcd-3:2379
     volumes:
-      - .rusternetes/certs:/certs:ro
+      - .k3rs/certs:/certs:ro
     networks:
-      - rusternetes-net
+      - k3rs-net
 </code>
       </pre>
 
@@ -745,15 +745,15 @@ podman compose -f compose.ha.yml exec etcd-1 \
 
 <span class="comment"># Check current scheduler leader</span>
 podman compose -f compose.ha.yml exec etcd-1 \
-  etcdctl get /rusternetes/scheduler/leader <span class="flag">--print-value-only</span>
+  etcdctl get /k3rs/scheduler/leader <span class="flag">--print-value-only</span>
 
 <span class="comment"># Check current controller manager leader</span>
 podman compose -f compose.ha.yml exec etcd-1 \
-  etcdctl get /rusternetes/controller-manager/leader <span class="flag">--print-value-only</span>
+  etcdctl get /k3rs/controller-manager/leader <span class="flag">--print-value-only</span>
 
 <span class="comment"># Watch leader election changes in real time</span>
 podman compose -f compose.ha.yml exec etcd-1 \
-  etcdctl watch /rusternetes/ <span class="flag">--prefix</span>
+  etcdctl watch /k3rs/ <span class="flag">--prefix</span>
 </code>
       </pre>
 
@@ -792,7 +792,7 @@ podman compose -f compose.ha.yml exec etcd-1 \
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

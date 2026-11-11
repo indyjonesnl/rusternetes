@@ -2,7 +2,7 @@
 
 
 > **Tip:** Node status, CPU/memory utilization, and pod assignments are visible in the [web console](CONSOLE_USER_GUIDE.md) Nodes and Topology pages.
-This guide explains how to configure the Rusternetes Kubelet using production-grade configuration methods.
+This guide explains how to configure the k3rs Kubelet using production-grade configuration methods.
 
 ## Table of Contents
 
@@ -16,7 +16,7 @@ This guide explains how to configure the Rusternetes Kubelet using production-gr
 
 ## Overview
 
-The Rusternetes Kubelet supports three configuration methods, designed to work seamlessly in both development and production environments:
+The k3rs Kubelet supports three configuration methods, designed to work seamlessly in both development and production environments:
 
 1. **CLI Flags** - Direct command-line arguments (highest precedence)
 2. **Configuration File** - YAML file following Kubernetes conventions
@@ -70,7 +70,7 @@ Simple environment-based configuration. Maintained for:
 - Docker Compose simplicity
 
 ```bash
-export KUBELET_VOLUMES_PATH=/tmp/rusternetes-volumes
+export KUBELET_VOLUMES_PATH=/tmp/k3rs-volumes
 export KUBELET_ROOT_DIR=/var/lib/kubelet
 export RUST_LOG=debug
 
@@ -228,8 +228,8 @@ Production deployment using systemd:
 ```ini
 # /etc/systemd/system/kubelet.service
 [Unit]
-Description=Rusternetes Kubelet
-Documentation=https://github.com/yourusername/rusternetes
+Description=k3rs Kubelet
+Documentation=https://github.com/yourusername/k3rs
 After=network.target
 
 [Service]
@@ -252,7 +252,7 @@ WantedBy=multi-user.target
 ```yaml
 services:
   kubelet:
-    image: rusternetes/kubelet:latest
+    image: k3rs/kubelet:latest
     command:
       - "--hostname-override=node-1"
       - "--etcd-servers=http://etcd:2379"
@@ -268,7 +268,7 @@ services:
 ```yaml
 services:
   kubelet:
-    image: rusternetes/kubelet:latest
+    image: k3rs/kubelet:latest
     command:
       - "--hostname-override=node-1"
       - "--etcd-servers=http://etcd:2379"
@@ -348,7 +348,7 @@ However, CLI flags and config files will override environment variables if speci
 The kubelet logs its effective configuration at startup:
 
 ```
-INFO Starting Rusternetes Kubelet
+INFO Starting k3rs Kubelet
 INFO Kubelet Runtime Configuration:
   Node Name: worker-1
   Root Directory: /var/lib/kubelet
@@ -396,7 +396,7 @@ If you see unexpected behavior, check the precedence order. CLI flags always win
 
 This implementation follows Kubernetes conventions:
 
-| Aspect | Rusternetes | Kubernetes |
+| Aspect | k3rs | Kubernetes |
 |--------|-------------|------------|
 | Config API | `kubelet.config.k8s.io/v1beta1` | `kubelet.config.k8s.io/v1beta1` |
 | CLI Flags | `--root-dir`, `--volume-dir` | `--root-dir`, `--volume-plugin-dir` |
@@ -405,9 +405,9 @@ This implementation follows Kubernetes conventions:
 | Precedence | CLI > File > Env > Default | CLI > File > Default |
 
 Key differences:
-- Rusternetes adds environment variable support for development convenience
-- Rusternetes simplifies volume path structure (no pod UID subdirectories)
-- Rusternetes combines root-dir-based defaults for easier setup
+- k3rs adds environment variable support for development convenience
+- k3rs simplifies volume path structure (no pod UID subdirectories)
+- k3rs combines root-dir-based defaults for easier setup
 
 ## See Also
 

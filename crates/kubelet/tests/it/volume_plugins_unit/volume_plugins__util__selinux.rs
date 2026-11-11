@@ -2,19 +2,19 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::pod::{PodSecurityContext, SELinuxOptions};
-    pub use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
-    pub use rusternetes_kubelet::go_selinux_label::Labeler;
-    pub use rusternetes_kubelet::volume_plugins::plugin::Spec;
-    pub use rusternetes_kubelet::volume_plugins::registry::VolumePluginMgr;
-    pub use rusternetes_kubelet::volume_plugins::util::contains_access_mode;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::pod::{PodSecurityContext, SELinuxOptions};
+    pub use k3rs_common::resources::volume::PersistentVolumeAccessMode;
+    pub use k3rs_kubelet::go_selinux_label::Labeler;
+    pub use k3rs_kubelet::volume_plugins::plugin::Spec;
+    pub use k3rs_kubelet::volume_plugins::registry::VolumePluginMgr;
+    pub use k3rs_kubelet::volume_plugins::util::contains_access_mode;
     pub use std::collections::BTreeSet;
 }
 
 mod real_translator_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::selinux::*;
+    use k3rs_kubelet::volume_plugins::util::selinux::*;
 
     #[test]
     fn real_translator_reports_the_platform_selinux_state() {
@@ -22,15 +22,15 @@ mod real_translator_tests {
         // (selinux.go:96-98), not a constant.
         assert_eq!(
             Translator.selinux_enabled(),
-            rusternetes_kubelet::go_selinux::get_enabled()
+            k3rs_kubelet::go_selinux::get_enabled()
         );
     }
 }
 
 mod translator_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::go_selinux_label::LxcContexts;
-    use rusternetes_kubelet::volume_plugins::util::selinux::*;
+    use k3rs_kubelet::go_selinux_label::LxcContexts;
+    use k3rs_kubelet::volume_plugins::util::selinux::*;
 
     fn labeler() -> Labeler {
         Labeler::new(LxcContexts::parse(
@@ -100,7 +100,7 @@ mod translator_tests {
 
 mod add_selinux_mount_option_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::selinux::*;
+    use k3rs_kubelet::volume_plugins::util::selinux::*;
 
     /// `selinux.go:233-235`: the comma-bearing example from upstream's comment
     /// is quoted as one option; the gate off leaves the options alone.

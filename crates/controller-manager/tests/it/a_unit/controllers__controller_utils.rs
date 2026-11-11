@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::pod::PodCondition;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_common::types::Phase;
+    pub use k3rs_common::resources::pod::PodCondition;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_common::types::Phase;
     pub use std::collections::{HashMap, HashSet};
     pub use std::time::Duration;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::controller_utils::*;
+    use k3rs_controller_manager::controllers::controller_utils::*;
     use serde_json::json;
 
     const GATES_ON: RankGates = RankGates {
@@ -26,7 +26,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn rank_gates_follow_logarithmic_scale_down_feature() {
-        use rusternetes_common::feature_gates::{self, Feature};
+        use k3rs_common::feature_gates::{self, Feature};
         feature_gates::reset_to_defaults();
         assert!(feature_gates::enabled(Feature::LogarithmicScaleDown));
         assert!(RankGates::current().logarithmic_scale_down);

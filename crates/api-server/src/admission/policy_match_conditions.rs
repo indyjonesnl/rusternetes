@@ -16,7 +16,7 @@
 //! (`Match`'s `authz` argument, a `NewCachingAuthorizer` from the dispatcher,
 //! #3228) is bound to the CEL `authorizer` / `authorizer.requestResource`
 //! variables (`OptionalVariableBindings.Authorizer`, matcher.go:80-86;
-//! `rusternetes_common::cel_authz_library`, #3300). A non-`bool` result is an
+//! `k3rs_common::cel_authz_library`, #3300). A non-`bool` result is an
 //! evaluation error here; the compile-time rejection (`ReturnTypes`) happens at
 //! policy / configuration validation (`cel_env::output_type_failure`).
 
@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use rusternetes_common::admission::Operation;
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::cel::CELEvaluator;
-use rusternetes_common::cel_cost::{charge_budget, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS};
-use rusternetes_common::cel_struct::TypeCheck;
-use rusternetes_common::resources::admission_webhook::MatchCondition;
-use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
+use k3rs_common::admission::Operation;
+use k3rs_common::authz::Authorizer;
+use k3rs_common::cel::CELEvaluator;
+use k3rs_common::cel_cost::{charge_budget, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS};
+use k3rs_common::cel_struct::TypeCheck;
+use k3rs_common::resources::admission_webhook::MatchCondition;
+use k3rs_common::resources::validating_admission_policy::FailurePolicy;
 use serde_json::Value;
 
 use super::admission_metrics::{

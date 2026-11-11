@@ -451,7 +451,7 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// which every workload spec validator calls — `ValidateStatefulSetSpec`
 /// (`pkg/apis/apps/validation/validation.go:214`), `ValidateDaemonSetSpec`
 /// (`:454`), `ValidatePodTemplateSpecForReplicaSet` (`:656`) and
-/// `ValidateJobSpec` (`pkg/apis/batch/validation/validation.go:276`). Rusternetes
+/// `ValidateJobSpec` (`pkg/apis/batch/validation/validation.go:276`). k3rs
 /// called that predicate from the standalone `PodTemplate` handler only, so this
 /// slice had to wire it into all five validators *first*: defaulting the fields
 /// without it would have turned serde's 400 into a silent accept rather than
@@ -460,7 +460,7 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `pod.rs`: 85 fields over four slices — the container surface (#1953), the
 /// pod-level surface (#1954), every volume source (#2005) and affinity (#2006).
 /// Most of them needed a validator ported before they could be defaulted, because
-/// Rusternetes had none: `validateEnvFrom`, `validateVolumeDevices`,
+/// k3rs had none: `validateEnvFrom`, `validateVolumeDevices`,
 /// `validateResizePolicy`, `validateContainerRestartRules`,
 /// `validateSeccompProfile`, `validateAppArmorProfile`, `validateOS`,
 /// `validatePodResourceClaims`, `validateReadinessGates`,
@@ -549,7 +549,7 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `validating_admission_policy.rs`: 8 fields over the policy spec
 /// (`ParamKind.kind`, `Validation.expression`, `AuditAnnotation.key` and
 /// `.valueExpression`, `Variable.name` and `.expression`) and the status
-/// (`ExpressionWarning.fieldRef` and `.warning`). Rusternetes had no
+/// (`ExpressionWarning.fieldRef` and `.warning`). k3rs had no
 /// admissionregistration policy validator at all — a policy with an empty
 /// `validations[0].expression`, a duplicate variable name or an unsupported
 /// `validationActions` entry was a 201 — so this slice ported
@@ -625,7 +625,7 @@ fn every_field_of_a_status_condition_decodes_when_absent() {
 /// `…_volumesnapshotcontents.yaml`: the `required:` lists
 /// (`[source]`, and `[deletionPolicy, driver, source, volumeSnapshotRef]`) and
 /// the `x-kubernetes-validations` CEL rules, whose `message:` strings are
-/// reproduced verbatim. Rusternetes serves both types natively rather than
+/// reproduced verbatim. k3rs serves both types natively rather than
 /// through the CRD machinery, so nothing else applied the schema and a
 /// snapshot with no `spec.source` at all was written. `volumeSnapshotClassName`
 /// is an `Option` and not a defaulted `String` for the same reason

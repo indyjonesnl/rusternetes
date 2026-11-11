@@ -1,4 +1,4 @@
-//! `rusternetes_common::qos` — the one port of upstream
+//! `k3rs_common::qos` — the one port of upstream
 //! `pkg/apis/core/v1/helper/qos/qos.go`.
 //!
 //! [`compute_pod_qos`] (upstream `ComputePodQOS`) is covered in depth from the
@@ -10,8 +10,8 @@
 //! ResourceQuota `BestEffort` scope and the CPU-resize gate agree with the
 //! class the api-server wrote.
 
-use rusternetes_common::qos::{compute_pod_qos, get_pod_qos, QoSClass};
-use rusternetes_common::resources::Pod;
+use k3rs_common::qos::{compute_pod_qos, get_pod_qos, QoSClass};
+use k3rs_common::resources::Pod;
 use serde_json::json;
 
 fn pod(value: serde_json::Value) -> Pod {
@@ -139,7 +139,7 @@ fn qos_class_strings_round_trip() {
 // never consulted.
 // ---------------------------------------------------------------------------
 
-use rusternetes_common::feature_gates::{with_feature, Feature};
+use k3rs_common::feature_gates::{with_feature, Feature};
 
 /// Pod-level limits for both cpu and memory, containers declaring nothing.
 /// `SetDefaults_Pod` (defaults.go:196-199, `defaultPodRequests`) defaults the

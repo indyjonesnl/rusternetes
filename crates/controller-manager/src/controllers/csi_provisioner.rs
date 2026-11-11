@@ -44,36 +44,36 @@ use super::csi_topology::{
     TopologyStore,
 };
 use anyhow::{anyhow, Context, Result};
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::{
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::{
     CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeMode,
     PersistentVolumePhase, PersistentVolumeReclaimPolicy, ReferenceGrant, SecretReference,
     StorageClass, VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
     PersistentVolumeStatus, Secret,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
-use rusternetes_csi::controller_client::{
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+use k3rs_csi::controller_client::{
     check_driver_capabilities, ControllerError, CsiControllerClient, DriverCapabilities,
     ProvisioningState, RequiredCapabilities,
 };
-use rusternetes_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
-use rusternetes_csi::proto::volume_capability::access_mode::Mode as AccessModeKind;
-use rusternetes_csi::proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
-use rusternetes_csi::proto::volume_content_source::{
+use k3rs_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
+use k3rs_csi::proto::volume_capability::access_mode::Mode as AccessModeKind;
+use k3rs_csi::proto::volume_capability::{AccessMode, AccessType, BlockVolume, MountVolume};
+use k3rs_csi::proto::volume_content_source::{
     SnapshotSource, Type as ContentSourceType, VolumeSource,
 };
-use rusternetes_csi::proto::{
+use k3rs_csi::proto::{
     CapacityRange, CreateVolumeRequest, DeleteVolumeRequest, VolumeCapability, VolumeContentSource,
 };
-use rusternetes_storage::WorkQueueConfig;
-use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+use k3rs_storage::WorkQueueConfig;
+use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1130,7 +1130,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 // become the owner."
                 let allowed = sc.allowed_topologies.as_deref().unwrap_or_default();
                 if !allowed.is_empty() && self.driver_capabilities().await?.supports_topology() {
-                    let node: rusternetes_common::resources::Node = self
+                    let node: k3rs_common::resources::Node = self
                         .storage
                         .get(&build_key("nodes", None, &nd.node_name))
                         .await
@@ -1200,7 +1200,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             return Err(anyhow!("empty storage class name"));
         };
         let sc = self.get_storage_class(class).await?;
-        let node: rusternetes_common::resources::Node = self
+        let node: k3rs_common::resources::Node = self
             .storage
             .get(&build_key("nodes", None, selected_node))
             .await
@@ -1219,7 +1219,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         // selected. But we have to be prepared for more than one (=> check
         // all, success if there is at least one) and none (no node selected
         // => check once without topology)."
-        let mut topologies: Vec<Option<rusternetes_csi::proto::Topology>> = vec![None];
+        let mut topologies: Vec<Option<k3rs_csi::proto::Topology>> = vec![None];
         if let Some(req) = prepared
             .req
             .accessibility_requirements
@@ -1231,7 +1231,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         for topology in topologies {
             let available = self
                 .client
-                .get_capacity(rusternetes_csi::proto::GetCapacityRequest {
+                .get_capacity(k3rs_csi::proto::GetCapacityRequest {
                     volume_capabilities: prepared.req.volume_capabilities.clone(),
                     parameters: prepared.req.parameters.clone(),
                     accessible_topology: topology,
@@ -1353,7 +1353,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 // "Lost the race or some other concurrent modification.
                 // Repeat the attempt." The next attempt uses a longer delay
                 // and most likely stops quickly once it sees the owner.
-                Err(rusternetes_common::Error::Conflict(_)) => {
+                Err(k3rs_common::Error::Conflict(_)) => {
                     debug!(
                         "conflict during PVC {ns}/{} update, will try again",
                         claim.metadata.name
@@ -1770,7 +1770,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             // deletion timestamp".
             let mut fresh: PersistentVolume = match self.storage.get(&key).await {
                 Ok(v) => v,
-                Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+                Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
                 Err(e) => {
                     return Err(anyhow!(
                         "failed to get persistentvolume to update finalizer: {e}"
@@ -1792,7 +1792,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 }
                 match self.storage.update(&key, &fresh).await {
                     Ok(_) => {}
-                    Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+                    Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
                     Err(e) => {
                         return Err(anyhow!(
                             "failed to remove finalizer for persistentvolume: {e}"
@@ -1806,7 +1806,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                     && fresh.metadata.finalizers.is_none()
                 {
                     match self.storage.delete(&key).await {
-                        Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+                        Ok(()) | Err(k3rs_common::Error::NotFound(_)) => {}
                         Err(e) => return Err(anyhow!("failed to delete persistentvolume: {e}")),
                     }
                 }
@@ -2251,7 +2251,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 sc,
                 &fs_type,
                 caps.controller.contains(
-                    &rusternetes_csi::proto::controller_service_capability::rpc::Type::SingleNodeMultiWriter,
+                    &k3rs_csi::proto::controller_service_capability::rpc::Type::SingleNodeMultiWriter,
                 ),
             )
             .map_err(fin)?;
@@ -2743,7 +2743,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         let key = build_key("volumesnapshots", Some(namespace), name);
         let mut snapshot: VolumeSnapshot = match self.storage.get(&key).await {
             Ok(s) => s,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         if !has_finalizer(&snapshot.metadata, SNAPSHOT_SOURCE_PROTECTION_FINALIZER) {
@@ -2753,7 +2753,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             f.retain(|f| f != SNAPSHOT_SOURCE_PROTECTION_FINALIZER);
         }
         match self.storage.update(&key, &snapshot).await {
-            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Ok(_) | Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -3066,7 +3066,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
     async fn save_volume(&self, pv: &PersistentVolume) -> Result<()> {
         let key = build_key("persistentvolumes", None, &pv.metadata.name);
         match self.storage.create(&key, pv).await {
-            Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => Ok(()),
+            Ok(_) | Err(k3rs_common::Error::AlreadyExists(_)) => Ok(()),
             Err(e) => Err(anyhow!("error saving volume {}: {e}", pv.metadata.name)),
         }
     }
@@ -3188,7 +3188,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             .await
         {
             Ok(v) => v,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         self.sync_volume(&volume)
@@ -3224,7 +3224,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
         }
         loop {
             self.enqueue_all_volumes(&queue).await;
-            let prefix = rusternetes_storage::build_prefix("persistentvolumes", None);
+            let prefix = k3rs_storage::build_prefix("persistentvolumes", None);
             let mut watch = match self.storage.watch(&prefix).await {
                 Ok(w) => w,
                 Err(e) => {
@@ -3308,7 +3308,7 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
                 return Ok(());
             }
             self.enqueue_all(&queue).await;
-            let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", None);
+            let prefix = k3rs_storage::build_prefix("persistentvolumeclaims", None);
             let mut watch = match self.storage.watch(&prefix).await {
                 Ok(w) => w,
                 Err(e) => {

@@ -10,14 +10,14 @@
 
 use crate::framework_runtime::{default_plugins, merge_plugins, PluginSet, Plugins};
 use crate::volume_binding::{FunctionShapePoint, MAX_CUSTOM_PRIORITY_SCORE, MAX_NODE_SCORE};
-use rusternetes_common::go_duration::format_go_duration;
-use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
-use rusternetes_common::quota::is_extended_resource_name;
-use rusternetes_common::resources::pod::{
+use k3rs_common::go_duration::format_go_duration;
+use k3rs_common::label_selector::{LabelOperator, LabelRequirement};
+use k3rs_common::quota::is_extended_resource_name;
+use k3rs_common::resources::pod::{
     NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, TopologySpreadConstraint,
 };
-use rusternetes_common::validation::field::{self, BadValue, ErrorList, Path};
-use rusternetes_common::validation::metav1::{is_qualified_name, validate_label_name};
+use k3rs_common::validation::field::{self, BadValue, ErrorList, Path};
+use k3rs_common::validation::metav1::{is_qualified_name, validate_label_name};
 use serde::{Deserialize, Serialize};
 
 /// `config.UtilizationShapePoint` (pkg/scheduler/apis/config/types.go).
@@ -606,7 +606,7 @@ impl NodeResourcesFitArgs {
 /// `time.ParseDuration` (apimachinery meta/v1/duration.go `UnmarshalJSON`).
 /// Signed because validation must see negative values.
 mod metav1_duration_nanos {
-    use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
+    use k3rs_common::go_duration::{format_go_duration, parse_go_duration};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
@@ -647,7 +647,7 @@ impl DynamicResourcesFeatures {
     /// `NewSchedulerFeaturesFromGates(feature.DefaultFeatureGate)` (validation.go:162)
     /// for the three gates used here.
     pub fn from_gates() -> Self {
-        use rusternetes_common::feature_gates::{enabled, Feature};
+        use k3rs_common::feature_gates::{enabled, Feature};
         Self {
             dra_scheduler_filter_timeout: enabled(Feature::DRASchedulerFilterTimeout),
             dra_device_binding_conditions: enabled(Feature::DRADeviceBindingConditions),
@@ -807,7 +807,7 @@ struct PluginConfig {
 /// document has no `VolumeBinding` pluginConfig. `Err` carries the aggregated
 /// validation errors, mirroring `ValidateVolumeBindingArgs` run per profile
 /// (validation.go ValidateKubeSchedulerConfiguration; only the first profile is
-/// consulted because Rusternetes runs a single `default-scheduler` profile).
+/// consulted because k3rs runs a single `default-scheduler` profile).
 pub fn volume_binding_args_from_config(
     doc: &str,
     storage_capacity_scoring: bool,
@@ -1351,8 +1351,8 @@ fn validate_percentage_of_nodes_to_score(path: &Path, pct: Option<i32>) -> Error
 /// feature gates, so apply `--feature-gates` first.
 pub fn load_volume_binding_args(path: &str) -> Result<VolumeBindingArgs, String> {
     let doc = std::fs::read_to_string(path).map_err(|e| format!("reading config {path}: {e}"))?;
-    let scoring = rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    let scoring = k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::StorageCapacityScoring,
     );
     volume_binding_args_from_config(&doc, scoring)
         .map_err(|e| format!("invalid config {path}: {e}"))
@@ -1362,8 +1362,8 @@ pub fn load_volume_binding_args(path: &str) -> Result<VolumeBindingArgs, String>
 /// scheduler-name-indexed [`crate::profile::Map`].
 pub fn load_profiles(path: &str) -> Result<crate::profile::Map, String> {
     let doc = std::fs::read_to_string(path).map_err(|e| format!("reading config {path}: {e}"))?;
-    let scoring = rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    let scoring = k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::StorageCapacityScoring,
     );
     profiles_from_config(&doc, scoring).map_err(|e| format!("invalid config {path}: {e}"))
 }

@@ -46,7 +46,7 @@ env:
   # mounts; compose/bake validate the volume spec even for a build-only run, so
   # an unset value yields "invalid spec: ::rw,rshared". No container is started
   # here — the path just has to be a non-empty absolute path.
-  KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+  KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.k3rs/volumes
   # scheduler / controller-manager / dns sit behind the `build` compose profile.
   COMPOSE_PROFILES: build
   IMAGE_PREFIX: ghcr.io/indyjonesnl/rusternetes
@@ -92,13 +92,13 @@ jobs:
 
       - name: Build + push by digest (linux/${{ matrix.arch }})
         env:
-          RUSTERNETES_GIT_SHA: ${{ github.sha }}
+          K3RS_GIT_SHA: ${{ github.sha }}
           # compose.ghcr.yml requires this to resolve during parse, but the
           # per-target --set below overrides each image ref to a bare repo (no
           # tag) — push-by-digest rejects a tagged ref ("can't push tagged ref
           # by digest"), so the sha-/main tags are applied later by the merge
           # job via imagetools, not here.
-          RUSTERNETES_IMAGE_TAG: sha-${{ github.sha }}
+          K3RS_IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
           # One --set per target forcing a tag-less repo name (compose.ghcr.yml

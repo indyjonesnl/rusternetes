@@ -3,8 +3,8 @@
 //! `apierrors.IsNotFound` (apimachinery errors.go:529-538) and the Status
 //! message survive instead of being dropped.
 
-use rusternetes_client::api_status::is_not_found;
-use rusternetes_client::http::{ApiClient, GetError};
+use k3rs_client::api_status::is_not_found;
+use k3rs_client::http::{ApiClient, GetError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

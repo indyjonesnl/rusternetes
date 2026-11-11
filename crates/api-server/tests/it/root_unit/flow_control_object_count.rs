@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::flow_control_work_estimator::{Stats, StatsError};
+    pub use k3rs_api_server::flow_control_work_estimator::{Stats, StatsError};
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, Mutex};
     pub use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::flow_control_object_count::*;
+    use k3rs_api_server::flow_control_object_count::*;
 
     struct FakeClock(Mutex<Instant>);
     impl FakeClock {

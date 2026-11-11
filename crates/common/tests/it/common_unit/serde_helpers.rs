@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::serde_helpers::empty_as_none as empty_string_as_none;
+    pub use k3rs_common::serde_helpers::empty_as_none as empty_string_as_none;
     pub use serde::{Deserialize, Deserializer};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::serde_helpers::*;
+    use k3rs_common::serde_helpers::*;
     use serde::Serialize;
 
     #[derive(Debug, Deserialize, Serialize, PartialEq)]

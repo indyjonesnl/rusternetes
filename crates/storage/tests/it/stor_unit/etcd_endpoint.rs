@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::{Error, Result};
+    pub use k3rs_common::{Error, Result};
     pub use std::path::PathBuf;
     pub use tokio::net::{TcpListener, UnixStream};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::etcd_endpoint::*;
+    use k3rs_storage::etcd_endpoint::*;
 
     fn unix(p: &str, tls: bool) -> ParsedEndpoint {
         ParsedEndpoint::Unix {

@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::ControllerRevision;
-use rusternetes_common::validation::controllerrevision::{
+use k3rs_common::resources::ControllerRevision;
+use k3rs_common::validation::controllerrevision::{
     validate_controller_revision, validate_controller_revision_update,
 };
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

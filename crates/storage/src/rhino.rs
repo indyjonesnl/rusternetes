@@ -1,6 +1,6 @@
 //! Rhino-backed storage using rhino's `Backend` trait directly.
 //!
-//! This module implements the rusternetes [`Storage`] trait on top of rhino
+//! This module implements the k3rs [`Storage`] trait on top of rhino
 //! backends (SQLite, Redis, etc.), bypassing the gRPC layer entirely.
 //! The result is an embedded, zero-dependency storage backend suitable for
 //! single-node / all-in-one deployments — no external etcd or rhino server
@@ -10,12 +10,12 @@ use crate::busy::{map_backend_error, retry_busy, RetryPolicy};
 use crate::concurrency;
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
+use k3rs_common::{authz::AuthzStorage, Error, Result};
 use rhino::backend::Backend;
 #[cfg(feature = "redis")]
 use rhino::{RedisBackend, RedisConfig};
 #[cfg(feature = "sqlite")]
 use rhino::{SqliteBackend, SqliteConfig};
-use rusternetes_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 
 /// Storage implementation backed by a rhino backend.
 ///
-/// Embeds a rhino backend in-process and translates rusternetes'
+/// Embeds a rhino backend in-process and translates k3rs'
 /// [`Storage`] trait calls directly into rhino backend operations.
 /// No gRPC, no network — pure in-process Rust calls.
 pub struct RhinoStorage<B: Backend> {

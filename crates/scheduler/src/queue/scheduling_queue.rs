@@ -46,7 +46,7 @@ use super::events::*;
 use super::heap::Heap;
 use super::nominator::{NominatingInfo, Nominator, PodLister, PodRef};
 use crate::fwk::{Code, Status};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

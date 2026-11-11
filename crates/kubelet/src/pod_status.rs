@@ -11,7 +11,7 @@
 //! migrated. Slice 2 (#3901): create-error, app-start-error and init-failure
 //! writes too, plus reason/message preservation.
 
-use rusternetes_common::{
+use k3rs_common::{
     resources::{pod::HostIP, ContainerStatus, Pod, PodCondition, PodIP, PodStatus},
     types::Phase,
 };
@@ -238,11 +238,7 @@ pub fn rejected_pod_status(pod: &Pod, reason: &str, message: &str) -> PodStatus 
         })
         .unwrap_or_default();
     PodStatus {
-        qos_class: Some(
-            rusternetes_common::qos::compute_pod_qos(pod)
-                .as_str()
-                .to_string(),
-        ),
+        qos_class: Some(k3rs_common::qos::compute_pod_qos(pod).as_str().to_string()),
         phase: Some(Phase::Failed),
         reason: Some(reason.to_string()),
         message: Some(format!("Pod was rejected: {message}")),

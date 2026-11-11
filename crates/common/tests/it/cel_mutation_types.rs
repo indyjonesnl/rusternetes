@@ -4,11 +4,11 @@
 //! (`cel/mutation/typeresolver.go`) and the output types of
 //! `patch/smd.go:52` / `patch/json_patch.go:57`.
 
-use rusternetes_common::cel_env::ExpectedOutput;
-use rusternetes_common::cel_mutation_types::{
+use k3rs_common::cel_env::ExpectedOutput;
+use k3rs_common::cel_mutation_types::{
     check_mutation_expression, mutation_divergence, PolicyExpression,
 };
-use rusternetes_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
+use k3rs_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
 
 fn set() -> EnvSet {
     EnvSet::must_base_env_set(default_compatibility_version())

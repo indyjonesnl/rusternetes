@@ -6,7 +6,7 @@
 //! snapshot and writes its whole object back, reverting the client's spec
 //! update. A status-only write must leave the stored spec untouched.
 
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_storage::{MemoryStorage, Storage};
 use serde_json::{json, Value};
 
 fn quota(cpu: &str, memory: &str) -> Value {
@@ -105,10 +105,7 @@ async fn update_status_cas_stale_rv_conflicts_and_keeps_spec() {
         .update_status_cas::<Value>(key, &v)
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
-        "{err:?}"
-    );
+    assert!(matches!(err, k3rs_common::Error::Conflict(_)), "{err:?}");
     let got: Value = storage.get(key).await.unwrap();
     assert_eq!(got["spec"]["hard"]["cpu"], json!("2"));
     assert!(got.get("status").is_none() || got["status"].is_null());

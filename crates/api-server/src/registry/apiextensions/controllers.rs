@@ -31,7 +31,7 @@
 
 use std::collections::HashSet;
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CustomResourceDefinition, CustomResourceDefinitionCondition, CustomResourceDefinitionNames,
     CustomResourceDefinitionStatus,
 };
@@ -368,7 +368,7 @@ pub fn sync_establishing(crd: &CustomResourceDefinition) -> Option<CustomResourc
         .as_ref()
         .and_then(|c| c.webhook.as_ref())
         .and_then(|w| w.client_config.ca_bundle.as_deref())
-        .is_some_and(rusternetes_common::validation::crd::is_invalid_ca_bundle);
+        .is_some_and(k3rs_common::validation::crd::is_invalid_ca_bundle);
     let established = if invalid_ca_bundle {
         condition(
             ESTABLISHED,

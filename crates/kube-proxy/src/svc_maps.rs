@@ -9,8 +9,8 @@
 
 use crate::iptables::{cluster_ip_for_family, IpFamily};
 use crate::service_health::NamespacedName;
-use rusternetes_common::resources::service::ServiceExternalTrafficPolicy;
-use rusternetes_common::resources::{EndpointSlice, Service, ServiceType};
+use k3rs_common::resources::service::ServiceExternalTrafficPolicy;
+use k3rs_common::resources::{EndpointSlice, Service, ServiceType};
 use std::collections::{HashMap, HashSet};
 
 /// `proxyutil.ShouldSkipService` (pkg/proxy/util/utils.go:55-67) plus the

@@ -11,7 +11,7 @@
 //! `ValidateJobSpec` (`pkg/apis/batch/validation/validation.go:276`) — so the
 //! answer is the same shape for all of them.
 //!
-//! Rusternetes answered serde's 400 BadRequest instead: `missing field
+//! k3rs answered serde's 400 BadRequest instead: `missing field
 //! `containers``, with no `reason`, no `details.causes`, no field path. Fixing
 //! that meant two changes in one commit, because they are only correct
 //! together — the workload validators had to start calling
@@ -20,7 +20,7 @@
 //! `#[serde(default)]`. Defaulting alone would have turned the 400 into a
 //! silent accept (#1939).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// A 400 means the body never reached a validator; the field path and the

@@ -1,9 +1,7 @@
 //! `TestNodePorts` (`plugins/nodeports/node_ports_test.go`).
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{
-    Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin,
-};
-use rusternetes_scheduler::in_tree::{NodePorts, ERR_REASON_NODE_PORTS};
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin};
+use k3rs_scheduler::in_tree::{NodePorts, ERR_REASON_NODE_PORTS};
 use serde_json::json;
 
 /// `newPod(host, "PROTO/ip/port"...)`.
@@ -23,7 +21,7 @@ fn new_pod(host: &str, ports: &[&str]) -> Pod {
     .unwrap()
 }
 
-async fn run(pod: Pod, existing: Vec<Pod>) -> rusternetes_scheduler::fwk::Status {
+async fn run(pod: Pod, existing: Vec<Pod>) -> k3rs_scheduler::fwk::Status {
     let node: Node = serde_json::from_value(json!({"metadata": {"name": "m1"}})).unwrap();
     let mut state = CycleState::new();
     let (result, status) = NodePorts
@@ -31,7 +29,7 @@ async fn run(pod: Pod, existing: Vec<Pod>) -> rusternetes_scheduler::fwk::Status
         .await;
     assert!(result.is_none(), "NodePorts never narrows the nodes");
     if status.is_skip() {
-        return rusternetes_scheduler::fwk::Status::success();
+        return k3rs_scheduler::fwk::Status::success();
     }
     assert!(status.is_success());
     NodePorts
@@ -39,7 +37,7 @@ async fn run(pod: Pod, existing: Vec<Pod>) -> rusternetes_scheduler::fwk::Status
         .await
 }
 
-fn conflict(s: rusternetes_scheduler::fwk::Status) {
+fn conflict(s: k3rs_scheduler::fwk::Status) {
     assert_eq!(s.code(), Code::Unschedulable);
     assert_eq!(s.reasons(), vec![ERR_REASON_NODE_PORTS.to_string()]);
 }

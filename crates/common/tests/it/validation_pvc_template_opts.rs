@@ -3,9 +3,9 @@
 //! the selector branch of `ValidationOptionsForPersistentVolumeClaimTemplate`
 //! (validation.go:2375-2381), which the upstream test does not exercise.
 
-use rusternetes_common::resources::pod::PersistentVolumeClaimTemplate;
-use rusternetes_common::resources::volume::{LabelSelector, PersistentVolumeClaimSpec};
-use rusternetes_common::validation::pvc::validation_options_for_persistent_volume_claim_template;
+use k3rs_common::resources::pod::PersistentVolumeClaimTemplate;
+use k3rs_common::resources::volume::{LabelSelector, PersistentVolumeClaimSpec};
+use k3rs_common::validation::pvc::validation_options_for_persistent_volume_claim_template;
 use std::collections::HashMap;
 
 fn template_with_selector(value: &str) -> PersistentVolumeClaimTemplate {

@@ -22,11 +22,11 @@
 
 use std::sync::Arc;
 
-use rusternetes_client::http::ApiClient;
-use rusternetes_controller_manager::controllers::namespace::NamespaceController;
-use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountController;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_controller_manager::controllers::namespace::NamespaceController;
+use k3rs_controller_manager::controllers::serviceaccount::ServiceAccountController;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// A `TestApiServer` served on a loopback port, plus `ApiStorage` pointed at

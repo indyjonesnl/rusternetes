@@ -1,13 +1,13 @@
 //! `signers_test.go` (`kube-scheduler/framework`), `SignPod`
 //! (`runtime/framework.go:805-854`) and the plugins' `SignPod`.
-use rusternetes_common::resources::Pod;
-use rusternetes_scheduler::framework_runtime::{Plugin, PluginSet, Plugins};
-use rusternetes_scheduler::fwk::{Code, SignPlugin};
-use rusternetes_scheduler::in_tree::{
+use k3rs_common::resources::Pod;
+use k3rs_scheduler::framework_runtime::{Plugin, PluginSet, Plugins};
+use k3rs_scheduler::fwk::{Code, SignPlugin};
+use k3rs_scheduler::in_tree::{
     DynamicResources, InterPodAffinity, NodeName, NodePorts, PodTopologySpread,
 };
-use rusternetes_scheduler::profile::{Map, Profile};
-use rusternetes_scheduler::signers::*;
+use k3rs_scheduler::profile::{Map, Profile};
+use k3rs_scheduler::signers::*;
 use serde_json::{json, Value};
 
 fn pod(spec: Value) -> Pod {
@@ -231,7 +231,7 @@ fn default_profile_can_sign_pods() {
 
 #[test]
 fn volume_and_balanced_allocation_signers() {
-    use rusternetes_scheduler::in_tree::{BalancedAllocation, VolumeRestrictions, VolumeZone};
+    use k3rs_scheduler::in_tree::{BalancedAllocation, VolumeRestrictions, VolumeZone};
     let p = pod(json!({"containers": [{"name": "c",
         "resources": {"requests": {"cpu": "1"}}}],
         "volumes": [{"name": "d", "gcePersistentDisk": {"pdName": "x"}}]}));
@@ -249,8 +249,8 @@ fn volume_and_balanced_allocation_signers() {
 #[test]
 #[serial_test::serial]
 fn resource_signers_refuse_while_dra_extended_resource_is_on() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_scheduler::in_tree::{BalancedAllocation, NodeResourcesFit};
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_scheduler::in_tree::{BalancedAllocation, NodeResourcesFit};
     let p = pod(json!({"containers": []}));
     let _g = with_feature(Feature::DRAExtendedResource, true);
     for status in [
@@ -271,7 +271,7 @@ fn signatures_stay_disabled_while_node_declared_features_cannot_sign() {
     // NodeDeclaredFeatures (Alpha, off in 1.35) joins the default profile
     // when its gate is on; it has no plugin object yet, so signatures turn
     // off rather than ignore it (`computeBatchablePlugins`).
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     let _g = with_feature(Feature::NodeDeclaredFeatures, true);
     let fw = Profile::named("default-scheduler").framework;
     assert!(!fw.signatures_enabled());

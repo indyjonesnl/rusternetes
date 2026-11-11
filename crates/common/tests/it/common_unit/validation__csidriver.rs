@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::csi::{CSIDriver, FSGroupPolicy, VolumeLifecycleMode};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::validate_immutable_field;
+    pub use k3rs_common::resources::csi::{CSIDriver, FSGroupPolicy, VolumeLifecycleMode};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::validate_immutable_field;
     pub use std::collections::HashSet;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::csi::{CSIDriverSpec, TokenRequest};
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_common::validation::csidriver::*;
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_common::resources::csi::{CSIDriverSpec, TokenRequest};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_common::validation::csidriver::*;
+    use k3rs_common::validation::field::ErrorType;
 
     /// A spec that passes every create-time rule, so each test can mutate one
     /// field and assert the single resulting error.

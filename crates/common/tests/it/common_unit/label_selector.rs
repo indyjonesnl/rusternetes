@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::validation::field::{BadValue, Error as FieldError, Path};
-    pub use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+    pub use k3rs_common::validation::field::{BadValue, Error as FieldError, Path};
+    pub use k3rs_common::validation::metav1::{is_qualified_name, is_valid_label_value};
     pub use serde_json::Value;
     pub use std::collections::{BTreeSet, HashMap};
     pub use std::fmt;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::label_selector::*;
+    use k3rs_common::label_selector::*;
     use serde_json::json;
 
     #[test]

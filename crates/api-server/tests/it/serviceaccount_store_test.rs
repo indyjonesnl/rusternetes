@@ -2,7 +2,7 @@
 //! `pkg/registry/core/serviceaccount/strategy.go`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SAS: &str = "/api/v1/namespaces/default/serviceaccounts";

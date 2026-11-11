@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::node_graph::{NodeGraph, VertexType};
-    pub use rusternetes_common::authz::reasons::quoted;
-    pub use rusternetes_common::authz::{
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::node_graph::{NodeGraph, VertexType};
+    pub use k3rs_common::authz::reasons::quoted;
+    pub use k3rs_common::authz::{
         node_rules_allow, Authorizer, Decision, Opinion, RequestAttributes,
     };
-    pub use rusternetes_common::error::Result;
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::field_selector::FieldOperator;
-    pub use rusternetes_common::resources::ResourceRule;
+    pub use k3rs_common::error::Result;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::field_selector::FieldOperator;
+    pub use k3rs_common::resources::ResourceRule;
     pub use std::sync::Arc;
 }
 
@@ -23,17 +23,17 @@ mod tests {
     //! `generatePod` / `populate` as the fixtures.
     //!
     //! One deliberate difference: with `AuthorizeNodeWithSelectors` off, pods fall
-    //! through to [`rusternetes_common::authz::NODE_RULES`], which (unlike upstream's
+    //! through to [`k3rs_common::authz::NODE_RULES`], which (unlike upstream's
     //! `bootstrappolicy.NodeRules()`) omits `create pods/eviction` because there is
     //! no NodeRestriction admission for evictions yet (see the comment on
     //! `NODE_RULES`). Those rows are marked `EVICTION_GAP` below.
 
     use super::__parent::*;
     use crate::common_unit::authz__node_graph::tests::{pod_from, pv_from};
-    use rusternetes_common::authz::node_authorizer::*;
-    use rusternetes_common::authz::node_graph::{GraphPopulator, NodeGraph};
-    use rusternetes_common::field_selector::FieldSelector;
-    use rusternetes_common::resources::Pod;
+    use k3rs_common::authz::node_authorizer::*;
+    use k3rs_common::authz::node_graph::{GraphPopulator, NodeGraph};
+    use k3rs_common::field_selector::FieldSelector;
+    use k3rs_common::resources::Pod;
     use serde_json::{json, Value};
 
     fn node_user(name: &str) -> UserInfo {

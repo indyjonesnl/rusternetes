@@ -14,8 +14,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CERT_DIR="${SCRIPT_DIR}/.rusternetes/certs"
-VOLUMES_DIR="${SCRIPT_DIR}/.rusternetes/volumes"
+CERT_DIR="${SCRIPT_DIR}/.k3rs/certs"
+VOLUMES_DIR="${SCRIPT_DIR}/.k3rs/volumes"
 
 print_header() {
     echo -e "${BLUE}========================================${NC}"
@@ -99,7 +99,7 @@ echo "  3) Clean and prepare Sonobuoy"
 echo ""
 read -p "Enter your choice [1-3]: " choice
 
-# NOTE: cluster DNS (rusternetes-dns) is a Deployment with its own
+# NOTE: cluster DNS (k3rs-dns) is a Deployment with its own
 # ServiceAccount, so the kubelet auto-projects its SA token — it needs no
 # pre-staged volume here. Only Sonobuoy still requires manual pre-staging
 # (#1172).

@@ -1,7 +1,7 @@
 //! Ported from `storage/testing/store_tests.go`.
 
 use super::fixtures::{pod, pod_key};
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use serde_json::Value;
 
 /// Ported from `RunTestCreate` (`store_tests.go:52-93`).
@@ -44,7 +44,7 @@ pub async fn run_test_create<S: Storage>(storage: &S, expects_resource_version: 
     // NotFound) — the create's success proves nothing if something seeded it.
     let before = storage.get::<Value>(&key).await;
     assert!(
-        matches!(before, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(before, Err(k3rs_common::Error::NotFound(_))),
         "expected an empty key before create, got {before:?}"
     );
 
@@ -79,7 +79,7 @@ pub async fn run_test_create_with_key_exist<S: Storage>(storage: &S) {
         .await
         .expect_err("second create should fail");
     assert!(
-        matches!(err, rusternetes_common::Error::AlreadyExists(_)),
+        matches!(err, k3rs_common::Error::AlreadyExists(_)),
         "expected AlreadyExists, got {err:?}"
     );
 }
@@ -126,7 +126,7 @@ pub async fn run_test_create_with_key_exist<S: Storage>(storage: &S) {
 ///
 ///   Either way the etcd and MemoryStorage results are a real divergence from
 ///   upstream's key semantics. It is unreachable from the api-server (every
-///   caller builds its prefix with `rusternetes_storage::build_prefix`, which
+///   caller builds its prefix with `k3rs_storage::build_prefix`, which
 ///   always ends in `/`), so the rows are left out rather than made to pass by
 ///   weakening anything.
 ///
@@ -189,13 +189,13 @@ pub async fn run_test_unconditional_delete<S: Storage>(storage: &S) {
 
     let gone = storage.get::<Value>(&key).await;
     assert!(
-        matches!(gone, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(gone, Err(k3rs_common::Error::NotFound(_))),
         "object readable after delete: {gone:?}"
     );
 
     let missing = storage.delete(&pod_key("test-ns", "never-existed")).await;
     assert!(
-        matches!(missing, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(missing, Err(k3rs_common::Error::NotFound(_))),
         "delete of a non-existing key should be NotFound, got {missing:?}"
     );
 }
@@ -344,7 +344,7 @@ pub async fn run_test_update_with_conflict<S: Storage>(storage: &S) {
         .await
         .expect_err("an update from a superseded resourceVersion must be rejected");
     assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
+        matches!(err, k3rs_common::Error::Conflict(_)),
         "expected Conflict for a superseded resourceVersion, got {err:?}"
     );
 }
@@ -414,7 +414,7 @@ where
         );
         for (writer, e) in &losers {
             assert!(
-                matches!(e, rusternetes_common::Error::Conflict(_)),
+                matches!(e, k3rs_common::Error::Conflict(_)),
                 "round {round}: writer {writer} must lose with Conflict, got {e:?}"
             );
         }
@@ -436,7 +436,7 @@ async fn gone_within<S: Storage>(storage: &S, key: &str, within: std::time::Dura
     loop {
         if matches!(
             storage.get::<Value>(key).await,
-            Err(rusternetes_common::Error::NotFound(_))
+            Err(k3rs_common::Error::NotFound(_))
         ) {
             return true;
         }
@@ -452,7 +452,7 @@ async fn gone_within<S: Storage>(storage: &S, key: &str, within: std::time::Dura
 /// (`SqliteBackend::watch` -> "background tasks started (first watch
 /// subscription)"), so a store nobody watches never expires anything. The
 /// api-server always holds watches, so this is the production condition.
-async fn hold_a_watch<S: Storage>(storage: &S) -> rusternetes_storage::WatchStream {
+async fn hold_a_watch<S: Storage>(storage: &S) -> k3rs_storage::WatchStream {
     storage
         .watch("/registry/")
         .await

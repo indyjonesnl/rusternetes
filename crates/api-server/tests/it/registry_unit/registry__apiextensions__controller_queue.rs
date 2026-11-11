@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::apiextensions::condition_controllers::ConditionControllers;
-    pub use rusternetes_api_server::registry::apiextensions::customresourcedefinition::{
+    pub use k3rs_api_server::registry::apiextensions::condition_controllers::ConditionControllers;
+    pub use k3rs_api_server::registry::apiextensions::customresourcedefinition::{
         ControllerRateLimiter, CrdRest, CRD_FINALIZER_WORKERS,
     };
-    pub use rusternetes_api_server::registry::apiextensions::finalizer_queue::FinalizerQueue;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_api_server::registry::apiextensions::finalizer_queue::FinalizerQueue;
+    pub use k3rs_storage::StorageBackend;
     pub use std::collections::{HashSet, VecDeque};
     pub use std::sync::atomic::{AtomicBool, Ordering};
     pub use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::controller_queue::*;
+    use k3rs_api_server::registry::apiextensions::controller_queue::*;
 
     /// Each condition controller has a workqueue of its own
     /// (nonstructuralschema_controller.go:66-69, apiapproval_controller.go:

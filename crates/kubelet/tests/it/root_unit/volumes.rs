@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod,
     };
-    pub use rusternetes_kubelet::atomic_writer::FileProjection;
-    pub use rusternetes_kubelet::volume_plugins::VolumePlugin;
-    pub use rusternetes_storage::{build_key, Storage};
+    pub use k3rs_kubelet::atomic_writer::FileProjection;
+    pub use k3rs_kubelet::volume_plugins::VolumePlugin;
+    pub use k3rs_storage::{build_key, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, info, warn};
@@ -16,7 +16,7 @@ mod __parent {
 
 mod configmap_payload_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volumes::*;
+    use k3rs_kubelet::volumes::*;
 
     fn cm(pairs: &[(&str, &str)]) -> ConfigMap {
         let mut c = ConfigMap::new("cm", "default");
@@ -89,7 +89,7 @@ mod configmap_payload_tests {
 /// (`pkg/kubelet/kubelet_volumes.go:169-260`).
 mod orphan_sweep_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volumes::*;
+    use k3rs_kubelet::volumes::*;
     use std::collections::HashSet;
 
     fn tmp(tag: &str) -> String {
@@ -103,17 +103,17 @@ mod orphan_sweep_tests {
         VolumeManager::new_with_recording_empty_dir_mounts(
             root.to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
     }
 
     /// Lay down `<root>/pods/<uid>/volumes/<plugin>/<volume>` as create_volume
     /// would, so the sweep sees a realistic tree.
     fn seed_pod(root: &str, uid: &str, volume: &str) -> std::path::PathBuf {
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             root,
             uid,
-            rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+            k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
             volume,
         );
         std::fs::create_dir_all(&dir).unwrap();
@@ -122,7 +122,7 @@ mod orphan_sweep_tests {
 
     /// Lay down a non-empty volume of `plugin`, as a running pod leaves it.
     fn seed_filled_volume(root: &str, uid: &str, plugin: &str, volume: &str) -> std::path::PathBuf {
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(root, uid, plugin, volume);
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(root, uid, plugin, volume);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/data"), "x").unwrap();
         dir
@@ -139,13 +139,13 @@ mod orphan_sweep_tests {
         seed_filled_volume(
             &root,
             "uid-gone",
-            rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+            k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
             "scratch",
         );
 
         vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
 
-        assert!(rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
+        assert!(k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
     }
 
     /// A pod known to the kubelet that mounts `volumes` (plugin, name) as
@@ -172,7 +172,7 @@ mod orphan_sweep_tests {
         crate::volume_world::world(
             vm,
             "node-1",
-            Arc::new(rusternetes_storage::StorageBackend::new_memory()),
+            Arc::new(k3rs_storage::StorageBackend::new_memory()),
             pods,
         )
         .await
@@ -184,7 +184,7 @@ mod orphan_sweep_tests {
     #[tokio::test]
     async fn teardown_then_cleanup_reaps_every_non_csi_volume_kind() {
         let root = tmp("filled-teardown");
-        use rusternetes_kubelet::pod_dirs::plugin;
+        use k3rs_kubelet::pod_dirs::plugin;
         for (p, v) in [
             (plugin::EMPTY_DIR, "scratch"),
             (plugin::CONFIG_MAP, "cfg"),
@@ -205,7 +205,7 @@ mod orphan_sweep_tests {
         vm.cleanup_orphaned_pod_dirs(&live);
 
         assert!(
-            !rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
+            !k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
             "the orphan's directory must be reaped once its volumes are torn down"
         );
         assert!(live_dir.join("sub/data").exists(), "live pod untouched");
@@ -220,7 +220,7 @@ mod orphan_sweep_tests {
         let dir = seed_filled_volume(
             &root,
             "uid-done",
-            rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+            k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
             "scratch",
         );
 
@@ -241,13 +241,13 @@ mod orphan_sweep_tests {
         let hp = seed_filled_volume(
             &root,
             "uid-gone",
-            rusternetes_kubelet::pod_dirs::plugin::HOST_PATH,
+            k3rs_kubelet::pod_dirs::plugin::HOST_PATH,
             "hp",
         );
         let other = seed_filled_volume(
             &root,
             "uid-gone",
-            rusternetes_kubelet::pod_dirs::UNSUPPORTED_PLUGIN,
+            k3rs_kubelet::pod_dirs::UNSUPPORTED_PLUGIN,
             "x",
         );
 
@@ -268,7 +268,7 @@ mod orphan_sweep_tests {
         vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
 
         assert!(
-            !rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
+            !k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists(),
             "an orphaned pod dir must be reaped"
         );
     }
@@ -282,10 +282,10 @@ mod orphan_sweep_tests {
         vm(&root).cleanup_orphaned_pod_dirs(&live);
 
         assert!(
-            rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+            k3rs_kubelet::pod_dirs::get_pod_volume_dir(
                 &root,
                 "uid-live",
-                rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+                k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
                 "scratch"
             )
             .exists(),
@@ -303,8 +303,8 @@ mod orphan_sweep_tests {
         let live: HashSet<String> = ["uid-live".to_string()].into_iter().collect();
         vm(&root).cleanup_orphaned_pod_dirs(&live);
 
-        assert!(rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-live").exists());
-        assert!(!rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
+        assert!(k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-live").exists());
+        assert!(!k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-gone").exists());
     }
 
     /// The property that makes the sweep safe to run unattended: a volume dir
@@ -327,7 +327,7 @@ mod orphan_sweep_tests {
             "and must be unmodified"
         );
         assert!(
-            rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-data").exists(),
+            k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-data").exists(),
             "the pod dir must be kept while content remains under it"
         );
     }
@@ -338,14 +338,13 @@ mod orphan_sweep_tests {
     fn other_pod_subdirs_are_reaped() {
         let root = tmp("subdirs");
         seed_pod(&root, "uid-sub", "scratch");
-        let containers =
-            rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-sub").join("containers");
+        let containers = k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-sub").join("containers");
         std::fs::create_dir_all(&containers).unwrap();
         std::fs::write(containers.join("log"), b"x").unwrap();
 
         vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
 
-        assert!(!rusternetes_kubelet::pod_dirs::get_pod_dir(&root, "uid-sub").exists());
+        assert!(!k3rs_kubelet::pod_dirs::get_pod_dir(&root, "uid-sub").exists());
     }
 
     #[test]
@@ -353,7 +352,7 @@ mod orphan_sweep_tests {
         let root = tmp("empty");
         // No pods/ dir at all — nothing has run yet.
         vm(&root).cleanup_orphaned_pod_dirs(&HashSet::new());
-        assert!(rusternetes_kubelet::pod_dirs::list_pods_from_disk(&root)
+        assert!(k3rs_kubelet::pod_dirs::list_pods_from_disk(&root)
             .unwrap()
             .is_empty());
     }
@@ -364,7 +363,7 @@ mod orphan_sweep_tests {
         seed_pod(&root, "uid-a", "v");
         seed_pod(&root, "uid-b", "v");
 
-        let mut found = rusternetes_kubelet::pod_dirs::list_pods_from_disk(&root).unwrap();
+        let mut found = k3rs_kubelet::pod_dirs::list_pods_from_disk(&root).unwrap();
         found.sort();
         assert_eq!(found, vec!["uid-a".to_string(), "uid-b".to_string()]);
     }
@@ -378,16 +377,16 @@ mod orphan_sweep_tests {
 /// `lifecycle.rs::is_volume_wait_error` matches on byte-for-byte.
 mod pvc_resolution_tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
-    use rusternetes_kubelet::volumes::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
+    use k3rs_kubelet::volumes::*;
+    use k3rs_storage::StorageBackend;
     use serde_json::json;
 
     fn vm(storage: Option<Arc<StorageBackend>>) -> VolumeManager {
         VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             storage,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
     }
 
@@ -516,7 +515,7 @@ mod pvc_resolution_tests {
             .await
             .unwrap();
         let resolved = resolved.expect("a bound PVC resolves to a PV");
-        let spec = rusternetes_kubelet::volume_plugins::Spec {
+        let spec = k3rs_kubelet::volume_plugins::Spec {
             volume: &volume,
             persistent_volume: Some(&resolved),
             read_only: false,
@@ -524,10 +523,7 @@ mod pvc_resolution_tests {
             inline_volume_spec_for_csi_migration: false,
         };
         let plugin = manager.plugin_mgr.find_plugin_by_spec(&spec).unwrap();
-        assert_eq!(
-            plugin.name(),
-            rusternetes_kubelet::pod_dirs::plugin::HOST_PATH
-        );
+        assert_eq!(plugin.name(), k3rs_kubelet::pod_dirs::plugin::HOST_PATH);
 
         // And create_volume must dispatch to the same plugin end-to-end.
         let path = manager.create_volume(&pod, &volume).await.unwrap();
@@ -744,7 +740,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim missing not found in namespace ns"
         );
-        assert!(rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err));
+        assert!(k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// Preserved byte-for-byte: `lifecycle.rs::is_volume_wait_error` matches
@@ -785,7 +781,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim is not bound to a volume"
         );
-        assert!(rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err));
+        assert!(k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// #1981: upstream handles a generic ephemeral volume "the same way as a
@@ -816,7 +812,7 @@ mod pvc_resolution_tests {
             err.to_string(),
             "PersistentVolumeClaim p-scratch is not bound to a volume"
         );
-        assert!(rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err));
+        assert!(k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err));
     }
 
     /// Ruling 3: `ephemeral` set but `volumeClaimTemplate` absent falls
@@ -912,15 +908,15 @@ mod pvc_resolution_tests {
 /// `pod_volume_dir` and the `kubelet.rs` init-container-restart path map).
 mod dispatch_tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Volume;
-    use rusternetes_kubelet::volumes::*;
+    use k3rs_common::resources::Volume;
+    use k3rs_kubelet::volumes::*;
     use serde_json::json;
 
     fn vm() -> VolumeManager {
         VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
     }
 
@@ -944,31 +940,31 @@ mod dispatch_tests {
         let cases: Vec<(Volume, &str)> = vec![
             (
                 volume("a", json!({"emptyDir": {}})),
-                rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+                k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
             ),
             (
                 volume("b", json!({"configMap": {"name": "cm"}})),
-                rusternetes_kubelet::pod_dirs::plugin::CONFIG_MAP,
+                k3rs_kubelet::pod_dirs::plugin::CONFIG_MAP,
             ),
             (
                 volume("c", json!({"secret": {"secretName": "s"}})),
-                rusternetes_kubelet::pod_dirs::plugin::SECRET,
+                k3rs_kubelet::pod_dirs::plugin::SECRET,
             ),
             (
                 volume("d", json!({"downwardAPI": {"defaultMode": 420}})),
-                rusternetes_kubelet::pod_dirs::plugin::DOWNWARD_API,
+                k3rs_kubelet::pod_dirs::plugin::DOWNWARD_API,
             ),
             (
                 volume("e", json!({"projected": {}})),
-                rusternetes_kubelet::pod_dirs::plugin::PROJECTED,
+                k3rs_kubelet::pod_dirs::plugin::PROJECTED,
             ),
             (
                 volume("f", json!({"csi": {"driver": "d"}})),
-                rusternetes_kubelet::pod_dirs::plugin::CSI,
+                k3rs_kubelet::pod_dirs::plugin::CSI,
             ),
             (
                 volume("g", json!({"hostPath": {"path": "/tmp"}})),
-                rusternetes_kubelet::pod_dirs::plugin::HOST_PATH,
+                k3rs_kubelet::pod_dirs::plugin::HOST_PATH,
             ),
         ];
         for (v, want) in cases {
@@ -992,16 +988,16 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let cases: Vec<(Volume, &str)> = vec![
             (
                 volume("a", json!({"emptyDir": {}})),
-                rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR,
+                k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR,
             ),
             (
                 volume("d", json!({"downwardAPI": {"defaultMode": 420}})),
-                rusternetes_kubelet::pod_dirs::plugin::DOWNWARD_API,
+                k3rs_kubelet::pod_dirs::plugin::DOWNWARD_API,
             ),
             // `projected` is not storage-free: upstream's SetUpAt fails with
             // "kube client is not configured" without a client, so its
@@ -1010,7 +1006,7 @@ mod dispatch_tests {
             // its dispatch is covered by the csi plugin tests.
             (
                 volume("g", json!({"hostPath": {"path": "/tmp"}})),
-                rusternetes_kubelet::pod_dirs::plugin::HOST_PATH,
+                k3rs_kubelet::pod_dirs::plugin::HOST_PATH,
             ),
         ];
         for (v, want) in cases {
@@ -1024,11 +1020,11 @@ mod dispatch_tests {
             // pod-dir-derived path, so this row asserts the literal instead
             // of the plugin-dir shape asserted below. The fixture is an
             // inline hostPath with no `$`, so its env expansion is a no-op.
-            if want == rusternetes_kubelet::pod_dirs::plugin::HOST_PATH {
+            if want == k3rs_kubelet::pod_dirs::plugin::HOST_PATH {
                 assert_eq!(path, "/tmp");
             } else {
                 assert!(
-                    path.contains(&rusternetes_kubelet::pod_dirs::escape_qualified_name(want)),
+                    path.contains(&k3rs_kubelet::pod_dirs::escape_qualified_name(want)),
                     "volume {} took path {path}, want it to contain the {want} plugin segment",
                     v.name
                 );
@@ -1046,7 +1042,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let v = volume(
             "n",
@@ -1069,7 +1065,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let v = volume("g", json!({"gitRepo": {"repository": "https://x/y.git"}}));
         assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/git-repo");
@@ -1089,7 +1085,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let v = volume(
             "i",
@@ -1108,14 +1104,14 @@ mod dispatch_tests {
     /// is recorded as globally mounted.
     #[tokio::test]
     async fn iscsi_global_mount_reconstructs() {
-        use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+        use k3rs_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_string_lossy().to_string();
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.clone(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let global = std::path::Path::new(&root)
             .join("plugins/kubernetes.io/iscsi/iface-default")
@@ -1147,7 +1143,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let v = volume(
             "f",
@@ -1171,7 +1167,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let v = volume("i", json!({"image": {"reference": "quay.io/a/b:1"}}));
         assert_eq!(vm.plugin_name_for_volume(&v), "kubernetes.io/image");
@@ -1196,7 +1192,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-rbd"},
@@ -1211,7 +1207,7 @@ mod dispatch_tests {
             err.to_string(),
             "failed to get Plugin from volumeSpec for volume \"rbd-vol\" err=no volume plugin matched"
         );
-        assert!(rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err));
+        assert!(k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err));
         assert!(!tmp.path().join("pods").exists(), "no fallback dir");
     }
 
@@ -1224,7 +1220,7 @@ mod dispatch_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-rbd"},

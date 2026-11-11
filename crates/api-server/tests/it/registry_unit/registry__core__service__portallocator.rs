@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::core::service::allocator::{
+    pub use k3rs_api_server::registry::core::service::allocator::{
         AllocationBitmap, AllocatorWithOffsetFactory, InMemory, Interface,
     };
-    pub use rusternetes_common::resources::rangeallocation::RangeAllocation;
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::resources::rangeallocation::RangeAllocation;
+    pub use k3rs_common::Error;
     pub use std::fmt;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::portallocator::*;
+    use k3rs_api_server::registry::core::service::portallocator::*;
 
     fn pr(s: &str) -> PortRange {
         PortRange::parse(s).unwrap()

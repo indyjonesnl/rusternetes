@@ -19,7 +19,7 @@ This guide describes how to write effective tests for kubectl commands without r
 
 ## Current Testing Approach
 
-Rusternetes kubectl uses **pure unit tests** that don't require cluster connectivity. Tests are located in:
+k3rs kubectl uses **pure unit tests** that don't require cluster connectivity. Tests are located in:
 
 ```
 crates/kubectl/src/commands/
@@ -293,7 +293,7 @@ If you want to test with actual API handlers but no cluster:
 ```rust
 #[tokio::test]
 async fn test_kubectl_flow_with_memory_storage() {
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_storage::memory::MemoryStorage;
 
     let storage = Arc::new(MemoryStorage::new());
 
@@ -373,27 +373,27 @@ async fn test_kubectl_flow_with_memory_storage() {
 
 ### Run all tests
 ```bash
-cargo test -p rusternetes-kubectl
+cargo test -p k3rs-kubectl
 ```
 
 ### Run specific test file
 ```bash
-cargo test -p rusternetes-kubectl --test mock_client_example
+cargo test -p k3rs-kubectl --test mock_client_example
 ```
 
 ### Run with output
 ```bash
-cargo test -p rusternetes-kubectl -- --nocapture
+cargo test -p k3rs-kubectl -- --nocapture
 ```
 
 ### Run single test
 ```bash
-cargo test -p rusternetes-kubectl test_duration_parsing
+cargo test -p k3rs-kubectl test_duration_parsing
 ```
 
 ### Watch mode (with cargo-watch)
 ```bash
-cargo watch -x 'test -p rusternetes-kubectl'
+cargo watch -x 'test -p k3rs-kubectl'
 ```
 
 ---
@@ -482,7 +482,7 @@ When adding new kubectl commands:
 2. ✅ Test all output formats
 3. ✅ Test error cases
 4. ✅ Add integration test with mock client
-5. ✅ Ensure tests pass without cluster: `cargo test -p rusternetes-kubectl`
+5. ✅ Ensure tests pass without cluster: `cargo test -p k3rs-kubectl`
 
 ---
 

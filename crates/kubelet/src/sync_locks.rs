@@ -37,7 +37,7 @@ impl SyncLocks {
     /// was free — and marks it held until the guard drops — or `None` if another
     /// sync already holds it, in which case the caller skips and a later
     /// reconcile retries. Mirrors upstream's one-goroutine-per-pod worker; the
-    /// skip-and-retry is rusternetes' equivalent serialization.
+    /// skip-and-retry is k3rs' equivalent serialization.
     pub fn try_acquire(&self, key: impl Into<String>) -> Option<SyncLockGuard<'_>> {
         let key = key.into();
         let mut held = self.held.lock().unwrap();

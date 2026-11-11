@@ -7,8 +7,8 @@ mod __parent {
     pub use base64::Engine;
     pub use chrono::{DateTime, Utc};
     pub use hmac::{Hmac, Mac};
-    pub use rusternetes_common::resources::{ConfigMap, Secret};
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_common::resources::{ConfigMap, Secret};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use sha2::Sha256;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -19,8 +19,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::Duration as D;
-    use rusternetes_controller_manager::controllers::bootstrap_signer::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::bootstrap_signer::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     const TEST_TOKEN_ID: &str = "abc123";
     const SIG: &str =
@@ -205,7 +205,7 @@ mod tests {
         let mut s = new_token_secret(TEST_TOKEN_ID, "tokenSecret");
         add_signing_usage(&mut s, "true");
         let (signer, st) = setup(Some(new_config_map("", "")), &[s]).await;
-        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        let queue = k3rs_storage::WorkQueue::named(QUEUE_NAME);
         queue.add(signer.config_map_key()).await;
         queue.add(signer.config_map_key()).await; // collapsed
         assert!(signer.service_config_map_queue(&queue).await);
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn service_queue_stops_when_the_queue_shuts_down() {
         let (signer, _st) = setup(None, &[]).await;
-        let queue = rusternetes_storage::WorkQueue::new();
+        let queue = k3rs_storage::WorkQueue::new();
         queue.shutdown().await;
         assert!(!signer.service_config_map_queue(&queue).await);
     }

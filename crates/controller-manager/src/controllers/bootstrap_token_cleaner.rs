@@ -32,8 +32,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusternetes_common::resources::Secret;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
+use k3rs_common::resources::Secret;
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -151,10 +151,10 @@ impl<S: Storage + 'static> TokenCleaner<S> {
         queue: &WorkQueue,
         key: &str,
         now: DateTime<Utc>,
-    ) -> Result<(), rusternetes_common::Error> {
+    ) -> Result<(), k3rs_common::Error> {
         // `cache.SplitMetaNamespaceKey`.
         let Some((namespace, name)) = key.split_once('/') else {
-            return Err(rusternetes_common::Error::BadRequest(format!(
+            return Err(k3rs_common::Error::BadRequest(format!(
                 "unexpected key format: {key:?}"
             )));
         };
@@ -164,7 +164,7 @@ impl<S: Storage + 'static> TokenCleaner<S> {
             .await
         {
             Ok(s) => s,
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 debug!("Secret {key} has been deleted");
                 return Ok(());
             }
@@ -205,7 +205,7 @@ impl<S: Storage + 'static> TokenCleaner<S> {
             match self.storage.get::<Secret>(&key).await {
                 Ok(live) if live.metadata.uid == secret.metadata.uid => {}
                 Ok(_) => return, // Conflict: the UID precondition failed
-                Err(rusternetes_common::Error::NotFound(_)) => return,
+                Err(k3rs_common::Error::NotFound(_)) => return,
                 Err(e) => {
                     info!("Error deleting secret: {e}");
                     return;
@@ -213,7 +213,7 @@ impl<S: Storage + 'static> TokenCleaner<S> {
             }
         }
         match self.storage.delete(&key).await {
-            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+            Ok(()) | Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => info!("Error deleting secret: {e}"),
         }
     }

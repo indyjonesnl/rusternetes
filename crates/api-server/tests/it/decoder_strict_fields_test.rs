@@ -11,7 +11,7 @@
 //! - `fieldValidation=Ignore`  → accept silently; unknown fields are dropped
 //!   on read-back with no header.
 //! - No param                  → in Kubernetes >= 1.25 the server-side
-//!   default is `Strict`. Rusternetes currently defaults to `Ignore`
+//!   default is `Strict`. k3rs currently defaults to `Ignore`
 //!   (handler short-circuits when the query param is absent), so the
 //!   strict-default test is `#[ignore]` pending parity work.
 //!
@@ -23,8 +23,8 @@
 //! brief.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -155,7 +155,7 @@ async fn test_field_validation_strict_pod_unknown_field_rejected() {
 
     let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
 
-    // Rusternetes maps strict-decoding errors through `Error::InvalidResource`,
+    // k3rs maps strict-decoding errors through `Error::InvalidResource`,
     // which renders as HTTP 422 with a Kubernetes `Status` body whose reason
     // is `Invalid` (see crates/common/src/error.rs:105). Upstream uses 400 /
     // `BadRequest`; the parity gap is tracked by the ignored test below.
@@ -314,7 +314,7 @@ async fn test_field_validation_strict_deployment_duplicate_field_rejected() {
 
 #[tokio::test]
 async fn test_field_validation_strict_status_body_reason_invalid() {
-    // After unit #7 fixed the strict-decode status mapping, rusternetes now
+    // After unit #7 fixed the strict-decode status mapping, k3rs now
     // matches upstream: HTTP 400 with reason=BadRequest. Test name preserved
     // for blame history; behaviour asserts the post-fix contract.
     let (_mem, router) = spawn_router();

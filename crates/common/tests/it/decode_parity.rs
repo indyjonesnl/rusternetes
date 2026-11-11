@@ -14,7 +14,7 @@
 //! `/api/v1/nodes`, decoded from `application/vnd.kubernetes.protobuf`). When a
 //! new decode gap is found, add the offending object here so it never regresses.
 
-use rusternetes_common::resources::Node;
+use k3rs_common::resources::Node;
 use serde_json::Value;
 
 /// Decode every object in a real vanilla-cluster snapshot into its typed struct,
@@ -24,7 +24,7 @@ use serde_json::Value;
 /// kubeadm/kind cluster's RBAC + kube-system addons (206 objects).
 #[test]
 fn real_cluster_snapshot_decodes_by_kind() {
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         ClusterRole, ClusterRoleBinding, ConfigMap, DaemonSet, Deployment, Namespace,
         PriorityClass, Role, RoleBinding, Service, ServiceAccount,
     };

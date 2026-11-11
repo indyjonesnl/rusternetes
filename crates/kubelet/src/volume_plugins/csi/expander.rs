@@ -5,7 +5,7 @@ use super::*;
 use crate::volume_plugins::csi_client::{CsiResizeOptions, NodeExpandError, FS_TYPE_BLOCK_NAME};
 use crate::volume_plugins::plugin::{NodeExpandableVolumePlugin, NodeResizeOptions};
 use crate::volume_plugins::util::types::VolumeOperationError;
-use rusternetes_common::resources::volume::{CSIVolumeSource, PersistentVolumeMode};
+use k3rs_common::resources::volume::{CSIVolumeSource, PersistentVolumeMode};
 
 /// Port of `inUseError` (`expander.go:132-142`): a FailedPrecondition means the
 /// driver does not support expansion of in-use volumes. A non-gRPC error (here

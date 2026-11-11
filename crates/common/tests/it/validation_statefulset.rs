@@ -5,9 +5,9 @@
 //! after defaulting, so the valid fixture carries `podManagementPolicy` +
 //! `updateStrategy` (which the api-server defaults).
 
-use rusternetes_common::resources::workloads::StatefulSet;
-use rusternetes_common::validation::apps::validate_statefulset;
-use rusternetes_common::validation::field::ErrorType;
+use k3rs_common::resources::workloads::StatefulSet;
+use k3rs_common::validation::apps::validate_statefulset;
+use k3rs_common::validation::field::ErrorType;
 use serde_json::json;
 
 fn ss(spec: serde_json::Value) -> StatefulSet {
@@ -32,7 +32,7 @@ fn valid_spec() -> serde_json::Value {
     })
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str, ty: ErrorType) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str, ty: ErrorType) -> bool {
     errs.iter().any(|e| e.field == field && e.error_type == ty)
 }
 

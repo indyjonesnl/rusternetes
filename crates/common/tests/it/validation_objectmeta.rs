@@ -5,15 +5,15 @@
 //!
 //! Each test mirrors a single `func Test*` block from upstream
 //! `objectmeta_test.go` (function name preserved). Tests construct
-//! `rusternetes_common::types::ObjectMeta` fixtures the same way upstream
+//! `k3rs_common::types::ObjectMeta` fixtures the same way upstream
 //! builds `metav1.ObjectMeta`, then drive validation through whatever public
-//! API the `rusternetes_common` validation surface exposes today.
+//! API the `k3rs_common` validation surface exposes today.
 //!
 //! RED-STATE TDD: the underlying validation primitives (`ValidateObjectMeta`,
 //! `ValidateObjectMetaUpdate`, `ValidateObjectMetaWithOpts`,
 //! `validateObjectMetaAccessorWithOptsCommon`, `NameIsDNSSubdomain`,
 //! `ValidateAnnotations`, `TotalAnnotationSizeLimitB`) have no Rust analogue
-//! in `rusternetes-common` yet. Each test below is `#[ignore]` with a TODO
+//! in `k3rs-common` yet. Each test below is `#[ignore]` with a TODO
 //! marker pointing at the missing function. They are checked-in pins that
 //! will switch from `#[ignore]` to live the moment the matching function
 //! lands.
@@ -25,9 +25,9 @@
 
 #![allow(clippy::never_loop)]
 
-use rusternetes_common::types::{ObjectMeta, OwnerReference};
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::types::{ObjectMeta, OwnerReference};
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_annotations, validate_object_meta,
     validate_object_meta_accessor_with_opts_common, validate_object_meta_update,
     validate_object_meta_with_opts,
@@ -597,7 +597,7 @@ fn test_validate_object_meta_trims_trailing_dash() {
 #[test]
 fn test_validate_annotations() {
     // Upstream constant value — declared here so the fixture compiles even
-    // though rusternetes-common does not yet expose the symbol.
+    // though k3rs-common does not yet expose the symbol.
     const TOTAL_ANNOTATION_SIZE_LIMIT_B: usize = 256 * 1024;
 
     let mk = |pairs: &[(&str, String)]| -> HashMap<String, String> {
@@ -675,7 +675,7 @@ fn test_validate_annotations() {
 
 // ===========================================================================
 // Bonus pin: ObjectMeta::ensure_name() — a small piece of the upstream
-// generateName contract that DOES exist in rusternetes-common today. This
+// generateName contract that DOES exist in k3rs-common today. This
 // test is intentionally NOT #[ignore]d so the file produces at least one
 // green pin while the rest stays red.
 // ===========================================================================

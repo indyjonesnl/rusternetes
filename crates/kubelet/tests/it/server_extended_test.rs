@@ -11,10 +11,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use rusternetes_common::resources::{Pod, PodSpec, PodStatus};
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_kubelet::server::{read_only_router, running_pods_for_node, ServerState};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{Pod, PodSpec, PodStatus};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_kubelet::server::{read_only_router, running_pods_for_node, ServerState};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -233,15 +233,13 @@ async fn healthz_sub_paths_are_served_by_the_kubelet_router() {
 /// in that list, so they are named here. A missing route answers axum's empty
 /// 404; a handler answers with its own status and a body.
 async fn assert_every_registered_path_is_served(enable_debugging_handlers: bool) {
-    use rusternetes_kubelet::server::{
-        build_server_router, registered_handle_paths, ServerRouterOptions,
-    };
+    use k3rs_kubelet::server::{build_server_router, registered_handle_paths, ServerRouterOptions};
     let storage = Arc::new(StorageBackend::new_memory());
     let dir = tempfile::tempdir().unwrap();
     let app = build_server_router(
         server_state(storage, "node-1"),
         Arc::new(
-            rusternetes_common::observability::MetricsRegistry::new()
+            k3rs_common::observability::MetricsRegistry::new()
                 .with_kubelet_metrics()
                 .unwrap(),
         ),
@@ -276,7 +274,7 @@ async fn assert_every_registered_path_is_served(enable_debugging_handlers: bool)
     );
     // `/checkpoint/` exists only with the ContainerCheckpoint gate, inside
     // `InstallAuthRequiredHandlers` (server.go:620-622).
-    if enable_debugging_handlers && rusternetes_kubelet::server::checkpoint_enabled() {
+    if enable_debugging_handlers && k3rs_kubelet::server::checkpoint_enabled() {
         paths.push("/checkpoint/ns/pod/c".to_string());
     }
     for p in paths {

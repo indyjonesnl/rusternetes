@@ -15,7 +15,7 @@ use crate::audit::{request_info, Attributes};
 /// `crate::audit`, so code compiled into both must name the type through
 /// here (the lib's), which is what the task-local holds.
 pub type RequestInfo = Attributes;
-use rusternetes_common::authz::RequestAttributes;
+use k3rs_common::authz::RequestAttributes;
 
 tokio::task_local! {
     static REQUEST_INFO: Attributes;
@@ -209,27 +209,27 @@ pub fn list_or_watch_verb() -> &'static str {
 /// The authorizer the handlers (and the `WithAuthorization` filter) use: the
 /// configured one, with [`with_request_name`] applied to every check.
 pub struct RequestInfoAuthorizer {
-    inner: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>,
+    inner: std::sync::Arc<dyn k3rs_common::authz::Authorizer>,
 }
 
 impl RequestInfoAuthorizer {
-    pub fn new(inner: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>) -> Self {
+    pub fn new(inner: std::sync::Arc<dyn k3rs_common::authz::Authorizer>) -> Self {
         Self { inner }
     }
 }
 
 #[async_trait::async_trait]
-impl rusternetes_common::authz::Authorizer for RequestInfoAuthorizer {
+impl k3rs_common::authz::Authorizer for RequestInfoAuthorizer {
     async fn authorize(
         &self,
         attrs: &RequestAttributes,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::Decision> {
+    ) -> k3rs_common::Result<k3rs_common::authz::Decision> {
         self.inner.authorize(&with_request_name(attrs)).await
     }
     async fn authorize_opinion(
         &self,
         attrs: &RequestAttributes,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::Opinion> {
+    ) -> k3rs_common::Result<k3rs_common::authz::Opinion> {
         self.inner
             .authorize_opinion(&with_request_name(attrs))
             .await
@@ -237,16 +237,16 @@ impl rusternetes_common::authz::Authorizer for RequestInfoAuthorizer {
     async fn authorize_outcome(
         &self,
         attrs: &RequestAttributes,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::AuthorizationOutcome> {
+    ) -> k3rs_common::Result<k3rs_common::authz::AuthorizationOutcome> {
         self.inner
             .authorize_outcome(&with_request_name(attrs))
             .await
     }
     async fn get_user_rules_outcome(
         &self,
-        user: &rusternetes_common::auth::UserInfo,
+        user: &k3rs_common::auth::UserInfo,
         namespace: &str,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> k3rs_common::Result<k3rs_common::authz::UserRulesOutcome> {
         self.inner.get_user_rules_outcome(user, namespace).await
     }
 }

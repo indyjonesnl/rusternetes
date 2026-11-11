@@ -3,7 +3,7 @@
 //! `livenessProbe.successThreshold: Invalid value: 0: must be 1`).
 //!
 //! Upstream defaults the object (SetDefaults_Probe → successThreshold=1) BEFORE
-//! validation; rusternetes previously validated first, so a probe that omits
+//! validation; k3rs previously validated first, so a probe that omits
 //! successThreshold (the common case — Go's omitempty drops the zero value) was
 //! rejected by the probe validator instead of being defaulted to 1.
 //!
@@ -11,7 +11,7 @@
 //! (201) and come back with successThreshold defaulted to 1.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 #[tokio::test]

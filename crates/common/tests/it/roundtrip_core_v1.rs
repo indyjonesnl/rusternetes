@@ -18,7 +18,7 @@
 //! (`podIP`, `containerID`, `apiVersion`, etc.). This layer catches regressions
 //! at the serde boundary before any router/storage code is involved.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ConfigMap, Endpoints, Event, LimitRange, Namespace, Node, PersistentVolume,
     PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
 };
@@ -605,7 +605,7 @@ fn roundtrip_node_with_taints_and_cidr() {
         "spec": {
             "podCIDR": "10.244.0.0/24",
             "podCIDRs": ["10.244.0.0/24"],
-            "providerID": "rusternetes://node-1",
+            "providerID": "k3rs://node-1",
             "unschedulable": false,
             "taints": [
                 {"key": "node-role.kubernetes.io/control-plane", "effect": "NoSchedule", "value": null}

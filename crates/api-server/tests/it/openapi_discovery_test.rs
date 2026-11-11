@@ -16,10 +16,10 @@
 //! out of scope here — those live in dedicated `byte_diff_*` mirrors.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::Value;
 
-// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// Harness: `TestApiServer` (k3rs-test-support) — `build_router` on
 // `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 fn spawn_router() -> TestApiServer {
     TestApiServer::new()
@@ -74,7 +74,7 @@ async fn test_openapi_v2_shape() {
 /// publishes one definition per built-in GVK via kube-openapi's
 /// `pkg/builder` — see `staging/src/k8s.io/kube-openapi/pkg/builder/openapi.go`.
 ///
-/// Rusternetes publishes hand-written stubs for the most commonly referenced
+/// k3rs publishes hand-written stubs for the most commonly referenced
 /// built-in GVKs (Pod, Service, Node, Deployment, ...). See
 /// `core_v1_builtin_definitions` in `crates/api-server/src/handlers/openapi.rs`.
 #[tokio::test]

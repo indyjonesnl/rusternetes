@@ -7,8 +7,8 @@ mod __parent {
     pub use jsonwebtoken::{
         decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
     };
-    pub use rusternetes_common::error::{Error, Result};
-    pub use rusternetes_common::sa_keys::VerificationKey;
+    pub use k3rs_common::error::{Error, Result};
+    pub use k3rs_common::sa_keys::VerificationKey;
     pub use serde::{Deserialize, Serialize};
     pub use sha2::{Digest, Sha256};
     pub use std::collections::HashMap;
@@ -16,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::auth::*;
+    use k3rs_common::auth::*;
 
     #[test]
     fn test_empty_sa_uid_token_round_trips_2358() {
@@ -246,7 +246,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::seconds(600)).timestamp(),
             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-            aud: vec!["rusternetes".to_string()],
+            aud: vec!["k3rs".to_string()],
             pod_name: None,
             pod_uid: None,
             node_name: None,
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_token_with_pod_binding() {
-        let secret = b"rusternetes-secret-change-in-production";
+        let secret = b"k3rs-secret-change-in-production";
         let manager = TokenManager::new(secret);
 
         let now = Utc::now();
@@ -282,7 +282,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-            aud: vec!["rusternetes".to_string()],
+            aud: vec!["k3rs".to_string()],
             kubernetes: None,
             pod_name: Some("my-pod".to_string()),
             pod_uid: Some("pod-uid-456".to_string()),
@@ -307,7 +307,7 @@ mod tests {
     fn test_token_review_includes_pod_extra_info() {
         // Simulate what create_token_review does: validate a token with pod binding
         // and verify the extra info contains pod-name, pod-uid, node-name
-        let secret = b"rusternetes-secret-change-in-production";
+        let secret = b"k3rs-secret-change-in-production";
         let manager = TokenManager::new(secret);
 
         let now = Utc::now();
@@ -318,7 +318,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-            aud: vec!["rusternetes".to_string()],
+            aud: vec!["k3rs".to_string()],
             kubernetes: None,
             pod_name: Some("pod-abc".to_string()),
             pod_uid: Some("pod-uid-abc".to_string()),

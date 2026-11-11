@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde::Deserialize;
     pub use serde_json::json;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::version::*;
+    use k3rs_kubectl::commands::version::*;
 
     #[test]
     fn test_client_version_constant() {

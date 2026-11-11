@@ -2,20 +2,20 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::admission_webhook::MatchCondition;
-    pub use rusternetes_common::resources::validating_admission_policy::{
+    pub use k3rs_common::resources::admission_webhook::MatchCondition;
+    pub use k3rs_common::resources::validating_admission_policy::{
         AuditAnnotation, ExpressionWarning, MatchPolicyType, MatchResources,
         NamedRuleWithOperations, ParamKind, ParamRef, ValidatingAdmissionPolicy,
         ValidatingAdmissionPolicyBinding, ValidatingAdmissionPolicyBindingSpec,
         ValidatingAdmissionPolicySpec, Validation, ValidationAction, Variable,
     };
-    pub use rusternetes_common::resources::LabelSelector;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::resources::LabelSelector;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1035_label, is_dns1123_subdomain, is_qualified_name, validate_label_selector,
         LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::webhookconfiguration::{
+    pub use k3rs_common::validation::webhookconfiguration::{
         to_metav1_selector, validate_rule_parts,
     };
     pub use std::collections::HashSet;
@@ -23,7 +23,7 @@ mod __parent {
 
 mod field_ref_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::validating_admission_policy::*;
+    use k3rs_common::validation::validating_admission_policy::*;
 
     /// Upstream `TestValidateValidatingAdmissionPolicyStatus`
     /// (`validation_test.go:4150-4199`): "type checking bad json path" expects

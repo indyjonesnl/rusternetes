@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::VolumeMount;
-    pub use rusternetes_common::resources::Pod;
+    pub use k3rs_common::resources::pod::VolumeMount;
+    pub use k3rs_common::resources::Pod;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::nested_volumes::*;
+    use k3rs_kubelet::volume_plugins::util::nested_volumes::*;
     use serde_json::json;
 
     fn pod(mounts: serde_json::Value) -> Pod {

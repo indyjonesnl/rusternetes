@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use rusternetes_common::resources::{Node, Pod, Toleration};
+use k3rs_common::resources::{Node, Pod, Toleration};
 
 use crate::advanced::{
     non_zero_request_amounts, parse_resource_quantity, pod_request_amounts,
@@ -342,7 +342,7 @@ impl ResourceAllocationScorer {
 
 /// `schedutil.IsScalarResourceName` (util/utils.go:142-145).
 pub fn is_scalar_resource_name(name: &str) -> bool {
-    use rusternetes_common::quota::{
+    use k3rs_common::quota::{
         is_extended_resource_name, is_hugepage_resource_name, is_prefixed_native_resource,
     };
     is_extended_resource_name(name)
@@ -375,8 +375,7 @@ pub fn node_usages(all_pods: &[Pod]) -> HashMap<String, NodeUsage> {
         }
         if matches!(
             p.status.as_ref().and_then(|s| s.phase.as_ref()),
-            Some(rusternetes_common::types::Phase::Succeeded)
-                | Some(rusternetes_common::types::Phase::Failed)
+            Some(k3rs_common::types::Phase::Succeeded) | Some(k3rs_common::types::Phase::Failed)
         ) {
             continue;
         }
@@ -475,7 +474,7 @@ pub fn image_states(nodes: &[&Node]) -> HashMap<String, (i64, usize)> {
     states
 }
 
-fn image_size(image: &rusternetes_common::resources::ContainerImage) -> i64 {
+fn image_size(image: &k3rs_common::resources::ContainerImage) -> i64 {
     image.size_bytes.unwrap_or(0)
 }
 

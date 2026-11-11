@@ -6,17 +6,17 @@
 //! sig-storage-lib-external-provisioner `controller/controller.go`
 //! (`syncClaim`, `provisionClaimOperation`) and `volume_store.go`.
 
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::{Event, PersistentVolume, PersistentVolumeClaim, Secret};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::csi_provisioner::CsiProvisioner;
-use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
-use rusternetes_csi::controller_client::CsiControllerClient;
-use rusternetes_csi::proto::controller_server::{Controller, ControllerServer};
-use rusternetes_csi::proto::identity_server::{Identity, IdentityServer};
-use rusternetes_csi::proto::*;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::{Event, PersistentVolume, PersistentVolumeClaim, Secret};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::csi_provisioner::CsiProvisioner;
+use k3rs_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
+use k3rs_csi::controller_client::CsiControllerClient;
+use k3rs_csi::proto::controller_server::{Controller, ControllerServer};
+use k3rs_csi::proto::identity_server::{Identity, IdentityServer};
+use k3rs_csi::proto::*;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
@@ -1303,16 +1303,16 @@ async fn an_attached_volume_postpones_deletion_without_failing_it() {
     let mut fake = Fake::new();
     fake.extra_caps = vec![controller_service_capability::rpc::Type::PublishUnpublishVolume];
     let (storage, p, rec, _d) = env(fake, storage_class(None)).await;
-    let va = rusternetes_common::resources::csi::VolumeAttachment {
+    let va = k3rs_common::resources::csi::VolumeAttachment {
         type_meta: TypeMeta {
             kind: "VolumeAttachment".into(),
             api_version: "storage.k8s.io/v1".into(),
         },
         metadata: ObjectMeta::new("va1"),
-        spec: rusternetes_common::resources::csi::VolumeAttachmentSpec {
+        spec: k3rs_common::resources::csi::VolumeAttachmentSpec {
             attacher: DRIVER.into(),
             node_name: "node-1".into(),
-            source: rusternetes_common::resources::csi::VolumeAttachmentSource {
+            source: k3rs_common::resources::csi::VolumeAttachmentSource {
                 persistent_volume_name: Some("pv1".into()),
                 inline_volume_spec: None,
             },
@@ -1405,7 +1405,7 @@ async fn a_non_infeasible_failure_is_not_slow_retried() {
 // (:743-:826), `getSecretReference` (:1922), `getCredentials` (:2004),
 // `getSecretsFromSC` (:1484); `Provision` (:985-:1018).
 
-use rusternetes_common::resources::csi::VolumeAttributesClass;
+use k3rs_common::resources::csi::VolumeAttributesClass;
 
 fn with_params(mut sc: StorageClass, extra: &[(&str, &str)]) -> StorageClass {
     let p = sc.parameters.get_or_insert_with(Default::default);
@@ -1696,8 +1696,8 @@ async fn a_volume_attributes_class_of_another_driver_is_refused() {
 
 // ---- topology (#3007): external-provisioner pkg/controller/topology.go -------
 
-use rusternetes_common::resources::csi::{CSINode, CSINodeDriver, CSINodeSpec};
-use rusternetes_common::resources::Node;
+use k3rs_common::resources::csi::{CSINode, CSINodeDriver, CSINodeSpec};
+use k3rs_common::resources::Node;
 
 const SELECTED_NODE: &str = "volume.kubernetes.io/selected-node";
 
@@ -1878,7 +1878,7 @@ async fn resource_exhausted_with_a_selected_node_reschedules() {
 // "distributed, no node selected", "distributed, wrong node selected"
 // (controller_test.go:2106-2182).
 
-use rusternetes_controller_manager::controllers::csi_provisioner::NodeDeployment;
+use k3rs_controller_manager::controllers::csi_provisioner::NodeDeployment;
 
 fn node_deployment(topology: Option<&[(&str, &str)]>) -> NodeDeployment {
     NodeDeployment {
@@ -2425,10 +2425,8 @@ async fn deleting_a_migrated_pv_translates_its_class_and_propagates_errors() {
 
 mod capacity_refresh {
     use super::*;
-    use rusternetes_controller_manager::controllers::csi_capacity::{Segment, SegmentEntry};
-    use rusternetes_controller_manager::controllers::csi_capacity_refresh::{
-        CapacityRefresher, ItemKey,
-    };
+    use k3rs_controller_manager::controllers::csi_capacity::{Segment, SegmentEntry};
+    use k3rs_controller_manager::controllers::csi_capacity_refresh::{CapacityRefresher, ItemKey};
 
     fn item(zone: Option<&str>, sc: &str) -> ItemKey {
         ItemKey {

@@ -9,12 +9,12 @@
 
 use axum::http::StatusCode;
 use base64::Engine;
-use rusternetes_common::{
+use k3rs_common::{
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, ServiceAccount, Subject},
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TOKEN_SECRET: &[u8] = b"csr-signer-authz-secret";
@@ -59,7 +59,7 @@ async fn seed_sa(state: &TestApiServer, namespace: &str, name: &str) -> String {
 /// handler would (claim shape: upstream `pkg/serviceaccount/claims.go`).
 fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
     let now = chrono::Utc::now();
-    let claims = rusternetes_common::auth::ServiceAccountClaims {
+    let claims = k3rs_common::auth::ServiceAccountClaims {
         sub: format!("system:serviceaccount:{namespace}:{sa_name}"),
         namespace: namespace.to_string(),
         uid: uid.to_string(),
@@ -67,9 +67,9 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         exp: (now + chrono::Duration::hours(1)).timestamp(),
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
         aud: vec!["https://kubernetes.default.svc".to_string()],
-        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+        kubernetes: Some(k3rs_common::auth::KubernetesClaims {
             namespace: namespace.to_string(),
-            svcacct: rusternetes_common::auth::KubeRef {
+            svcacct: k3rs_common::auth::KubeRef {
                 name: sa_name.to_string(),
                 uid: uid.to_string(),
             },
@@ -84,7 +84,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         node_uid: None,
         jti: String::new(),
     };
-    rusternetes_common::auth::TokenManager::new(TOKEN_SECRET)
+    k3rs_common::auth::TokenManager::new(TOKEN_SECRET)
         .generate_token(claims)
         .unwrap()
 }
@@ -386,7 +386,7 @@ async fn pcr_setup(extra: Vec<PolicyRule>) -> (TestApiServer, String) {
     )];
     rules.extend(extra);
     seed_controller_role(&state, "csr-user", rules).await;
-    let pcr: rusternetes_common::resources::podcertificaterequest::PodCertificateRequest =
+    let pcr: k3rs_common::resources::podcertificaterequest::PodCertificateRequest =
         serde_json::from_value(pcr_body()).unwrap();
     state
         .storage
@@ -418,8 +418,8 @@ async fn put_pcr_status(state: &TestApiServer, token: &str) -> (u16, Value) {
 #[tokio::test]
 #[serial_test::serial]
 async fn pcr_status_update_without_sign_is_forbidden() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
         true,
     );
     let (state, token) = pcr_setup(vec![]).await;
@@ -437,8 +437,8 @@ async fn pcr_status_update_without_sign_is_forbidden() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pcr_status_update_with_sign_on_signer_is_allowed() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
         true,
     );
     let (state, token) = pcr_setup(vec![signers_rule("sign", &[PCR_SIGNER])]).await;
@@ -449,8 +449,8 @@ async fn pcr_status_update_with_sign_on_signer_is_allowed() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pcr_status_update_with_sign_on_domain_wildcard_is_allowed() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
         true,
     );
     let (state, token) = pcr_setup(vec![signers_rule("sign", &["example.com/*"])]).await;
@@ -461,8 +461,8 @@ async fn pcr_status_update_with_sign_on_domain_wildcard_is_allowed() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pcr_status_update_with_sign_on_other_signer_is_forbidden() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
         true,
     );
     let (state, token) = pcr_setup(vec![signers_rule("sign", &["example.com/other"])]).await;

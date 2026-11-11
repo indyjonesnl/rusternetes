@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         Node, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, Pod,
     };
     pub use tracing::debug;
@@ -10,10 +10,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::affinity::*;
-    use rusternetes_common::resources::{Affinity, Node, Pod};
-    use rusternetes_common::resources::{PodAffinity, PodAffinityTerm, PodSpec, PodStatus};
-    use rusternetes_common::types::{LabelSelector, Phase};
+    use k3rs_common::affinity::*;
+    use k3rs_common::resources::{Affinity, Node, Pod};
+    use k3rs_common::resources::{PodAffinity, PodAffinityTerm, PodSpec, PodStatus};
+    use k3rs_common::types::{LabelSelector, Phase};
     use std::collections::HashMap;
 
     /// Build a node carrying a single topology label.

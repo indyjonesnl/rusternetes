@@ -8,7 +8,7 @@
 //! These drive the real router with `strict_namespaces()`, which turns off the
 //! harness's namespace auto-seeding so a missing namespace stays missing.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn strict() -> TestApiServer {
@@ -110,7 +110,7 @@ async fn terminating_namespace_and_immortal_deletes() {
 
 /// admission_test.go:239 TestAdmissionNamespaceForceLiveLookup: the cache-miss
 /// path exists upstream so a create right after the namespace's DELETE never
-/// sees stale Active state. Rusternetes reads storage live on every request,
+/// sees stale Active state. k3rs reads storage live on every request,
 /// so the equivalent invariant is: create immediately after DELETE is refused.
 #[tokio::test]
 async fn create_right_after_namespace_delete_is_refused() {

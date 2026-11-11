@@ -1,15 +1,15 @@
 use anyhow::Result;
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::{
     get_default_class, NodeSelectorTerm, PersistentVolumeClaimPhase, PersistentVolumeMode,
     PersistentVolumePhase, PersistentVolumeReclaimPolicy, StorageClass, VolumeBindingMode,
     VolumeNodeAffinity,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     EventSource, EventType, Node, PersistentVolume, PersistentVolumeClaim,
     PersistentVolumeClaimSpec, PersistentVolumeSpec, PersistentVolumeStatus, Pod,
 };
-use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -91,10 +91,10 @@ const ANN_BETA_STORAGE_CLASS: &str = "volume.beta.kubernetes.io/storage-class";
 
 /// `util.IsPodTerminated` (`pkg/volume/util/util.go:303-310`).
 pub fn is_pod_terminated(pod: &Pod) -> bool {
-    use rusternetes_common::resources::pod::{
+    use k3rs_common::resources::pod::{
         ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
     };
-    use rusternetes_common::types::Phase;
+    use k3rs_common::types::Phase;
     let Some(status) = pod.status.as_ref() else {
         return false;
     };
@@ -170,11 +170,11 @@ async fn host_path_delete(path: &str) -> std::result::Result<(), String> {
 /// `FindDeletablePluginByName` names this controller has a deleter for. The
 /// upstream in-tree one is hostPath (`kubernetes.io/host-path`,
 /// `pkg/volume/hostpath/host_path.go:77`); the rest are the names
-/// `DynamicProvisioner` stamps on the PVs it creates (Rusternetes-only).
+/// `DynamicProvisioner` stamps on the PVs it creates (k3rs-only).
 const BUILTIN_DELETER_PLUGINS: &[&str] = &[
     "kubernetes.io/host-path",
     "kubernetes.io/hostpath",
-    "rusternetes.io/hostpath",
+    "k3rs.io/hostpath",
     "hostpath",
 ];
 
@@ -331,7 +331,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         loop {
             self.enqueue_all(&queue, &volume_queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", None);
+            let prefix = k3rs_storage::build_prefix("persistentvolumeclaims", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -343,7 +343,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
             };
 
             // Upstream's volume informer drives syncVolume on every PV event.
-            let pv_prefix = rusternetes_storage::build_prefix("persistentvolumes", None);
+            let pv_prefix = k3rs_storage::build_prefix("persistentvolumes", None);
             let mut pv_watch = match self.storage.watch(&pv_prefix).await {
                 Ok(w) => w,
                 Err(e) => {
@@ -365,7 +365,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
                                 // `deleteClaim` (pv_controller_base.go:273-295):
                                 // "sync the volume when its claim is deleted"
                                 // so its Release does not wait for the resync.
-                                if let rusternetes_storage::WatchEvent::Deleted(_, prev) = &ev {
+                                if let k3rs_storage::WatchEvent::Deleted(_, prev) = &ev {
                                     if let Some(volume) = deleted_claim_volume_key(prev) {
                                         volume_queue.add(volume).await;
                                     }
@@ -389,7 +389,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
                                 // `deleteVolume` (pv_controller_base.go:228-243):
                                 // "sync the claim when its volume is deleted"
                                 // so its Lost status does not wait for the resync.
-                                if let rusternetes_storage::WatchEvent::Deleted(_, prev) = &ev {
+                                if let k3rs_storage::WatchEvent::Deleted(_, prev) = &ev {
                                     if let Some(claim) = deleted_volume_claim_key(prev) {
                                         queue.add(claim).await;
                                     }
@@ -461,7 +461,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
                         error!("Failed to sync PV {}: {}", name, e);
                     }
                 }
-                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(k3rs_common::Error::NotFound(_)) => {}
                 Err(e) => error!("Failed to get PV {}: {}", name, e),
             }
             queue.forget(&key).await;
@@ -596,7 +596,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 let key = build_key("persistentvolumeclaims", Some(ns), name);
                 match self.storage.get::<PersistentVolumeClaim>(&key).await {
                     Ok(c) => Some(c),
-                    Err(rusternetes_common::Error::NotFound(_)) => None,
+                    Err(k3rs_common::Error::NotFound(_)) => None,
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -852,7 +852,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
         let key = build_key("persistentvolumeclaims", Some(ns), name);
         match self.storage.get::<PersistentVolumeClaim>(&key).await {
             Ok(c) => Ok(Some(c)),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -938,7 +938,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
             .await?;
         let pv_key = build_key("persistentvolumes", None, &volume.metadata.name);
         match self.storage.delete(&pv_key).await {
-            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+            Ok(()) | Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
         info!(
@@ -1408,7 +1408,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
             .await
         {
             Ok(pv) => Ok(Some(pv)),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -1778,7 +1778,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
             .await
         {
             Ok(c) => c,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(false),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(false),
             Err(e) => return Err(e.into()),
         };
         match class.volume_binding_mode {
@@ -1899,17 +1899,15 @@ impl<S: Storage + 'static> PVBinderController<S> {
                 .or_insert_with(|| "yes".to_string());
         }
         // Pin the PV to this PVC (idempotent for an already pre-bound PV).
-        pv.spec.claim_ref = Some(
-            rusternetes_common::resources::service_account::ObjectReference {
-                kind: Some("PersistentVolumeClaim".to_string()),
-                namespace: Some(namespace.clone()),
-                name: Some(pvc_name.clone()),
-                uid: Some(pvc.metadata.uid.clone()),
-                api_version: Some("v1".to_string()),
-                resource_version: None,
-                field_path: None,
-            },
-        );
+        pv.spec.claim_ref = Some(k3rs_common::resources::service_account::ObjectReference {
+            kind: Some("PersistentVolumeClaim".to_string()),
+            namespace: Some(namespace.clone()),
+            name: Some(pvc_name.clone()),
+            uid: Some(pvc.metadata.uid.clone()),
+            api_version: Some("v1".to_string()),
+            resource_version: None,
+            field_path: None,
+        });
         pv.status = Some(PersistentVolumeStatus {
             phase: PersistentVolumePhase::Bound,
             message: None,
@@ -1957,8 +1955,8 @@ impl<S: Storage + 'static> PVBinderController<S> {
     /// Check if a PV matches the requirements of a PVC
     fn pv_matches_pvc(
         &self,
-        pv_spec: &rusternetes_common::resources::PersistentVolumeSpec,
-        pvc_spec: &rusternetes_common::resources::PersistentVolumeClaimSpec,
+        pv_spec: &k3rs_common::resources::PersistentVolumeSpec,
+        pvc_spec: &k3rs_common::resources::PersistentVolumeClaimSpec,
     ) -> bool {
         // Check storage class match
         if let (Some(pv_class), Some(pvc_class)) =
@@ -2041,7 +2039,7 @@ impl<S: Storage + 'static> PVBinderController<S> {
 /// `required.nodeSelectorTerms` are ORed; within a term every match expression
 /// and match field must hold (AND). Mirrors upstream
 /// `pkg/apis/core/v1/helper.MatchNodeSelectorTerms` semantics for the operators
-/// rusternetes models.
+/// k3rs models.
 /// True when a PV's `claimRef` names this exact PVC (namespace + name), with a
 /// matching UID when the ref carries one. A pre-bound PV from the dynamic
 /// provisioner sets all three; the UID guard prevents binding to a PV that was
@@ -2066,7 +2064,7 @@ pub const EXTERNAL_PV_DELETION_PROTECTION_FINALIZER: &str =
 /// `csilibplugins.*InTreePluginName` -> `*DriverName`, the entries of
 /// `inTreePlugins` in `csi-translation-lib/translate.go:30-38` (names from
 /// `plugins/{aws_ebs,gce_pd,azure_file,azure_disk,openstack_cinder,
-/// vsphere_volume,portworx}.go`). Only the name mapping is ported; Rusternetes
+/// vsphere_volume,portworx}.go`). Only the name mapping is ported; k3rs
 /// has no volume-source translation.
 const IN_TREE_TO_CSI_DRIVER: &[(&str, &str)] = &[
     ("kubernetes.io/gce-pd", "pd.csi.storage.gke.io"),
@@ -2276,7 +2274,7 @@ fn object_ref_for_pvc(pvc: &PersistentVolumeClaim) -> ObjectReference {
 }
 
 pub fn claim_ref_points_to(
-    claim_ref: &rusternetes_common::resources::service_account::ObjectReference,
+    claim_ref: &k3rs_common::resources::service_account::ObjectReference,
     namespace: &str,
     pvc_name: &str,
     pvc_uid: &str,

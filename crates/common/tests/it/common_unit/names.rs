@@ -5,7 +5,7 @@ mod __parent {}
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::names::*;
+    use k3rs_common::names::*;
 
     /// Upstream `TestSimpleNameGenerator` (generate_test.go): the base is kept
     /// and five characters are appended.

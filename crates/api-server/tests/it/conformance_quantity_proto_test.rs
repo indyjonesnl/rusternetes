@@ -30,13 +30,13 @@
 //!   length-delimited payload: `varint(len) + bytes`
 //!
 //! If any of these fail, the protobuf middleware will emit JSON that the
-//! typed deserializers in `rusternetes_common::resources` reject — most
+//! typed deserializers in `k3rs_common::resources` reject — most
 //! visibly via `deserialize_quantity_map`, which expects each entry to be
 //! a string. The conformance suite's `[sig-scheduling]` and
 //! `[sig-storage]` tests all post Pods/PVCs over the protobuf wire, so a
 //! regression here breaks roughly half of upstream conformance.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::Value;
 
 // ---------- wire helpers ---------------------------------------------------
@@ -211,13 +211,13 @@ fn test_resource_requirements_canonical_quantity_forms_pass_through() {
 
 /// End-to-end shape check: decode a `Container` carrying `resources.limits`
 /// and `resources.requests`, then feed the resulting JSON to the typed
-/// `rusternetes_common::resources::Container`. This is exactly what the
+/// `k3rs_common::resources::Container`. This is exactly what the
 /// pod handler does after the protobuf middleware rewrites the body to
 /// JSON — if the decoder emitted bare numbers, `deserialize_quantity_map`
 /// would reject the request with `expected string`.
 #[test]
 fn test_container_resources_round_trip_through_typed_container() {
-    use rusternetes_common::resources::Container;
+    use k3rs_common::resources::Container;
 
     let registry = ProtoRegistry::new();
 
@@ -298,7 +298,7 @@ fn test_volume_resource_requirements_quantity_map_decodes_to_strings() {
 /// [Conformance]`.
 #[test]
 fn test_pvc_spec_resources_requests_storage_round_trips() {
-    use rusternetes_common::resources::PersistentVolumeClaimSpec;
+    use k3rs_common::resources::PersistentVolumeClaimSpec;
 
     let registry = ProtoRegistry::new();
 
@@ -332,7 +332,7 @@ fn test_pvc_spec_resources_requests_storage_round_trips() {
 /// `ResourceQuotaSpec.hard` is `map<string, Quantity>` at field 1 in
 /// upstream `k8s.io/api/core/v1/generated.proto`. The decoded JSON must
 /// be an object of quoted canonical strings so the typed
-/// `rusternetes_common::resources::ResourceQuotaSpec` deserializer
+/// `k3rs_common::resources::ResourceQuotaSpec` deserializer
 /// (`deserialize_quantity_map`) accepts it.
 #[test]
 fn test_resource_quota_spec_hard_decodes_to_quoted_strings() {
@@ -386,7 +386,7 @@ fn test_resource_quota_spec_hard_decodes_to_quoted_strings() {
 /// ResourceQuota create/update.
 #[test]
 fn test_resource_quota_spec_round_trips_through_typed_struct() {
-    use rusternetes_common::resources::ResourceQuotaSpec;
+    use k3rs_common::resources::ResourceQuotaSpec;
 
     let registry = ProtoRegistry::new();
 

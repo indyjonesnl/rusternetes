@@ -33,7 +33,7 @@
 //! - `X-Forwarded-For` is only added when the request carries the peer address
 //!   as axum `ConnectInfo<SocketAddr>`, as Go does when `RemoteAddr` parses.
 //!   Every api-server listener provides it through
-//!   `rusternetes_api_server::serve_service`.
+//!   `k3rs_api_server::serve_service`.
 
 use crate::egress_selector::Dialer;
 use crate::handlers::aggregator::AggregatorTarget;
@@ -41,7 +41,7 @@ use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
-use rusternetes_common::auth::UserInfo;
+use k3rs_common::auth::UserInfo;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

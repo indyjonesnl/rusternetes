@@ -8,7 +8,7 @@
 //!   and `delegating.go:46-60` (`DelegatingAuthorizerConfig.New`)
 //! * `plugin/pkg/authorizer/webhook/webhook.go:171-319,426-436,535-547`
 //!   (`WebhookAuthorizer.Authorize`, `shouldCache`)
-//! * `pkg/authorization/union/union.go` (reused: `rusternetes_common::authz::UnionAuthorizer`)
+//! * `pkg/authorization/union/union.go` (reused: `k3rs_common::authz::UnionAuthorizer`)
 //!
 //! Not ported (unreachable from the delegating authorizer): `matchConditions`
 //! (`NewFromInterface` passes none), the authorizer metrics, and the
@@ -17,9 +17,9 @@
 
 use super::webhook::{default_should_retry, with_exponential_backoff, Backoff, ReviewClient};
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::error::{Error, Result};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::error::{Error, Result};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,8 +70,8 @@ impl Authorizer for PathAuthorizer {
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -308,8 +308,8 @@ impl Authorizer for SubjectAccessReviewAuthorizer {
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 

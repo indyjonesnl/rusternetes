@@ -5,13 +5,11 @@ mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
     pub use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-    pub use rusternetes_common::resources::Service;
-    pub use rusternetes_common::resources::ServiceType;
-    pub use rusternetes_common::resources::{
-        IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy,
-    };
-    pub use rusternetes_common::service_ip_ranges::ServiceIpRanges;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_common::resources::Service;
+    pub use k3rs_common::resources::ServiceType;
+    pub use k3rs_common::resources::{IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy};
+    pub use k3rs_common::service_ip_ranges::ServiceIpRanges;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashSet;
     pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     pub use std::sync::Arc;
@@ -21,13 +19,13 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{IntOrString, ServicePort, ServiceSpec};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::service::*;
+    use k3rs_common::resources::{IntOrString, ServicePort, ServiceSpec};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::service::*;
 
     #[tokio::test]
     async fn test_allocate_cluster_ip() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceController::new(storage);
 
@@ -50,7 +48,7 @@ mod tests {
     /// hard-coded 10.96.0.1.
     #[tokio::test]
     async fn custom_range_allocates_from_that_range() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
             .with_service_cluster_ip_range("192.0.2.0/24")
             .unwrap();
@@ -63,7 +61,7 @@ mod tests {
     /// range at all.
     #[tokio::test]
     async fn reserved_api_server_ip_is_the_first_of_the_primary_range() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
             .with_service_cluster_ip_range("10.0.0.0/24")
             .unwrap();
@@ -82,7 +80,7 @@ mod tests {
     /// range's first, and both families allocate from their own range.
     #[tokio::test]
     async fn ipv6_primary_dual_stack_ranges() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
             .with_service_cluster_ip_range("2001:db8:1::/112,192.0.2.0/24")
             .unwrap();
@@ -101,7 +99,7 @@ mod tests {
     /// from it is an error rather than an address from a default range.
     #[tokio::test]
     async fn family_without_a_range_cannot_allocate() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let controller = ServiceController::new(Arc::new(MemoryStorage::new()))
             .with_service_cluster_ip_range("192.0.2.0/24")
             .unwrap();
@@ -110,7 +108,7 @@ mod tests {
 
     #[test]
     fn invalid_range_flag_is_rejected_like_upstream() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let c = || ServiceController::new(Arc::new(MemoryStorage::new()));
         assert!(c().with_service_cluster_ip_range("nope").is_err());
         assert!(c()
@@ -120,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_allocate_node_port() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceController::new(storage);
 
@@ -138,12 +136,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_clusterip_service() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceController::new(storage.clone());
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -213,12 +211,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_nodeport_service() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceController::new(storage.clone());
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },

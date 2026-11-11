@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::{Lease, LeaseSpec};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_common::resources::{Lease, LeaseSpec};
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use sha2::{Digest, Sha256};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -17,7 +17,7 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::TimeZone;
-    use rusternetes_api_server::apiserver_identity::*;
+    use k3rs_api_server::apiserver_identity::*;
 
     fn t0() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap()
@@ -123,7 +123,7 @@ mod tests {
         let s = Arc::new(StorageBackend::new_memory());
         spawn_identity_hooks(s);
         for _ in 0..50 {
-            let g = rusternetes_api_server::post_start_hooks::global();
+            let g = k3rs_api_server::post_start_hooks::global();
             if g.check(IDENTITY_LEASE_CONTROLLER_HOOK) == Some(Ok(()))
                 && g.check(IDENTITY_LEASE_GC_HOOK) == Some(Ok(()))
             {

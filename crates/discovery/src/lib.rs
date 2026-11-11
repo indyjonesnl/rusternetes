@@ -14,7 +14,7 @@ pub mod restmapper;
 pub mod vap_typechecking;
 
 /// Version information (`apimachinery/pkg/version.Info`).
-pub use rusternetes_common::compatibility::VersionInfo;
+pub use k3rs_common::compatibility::VersionInfo;
 
 /// APIVersions lists the versions that are available, to allow clients to discover
 /// the API at /api
@@ -175,13 +175,13 @@ pub async fn get_core_api(headers: HeaderMap) -> Response {
 /// List groups registered via APIService objects from storage.
 /// Storage-only: returns group/version metadata without proxying to backends.
 async fn list_registered_apiservice_groups_with_storage(
-    storage: &rusternetes_storage::StorageBackend,
+    storage: &k3rs_storage::StorageBackend,
 ) -> Vec<serde_json::Value> {
-    use rusternetes_storage::Storage;
+    use k3rs_storage::Storage;
     use std::cmp::Reverse;
     use std::collections::HashMap;
 
-    let prefix = rusternetes_storage::build_prefix("apiservices", None);
+    let prefix = k3rs_storage::build_prefix("apiservices", None);
     let items: Vec<serde_json::Value> = storage.list(&prefix).await.unwrap_or_default();
 
     let mut by_group: HashMap<String, Vec<(String, i32)>> = HashMap::new();
@@ -248,7 +248,7 @@ pub fn crd_established(crd: &serde_json::Value) -> bool {
 /// GET /apis
 /// Returns the list of API groups available
 pub async fn get_api_groups(
-    storage: Option<std::sync::Arc<rusternetes_storage::StorageBackend>>,
+    storage: Option<std::sync::Arc<k3rs_storage::StorageBackend>>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(disc_version) = aggregated_discovery_version(&headers) {
@@ -321,8 +321,8 @@ pub async fn get_api_groups(
         // K8s aggregated discovery returns one group entry with ALL resources nested
         // under their respective versions.
         if let Some(ref storage) = storage {
-            use rusternetes_storage::Storage;
-            let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+            use k3rs_storage::Storage;
+            let crd_prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
             if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
                 // Collect resources per group+version, then emit one group entry per group.
                 // Key: (group, version) → Vec<resource_entry>
@@ -855,8 +855,8 @@ pub async fn get_api_groups(
     // kubectl create/explain fails with "no matches for kind".
     // K8s ref: apiextensions-apiserver registers CRD API groups dynamically.
     if let Some(ref storage) = storage {
-        use rusternetes_storage::Storage;
-        let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+        use k3rs_storage::Storage;
+        let crd_prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
         if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             // One APIGroup per group, built from the served versions of
             // every Established CRD in it, de-duplicated by version
@@ -967,7 +967,7 @@ pub async fn get_api_groups(
 /// (pkg/registry/certificates/rest/storage_certificates.go:91-117), and
 /// upstream drops a group version that has no storage.
 fn certificates_v1beta1_served() -> bool {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     enabled(Feature::ClusterTrustBundle) || enabled(Feature::PodCertificateRequest)
 }
 
@@ -978,12 +978,10 @@ fn certificates_v1beta1_served() -> bool {
 /// upstream drops a group version that has no storage. Upstream also needs the
 /// alpha version enabled through `--runtime-config`
 /// (`alphaAPIGroupVersionsDisabledByDefault`, pkg/controlplane/instance.go);
-/// Rusternetes has no `--runtime-config`, so the gate stands in for both, as it
+/// k3rs has no `--runtime-config`, so the gate stands in for both, as it
 /// does for v1beta1.
 fn certificates_v1alpha1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    )
+    k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::ClusterTrustBundle)
 }
 
 /// Whether `group` also serves a `v1alpha1` next to its v1beta1.
@@ -1000,8 +998,8 @@ fn group_v1alpha1_served(group: &str) -> bool {
 /// storage_apiserver.go:187-205), and upstream drops a group version that has
 /// no storage.
 fn admissionregistration_v1beta1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+    k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::MutatingAdmissionPolicy,
     )
 }
 
@@ -1011,9 +1009,7 @@ fn admissionregistration_v1beta1_served() -> bool {
 /// storage_resource.go:117-130 `v1alpha3Storage`, `ResourceEnabled`), and
 /// upstream drops a group version that has no storage.
 fn resource_v1alpha3_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::DRADeviceTaintRules,
-    )
+    k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::DRADeviceTaintRules)
 }
 
 /// Whether `group` also serves a `v1alpha3` next to its preferred version.
@@ -1030,9 +1026,7 @@ fn group_v1alpha3_served(group: &str) -> bool {
 /// storage_storagemigration.go:54-70 `v1beta1Storage`), and upstream drops a
 /// group version that has no storage (`len(storageMap) > 0`, :41-43).
 fn storagemigration_v1beta1_served() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::StorageVersionMigrator,
-    )
+    k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::StorageVersionMigrator)
 }
 
 /// Whether `group` also serves a `v1beta1` next to its preferred version.
@@ -1048,15 +1042,12 @@ fn group_v1beta1_served(group: &str) -> bool {
 /// from the scheme table. `None` when nothing is filtered, which is always the
 /// case at the binary version, as no kind is introduced after it.
 fn emulation_served_resources(group: &str) -> Option<deleted_kinds::VersionedResources> {
-    emulation_served_resources_at(
-        group,
-        rusternetes_common::feature_gates::emulation_version(),
-    )
+    emulation_served_resources_at(group, k3rs_common::feature_gates::emulation_version())
 }
 
 fn emulation_served_resources_at(
     group: &str,
-    emulation: rusternetes_common::feature_gates::Version,
+    emulation: k3rs_common::feature_gates::Version,
 ) -> Option<deleted_kinds::VersionedResources> {
     try_emulation_served_resources_at(
         group,
@@ -1093,7 +1084,7 @@ fn runtime_config() -> Option<std::sync::Arc<resource_config::ResourceConfig>> {
 /// over every built-in group at the current emulation version.
 pub fn check_runtime_config_against_emulation_version() -> Result<(), String> {
     let config = runtime_config();
-    let emulation = rusternetes_common::feature_gates::emulation_version();
+    let emulation = k3rs_common::feature_gates::emulation_version();
     let mut groups: Vec<&str> = raw_api_group_names().into_iter().map(|(g, _)| g).collect();
     groups.sort_unstable();
     groups.dedup();
@@ -1111,14 +1102,14 @@ pub fn check_runtime_config_against_emulation_version() -> Result<(), String> {
 
 fn try_emulation_served_resources_at(
     group: &str,
-    emulation: rusternetes_common::feature_gates::Version,
+    emulation: k3rs_common::feature_gates::Version,
     config: Option<&dyn deleted_kinds::ResourceConfig>,
 ) -> Result<Option<deleted_kinds::VersionedResources>, String> {
-    use rusternetes_common::resource_encoding::Scheme;
+    use k3rs_common::resource_encoding::Scheme;
     static SCHEME: std::sync::OnceLock<Scheme> = std::sync::OnceLock::new();
 
     if emulation
-        >= rusternetes_common::compatibility::default_build_effective_version().emulation_version()
+        >= k3rs_common::compatibility::default_build_effective_version().emulation_version()
     {
         return Ok(None);
     }
@@ -1199,14 +1190,14 @@ fn get_aggregated_resources_for_group_uncategorized(
     resources_at_emulation_version(
         group,
         version,
-        rusternetes_common::feature_gates::emulation_version(),
+        k3rs_common::feature_gates::emulation_version(),
     )
 }
 
 fn resources_at_emulation_version(
     group: &str,
     version: &str,
-    emulation: rusternetes_common::feature_gates::Version,
+    emulation: k3rs_common::feature_gates::Version,
 ) -> Vec<serde_json::Value> {
     let mut entries = get_aggregated_resources_for_group_unfiltered(group, version);
     let Some(served) = emulation_served_resources_at(group, emulation) else {
@@ -1988,7 +1979,7 @@ fn get_aggregated_resources_for_group_unfiltered(
             }
         }
         "certificates.k8s.io" if version == "v1beta1" => {
-            use rusternetes_common::feature_gates::{enabled, Feature};
+            use k3rs_common::feature_gates::{enabled, Feature};
             let mut v = Vec::new();
             if enabled(Feature::ClusterTrustBundle) {
                 v.push(res(
@@ -2267,7 +2258,7 @@ fn get_aggregated_resources_for_group_unfiltered(
 /// apiextensions-apiserver registers CRD API groups dynamically; we synthesize
 /// the same APIGroup document on read.
 pub async fn get_api_group(
-    storage: Option<std::sync::Arc<rusternetes_storage::StorageBackend>>,
+    storage: Option<std::sync::Arc<k3rs_storage::StorageBackend>>,
     axum::extract::Path(group): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -2345,8 +2336,8 @@ pub async fn get_api_group(
     // served version across all CRDs sharing the group, de-duplicated, so a CRD
     // with multiple versions (or several CRDs in the same group) all surface.
     if let Some(ref storage) = storage {
-        use rusternetes_storage::Storage;
-        let crd_prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+        use k3rs_storage::Storage;
+        let crd_prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
         if let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await {
             let mut versions: Vec<GroupVersionForDiscovery> = Vec::new();
             for crd in crds.iter().filter(|c| crd_established(c)) {
@@ -2412,7 +2403,7 @@ pub async fn get_api_group(
 pub async fn get_version() -> (StatusCode, Json<VersionInfo>) {
     // `routes.Version{Version: c.EffectiveVersion.Info()}`
     // (apiserver/pkg/server/config.go:1129).
-    let version_info = rusternetes_common::compatibility::current_effective_version().info();
+    let version_info = k3rs_common::compatibility::current_effective_version().info();
 
     (StatusCode::OK, Json(version_info))
 }
@@ -2459,7 +2450,7 @@ impl APIResourceList {
     /// (`name` containing `/`) are served by REST objects that are not
     /// `StorageVersionProvider`s and carry no hash.
     pub fn with_storage_version_hashes(mut self) -> Self {
-        use rusternetes_common::resource_encoding::{
+        use k3rs_common::resource_encoding::{
             storage_version_hash::discovery_storage_version_hash, GroupResource,
             StorageFactoryConfig,
         };
@@ -4305,7 +4296,7 @@ pub async fn get_certificates_v1beta1_resources() -> Response {
         )
             .into_response();
     }
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     let all_verbs = || -> Vec<String> {
         [
             "create",
@@ -5536,8 +5527,8 @@ mod tests {
     /// matching /apis/{group}.
     #[tokio::test]
     async fn apis_merges_served_versions_across_crds_in_a_group() {
-        use rusternetes_storage::Storage;
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        use k3rs_storage::Storage;
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
         for (name, plural, kind, vers) in [
             (
                 "foos.merge.example.com",
@@ -5560,7 +5551,7 @@ mod tests {
                     "versions": versions},
                 "status": {"conditions": [{"type": "Established", "status": "True"}]}
             });
-            let key = rusternetes_storage::build_key("customresourcedefinitions", None, name);
+            let key = k3rs_storage::build_key("customresourcedefinitions", None, name);
             storage.create(&key, &crd).await.unwrap();
         }
         let resp = get_api_groups(Some(storage.clone()), HeaderMap::new()).await;
@@ -5592,8 +5583,8 @@ mod tests {
     /// discovery document and in the RESTMapper input.
     #[tokio::test]
     async fn crd_group_versions_are_ordered_by_kube_aware_priority() {
-        use rusternetes_storage::Storage;
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        use k3rs_storage::Storage;
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
         let crd = serde_json::json!({
             "apiVersion": "apiextensions.k8s.io/v1",
             "kind": "CustomResourceDefinition",
@@ -5608,7 +5599,7 @@ mod tests {
                 ]},
             "status": {"conditions": [{"type": "Established", "status": "True"}]}
         });
-        let key = rusternetes_storage::build_key(
+        let key = k3rs_storage::build_key(
             "customresourcedefinitions",
             None,
             "foos.ordered.example.com",
@@ -5697,8 +5688,8 @@ mod tests {
     /// `Established` contributes nothing to discovery.
     #[tokio::test]
     async fn crd_group_is_not_discoverable_until_established() {
-        use rusternetes_storage::Storage;
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        use k3rs_storage::Storage;
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
         let crd = |name: &str, group: &str, established: &str| {
             serde_json::json!({
                 "apiVersion": "apiextensions.k8s.io/v1",
@@ -5710,7 +5701,7 @@ mod tests {
                 "status": {"conditions": [{"type": "Established", "status": established}]}
             })
         };
-        let k1 = rusternetes_storage::build_key(
+        let k1 = k3rs_storage::build_key(
             "customresourcedefinitions",
             None,
             "foos.pending.example.com",
@@ -5722,11 +5713,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let k2 = rusternetes_storage::build_key(
-            "customresourcedefinitions",
-            None,
-            "foos.ready.example.com",
-        );
+        let k2 =
+            k3rs_storage::build_key("customresourcedefinitions", None, "foos.ready.example.com");
         storage
             .create(
                 &k2,
@@ -6457,7 +6445,7 @@ mod tests {
 #[cfg(test)]
 mod emulation_tests {
     use super::*;
-    use rusternetes_common::feature_gates::Version;
+    use k3rs_common::feature_gates::Version;
 
     fn names(group: &str, version: &str, emulation: Version) -> Vec<String> {
         resources_at_emulation_version(group, version, emulation)
@@ -6512,7 +6500,7 @@ mod emulation_tests {
             merge_api_resource_configs, ConfigurationMap, ResourceConfig,
         };
         let emulation = Version::major_minor(1, 33);
-        let scheme = rusternetes_common::resource_encoding::Scheme::legacy();
+        let scheme = k3rs_common::resource_encoding::Scheme::legacy();
         let mut overrides = ConfigurationMap::new();
         overrides.insert("resource.k8s.io/v1".into(), "true".into());
         let cfg = merge_api_resource_configs(ResourceConfig::new(), &overrides, &scheme).unwrap();

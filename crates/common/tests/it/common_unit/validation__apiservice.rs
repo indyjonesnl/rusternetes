@@ -3,18 +3,18 @@
 
 mod __parent {
     pub use base64::Engine;
-    pub use rusternetes_common::resources::{APIService, APIServiceStatus};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::{APIService, APIServiceStatus};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_path_segment, validate_object_meta, validate_object_meta_update,
     };
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::APIServiceReference;
-    use rusternetes_common::validation::apiservice::*;
+    use k3rs_common::resources::APIServiceReference;
+    use k3rs_common::validation::apiservice::*;
 
     fn valid(name: &str) -> APIService {
         let mut a = APIService::default();
@@ -137,7 +137,7 @@ mod tests {
         let mut a = remote();
         a.status
             .conditions
-            .push(rusternetes_common::resources::APIServiceCondition {
+            .push(k3rs_common::resources::APIServiceCondition {
                 type_: "Available".into(),
                 status: "Maybe".into(),
                 ..Default::default()

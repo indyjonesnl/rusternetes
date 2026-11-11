@@ -13,7 +13,7 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      // Proxy K8s API calls to the rusternetes API server during development
+      // Proxy K8s API calls to the k3rs API server during development
       "/api": {
         target: "http://localhost:6443",
         changeOrigin: true,

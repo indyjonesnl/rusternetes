@@ -4,17 +4,17 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use chrono::SecondsFormat;
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::volume::{
         PersistentVolumeClaim, PersistentVolumeClaimCondition, PersistentVolumeClaimStatus,
     };
-    pub use rusternetes_storage::{build_key, Storage};
+    pub use k3rs_storage::{build_key, Storage};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::resize_util::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_kubelet::volume_plugins::util::resize_util::*;
+    use k3rs_storage::StorageBackend;
     use serde_json::json;
 
     pub(crate) fn pvc(status: serde_json::Value) -> PersistentVolumeClaim {

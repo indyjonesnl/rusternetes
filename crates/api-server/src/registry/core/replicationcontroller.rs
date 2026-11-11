@@ -4,18 +4,18 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::resources::{
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::resources::{
     ReplicationController, ReplicationControllerStatus, Scale, ScaleSpec, ScaleStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_common::validation::field::{Error, ErrorList, Path};
-use rusternetes_common::validation::metav1::is_dns1123_label;
-use rusternetes_common::validation::replicationcontroller::{
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::validation::field::{Error, ErrorList, Path};
+use k3rs_common::validation::metav1::is_dns1123_label;
+use k3rs_common::validation::replicationcontroller::{
     validate_replication_controller, validate_replication_controller_status_update,
     validate_replication_controller_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -50,10 +50,7 @@ impl RestCreateStrategy<ReplicationController> for Strategy {
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut ReplicationController) {
         obj.status = Some(ReplicationControllerStatus::default());
         obj.metadata.generation = Some(1);
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
-            &mut obj.spec.template,
-            None,
-        );
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(&mut obj.spec.template, None);
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &ReplicationController) -> ErrorList {
@@ -97,7 +94,7 @@ impl RestUpdateStrategy<ReplicationController> for Strategy {
         old: &ReplicationController,
     ) {
         obj.status = old.status.clone();
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(
             &mut obj.spec.template,
             Some(&old.spec.template),
         );

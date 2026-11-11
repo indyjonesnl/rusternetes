@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::volume_plugins::util::exec::{Exec, ExecError};
-    pub use rusternetes_kubelet::volume_plugins::util::mount_ops::{
+    pub use k3rs_kubelet::volume_plugins::util::exec::{Exec, ExecError};
+    pub use k3rs_kubelet::volume_plugins::util::mount_ops::{
         sanitized_options_for_logging, Mounter,
     };
     pub use std::io;
@@ -15,9 +15,9 @@ mod __parent {
 mod tests {
     //! Port of `TestSafeFormatAndMount` (`safe_format_and_mount_test.go:55-262`).
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::exec::testing::{CommandScript, FakeExec};
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::*;
+    use k3rs_kubelet::volume_plugins::util::exec::testing::{CommandScript, FakeExec};
+    use k3rs_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::*;
 
     const BLKID: [&str; 8] = [
         "-p", "-s", "TYPE", "-s", "PTTYPE", "-o", "export", "/dev/foo",
@@ -259,8 +259,8 @@ mod format_limit_tests {
     //! `TestSafeFormatAndMount_format` concurrency (`mount_linux_test.go:
     //! 655-755`) and `TestFormatTimeout` (`:757-818`).
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::*;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::*;
     use std::sync::mpsc;
     use std::thread;
 

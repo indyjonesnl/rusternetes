@@ -29,9 +29,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rusternetes_common::resources::Pod;
-use rusternetes_kubelet::volumes::VolumeManager;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Pod;
+use k3rs_kubelet::volumes::VolumeManager;
+use k3rs_storage::StorageBackend;
 use serde_json::{json, Value};
 
 struct Node {
@@ -50,7 +50,7 @@ impl Node {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.path().to_string_lossy().to_string(),
             Some(api.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         Self { _root: root, vm }
     }

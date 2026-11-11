@@ -18,13 +18,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures::StreamExt;
 
 use async_trait::async_trait;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::resources::Namespace;
-use rusternetes_common::Error;
-use rusternetes_discovery::restmapper::{
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::resources::Namespace;
+use k3rs_common::Error;
+use k3rs_discovery::restmapper::{
     new_discovery_rest_mapper, served_group_resources, Gk, PriorityRestMapper, Scope,
 };
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+use k3rs_storage::{build_prefix, Storage, WatchEvent};
 use serde_json::Value;
 
 use super::policy_dispatch::ParamScope;
@@ -38,8 +38,8 @@ use super::policy_source::{
     Informer, ParamInformerFactory, PolicySource, RestMapper, RestMapping, StorageInformer,
     StorageParamInformerFactory,
 };
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::resources::mutating_admission_policy::{
+use k3rs_common::authz::Authorizer;
+use k3rs_common::resources::mutating_admission_policy::{
     MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
 };
 
@@ -228,7 +228,7 @@ impl CrdEquivalentRegistry {
             .crds
             .values()
             .iter()
-            .filter(|c| rusternetes_discovery::crd_established(c))
+            .filter(|c| k3rs_discovery::crd_established(c))
         {
             register_crd(&reg, crd);
         }
@@ -394,7 +394,7 @@ impl<S: Storage> NamespaceObjects for StorageNamespaceObjects<S> {
     async fn get_namespace(&self, name: &str) -> Result<Value, Error> {
         let ns: Namespace = self
             .storage
-            .get(&rusternetes_storage::build_key("namespaces", None, name))
+            .get(&k3rs_storage::build_key("namespaces", None, name))
             .await?;
         serde_json::to_value(ns).map_err(|e| Error::Internal(e.to_string()))
     }
@@ -405,8 +405,7 @@ pub struct RegistryTypeConverters;
 
 impl TypeConverters for RegistryTypeConverters {
     fn has_type_converter(&self, kind: &GroupVersionKind) -> bool {
-        rusternetes_discovery::resolve_kind_to_resource(&kind.group, &kind.version, &kind.kind)
-            .is_some()
+        k3rs_discovery::resolve_kind_to_resource(&kind.group, &kind.version, &kind.kind).is_some()
     }
 }
 
@@ -486,17 +485,17 @@ impl<S: Storage> StorageObjectDefaulter<S> {
 impl<S: Storage> ObjectDefaulter for StorageObjectDefaulter<S> {
     async fn default_object(&self, resource: &GroupVersionResource, object: &mut Value) {
         if !resource.group.is_empty() {
-            let key = rusternetes_storage::build_key(
+            let key = k3rs_storage::build_key(
                 "customresourcedefinitions",
                 None,
                 &format!("{}.{}", resource.resource, resource.group),
             );
             if let Ok(crd) = self
                 .storage
-                .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
+                .get::<k3rs_common::resources::CustomResourceDefinition>(&key)
                 .await
             {
-                rusternetes_common::resources::crd::default_custom_resource_value(
+                k3rs_common::resources::crd::default_custom_resource_value(
                     &crd,
                     &resource.version,
                     object,
@@ -512,7 +511,7 @@ impl<S: Storage> ObjectDefaulter for StorageObjectDefaulter<S> {
 impl ObjectDefaulter for SchemeObjectDefaulter {
     async fn default_object(&self, _resource: &GroupVersionResource, object: &mut Value) {
         use crate::handlers::defaults as d;
-        use rusternetes_common::resources as r;
+        use k3rs_common::resources as r;
         let api_version = object["apiVersion"].as_str().unwrap_or_default();
         let group = api_version.split_once('/').map_or("", |(g, _)| g);
         let kind = object["kind"].as_str().unwrap_or_default().to_string();
@@ -571,7 +570,7 @@ impl HookSource for MutatingSource {
 /// under: built-in groups are keyed by resource name, custom resources by
 /// `{group}_{plural}` (`registry::apiextensions::customresource::storage_prefix`).
 pub fn param_storage_type(gvr: &GroupVersionResource) -> String {
-    if rusternetes_discovery::restmapper::is_builtin_group(&gvr.group) {
+    if k3rs_discovery::restmapper::is_builtin_group(&gvr.group) {
         gvr.resource.clone()
     } else {
         crate::registry::apiextensions::customresource::storage_prefix(&gvr.group, &gvr.resource)

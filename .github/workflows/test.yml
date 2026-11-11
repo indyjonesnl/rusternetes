@@ -158,7 +158,7 @@ jobs:
         # (nextest limitation); none of the workspace depends on doctest
         # coverage; add a separate `cargo test --doc` step if that changes.
         if: steps.rust.outputs.changed == 'true'
-        run: cargo nextest run --workspace --features rusternetes-api-server/sqlite --locked --no-fail-fast --status-level fail
+        run: cargo nextest run --workspace --features k3rs-api-server/sqlite --locked --no-fail-fast --status-level fail
 
       - name: Wire-format coverage report (warnings only)
         # Passing nextest tests hide their output, so the gaps (protobuf

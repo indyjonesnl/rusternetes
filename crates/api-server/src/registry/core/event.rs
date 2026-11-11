@@ -8,12 +8,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{Event, EventV1};
-use rusternetes_common::validation::events::{
+use k3rs_common::resources::{Event, EventV1};
+use k3rs_common::validation::events::{
     validate_event_create, validate_event_update, RequestVersion,
 };
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -100,7 +100,7 @@ impl RestDeleteStrategy<Event> for Strategy {
 
 /// `--event-ttl`'s default, 1h (`pkg/controlplane/apiserver/options/options.go:129`),
 /// in seconds. Defined in the storage crate so in-process recorders share it.
-pub use rusternetes_storage::event_recorder::DEFAULT_EVENT_TTL_SECONDS;
+pub use k3rs_storage::event_recorder::DEFAULT_EVENT_TTL_SECONDS;
 
 /// `NewREST(optsGetter, ttl)` (storage/storage.go:40-60): events expire `ttl`
 /// seconds after they are written. The `TTLFunc` ignores the existing TTL and
@@ -209,9 +209,9 @@ pub const EVENTS_V1_PATCH_CONVERSION: crate::endpoints::handlers::RequestVersion
 fn strict_decode_events_v1(
     params: &std::collections::HashMap<String, String>,
     patched: &[u8],
-) -> rusternetes_common::Result<Vec<String>> {
+) -> k3rs_common::Result<Vec<String>> {
     let v1: EventV1 = serde_json::from_slice(patched)
-        .map_err(|e| rusternetes_common::Error::BadRequest(e.to_string()))?;
+        .map_err(|e| k3rs_common::Error::BadRequest(e.to_string()))?;
     crate::handlers::validation::validate_strict_fields(params, patched, &v1)
 }
 

@@ -1,5 +1,5 @@
 ---
-# Example LoadBalancer Service for Rusternetes
+# Example LoadBalancer Service for k3rs
 # This creates an external load balancer (AWS NLB by default)
 
 apiVersion: v1

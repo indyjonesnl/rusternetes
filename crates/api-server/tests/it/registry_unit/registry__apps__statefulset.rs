@@ -2,33 +2,33 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::core::persistentvolumeclaim::get_warnings_for_persistent_volume_claim_spec;
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::core::persistentvolumeclaim::get_warnings_for_persistent_volume_claim_spec;
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_api_server::registry::scale::{Scalable, ScaleRest};
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::equality::semantic_equal;
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::pod_warnings::get_warnings_for_pod_template;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_api_server::registry::scale::{Scalable, ScaleRest};
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::equality::semantic_equal;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::pod_warnings::get_warnings_for_pod_template;
+    pub use k3rs_common::resources::{
         Scale, ScaleSpec, ScaleStatus, StatefulSet, StatefulSetStatus,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_common::validation::apps::{
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::validation::apps::{
         validate_statefulset, validate_statefulset_status_update, validate_statefulset_update,
     };
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apps::statefulset::*;
-    use rusternetes_common::resources::policy::IntOrString;
+    use k3rs_api_server::registry::apps::statefulset::*;
+    use k3rs_common::resources::policy::IntOrString;
     use std::collections::HashMap;
 
     fn stateful_set() -> StatefulSet {

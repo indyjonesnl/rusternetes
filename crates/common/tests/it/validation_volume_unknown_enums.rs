@@ -6,12 +6,10 @@
 //! (volumeMode); `pkg/apis/storage/validation/validation.go` :133
 //! (reclaimPolicy), :271 (volumeBindingMode).
 
-use rusternetes_common::resources::volume::{
-    PersistentVolume, PersistentVolumeClaim, StorageClass,
-};
-use rusternetes_common::validation::persistentvolume::validate_persistent_volume;
-use rusternetes_common::validation::pvc::validate_persistent_volume_claim;
-use rusternetes_common::validation::storageclass::validate_storage_class;
+use k3rs_common::resources::volume::{PersistentVolume, PersistentVolumeClaim, StorageClass};
+use k3rs_common::validation::persistentvolume::validate_persistent_volume;
+use k3rs_common::validation::pvc::validate_persistent_volume_claim;
+use k3rs_common::validation::storageclass::validate_storage_class;
 use serde_json::{json, Value};
 
 fn pv_errs(spec: Value) -> Vec<String> {

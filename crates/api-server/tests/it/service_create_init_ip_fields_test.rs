@@ -15,7 +15,7 @@
 //! the primary service range is honoured (#2445).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SVCS: &str = "/api/v1/namespaces/default/services";

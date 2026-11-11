@@ -108,8 +108,8 @@ impl StorageReadinessHook {
 }
 
 fn gate_enabled() -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::WatchCacheInitializationPostStartHook,
+    k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::WatchCacheInitializationPostStartHook,
     )
 }
 
@@ -140,7 +140,7 @@ const NOT_STORAGE_WITH_READINESS: &[&str] = &[
 /// `GroupVersionResource.String()`. Subresources are separate storage-map
 /// entries upstream whose REST (e.g. `StatusREST`) has no `ReadinessCheck`.
 pub fn storage_readiness_gvrs() -> Vec<String> {
-    rusternetes_discovery::registered_kinds()
+    k3rs_discovery::registered_kinds()
         .into_iter()
         .filter(|k| k.subresource.is_empty())
         .filter(|k| !NOT_STORAGE_WITH_READINESS.contains(&k.resource.as_str()))
@@ -172,8 +172,8 @@ pub fn register_resource_storages(hook: &StorageReadinessHook, ready: Arc<Atomic
 /// the watch cache's `ReadinessCheck`. We register one per served GVR too
 /// ([`register_resource_storages`]); with no per-resource cacher they all
 /// observe the one storage backend answering a revision query.
-pub fn spawn_for_backend(storage: Arc<rusternetes_storage::StorageBackend>) -> bool {
-    use rusternetes_storage::Storage;
+pub fn spawn_for_backend(storage: Arc<k3rs_storage::StorageBackend>) -> bool {
+    use k3rs_storage::Storage;
     if !gate_enabled() {
         return false;
     }

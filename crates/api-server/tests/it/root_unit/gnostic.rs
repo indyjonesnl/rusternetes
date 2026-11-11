@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_api_server::gnostic::openapi_v2::*;
     pub use prost::Message;
-    pub use rusternetes_api_server::gnostic::openapi_v2::*;
 }
 
 mod v3_tests {
     use super::__parent::*;
-    use rusternetes_api_server::gnostic::*;
+    use k3rs_api_server::gnostic::*;
 
     #[test]
     fn roundtrip_minimal_v3_document() {
@@ -17,7 +17,7 @@ mod v3_tests {
         let json = serde_json::json!({
             "openapi": "3.0.0",
             "info": {
-                "title": "Rusternetes Test",
+                "title": "k3rs Test",
                 "version": "v1.35.0",
                 "description": "test doc"
             },
@@ -34,7 +34,7 @@ mod v3_tests {
 
         assert_eq!(decoded.openapi, "3.0.0");
         let info = decoded.info.expect("info present");
-        assert_eq!(info.title, "Rusternetes Test");
+        assert_eq!(info.title, "k3rs Test");
         assert_eq!(info.version, "v1.35.0");
         assert_eq!(info.description, "test doc");
 

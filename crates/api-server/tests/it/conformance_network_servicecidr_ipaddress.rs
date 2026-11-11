@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use rusternetes_api_server::bootstrap::{DefaultServiceCIDRController, DEFAULT_SERVICE_CIDR_NAME};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::bootstrap::{DefaultServiceCIDRController, DEFAULT_SERVICE_CIDR_NAME};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const GV: &str = "/apis/networking.k8s.io/v1";

@@ -4,33 +4,33 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::Utc;
-    pub use rusternetes_common::resources::autoscaling::ResourceMetricStatus;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::autoscaling::ResourceMetricStatus;
+    pub use k3rs_common::resources::{
         Deployment, HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition,
         HorizontalPodAutoscalerStatus, MetricSpec, MetricStatus, MetricValueStatus, ReplicaSet,
         StatefulSet,
     };
-    pub use rusternetes_controller_manager::controllers::hpa_metrics_client::{
+    pub use k3rs_controller_manager::controllers::hpa_metrics_client::{
         format_milli_quantity, FakeMetricsClient, HttpMetricsClient, HttpMetricsConfig,
         MetricsClient, PodMetricsInfo,
     };
-    pub use rusternetes_controller_manager::controllers::hpa_replica_calculator as calc;
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::hpa_replica_calculator as calc;
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info, warn};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         CrossVersionObjectReference, DeploymentSpec, HorizontalPodAutoscalerSpec, MetricSpec,
         MetricTarget, ResourceMetricSource,
     };
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::hpa::*;
-    use rusternetes_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::hpa::*;
+    use k3rs_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashMap;
 
     fn controller_with_cpu_util(
@@ -52,20 +52,20 @@ mod tests {
 
         // Create a deployment
         let mut deployment = Deployment {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Deployment".to_string(),
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("web-app").with_namespace("default"),
             spec: DeploymentSpec {
                 replicas: Some(3),
-                selector: rusternetes_common::types::LabelSelector {
+                selector: k3rs_common::types::LabelSelector {
                     match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                     match_expressions: None,
                 },
-                template: rusternetes_common::resources::PodTemplateSpec {
+                template: k3rs_common::resources::PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("web-pod")),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![],
                         init_containers: None,
                         restart_policy: None,
@@ -210,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn container_resource_metric_scales_on_container_utilization() {
-        use rusternetes_common::resources::ContainerResourceMetricSource;
+        use k3rs_common::resources::ContainerResourceMetricSource;
         let storage = Arc::new(MemoryStorage::new());
         let mut fake = FakeMetricsClient::new();
         // Keyed "{resource}/{container}" — 100% util vs 50% target -> ratio 2.
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn go_label_selector_string_matches_generated_string() {
         assert_eq!(go_label_selector_string(None), "nil");
-        let sel = rusternetes_common::types::LabelSelector {
+        let sel = k3rs_common::types::LabelSelector {
             match_labels: Some(
                 [
                     ("b".to_string(), "2".to_string()),
@@ -264,7 +264,7 @@ mod tests {
                 ]
                 .into(),
             ),
-            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+            match_expressions: Some(vec![k3rs_common::types::LabelSelectorRequirement {
                 key: "k".into(),
                 operator: "In".into(),
                 values: Some(vec!["x".into(), "y".into()]),
@@ -278,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_status_reports_sum_over_replicas() {
-        use rusternetes_common::resources::{ExternalMetricSource, MetricIdentifier};
+        use k3rs_common::resources::{ExternalMetricSource, MetricIdentifier};
         let storage = Arc::new(MemoryStorage::new());
         let mut fake = FakeMetricsClient::new();
         fake.external.insert("queue".to_string(), vec![90_000]);
@@ -316,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn object_average_value_target_reports_average_value() {
-        use rusternetes_common::resources::{MetricIdentifier, ObjectMetricSource};
+        use k3rs_common::resources::{MetricIdentifier, ObjectMetricSource};
         let storage = Arc::new(MemoryStorage::new());
         let mut fake = FakeMetricsClient::new();
         fake.object.insert("hits".to_string(), 200_000);
@@ -366,20 +366,20 @@ mod tests {
 
         // Create a deployment
         let mut deployment = Deployment {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Deployment".to_string(),
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("web-app").with_namespace("default"),
             spec: DeploymentSpec {
                 replicas: Some(2),
-                selector: rusternetes_common::types::LabelSelector {
+                selector: k3rs_common::types::LabelSelector {
                     match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                     match_expressions: None,
                 },
-                template: rusternetes_common::resources::PodTemplateSpec {
+                template: k3rs_common::resources::PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("web-pod")),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![],
                         init_containers: None,
                         restart_policy: None,
@@ -467,13 +467,13 @@ mod tests {
         // Minimal Deployment with replicas matching what the HPA will compute.
         let mut deployment_spec = DeploymentSpec {
             replicas: Some(3),
-            selector: rusternetes_common::types::LabelSelector {
+            selector: k3rs_common::types::LabelSelector {
                 match_labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                 match_expressions: None,
             },
-            template: rusternetes_common::resources::PodTemplateSpec {
+            template: k3rs_common::resources::PodTemplateSpec {
                 metadata: Some(ObjectMeta::new("web-pod")),
-                spec: rusternetes_common::resources::PodSpec::default(),
+                spec: k3rs_common::resources::PodSpec::default(),
             },
             strategy: None,
             min_ready_seconds: None,

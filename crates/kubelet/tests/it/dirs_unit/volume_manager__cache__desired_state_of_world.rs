@@ -2,27 +2,27 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::quota::pod_limits;
-    pub use rusternetes_common::resources::pod::SELinuxOptions;
-    pub use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::volume_manager::cache::desired_state_of_world_selinux_metrics::{
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::quota::pod_limits;
+    pub use k3rs_common::resources::pod::SELinuxOptions;
+    pub use k3rs_common::resources::volume::PersistentVolumeAccessMode;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::volume_manager::cache::desired_state_of_world_selinux_metrics::{
         register_selinux_metrics, GaugeVec, SELINUX_CONTAINER_CONTEXT_ERRORS,
         SELINUX_CONTAINER_CONTEXT_WARNINGS, SELINUX_POD_CONTEXT_MISMATCH_ERRORS,
         SELINUX_POD_CONTEXT_MISMATCH_WARNINGS, SELINUX_VOLUMES_ADMITTED,
         SELINUX_VOLUME_CONTEXT_MISMATCH_ERRORS, SELINUX_VOLUME_CONTEXT_MISMATCH_WARNINGS,
     };
-    pub use rusternetes_kubelet::volume_plugins::plugin::{OwnedSpec, Spec, VolumePlugin};
-    pub use rusternetes_kubelet::volume_plugins::registry::VolumePluginMgr;
-    pub use rusternetes_kubelet::volume_plugins::util::operation_executor;
-    pub use rusternetes_kubelet::volume_plugins::util::selinux::{
+    pub use k3rs_kubelet::volume_plugins::plugin::{OwnedSpec, Spec, VolumePlugin};
+    pub use k3rs_kubelet::volume_plugins::registry::VolumePluginMgr;
+    pub use k3rs_kubelet::volume_plugins::util::operation_executor;
+    pub use k3rs_kubelet::volume_plugins::util::selinux::{
         get_mount_selinux_label, volume_supports_selinux_mount, SELinuxLabelError,
         SELinuxLabelTranslator,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
-    pub use rusternetes_kubelet::volume_plugins::util::{
+    pub use k3rs_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
+    pub use k3rs_kubelet::volume_plugins::util::{
         contains_access_mode, get_unique_volume_name_from_spec,
         get_unique_volume_name_from_spec_with_pod, is_attachable_volume,
         is_device_mountable_volume, is_local_ephemeral_volume,
@@ -58,12 +58,12 @@ mod tests {
     use super::__parent::*;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
-    use rusternetes_common::feature_gates::with_feature;
-    use rusternetes_common::resources::{PersistentVolume, Volume};
-    use rusternetes_kubelet::volume_manager::cache::desired_state_of_world::*;
-    use rusternetes_kubelet::volume_plugins::plugin::Mounter;
-    use rusternetes_kubelet::volume_plugins::util::get_unique_pod_name;
-    use rusternetes_kubelet::volume_plugins::util::selinux::FakeSELinuxLabelTranslator;
+    use k3rs_common::feature_gates::with_feature;
+    use k3rs_common::resources::{PersistentVolume, Volume};
+    use k3rs_kubelet::volume_manager::cache::desired_state_of_world::*;
+    use k3rs_kubelet::volume_plugins::plugin::Mounter;
+    use k3rs_kubelet::volume_plugins::util::get_unique_pod_name;
+    use k3rs_kubelet::volume_plugins::util::selinux::FakeSELinuxLabelTranslator;
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -158,7 +158,7 @@ mod tests {
             &self,
             _vol_name: &str,
             _pod_uid: &str,
-        ) -> Result<Box<dyn rusternetes_kubelet::volume_plugins::Unmounter>> {
+        ) -> Result<Box<dyn k3rs_kubelet::volume_plugins::Unmounter>> {
             unimplemented!("test plugin never unmounts")
         }
 
@@ -166,7 +166,7 @@ mod tests {
             &self,
             _vol_name: &str,
             _mount_path: &str,
-        ) -> Result<rusternetes_kubelet::volume_plugins::ReconstructedVolume> {
+        ) -> Result<k3rs_kubelet::volume_plugins::ReconstructedVolume> {
             unimplemented!("test plugin never reconstructs")
         }
     }

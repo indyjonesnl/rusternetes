@@ -1,5 +1,5 @@
 /// Concurrency control module for optimistic locking with resourceVersion
-use rusternetes_common::Error;
+use k3rs_common::Error;
 
 /// Extract resourceVersion from metadata.
 ///

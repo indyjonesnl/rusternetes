@@ -32,8 +32,8 @@
 //! `tower::ServiceExt::oneshot`. No real cluster, no kubelet, no scheduler.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

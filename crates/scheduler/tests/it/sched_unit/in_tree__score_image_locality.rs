@@ -1,10 +1,10 @@
 //! ImageLocality through the plugin object and `Framework::run_score_plugins`
 //! (`imagelocality/image_locality_test.go`: `TestImageLocalityPriority`).
 use super::listers::EmptyListers;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{CycleState, SignPlugin};
-use rusternetes_scheduler::in_tree::ImageLocality;
-use rusternetes_scheduler::profile::Profile;
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{CycleState, SignPlugin};
+use k3rs_scheduler::in_tree::ImageLocality;
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
 const MB: u64 = 1024 * 1024;

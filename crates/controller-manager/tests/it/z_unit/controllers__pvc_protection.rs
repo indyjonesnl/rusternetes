@@ -3,10 +3,10 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::resources::volume::PVC_PROTECTION_FINALIZER;
-    pub use rusternetes_common::resources::{PersistentVolumeClaim, Pod};
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+    pub use k3rs_common::resources::volume::PVC_PROTECTION_FINALIZER;
+    pub use k3rs_common::resources::{PersistentVolumeClaim, Pod};
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tokio::time;
@@ -15,8 +15,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::pvc_protection::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::pvc_protection::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::json;
 
     const FIN: &str = "kubernetes.io/pvc-protection";

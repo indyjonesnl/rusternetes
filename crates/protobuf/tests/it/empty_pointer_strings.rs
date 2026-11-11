@@ -4,7 +4,7 @@
 //! `storageClassName: ""` ("no class, do not default"), which is different from
 //! the field being absent. A plain `string` is never written when empty
 //! (omitempty), so only pointer strings can carry an explicit empty value.
-use rusternetes_protobuf::PROTO_REGISTRY;
+use k3rs_protobuf::PROTO_REGISTRY;
 use serde_json::Value;
 
 fn decode(msg: &str, data: &[u8]) -> Value {

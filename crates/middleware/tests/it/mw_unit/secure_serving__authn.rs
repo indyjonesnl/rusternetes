@@ -6,8 +6,8 @@ mod __parent {
     pub use axum::http::{HeaderMap, HeaderName, HeaderValue};
     pub use futures::future::{BoxFuture, FutureExt, Shared};
     pub use hmac::{Hmac, Mac};
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_middleware::secure_serving::webhook::{
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_middleware::secure_serving::webhook::{
         default_should_retry, with_exponential_backoff, Backoff, ReviewClient,
     };
     pub use sha2::{Digest, Sha256};
@@ -19,8 +19,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::secure_serving::authn::*;
-    use rusternetes_middleware::secure_serving::webhook::ReviewError;
+    use k3rs_middleware::secure_serving::authn::*;
+    use k3rs_middleware::secure_serving::webhook::ReviewError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 

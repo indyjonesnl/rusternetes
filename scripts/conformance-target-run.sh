@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run one conformance TARGET (a SIG's [Conformance] slice or a curated feature
-# focus) — or a narrowed --focus — against an already-running rusternetes
+# focus) — or a narrowed --focus — against an already-running k3rs
 # cluster via Hydrophone, parse the junit, and report passed/failed/total.
 # NON-GATING: test failures do NOT fail the run — only an infra failure (no
 # junit produced) exits non-zero. Same caller contract as
@@ -45,7 +45,7 @@ IFS=$'\n\t'
 
 # Enable payload dumps in api-server/kubelet so any panic / 5xx / decode
 # failure during the run logs the offending request body.
-export RUSTERNETES_DUMP_PAYLOADS=1
+export K3RS_DUMP_PAYLOADS=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -176,9 +176,9 @@ suite_level_failures() {
 #     nightly.
 #
 #   * `controller-manager` and `scheduler` are NOT compose services in this
-#     stack — they run as kubelet static pods (see .rusternetes/manifests/).
+#     stack — they run as kubelet static pods (see .k3rs/manifests/).
 #     Both `compose logs controller-manager` and `docker logs
-#     rusternetes-controller-manager` therefore fail, the file comes out empty
+#     k3rs-controller-manager` therefore fail, the file comes out empty
 #     and is deleted, and the artifact has silently never contained a
 #     controller-manager log. For a garbage-collector or namespace-controller
 #     failure that is precisely the log you need (#1836, #1804). Their stdout
@@ -202,7 +202,7 @@ capture_component_logs() {
         if "$runtime" compose -f "$COMPOSE_STACK" logs --no-color --tail="$tail" "$svc" \
              >"$dest" 2>/dev/null && [ -s "$dest" ]; then
             echo "[conformance-target-run] captured $svc log -> $dest"
-        elif "$runtime" logs --tail="$tail" "rusternetes-$svc" \
+        elif "$runtime" logs --tail="$tail" "k3rs-$svc" \
              >"$dest" 2>&1 && [ -s "$dest" ]; then
             echo "[conformance-target-run] captured $svc log (direct) -> $dest"
         else
@@ -243,7 +243,7 @@ capture_static_pod_logs() {
     for comp in kube-controller-manager kube-scheduler; do
         dest="$out/component-$comp.log"
         captured=""
-        for kubelet in rusternetes-kubelet rusternetes-kubelet2; do
+        for kubelet in k3rs-kubelet k3rs-kubelet2; do
             if "$runtime" exec "$kubelet" sh -c \
                    "cat $vol/pod-logs/kube-system_${comp}*/${comp}.log $vol/*/pod-logs/kube-system_${comp}*/${comp}.log; true" \
                    >"$dest" 2>/dev/null && [ -s "$dest" ]; then
@@ -392,7 +392,7 @@ stop_hydrophone_at_done() {
 
 # ---------- arg parsing ----------
 TARGET=""; FOCUS=""; SKIP=""; FOCUS_OVERRIDDEN=0
-KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
 CONFORMANCE_IMAGE_EXPLICIT=0
 IMAGE_SOURCE="${IMAGE_SOURCE:-auto}"
@@ -400,7 +400,7 @@ MIRROR_PREFIX="${MIRROR_PREFIX:-ghcr.io/indyjonesnl/rusternetes/mirror}"
 OUTPUT_DIR=""; HYDROPHONE_BIN=""; PARALLEL=2
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-0}"
 # Extra flags handed to conformance-preflight.sh. The gate's defaults describe
-# the compose stack (kube-scheduler-node-1, rusternetes-dns); a caller running
+# the compose stack (kube-scheduler-node-1, k3rs-dns); a caller running
 # against a differently-shaped cluster — vanilla-swap's kind cluster, #1629 —
 # says so here instead of turning the gate off wholesale.
 PREFLIGHT_ARGS=()
@@ -465,7 +465,7 @@ fi
 [ -x "$HYDROPHONE_BIN" ] || die "hydrophone not executable: $HYDROPHONE_BIN"
 
 if [ -z "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR="$REPO_ROOT/.rusternetes/volumes/target-$TARGET-$(date +%Y%m%d-%H%M%S)"
+    OUTPUT_DIR="$REPO_ROOT/.k3rs/volumes/target-$TARGET-$(date +%Y%m%d-%H%M%S)"
 fi
 mkdir -p "$OUTPUT_DIR"
 

@@ -23,7 +23,7 @@
 //! Mirrors the helper pattern in `roundtrip_core_v1.rs` -- the local helper
 //! there is not `pub`, so we inline the same four-step assertion here.
 
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Run the four-step roundtrip assertion for a typed payload.

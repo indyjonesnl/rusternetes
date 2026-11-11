@@ -11,7 +11,7 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: manual
   hostPath:
-    path: /tmp/rusternetes-pv-data
+    path: /tmp/k3rs-pv-data
     type: DirectoryOrCreate
 ---
 # PersistentVolumeClaim

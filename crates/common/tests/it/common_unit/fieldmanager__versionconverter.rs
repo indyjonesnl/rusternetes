@@ -2,19 +2,19 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::fieldmanager::apply::remove_path;
-    pub use rusternetes_common::fieldmanager::apply::ApplyConflict;
-    pub use rusternetes_common::fieldmanager::fieldset::Set;
-    pub use rusternetes_common::fieldmanager::{FieldManager, Managed, ManagerIdentity};
+    pub use k3rs_common::fieldmanager::apply::remove_path;
+    pub use k3rs_common::fieldmanager::apply::ApplyConflict;
+    pub use k3rs_common::fieldmanager::fieldset::Set;
+    pub use k3rs_common::fieldmanager::{FieldManager, Managed, ManagerIdentity};
     pub use serde_json::{Map, Value};
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::fieldmanager::fieldset::field_path;
-    use rusternetes_common::fieldmanager::versionconverter::*;
-    use rusternetes_common::fieldmanager::{build_manager_identifier, ResetFields, VersionedSet};
+    use k3rs_common::fieldmanager::fieldset::field_path;
+    use k3rs_common::fieldmanager::versionconverter::*;
+    use k3rs_common::fieldmanager::{build_manager_identifier, ResetFields, VersionedSet};
     use serde_json::json;
 
     /// Two versions of one kind that spell the replica count differently:
@@ -277,7 +277,7 @@ mod tests {
         let live = fm("example.io/v1")
             .apply_value(None, &obj("example.io/v1", "replicas", 1), "a", false)
             .unwrap();
-        let entries: Vec<rusternetes_common::types::ManagedFieldsEntry> =
+        let entries: Vec<k3rs_common::types::ManagedFieldsEntry> =
             serde_json::from_value(live["metadata"]["managedFields"].clone()).unwrap();
         let mut managed = Managed::decode(&entries).unwrap();
         let (bid, vs) = entry("b", "Update", "example.io/v2", &["spec", "size"]);

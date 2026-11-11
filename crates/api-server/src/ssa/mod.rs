@@ -25,7 +25,7 @@
 //!
 //! The PATCH handlers for Pod / Deployment / Service / etc. delegate to
 //! [`apply_legacy`], which applies through the field manager
-//! (`rusternetes_common::fieldmanager`) with per-path `FieldsV1` ownership.
+//! (`k3rs_common::fieldmanager`) with per-path `FieldsV1` ownership.
 //! The schema mechanism is
 //! deliberately a thin curated alternative to the upstream OpenAPI-driven
 //! type converter
@@ -58,8 +58,8 @@
 pub mod merge;
 
 use chrono::Utc;
-use rusternetes_common::resources::{ConfigMap, Secret};
-use rusternetes_common::types::ManagedFieldsEntry;
+use k3rs_common::resources::{ConfigMap, Secret};
+use k3rs_common::types::ManagedFieldsEntry;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -70,7 +70,7 @@ use self::merge::{
     merge_string_map_group, LeafGroup, OwnedPaths, PathConflict, ResourceLeafSchema,
     CONFIGMAP_SCHEMA, SECRET_SCHEMA,
 };
-pub use rusternetes_common::fieldmanager::ResetFields;
+pub use k3rs_common::fieldmanager::ResetFields;
 
 /// Per-request SSA options sourced from query parameters.
 ///
@@ -93,11 +93,11 @@ pub struct ApplyOptions {
     /// The kind's `typeConverter` when the serving storage supplies one (a
     /// custom resource's structural schema); a built-in's comes from
     /// [`crate::fieldmanager::schemas::builtin`].
-    pub schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+    pub schema: Option<std::sync::Arc<k3rs_common::fieldmanager::schema::Type>>,
     /// The kind's version converter when it is served at several versions
     /// (#2736).
     pub converter:
-        Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>,
+        Option<std::sync::Arc<dyn k3rs_common::fieldmanager::versionconverter::Converter>>,
 }
 
 impl ApplyOptions {
@@ -115,7 +115,7 @@ impl ApplyOptions {
     pub fn with_converter(
         mut self,
         converter: Option<
-            std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>,
+            std::sync::Arc<dyn k3rs_common::fieldmanager::versionconverter::Converter>,
         >,
     ) -> Self {
         self.converter = converter;
@@ -124,7 +124,7 @@ impl ApplyOptions {
 
     pub fn with_schema(
         mut self,
-        schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+        schema: Option<std::sync::Arc<k3rs_common::fieldmanager::schema::Type>>,
     ) -> Self {
         self.schema = schema;
         self
@@ -251,7 +251,7 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
     .with_converter(opts.converter.clone());
     match field_manager.apply_value(current.as_ref(), desired, &opts.field_manager, opts.force) {
         Ok(mut applied) => {
-            rusternetes_common::fieldmanager::apply::retain_live_system_metadata(
+            k3rs_common::fieldmanager::apply::retain_live_system_metadata(
                 &mut applied,
                 current.as_ref(),
             );
@@ -261,23 +261,23 @@ pub fn apply_legacy<T: Serialize + DeserializeOwned>(
                 object: Box::new(object),
             })
         }
-        Err(rusternetes_common::fieldmanager::versionconverter::UpdateFailure::Convert(e)) => {
+        Err(k3rs_common::fieldmanager::versionconverter::UpdateFailure::Convert(e)) => {
             Err(ApplyError::Internal(e))
         }
-        Err(rusternetes_common::fieldmanager::versionconverter::UpdateFailure::Conflicts(
-            conflicts,
-        )) => Ok(ApplyOutcome::Conflicts(
-            conflicts
-                .into_iter()
-                .map(|c| PathConflict {
-                    // `PathConflict::path` has no leading dot; the handler
-                    // adds it (`Path.String()` starts with one).
-                    path: c.path.trim_start_matches('.').to_string(),
-                    current_manager: c.manager,
-                    applying_manager: opts.field_manager.clone(),
-                })
-                .collect(),
-        )),
+        Err(k3rs_common::fieldmanager::versionconverter::UpdateFailure::Conflicts(conflicts)) => {
+            Ok(ApplyOutcome::Conflicts(
+                conflicts
+                    .into_iter()
+                    .map(|c| PathConflict {
+                        // `PathConflict::path` has no leading dot; the handler
+                        // adds it (`Path.String()` starts with one).
+                        path: c.path.trim_start_matches('.').to_string(),
+                        current_manager: c.manager,
+                        applying_manager: opts.field_manager.clone(),
+                    })
+                    .collect(),
+            ))
+        }
     }
 }
 
@@ -719,7 +719,7 @@ fn rewrite_managed_fields(
 /// use — it accepts either format transparently.
 ///
 /// YAML is decoded via `serde_yaml` (already an indirect dependency through
-/// `rusternetes-common`). JSON is decoded directly.
+/// `k3rs-common`). JSON is decoded directly.
 pub fn decode_apply_body(content_type: &str, body: &[u8]) -> Result<Value, ApplyError> {
     if content_type.contains("apply-patch+yaml") || content_type.contains("+yaml") {
         serde_yaml::from_slice::<Value>(body)

@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::serde_helpers::go_zero_time;
-    pub use rusternetes_common::serde_helpers::{
+    pub use k3rs_common::serde_helpers::go_zero_time;
+    pub use k3rs_common::serde_helpers::{
         k8s_float, k8s_micro_time, k8s_micro_time_required, k8s_time, k8s_time_map,
         k8s_time_required, k8s_time_str, sorted_opt_map,
     };
@@ -18,9 +18,9 @@ mod tests {
         // Time.UnmarshalJSON time.go:100-104; MarshalJSON time.go:162-166.
         #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
         struct W {
-            #[serde(with = "rusternetes_common::types::k8s_time_required")]
+            #[serde(with = "k3rs_common::types::k8s_time_required")]
             t: chrono::DateTime<chrono::Utc>,
-            #[serde(with = "rusternetes_common::types::k8s_micro_time_required")]
+            #[serde(with = "k3rs_common::types::k8s_micro_time_required")]
             m: chrono::DateTime<chrono::Utc>,
         }
         let w: W = serde_json::from_str(r#"{"t":null,"m":null}"#).unwrap();
@@ -38,7 +38,7 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_common::types::*;
+    use k3rs_common::types::*;
 
     /// metav1.ObjectMeta: `Name string `json:"name,omitempty"``
     /// (staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/types.go) — an empty

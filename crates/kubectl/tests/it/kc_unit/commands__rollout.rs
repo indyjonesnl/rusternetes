@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_kubectl::types::RolloutCommands;
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_kubectl::types::RolloutCommands;
     pub use serde_json::{json, Value};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::rollout::*;
+    use k3rs_kubectl::commands::rollout::*;
 
     #[test]
     fn test_rollout_api_path_deployment() {

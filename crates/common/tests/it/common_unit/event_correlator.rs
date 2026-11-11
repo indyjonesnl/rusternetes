@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::event_correlator::*;
+    use k3rs_common::event_correlator::*;
 
     fn make_object_reference(kind: &str, name: &str, namespace: &str) -> CorrelatorObjectReference {
         CorrelatorObjectReference {

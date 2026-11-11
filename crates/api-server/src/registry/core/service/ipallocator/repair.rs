@@ -6,7 +6,7 @@
 //! gone.
 //!
 //! Upstream runs `runOnce` once and then reacts to Service and IPAddress
-//! informer events, with a resync every interval. Rusternetes has no
+//! informer events, with a resync every interval. k3rs has no
 //! informers in the api-server: `run_once` runs every interval (the
 //! resync), and `spawn_workers` adds the event-driven workers over the
 //! storage watch, with the same queues, 5 workers each, `maxRetries` and
@@ -24,12 +24,12 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use ipnet::IpNet;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     EventSource, EventType, IPAddress, ObjectReference, Service, ServiceCIDR,
 };
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::workqueue::{extract_key, WorkQueue};
-use rusternetes_storage::{build_key, EventRecorder, Storage};
+use k3rs_common::{Error, Result};
+use k3rs_storage::workqueue::{extract_key, WorkQueue};
+use k3rs_storage::{build_key, EventRecorder, Storage};
 use tracing::{error, warn};
 
 use super::{
@@ -472,7 +472,7 @@ impl<S: Storage + 'static> RepairIpAddress<S> {
     /// The event-driven half of `RunUntil` (repairip.go:208-216): the
     /// Service and IPAddress event handlers feeding `svcQueue` /
     /// `ipQueue` (:130-178) and `workers` workers on each. The caller has
-    /// already run `run_once`. Rusternetes has no informers in the
+    /// already run `run_once`. k3rs has no informers in the
     /// api-server, so the handlers read the storage watch instead.
     pub fn spawn_workers(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
         // `Name: "services"` / `Name: "ipaddresses"` (repairip.go:140-146).

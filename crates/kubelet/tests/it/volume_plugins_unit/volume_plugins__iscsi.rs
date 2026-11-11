@@ -4,37 +4,35 @@
 mod __parent {
     pub use anyhow::{anyhow, bail, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::volume::{
         ISCSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeMode,
     };
-    pub use rusternetes_common::resources::{Pod, Secret};
-    pub use rusternetes_kubelet::volume_plugins::iscsi::attacher::IscsiAttacher;
-    pub use rusternetes_kubelet::volume_plugins::iscsi::disk_manager::DiskManager;
-    pub use rusternetes_kubelet::volume_plugins::iscsi::util::IscsiUtil;
-    pub use rusternetes_kubelet::volume_plugins::metrics_statfs::MetricsStatFs;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
+    pub use k3rs_common::resources::{Pod, Secret};
+    pub use k3rs_kubelet::volume_plugins::iscsi::attacher::IscsiAttacher;
+    pub use k3rs_kubelet::volume_plugins::iscsi::disk_manager::DiskManager;
+    pub use k3rs_kubelet::volume_plugins::iscsi::util::IscsiUtil;
+    pub use k3rs_kubelet::volume_plugins::metrics_statfs::MetricsStatFs;
+    pub use k3rs_kubelet::volume_plugins::plugin::{
         Attributes, BlockVolumeMapper, BlockVolumePlugin, BlockVolumeUnmapper,
         CustomBlockVolumeUnmapper, Metrics, MetricsProvider, OwnedSpec,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::device_util::{
-        new_os_device_handler, DeviceUtil,
-    };
-    pub use rusternetes_kubelet::volume_plugins::util::exec::{Exec, RealExec};
-    pub use rusternetes_kubelet::volume_plugins::util::key_mutex::KeyMutex;
-    pub use rusternetes_kubelet::volume_plugins::util::metrics::{
+    pub use k3rs_kubelet::volume_plugins::util::device_util::{new_os_device_handler, DeviceUtil};
+    pub use k3rs_kubelet::volume_plugins::util::exec::{Exec, RealExec};
+    pub use k3rs_kubelet::volume_plugins::util::key_mutex::KeyMutex;
+    pub use k3rs_kubelet::volume_plugins::util::metrics::{
         new_metrics_block, MetricsBlock, MetricsNil,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::mount_interface::{
+    pub use k3rs_kubelet::volume_plugins::util::mount_interface::{
         MountInterface, SafeFormatAndMount,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::mount_ops::cleanup_mount_point;
-    pub use rusternetes_kubelet::volume_plugins::util::{
+    pub use k3rs_kubelet::volume_plugins::util::mount_ops::cleanup_mount_point;
+    pub use k3rs_kubelet::volume_plugins::util::{
         mount_option_from_spec, types::VolumeOperationError,
     };
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_kubelet::volume_plugins::{
         DeviceMounter, MounterArgs, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
     };
-    pub use rusternetes_storage::{build_key, Storage};
+    pub use k3rs_storage::{build_key, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::atomic::{AtomicBool, Ordering};
     pub use std::sync::Arc;
@@ -48,19 +46,19 @@ mod tests {
     //! `TestPortalMounter`, `TestGetSecretNameAndNamespaceForPV`,
     //! `TestGetISCSIInitiatorInfo`, `TestGetISCSICHAP`, `TestGetVolumeSpec*`).
     use super::__parent::*;
-    use rusternetes_common::resources::{PersistentVolume, Volume};
-    use rusternetes_kubelet::volume_plugins::iscsi::*;
-    use rusternetes_kubelet::volume_plugins::util::exec::testing::no_commands;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
-    use rusternetes_kubelet::volume_plugins::Mounter as _;
-    use rusternetes_kubelet::volume_plugins::{KubeletVolumeHost, VolumePluginMgr};
+    use k3rs_common::resources::{PersistentVolume, Volume};
+    use k3rs_kubelet::volume_plugins::iscsi::*;
+    use k3rs_kubelet::volume_plugins::util::exec::testing::no_commands;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
+    use k3rs_kubelet::volume_plugins::Mounter as _;
+    use k3rs_kubelet::volume_plugins::{KubeletVolumeHost, VolumePluginMgr};
     use serde_json::json;
 
     fn host(tmp: &std::path::Path) -> Arc<dyn VolumeHost> {
         Arc::new(KubeletVolumeHost::new_for_tests(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         ))
     }
@@ -394,7 +392,7 @@ mod tests {
     /// an `initiatorName` the iface becomes `<portal>:<volume name>`.
     #[test]
     fn device_mount_path_is_the_global_pd_name() {
-        use rusternetes_kubelet::volume_plugins::plugin::DeviceMounter;
+        use k3rs_kubelet::volume_plugins::plugin::DeviceMounter;
         let tmp = tempfile::tempdir().unwrap();
         let plug = IscsiPlugin::new(host(tmp.path()));
         let attacher = plug.new_attacher_internal();
@@ -436,7 +434,7 @@ mod tests {
     /// the statfs of the pod volume dir (#3494).
     #[tokio::test]
     async fn mounter_and_unmounter_provide_statfs_metrics() {
-        use rusternetes_kubelet::volume_plugins::plugin::MetricsProvider;
+        use k3rs_kubelet::volume_plugins::plugin::MetricsProvider;
         let tmp = tempfile::tempdir().unwrap();
         let plug = IscsiPlugin::new(host(tmp.path()));
         let v = vol("vol1", source());
@@ -472,7 +470,7 @@ mod tests {
     /// `MountDevice`'s option list (`attacher.go:124-130`).
     #[test]
     fn device_mount_options_add_selinux_context() {
-        use rusternetes_kubelet::volume_plugins::iscsi::attacher::device_mount_options;
+        use k3rs_kubelet::volume_plugins::iscsi::attacher::device_mount_options;
         assert!(device_mount_options(false, "").is_empty());
         assert_eq!(device_mount_options(true, ""), ["ro"]);
         assert_eq!(
@@ -482,8 +480,8 @@ mod tests {
                 "context=\"system_u:object_r:container_file_t:s0:c1,c2\""
             ]
         );
-        let _off = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _off = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             false,
         );
         assert_eq!(device_mount_options(true, "system_u:object_r:x:s0"), ["ro"]);
@@ -491,7 +489,7 @@ mod tests {
 
     struct ContextHostUtil(String);
 
-    impl rusternetes_kubelet::volume_plugins::util::hostutil::HostUtils for ContextHostUtil {
+    impl k3rs_kubelet::volume_plugins::util::hostutil::HostUtils for ContextHostUtil {
         fn device_opened(&self, _: &str) -> std::io::Result<bool> {
             Ok(false)
         }
@@ -501,8 +499,7 @@ mod tests {
         fn get_file_type(
             &self,
             _: &str,
-        ) -> std::io::Result<rusternetes_kubelet::volume_plugins::util::hostutil::FileType>
-        {
+        ) -> std::io::Result<k3rs_kubelet::volume_plugins::util::hostutil::FileType> {
             Err(std::io::Error::other("not faked"))
         }
         fn get_selinux_mount_context(&self, _: &str) -> std::io::Result<String> {
@@ -534,14 +531,12 @@ mod tests {
             KubeletVolumeHost::new_for_tests(
                 root.to_string_lossy().to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_mounter(
-                rusternetes_kubelet::volume_plugins::util::mount_ops::Mounter::new(
-                    "", false, false,
-                )
-                .with_mountinfo_path(mountinfo.to_str().unwrap()),
+                k3rs_kubelet::volume_plugins::util::mount_ops::Mounter::new("", false, false)
+                    .with_mountinfo_path(mountinfo.to_str().unwrap()),
             )
             .with_host_util(Arc::new(ContextHostUtil(
                 "system_u:object_r:c:s0:c1".into(),
@@ -556,8 +551,8 @@ mod tests {
         assert_eq!(iscsi.iqn, "iqn.2014-12.server:storage.target01");
 
         // Gate off: upstream never asks the host util.
-        let _off = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _off = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             false,
         );
         let got = plug

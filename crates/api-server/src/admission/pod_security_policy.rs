@@ -9,11 +9,11 @@
 //! cases.
 
 use super::pod_security_api::{Level, LevelVersion, Version};
-use rusternetes_common::resources::pod::{
+use k3rs_common::resources::pod::{
     ContainerPort, EphemeralContainer, Lifecycle, LifecycleHandler, PodSpec, Probe,
     SecurityContext, Volume,
 };
-use rusternetes_common::types::ObjectMeta;
+use k3rs_common::types::ObjectMeta;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -421,7 +421,7 @@ struct ContainerView<'a> {
     lifecycle: Option<&'a Lifecycle>,
 }
 
-fn container_view(c: &rusternetes_common::resources::pod::Container) -> ContainerView<'_> {
+fn container_view(c: &k3rs_common::resources::pod::Container) -> ContainerView<'_> {
     ContainerView {
         name: c.name.as_str(),
         security_context: c.security_context.as_ref(),
@@ -1193,7 +1193,7 @@ pub fn se_linux_options_1_31(_: &ObjectMeta, spec: &PodSpec) -> CheckResult {
 }
 
 fn se_linux_options(spec: &PodSpec, allowed_types: &[&str]) -> CheckResult {
-    use rusternetes_common::resources::pod::SELinuxOptions;
+    use k3rs_common::resources::pod::SELinuxOptions;
     let mut bad_setters: Vec<String> = Vec::new();
     let mut bad_types: BTreeSet<String> = BTreeSet::new();
     let mut set_user = false;

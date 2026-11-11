@@ -4,10 +4,10 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use futures::StreamExt;
-    pub use rusternetes_api_server::crdregistration::WorkQueue;
-    pub use rusternetes_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
-    pub use rusternetes_common::resources::APIService;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent};
+    pub use k3rs_api_server::crdregistration::WorkQueue;
+    pub use k3rs_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
+    pub use k3rs_common::resources::APIService;
+    pub use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent};
     pub use std::collections::{BTreeSet, HashMap, HashSet};
     pub use std::sync::Arc;
     pub use std::sync::Mutex;
@@ -16,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::autoregister::*;
+    use k3rs_api_server::autoregister::*;
     use std::sync::Mutex;
 
     #[derive(Debug, PartialEq, Clone)]
@@ -123,7 +123,7 @@ mod tests {
     fn available(mut s: APIService, status: &str) -> APIService {
         s.status
             .conditions
-            .push(rusternetes_common::resources::APIServiceCondition {
+            .push(k3rs_common::resources::APIServiceCondition {
                 type_: "Available".to_string(),
                 status: status.to_string(),
                 ..Default::default()
@@ -154,7 +154,7 @@ mod tests {
     // The hook creates every delegate path's APIService as `onstart`-managed.
     #[tokio::test]
     async fn autoregistration_hook_seeds_listed_apiservices() {
-        let storage = std::sync::Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = std::sync::Arc::new(k3rs_storage::MemoryStorage::new());
         let paths = vec!["/api/v1".to_string(), "/apis/apps/v1".to_string()];
         let h = spawn_autoregistration(storage.clone(), paths);
         let client = StorageAPIServiceClient(storage.clone());
@@ -436,7 +436,7 @@ mod tests {
     /// The APIService watch feeds the workqueue and the completion check.
     #[tokio::test]
     async fn watch_events_drive_queue_and_check() {
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_storage::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let ctl = Arc::new(AutoRegisterController::new());
         let mut pending = plain("v1.example.com");

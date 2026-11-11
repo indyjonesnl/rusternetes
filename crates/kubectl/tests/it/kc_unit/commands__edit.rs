@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use std::env;
     pub use std::fs;
     pub use std::process::Command;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::edit::*;
+    use k3rs_kubectl::commands::edit::*;
 
     #[test]
     fn test_get_resource_api_path_pod_aliases() {

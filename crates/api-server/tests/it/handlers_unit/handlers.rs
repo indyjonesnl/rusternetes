@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_discovery as discovery;
+    pub use k3rs_discovery as discovery;
 }
 
 mod collection_rv_tests {
-    use rusternetes_api_server::handlers::{collection_resource_version, list_resource_version};
+    use k3rs_api_server::handlers::{collection_resource_version, list_resource_version};
     use serde_json::json;
 
     /// A LIST's `metadata.resourceVersion` must never be below an item the

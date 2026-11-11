@@ -40,8 +40,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use rusternetes_common::resources::{ConfigMap, Secret};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
+use k3rs_common::resources::{ConfigMap, Secret};
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,7 +197,7 @@ impl<S: Storage + 'static> Signer<S> {
         );
         match self.storage.get::<ConfigMap>(&key).await {
             Ok(cm) => Some(cm),
-            Err(rusternetes_common::Error::NotFound(_)) => None,
+            Err(k3rs_common::Error::NotFound(_)) => None,
             Err(e) => {
                 error!("Reading bootstrap signer ConfigMap: {e}");
                 None
@@ -311,9 +311,8 @@ impl<S: Storage + 'static> Signer<S> {
             &cm.metadata.name,
         );
         match self.storage.update(&key, cm).await {
-            Ok(_)
-            | Err(rusternetes_common::Error::NotFound(_))
-            | Err(rusternetes_common::Error::Conflict(_)) => {}
+            Ok(_) | Err(k3rs_common::Error::NotFound(_)) | Err(k3rs_common::Error::Conflict(_)) => {
+            }
             Err(e) => debug!("Error updating ConfigMap: {e}"),
         }
     }

@@ -4,14 +4,14 @@
 # This generates a 2048-bit RSA key pair in PEM format
 #
 # NOTE: This is ONLY required for production deployments.
-# For local development, Rusternetes will work without signing keys
+# For local development, k3rs will work without signing keys
 # (tokens will be unsigned but functional).
 #
 # See docs/security/service-account-tokens.md for full documentation.
 
 set -e
 
-KEY_DIR="${HOME}/.rusternetes/keys"
+KEY_DIR="${HOME}/.k3rs/keys"
 PRIVATE_KEY_PATH="${KEY_DIR}/sa-signing-key.pem"
 PUBLIC_KEY_PATH="${KEY_DIR}/sa-signing-key.pub"
 

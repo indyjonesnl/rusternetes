@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-cri"
+name = "k3rs-cri"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_cri"
+name = "k3rs_cri"
 path = "src/lib.rs"
 
 # CRI v1 gRPC client for the kubelet. Talks the Kubernetes Container Runtime
@@ -31,7 +31,7 @@ hyper-util = { version = "0.1", features = ["client", "tokio"] }
 # Stream helpers (exec/attach/log): WebSocket client for CRI streaming server.
 tokio-tungstenite = "0.24"
 url = "2.5.8"
-rusternetes-common = { path = "../common" }
+k3rs-common = { path = "../common" }
 # In-process fake CRI RuntimeService for tests (feature `fake-server`, #1115).
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
 

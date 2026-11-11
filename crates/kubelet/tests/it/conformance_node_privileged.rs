@@ -14,7 +14,7 @@
 //! Behavioural (does-it-actually-launch-privileged) coverage requires a
 //! real runtime; that is exercised separately in node conformance.
 
-use rusternetes_common::resources::{Container, SecurityContext};
+use k3rs_common::resources::{Container, SecurityContext};
 
 fn sec_ctx(privileged: Option<bool>) -> SecurityContext {
     SecurityContext {

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Installation - Rūsternetes</title>
+  <title>Installation - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Installation</h1>
       <p class="lead">
-        Build Rūsternetes from source, understand feature flags, and set up your development
+        Build k3rs from source, understand feature flags, and set up your development
         environment. For a quick container-based setup without building from source, see the
         <a href="quickstart.html">Quick Start</a>.
       </p>
@@ -112,7 +112,7 @@
 
       <h3>Install the Rust toolchain</h3>
       <p>
-        Rūsternetes requires Rust 2021 edition. Install via
+        k3rs requires Rust 2021 edition. Install via
         <a href="https://rustup.rs/">rustup</a>:
       </p>
 
@@ -150,7 +150,7 @@ cargo --version</code>
           <span class="code-title">terminal</span>
         </div>
         <code>git clone https://github.com/calfonso/rusternetes.git
-cd rusternetes
+cd k3rs
 
 <span class="comment"># Debug build (faster compilation, slower runtime)</span>
 cargo build
@@ -178,15 +178,15 @@ cargo build <span class="flag">--release</span></code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Build the all-in-one binary</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span>
 
 <span class="comment"># Build individual components</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-api-server</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-scheduler</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-controller-manager</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-kubelet</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-kube-proxy</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-kubectl</span></code>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-api-server</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-scheduler</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-controller-manager</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-kubelet</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-kube-proxy</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-kubectl</span></code>
       </pre>
 
       <h3>Run tests</h3>
@@ -202,7 +202,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes-kubectl
 cargo test
 
 <span class="comment"># Run tests for a single crate</span>
-cargo test <span class="flag">-p</span> <span class="value">rusternetes-kubelet</span>
+cargo test <span class="flag">-p</span> <span class="value">k3rs-kubelet</span>
 
 <span class="comment"># Run a specific test by name</span>
 cargo test <span class="value">test_pod_scheduling</span>
@@ -216,7 +216,7 @@ make pre-commit</code>
 
       <h2>Feature Flags</h2>
       <p>
-        Rūsternetes uses Cargo feature flags to control optional functionality at compile time.
+        k3rs uses Cargo feature flags to control optional functionality at compile time.
       </p>
 
       <table>
@@ -249,19 +249,19 @@ make pre-commit</code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Build with default features (includes SQLite)</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span>
 
 <span class="comment"># Build without SQLite (etcd-only)</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--no-default-features</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span> <span class="flag">--no-default-features</span>
 
 <span class="comment"># Explicitly enable SQLite</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">sqlite</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span> <span class="flag">--features</span> <span class="value">sqlite</span>
 
 <span class="comment"># Enable Redis backend</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">redis</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span> <span class="flag">--features</span> <span class="value">redis</span>
 
 <span class="comment"># Enable both SQLite and Redis</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--features</span> <span class="value">sqlite,redis</span></code>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span> <span class="flag">--features</span> <span class="value">sqlite,redis</span></code>
       </pre>
 
       <div class="admonition note">
@@ -298,7 +298,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
           </tr>
           <tr>
             <td><code>all-in-one.Dockerfile</code></td>
-            <td><code>rusternetes</code></td>
+            <td><code>k3rs</code></td>
             <td>Single binary that runs api-server + scheduler + controller-manager + kubelet as concurrent tokio tasks. Used by <code>compose.all-in-one.yml</code> and <code>compose.all-in-one-redis.yml</code>.</td>
           </tr>
           <tr>
@@ -313,7 +313,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
           </tr>
           <tr>
             <td><code>Dockerfile</code></td>
-            <td><code>rusternetes</code></td>
+            <td><code>k3rs</code></td>
             <td>All-in-one binary</td>
           </tr>
         </tbody>
@@ -332,12 +332,12 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
 podman compose -f compose.yml build api-server
 
 <span class="comment"># Build the all-in-one image directly</span>
-podman build <span class="flag">-t</span> <span class="value">rusternetes:latest</span> <span class="flag">-f</span> <span class="value">Dockerfile</span> .</code>
+podman build <span class="flag">-t</span> <span class="value">k3rs:latest</span> <span class="flag">-f</span> <span class="value">Dockerfile</span> .</code>
       </pre>
 
       <h2>All-in-One Binary</h2>
       <p>
-        The <code>rusternetes</code> crate produces a single binary that runs the API server,
+        The <code>k3rs</code> crate produces a single binary that runs the API server,
         scheduler, controller manager, kubelet, and kube-proxy as concurrent tokio tasks in
         one process. It defaults to embedded SQLite storage, so no external etcd is needed.
       </p>
@@ -350,14 +350,14 @@ podman build <span class="flag">-t</span> <span class="value">rusternetes:latest
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Build the all-in-one binary</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> <span class="flag">--release</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs</span> <span class="flag">--release</span>
 
 <span class="comment"># Run it (no Docker or etcd required)</span>
-./target/release/rusternetes</code>
+./target/release/k3rs</code>
       </pre>
 
       <p>
-        This is the simplest way to run a Rūsternetes cluster &mdash; a single process, a single
+        This is the simplest way to run a k3rs cluster &mdash; a single process, a single
         binary, no containers or external dependencies. See <a href="all-in-one.html">All-in-One Binary</a>
         for configuration options and production usage.
       </p>
@@ -373,7 +373,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
 
       <h2>kubectl</h2>
       <p>
-        Rūsternetes includes a built-in <code>kubectl</code> implementation in the
+        k3rs includes a built-in <code>kubectl</code> implementation in the
         <code>crates/kubectl</code> crate. It implements the most common kubectl commands
         natively in Rust.
       </p>
@@ -388,7 +388,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes</span> 
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Build the Rust kubectl</span>
-cargo build <span class="flag">-p</span> <span class="value">rusternetes-kubectl</span> <span class="flag">--release</span>
+cargo build <span class="flag">-p</span> <span class="value">k3rs-kubectl</span> <span class="flag">--release</span>
 
 <span class="comment"># Run it</span>
 ./target/release/kubectl get pods
@@ -398,7 +398,7 @@ cargo build <span class="flag">-p</span> <span class="value">rusternetes-kubectl
       <h3>System kubectl</h3>
       <p>
         The standard <code>kubectl</code> from the Kubernetes project works perfectly with
-        Rūsternetes. The API is fully compatible. Install it via your package manager or from
+        k3rs. The API is fully compatible. Install it via your package manager or from
         the <a href="https://kubernetes.io/docs/tasks/tools/">Kubernetes docs</a>.
       </p>
 
@@ -575,7 +575,7 @@ xcode-select --install</code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Check the all-in-one binary</span>
-./target/release/rusternetes <span class="flag">--help</span>
+./target/release/k3rs <span class="flag">--help</span>
 
 <span class="comment"># Check individual components</span>
 ./target/release/api-server <span class="flag">--help</span>
@@ -608,7 +608,7 @@ xcode-select --install</code>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

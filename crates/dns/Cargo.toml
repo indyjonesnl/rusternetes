@@ -1,29 +1,29 @@
 [package]
-name = "rusternetes-dns"
+name = "k3rs-dns"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_dns"
+name = "k3rs_dns"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rusternetes-dns"
+name = "k3rs-dns"
 path = "src/main.rs"
 
 [features]
 mimalloc = ["dep:mimalloc"]
 default = []
-sqlite = ["rusternetes-storage/sqlite"]
-redis = ["rusternetes-storage/redis"]
+sqlite = ["k3rs-storage/sqlite"]
+redis = ["k3rs-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
-rusternetes-client = { path = "../client" }
+k3rs-common = { path = "../common" }
+k3rs-storage = { path = "../storage" }
+k3rs-client = { path = "../client" }
 tokio.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true

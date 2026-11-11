@@ -12,8 +12,8 @@
 //! `TestCSILimitsAfterCSINodeUpdatedQHint` (`:983`).
 
 use super::events::*;
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::resources::{
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::resources::{
     CSINode, CSINodeDriver, PersistentVolumeClaim, Pod, Volume, VolumeAttachment,
 };
 use std::collections::HashMap;

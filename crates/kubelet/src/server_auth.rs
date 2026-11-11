@@ -36,17 +36,17 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use hmac::{Hmac, Mac};
-use rusternetes_client::api_status;
-use rusternetes_client::http::ApiClient;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer, Decision, Opinion};
-use rusternetes_common::lru_expire_cache::LruExpireCache;
-use rusternetes_common::resources::{
+use k3rs_client::api_status;
+use k3rs_client::http::ApiClient;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer, Decision, Opinion};
+use k3rs_common::lru_expire_cache::LruExpireCache;
+use k3rs_common::resources::{
     NonResourceAttributes, ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
     TokenReview, TokenReviewSpec,
 };
-use rusternetes_common::wait::Backoff;
-use rusternetes_middleware::{user_from_client_cert_der, PeerCertificates};
+use k3rs_common::wait::Backoff;
+use k3rs_middleware::{user_from_client_cert_der, PeerCertificates};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::ClientCertVerifier;
 use sha2::Sha256;
@@ -832,7 +832,7 @@ impl ClientCaContent {
         }
 
         let verifier =
-            rusternetes_common::tls::client_cert_verifier_for_ca_bundle(&self.name, &ca_bundle)?;
+            k3rs_common::tls::client_cert_verifier_for_ca_bundle(&self.name, &ca_bundle)?;
         *self.ca_bundle.write().unwrap() = Some(Arc::new(CaBundleAndVerifier {
             ca_bundle,
             verifier,
@@ -1247,7 +1247,7 @@ impl DelegatingAuthorizer {
 }
 
 /// `shouldCache` (webhook.go:537-547).
-fn should_cache(attr: &rusternetes_common::authz::RequestAttributes) -> bool {
+fn should_cache(attr: &k3rs_common::authz::RequestAttributes) -> bool {
     let n = attr.namespace.as_deref().unwrap_or("").len()
         + attr.verb.len()
         + attr.api_group.len()
@@ -1263,8 +1263,8 @@ fn should_cache(attr: &rusternetes_common::authz::RequestAttributes) -> bool {
 impl Authorizer for DelegatingAuthorizer {
     async fn authorize(
         &self,
-        attrs: &rusternetes_common::authz::RequestAttributes,
-    ) -> rusternetes_common::Result<Decision> {
+        attrs: &k3rs_common::authz::RequestAttributes,
+    ) -> k3rs_common::Result<Decision> {
         Ok(match self.authorize_opinion(attrs).await? {
             Opinion::Allow(_) => Decision::Allow,
             Opinion::Deny(r) => Decision::Deny(r),
@@ -1275,8 +1275,8 @@ impl Authorizer for DelegatingAuthorizer {
     /// `WebhookAuthorizer.Authorize` (webhook.go:188-299).
     async fn authorize_opinion(
         &self,
-        attr: &rusternetes_common::authz::RequestAttributes,
-    ) -> rusternetes_common::Result<Opinion> {
+        attr: &k3rs_common::authz::RequestAttributes,
+    ) -> k3rs_common::Result<Opinion> {
         let user = &attr.user;
         let mut spec = SubjectAccessReviewSpec {
             user: Some(user.username.clone()),
@@ -1306,11 +1306,10 @@ impl Authorizer for DelegatingAuthorizer {
 
         // `json.Marshal(r.Spec)`: the cache key. `extra` is a Go map, which
         // marshals with sorted keys.
-        let mut keyed = serde_json::to_value(&spec).map_err(rusternetes_common::Error::from)?;
+        let mut keyed = serde_json::to_value(&spec).map_err(k3rs_common::Error::from)?;
         if let Some(extra) = &spec.extra {
             let sorted: BTreeMap<_, _> = extra.iter().collect();
-            keyed["extra"] =
-                serde_json::to_value(sorted).map_err(rusternetes_common::Error::from)?;
+            keyed["extra"] = serde_json::to_value(sorted).map_err(k3rs_common::Error::from)?;
         }
         let key = keyed.to_string();
 
@@ -1333,7 +1332,7 @@ impl Authorizer for DelegatingAuthorizer {
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to make webhook authorizer request: {e:#}");
-                    rusternetes_common::Error::Internal(format!("{e:#}"))
+                    k3rs_common::Error::Internal(format!("{e:#}"))
                 })?;
                 let s = result.status.unwrap_or_default();
                 let status = SarStatus {
@@ -1354,7 +1353,7 @@ impl Authorizer for DelegatingAuthorizer {
             }
         };
         if status.denied && status.allowed {
-            return Err(rusternetes_common::Error::Internal(
+            return Err(k3rs_common::Error::Internal(
                 "webhook subject access review returned both allow and deny response".into(),
             ));
         }
@@ -1374,8 +1373,8 @@ impl Authorizer for DelegatingAuthorizer {
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> k3rs_common::Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -1637,8 +1636,8 @@ pub async fn auth_filter(
 fn to_authz_attributes(
     a: &RequestAttributes,
     user: &UserInfo,
-) -> rusternetes_common::authz::RequestAttributes {
-    let mut r = rusternetes_common::authz::RequestAttributes::new(
+) -> k3rs_common::authz::RequestAttributes {
+    let mut r = k3rs_common::authz::RequestAttributes::new(
         user.clone(),
         a.verb.clone(),
         a.resource.clone(),

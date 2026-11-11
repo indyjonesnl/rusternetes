@@ -1,5 +1,5 @@
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::*;
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::*;
 
 /// Assert that a PVC is bound to a PV
 pub fn assert_pvc_bound(pvc: &PersistentVolumeClaim) {

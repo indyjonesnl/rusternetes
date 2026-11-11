@@ -13,10 +13,10 @@ use std::sync::Arc;
 use axum::extract::{Extension, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use rusternetes_common::admission::{GroupVersionKind, Operation};
-use rusternetes_common::resources::Namespace;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::admission::{GroupVersionKind, Operation};
+use k3rs_common::resources::Namespace;
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 
 use super::builtin_plugins::new_forbidden;
 use super::plugins::enabled;
@@ -134,14 +134,14 @@ pub async fn namespace_lifecycle_gate(
     let started = std::time::Instant::now();
     let mut skipped = false;
     if enabled("NamespaceAutoProvision") && request.method() == axum::http::Method::POST {
-        if let Some(ns) = rusternetes_middleware::create_target_namespace(request.uri().path()) {
+        if let Some(ns) = k3rs_middleware::create_target_namespace(request.uri().path()) {
             skipped = matches!(namespace_exists(&storage, ns).await, Ok(false));
         }
     }
     let rejection = if skipped {
         None
     } else {
-        rusternetes_middleware::namespace_lifecycle_rejection(
+        k3rs_middleware::namespace_lifecycle_rejection(
             &storage,
             request.method(),
             request.uri().path(),
@@ -154,11 +154,11 @@ pub async fn namespace_lifecycle_gate(
     // Update, Delete)`, namespace/lifecycle/admission.go:196), and
     // `rejected` is `err != nil`.
     if let Some(op) = observed_op {
-        rusternetes_admission_webhook::admission_metrics::observe_admission_controller(
+        k3rs_admission_webhook::admission_metrics::observe_admission_controller(
             started.elapsed(),
             rejection.is_some(),
             &op,
-            rusternetes_admission_webhook::admission_metrics::STEP_ADMIT,
+            k3rs_admission_webhook::admission_metrics::STEP_ADMIT,
             "NamespaceLifecycle",
         );
     }

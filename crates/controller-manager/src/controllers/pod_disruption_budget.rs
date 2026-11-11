@@ -29,15 +29,15 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::{
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::{
     CustomResource, CustomResourceDefinition, EventSource, EventType, IntOrString, Pod,
     PodDisruptionBudget, PodDisruptionBudgetCondition, PodDisruptionBudgetStatus,
 };
-use rusternetes_common::types::{LabelSelector, OwnerReference, Phase, Selector};
-use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
-use rusternetes_common::Error;
-use rusternetes_storage::{
+use k3rs_common::types::{LabelSelector, OwnerReference, Phase, Selector};
+use k3rs_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+use k3rs_common::Error;
+use k3rs_storage::{
     build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
 };
 use std::collections::HashMap;
@@ -54,11 +54,11 @@ pub const DELETION_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
 /// `stalePodDisruptionTimeout` (`disruption.go:70-74`).
 pub const STALE_POD_DISRUPTION_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60);
 
-use rusternetes_common::pdbhelper::{
+use k3rs_common::pdbhelper::{
     conditions_are_up_to_date, set_status_condition, update_disruption_allowed_condition,
     DISRUPTION_ALLOWED_CONDITION, SYNC_FAILED_REASON,
 };
-use rusternetes_common::podutil::is_pod_ready;
+use k3rs_common::podutil::is_pod_ready;
 
 /// `v1.PodReasonTerminationByKubelet`.
 const POD_REASON_TERMINATION_BY_KUBELET: &str = "TerminationByKubelet";
@@ -96,7 +96,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
 
     /// `DisruptionController.Run` (`disruption.go:419`): the sync worker, the
     /// recheck worker, and the PDB + Pod event sources feeding them.
-    pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
+    pub async fn run(self: Arc<Self>) -> k3rs_common::Result<()> {
         info!("Starting PodDisruptionBudget controller");
 
         let worker_self = Arc::clone(&self);
@@ -268,10 +268,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     /// `getPodsForPdb` (`disruption.go:631`): `LabelSelectorAsSelector` then a
     /// namespace-scoped list. A `nil` selector is `labels.Nothing()`, an empty
     /// one `labels.Everything()` (`apimachinery/.../meta/v1/helpers.go:37-43`).
-    async fn get_pods_for_pdb(
-        &self,
-        pdb: &PodDisruptionBudget,
-    ) -> rusternetes_common::Result<Vec<Pod>> {
+    async fn get_pods_for_pdb(&self, pdb: &PodDisruptionBudget) -> k3rs_common::Result<Vec<Pod>> {
         let selector = pdb_selector(pdb).map_err(Error::InvalidResource)?;
         let ns = pdb.metadata.namespace.as_deref().unwrap_or("default");
         // The v1beta1 compat rule: an empty selector selects no pods.
@@ -286,14 +283,14 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     }
 
     /// `sync` (`disruption.go:700-731`), keyed `namespace/name`.
-    pub async fn sync(&self, key: &str) -> rusternetes_common::Result<()> {
+    pub async fn sync(&self, key: &str) -> k3rs_common::Result<()> {
         self.sync_at(key, Utc::now()).await
     }
 
     /// [`sync`](Self::sync) with an injected "now" (upstream injects a
     /// `clock.Clock`; `disruption_test.go` drives it with a fake one).
     #[doc(hidden)]
-    pub async fn sync_at(&self, key: &str, now: DateTime<Utc>) -> rusternetes_common::Result<()> {
+    pub async fn sync_at(&self, key: &str, now: DateTime<Utc>) -> k3rs_common::Result<()> {
         let (namespace, name) = match key.split_once('/') {
             Some((ns, n)) => (ns, n),
             None => ("", key),
@@ -325,7 +322,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         pdb: &PodDisruptionBudget,
         now: DateTime<Utc>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let pods = match self.get_pods_for_pdb(pdb).await {
             Ok(p) => p,
             Err(e) => {
@@ -404,7 +401,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         pdb: &PodDisruptionBudget,
         pods: &[Pod],
-    ) -> rusternetes_common::Result<(i32, i32, Vec<String>)> {
+    ) -> k3rs_common::Result<(i32, i32, Vec<String>)> {
         let mut expected_count = 0;
         let mut desired_healthy = 0;
         let mut unmanaged_pods = Vec::new();
@@ -437,10 +434,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     /// where `C` is the set of controllers of the selected pods. Pods without a
     /// controller are collected as unmanaged rather than failing the sync; a
     /// controller no finder recognises is an error.
-    async fn get_expected_scale(
-        &self,
-        pods: &[Pod],
-    ) -> rusternetes_common::Result<(i32, Vec<String>)> {
+    async fn get_expected_scale(&self, pods: &[Pod]) -> k3rs_common::Result<(i32, Vec<String>)> {
         let mut controller_scale: HashMap<String, i32> = HashMap::new();
         let mut unmanaged_pods = Vec::new();
 
@@ -478,7 +472,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         if let Some(c) = self
             .get_pod_replication_controller(controller_ref, namespace)
             .await?
@@ -517,7 +511,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         if !verify_group_kind(controller_ref, "ReplicaSet", &["apps", "extensions"])? {
             return Ok(None);
         }
@@ -547,7 +541,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         if !verify_group_kind(controller_ref, "StatefulSet", &["apps"])? {
             return Ok(None);
         }
@@ -572,7 +566,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         if !verify_group_kind(controller_ref, "ReplicaSet", &["apps", "extensions"])? {
             return Ok(None);
         }
@@ -611,7 +605,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         if !verify_group_kind(controller_ref, "ReplicationController", &[""])? {
             return Ok(None);
         }
@@ -646,7 +640,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         &self,
         controller_ref: &OwnerReference,
         namespace: &str,
-    ) -> rusternetes_common::Result<Option<ControllerAndScale>> {
+    ) -> k3rs_common::Result<Option<ControllerAndScale>> {
         let (group, version) = parse_group_version(&controller_ref.api_version)?;
 
         // Built-in kinds that implement /scale (a pod owned directly by one).
@@ -808,11 +802,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     /// place we implement the 'fail open' part of the design since if we manage
     /// to update this field correctly, we will prevent the /evict handler from
     /// approving an eviction when it may be unsafe to do so."
-    async fn fail_safe(
-        &self,
-        pdb: &PodDisruptionBudget,
-        err: &Error,
-    ) -> rusternetes_common::Result<()> {
+    async fn fail_safe(&self, pdb: &PodDisruptionBudget, err: &Error) -> k3rs_common::Result<()> {
         let mut new_pdb = pdb.clone();
         let status = new_pdb.status.get_or_insert_with(empty_status);
         status.disruptions_allowed = 0;
@@ -839,7 +829,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
         desired_healthy: i32,
         expected_count: i32,
         disrupted_pods: HashMap<String, DateTime<Utc>>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         // "We require expectedCount to be > 0 so that PDBs which currently match
         // no pods are in a safe state when their first pods appear but this
         // controller has not updated their status yet."
@@ -890,10 +880,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     /// onto the stored object only if its `resourceVersion` still equals the
     /// one this sync read, atomically with the write on every backend, and
     /// returns `Error::Conflict` otherwise (#2151).
-    pub async fn write_pdb_status(
-        &self,
-        pdb: &PodDisruptionBudget,
-    ) -> rusternetes_common::Result<()> {
+    pub async fn write_pdb_status(&self, pdb: &PodDisruptionBudget) -> k3rs_common::Result<()> {
         let ns = pdb.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("poddisruptionbudgets", Some(ns), &pdb.metadata.name);
         // A status write, NOT `update`: a full-object PUT has its `.status`
@@ -903,7 +890,7 @@ impl<S: Storage + 'static> PodDisruptionBudgetController<S> {
     }
 
     /// Reconcile every PDB once (tests and one-shot callers).
-    pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
+    pub async fn reconcile_all(&self) -> k3rs_common::Result<()> {
         let pdbs: Vec<PodDisruptionBudget> = self
             .storage
             .list(&build_prefix("poddisruptionbudgets", None))
@@ -1039,7 +1026,7 @@ fn get_scaled_value_from_int_or_percent(
     value: &IntOrString,
     total: i32,
     round_up: bool,
-) -> rusternetes_common::Result<i32> {
+) -> k3rs_common::Result<i32> {
     match value {
         IntOrString::Int(v) => Ok(*v),
         IntOrString::String(s) => {
@@ -1068,8 +1055,7 @@ fn get_scaled_value_from_int_or_percent(
 /// every `matchLabels` / `matchExpressions` key and value is validated by
 /// `labels.NewRequirement`, so an unusable selector is an error here too.
 fn pdb_selector(pdb: &PodDisruptionBudget) -> Result<Selector, String> {
-    let selector =
-        rusternetes_common::types::label_selector_as_selector(pdb.spec.selector.as_ref())?;
+    let selector = k3rs_common::types::label_selector_as_selector(pdb.spec.selector.as_ref())?;
     if let Some(sel) = &pdb.spec.selector {
         validate_selector_requirements(sel)?;
     }
@@ -1104,7 +1090,7 @@ fn validate_selector_requirements(sel: &LabelSelector) -> Result<(), String> {
 /// ("An empty selector ({}) also selects no pods", `staging/src/k8s.io/api/policy/
 /// v1beta1/types.go:33-37`) is upstream's `Convert_v1beta1_PodDisruptionBudget_To_
 /// policy_PodDisruptionBudget` (`pkg/apis/policy/v1beta1/conversion.go:26-47`);
-/// rusternetes serves only `policy/v1`, so there is no conversion boundary to
+/// k3rs serves only `policy/v1`, so there is no conversion boundary to
 /// hook and the rule is keyed off the stored `apiVersion`.
 fn pdb_selector_matches(pdb: &PodDisruptionBudget, pod: &Pod) -> Result<bool, String> {
     let selector = pdb_selector(pdb)?;
@@ -1119,7 +1105,7 @@ fn verify_group_kind(
     controller_ref: &OwnerReference,
     expected_kind: &str,
     expected_groups: &[&str],
-) -> rusternetes_common::Result<bool> {
+) -> k3rs_common::Result<bool> {
     let (group, _) = parse_group_version(&controller_ref.api_version)?;
     if controller_ref.kind != expected_kind {
         return Ok(false);
@@ -1128,7 +1114,7 @@ fn verify_group_kind(
 }
 
 /// `schema.ParseGroupVersion` (`apimachinery/pkg/runtime/schema/group_version.go`).
-pub fn parse_group_version(gv: &str) -> rusternetes_common::Result<(String, String)> {
+pub fn parse_group_version(gv: &str) -> k3rs_common::Result<(String, String)> {
     if gv.is_empty() || gv == "/" {
         return Ok((String::new(), String::new()));
     }

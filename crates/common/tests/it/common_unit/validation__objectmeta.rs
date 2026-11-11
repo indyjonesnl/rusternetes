@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::types::{ObjectMeta, OwnerReference};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::types::{ObjectMeta, OwnerReference};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_qualified_name, validate_labels,
         validate_managed_fields,
     };
@@ -15,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::objectmeta::*;
+    use k3rs_common::validation::objectmeta::*;
 
     #[test]
     fn mask_trailing_dash_replaces_dash_with_a() {

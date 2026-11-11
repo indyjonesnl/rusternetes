@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::diff::*;
+    use k3rs_common::diff::*;
 
     fn d(a: &str, b: &str) -> String {
         unified_diff(&split_lines(a), &split_lines(b), 3)

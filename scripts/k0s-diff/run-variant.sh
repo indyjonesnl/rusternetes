@@ -52,7 +52,7 @@ mkdir -p "$resdir"
 # variant reused in place — no recreate.
 img="$(awk '/^[[:space:]]*image:/{print $2; exit}' "$f")"
 if [ "${K0S_DIFF_REBUILD:-0}" = 1 ] || ! docker image inspect "$img" >/dev/null 2>&1; then
-  # Baked component swaps (v1..v4) bake .build/rusternetes-<component> +
+  # Baked component swaps (v1..v4) bake .build/k3rs-<component> +
   # .build/<k0s-binary>.real; produce them from source first (idempotent).
   # v5 (kube-proxy) / v6 (dns) are workload swaps — same base image, no bake.
   case "$swap" in
@@ -78,7 +78,7 @@ fi
 # containerd-rs has NO local-image load path (containerd-rs.toml) — it can only
 # PULL. So for the workload swaps we stand up a throwaway HTTP registry on the
 # k0s-diff-net gateway (the host address the in-container containerd-rs reaches),
-# push the rusternetes-<component> image there, and tell containerd-rs to pull it
+# push the k3rs-<component> image there, and tell containerd-rs to pull it
 # over HTTP via CONTAINERD_RS_INSECURE_REGISTRIES (set BEFORE `up` so the daemon
 # starts trusting it). apply-workload-swap.sh later references the image by this
 # same registry host:port.
@@ -121,8 +121,8 @@ case "$swap" in
     fi
     bash "$here/build-swap-images.sh" "$swap" >/dev/null
     tag="${K8S_VERSION#v}"
-    push_img="localhost:${registry_port}/rusternetes-${swap}:${tag}"
-    docker tag "k0s-diff-rusternetes-${swap}:${tag}" "$push_img"
+    push_img="localhost:${registry_port}/k3rs-${swap}:${tag}"
+    docker tag "k0s-diff-k3rs-${swap}:${tag}" "$push_img"
     log "pushing $push_img"
     docker push "$push_img" >/dev/null
 
@@ -133,7 +133,7 @@ case "$swap" in
     # the registry over HTTP (same repo, pulled by the gateway ref).
     REGISTRY_HOSTPORT="${K0S_DIFF_NET_GATEWAY}:${registry_port}"
     export CONTAINERD_RS_INSECURE_REGISTRIES="$REGISTRY_HOSTPORT"
-    log "insecure registry for containerd-rs: $REGISTRY_HOSTPORT (image ref ${REGISTRY_HOSTPORT}/rusternetes-${swap}:${tag})"
+    log "insecure registry for containerd-rs: $REGISTRY_HOSTPORT (image ref ${REGISTRY_HOSTPORT}/k3rs-${swap}:${tag})"
     ;;
 esac
 
@@ -176,7 +176,7 @@ fi
 
 # --- workload swaps (v5 kube-proxy / v6 dns): apply AFTER smoke -------------
 # Unlike the baked binary swaps (v1..v4), v5/v6 replace an in-cluster workload
-# (DaemonSet/Deployment) with a Rusternetes pod image. The all-Go stack must be
+# (DaemonSet/Deployment) with a k3rs pod image. The all-Go stack must be
 # healthy (smoke passed) first; only then do we swap the component and re-verify.
 # NB: the swap itself runs here, AFTER smoke. What must precede the compose
 # `up` above is the registry/env staging (CONTAINERD_RS_INSECURE_REGISTRIES

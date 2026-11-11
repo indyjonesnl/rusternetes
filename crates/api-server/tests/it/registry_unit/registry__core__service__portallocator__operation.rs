@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::core::service::portallocator::{
+    pub use k3rs_api_server::registry::core::service::portallocator::{
         PortAllocator, PortError, PortResult,
     };
     pub use std::sync::Arc;
@@ -10,8 +10,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::portallocator::operation::*;
-    use rusternetes_api_server::registry::core::service::portallocator::PortRange;
+    use k3rs_api_server::registry::core::service::portallocator::operation::*;
+    use k3rs_api_server::registry::core::service::portallocator::PortRange;
 
     async fn allocator() -> Arc<PortAllocator> {
         let r = PortAllocator::new_in_memory(PortRange::parse("10000-10200").unwrap());

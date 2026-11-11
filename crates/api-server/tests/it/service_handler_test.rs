@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for services
 
-use rusternetes_common::resources::{IntOrString, Service, ServicePort, ServiceSpec, ServiceType};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{IntOrString, Service, ServicePort, ServiceSpec, ServiceType};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -428,7 +428,7 @@ async fn test_service_session_affinity() {
 
 #[tokio::test]
 async fn test_service_list_label_selector_filtering() {
-    use rusternetes_api_server::handlers::filtering::apply_selectors;
+    use k3rs_api_server::handlers::filtering::apply_selectors;
 
     let storage = Arc::new(MemoryStorage::new());
 
@@ -495,7 +495,7 @@ async fn test_service_list_label_selector_filtering() {
 
 #[tokio::test]
 async fn test_service_list_field_selector_filtering() {
-    use rusternetes_api_server::handlers::filtering::apply_selectors;
+    use k3rs_api_server::handlers::filtering::apply_selectors;
 
     let storage = Arc::new(MemoryStorage::new());
 
@@ -533,7 +533,7 @@ async fn test_service_list_field_selector_filtering() {
 
 #[tokio::test]
 async fn test_service_list_combined_selectors() {
-    use rusternetes_api_server::handlers::filtering::apply_selectors;
+    use k3rs_api_server::handlers::filtering::apply_selectors;
 
     let storage = Arc::new(MemoryStorage::new());
 
@@ -591,7 +591,7 @@ async fn test_service_list_combined_selectors() {
 
 #[tokio::test]
 async fn test_service_status_loadbalancer_update() {
-    use rusternetes_common::resources::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
+    use k3rs_common::resources::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus};
 
     let storage = Arc::new(MemoryStorage::new());
 
@@ -632,7 +632,7 @@ async fn test_service_status_loadbalancer_update() {
 async fn test_service_create_initializes_status() {
     // Verify that the ServiceStatus and LoadBalancerStatus structs
     // serialize correctly when initialized with empty ingress
-    use rusternetes_common::resources::{LoadBalancerStatus, ServiceStatus};
+    use k3rs_common::resources::{LoadBalancerStatus, ServiceStatus};
 
     let status = ServiceStatus {
         load_balancer: Some(LoadBalancerStatus { ingress: vec![] }),

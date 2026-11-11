@@ -13,10 +13,10 @@
 
 use crate::cel_checker_shadow::checker_env_set;
 use crate::cel_versions::{EnvSet, EnvType};
-use rusternetes_cel_checker as checker;
-pub use rusternetes_cel_checker::decl::DeclType;
-use rusternetes_cel_checker::decl::{DeclField, DeclTypeProvider};
-use rusternetes_cel_checker::DType;
+use k3rs_cel_checker as checker;
+pub use k3rs_cel_checker::decl::DeclType;
+use k3rs_cel_checker::decl::{DeclField, DeclTypeProvider};
+use k3rs_cel_checker::DType;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

@@ -17,7 +17,7 @@
 //! `upstream_openapi_golden_allowlist.txt` (xfail: a listed unit that now
 //! matches fails the test). `GOLDEN_DUMP=1` prints every mismatch.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authentication - Rūsternetes</title>
+  <title>Authentication - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -104,7 +104,7 @@
     <main class="doc-content">
       <h1>Authentication &amp; Authorization</h1>
       <p class="lead">
-        How to secure your rusternetes cluster. By default, rusternetes runs with <code>--skip-auth</code>
+        How to secure your k3rs cluster. By default, k3rs runs with <code>--skip-auth</code>
         which bypasses all authentication and authorization. This guide shows you how to enable
         proper security with JWT tokens, RBAC, and client certificate (mTLS) authentication.
       </p>
@@ -157,10 +157,10 @@ RBAC Authorization (Roles + Bindings)</code>
           <span class="code-lang">Terminal</span>
         </div>
         <code><span class="c"># RSA key pair for JWT token signing</span>
-mkdir -p .rusternetes/certs
-openssl genrsa -out .rusternetes/certs/sa.key 2048
-openssl rsa -in .rusternetes/certs/sa.key \
-  -pubout -out .rusternetes/certs/sa.pub</code>
+mkdir -p .k3rs/certs
+openssl genrsa -out .k3rs/certs/sa.key 2048
+openssl rsa -in .k3rs/certs/sa.key \
+  -pubout -out .k3rs/certs/sa.pub</code>
       </pre>
 
       <h3>2. Create an admin ServiceAccount</h3>
@@ -209,8 +209,8 @@ echo "$TOKEN"</code>
           <span class="code-dot green"></span>
           <span class="code-lang">Terminal</span>
         </div>
-        <code>kubectl config set-credentials rusternetes-admin --token="$TOKEN"
-kubectl config set-context rusternetes --user=rusternetes-admin</code>
+        <code>kubectl config set-credentials k3rs-admin --token="$TOKEN"
+kubectl config set-context k3rs --user=k3rs-admin</code>
       </pre>
 
       <h3>4. Restart without --skip-auth</h3>
@@ -222,7 +222,7 @@ kubectl config set-context rusternetes --user=rusternetes-admin</code>
           <span class="code-dot green"></span>
           <span class="code-lang">Terminal</span>
         </div>
-        <code>rusternetes --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
+        <code>k3rs --skip-auth=false --authorization-mode=Node,RBAC --data-dir ./cluster.db
 
 <span class="c"># Verify authentication works</span>
 kubectl get pods                      <span class="c"># should work with token</span>
@@ -244,7 +244,7 @@ curl -k https://localhost:6443/api/v1 <span class="c"># should get 401/403</span
         <code><span class="c"># Generate CA</span>
 openssl genrsa -out ca.key 2048
 openssl req -new -x509 -key ca.key -out ca.crt \
-  -days 3650 -subj "/CN=rusternetes-ca"
+  -days 3650 -subj "/CN=k3rs-ca"
 
 <span class="c"># Generate admin client cert (CN=username, O=group)</span>
 openssl genrsa -out admin.key 2048
@@ -254,7 +254,7 @@ openssl x509 -req -in admin.csr -CA ca.crt -CAkey ca.key \
   -CAcreateserial -out admin.crt -days 365
 
 <span class="c"># Start with mTLS</span>
-rusternetes \
+k3rs \
   --tls --tls-cert-file server.crt --tls-key-file server.key \
   --client-ca-file ca.crt --authorization-mode=Node,RBAC --skip-auth=false
 
@@ -295,7 +295,7 @@ kubectl config set-credentials admin \
 
       <h2>Security Checklist</h2>
 
-      <p>Before exposing a rusternetes cluster to any network:</p>
+      <p>Before exposing a k3rs cluster to any network:</p>
 
       <ul>
         <li>Remove <code>--skip-auth</code> from the API server command</li>
@@ -366,7 +366,7 @@ kubectl config set-credentials admin \
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

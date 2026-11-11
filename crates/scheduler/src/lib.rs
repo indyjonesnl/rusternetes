@@ -28,7 +28,7 @@ pub mod volume_bind;
 pub mod volume_binding;
 pub mod waiting_pods;
 
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 use tracing::info;
 
@@ -45,7 +45,7 @@ pub struct SchedulerConfig {
 /// This is the main entry point for embedding the scheduler in the all-in-one binary.
 /// Runs the scheduling loop until the process is terminated.
 pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyhow::Result<()> {
-    info!("Starting Rusternetes Scheduler");
+    info!("Starting k3rs Scheduler");
 
     let scheduler = Arc::new(scheduler::Scheduler::new_with_profiles(
         storage,
@@ -62,14 +62,14 @@ pub async fn run(storage: Arc<StorageBackend>, config: SchedulerConfig) -> anyho
 /// and events — no direct storage handle.
 ///
 /// This is the in-process counterpart of the binary's `--api-server-url`
-/// mode: the all-in-one binary calls this with an [`rusternetes_client::http::ApiClient`]
+/// mode: the all-in-one binary calls this with an [`k3rs_client::http::ApiClient`]
 /// pointed at its embedded api-server over loopback, so DNS/scheduler all share
 /// the same trust boundary (only the api-server touches storage).
 pub async fn run_with_api(
-    client: Arc<rusternetes_client::http::ApiClient>,
+    client: Arc<k3rs_client::http::ApiClient>,
     config: SchedulerConfig,
 ) -> anyhow::Result<()> {
-    info!("Starting Rusternetes Scheduler (API mode)");
+    info!("Starting k3rs Scheduler (API mode)");
 
     let backend = data_plane::ApiBackend::new(client);
     let scheduler = Arc::new(scheduler::Scheduler::new_api_with_profiles(

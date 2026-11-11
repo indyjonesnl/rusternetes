@@ -3,11 +3,11 @@
 
 mod __parent {
     pub use async_trait::async_trait;
+    pub use k3rs_common::{authz::AuthzStorage, Error, Result};
+    pub use k3rs_storage::busy::{map_backend_error, retry_busy, RetryPolicy};
+    pub use k3rs_storage::concurrency;
+    pub use k3rs_storage::{Storage, WatchEvent, WatchStream};
     pub use rhino::backend::Backend;
-    pub use rusternetes_common::{authz::AuthzStorage, Error, Result};
-    pub use rusternetes_storage::busy::{map_backend_error, retry_busy, RetryPolicy};
-    pub use rusternetes_storage::concurrency;
-    pub use rusternetes_storage::{Storage, WatchEvent, WatchStream};
     pub use serde::{de::DeserializeOwned, Serialize};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -19,8 +19,8 @@ mod busy_read_tests {
     //! follow-up to #1621). A backend whose reads fail `database is locked`
     //! a set number of times stands in for a writer holding BEGIN IMMEDIATE.
     use super::__parent::*;
+    use k3rs_storage::rhino::*;
     use rhino::backend::{Backend, BackendError, KeyValue, Result as BResult, WatchResult};
-    use rusternetes_storage::rhino::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     struct Flaky {
@@ -187,8 +187,8 @@ mod stats_tests {
     //! not a list that decodes and re-encodes every object once a minute.
     use super::__parent::*;
     use futures::StreamExt;
+    use k3rs_storage::rhino::*;
     use rhino::backend::{Backend, Event, KeyValue, Result as BResult, WatchResult};
-    use rusternetes_storage::rhino::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -401,7 +401,7 @@ mod stats_tests {
 #[cfg(feature = "sqlite")]
 mod preconditions_tests {
     use super::__parent::*;
-    use rusternetes_storage::rhino::*;
+    use k3rs_storage::rhino::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delete_with_preconditions_suite() {

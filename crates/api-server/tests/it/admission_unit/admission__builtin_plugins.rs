@@ -2,33 +2,33 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+    pub use k3rs_common::resources::{
         Ingress, IngressClass, PersistentVolumeClaim, Pod, Service, StorageClass,
     };
-    pub use rusternetes_common::types::{ObjectMeta, Status};
-    pub use rusternetes_common::validation::field;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_common::types::{ObjectMeta, Status};
+    pub use k3rs_common::validation::field;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::Storage;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use std::sync::Arc;
 
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-    use rusternetes_common::auth::{TokenManager, UserInfo};
-    use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer};
-    use rusternetes_common::observability::MetricsRegistry;
-    use rusternetes_common::{Error, Result};
-    use rusternetes_storage::{Storage, StorageBackend};
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+    use k3rs_common::auth::{TokenManager, UserInfo};
+    use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer};
+    use k3rs_common::observability::MetricsRegistry;
+    use k3rs_common::{Error, Result};
+    use k3rs_storage::{Storage, StorageBackend};
     use serde_json::{json, Value};
 
-    use rusternetes_api_server::admission::plugins::EnabledForTest;
-    use rusternetes_api_server::endpoints::handlers::admission::Admission;
-    use rusternetes_api_server::registry::rest::{Object, RequestContext};
-    use rusternetes_api_server::state::ApiServerState;
+    use k3rs_api_server::admission::plugins::EnabledForTest;
+    use k3rs_api_server::endpoints::handlers::admission::Admission;
+    use k3rs_api_server::registry::rest::{Object, RequestContext};
+    use k3rs_api_server::state::ApiServerState;
 
     fn state() -> ApiServerState {
         ApiServerState::new(
@@ -105,7 +105,7 @@ mod tests {
         sub: Option<&str>,
         obj: Value,
         old: Option<Value>,
-    ) -> Result<rusternetes_common::resources::Pod> {
+    ) -> Result<k3rs_common::resources::Pod> {
         let _g = EnabledForTest::new(enabled);
         run(&state(), ("", "Pod", "pods"), sub, obj, old).await
     }
@@ -219,7 +219,7 @@ mod tests {
         ];
         for (name, new, old, fail) in cases {
             let _g = EnabledForTest::new(&["DenyServiceExternalIPs"]);
-            let r = run::<rusternetes_common::resources::Service>(
+            let r = run::<k3rs_common::resources::Service>(
                 &state(),
                 ("", "Service", "services"),
                 None,
@@ -238,7 +238,7 @@ mod tests {
         }
         // Default-off: the same request passes.
         let _g = EnabledForTest::new(&[]);
-        run::<rusternetes_common::resources::Service>(
+        run::<k3rs_common::resources::Service>(
             &state(),
             ("", "Service", "services"),
             None,
@@ -315,16 +315,15 @@ mod tests {
     // validator is called directly.
     #[test]
     fn always_pull_images_validate_message() {
-        let pod: rusternetes_common::resources::Pod = serde_json::from_value(json!({
+        let pod: k3rs_common::resources::Pod = serde_json::from_value(json!({
             "apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},
             "spec":{"initContainers":[{"name":"i","image":"i","imagePullPolicy":"Never"}],
                     "containers":[{"name":"c","image":"i","imagePullPolicy":"IfNotPresent"}],
                     "volumes":[{"name":"v","image":{"reference":"r"}}]}}))
         .unwrap();
-        let e = rusternetes_api_server::admission::builtin_plugins::always_pull_images_validate(
-            "pods", &pod,
-        )
-        .unwrap_err();
+        let e =
+            k3rs_api_server::admission::builtin_plugins::always_pull_images_validate("pods", &pod)
+                .unwrap_err();
         assert_eq!(
             msg(e),
             "[pods \"p\" is forbidden: spec.initContainers[0].imagePullPolicy: Unsupported value: \"Never\": supported values: \"Always\", \
@@ -394,7 +393,7 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
         storage_class(&state, "silver", Some(false)).await;
         storage_class(&state, "nil", None).await;
         let id = ("", "PersistentVolumeClaim", "persistentvolumeclaims");
-        type P = rusternetes_common::resources::PersistentVolumeClaim;
+        type P = k3rs_common::resources::PersistentVolumeClaim;
         // gold allows expansion.
         run::<P>(
             &state,
@@ -489,7 +488,7 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
             v
         };
         let id = ("networking.k8s.io", "Ingress", "ingresses");
-        type I = rusternetes_common::resources::Ingress;
+        type I = k3rs_common::resources::Ingress;
         let class = |name: &str, default: Option<&str>, created: Option<&str>| {
             let mut c = json!({"apiVersion":"networking.k8s.io/v1","kind":"IngressClass",
                 "metadata":{"name":name},"spec":{"controller":"example.com/c"}});
@@ -595,7 +594,7 @@ pods \"p\" is forbidden: spec.volumes[0].image.pullPolicy: Unsupported value: \"
     // plugin's `NewHandler(Create)` and the gate.
     async fn run_node(enabled: &[&str], obj: Value, old: Option<Value>) -> Value {
         let _g = EnabledForTest::new(enabled);
-        let node: rusternetes_common::resources::Node =
+        let node: k3rs_common::resources::Node =
             run(&state(), ("", "Node", "nodes"), None, obj, old)
                 .await
                 .unwrap();

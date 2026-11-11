@@ -21,7 +21,7 @@
 //! `decode`: pb -> JSON via `PROTO_REGISTRY.decode_k8s_resource` equals the fixture JSON.
 //!
 //! `encode-bytes`: fixture JSON -> pb via the production response encoder
-//! (`rusternetes_middleware::response::encode_native`); the payload bytes
+//! (`k3rs_middleware::response::encode_native`); the payload bytes
 //! (`Unknown.raw`) equal the fixture pb payload, byte for byte.
 //!
 //! `encode-semantic`: decode(encode(JSON)) equals JSON (lossless codec,
@@ -46,10 +46,10 @@
 //! shrink. Set `GOLDEN_DUMP=1` to print every failing (check, stem) with its diff
 //! when (re)generating entries.
 
+use k3rs_common::protobuf::Unknown;
+use k3rs_middleware::response::encode_native;
+use k3rs_protobuf::PROTO_REGISTRY;
 use prost::Message;
-use rusternetes_common::protobuf::Unknown;
-use rusternetes_middleware::response::encode_native;
-use rusternetes_protobuf::PROTO_REGISTRY;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;

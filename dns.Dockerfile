@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 #
-# Standalone Dockerfile for the rusternetes-dns binary.
+# Standalone Dockerfile for the k3rs-dns binary.
 #
 # This file exists primarily so the DNS image can be built independently
 # of the larger services.Dockerfile pipeline — useful for fast local
@@ -13,10 +13,10 @@
 # cache once and reuses it across all six services.
 #
 # Build:
-#   docker build -f dns.Dockerfile -t rusternetes-dns:dev .
+#   docker build -f dns.Dockerfile -t k3rs-dns:dev .
 #
 # Run (against an etcd reachable from the container):
-#   docker run --rm -p 53:53/udp -p 53:53/tcp rusternetes-dns:dev \
+#   docker run --rm -p 53:53/udp -p 53:53/tcp k3rs-dns:dev \
 #       --etcd-servers http://etcd:2379
 
 FROM rust:1.99 AS builder
@@ -73,7 +73,7 @@ COPY crates/kubelet/Cargo.toml            crates/kubelet/Cargo.toml
 COPY crates/kube-proxy/Cargo.toml         crates/kube-proxy/Cargo.toml
 COPY crates/middleware/Cargo.toml         crates/middleware/Cargo.toml
 COPY crates/protobuf/Cargo.toml           crates/protobuf/Cargo.toml
-COPY crates/rusternetes/Cargo.toml        crates/rusternetes/Cargo.toml
+COPY crates/k3rs/Cargo.toml        crates/k3rs/Cargo.toml
 COPY crates/scheduler/Cargo.toml          crates/scheduler/Cargo.toml
 COPY crates/storage/Cargo.toml            crates/storage/Cargo.toml
 COPY crates/streamproxy/Cargo.toml        crates/streamproxy/Cargo.toml
@@ -99,7 +99,7 @@ RUN set -eux; \
     for c in client common controller-core storage streamproxy cel-checker csi test_support; do \
         mkdir -p crates/$c/src && : > crates/$c/src/lib.rs; \
     done; \
-    for c in kubectl rusternetes; do \
+    for c in kubectl k3rs; do \
         mkdir -p crates/$c/src && echo "fn main(){}" > crates/$c/src/main.rs; \
     done; \
     for c in api-server controller-manager dns kubelet kube-proxy scheduler; do \
@@ -120,20 +120,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    cargo build --profile release-fast --bin rusternetes-dns \
+    cargo build --profile release-fast --bin k3rs-dns \
  && cargo clean --profile release-fast \
-        -p rusternetes-api-server \
-        -p rusternetes-client \
-        -p rusternetes-common \
-        -p rusternetes-cel-checker \
-        -p rusternetes-controller-manager \
-        -p rusternetes-dns \
-        -p rusternetes-kubectl \
-        -p rusternetes-kubelet \
-        -p rusternetes-kube-proxy \
-        -p rusternetes \
-        -p rusternetes-scheduler \
-        -p rusternetes-storage \
+        -p k3rs-api-server \
+        -p k3rs-client \
+        -p k3rs-common \
+        -p k3rs-cel-checker \
+        -p k3rs-controller-manager \
+        -p k3rs-dns \
+        -p k3rs-kubectl \
+        -p k3rs-kubelet \
+        -p k3rs-kube-proxy \
+        -p k3rs \
+        -p k3rs-scheduler \
+        -p k3rs-storage \
  && sccache --show-stats
 
 # Pass 2: real sources. Only the dns crate + its dependency chain
@@ -149,10 +149,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/sccache,id=sccache-rusternetes,sharing=locked \
-    cargo build --profile release-fast --bin rusternetes-dns \
+    cargo build --profile release-fast --bin k3rs-dns \
  && sccache --show-stats \
  && mkdir -p /out \
- && cp target/release-fast/rusternetes-dns /out/rusternetes-dns
+ && cp target/release-fast/k3rs-dns /out/k3rs-dns
 
 # ---------------------------------------------------------------------
 # Runtime image.
@@ -166,10 +166,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /out/rusternetes-dns /app/rusternetes-dns
+COPY --from=builder /out/k3rs-dns /app/k3rs-dns
 
 EXPOSE 53/udp
 EXPOSE 53/tcp
 
-ENTRYPOINT ["/app/rusternetes-dns"]
+ENTRYPOINT ["/app/k3rs-dns"]
 CMD ["--etcd-servers", "http://etcd:2379"]

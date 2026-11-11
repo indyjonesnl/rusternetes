@@ -26,8 +26,8 @@
 //! over `MemoryStorage`, driven via `tower::ServiceExt::oneshot`.
 
 use axum::http::StatusCode;
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::Value;
 
 const K8S_MAGIC: &[u8] = b"k8s\0";
@@ -514,7 +514,7 @@ async fn status_200_success_returns_native_protobuf_when_accept_is_protobuf() {
 
 /// The client-go default Accept is the dual `protobuf, json` header. Per
 /// upstream contract the server picks the highest-precedence supported type;
-/// for Status responses Rusternetes now supports protobuf, so this case must
+/// for Status responses k3rs now supports protobuf, so this case must
 /// emit the protobuf envelope (same as the explicit-protobuf case above).
 #[tokio::test]
 async fn status_404_with_protobuf_then_json_accept_picks_protobuf() {

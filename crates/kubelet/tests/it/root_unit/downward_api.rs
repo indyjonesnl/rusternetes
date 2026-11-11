@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::{Pod, ResourceFieldSelector};
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::{Pod, ResourceFieldSelector};
+    pub use k3rs_common::validation::metav1::is_qualified_name;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{Container, Pod, PodSpec};
-    use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-    use rusternetes_kubelet::downward_api::*;
+    use k3rs_common::resources::{Container, Pod, PodSpec};
+    use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+    use k3rs_kubelet::downward_api::*;
     use std::collections::HashMap;
 
     fn make_pod() -> Pod {

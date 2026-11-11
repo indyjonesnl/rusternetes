@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::patch::mergepatch::{
+    pub use k3rs_common::patch::mergepatch::{
         err_bad_arg_type, err_bad_patch_type, err_no_merge_key, go_fmt_v, GO_SLICE,
     };
-    pub use rusternetes_common::patch::meta::PatchSchema;
+    pub use k3rs_common::patch::meta::PatchSchema;
     pub use serde::{Deserialize, Serialize};
     pub use serde_json::{json, Value};
 }
@@ -13,7 +13,7 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use crate::common_unit::patch::smp_schema_tests;
-    use rusternetes_common::patch::*;
+    use k3rs_common::patch::*;
 
     fn apply_strategic_merge_patch(original: &Value, patch: &Value) -> Result<Value, PatchError> {
         apply_patch(original, patch, PatchType::StrategicMergePatch)
@@ -658,7 +658,7 @@ mod smp_error_tests {
     //! default arm, apiserver `endpoints/handlers/patch.go:805-806`) carry
     //! upstream's exact `mergepatch` / `strategicpatch` wording.
 
-    use rusternetes_common::patch::{apply_patch, PatchError, PatchType};
+    use k3rs_common::patch::{apply_patch, PatchError, PatchType};
     use serde_json::{json, Value};
 
     fn smp(original: Value, patch: Value) -> Result<Value, PatchError> {
@@ -838,7 +838,7 @@ pub mod smp_schema_tests {
     //! a list come from the field's struct tags (`PatchMetaFromStruct`,
     //! strategicpatch/meta.go), not from what the patch items happen to carry.
 
-    use rusternetes_common::patch::{
+    use k3rs_common::patch::{
         apply_patch, apply_patch_with_schema, PatchError, PatchSchema, PatchType,
     };
     use serde_json::{json, Value};
@@ -1097,7 +1097,7 @@ pub mod smp_schema_tests {
 }
 
 mod deep_merge_tests {
-    use rusternetes_common::patch::deep_merge_objects;
+    use k3rs_common::patch::deep_merge_objects;
 
     #[test]
     fn test_deep_merge_preserves_existing_map_entries() {

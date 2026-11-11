@@ -11,7 +11,7 @@
 //! only the first signal that fits is kept (upstream `s chan *fwk.Status`).
 
 use crate::fwk::{Code, Status};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

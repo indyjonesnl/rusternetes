@@ -11,7 +11,7 @@
 //!     ... Message: fmt.Sprintf("%s %q already exists", qualifiedResource.String(), name),
 //! ```
 //!
-//! Rusternetes' storage layer raises `Error::NotFound(key)` /
+//! k3rs' storage layer raises `Error::NotFound(key)` /
 //! `Error::AlreadyExists(key)` with the raw key. `NotFound` was sanitized on
 //! the way out; `AlreadyExists` was not, so a duplicate create answered with
 //! the literal backend path:
@@ -31,7 +31,7 @@
 //! storage layout.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn cm(name: &str) -> Value {

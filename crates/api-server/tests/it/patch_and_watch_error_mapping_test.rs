@@ -17,7 +17,7 @@
 //!   renders a plain error: 500, no reason.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CM: &str = "/api/v1/namespaces/default/configmaps";

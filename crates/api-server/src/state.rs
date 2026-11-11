@@ -8,10 +8,10 @@ use crate::registry::core::service::portallocator::{
     PortAllocator, PortRange, DEFAULT_SERVICE_NODE_PORT_RANGE,
 };
 use crate::watch_cache::WatchCache;
-use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::auth::{BootstrapTokenManager, TokenManager};
+use k3rs_common::authz::Authorizer;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 
 /// Shared state for the API server
@@ -106,7 +106,7 @@ impl ApiServerState {
             &ServiceIpRanges::default().families(),
         ));
 
-        rusternetes_common::authz_filter_metrics::register_metrics();
+        k3rs_common::authz_filter_metrics::register_metrics();
 
         let custom_metrics_mapper =
             crate::handlers::custom_metrics::new_served_rest_mapper(storage.clone());

@@ -1,8 +1,8 @@
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerState, ContainerStateRunning, ContainerStateWaiting, ContainerStatus,
     EphemeralContainer, Pod, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
 
 /// Test helper to create a running pod
 fn create_running_pod(name: &str) -> Pod {
@@ -342,7 +342,7 @@ fn test_ephemeral_container_status() {
 
 #[test]
 fn test_ephemeral_container_with_volume_mounts() {
-    use rusternetes_common::resources::VolumeMount;
+    use k3rs_common::resources::VolumeMount;
 
     let mut ephemeral = create_ephemeral_container("debugger", Some("main"));
 
@@ -379,7 +379,7 @@ fn test_ephemeral_container_with_volume_mounts() {
 
 #[test]
 fn test_ephemeral_container_with_env_vars() {
-    use rusternetes_common::resources::EnvVar;
+    use k3rs_common::resources::EnvVar;
 
     let mut ephemeral = create_ephemeral_container("debugger", Some("main"));
 

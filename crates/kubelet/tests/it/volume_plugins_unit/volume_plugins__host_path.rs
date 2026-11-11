@@ -4,12 +4,10 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::volume::HostPathType;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::runtime::check_host_path_type_msg;
-    pub use rusternetes_kubelet::volume_plugins::{
-        Attributes, Mounter, Spec, VolumeHost, VolumePlugin,
-    };
+    pub use k3rs_common::resources::volume::HostPathType;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::runtime::check_host_path_type_msg;
+    pub use k3rs_kubelet::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
     pub use std::sync::Arc;
     pub use tracing::info;
 }
@@ -20,24 +18,24 @@ mod tests {
     /// supertrait.
     #[test]
     fn unmounter_reports_metrics_not_supported() {
-        use rusternetes_kubelet::volume_plugins::plugin::MetricsProvider;
-        let want = rusternetes_kubelet::volume_plugins::util::metrics::NOT_SUPPORTED;
-        let m = rusternetes_kubelet::volume_plugins::host_path::HostPathUnmounter;
+        use k3rs_kubelet::volume_plugins::plugin::MetricsProvider;
+        let want = k3rs_kubelet::volume_plugins::util::metrics::NOT_SUPPORTED;
+        let m = k3rs_kubelet::volume_plugins::host_path::HostPathUnmounter;
         assert_eq!(m.get_metrics().unwrap_err().to_string(), want);
     }
 
     use super::__parent::*;
-    use rusternetes_common::resources::{PersistentVolume, Volume};
-    use rusternetes_kubelet::runtime::{check_host_path_type, HostPathCheck};
-    use rusternetes_kubelet::volume_plugins::host_path::*;
+    use k3rs_common::resources::{PersistentVolume, Volume};
+    use k3rs_kubelet::runtime::{check_host_path_type, HostPathCheck};
+    use k3rs_kubelet::volume_plugins::host_path::*;
     use serde_json::json;
 
     fn plugin() -> HostPathPlugin {
         HostPathPlugin::new(std::sync::Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -137,7 +135,7 @@ mod tests {
     /// and silently mount a different, existing directory.
     #[tokio::test]
     async fn the_inline_arm_does_not_expand_environment_variables() {
-        let v = inline_host_path("/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        let v = inline_host_path("/data/$K3RS_HOSTPATH_TEST_UNSET_VAR");
         let spec = Spec {
             volume: &v,
             persistent_volume: None,
@@ -147,7 +145,7 @@ mod tests {
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
-        assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        assert_eq!(m.get_path(), "/data/$K3RS_HOSTPATH_TEST_UNSET_VAR");
     }
 
     /// `host_path.go:242-245`: the backstep check precedes the type check, so
@@ -183,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn the_pv_arm_does_not_expand_environment_variables() {
         let v = claimed_volume();
-        let pv = pv_host_path("/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        let pv = pv_host_path("/data/$K3RS_HOSTPATH_TEST_UNSET_VAR");
         let spec = Spec {
             volume: &v,
             persistent_volume: Some(&pv),
@@ -193,7 +191,7 @@ mod tests {
         };
         let pod = test_pod();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
-        assert_eq!(m.get_path(), "/data/$RUSTERNETES_HOSTPATH_TEST_UNSET_VAR");
+        assert_eq!(m.get_path(), "/data/$K3RS_HOSTPATH_TEST_UNSET_VAR");
     }
 
     async fn set_up_err(path: &str, ty: &str) -> String {

@@ -8,9 +8,9 @@
 //! in declaration order by `kubeOpenAPIResultToFieldErrors`
 //! (apiextensions-apiserver/pkg/apiserver/validation/validation.go:177-190).
 
-use rusternetes_common::resources::volume::{VolumeSnapshotClass, VolumeSnapshotContent};
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::volumesnapshot::{
+use k3rs_common::resources::volume::{VolumeSnapshotClass, VolumeSnapshotContent};
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::volumesnapshot::{
     validate_volume_snapshot_class, validate_volume_snapshot_content,
 };
 use serde_json::json;

@@ -3,10 +3,10 @@
 //! pkg/registry/apps/{deployment:131,replicaset:144,daemonset:144,statefulset:163}/strategy.go
 //! versus the create path (`..., nil`) at :85/:114/:119/:131. Mirrors the
 //! RC test for #3947.
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_common::resources::deployment::Deployment;
-use rusternetes_common::resources::workloads::{DaemonSet, ReplicaSet, StatefulSet};
-use rusternetes_common::validation::apps::*;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_common::resources::deployment::Deployment;
+use k3rs_common::resources::workloads::{DaemonSet, ReplicaSet, StatefulSet};
+use k3rs_common::validation::apps::*;
 use serde_json::{json, Value};
 
 const RELAXED: &str = "my_search.example.com";

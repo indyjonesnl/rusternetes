@@ -2,7 +2,7 @@
 
 use super::fixtures::{pod, pod_key};
 use futures::StreamExt;
-use rusternetes_storage::{Storage, WatchEvent};
+use k3rs_storage::{Storage, WatchEvent};
 use std::time::Duration;
 
 /// Ported from `RunTestDeleteTriggerWatch` (`watcher_tests.go`): seed a key,

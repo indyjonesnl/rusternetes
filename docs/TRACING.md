@@ -1,10 +1,10 @@
 # Distributed Tracing with OpenTelemetry
 
-This document describes how to use distributed tracing in Rusternetes with OpenTelemetry.
+This document describes how to use distributed tracing in k3rs with OpenTelemetry.
 
 ## Overview
 
-Rusternetes supports distributed tracing using OpenTelemetry, allowing you to trace requests across all components:
+k3rs supports distributed tracing using OpenTelemetry, allowing you to trace requests across all components:
 - API Server
 - Scheduler
 - Controller Manager
@@ -34,7 +34,7 @@ podman run -d --name jaeger \
 # Access Jaeger UI at http://localhost:16686
 ```
 
-### 2. Build Rusternetes with Tracing Support
+### 2. Build k3rs with Tracing Support
 
 Rebuild components with the `jaeger` feature enabled:
 
@@ -43,8 +43,8 @@ Rebuild components with the `jaeger` feature enabled:
 cargo build --release --features jaeger
 
 # Or build individual components
-cargo build --release -p rusternetes-api-server --features jaeger
-cargo build --release -p rusternetes-scheduler --features jaeger
+cargo build --release -p k3rs-api-server --features jaeger
+cargo build --release -p k3rs-scheduler --features jaeger
 ```
 
 ### 3. Run Components with Tracing
@@ -76,7 +76,7 @@ Tracing can be configured via environment variables:
 
 ```bash
 # Tracing exporter type (jaeger, otlp, stdout, none)
-export RUSTERNETES_TRACING_EXPORTER=jaeger
+export K3RS_TRACING_EXPORTER=jaeger
 
 # Jaeger endpoint
 export JAEGER_ENDPOINT=http://localhost:14268/api/traces
@@ -85,10 +85,10 @@ export JAEGER_ENDPOINT=http://localhost:14268/api/traces
 export OTLP_ENDPOINT=http://localhost:4317
 
 # Sampling rate (0.0 to 1.0, where 1.0 = 100%)
-export RUSTERNETES_TRACING_SAMPLE_RATE=1.0
+export K3RS_TRACING_SAMPLE_RATE=1.0
 
 # Service name (defaults to component name)
-export RUSTERNETES_SERVICE_NAME=api-server
+export K3RS_SERVICE_NAME=api-server
 ```
 
 ### Command-Line Flags
@@ -105,7 +105,7 @@ Most components support these tracing flags:
 ### Programmatic Configuration
 
 ```rust
-use rusternetes_common::tracing::{TracingConfig, TracingExporter, init_tracing};
+use k3rs_common::tracing::{TracingConfig, TracingExporter, init_tracing};
 
 // Create tracing configuration
 let config = TracingConfig::new("api-server")
@@ -120,7 +120,7 @@ init_tracing(config)?;
 // Your application code here...
 
 // Shutdown tracing on exit
-rusternetes_common::tracing::shutdown_tracing();
+k3rs_common::tracing::shutdown_tracing();
 ```
 
 ## Tracing Backends
@@ -221,7 +221,7 @@ Sampling controls what percentage of traces are collected. This is useful for hi
 
 ## Trace Context Propagation
 
-Rusternetes automatically propagates trace context across HTTP requests using the W3C Trace Context standard.
+k3rs automatically propagates trace context across HTTP requests using the W3C Trace Context standard.
 
 **Headers:**
 - `traceparent` - Contains trace ID, span ID, and sampling decision
@@ -233,7 +233,7 @@ This allows you to trace a request from kubectl → API Server → Scheduler →
 
 ### Kubernetes kubectl
 
-When using the real `kubectl` with Rusternetes, traces will show:
+When using the real `kubectl` with k3rs, traces will show:
 1. kubectl HTTP request to API server
 2. API server processing
 3. Storage (etcd) operations
@@ -257,7 +257,7 @@ services:
       - "14268:14268"
       - "4317:4317"
     networks:
-      - rusternetes-network
+      - k3rs-network
 
   api-server:
     build:
@@ -267,13 +267,13 @@ services:
       args:
         CARGO_FEATURES: "--features jaeger"
     environment:
-      - RUSTERNETES_TRACING_EXPORTER=jaeger
+      - K3RS_TRACING_EXPORTER=jaeger
       - JAEGER_ENDPOINT=http://jaeger:14268/api/traces
     depends_on:
       - jaeger
       - etcd
     networks:
-      - rusternetes-network
+      - k3rs-network
 ```
 
 ## Production Deployment
@@ -341,13 +341,13 @@ Most cloud providers support OpenTelemetry:
 3. **Check component is configured:**
    ```bash
    # Look for "Initialized OpenTelemetry tracing" in logs
-   podman logs rusternetes-api-server | grep -i tracing
+   podman logs k3rs-api-server | grep -i tracing
    ```
 
 4. **Verify network connectivity:**
    ```bash
    # From inside component container
-   podman exec rusternetes-api-server curl http://jaeger:14268
+   podman exec k3rs-api-server curl http://jaeger:14268
    ```
 
 ### Traces are incomplete
@@ -420,4 +420,4 @@ Distributed tracing with OpenTelemetry provides:
 ✅ Integration with popular observability platforms
 ✅ Production-ready sampling and export capabilities
 
-Enable tracing in your Rusternetes deployment to gain deep insights into request flows and system behavior!
+Enable tracing in your k3rs deployment to gain deep insights into request flows and system behavior!

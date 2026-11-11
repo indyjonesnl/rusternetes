@@ -2,26 +2,26 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::policy::{
+    pub use k3rs_common::resources::policy::{
         IntOrString, PodDisruptionBudget, PodDisruptionBudgetCondition, PodDisruptionBudgetSpec,
         PodDisruptionBudgetStatus,
     };
-    pub use rusternetes_common::types::Condition;
-    pub use rusternetes_common::validation::apps::{
+    pub use k3rs_common::types::Condition;
+    pub use k3rs_common::validation::apps::{
         is_not_more_than_100_percent, validate_positive_int_or_percent,
     };
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         validate_conditions, validate_label_selector, LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::objectmeta::validate_nonnegative_field;
+    pub use k3rs_common::validation::objectmeta::validate_nonnegative_field;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::policy::PodDisruptionBudgetSpec;
-    use rusternetes_common::types::LabelSelector;
-    use rusternetes_common::validation::pdb::*;
+    use k3rs_common::resources::policy::PodDisruptionBudgetSpec;
+    use k3rs_common::types::LabelSelector;
+    use k3rs_common::validation::pdb::*;
 
     fn empty_status() -> PodDisruptionBudgetStatus {
         PodDisruptionBudgetStatus {

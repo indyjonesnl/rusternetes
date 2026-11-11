@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{Node, NodeSelector, Pod};
-    pub use rusternetes_scheduler::framework_runtime::names;
-    pub use rusternetes_scheduler::profile::Profile;
-    pub use rusternetes_scheduler::queue::events::*;
-    pub use rusternetes_scheduler::queue::scheduling_queue::{
+    pub use k3rs_common::resources::{Node, NodeSelector, Pod};
+    pub use k3rs_scheduler::framework_runtime::names;
+    pub use k3rs_scheduler::profile::Profile;
+    pub use k3rs_scheduler::queue::events::*;
+    pub use k3rs_scheduler::queue::scheduling_queue::{
         QueueingHintFunction, QueueingHintMap, QueueingHintMapPerProfile,
     };
     pub use std::collections::HashMap;
@@ -16,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::hints::*;
+    use k3rs_scheduler::queue::hints::*;
     use serde_json::json;
 
     fn pod_req(cpu: &str, mem: &str) -> Pod {

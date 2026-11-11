@@ -3,43 +3,43 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::resources::csi::{VolumeAttachment, VolumeAttributesClass};
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::{
         CSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase,
         PersistentVolumeMode, PersistentVolumePhase, PersistentVolumeReclaimPolicy, ReferenceGrant,
         SecretReference, StorageClass, VolumeBindingMode, VolumeSnapshot, VolumeSnapshotContent,
     };
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeSpec,
         PersistentVolumeStatus, Secret,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
-    pub use rusternetes_controller_manager::controllers::csi_topology::{
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+    pub use k3rs_controller_manager::controllers::csi_topology::{
         generate_volume_node_affinity, volume_is_accessible, TopologyError, TopologyInputs,
         TopologyStore,
     };
-    pub use rusternetes_csi::controller_client::{
+    pub use k3rs_csi::controller_client::{
         check_driver_capabilities, ControllerError, CsiControllerClient, DriverCapabilities,
         ProvisioningState, RequiredCapabilities,
     };
-    pub use rusternetes_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
-    pub use rusternetes_csi::proto::volume_capability::access_mode::Mode as AccessModeKind;
-    pub use rusternetes_csi::proto::volume_capability::{
+    pub use k3rs_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
+    pub use k3rs_csi::proto::volume_capability::access_mode::Mode as AccessModeKind;
+    pub use k3rs_csi::proto::volume_capability::{
         AccessMode, AccessType, BlockVolume, MountVolume,
     };
-    pub use rusternetes_csi::proto::volume_content_source::{
+    pub use k3rs_csi::proto::volume_content_source::{
         SnapshotSource, Type as ContentSourceType, VolumeSource,
     };
-    pub use rusternetes_csi::proto::{
+    pub use k3rs_csi::proto::{
         CapacityRange, CreateVolumeRequest, DeleteVolumeRequest, VolumeCapability,
         VolumeContentSource,
     };
-    pub use rusternetes_storage::WorkQueueConfig;
-    pub use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+    pub use k3rs_storage::WorkQueueConfig;
+    pub use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::{Arc, Mutex};
     pub use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::csi_provisioner::*;
+    use k3rs_controller_manager::controllers::csi_provisioner::*;
     use PersistentVolumeAccessMode::*;
 
     /// `access_modes_test.go`'s table, both mappings.

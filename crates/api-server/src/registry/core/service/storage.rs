@@ -7,13 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::deletion::DeleteOptions;
-use rusternetes_common::resources::{
+use k3rs_common::deletion::DeleteOptions;
+use k3rs_common::resources::{
     Endpoints, IPFamily, IPFamilyPolicy, Service, ServiceExternalTrafficPolicy, ServiceType,
 };
-use rusternetes_common::validation::service::parse_ip_sloppy;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::service::parse_ip_sloppy;
+use k3rs_common::{Error, Result};
+use k3rs_storage::StorageBackend;
 
 use super::alloc::{self, ClusterIpAllocators, ClusterIpTxn};
 use super::portallocator::operation::PortAllocationOperation;

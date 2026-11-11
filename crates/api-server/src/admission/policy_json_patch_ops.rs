@@ -3,7 +3,7 @@
 //! MutatingAdmissionPolicy `jsonPatch` patcher applies its operations with
 //! (`mutating/patch/json_patch.go:31,92`).
 //!
-//! Ported rather than replaced by the in-tree `rusternetes_common::patch`
+//! Ported rather than replaced by the in-tree `k3rs_common::patch`
 //! applier because the two disagree where `json_patch_test.go` pins the
 //! behaviour: `replace` of an unset *map* key adds it
 //! (`patch.go:393-395,599-604`: `partialDoc.get` returns `nil, nil`), a failed

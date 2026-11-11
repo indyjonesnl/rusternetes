@@ -2,8 +2,8 @@ use crate::runtime::check_host_path_type_msg;
 use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::volume::HostPathType;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::volume::HostPathType;
+use k3rs_common::resources::Pod;
 use std::sync::Arc;
 use tracing::info;
 

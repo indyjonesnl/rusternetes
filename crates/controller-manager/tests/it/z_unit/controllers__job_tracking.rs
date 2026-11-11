@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::workloads::UncountedTerminatedPods;
-    pub use rusternetes_common::resources::Pod;
+    pub use k3rs_common::resources::workloads::UncountedTerminatedPods;
+    pub use k3rs_common::resources::Pod;
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_controller_manager::controllers::job_tracking::*;
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::job_tracking::*;
 
     fn pod_with(finalizers: Option<Vec<String>>) -> Pod {
         Pod {

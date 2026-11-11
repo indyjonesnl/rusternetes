@@ -11,10 +11,10 @@
 //!   `invalid type: integer 0, expected a string`
 //! which in turn blocks five `[Conformance]`-labelled tests.
 
-use rusternetes_common::resources::LimitRange;
-use rusternetes_common::resources::PersistentVolumeClaim;
-use rusternetes_common::resources::Pod;
-use rusternetes_common::resources::ResourceQuota;
+use k3rs_common::resources::LimitRange;
+use k3rs_common::resources::PersistentVolumeClaim;
+use k3rs_common::resources::Pod;
+use k3rs_common::resources::ResourceQuota;
 use serde_json::json;
 
 #[test]

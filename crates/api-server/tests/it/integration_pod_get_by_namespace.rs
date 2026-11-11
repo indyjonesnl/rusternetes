@@ -13,7 +13,7 @@
 //! REST surface here reproduces any server-side bug kubectl would surface.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn spawn_router() -> TestApiServer {

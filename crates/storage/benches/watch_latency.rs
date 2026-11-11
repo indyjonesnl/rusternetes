@@ -9,13 +9,13 @@
 //! makes the future win falsifiable.
 //!
 //! Run:
-//!   cargo bench -p rusternetes-storage --bench watch_latency
-//!   cargo bench -p rusternetes-storage --bench watch_latency --features sqlite
-//!   cargo bench -p rusternetes-storage --bench watch_latency -- --save-baseline pre-bus
+//!   cargo bench -p k3rs-storage --bench watch_latency
+//!   cargo bench -p k3rs-storage --bench watch_latency --features sqlite
+//!   cargo bench -p k3rs-storage --bench watch_latency -- --save-baseline pre-bus
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::StreamExt;
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_storage::{MemoryStorage, Storage};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -103,7 +103,7 @@ fn bench_memory_fanout(c: &mut Criterion) {
 
 #[cfg(feature = "sqlite")]
 fn bench_sqlite_single(c: &mut Criterion) {
-    use rusternetes_storage::{StorageBackend, StorageConfig};
+    use k3rs_storage::{StorageBackend, StorageConfig};
 
     let rt = Runtime::new().expect("tokio runtime");
     // tempfile keeps the db out of the repo and auto-cleans on drop.
@@ -146,7 +146,7 @@ fn bench_sqlite_single(c: &mut Criterion) {
 
 #[cfg(feature = "sqlite")]
 fn bench_sqlite_delivery(c: &mut Criterion) {
-    use rusternetes_storage::{StorageBackend, StorageConfig};
+    use k3rs_storage::{StorageBackend, StorageConfig};
 
     let rt = Runtime::new().expect("tokio runtime");
     let mut group = c.benchmark_group("watch_delivery/sqlite");

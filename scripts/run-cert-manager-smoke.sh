@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # cert-manager smoke test — proves a real third-party operator installs and
-# functions end-to-end on Rusternetes. Exercises, in one shot:
+# functions end-to-end on k3rs. Exercises, in one shot:
 #   - CRD install + Established (cert-manager.io/v1: Issuer, Certificate, ...)
 #   - the cert-manager validating/mutating webhook (api-server -> webhook svc)
 #   - the cainjector (patches caBundle into webhook configs / CRD conversion)
@@ -22,7 +22,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/cert-manager-smoke}"
 mkdir -p "${RESULTS_DIR}"
 
-export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.rusternetes/volumes}"
+export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.k3rs/volumes}"
 mkdir -p "${KUBELET_VOLUMES_PATH}"
 
 # CERTS_PATH MUST be exported BEFORE the first `compose up` below (regression
@@ -31,20 +31,20 @@ mkdir -p "${KUBELET_VOLUMES_PATH}"
 # bootstrap-cluster.sh later templates that SAME host-absolute path into the
 # control-plane static-pod hostPath volume (kube-controller-manager /
 # kube-scheduler). If CERTS_PATH is unset at `up` time, the kubelet falls back
-# to mounting certs at /etc/rusternetes/certs, so the host-absolute path the
+# to mounting certs at /etc/k3rs/certs, so the host-absolute path the
 # static pods hostPath-mount does not exist inside the kubelet container: its
 # `type: Directory` check fails, the static pods stay Pending forever, the
-# controller-manager never runs, and Deployments (rusternetes-dns, then
+# controller-manager never runs, and Deployments (k3rs-dns, then
 # cert-manager) never reconcile — the rollout wait in [6/7] then times out.
 # The canary's ci/actions/bring-up-cluster sets this the same way; the
 # standalone smoke script needs its own copy.
-export CERTS_PATH="${CERTS_PATH:-${PROJECT_ROOT}/.rusternetes/certs}"
+export CERTS_PATH="${CERTS_PATH:-${PROJECT_ROOT}/.k3rs/certs}"
 mkdir -p "${CERTS_PATH}"
 
 # Pre-create every host dir that compose bind-mounts, BEFORE `compose up`.
 # bootstrap-cluster.sh templates the control-plane static pod YAML
 # (kube-controller-manager.yaml, kube-scheduler.yaml) into
-# .rusternetes/manifests AFTER `compose up`, and compose.sqlite.yml bind-mounts
+# .k3rs/manifests AFTER `compose up`, and compose.sqlite.yml bind-mounts
 # that dir into the kubelets. If the dir does not already exist, the Docker
 # daemon creates it as root on `up`, and bootstrap-cluster.sh — running as this
 # user — then dies with "Permission denied" templating the manifests. The
@@ -55,13 +55,13 @@ mkdir -p "${CERTS_PATH}"
 #
 # A plain `mkdir -p` is NOT enough on the persistent self-hosted (ARC) runner
 # workspace: an earlier run — from before this pre-create existed — already
-# left a root-owned .rusternetes/manifests behind, and `mkdir -p` is a no-op on
+# left a root-owned .k3rs/manifests behind, and `mkdir -p` is a no-op on
 # an existing dir, so it can never repair the ownership (there is no sudo on
 # the runner). The templating then fails forever with "Permission denied". Heal
 # it: if the dir is not writable by us, move it aside (a rename only needs write
-# on the user-owned parent .rusternetes, so it works without sudo) and recreate
+# on the user-owned parent .k3rs, so it works without sudo) and recreate
 # a fresh, user-owned dir.
-MANIFESTS_DIR="${PROJECT_ROOT}/.rusternetes/manifests"
+MANIFESTS_DIR="${PROJECT_ROOT}/.k3rs/manifests"
 if [ -e "${MANIFESTS_DIR}" ] && [ ! -w "${MANIFESTS_DIR}" ]; then
     echo "manifests dir not writable (stale root-owned?) — moving aside" >&2
     rm -rf "${MANIFESTS_DIR}" 2>/dev/null \
@@ -70,7 +70,7 @@ if [ -e "${MANIFESTS_DIR}" ] && [ ! -w "${MANIFESTS_DIR}" ]; then
 fi
 mkdir -p "${MANIFESTS_DIR}"
 
-KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/rusternetes-config}"
+KUBECONFIG_FILE="${KUBECONFIG:-${HOME}/.kube/k3rs-config}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)}"
 
 # Rhino+SQLite stack. Pod runtime is the in-compose containerd service, so no
@@ -130,14 +130,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Rusternetes cert-manager smoke (${CERT_MANAGER_VERSION}) ==="
+echo "=== k3rs cert-manager smoke (${CERT_MANAGER_VERSION}) ==="
 
 echo "[1/7] Tearing down any previous stack..."
 # shellcheck disable=SC2086
 ${COMPOSE} down -v --remove-orphans >/dev/null 2>&1 || true
 
 echo "[2/7] Generating certs (if absent) + bringing up the stack..."
-[ -f "${PROJECT_ROOT}/.rusternetes/certs/api-server.crt" ] || bash "${PROJECT_ROOT}/scripts/generate-certs.sh"
+[ -f "${PROJECT_ROOT}/.k3rs/certs/api-server.crt" ] || bash "${PROJECT_ROOT}/scripts/generate-certs.sh"
 # The control-plane images (scheduler, controller-manager) and the in-cluster
 # dns Deployment image are gated behind the `build` profile in compose.sqlite.yml.
 # `compose up -d --build` does not include profile-only services, so bootstrap
@@ -165,12 +165,12 @@ if [ ! -f "${KUBECONFIG_FILE}" ]; then
 apiVersion: v1
 kind: Config
 clusters:
-  - name: rusternetes
+  - name: k3rs
     cluster: {insecure-skip-tls-verify: true, server: https://localhost:6443}
 contexts:
-  - name: rusternetes
-    context: {cluster: rusternetes, user: admin}
-current-context: rusternetes
+  - name: k3rs
+    context: {cluster: k3rs, user: admin}
+current-context: k3rs
 users:
   - name: admin
     user: {token: anonymous}
@@ -272,9 +272,9 @@ metadata:
   namespace: default
 spec:
   secretName: smoke-cert-tls
-  commonName: smoke.rusternetes.local
+  commonName: smoke.k3rs.local
   dnsNames:
-    - smoke.rusternetes.local
+    - smoke.k3rs.local
   issuerRef:
     name: smoke-selfsigned
     kind: Issuer
@@ -313,4 +313,4 @@ echo "Issued certificate subject: ${SUBJECT}"
 printf '%s' "${CRT}" | base64 -d | openssl x509 -noout -checkend 0 >/dev/null 2>&1 || {
     echo "ERROR: issued certificate is not valid"; exit 1; }
 
-echo "PASS: cert-manager installed and issued a working certificate on Rusternetes."
+echo "PASS: cert-manager installed and issued a working certificate on k3rs."

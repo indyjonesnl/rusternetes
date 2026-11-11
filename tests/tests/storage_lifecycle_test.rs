@@ -1,12 +1,12 @@
 // Storage Lifecycle Verification Test
-// This test verifies that Rusternetes storage behaves exactly like Kubernetes storage
+// This test verifies that k3rs storage behaves exactly like Kubernetes storage
 
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
-use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::pv_binder::PVBinderController;
+use k3rs_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -151,10 +151,10 @@ async fn test_dynamic_provisioning() {
             api_version: "storage.k8s.io/v1".to_string()
         },
         metadata: ObjectMeta::new("fast-storage"),
-        provisioner: "rusternetes.io/hostpath".to_string(),
+        provisioner: "k3rs.io/hostpath".to_string(),
         parameters: Some({
             let mut params = HashMap::new();
-            params.insert("path".to_string(), "/tmp/rusternetes/volumes".to_string());
+            params.insert("path".to_string(), "/tmp/k3rs/volumes".to_string());
             params
         }),
         reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
@@ -250,7 +250,7 @@ async fn test_storage_class_parameters() {
             api_version: "storage.k8s.io/v1".to_string()
         },
         metadata: ObjectMeta::new("custom-storage"),
-        provisioner: "rusternetes.io/hostpath".to_string(),
+        provisioner: "k3rs.io/hostpath".to_string(),
         parameters: Some({
             let mut params = HashMap::new();
             params.insert("path".to_string(), "/custom/path".to_string());
@@ -270,7 +270,7 @@ async fn test_storage_class_parameters() {
     let retrieved: StorageClass = storage.get(&sc_key).await.expect("Failed to get StorageClass");
 
     // Verify all parameters are stored correctly
-    assert_eq!(retrieved.provisioner, "rusternetes.io/hostpath");
+    assert_eq!(retrieved.provisioner, "k3rs.io/hostpath");
     assert_eq!(retrieved.reclaim_policy, Some(PersistentVolumeReclaimPolicy::Retain));
     assert_eq!(retrieved.volume_binding_mode, Some(VolumeBindingMode::WaitForFirstConsumer));
     assert_eq!(retrieved.allow_volume_expansion, Some(false));

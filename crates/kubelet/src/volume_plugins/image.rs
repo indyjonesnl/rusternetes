@@ -3,7 +3,7 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 
 /// Port of `imagePlugin` (`pkg/volume/image/image.go:27-91`), registered by
 /// `image.ProbeVolumePlugins` (`cmd/kubelet/app/plugins.go`).

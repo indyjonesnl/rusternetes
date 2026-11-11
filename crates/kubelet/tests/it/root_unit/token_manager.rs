@@ -4,7 +4,7 @@
 //! `TestServiceAccountRecreationCacheInvalidation`).
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use rusternetes_kubelet::token_manager::{
+use k3rs_kubelet::token_manager::{
     key_func, BoundObjectReference, Clock, GetTokenFn, Manager, TokenRequest, TokenRequestSpec,
     TokenRequestStatus,
 };

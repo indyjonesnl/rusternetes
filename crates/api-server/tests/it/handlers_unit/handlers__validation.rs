@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::Error;
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::validation::*;
+    use k3rs_api_server::handlers::validation::*;
 
     /// A CRD whose validation schema sets standard JSON-Schema fields to their
     /// zero value (`exclusiveMaximum: false`, `nullable: false`,
@@ -25,7 +25,7 @@ mod tests {
     /// "spec.versions[0].schema.openAPIV3Schema.exclusiveMaximum", ...`.
     #[test]
     fn crd_with_zero_valued_schema_fields_passes_strict() {
-        use rusternetes_common::resources::CustomResourceDefinition;
+        use k3rs_common::resources::CustomResourceDefinition;
 
         let body = br#"{
             "apiVersion": "apiextensions.k8s.io/v1",

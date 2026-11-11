@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::flow_control_queueset::{seats_times_duration, WorkEstimate};
+    pub use k3rs_api_server::flow_control_queueset::{seats_times_duration, WorkEstimate};
     pub use std::time::Duration;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::flow_control_work_estimator::*;
+    use k3rs_api_server::flow_control_work_estimator::*;
 
     struct Case {
         name: &'static str,
@@ -145,7 +145,7 @@ mod tests {
     /// mutating_work_estimator.go:78 `metrics.ObserveWatchCount`.
     #[test]
     fn mutating_estimate_observes_the_watch_count() {
-        use rusternetes_api_server::flow_control::metric_test_util::{sample, sample_sum};
+        use k3rs_api_server::flow_control::metric_test_util::{sample, sample_sum};
         let est = WorkEstimator::new(
             Box::new(|_| Ok(Stats::default())),
             Box::new(|_| 5),

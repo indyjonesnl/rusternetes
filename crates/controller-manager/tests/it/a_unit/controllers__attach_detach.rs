@@ -4,24 +4,24 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::csi_migration::{
+    pub use k3rs_common::csi_migration::{
         translate_in_tree_spec_to_csi, PluginManager, VolumeSpec,
     };
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::resources::csi::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::resources::csi::{
         CSIDriver, CSINode, VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
     };
-    pub use rusternetes_common::resources::node::AttachedVolume;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::node::AttachedVolume;
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::{
         PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeSpec,
     };
-    pub use rusternetes_common::resources::{EventSource, EventType};
-    pub use rusternetes_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_controller_manager::controllers::pv_binder::is_pod_terminated;
-    pub use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage};
+    pub use k3rs_common::resources::{EventSource, EventType};
+    pub use k3rs_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::Error;
+    pub use k3rs_controller_manager::controllers::pv_binder::is_pod_terminated;
+    pub use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage};
     pub use sha2::{Digest, Sha256};
     pub use std::collections::{BTreeSet, HashMap, HashSet};
     pub use std::sync::{Arc, Mutex};
@@ -30,10 +30,10 @@ mod __parent {
 }
 
 mod tests {
-    use rusternetes_common::csi_migration::PluginManager;
-    use rusternetes_common::resources::csi::CSINode;
-    use rusternetes_common::resources::csi::{CSIDriver, VolumeAttachment};
-    use rusternetes_controller_manager::controllers::attach_detach::{
+    use k3rs_common::csi_migration::PluginManager;
+    use k3rs_common::resources::csi::CSINode;
+    use k3rs_common::resources::csi::{CSIDriver, VolumeAttachment};
+    use k3rs_controller_manager::controllers::attach_detach::{
         migration_supported_on_node, multi_attach_messages, volume_is_attached,
         MIGRATED_PLUGINS_ANNOTATION_KEY,
     };

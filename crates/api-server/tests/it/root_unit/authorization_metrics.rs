@@ -3,18 +3,18 @@
 
 mod __parent {
     pub use async_trait::async_trait;
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+    pub use k3rs_common::resources::{NonResourceRule, ResourceRule};
+    pub use k3rs_common::Result;
     pub use prometheus::{register, IntCounterVec, Opts};
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-    pub use rusternetes_common::resources::{NonResourceRule, ResourceRule};
-    pub use rusternetes_common::Result;
     pub use std::sync::{Arc, LazyLock, Once};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::authorization_metrics::*;
-    use rusternetes_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer};
+    use k3rs_api_server::authorization_metrics::*;
+    use k3rs_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer};
 
     fn attrs() -> RequestAttributes {
         RequestAttributes::new(

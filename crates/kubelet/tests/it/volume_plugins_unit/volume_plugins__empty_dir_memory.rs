@@ -5,12 +5,10 @@
 //! sibling kernel/userns helpers (`pkg/kubelet/util/swap/swap_util.go`) and the
 //! memory limit of `cm.ResourceConfigForPod` (`helpers_linux_test.go`).
 
-use rusternetes_common::resources::Pod;
-use rusternetes_kubelet::cm_helpers::resource_config_for_pod_memory;
-use rusternetes_kubelet::swap_util::{
-    parse_generic_version, running_in_user_ns_from, version_at_least,
-};
-use rusternetes_kubelet::volume_plugins::empty_dir::{
+use k3rs_common::resources::Pod;
+use k3rs_kubelet::cm_helpers::resource_config_for_pod_memory;
+use k3rs_kubelet::swap_util::{parse_generic_version, running_in_user_ns_from, version_at_least};
+use k3rs_kubelet::volume_plugins::empty_dir::{
     calculate_empty_dir_memory_size, generate_tmpfs_mount_options,
 };
 

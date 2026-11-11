@@ -7,9 +7,9 @@ mod __parent {
         http::StatusCode,
         Extension, Json,
     };
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::dump::DumpingJson;
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::dump::DumpingJson;
+    pub use k3rs_common::{
         auth::UserInfo,
         authz::{Decision, RequestAttributes},
         resources::{

@@ -9,16 +9,16 @@ mod __parent {
         response::{IntoResponse, Response},
         Extension,
     };
-    pub use rusternetes_api_server::endpoints::handlers::{self as endpoints, RequestScope};
-    pub use rusternetes_api_server::registry::apiextensions::customresourcedefinition;
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::endpoints::handlers::{self as endpoints, RequestScope};
+    pub use k3rs_api_server::registry::apiextensions::customresourcedefinition;
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::{
         admission::{GroupVersionKind, GroupVersionResource},
         authz::{Decision, RequestAttributes},
         resources::CustomResourceDefinition,
         List, Result,
     };
-    pub use rusternetes_storage::{build_prefix, Storage};
+    pub use k3rs_storage::{build_prefix, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::debug;
@@ -26,12 +26,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::crd::*;
-    use rusternetes_common::resources::{
+    use k3rs_api_server::handlers::crd::*;
+    use k3rs_common::resources::{
         CustomResourceDefinition, CustomResourceDefinitionNames, CustomResourceDefinitionSpec,
         CustomResourceDefinitionVersion, ResourceScope,
     };
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_common::types::ObjectMeta;
 
     fn create_test_crd() -> CustomResourceDefinition {
         CustomResourceDefinition {
@@ -69,15 +69,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_validating_webhook_called_for_crd_creation() {
-        use rusternetes_api_server::admission_webhook::AdmissionWebhookManager;
-        use rusternetes_common::admission::{
-            GroupVersionKind, GroupVersionResource, Operation, UserInfo,
-        };
-        use rusternetes_common::resources::{
+        use k3rs_api_server::admission_webhook::AdmissionWebhookManager;
+        use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation, UserInfo};
+        use k3rs_common::resources::{
             FailurePolicy, OperationType, Rule, RuleWithOperations, SideEffectClass,
             ValidatingWebhook, ValidatingWebhookConfiguration, WebhookClientConfig,
         };
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let manager = AdmissionWebhookManager::new(storage.clone());
@@ -86,7 +84,7 @@ mod tests {
         let webhook_config = ValidatingWebhookConfiguration {
             api_version: "admissionregistration.k8s.io/v1".to_string(),
             kind: "ValidatingWebhookConfiguration".to_string(),
-            metadata: rusternetes_common::types::ObjectMeta::new("deny-crd-creation"),
+            metadata: k3rs_common::types::ObjectMeta::new("deny-crd-creation"),
             webhooks: Some(vec![ValidatingWebhook {
                 name: "deny-crd.example.com".to_string(),
                 client_config: WebhookClientConfig {

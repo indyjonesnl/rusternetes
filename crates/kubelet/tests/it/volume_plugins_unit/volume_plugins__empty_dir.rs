@@ -4,8 +4,8 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::{EmptyDirVolumeSource, Pod};
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_common::resources::{EmptyDirVolumeSource, Pod};
+    pub use k3rs_kubelet::volume_plugins::{
         Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
     };
     pub use std::path::Path;
@@ -20,7 +20,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn assign_quota_is_noop_without_size_or_support() {
-        use rusternetes_kubelet::fsquota::{FsQuota, RealMounter};
+        use k3rs_kubelet::fsquota::{FsQuota, RealMounter};
         let mk = |on: bool| {
             FsQuota::new(
                 vec![],
@@ -38,16 +38,16 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_common::resources::Volume;
-    use rusternetes_kubelet::volume_plugins::empty_dir::*;
+    use k3rs_common::resources::Volume;
+    use k3rs_kubelet::volume_plugins::empty_dir::*;
     use serde_json::json;
 
     fn plugin() -> EmptyDirPlugin {
         EmptyDirPlugin::new(std::sync::Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -76,7 +76,7 @@ mod tests {
                 size_limit: None,
             },
         };
-        m.set_up_with(&rusternetes_kubelet::volume_plugins::MounterArgs {
+        m.set_up_with(&k3rs_kubelet::volume_plugins::MounterArgs {
             fs_group: Some(gid),
             ..Default::default()
         })
@@ -124,10 +124,7 @@ mod tests {
 
     #[test]
     fn plugin_name_is_the_upstream_name() {
-        assert_eq!(
-            plugin().name(),
-            rusternetes_kubelet::pod_dirs::plugin::EMPTY_DIR
-        );
+        assert_eq!(plugin().name(), k3rs_kubelet::pod_dirs::plugin::EMPTY_DIR);
     }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -232,12 +229,8 @@ mod tests {
         let root = tmp(tag);
         std::fs::create_dir_all(&root).unwrap();
         let root = root.to_string_lossy().into_owned();
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
-            &root,
-            "poduid",
-            plugin().name(),
-            "scratch",
-        );
+        let dir =
+            k3rs_kubelet::pod_dirs::get_pod_volume_dir(&root, "poduid", plugin().name(), "scratch");
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("nested/file"), "data").unwrap();
         (root, dir)
@@ -249,10 +242,10 @@ mod tests {
         mounter: Arc<dyn Unmount>,
     ) -> EmptyDirUnmounter {
         EmptyDirPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -456,7 +449,7 @@ mod tests {
         let u = plugin().new_unmounter("scratch", "uid-1").unwrap();
         assert_eq!(
             u.get_path(),
-            "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~empty-dir/scratch"
+            "/var/lib/k3rs/pods/uid-1/volumes/kubernetes.io~empty-dir/scratch"
         );
     }
 
@@ -480,7 +473,7 @@ mod tests {
         };
         assert_eq!(
             m.get_attributes(),
-            rusternetes_kubelet::volume_plugins::plugin::Attributes {
+            k3rs_kubelet::volume_plugins::plugin::Attributes {
                 read_only: false,
                 managed: true,
                 selinux_relabel: true
@@ -510,10 +503,10 @@ mod tests {
 
     fn plugin_in(root: &str) -> EmptyDirPlugin {
         EmptyDirPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -545,7 +538,7 @@ mod tests {
         let root = root.to_string_lossy().into_owned();
         let m = mounter_in(&root);
         std::fs::create_dir_all(&m.path).unwrap();
-        rusternetes_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
+        k3rs_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&m.path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -564,7 +557,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let root = root.to_string_lossy().into_owned();
         let m = mounter_in(&root);
-        rusternetes_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
+        k3rs_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
         assert!(!std::path::Path::new(&m.path).exists());
         m.set_up_with(&Default::default()).await.unwrap();
         assert!(std::path::Path::new(&m.path).is_dir());
@@ -577,7 +570,7 @@ mod tests {
     async fn tear_down_removes_the_ready_dir() {
         let (root, dir) = filled("td-ready");
         let m = mounter_in(&root);
-        rusternetes_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
+        k3rs_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
         let u = unmounter_for(
             &root,
             Arc::new(FakeMountDetector {
@@ -591,7 +584,7 @@ mod tests {
         assert!(!std::path::Path::new(&m.meta_dir).exists());
 
         // Volume dir already gone, ready dir still there.
-        rusternetes_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
+        k3rs_kubelet::volume_plugins::util::set_ready(&m.meta_dir);
         u.tear_down().await.unwrap();
         assert!(!std::path::Path::new(&m.meta_dir).exists());
     }
@@ -599,8 +592,8 @@ mod tests {
     // ---- hugepages (`TestGetHugePagesMountOptions`, `TestGetPageSize`,
     // `TestSetupHugepages`, empty_dir_test.go:377-976) ----
 
-    use rusternetes_common::resources::{Container, PodSpec};
-    use rusternetes_common::types::ResourceRequirements;
+    use k3rs_common::resources::{Container, PodSpec};
+    use k3rs_common::types::ResourceRequirements;
 
     fn reqs(r: &[(&str, &str)]) -> ResourceRequirements {
         ResourceRequirements {

@@ -6,7 +6,7 @@
 //!   - `staging/src/k8s.io/api/core/v1/types.go::ServiceSpec` for
 //!     `clusterIP` / `clusterIPs` / `publishNotReadyAddresses`
 //!
-//! In Rusternetes the DNS plane is CoreDNS itself; kube-proxy programs
+//! In k3rs the DNS plane is CoreDNS itself; kube-proxy programs
 //! the iptables that send `clusterIP` traffic to backing pods. The
 //! resource fields below are what CoreDNS, kube-proxy, and the kubelet
 //! all read to produce in-cluster names. Pin the wire shape so a future
@@ -15,7 +15,7 @@
 //! No runtime / iptables side-effects — those are exercised in the
 //! kube-proxy integration tests.
 
-use rusternetes_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
+use k3rs_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
 
 fn cluster_ip_service(name: &str, cluster_ip: Option<&str>) -> Service {
     Service::new(

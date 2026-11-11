@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::resources::{Lease, LeaseSpec};
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{Lease, LeaseSpec};
+use k3rs_common::Error;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
@@ -149,7 +149,7 @@ impl LeaseController {
     }
 
     /// `ensureLease` (controller.go:237-262): `(lease, created)`.
-    async fn ensure_lease(&self, now: DateTime<Utc>) -> rusternetes_common::Result<(Lease, bool)> {
+    async fn ensure_lease(&self, now: DateTime<Utc>) -> k3rs_common::Result<(Lease, bool)> {
         let key = lease_key(&self.lease_name);
         match self.storage.get::<Lease>(&key).await {
             Ok(l) => Ok((l, false)),

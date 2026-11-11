@@ -1,8 +1,8 @@
 use crate::volume_plugins::csi_driver_lister::CsiDriverLister;
 use crate::volume_plugins::util::hostutil::{HostUtil, HostUtils};
 use crate::volume_plugins::util::mount_ops::Mounter;
-use rusternetes_common::auth::TokenManager;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::auth::TokenManager;
+use k3rs_storage::StorageBackend;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -78,7 +78,7 @@ pub trait VolumeHost: Send + Sync {
     /// derived dirs: `GetPluginDir`, `GetPodsDir`, `GetPodVolumeDir`,
     /// `GetPodPluginDir`, `GetVolumeDevicePluginDir`,
     /// `GetPodVolumeDeviceDir` — none return the bare root). This exists
-    /// because the secret plugin's CA-cert injection is a Rusternetes-only
+    /// because the secret plugin's CA-cert injection is a k3rs-only
     /// mechanism with no upstream counterpart, and it needs the root to build
     /// a `_certs` path alongside `pods`. It returns the host's *stored* root
     /// rather than inverting `crate::pod_dirs::get_pods_dir()` (i.e.

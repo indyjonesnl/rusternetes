@@ -19,9 +19,9 @@
 
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use rusternetes_client::reflector::{ListWatch, WatchItem};
-use rusternetes_client::watch::WatchEvent as ClientWatchEvent;
-use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+use k3rs_client::reflector::{ListWatch, WatchItem};
+use k3rs_client::watch::WatchEvent as ClientWatchEvent;
+use k3rs_storage::{Storage, WatchEvent, WatchStream};
 use std::sync::{Arc, Mutex};
 
 /// Keep-predicate applied to listed items and watched objects.

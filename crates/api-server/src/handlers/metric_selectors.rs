@@ -9,11 +9,11 @@
 //! object selector, `metricLabelSelector` parsed with `labels.Parse` and its
 //! error returned as-is, `metadata.name` `RequiresExactMatch`).
 
-use rusternetes_common::field_selector::{FieldOperator, FieldSelector};
-use rusternetes_common::label_selector::{LabelOperator, LabelSelector};
-use rusternetes_common::resources::custom_metrics::MetricSelector;
-use rusternetes_common::types::{LabelSelectorRequirement, Status};
-use rusternetes_common::Error;
+use k3rs_common::field_selector::{FieldOperator, FieldSelector};
+use k3rs_common::label_selector::{LabelOperator, LabelSelector};
+use k3rs_common::resources::custom_metrics::MetricSelector;
+use k3rs_common::types::{LabelSelectorRequirement, Status};
+use k3rs_common::Error;
 use std::collections::{BTreeMap, HashMap};
 
 /// What `ListResource` hands to `REST.List` for the custom metrics API.

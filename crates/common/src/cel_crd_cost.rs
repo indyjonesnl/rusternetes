@@ -3,8 +3,8 @@
 //! `sizeEstimator` and `maxCardinality` (release-1.35), over the
 //! [`DeclType`] of [`crate::cel_schema_types`].
 
-use rusternetes_cel_checker::cost::{AstNode, CallEstimate, CostEstimator, SizeEstimate};
-use rusternetes_cel_checker::decl::{limits, DeclType};
+use k3rs_cel_checker::cost::{AstNode, CallEstimate, CostEstimator, SizeEstimate};
+use k3rs_cel_checker::decl::{limits, DeclType};
 
 /// `sizeEstimator`: `EstimateSize` walks the node's field path down the
 /// rule's root type and reads the `MaxElements` of the type it ends at.

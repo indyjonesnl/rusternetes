@@ -9,8 +9,8 @@
 //! outcome as GET) rather than rejected with 405 Method Not Allowed.
 
 use axum::http::StatusCode;
-use rusternetes_storage::Storage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::Storage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 async fn status_for(method: &str) -> StatusCode {

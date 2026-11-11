@@ -1,4 +1,4 @@
-# Custom ARC runner image for the rusternetes self-hosted CI scale set.
+# Custom ARC runner image for the k3rs self-hosted CI scale set.
 #
 # Pre-bakes:
 # - the Rust stable toolchain (rustup + clippy + rustfmt)
@@ -46,7 +46,7 @@ RUN curl -LsSf https://get.nexte.st/latest/linux \
 
 # docker-compose v2 plugin. gha-runner-scale-set's stock DinD bundle
 # ships the docker CLI but not the compose plugin, so the conformance
-# tier (which brings up the rusternetes cluster via `docker compose
+# tier (which brings up the k3rs cluster via `docker compose
 # up`) needs the binary on PATH. Drop it into the runner-user's local
 # plugin directory so no root and no global $PATH mutation is needed.
 # Pinned to a known release tag; bumps land here, not in workflow files.

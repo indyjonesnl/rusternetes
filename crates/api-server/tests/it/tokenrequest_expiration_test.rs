@@ -2,7 +2,7 @@
 //! must be >= 10 minutes (600s) and <= 2^32 seconds.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";
@@ -97,7 +97,7 @@ async fn token_expiration_invalid_is_new_invalid_shaped() {
 /// issued token's `exp` and the status timestamp follow the shortened value.
 #[tokio::test]
 async fn token_expiration_clamped_to_max_2714() {
-    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    use k3rs_common::auth::{ServiceAccountOptions, TokenManager};
     let tm = TokenManager::new(b"max-exp-secret")
         .with_service_account_options(&ServiceAccountOptions {
             max_expiration: Some(std::time::Duration::from_secs(7200)),
@@ -131,7 +131,7 @@ async fn token_expiration_clamped_to_max_2714() {
 const SA_ISSUER: &str = "https://kubernetes.default.svc";
 
 fn extend_state(extend: bool) -> TestApiServer {
-    use rusternetes_common::auth::{ServiceAccountOptions, TokenManager};
+    use k3rs_common::auth::{ServiceAccountOptions, TokenManager};
     let fixture = |n: &str| {
         format!(
             "{}/../common/tests/fixtures/sa/{n}",

@@ -8,8 +8,8 @@
 //! `--service-account-issuer` and `--api-audiences`.
 
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use rusternetes_common::auth::{ServiceAccountClaims, ServiceAccountOptions, TokenManager};
-use rusternetes_common::sa_keys;
+use k3rs_common::auth::{ServiceAccountClaims, ServiceAccountOptions, TokenManager};
+use k3rs_common::sa_keys;
 use serde_json::{json, Value};
 
 const ISSUER: &str = "https://kubernetes.default.svc";
@@ -226,7 +226,7 @@ fn generated_token_carries_configured_issuer_and_kid() {
     let validated = tm
         .authenticate_token(&token, Some(&[ISSUER.to_string()]))
         .unwrap_err();
-    // The default claims audience ("rusternetes") is not an API audience.
+    // The default claims audience ("k3rs") is not an API audience.
     assert!(validated.to_string().contains("audiences"), "{validated}");
 
     let mut claims = ServiceAccountClaims::new("sa1".into(), "ns1".into(), "uid".into(), 1);
@@ -625,7 +625,7 @@ fn tweak_expiration_3725() {
 /// `kubernetes.io.warnafter` round-trips as Unix seconds (`jwt.NumericDate`).
 #[test]
 fn warnafter_claim_roundtrip_3725() {
-    let k: rusternetes_common::auth::KubernetesClaims =
+    let k: k3rs_common::auth::KubernetesClaims =
         serde_json::from_value(json!({"namespace": "n", "warnafter": 1234})).unwrap();
     assert_eq!(k.warnafter, Some(1234));
     assert_eq!(serde_json::to_value(&k).unwrap()["warnafter"], 1234);

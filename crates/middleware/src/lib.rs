@@ -13,16 +13,16 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
 
 /// Global protobuf schema registry — initialized once on first use
-static PROTO_REGISTRY: LazyLock<rusternetes_protobuf::ProtoRegistry> =
-    LazyLock::new(rusternetes_protobuf::ProtoRegistry::new);
+static PROTO_REGISTRY: LazyLock<k3rs_protobuf::ProtoRegistry> =
+    LazyLock::new(k3rs_protobuf::ProtoRegistry::new);
 
 /// Standard Kubernetes impersonation request headers. Mirrors the constants in
 /// upstream `k8s.io/api/authentication/v1/types.go` and the filter in
@@ -638,14 +638,14 @@ pub async fn skip_auth_middleware(
 pub async fn validate_service_account_token(
     storage: &StorageBackend,
     token: &str,
-    claims: &rusternetes_common::auth::ServiceAccountClaims,
+    claims: &k3rs_common::auth::ServiceAccountClaims,
     legacy_lookup: bool,
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
     if claims.aud.is_empty() {
         obs.observe_legacy_token(&claims.sub);
     }
-    if claims.iss == rusternetes_common::auth::LEGACY_ISSUER {
+    if claims.iss == k3rs_common::auth::LEGACY_ISSUER {
         validate_legacy_service_account_token(storage, token, claims, legacy_lookup, obs).await
     } else {
         validate_service_account_claims(storage, claims, obs).await
@@ -676,14 +676,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 async fn validate_legacy_service_account_token(
     storage: &StorageBackend,
     token: &str,
-    claims: &rusternetes_common::auth::ServiceAccountClaims,
+    claims: &k3rs_common::auth::ServiceAccountClaims,
     lookup: bool,
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
-    use rusternetes_common::auth::{
+    use k3rs_common::auth::{
         LegacyPrivateClaims, LEGACY_TOKEN_INVALID_SINCE_LABEL_KEY as INVALID_SINCE,
     };
-    use rusternetes_common::resources::{Secret, ServiceAccount};
+    use k3rs_common::resources::{Secret, ServiceAccount};
 
     let private = LegacyPrivateClaims::from_verified_token(token).map_err(|e| e.to_string())?;
 
@@ -832,9 +832,9 @@ async fn validate_legacy_service_account_token(
 async fn patch_secret_with_last_used_date(
     storage: &StorageBackend,
     key: &str,
-    secret: &rusternetes_common::resources::Secret,
+    secret: &k3rs_common::resources::Secret,
 ) {
-    use rusternetes_common::auth::LEGACY_TOKEN_LAST_USED_LABEL_KEY as LAST_USED;
+    use k3rs_common::auth::LEGACY_TOKEN_LAST_USED_LABEL_KEY as LAST_USED;
 
     let now = chrono::Utc::now();
     let today = now.format("%Y-%m-%d").to_string();
@@ -876,14 +876,14 @@ async fn patch_secret_with_last_used_date(
 /// they are treated as enabled.
 pub async fn validate_service_account_claims(
     storage: &StorageBackend,
-    claims: &rusternetes_common::auth::ServiceAccountClaims,
+    claims: &k3rs_common::auth::ServiceAccountClaims,
     obs: &mut AuthObservations,
 ) -> std::result::Result<(), String> {
-    use rusternetes_common::resources::{Node, Pod, Secret, ServiceAccount};
+    use k3rs_common::resources::{Node, Pod, Secret, ServiceAccount};
 
     // consider things deleted prior to now()-leeway to be invalid
     let invalid_if_deleted_before = chrono::Utc::now() - chrono::Duration::seconds(60);
-    let deleted = |m: &rusternetes_common::types::ObjectMeta| {
+    let deleted = |m: &k3rs_common::types::ObjectMeta| {
         m.deletion_timestamp
             .is_some_and(|t| t < invalid_if_deleted_before)
     };
@@ -945,7 +945,7 @@ pub async fn validate_service_account_claims(
         }
     }
 
-    // Bound Pod (claims.go:212-230); older rusternetes tokens carry the pod
+    // Bound Pod (claims.go:212-230); older k3rs tokens carry the pod
     // only in the flat `pod_name` / `pod_uid` claims.
     let pod_ref = kube
         .and_then(|k| k.pod.as_ref())
@@ -1006,7 +1006,7 @@ pub struct AuthenticationLatencyGuard(pub std::time::Instant);
 
 impl Drop for AuthenticationLatencyGuard {
     fn drop(&mut self) {
-        rusternetes_common::latency_trackers::track_authentication_latency(self.0.elapsed());
+        k3rs_common::latency_trackers::track_authentication_latency(self.0.elapsed());
     }
 }
 
@@ -1339,7 +1339,7 @@ pub async fn normalize_content_type_middleware(
     // `application/vnd.kubernetes.protobuf`, regardless of the request
     // Content-Type. Per `staging/src/k8s.io/apimachinery/pkg/runtime/serializer/protobuf`,
     // the envelope's `raw` field carries the native protobuf bytes produced
-    // by the generated `pb.go` `Marshal` method for the resource. Rusternetes
+    // by the generated `pb.go` `Marshal` method for the resource. k3rs
     // does not yet ship per-resource native encoders; the [`ProtoEncoder`]
     // in `crate::response` produces an `Unknown` envelope whose `raw` is
     // JSON and whose `contentType` is `application/json` — a valid envelope
@@ -1525,14 +1525,13 @@ pub async fn normalize_content_type_middleware(
                         .and_then(|v| v.get("kind"))
                         .and_then(|k| k.as_str())
                         == Some("Status");
-                    let typed_status: Option<rusternetes_common::types::Status> = if kind_is_status
-                    {
+                    let typed_status: Option<k3rs_common::types::Status> = if kind_is_status {
                         value.and_then(|v| serde_json::from_value(v).ok())
                     } else {
                         None
                     };
                     if let Some(status_obj) = typed_status {
-                        let pb = rusternetes_protobuf::encode_status_protobuf(&status_obj);
+                        let pb = k3rs_protobuf::encode_status_protobuf(&status_obj);
                         let mut resp = Response::from_parts(parts, Body::from(pb));
                         resp.headers_mut().insert(
                             axum::http::header::CONTENT_TYPE,
@@ -1707,7 +1706,7 @@ pub async fn normalize_content_type_middleware(
                                 // `TrackTransformResponseObjectLatency`
                                 // (handlers/response.go:335) times
                                 // `doTransformObject`.
-                                let converted = rusternetes_common::latency_trackers::track_transform_response_object_latency_sync(|| match neg.target {
+                                let converted = k3rs_common::latency_trackers::track_transform_response_object_latency_sync(|| match neg.target {
                                     // A handler that already produced a Table
                                     // (its list path branches on `wants_table`)
                                     // is passed through verbatim — re-running
@@ -1724,7 +1723,7 @@ pub async fn normalize_content_type_middleware(
                                 });
                                 // `TrackSerializeResponseObjectLatency`
                                 // (responsewriters/writers.go:354).
-                                let (new_body, new_ct) = rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+                                let (new_body, new_ct) = k3rs_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
                                 let converted_json = serde_json::to_vec(&converted)
                                     .unwrap_or_else(|_| json_bytes.to_vec());
                                 match neg.wire {
@@ -1748,7 +1747,7 @@ pub async fn normalize_content_type_middleware(
                                         let pb = match neg.target {
                                             AsTarget::PartialObjectMetadata
                                             | AsTarget::PartialObjectMetadataList => {
-                                                rusternetes_protobuf::encode_partial_object_metadata_k8s(
+                                                k3rs_protobuf::encode_partial_object_metadata_k8s(
                                                     &converted,
                                                     neg.target.name(),
                                                 )
@@ -3101,8 +3100,8 @@ pub fn try_brace_scan_or_type_meta(body_bytes: &[u8]) -> Vec<u8> {
 // Conformance payload-dump middleware.
 //
 // Outermost layer in the router. Buffers the request body (up to
-// MAX_DUMP_BODY) into `rusternetes_common::dump::CURRENT_PAYLOAD`, then
-// logs the body on any 5xx response. No-op when RUSTERNETES_DUMP_PAYLOADS
+// MAX_DUMP_BODY) into `k3rs_common::dump::CURRENT_PAYLOAD`, then
+// logs the body on any 5xx response. No-op when K3RS_DUMP_PAYLOADS
 // is unset.
 // ============================================================================
 
@@ -3131,7 +3130,7 @@ const MAX_GENERATE_NAME_BODY: usize = 4 * 1024 * 1024;
 /// untouched — preserving raw-byte strict decoding (e.g. duplicate-field
 /// detection) for the overwhelmingly common path.
 pub fn synthesize_generate_name(body: &[u8]) -> Option<Vec<u8>> {
-    synthesize_generate_name_with(body, &rusternetes_common::names::simple_name_generator)
+    synthesize_generate_name_with(body, &k3rs_common::names::simple_name_generator)
 }
 
 /// [`synthesize_generate_name`] with the name generator injected
@@ -3173,8 +3172,7 @@ pub fn synthesize_generate_name_with(
 /// here. Non-POST, non-JSON, and already-named requests pass straight through
 /// with their original bytes intact.
 pub async fn generate_name_middleware(req: Request, next: Next) -> Response {
-    generate_name_middleware_with(req, next, &rusternetes_common::names::simple_name_generator)
-        .await
+    generate_name_middleware_with(req, next, &k3rs_common::names::simple_name_generator).await
 }
 
 /// `maxNameGenerationCreateAttempts` (apiserver
@@ -3523,7 +3521,7 @@ pub async fn namespace_lifecycle_rejection(
             }
         }
         // `admission.go:129-166`: a missing namespace is NotFound.
-        Err(rusternetes_common::Error::NotFound(_)) => {
+        Err(k3rs_common::Error::NotFound(_)) => {
             return Some(
                 (
                     StatusCode::NOT_FOUND,
@@ -3559,7 +3557,7 @@ pub async fn capture_payload(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::body::{to_bytes, Body};
-    use rusternetes_common::dump::{self, redact_secret_like, CURRENT_PAYLOAD};
+    use k3rs_common::dump::{self, redact_secret_like, CURRENT_PAYLOAD};
     use std::cell::RefCell;
 
     if !dump::dumps_enabled() {
@@ -3617,7 +3615,7 @@ pub async fn capture_payload(
 /// DELETE, `:263` for DeleteCollection), reading the request BODY and falling
 /// back to query parameters. Every resource therefore gets identical decoding.
 ///
-/// Rusternetes has one handler per resource and they did not: only the pod
+/// k3rs has one handler per resource and they did not: only the pod
 /// handler read the body, so `kubectl delete --cascade=orphan` -- which sends
 /// `propagationPolicy` in the DELETE body, not the query string -- was silently
 /// ignored on every other resource.
@@ -3670,7 +3668,7 @@ pub fn parse_delete_options(
         propagation_policy: params.get("propagationPolicy").cloned(),
         orphan_dependents: params
             .get("orphanDependents")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+            .map(|v| k3rs_common::query::k8s_query_bool(v)),
     }
 }
 

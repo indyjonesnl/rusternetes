@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::quota::aggregate_container_resources;
-    pub use rusternetes_common::resources::pod::PodSpec;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_common::types::{ResourceClaim, ResourceRequirements};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::limitrange::is_overcommit_allowed;
-    pub use rusternetes_common::validation::metav1::is_dns1123_label;
-    pub use rusternetes_common::validation::pod_options::PodValidationOptions;
-    pub use rusternetes_common::validation::resourcequota::validate_resource_quantity_value;
-    pub use rusternetes_common::validation::runtimeclass::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::quota::aggregate_container_resources;
+    pub use k3rs_common::resources::pod::PodSpec;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_common::types::{ResourceClaim, ResourceRequirements};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::limitrange::is_overcommit_allowed;
+    pub use k3rs_common::validation::metav1::is_dns1123_label;
+    pub use k3rs_common::validation::pod_options::PodValidationOptions;
+    pub use k3rs_common::validation::resourcequota::validate_resource_quantity_value;
+    pub use k3rs_common::validation::runtimeclass::{
         is_huge_page_resource_name, validate_resource_name,
     };
     pub use std::collections::BTreeSet;
@@ -20,7 +20,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::pod_resources::*;
+    use k3rs_common::validation::pod_resources::*;
     use serde_json::json;
 
     fn spec(v: serde_json::Value) -> PodSpec {

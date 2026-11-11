@@ -26,7 +26,7 @@
 //! that is not an apply.
 //!
 //! The engine itself (`Managed`, the apply path, the field sets) lives in
-//! `rusternetes_common::fieldmanager` so the direct storage backends run the
+//! `k3rs_common::fieldmanager` so the direct storage backends run the
 //! same `FieldManager.Apply` (#3292); this module keeps what needs the
 //! registry `Object` bound and the request (the typed Update entry points and
 //! the user agent).
@@ -40,13 +40,13 @@
 
 pub mod schemas;
 
-pub use rusternetes_common::fieldmanager::{
+pub use k3rs_common::fieldmanager::{
     apply, fieldset, is_reset_managed_fields, remove_managed_fields, Managed, ResetFields,
 };
 
 use std::ops::Deref;
 
-use rusternetes_common::validation::metav1::FIELD_MANAGER_MAX_LENGTH;
+use k3rs_common::validation::metav1::FIELD_MANAGER_MAX_LENGTH;
 use serde_json::Value;
 
 use crate::registry::rest::Object;
@@ -99,10 +99,10 @@ pub fn prefix_from_user_agent(user_agent: &str) -> String {
 
 /// `FieldManager` (fieldmanager.go:38-44) for one served resource: the
 /// shared engine plus the typed Update entry points.
-pub struct FieldManager(rusternetes_common::fieldmanager::FieldManager);
+pub struct FieldManager(k3rs_common::fieldmanager::FieldManager);
 
 impl Deref for FieldManager {
-    type Target = rusternetes_common::fieldmanager::FieldManager;
+    type Target = k3rs_common::fieldmanager::FieldManager;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -110,7 +110,7 @@ impl Deref for FieldManager {
 
 impl FieldManager {
     pub fn new(api_version: &str, subresource: Option<&str>, reset_fields: ResetFields) -> Self {
-        Self(rusternetes_common::fieldmanager::FieldManager::new(
+        Self(k3rs_common::fieldmanager::FieldManager::new(
             api_version,
             subresource,
             reset_fields,
@@ -118,21 +118,21 @@ impl FieldManager {
     }
 
     /// The kind's version `Converter` (#2736), see
-    /// [`rusternetes_common::fieldmanager::FieldManager::with_converter`].
+    /// [`k3rs_common::fieldmanager::FieldManager::with_converter`].
     pub fn with_converter(
         self,
         converter: Option<
-            std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>,
+            std::sync::Arc<dyn k3rs_common::fieldmanager::versionconverter::Converter>,
         >,
     ) -> Self {
         Self(self.0.with_converter(converter))
     }
 
     /// The kind's `typeConverter`, see
-    /// [`rusternetes_common::fieldmanager::FieldManager::with_schema`].
+    /// [`k3rs_common::fieldmanager::FieldManager::with_schema`].
     pub fn with_schema(
         self,
-        schema: Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>>,
+        schema: Option<std::sync::Arc<k3rs_common::fieldmanager::schema::Type>>,
     ) -> Self {
         Self(self.0.with_schema(schema))
     }

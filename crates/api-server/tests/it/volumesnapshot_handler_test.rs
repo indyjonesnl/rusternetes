@@ -3,12 +3,12 @@
 //! Tests all CRUD operations, edge cases, and error handling for volumesnapshots.
 //! VolumeSnapshot represents a snapshot of a volume for backup and restore.
 
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     VolumeSnapshot, VolumeSnapshotError, VolumeSnapshotSource, VolumeSnapshotSpec,
     VolumeSnapshotStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -400,7 +400,7 @@ async fn test_volumesnapshot_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut vs = create_test_volumesnapshot("test-owner", "default", "test-pvc");
-    vs.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    vs.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "v1".to_string(),
         kind: "PersistentVolumeClaim".to_string(),
         name: "test-pvc".to_string(),

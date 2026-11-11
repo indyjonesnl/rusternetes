@@ -1,6 +1,6 @@
 # MetalLB Quick Start - 5 Minutes to LoadBalancer
 
-Get LoadBalancer services working in Rusternetes in under 5 minutes!
+Get LoadBalancer services working in k3rs in under 5 minutes!
 
 ## One-Line Install (Automated)
 
@@ -81,7 +81,7 @@ kubectl logs -n metallb-system -l app=metallb,component=controller
 
 **For Podman/Docker:**
 - IPs only work from the host machine or other containers
-- Try: `podman exec rusternetes-api-server curl http://$EXTERNAL_IP`
+- Try: `podman exec k3rs-api-server curl http://$EXTERNAL_IP`
 
 **For Local Network:**
 - Ensure IP is on the same subnet as your nodes

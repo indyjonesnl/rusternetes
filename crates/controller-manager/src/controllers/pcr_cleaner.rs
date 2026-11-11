@@ -18,8 +18,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
@@ -98,7 +98,7 @@ impl<S: Storage + 'static> PcrCleanerController<S> {
         match self.storage.get::<PodCertificateRequest>(&key).await {
             Ok(live) if live.metadata.uid == pcr.metadata.uid => {}
             Ok(_) => return Ok(()),
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "unable to delete PodCertificateRequest \"{}/{}\": {e}",
@@ -108,7 +108,7 @@ impl<S: Storage + 'static> PcrCleanerController<S> {
             }
         }
         match self.storage.delete(&key).await {
-            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Ok(()) | Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(anyhow::anyhow!(
                 "unable to delete PodCertificateRequest \"{}/{}\": {e}",
                 ns.unwrap_or(""),

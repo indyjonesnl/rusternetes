@@ -20,13 +20,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::Service,
     List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -94,7 +94,7 @@ pub async fn create(
 async fn get_in(
     state: &ApiServerState,
     subresource: Option<&'static str>,
-    user: &rusternetes_common::auth::UserInfo,
+    user: &k3rs_common::auth::UserInfo,
     namespace: &str,
     name: &str,
     params: &std::collections::HashMap<String, String>,
@@ -142,7 +142,7 @@ pub async fn update(
 async fn patch_in(
     state: &ApiServerState,
     subresource: Option<&'static str>,
-    user: &rusternetes_common::auth::UserInfo,
+    user: &k3rs_common::auth::UserInfo,
     namespace: &str,
     name: &str,
     params: &HashMap<String, String>,
@@ -288,7 +288,7 @@ pub async fn patch_status(
 /// e.Decorator), nil }`). Best-effort: an object that does not decode as a
 /// Service is passed through unchanged.
 pub(crate) fn default_on_read_watch_converter(
-    primary: rusternetes_common::resources::IPFamily,
+    primary: k3rs_common::resources::IPFamily,
 ) -> crate::handlers::watch::WatchObjectConverter {
     Arc::new(move |val: serde_json::Value| {
         let primary = primary.clone();
@@ -334,7 +334,7 @@ pub async fn list(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -429,7 +429,7 @@ pub async fn list_all_services(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 

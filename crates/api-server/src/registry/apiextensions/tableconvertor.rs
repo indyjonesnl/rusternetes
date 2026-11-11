@@ -9,7 +9,7 @@
 //! `k8s.io/client-go/util/jsonpath/jsonpath.go` (`FindResults`, `walk`,
 //! `evalField`, `evalArray`, `evalWildcard`, `evalUnion`, `PrintResults`) a
 //! printer column can use, run over the parse tree of
-//! [`rusternetes_common::jsonpath`] with `AllowMissingKeys(true)`, including
+//! [`k3rs_common::jsonpath`] with `AllowMissingKeys(true)`, including
 //! filters (`[?(...)]`, with the comparisons of
 //! `client-go/third_party/forked/golang/template/funcs.go`), recursive descent
 //! (`..`) and the `range`/`end` block state machine of `FindResults`. An
@@ -20,9 +20,9 @@
 //! (upstream applies it in the response writer, `handlers/response.go asTable`,
 //! not in this convertor; rows keep the full object like every other kind).
 
-use rusternetes_common::jsonpath::{self, ListNode, Node};
-use rusternetes_common::resources::{CustomResourceColumnDefinition, CustomResourceDefinition};
-use rusternetes_middleware::table::{
+use k3rs_common::jsonpath::{self, ListNode, Node};
+use k3rs_common::resources::{CustomResourceColumnDefinition, CustomResourceDefinition};
+use k3rs_middleware::table::{
     humanize_age, ColumnDefinition, Table, TableMetadata, TableRow,
     OBJECT_META_CREATION_TIMESTAMP_DOC, OBJECT_META_NAME_DOC,
 };

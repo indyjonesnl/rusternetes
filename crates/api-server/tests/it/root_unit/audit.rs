@@ -9,7 +9,7 @@ mod __parent {
         response::Response,
     };
     pub use chrono::Utc;
-    pub use rusternetes_common::audit::{
+    pub use k3rs_common::audit::{
         AuditBackend, AuditEvent, AuditLevel, AuditStage, ObjectReference, ResponseStatus, UserInfo,
     };
     pub use serde::Deserialize;
@@ -20,7 +20,7 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use axum::{body::Body, routing::get, Router};
-    use rusternetes_api_server::audit::*;
+    use k3rs_api_server::audit::*;
     use tower::ServiceExt;
 
     struct Capture(tokio::sync::Mutex<Vec<AuditEvent>>);
@@ -408,7 +408,7 @@ rules:
             .body(Body::empty())
             .unwrap();
         req.extensions_mut()
-            .insert(rusternetes_middleware::AuthAuditAnnotations(vec![(
+            .insert(k3rs_middleware::AuthAuditAnnotations(vec![(
                 "authentication.k8s.io/legacy-token".to_string(),
                 "system:serviceaccount:ns:sa".to_string(),
             )]));
@@ -437,7 +437,7 @@ rules:
             .route(
                 "/api/v1/namespaces/:ns/secrets/:name",
                 get(|axum::extract::Path((_, name)): axum::extract::Path<(String, String)>| async move {
-                    rusternetes_common::latency_trackers::track_storage_latency(
+                    k3rs_common::latency_trackers::track_storage_latency(
                         std::time::Duration::from_millis(7),
                     );
                     if name == "slow" {
@@ -451,7 +451,7 @@ rules:
                 async move { with_audit(cfg, req, next).await }
             }))
             .layer(axum::middleware::from_fn(
-                rusternetes_api_server::apiserver_request_metrics::with_latency_trackers_filter,
+                k3rs_api_server::apiserver_request_metrics::with_latency_trackers_filter,
             ));
         for n in ["fast", "slow"] {
             let resp = app
@@ -514,7 +514,7 @@ rules:
                 async move { with_audit(cfg, req, next).await }
             }))
             .layer(axum::middleware::from_fn(
-                rusternetes_api_server::apiserver_request_metrics::with_latency_trackers_filter,
+                k3rs_api_server::apiserver_request_metrics::with_latency_trackers_filter,
             ));
         let resp = app
             .oneshot(
@@ -547,7 +547,7 @@ rules:
     #[tokio::test]
     async fn failed_response_status_is_recorded() {
         let (resp, ev) = run_status_app(get(|| async {
-            Err::<&str, _>(rusternetes_common::Error::NotFound(
+            Err::<&str, _>(k3rs_common::Error::NotFound(
                 "secrets \"s\" not found".into(),
             ))
         }))
@@ -700,8 +700,8 @@ rules:
     /// (a delete's `Success`) is recorded handler-side.
     #[tokio::test]
     async fn respond_helper_records_the_object() {
-        use rusternetes_api_server::endpoints::handlers::rest::respond;
-        use rusternetes_api_server::registry::rest::RequestContext;
+        use k3rs_api_server::endpoints::handlers::rest::respond;
+        use k3rs_api_server::registry::rest::RequestContext;
         let (resp, ev) = run_policy_app(
             level_policy("RequestResponse", false),
             get(|| async {
@@ -952,7 +952,7 @@ rules:
     #[tokio::test]
     async fn pod_security_outcome_is_recorded_with_the_psa_prefix() {
         let ac = test_ac();
-        let outcome = rusternetes_api_server::admission::PodSecurityOutcome {
+        let outcome = k3rs_api_server::admission::PodSecurityOutcome {
             warnings: vec![],
             audit_annotations: std::collections::BTreeMap::from([
                 ("enforce-policy".to_string(), "baseline:latest".to_string()),
@@ -961,7 +961,7 @@ rules:
         };
         AUDIT_CONTEXT
             .scope(ac.clone(), async {
-                rusternetes_api_server::admission::record_pod_security_audit(&outcome)
+                k3rs_api_server::admission::record_pod_security_audit(&outcome)
             })
             .await;
         let g = ac.inner.lock().unwrap();
@@ -988,7 +988,7 @@ rules:
             sink: cap.clone(),
         };
         let status =
-            rusternetes_common::types::Status::failure("error serving request", "BadRequest", 400);
+            k3rs_common::types::Status::failure("error serving request", "BadRequest", 400);
         let failed = || {
             let mut r = Response::new(Body::empty());
             *r.status_mut() = axum::http::StatusCode::BAD_REQUEST;
@@ -1023,23 +1023,23 @@ rules:
         ev.last().and_then(|e| e.response_object.clone())
     }
 
-    fn list_state() -> Arc<rusternetes_api_server::state::ApiServerState> {
-        use rusternetes_common::auth::TokenManager;
-        use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::StorageBackend;
-        Arc::new(rusternetes_api_server::state::ApiServerState::new(
+    fn list_state() -> Arc<k3rs_api_server::state::ApiServerState> {
+        use k3rs_common::auth::TokenManager;
+        use k3rs_common::observability::MetricsRegistry;
+        use k3rs_storage::StorageBackend;
+        Arc::new(k3rs_api_server::state::ApiServerState::new(
             Arc::new(StorageBackend::new_memory()),
             Arc::new(TokenManager::new(b"test-secret")),
-            Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
-                as Arc<dyn rusternetes_common::authz::Authorizer>,
+            Arc::new(k3rs_common::authz::AlwaysAllowAuthorizer)
+                as Arc<dyn k3rs_common::authz::Authorizer>,
             Arc::new(MetricsRegistry::new()),
             true,
         ))
     }
 
-    fn anon() -> axum::Extension<rusternetes_api_server::middleware::AuthContext> {
-        axum::Extension(rusternetes_api_server::middleware::AuthContext {
-            user: rusternetes_common::auth::UserInfo::anonymous(),
+    fn anon() -> axum::Extension<k3rs_api_server::middleware::AuthContext> {
+        axum::Extension(k3rs_api_server::middleware::AuthContext {
+            user: k3rs_common::auth::UserInfo::anonymous(),
         })
     }
 
@@ -1048,7 +1048,7 @@ rules:
         use axum::extract::{Path, Query, State};
         let state = list_state();
         let obj = list_handler_response_object(get(move || async move {
-            rusternetes_api_server::handlers::deployment::list(
+            k3rs_api_server::handlers::deployment::list(
                 State(state),
                 anon(),
                 Path("ns".to_string()),
@@ -1068,7 +1068,7 @@ rules:
         use axum::extract::{Path, Query, State};
         let state = list_state();
         let obj = list_handler_response_object(get(move || async move {
-            rusternetes_api_server::handlers::secret::list(
+            k3rs_api_server::handlers::secret::list(
                 State(state),
                 anon(),
                 Path("ns".to_string()),
@@ -1087,7 +1087,7 @@ rules:
         use axum::extract::{Path, State};
         let state = list_state();
         let obj = list_handler_response_object(get(move || async move {
-            rusternetes_api_server::handlers::pod::list(
+            k3rs_api_server::handlers::pod::list(
                 State(state),
                 anon(),
                 Path("ns".to_string()),

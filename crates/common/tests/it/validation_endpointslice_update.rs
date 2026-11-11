@@ -1,5 +1,5 @@
-use rusternetes_common::resources::endpointslice::EndpointSlice;
-use rusternetes_common::validation::endpointslice::validate_endpoint_slice_update;
+use k3rs_common::resources::endpointslice::EndpointSlice;
+use k3rs_common::validation::endpointslice::validate_endpoint_slice_update;
 
 fn slice(address_type: &str, addr: &str) -> EndpointSlice {
     serde_json::from_value(serde_json::json!({

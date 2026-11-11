@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::flowcontrol::{
+    pub use k3rs_common::resources::flowcontrol::{
         FlowDistinguisherMethodType, FlowSchema, FlowSchemaCondition, FlowSchemaStatus,
         FlowSchemaSubject, NonResourcePolicyRule, PolicyRulesWithSubjects, ResourcePolicyRule,
         SubjectKind,
     };
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::flowcontrol_bootstrap::{
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::flowcontrol_bootstrap::{
         mandatory_flow_schema, semantic_equal,
     };
-    pub use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+    pub use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
     pub use std::collections::HashSet;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::field::ErrorType;
-    use rusternetes_common::validation::flowschema::*;
+    use k3rs_common::validation::field::ErrorType;
+    use k3rs_common::validation::flowschema::*;
 
     fn cond(type_: &str) -> FlowSchemaCondition {
         FlowSchemaCondition {

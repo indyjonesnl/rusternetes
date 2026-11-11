@@ -1,6 +1,6 @@
-# Rusternetes Examples
+# k3rs Examples
 
-This directory contains example manifests and configurations for testing and demonstrating Rusternetes functionality.
+This directory contains example manifests and configurations for testing and demonstrating k3rs functionality.
 
 ## Directory Structure
 

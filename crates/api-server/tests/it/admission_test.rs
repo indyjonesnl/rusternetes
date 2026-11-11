@@ -7,16 +7,16 @@
 //
 // Full E2E testing happens through the workflow tests that test the pod creation handler.
 
-use rusternetes_api_server::admission::apply_limit_range;
-use rusternetes_api_server::admission::resourcequota::evaluator::PodEvaluator;
-use rusternetes_api_server::admission::resourcequota::{evaluate, Attributes, QuotaError};
-use rusternetes_common::admission::Operation;
-use rusternetes_common::resources::{
+use k3rs_api_server::admission::apply_limit_range;
+use k3rs_api_server::admission::resourcequota::evaluator::PodEvaluator;
+use k3rs_api_server::admission::resourcequota::{evaluate, Attributes, QuotaError};
+use k3rs_common::admission::Operation;
+use k3rs_common::resources::{
     Container, LimitRange, LimitRangeItem, LimitRangeSpec, Pod, PodSpec, ResourceQuota,
     ResourceQuotaSpec,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -210,9 +210,9 @@ async fn test_quota_rejects_when_exceeding_pod_count() {
 
 // ===== DefaultStorageClass admission tests =====
 
-use rusternetes_api_server::admission::set_default_storage_class;
-use rusternetes_common::resources::volume::ResourceRequirements;
-use rusternetes_common::resources::{
+use k3rs_api_server::admission::set_default_storage_class;
+use k3rs_common::resources::volume::ResourceRequirements;
+use k3rs_common::resources::{
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimSpec, StorageClass,
 };
 
@@ -381,9 +381,9 @@ async fn test_default_storage_class_beta_annotation() {
 // controller. These mirror test/e2e/apimachinery/limit_range.go (release-1.35).
 // ===========================================================================
 
-use rusternetes_api_server::admission::{apply_limit_range_with, limit_ranger_validate_pvc};
-use rusternetes_common::resources::volume::ResourceRequirements as PvcResourceRequirements;
-use rusternetes_common::types::ResourceRequirements as PodResourceRequirements;
+use k3rs_api_server::admission::{apply_limit_range_with, limit_ranger_validate_pvc};
+use k3rs_common::resources::volume::ResourceRequirements as PvcResourceRequirements;
+use k3rs_common::types::ResourceRequirements as PodResourceRequirements;
 
 const LR_NS: &str = "limitrange-e2e";
 
@@ -720,7 +720,7 @@ fn pod_with_requests(name: &str, namespace: &str, requests: &[(&str, &str)]) -> 
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     pod.spec.as_mut().unwrap().containers[0].resources =
-        Some(rusternetes_common::types::ResourceRequirements {
+        Some(k3rs_common::types::ResourceRequirements {
             requests: Some(map),
             limits: None,
             claims: None,
@@ -759,7 +759,7 @@ async fn put_quota_used(
         hard.keys().map(|k| (k.clone(), "0".to_string())).collect();
     recorded.extend(used.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     let used = recorded;
-    quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
+    quota.status = Some(k3rs_common::resources::ResourceQuotaStatus {
         hard: Some(hard),
         used: Some(used),
     });
@@ -839,7 +839,7 @@ async fn quota_charges_init_container_peak() {
     init.name = "init".to_string();
     let mut init_reqs = HashMap::new();
     init_reqs.insert("memory".to_string(), "4Gi".to_string());
-    init.resources = Some(rusternetes_common::types::ResourceRequirements {
+    init.resources = Some(k3rs_common::types::ResourceRequirements {
         requests: Some(init_reqs),
         limits: None,
         claims: None,
@@ -1030,7 +1030,7 @@ async fn quota_constraints_pods_only_quota_imposes_nothing() {
 /// and a synced one constrains what its status says.
 #[tokio::test]
 async fn quota_constraints_read_status_hard_not_spec_hard() {
-    use rusternetes_common::resources::ResourceQuotaStatus;
+    use k3rs_common::resources::ResourceQuotaStatus;
 
     let storage = Arc::new(MemoryStorage::new());
     let none = create_minimal_pod("p", "test-namespace");
@@ -1148,7 +1148,7 @@ async fn quota_without_status_used_is_refused() {
             scope_selector: None,
         },
     );
-    quota.status = Some(rusternetes_common::resources::ResourceQuotaStatus {
+    quota.status = Some(k3rs_common::resources::ResourceQuotaStatus {
         hard: Some(hard),
         used: None,
     });

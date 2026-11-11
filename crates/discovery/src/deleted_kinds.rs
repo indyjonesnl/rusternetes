@@ -19,7 +19,7 @@
 //! `Test_RemoveUnavailableKinds` and `Test_shouldRemoveResource`.
 
 use crate::kube_version::compare_kube_aware_version_strings;
-use rusternetes_common::feature_gates::Version;
+use k3rs_common::feature_gates::Version;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The lifecycle facts upstream reads off a versioned object. `None` means the

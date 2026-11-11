@@ -5,7 +5,7 @@
 //! (`FilterSpecByPathsWithoutSideEffects`, `mergeSpecs`, `mergedGVKs`,
 //! `walkOnAllReferences`).
 
-use rusternetes_api_server::kube_openapi::{
+use k3rs_api_server::kube_openapi::{
     filter_spec_by_paths_without_side_effects, merge_specs,
     merge_specs_ignore_path_conflict_renaming_definitions_and_parameters, walk_on_all_references,
 };

@@ -4,8 +4,8 @@
 //! used by the HorizontalPodAutoscaler and other consumers of custom.metrics.k8s.io
 
 use anyhow::{Context, Result};
+use k3rs_common::label_selector::{LabelOperator, LabelSelector};
 use prometheus_http_query::Client;
-use rusternetes_common::label_selector::{LabelOperator, LabelSelector};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +21,7 @@ fn promql_string(v: &str) -> String {
 
 /// Map a metric label selector onto PromQL series matchers.
 ///
-/// Rusternetes-only (there is no in-tree Prometheus provider upstream; the
+/// k3rs-only (there is no in-tree Prometheus provider upstream; the
 /// custom-metrics-apiserver library hands the parsed `labels.Selector` to the
 /// provider, `pkg/provider/interfaces.go`). Semantics follow
 /// `labels.Requirement.Matches` (apimachinery selector.go): `in`/`notin` are
@@ -466,7 +466,7 @@ pub struct ExternalSeries {
 
 /// The labels an `ExternalMetricValue` carries for a Prometheus sample. The
 /// `__name__` label is the metric name, which `ExternalMetricValue.metricName`
-/// already reports (Rusternetes-only Prometheus mapping; the upstream test
+/// already reports (k3rs-only Prometheus mapping; the upstream test
 /// adapter has no Prometheus).
 pub fn external_series_from_sample(
     metric: &HashMap<String, String>,

@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Pod;
+    pub use k3rs_common::resources::Pod;
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_kubelet::labels::*;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_kubelet::labels::*;
 
     fn pod_with(name: &str, namespace: Option<&str>, uid: &str) -> Pod {
         Pod {

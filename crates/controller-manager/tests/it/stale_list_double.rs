@@ -26,7 +26,7 @@
 //! Two knobs, one per shape of lag. Both are opt-in so each test states exactly
 //! what it models; everything else passes through to `MemoryStorage`.
 
-use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
+use k3rs_storage::{memory::MemoryStorage, Storage, WatchStream};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -87,7 +87,7 @@ impl Default for StaleListStorage {
 
 #[async_trait::async_trait]
 impl Storage for StaleListStorage {
-    async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+    async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
@@ -111,39 +111,36 @@ impl Storage for StaleListStorage {
                     meta.remove("deletionTimestamp");
                 }
             }
-            out.push(
-                serde_json::from_value(item).map_err(rusternetes_common::Error::Serialization)?,
-            );
+            out.push(serde_json::from_value(item).map_err(k3rs_common::Error::Serialization)?);
         }
         Ok(out)
     }
 
-    async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.create(key, value).await
     }
 
-    async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+    async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
     where
         T: serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.get(key).await
     }
 
-    async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         if self.reject_deletion_timestamp_stamps {
-            let new =
-                serde_json::to_value(value).map_err(rusternetes_common::Error::Serialization)?;
+            let new = serde_json::to_value(value).map_err(k3rs_common::Error::Serialization)?;
             let stored: serde_json::Value = self.inner.get(key).await?;
             if new.pointer("/metadata/deletionTimestamp").is_some()
                 && stored.pointer("/metadata/deletionTimestamp").is_none()
             {
-                return Err(rusternetes_common::Error::InvalidResource(
+                return Err(k3rs_common::Error::InvalidResource(
                     "metadata.deletionTimestamp: field is immutable".to_string(),
                 ));
             }
@@ -156,37 +153,33 @@ impl Storage for StaleListStorage {
         key: &str,
         subresource: &str,
         value: &T,
-    ) -> rusternetes_common::Result<T>
+    ) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.update_subresource(key, subresource, value).await
     }
 
-    async fn update_status<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn update_status<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.update_status(key, value).await
     }
 
-    async fn update_raw(
-        &self,
-        key: &str,
-        value: &serde_json::Value,
-    ) -> rusternetes_common::Result<()> {
+    async fn update_raw(&self, key: &str, value: &serde_json::Value) -> k3rs_common::Result<()> {
         self.inner.update_raw(key, value).await
     }
 
-    async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
         self.inner.delete(key).await
     }
 
-    async fn delete_gracefully(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn delete_gracefully(&self, key: &str) -> k3rs_common::Result<()> {
         self.inner.delete_gracefully(key).await
     }
 
-    async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+    async fn watch(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
         self.inner.watch(prefix).await
     }
 
@@ -194,15 +187,15 @@ impl Storage for StaleListStorage {
         &self,
         prefix: &str,
         revision: i64,
-    ) -> rusternetes_common::Result<WatchStream> {
+    ) -> k3rs_common::Result<WatchStream> {
         self.inner.watch_from_revision(prefix, revision).await
     }
 
-    async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+    async fn current_revision(&self) -> k3rs_common::Result<i64> {
         self.inner.current_revision().await
     }
 
-    async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+    async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
         self.inner.is_revision_compacted(revision).await
     }
 }

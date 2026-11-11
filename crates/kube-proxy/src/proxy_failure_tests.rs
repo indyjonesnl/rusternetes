@@ -2,16 +2,15 @@
 //! pkg/proxy/iptables/proxier.go:1497-1506,1521-1522. Retrying identical state
 //! must attempt the dataplane again rather than reporting a cached success.
 use super::*;
-use rusternetes_storage::memory::MemoryStorage;
+use k3rs_storage::memory::MemoryStorage;
 use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
 async fn failed_sync_is_not_cached() {
-    if std::env::var_os("RUSTERNETES_TEST_SYNC_FAILURE").is_none() {
+    if std::env::var_os("K3RS_TEST_SYNC_FAILURE").is_none() {
         // Run in a child so PATH isolation cannot affect other tests. Both
         // binaries are failing scripts: this test never invokes host iptables.
-        let directory =
-            std::env::temp_dir().join(format!("rusternetes-3477-sync-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("k3rs-3477-sync-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         for binary in ["iptables", "iptables-restore"] {
             let path = directory.join(binary);
@@ -24,7 +23,7 @@ async fn failed_sync_is_not_cached() {
                 "proxy::failure_tests::failed_sync_is_not_cached",
                 "--nocapture",
             ])
-            .env("RUSTERNETES_TEST_SYNC_FAILURE", "1")
+            .env("K3RS_TEST_SYNC_FAILURE", "1")
             .env("PATH", &directory)
             .status()
             .unwrap();

@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use cel::common::ast::{EntryExpr, Expr, IdedExpr, LiteralValue};
-    pub use rusternetes_common::feature_gates::{self, Feature};
+    pub use k3rs_common::feature_gates::{self, Feature};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cel_authz::*;
-    use rusternetes_common::feature_gates::with_feature;
+    use k3rs_common::cel_authz::*;
+    use k3rs_common::feature_gates::with_feature;
     use serial_test::serial;
 
     /// compile_test.go `TestCompileCELExpression`.

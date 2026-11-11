@@ -2,9 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project goal — k3s (Go) → Rusternetes (Rust)
+## Project goal — k3s (Go) → k3rs (Rust)
 
-Rusternetes is a Rust rewrite of **k3s**: Kubernetes release-1.35 packaged as a
+k3rs is a Rust rewrite of **k3s**: Kubernetes release-1.35 packaged as a
 lightweight, single-binary distribution, with the in-tree cloud provider
 implementations (AWS, GCP, Azure) dropped. Conformance is unchanged: the target
 is still the full CNCF conformance suite (Hydrophone / Sonobuoy), which k3s
@@ -32,7 +32,7 @@ vendors".
 
 ## Upstream-first — port, do NOT reinvent (MANDATORY)
 
-Rusternetes reimplements k3s, and so the Kubernetes it vendors. **Almost every behavior you need already
+k3rs reimplements k3s, and so the Kubernetes it vendors. **Almost every behavior you need already
 exists in a battle-tested upstream implementation.** Before designing ANY
 non-trivial logic — an authorizer rule, a bootstrap step, a controller loop, a
 validation, a CRI/CNI/CSI call sequence, a default, an error string, a status
@@ -46,7 +46,7 @@ wrong defaults, broken invariants) that only surface as failing tests later.
 
 ### The gate (MUST — this is a precondition, not advice)
 
-**You MUST NOT write new behavioural logic in Rusternetes without first
+**You MUST NOT write new behavioural logic in k3rs without first
 locating and citing the upstream implementation of that behaviour.** If you
 cannot name the upstream file and symbol, you have not finished looking — go
 look. "I could not find it" is a search result to report, not a licence to
@@ -107,7 +107,7 @@ re-derivation that happens to agree. Where Rust idiom differs (ownership,
 7. **Cite it.** In the code comment and the commit/PR, name the upstream file
    (and ideally the symbol/line) you ported from. Reviewers verify against it.
 8. **Only invent when upstream genuinely has no equivalent** (a Rust-specific
-   concern, a Rusternetes-only feature). Say so explicitly when you do — and if
+   concern, a k3rs-only feature). Say so explicitly when you do — and if
    you deviate deliberately, say that too, with the reason.
 
 ### Worked example — a value looked up, a topology not
@@ -182,7 +182,7 @@ failing batch must report. Neither is inferable from the implementation alone.
   for api-server, kubelet, scheduler, controller-manager, kube-proxy, RBAC,
   validation, bootstrap policy, conformance expectations. Pinned to the target
   version.
-- **`../k3s`** — k3s `v1.35.9+k3s1`, the distribution Rusternetes is a Rust
+- **`../k3s`** — k3s `v1.35.9+k3s1`, the distribution k3rs is a Rust
   rewrite of. Source of truth for packaging, bundled addons, the embedded
   cloud-controller (`pkg/cloudprovider`: node metadata + ServiceLB), datastore
   wiring and server/agent bootstrap. Clone with
@@ -209,7 +209,7 @@ cargo build --release          # Release build
 
 # Test
 cargo test                     # All workspace tests
-cargo test -p rusternetes-api-server  # Single crate
+cargo test -p k3rs-api-server  # Single crate
 cargo test test_name           # Single test by name
 cargo test test_name -- --nocapture  # With stdout
 
@@ -224,11 +224,11 @@ make pre-commit                # Format + clippy + test (run before commits)
 # the bind-mount host dirs so a fresh checkout works with no manual chown:
 bash scripts/cluster-up.sh                       # SQLite (default); --backend etcd|redis
 
-# Manual bring-up. IMPORTANT: pre-create .rusternetes/manifests (and volumes)
+# Manual bring-up. IMPORTANT: pre-create .k3rs/manifests (and volumes)
 # BEFORE `compose up` — otherwise the daemon creates the bind-mount source as
 # root and bootstrap-cluster.sh fails to template static-pod YAML into it (#1152).
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
-mkdir -p .rusternetes/manifests .rusternetes/certs "$KUBELET_VOLUMES_PATH"
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
+mkdir -p .k3rs/manifests .k3rs/certs "$KUBELET_VOLUMES_PATH"
 podman compose build           # Build images (~1 hour first build, faster with cache)
 podman compose up -d           # Start cluster (etcd, default)
 podman compose down            # Stop cluster
@@ -248,7 +248,7 @@ bash scripts/conformance-progress.sh  # Monitor pass/fail progress
 # e2e output is in /tmp/sonobuoy/results/e2e.log inside the e2e container
 ```
 
-KUBECONFIG: `~/.kube/rusternetes-config`
+KUBECONFIG: `~/.kube/k3rs-config`
 
 ### Local build performance
 
@@ -259,7 +259,7 @@ crate* on the big crates (api-server, ~9400-line router). For local iteration,
 building a test/container image, or any functional (non-shipped) binary, use:
 
 ```bash
-make build-fast ARGS="-p rusternetes-api-server --bin api-server --features sqlite"
+make build-fast ARGS="-p k3rs-api-server --bin api-server --features sqlite"
 ```
 
 `build-fast` uses the `release-fast` profile (`codegen-units = 16`, `lto = off`)
@@ -316,7 +316,7 @@ Rust reimplementation of k3s (Kubernetes without in-tree cloud providers). Works
 - **`kube-proxy`** - iptables-based service routing. Runs in host network mode. Reads both Endpoints and EndpointSlices.
 - **`scheduler`** - Pod scheduling with affinity, taints/tolerations, priority/preemption. Plugins in `src/plugins/`.
 - **`kubectl`** - CLI tool. Commands in `src/commands/`.
-- **`rusternetes`** - All-in-one binary. Spawns api-server, scheduler, controller-manager, kubelet, and kube-proxy as concurrent tokio tasks sharing one `StorageBackend`. Defaults to embedded SQLite. Supports `--storage-backend redis --redis-url redis://host:6379` for Redis via rhino.
+- **`k3rs`** - All-in-one binary. Spawns api-server, scheduler, controller-manager, kubelet, and kube-proxy as concurrent tokio tasks sharing one `StorageBackend`. Defaults to embedded SQLite. Supports `--storage-backend redis --redis-url redis://host:6379` for Redis via rhino.
 
 ## Key Conventions
 
@@ -381,10 +381,10 @@ When working across multiple branches (rebases, cherry-picks, parallel work), re
 Services: etcd/rhino/redis, api-server (port 6443 with TLS), scheduler, controller-manager, 2x kubelet (node-1, node-2), kube-proxy (host network).
 
 ### All-in-one (compose.all-in-one.yml / compose.all-in-one-redis.yml)
-Single `rusternetes` binary container + optional Redis container. All components run as tokio tasks in one process. No kube-proxy (disabled, no iptables in container).
+Single `k3rs` binary container + optional Redis container. All components run as tokio tasks in one process. No kube-proxy (disabled, no iptables in container).
 
 ### Common
-- TLS certs in `.rusternetes/certs/`, generated by `scripts/generate-certs.sh`
+- TLS certs in `.k3rs/certs/`, generated by `scripts/generate-certs.sh`
 - Cert SANs must include bridge IPs (172.18.0.2-5, 10.89.0.x)
 - kube-proxy needs `CAP_NET_ADMIN` for iptables; runs host network mode
 - `KUBERNETES_SERVICE_HOST_OVERRIDE` env var sets the API server address for pods

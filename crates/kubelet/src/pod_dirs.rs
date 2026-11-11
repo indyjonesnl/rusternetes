@@ -76,13 +76,13 @@ pub fn escape_qualified_name(name: &str) -> String {
     name.replace('/', "~")
 }
 
-/// Rusternetes-specific: the plugin segment used only to *locate* (cleanup,
+/// k3rs-specific: the plugin segment used only to *locate* (cleanup,
 /// resync) a volume no plugin claims (nfs, iscsi, …). Since #3262 such a volume
 /// is never provisioned: `create_volume` fails like upstream's
 /// `FindPluginBySpec` (`pkg/volume/plugins.go:659`) instead of creating an
-/// empty directory under this segment. The `rusternetes.io/` prefix keeps it
+/// empty directory under this segment. The `k3rs.io/` prefix keeps it
 /// from colliding with a real `kubernetes.io/` plugin.
-pub const UNSUPPORTED_PLUGIN: &str = "rusternetes.io/unsupported";
+pub const UNSUPPORTED_PLUGIN: &str = "k3rs.io/unsupported";
 
 /// `<root>/pods` — `getPodsDir` (`kubelet_getters.go:60-62`).
 pub fn get_pods_dir(root: &str) -> PathBuf {

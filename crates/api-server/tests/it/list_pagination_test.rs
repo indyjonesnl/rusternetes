@@ -15,7 +15,7 @@
 //!      no continue token.
 //!   4. `?limit=0` — returns all items (upstream contract: `limit=0` is
 //!      "no chunking", not "empty page"). Pinned as the upstream
-//!      behaviour rusternetes is expected to match.
+//!      behaviour k3rs is expected to match.
 //!   5. `?limit=N` + `resourceVersion=<old>` — pagination chain is
 //!      consistent at the snapshot resourceVersion.
 //!   6. `?continue=<malformed>` — must return a `Status` body with HTTP
@@ -37,12 +37,12 @@
 //! pagination wiring are marked `#[ignore = "blocked on issue #TBD: ..."]`
 //! until the handler adopts the pattern from
 //! `crates/api-server/src/handlers/pod.rs` (or `podtemplate.rs`). The
-//! pagination *primitive* (`rusternetes_common::paginate` and
+//! pagination *primitive* (`k3rs_common::paginate` and
 //! `Storage::list_paginated`) is implemented and unit-tested elsewhere; this
 //! file is the wire-level contract pin.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::options::*;
+    use k3rs_kubectl::commands::options::*;
 
     #[test]
     fn test_execute_succeeds() {

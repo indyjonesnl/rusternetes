@@ -1,6 +1,6 @@
 //! Unit tests for Pod QoS class determination.
 //!
-//! These tests pin the behaviour of [`rusternetes_kubelet::eviction::get_qos_class`],
+//! These tests pin the behaviour of [`k3rs_kubelet::eviction::get_qos_class`],
 //! which mirrors upstream Kubernetes' `ComputePodQOS` in
 //! <https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/helper/qos/qos.go>
 //! (test suite at
@@ -19,10 +19,10 @@
 //!   but the pod does not qualify as Guaranteed.
 //! - **BestEffort** – no container has any resource requests or limits.
 
-use rusternetes_common::resources::{Container, EphemeralContainer, PodSpec};
-use rusternetes_common::resources::{Pod, PodStatus};
-use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-use rusternetes_kubelet::eviction::{get_qos_class, QoSClass};
+use k3rs_common::resources::{Container, EphemeralContainer, PodSpec};
+use k3rs_common::resources::{Pod, PodStatus};
+use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+use k3rs_kubelet::eviction::{get_qos_class, QoSClass};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ fn best_effort_multiple_containers_no_resources() {
 
 /// Resource-less init containers leave a BestEffort pod BestEffort.
 ///
-/// This is the one init-container scenario where Rusternetes and upstream
+/// This is the one init-container scenario where k3rs and upstream
 /// agree: when the init containers carry no resources there is nothing to fold
 /// into the QoS calculation, so both classify the pod BestEffort.
 #[test]
@@ -303,7 +303,7 @@ fn guaranteed_app_containers_with_guaranteed_init_containers() {
 /// This matches upstream: `GetPodQOS` in
 /// `pkg/apis/core/v1/helper/qos/qos.go` iterates only regular and init
 /// containers; ephemeral containers are excluded by design (they are also
-/// forbidden from declaring resources in the API). Rusternetes likewise
+/// forbidden from declaring resources in the API). k3rs likewise
 /// excludes them.
 #[test]
 fn guaranteed_unaffected_by_ephemeral_containers() {

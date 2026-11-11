@@ -4,28 +4,28 @@
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
     pub use chrono::Datelike;
+    pub use k3rs_common::resources::KeyUsage;
     pub use rcgen::{
         Certificate, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose,
         IsCa, KeyPair, KeyUsagePurpose,
     };
-    pub use rusternetes_common::resources::KeyUsage;
 }
 
 mod tests {
     use super::__parent::*;
+    use k3rs_controller_manager::controllers::cert_authority::*;
     use rcgen::{BasicConstraints, CertificateParams, DnType, KeyPair};
-    use rusternetes_controller_manager::controllers::cert_authority::*;
     use x509_parser::prelude::*;
     // Disambiguate from `x509_parser::prelude::KeyUsage` (a different type that
     // the glob above also brings into scope).
-    use rusternetes_common::resources::KeyUsage;
+    use k3rs_common::resources::KeyUsage;
 
     /// Generate a self-signed CA, returning `(cert_pem, key_pem)`.
     fn make_ca() -> (String, String) {
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params
             .distinguished_name
-            .push(DnType::CommonName, "rusternetes-test-ca");
+            .push(DnType::CommonName, "k3rs-test-ca");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let key = KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();

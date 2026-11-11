@@ -6,7 +6,7 @@
 # Removes:
 #   * compose stack inside the dind (compose down -v)
 #   * the dind container itself
-#   * .rusternetes/agents/N/                (kept unless --purge)
+#   * .k3rs/agents/N/                (kept unless --purge)
 
 set -euo pipefail
 
@@ -33,8 +33,8 @@ agent_banner "tearing down (purge=${PURGE})"
 if docker inspect "$DIND_NAME" >/dev/null 2>&1; then
   # Best-effort compose down — the dind may be unhealthy already.
   docker exec -w /workspace \
-    -e COMPOSE_PROJECT_NAME=rusternetes \
-    -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/agents/${AGENT_ID}/kubelet-volumes \
+    -e COMPOSE_PROJECT_NAME=k3rs \
+    -e KUBELET_VOLUMES_PATH=/workspace/.k3rs/agents/${AGENT_ID}/kubelet-volumes \
     "$DIND_NAME" \
     docker compose -f compose.yml down -v 2>/dev/null || true
   docker rm -f "$DIND_NAME" >/dev/null
@@ -50,7 +50,7 @@ if [[ "$PURGE" -eq 1 ]]; then
   # host. The current shell can't unlink them without sudo — pay for a
   # throwaway alpine container that does have root to wipe the tree.
   if [[ -d "$AGENT_ARTIFACT_DIR" ]]; then
-    docker run --rm -v "${AGENT_WORKDIR}/.rusternetes/agents:/data" alpine \
+    docker run --rm -v "${AGENT_WORKDIR}/.k3rs/agents:/data" alpine \
       rm -rf "/data/${AGENT_ID}" >/dev/null
   fi
 fi

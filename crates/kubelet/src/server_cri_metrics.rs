@@ -25,7 +25,7 @@ use axum::{
     routing::any,
     Router,
 };
-use rusternetes_cri::{v1, CriClient};
+use k3rs_cri::{v1, CriClient};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -173,7 +173,7 @@ async fn scrape(state: &State, cri: &mut CriClient) -> String {
     let collector = {
         let mut guard = state.collector.lock().await;
         if guard.is_none() {
-            let req = rusternetes_cri::with_deadline(v1::ListMetricDescriptorsRequest {}, timeout);
+            let req = k3rs_cri::with_deadline(v1::ListMetricDescriptorsRequest {}, timeout);
             match cri.runtime().list_metric_descriptors(req).await {
                 Ok(r) => {
                     *guard = Some(Arc::new(CriMetricsCollector::new(
@@ -188,7 +188,7 @@ async fn scrape(state: &State, cri: &mut CriClient) -> String {
     let Some(collector) = collector else {
         return String::new();
     };
-    let req = rusternetes_cri::with_deadline(v1::ListPodSandboxMetricsRequest {}, timeout);
+    let req = k3rs_cri::with_deadline(v1::ListPodSandboxMetricsRequest {}, timeout);
     match cri.runtime().list_pod_sandbox_metrics(req).await {
         Ok(r) => collector.render(&r.into_inner().pod_metrics),
         Err(e) => {

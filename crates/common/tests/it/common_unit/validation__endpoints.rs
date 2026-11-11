@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::equality::semantic_equal;
-    pub use rusternetes_common::resources::endpoints::{EndpointAddress, EndpointPort, Endpoints};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_label;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::equality::semantic_equal;
+    pub use k3rs_common::resources::endpoints::{EndpointAddress, EndpointPort, Endpoints};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_label;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
     pub use std::net::IpAddr;
@@ -15,8 +15,8 @@ mod __parent {
 
 mod port_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::endpoints::*;
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_common::validation::endpoints::*;
+    use k3rs_common::validation::field::ErrorType;
 
     fn ep(subsets: serde_json::Value) -> Endpoints {
         serde_json::from_value(serde_json::json!({

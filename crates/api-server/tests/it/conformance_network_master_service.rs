@@ -14,10 +14,8 @@
 //! a fixed address instead of the discovered interface IP, then issues the
 //! upstream client calls through the router. Neither case needs kube-proxy.
 
-use rusternetes_api_server::bootstrap::{
-    reconcile_kubernetes_endpoint, reconcile_kubernetes_service,
-};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::bootstrap::{reconcile_kubernetes_endpoint, reconcile_kubernetes_service};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::Value;
 use std::collections::BTreeSet;
 

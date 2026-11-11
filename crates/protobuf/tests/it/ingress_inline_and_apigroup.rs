@@ -4,7 +4,7 @@
 //!   rule itself, not under an `ingressRuleValue` key.
 //! * `IngressClassParametersReference.APIGroup` has the JSON tag `apiGroup`;
 //!   `aPIGroup` is only the proto field name.
-use rusternetes_protobuf::PROTO_REGISTRY;
+use k3rs_protobuf::PROTO_REGISTRY;
 use serde_json::json;
 
 #[test]

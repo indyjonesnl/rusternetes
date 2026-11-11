@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::csi_translation::{
+    pub use k3rs_common::csi_translation::{
         CsiTranslator, AWS_EBS_IN_TREE_PLUGIN_NAME, GCE_PD_IN_TREE_PLUGIN_NAME,
     };
-    pub use rusternetes_common::resources::pod::Volume;
-    pub use rusternetes_common::resources::PersistentVolume;
+    pub use k3rs_common::resources::pod::Volume;
+    pub use k3rs_common::resources::PersistentVolume;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::csi_migration::*;
+    use k3rs_common::csi_migration::*;
 
     fn inline(v: serde_json::Value) -> Volume {
         serde_json::from_value(v).unwrap()

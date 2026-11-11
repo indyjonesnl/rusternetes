@@ -3,7 +3,7 @@
 //!
 //! Upstream authorizes once, from the request's `RequestInfo`
 //! (`filters/authorization.go:57-99`, `GetAuthorizerAttributes` :101-153);
-//! the registry never authorizes the request again. Rusternetes handlers still
+//! the registry never authorizes the request again. k3rs handlers still
 //! build their own attributes. Before a handler's check can be dropped, the
 //! attributes it builds must equal what the filter derived for the same
 //! request. This test drives every route in `router.rs` (scraped from the
@@ -17,12 +17,10 @@
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{
-    AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
-};
-use rusternetes_common::Result;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::Result;
+use k3rs_test_support::harness::TestApiServer;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,7 +69,7 @@ impl Authorizer for Recorder {
         &self,
         u: &UserInfo,
         ns: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
         self.inner.get_user_rules_outcome(u, ns).await
     }
 }
@@ -318,8 +316,8 @@ impl Authorizer for AllowOnly {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -392,9 +390,9 @@ async fn fixed_divergences_are_not_denied_by_the_handler() {
             None => (*uri, None),
         };
         let m: axum::http::Method = method.parse().unwrap();
-        let info = rusternetes_api_server::audit::request_info(&m, path, query);
+        let info = k3rs_api_server::audit::request_info(&m, path, query);
         let expected = key(
-            &rusternetes_api_server::authorization_filter::get_authorizer_attributes(
+            &k3rs_api_server::authorization_filter::get_authorizer_attributes(
                 UserInfo::anonymous(),
                 &info,
             ),
@@ -423,8 +421,8 @@ impl Authorizer for DenyAll {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 

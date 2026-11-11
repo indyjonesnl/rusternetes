@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use rusternetes_common::resources::ConfigMap;
-use rusternetes_storage::{build_key, Storage, StorageBackend, WatchEvent};
+use k3rs_common::resources::ConfigMap;
+use k3rs_storage::{build_key, Storage, StorageBackend, WatchEvent};
 use tracing::{info, warn};
 
 use crate::registry::apiextensions::customresourcedefinition::ItemExponentialFailureRateLimiter;
@@ -92,11 +92,11 @@ pub enum Synced {
 
 pub fn new_config_map(now: DateTime<Utc>) -> ConfigMap {
     let mut cm = ConfigMap {
-        type_meta: rusternetes_common::types::TypeMeta {
+        type_meta: k3rs_common::types::TypeMeta {
             kind: "ConfigMap".to_string(),
             api_version: "v1".to_string(),
         },
-        metadata: rusternetes_common::types::ObjectMeta::new(CONFIG_MAP_NAME)
+        metadata: k3rs_common::types::ObjectMeta::new(CONFIG_MAP_NAME)
             .with_namespace(CONFIG_MAP_NAMESPACE.to_string()),
         data: Some(
             [(CONFIG_MAP_DATA_KEY.to_string(), format_date(now))]
@@ -116,8 +116,8 @@ pub async fn sync_config_map(
     storage: &StorageBackend,
     now: DateTime<Utc>,
     limiter: &mut CreationLimiter,
-) -> rusternetes_common::Result<Synced> {
-    use rusternetes_common::Error;
+) -> k3rs_common::Result<Synced> {
+    use k3rs_common::Error;
     let key = build_key("configmaps", Some(CONFIG_MAP_NAMESPACE), CONFIG_MAP_NAME);
     let existing = match storage.get::<ConfigMap>(&key).await {
         Ok(cm) => Some(cm),

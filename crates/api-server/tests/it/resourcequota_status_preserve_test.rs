@@ -6,8 +6,8 @@
 //! an empty status) cannot clobber `used`/`hard`. This mirrors the symmetric
 //! `/status` strategy fixed in #268.
 
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // Thin shim over the shared harness: returns just the JSON body (this file

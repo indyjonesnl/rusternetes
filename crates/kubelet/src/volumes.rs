@@ -8,10 +8,8 @@
 //! identical to when this code lived inline in `runtime.rs`.
 
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{
-    ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod,
-};
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::resources::{ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod};
+use k3rs_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -112,8 +110,8 @@ const VOLUME_GID_ANNOTATION_KEY: &str = "pv.beta.kubernetes.io/gid";
 #[derive(Clone)]
 pub struct VolumeManager {
     pub volumes_base_path: String,
-    pub storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-    pub token_manager: rusternetes_common::auth::TokenManager,
+    pub storage: Option<Arc<k3rs_storage::StorageBackend>>,
+    pub token_manager: k3rs_common::auth::TokenManager,
     /// The node's `status.allocatable`, used to default an unset downwardAPI
     /// `limits.*` the way upstream `defaultPodLimitsForDownwardAPI`
     /// (`pkg/kubelet/kubelet_resources.go:43-47`) does. Seeded from the same
@@ -158,9 +156,9 @@ pub struct VolumeManager {
     pub iscsi_plugin: Arc<crate::volume_plugins::iscsi::IscsiPlugin>,
     /// `csiMigratedPluginManager` of `desiredStateOfWorldPopulator`
     /// (`desired_state_of_world_populator.go:131`).
-    pub csi_migrated_plugin_manager: rusternetes_common::csi_migration::PluginManager,
+    pub csi_migrated_plugin_manager: k3rs_common::csi_migration::PluginManager,
     /// `intreeToCSITranslator` of `desiredStateOfWorldPopulator` (`:132`).
-    pub intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator,
+    pub intree_to_csi_translator: k3rs_common::csi_translation::CsiTranslator,
     /// The kubelet's one `ActualStateOfWorld` (`volumeManager.actualStateOfWorld`,
     /// `pkg/kubelet/volumemanager/volume_manager.go`), as far as the CSI
     /// device-unmount sweep uses it. Staged devices are reconstructed into it
@@ -205,7 +203,7 @@ pub struct MountedVolume {
 /// (`pkg/kubelet/volumemanager/populator/desired_state_of_world_populator.go:461`,
 /// `:588`). An `ephemeral` volume carries no such flag (`:432-441` builds the
 /// claim source from the generated name alone), so it is false.
-pub fn pvc_read_only(volume: &rusternetes_common::resources::Volume) -> bool {
+pub fn pvc_read_only(volume: &k3rs_common::resources::Volume) -> bool {
     volume
         .persistent_volume_claim
         .as_ref()
@@ -256,8 +254,8 @@ impl VolumeManager {
     /// `ContainerRuntime` already carries.
     pub fn new(
         volumes_base_path: String,
-        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-        token_manager: rusternetes_common::auth::TokenManager,
+        storage: Option<Arc<k3rs_storage::StorageBackend>>,
+        token_manager: k3rs_common::auth::TokenManager,
     ) -> Self {
         Self::new_with_pod_certificate_manager(volumes_base_path, storage, token_manager, None)
     }
@@ -267,8 +265,8 @@ impl VolumeManager {
     /// (`kubeletVolumeHost.podCertificateManager`, `pkg/kubelet/volume_host.go:86`).
     pub fn new_with_pod_certificate_manager(
         volumes_base_path: String,
-        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-        token_manager: rusternetes_common::auth::TokenManager,
+        storage: Option<Arc<k3rs_storage::StorageBackend>>,
+        token_manager: k3rs_common::auth::TokenManager,
         pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     ) -> Self {
         Self::new_inner(
@@ -286,8 +284,8 @@ impl VolumeManager {
     #[doc(hidden)]
     pub fn new_with_recording_empty_dir_mounts(
         volumes_base_path: String,
-        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-        token_manager: rusternetes_common::auth::TokenManager,
+        storage: Option<Arc<k3rs_storage::StorageBackend>>,
+        token_manager: k3rs_common::auth::TokenManager,
     ) -> Self {
         Self::new_inner(
             volumes_base_path,
@@ -304,8 +302,8 @@ impl VolumeManager {
     #[doc(hidden)]
     pub fn new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
         volumes_base_path: String,
-        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-        token_manager: rusternetes_common::auth::TokenManager,
+        storage: Option<Arc<k3rs_storage::StorageBackend>>,
+        token_manager: k3rs_common::auth::TokenManager,
         pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
     ) -> Self {
         Self::new_inner(
@@ -319,8 +317,8 @@ impl VolumeManager {
 
     fn new_inner(
         volumes_base_path: String,
-        storage: Option<Arc<rusternetes_storage::StorageBackend>>,
-        token_manager: rusternetes_common::auth::TokenManager,
+        storage: Option<Arc<k3rs_storage::StorageBackend>>,
+        token_manager: k3rs_common::auth::TokenManager,
         pod_certificate_manager: Option<Arc<dyn crate::podcertificate::Manager>>,
         empty_dir_mount_deps: Option<crate::volume_plugins::empty_dir::EmptyDirMountDeps>,
     ) -> Self {
@@ -400,7 +398,7 @@ impl VolumeManager {
                     false,
                 ),
             csi_migrated_plugin_manager: Default::default(),
-            intree_to_csi_translator: rusternetes_common::csi_translation::CsiTranslator::new(),
+            intree_to_csi_translator: k3rs_common::csi_translation::CsiTranslator::new(),
             // `NewActualStateOfWorld(nodeName, volumePluginMgr)`; rebuilt with
             // the real node name by [`VolumeManager::with_node_name`].
             asw: Arc::new(
@@ -484,11 +482,11 @@ impl VolumeManager {
     pub fn create_volume_spec(
         &self,
         pod_namespace: &str,
-        volume: &rusternetes_common::resources::Volume,
+        volume: &k3rs_common::resources::Volume,
         pv: Option<&PersistentVolume>,
         read_only: bool,
     ) -> Result<crate::volume_plugins::OwnedSpec> {
-        use rusternetes_common::csi_migration::{translate_in_tree_spec_to_csi, VolumeSpec};
+        use k3rs_common::csi_migration::{translate_in_tree_spec_to_csi, VolumeSpec};
         let spec = VolumeSpec {
             volume: pv.is_none().then(|| volume.clone()),
             persistent_volume: pv.cloned(),
@@ -531,7 +529,7 @@ impl VolumeManager {
     pub fn mount_attributes(
         &self,
         pod: &Pod,
-        container: &rusternetes_common::resources::Container,
+        container: &k3rs_common::resources::Container,
     ) -> HashMap<String, crate::cri_runtime::translate::MountAttrs> {
         let mut out = HashMap::new();
         let mut mounted = self.mounted.lock().unwrap();
@@ -1243,10 +1241,7 @@ impl VolumeManager {
     /// directory under the pod dir (they resolve to a path elsewhere on the
     /// host), so an unmatched PVC/ephemeral volume correctly falls back to
     /// `UNSUPPORTED_PLUGIN` here too.
-    pub fn plugin_name_for_volume(
-        &self,
-        volume: &rusternetes_common::resources::Volume,
-    ) -> &'static str {
+    pub fn plugin_name_for_volume(&self, volume: &k3rs_common::resources::Volume) -> &'static str {
         let spec = crate::volume_plugins::Spec {
             volume,
             persistent_volume: None,
@@ -1365,7 +1360,7 @@ impl VolumeManager {
     pub async fn resolve_persistent_volume(
         &self,
         pod: &Pod,
-        volume: &rusternetes_common::resources::Volume,
+        volume: &k3rs_common::resources::Volume,
     ) -> Result<Option<PersistentVolume>> {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
@@ -1438,11 +1433,11 @@ impl VolumeManager {
                 if !pvc_exists {
                     // Create the PVC from the template
                     let mut pvc = PersistentVolumeClaim {
-                        type_meta: rusternetes_common::types::TypeMeta {
+                        type_meta: k3rs_common::types::TypeMeta {
                             kind: "PersistentVolumeClaim".to_string(),
                             api_version: "v1".to_string(),
                         },
-                        metadata: rusternetes_common::types::ObjectMeta::new(&pvc_name)
+                        metadata: k3rs_common::types::ObjectMeta::new(&pvc_name)
                             .with_namespace(namespace),
                         spec: pvc_template.spec.clone(),
                         status: None,
@@ -1529,7 +1524,7 @@ impl VolumeManager {
     pub async fn create_volume(
         &self,
         pod: &Pod,
-        volume: &rusternetes_common::resources::Volume,
+        volume: &k3rs_common::resources::Volume,
     ) -> Result<String> {
         // persistentVolumeClaim / ephemeral resolve to a PersistentVolume
         // first; the PV's source then selects the plugin. Returns `None` for
@@ -1614,9 +1609,9 @@ impl VolumeManager {
             // `og.recorder`: the kubelet's event recorder over the same API
             // the volumes are read through.
             self.storage.as_ref().map(|s| {
-                crate::volume_plugins::plugin::MounterRecorder(
-                    rusternetes_storage::EventRecorder::new(s.clone()),
-                )
+                crate::volume_plugins::plugin::MounterRecorder(k3rs_storage::EventRecorder::new(
+                    s.clone(),
+                ))
             }),
             Some(mount_state),
         )
@@ -1771,12 +1766,12 @@ impl VolumeManager {
     pub async fn expand_in_use_volume(
         &self,
         volume_to_mount: &crate::volume_plugins::util::operation_executor::VolumeToMount,
-        current_size: rusternetes_common::quantity::Quantity,
+        current_size: k3rs_common::quantity::Quantity,
     ) -> Result<()> {
         let Some(storage) = self.storage.as_ref() else {
             return Ok(());
         };
-        let recorder = rusternetes_storage::EventRecorder::new(storage.clone());
+        let recorder = k3rs_storage::EventRecorder::new(storage.clone());
         let og = crate::volume_plugins::util::operation_generator::OperationGenerator {
             volume_plugin_mgr: &self.plugin_mgr,
             kube_client: storage.as_ref(),
@@ -1829,7 +1824,7 @@ impl VolumeManager {
         plugin: &dyn crate::volume_plugins::plugin::VolumePlugin,
         owned: crate::volume_plugins::plugin::OwnedSpec,
         pod: &Pod,
-        volume: &rusternetes_common::resources::Volume,
+        volume: &k3rs_common::resources::Volume,
     ) -> Result<crate::volume_plugins::util::operation_executor::VolumeToMount> {
         use crate::volume_manager::cache::desired_state_of_world::get_unique_volume_name_for_pod;
         let pod_name = crate::volume_plugins::util::get_unique_pod_name(pod);

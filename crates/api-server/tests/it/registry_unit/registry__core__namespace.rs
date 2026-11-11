@@ -3,32 +3,30 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::registry::generic::{
-        CreateOptions, Deleted, Store, UpdateOptions,
-    };
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject,
         ValidateObjectUpdate,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-    pub use rusternetes_common::resources::{Namespace, NamespaceSpec, NamespaceStatus};
-    pub use rusternetes_common::types::{DeletionPropagation, Phase};
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::namespace::{
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::deletion::{DeleteOptions, Preconditions};
+    pub use k3rs_common::resources::{Namespace, NamespaceSpec, NamespaceStatus};
+    pub use k3rs_common::types::{DeletionPropagation, Phase};
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::namespace::{
         validate_namespace, validate_namespace_finalize_update, validate_namespace_status_update,
         validate_namespace_update,
     };
-    pub use rusternetes_common::Result;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::Result;
+    pub use k3rs_storage::StorageBackend;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::namespace::*;
+    use k3rs_api_server::registry::core::namespace::*;
 
     fn ns(json: serde_json::Value) -> Namespace {
         let mut ns: Namespace = serde_json::from_value(json).unwrap();

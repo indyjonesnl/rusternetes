@@ -1,7 +1,7 @@
 # Upstream conformance timing baseline
 
 Per-spec conformance timings for **upstream Kubernetes v1.35.0**, measured so
-Rusternetes timings can be read as a *ratio* rather than an absolute. A spec
+k3rs timings can be read as a *ratio* rather than an absolute. A spec
 that is slow on both is slow by design; a spec that is slow only here is ours
 to fix.
 
@@ -21,7 +21,7 @@ Same harness on both sides — only the implementation under test differs:
 | runner | `scripts/conformance-tags-run.sh --parallel 4` (two-phase split) |
 | box | otherwise idle — a competing run inverts the conclusion |
 
-`--skip-preflight` is required against kind: the gate inspects Rusternetes
+`--skip-preflight` is required against kind: the gate inspects k3rs
 containers by name.
 
 ## Upstream results
@@ -43,9 +43,9 @@ Two failures, both environmental rather than upstream defects:
 
 ## What the ratio showed
 
-Against a Rusternetes phase-1 run on the same 406 specs:
+Against a k3rs phase-1 run on the same 406 specs:
 
-| | upstream | Rusternetes | ratio |
+| | upstream | k3rs | ratio |
 |---|---|---|---|
 | phase 1 wall | 22.7 min | 95 min | **4.2x** |
 | phase 1 spec time | 81.0 min | 371.1 min | **4.6x** |
@@ -56,10 +56,10 @@ Against a Rusternetes phase-1 run on the same 406 specs:
 api-machinery 96.6 min, node 67.5, network 49.3, apps 32.1, storage 30.0,
 cli 9.7, auth 3.1, scheduling 1.2, instrumentation 0.6.
 
-Phase 2 is roughly at **parity** (upstream 36.7 min; a previous Rusternetes
+Phase 2 is roughly at **parity** (upstream 36.7 min; a previous k3rs
 phase-2 measurement was 38m01s). Its slowest specs wait by design — API
 chunking 598 s, SchedulerPredicates 304 s, suspended CronJob 300 s — so the
-serial phase is not where Rusternetes loses time. Phase 1 is.
+serial phase is not where k3rs loses time. Phase 1 is.
 
 ## Findings worth keeping
 

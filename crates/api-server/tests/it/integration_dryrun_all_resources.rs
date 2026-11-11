@@ -61,8 +61,8 @@
 //! identifying which GVR / verb regressed.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

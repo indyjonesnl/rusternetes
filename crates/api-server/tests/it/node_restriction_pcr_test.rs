@@ -6,16 +6,16 @@
 //! The feature-gate-disabled case (`admission.go:821-823`) has no counterpart:
 //! the resource is only served when the gate is on.
 
-use rusternetes_api_server::handlers::node_restriction::{
+use k3rs_api_server::handlers::node_restriction::{
     admit_pod_certificate_request, MIRROR_POD_ANNOTATION_KEY,
 };
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-use rusternetes_common::resources::{Node, Pod, ServiceAccount};
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_common::Error;
-use rusternetes_middleware::AuthContext;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+use k3rs_common::resources::{Node, Pod, ServiceAccount};
+use k3rs_common::types::ObjectMeta;
+use k3rs_common::Error;
+use k3rs_middleware::AuthContext;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use serde_json::json;
 use std::collections::HashMap;
 

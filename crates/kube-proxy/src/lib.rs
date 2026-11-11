@@ -6,10 +6,10 @@ pub mod service_health;
 pub mod svc_maps;
 
 use futures::StreamExt;
+use k3rs_client::http::ApiClient;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_storage::{Storage, StorageBackend, WorkQueue, RECONCILE_ALL_SENTINEL};
 use proxy::KubeProxy;
-use rusternetes_client::http::ApiClient;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_storage::{Storage, StorageBackend, WorkQueue, RECONCILE_ALL_SENTINEL};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -93,10 +93,7 @@ async fn run_proxy<S: Storage + Send + Sync + 'static>(
     config: KubeProxyConfig,
     diagnostics: serve_metrics::DiagnosticsOptions,
 ) -> anyhow::Result<()> {
-    info!(
-        "Starting Rusternetes Kube-proxy for node: {}",
-        config.node_name
-    );
+    info!("Starting k3rs Kube-proxy for node: {}", config.node_name);
 
     // iptables invocation is blocking; offload to a worker thread so the runtime
     // is not stalled even briefly during startup.
@@ -192,7 +189,7 @@ async fn run_loop<S: Storage + Send + Sync + 'static>(
         tokio::spawn(async move {
             loop {
                 match node_storage
-                    .list::<rusternetes_common::resources::Node>("/registry/nodes/")
+                    .list::<k3rs_common::resources::Node>("/registry/nodes/")
                     .await
                 {
                     Ok(nodes) => {
@@ -242,7 +239,7 @@ async fn run_loop<S: Storage + Send + Sync + 'static>(
     // SIGTERM is what `docker stop` (and Kubernetes pod termination) sends.
     // Without an explicit handler, tokio just lets the process get killed
     // and the IptablesManager::Drop never runs — leaving the host's
-    // iptables polluted with RUSTERNETES-* chains and jump rules.
+    // iptables polluted with K3RS-* chains and jump rules.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("install SIGTERM handler");
 

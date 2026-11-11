@@ -20,11 +20,9 @@
 
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::{EventSource, EventType, PersistentVolumeClaim};
-use rusternetes_storage::{
-    build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue,
-};
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::{EventSource, EventType, PersistentVolumeClaim};
+use k3rs_storage::{build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -186,7 +184,7 @@ impl<S: Storage + 'static> VolumeDataSourceValidator<S> {
             .await
         {
             Ok(p) => p,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         self.sync_pvc(&pvc).await

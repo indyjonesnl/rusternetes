@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::csi::VolumeAttributesClass;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::volumeattributesclass::{
+use k3rs_common::resources::csi::VolumeAttributesClass;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::volumeattributesclass::{
     validate_volume_attributes_class, validate_volume_attributes_class_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

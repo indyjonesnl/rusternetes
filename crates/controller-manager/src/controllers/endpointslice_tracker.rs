@@ -9,7 +9,7 @@
 //! informer cache, and this controller reads slices straight from storage
 //! rather than through a lagging cache, so the condition cannot arise.
 
-use rusternetes_common::resources::EndpointSlice;
+use k3rs_common::resources::EndpointSlice;
 use std::collections::HashMap;
 use std::sync::Mutex;
 

@@ -4,29 +4,29 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use futures::StreamExt;
-    pub use rusternetes_common::csi_migration::{
+    pub use k3rs_common::csi_migration::{
         translate_in_tree_spec_to_csi, PluginManager, VolumeSpec,
     };
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::csi::CSIDriver;
-    pub use rusternetes_common::resources::pod::{PodSecurityContext, SELinuxOptions, Volume};
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::csi::CSIDriver;
+    pub use k3rs_common::resources::pod::{PodSecurityContext, SELinuxOptions, Volume};
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+    pub use k3rs_common::resources::{
         EventSource, EventType, PersistentVolume, PersistentVolumeClaim, Pod,
     };
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_common::Error;
-    pub use rusternetes_controller_manager::controllers::ephemeral_volume::{
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_common::Error;
+    pub use k3rs_controller_manager::controllers::ephemeral_volume::{
         volume_claim_name, volume_is_for_pod,
     };
-    pub use rusternetes_controller_manager::controllers::selinux_warning::cache::{
+    pub use k3rs_controller_manager::controllers::selinux_warning::cache::{
         Conflict, ObjectName, VolumeCache, VolumeLabelCache, SELINUX_CHANGE_POLICY_MOUNT_OPTION,
         SELINUX_CHANGE_POLICY_RECURSIVE,
     };
-    pub use rusternetes_controller_manager::controllers::selinux_warning::translator::ControllerSELinuxTranslator;
-    pub use rusternetes_storage::{
+    pub use k3rs_controller_manager::controllers::selinux_warning::translator::ControllerSELinuxTranslator;
+    pub use k3rs_storage::{
         build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
     };
     pub use std::collections::{BTreeSet, HashMap};
@@ -41,10 +41,10 @@ mod tests {
     //! cases the controller depends on.
 
     use super::__parent::*;
-    use rusternetes_common::feature_gates::with_feature;
-    use rusternetes_common::resources::Event;
-    use rusternetes_controller_manager::controllers::selinux_warning::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::feature_gates::with_feature;
+    use k3rs_common::resources::Event;
+    use k3rs_controller_manager::controllers::selinux_warning::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::{json, Value};
     use serial_test::serial;
     use std::collections::HashMap;

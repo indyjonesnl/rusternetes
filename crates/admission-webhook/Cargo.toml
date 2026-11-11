@@ -1,17 +1,17 @@
 [package]
-name = "rusternetes-admission-webhook"
+name = "k3rs-admission-webhook"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_admission_webhook"
+name = "k3rs_admission_webhook"
 path = "src/lib.rs"
 
 [dependencies]
-rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
+k3rs-common = { path = "../common" }
+k3rs-storage = { path = "../storage" }
 serde_json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
@@ -25,6 +25,6 @@ prometheus.workspace = true
 rand = "0.9"
 
 [dev-dependencies]
-rusternetes-storage = { path = "../storage" }
+k3rs-storage = { path = "../storage" }
 axum.workspace = true
 chrono.workspace = true

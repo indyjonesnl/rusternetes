@@ -1,10 +1,10 @@
 //! Tests for RBAC validation (port of upstream `pkg/apis/rbac/validation`).
 
-use rusternetes_common::resources::rbac::{
+use k3rs_common::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::rbac::{
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::rbac::{
     default_cluster_role_binding, default_role_binding, validate_cluster_role,
     validate_cluster_role_binding, validate_role, validate_role_binding,
 };

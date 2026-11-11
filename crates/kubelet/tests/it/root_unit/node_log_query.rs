@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use chrono::{DateTime, FixedOffset, SecondsFormat};
+    pub use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
     pub use regex::Regex;
-    pub use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
     pub use std::fs::File;
     pub use std::io::{self, Read, Write};
     pub use std::path::{Component, PathBuf};
@@ -15,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::node_log_query::*;
+    use k3rs_kubelet::node_log_query::*;
 
     fn q(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

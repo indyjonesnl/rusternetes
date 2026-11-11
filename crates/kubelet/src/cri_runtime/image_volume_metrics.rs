@@ -4,9 +4,9 @@
 //! the `ImageVolume` gate at `:1300-1304`) and `incrementImageVolumeMetrics`
 //! (`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1745-1763`).
 
+use k3rs_common::feature_gates::{enabled, Feature};
+use k3rs_common::resources::pod::Container;
 use prometheus::{IntCounter, Opts};
-use rusternetes_common::feature_gates::{enabled, Feature};
-use rusternetes_common::resources::pod::Container;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Once};
 
@@ -89,8 +89,8 @@ pub fn increment_image_volume_metrics<V>(
 /// a CRI error, the error text otherwise.
 pub fn grpc_message(err: &anyhow::Error) -> String {
     for cause in err.chain() {
-        if let Some(rusternetes_cri::CriError::Rpc { source, .. }) =
-            cause.downcast_ref::<rusternetes_cri::CriError>()
+        if let Some(k3rs_cri::CriError::Rpc { source, .. }) =
+            cause.downcast_ref::<k3rs_cri::CriError>()
         {
             return source.message().to_string();
         }

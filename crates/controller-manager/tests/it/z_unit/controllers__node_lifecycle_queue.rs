@@ -13,7 +13,7 @@ mod tests {
     //! Ported from
     //! `pkg/controller/nodelifecycle/scheduler/rate_limited_queue_test.go`.
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::node_lifecycle_queue::*;
+    use k3rs_controller_manager::controllers::node_lifecycle_queue::*;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     fn unix(secs: i64) -> DateTime<Utc> {

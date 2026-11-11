@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::ConfigMap;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::ConfigMap;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::ConfigMap;
-    use rusternetes_common::validation::configmap::*;
+    use k3rs_common::resources::ConfigMap;
+    use k3rs_common::validation::configmap::*;
     use std::collections::HashMap;
 
     fn cm() -> ConfigMap {
         ConfigMap {
             type_meta: Default::default(),
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "cm".to_string(),
                 namespace: Some("default".to_string()),
                 resource_version: Some("1".to_string()),

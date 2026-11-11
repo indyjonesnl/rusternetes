@@ -8,7 +8,7 @@
 //! (`staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go`).
 //! The bystander (unlabelled) object must be dropped by the filter.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn names(body: &Value) -> Vec<String> {
@@ -95,8 +95,8 @@ async fn node_metrics_list_honours_label_selector() {
 
 /// Publish a kubelet-style (label-less) NodeMetrics sample for `name`.
 async fn publish_node_sample(api: &TestApiServer, name: &str) {
-    use rusternetes_storage::Storage;
-    let sample: rusternetes_common::resources::NodeMetrics = serde_json::from_value(json!({
+    use k3rs_storage::Storage;
+    let sample: k3rs_common::resources::NodeMetrics = serde_json::from_value(json!({
         "apiVersion": "metrics.k8s.io/v1beta1",
         "kind": "NodeMetrics",
         "metadata": {"name": name},
@@ -168,8 +168,8 @@ async fn node_metrics_get_without_sample_is_not_found() {
 
 /// Publish a kubelet-style (label-less) PodMetrics sample for `ns/name`.
 async fn publish_pod_sample(api: &TestApiServer, ns: &str, name: &str) {
-    use rusternetes_storage::Storage;
-    let sample: rusternetes_common::resources::PodMetrics = serde_json::from_value(json!({
+    use k3rs_storage::Storage;
+    let sample: k3rs_common::resources::PodMetrics = serde_json::from_value(json!({
         "apiVersion": "metrics.k8s.io/v1beta1",
         "kind": "PodMetrics",
         "metadata": {"name": name, "namespace": ns},

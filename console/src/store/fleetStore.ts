@@ -39,6 +39,6 @@ export const useFleetStore = create<FleetState>()(
           activeClusterId: s.activeClusterId === id ? "local" : s.activeClusterId,
         })),
     }),
-    { name: "rusternetes-fleet" },
+    { name: "k3rs-fleet" },
   ),
 );

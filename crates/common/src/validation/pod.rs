@@ -4943,7 +4943,7 @@ pub fn validate_pod_dns_config(
         ));
     }
     // NOTE: upstream additionally runs `IsValidIPForLegacyField` per
-    // nameserver. That helper isn't ported to rusternetes yet — DNS IP
+    // nameserver. That helper isn't ported to k3rs yet — DNS IP
     // validation lands with the upstream "legacy IP" port (see
     // pkg/apis/core/validation/validation.go::IsValidIPForLegacyField). The
     // current handler accepts any string here, which preserves prior

@@ -8,9 +8,9 @@
 
 use crate::authorization_match_conditions::{CelMatcher, WebhookMatchCondition};
 use crate::authorizer::{AUTHORIZATION_MODE_CHOICES, MODE_WEBHOOK};
-use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
-use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::metav1::is_dns1123_subdomain;
+use k3rs_common::go_duration::{format_go_duration, parse_go_duration};
+use k3rs_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::metav1::is_dns1123_subdomain;
 use std::collections::BTreeSet;
 
 /// `AuthorizerType` `Webhook` (types.go).

@@ -4,7 +4,7 @@
 #![cfg(feature = "sqlite")]
 
 use futures::StreamExt;
-use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
+use k3rs_storage::{Storage, StorageBackend, StorageConfig};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -29,12 +29,12 @@ async fn bus_and_native_feeds_both_see_write() {
     let _: serde_json::Value = storage.create(key, &obj).await.unwrap();
 
     let via_bus = internal.next().await.unwrap().unwrap();
-    assert!(matches!(via_bus, rusternetes_storage::WatchEvent::Added(ref k, _) if k == key));
+    assert!(matches!(via_bus, k3rs_storage::WatchEvent::Added(ref k, _) if k == key));
 
     let via_native = tokio::time::timeout(std::time::Duration::from_secs(5), native.next())
         .await
         .expect("native feed delivered within 5s")
         .unwrap()
         .unwrap();
-    assert!(matches!(via_native, rusternetes_storage::WatchEvent::Added(ref k, _) if k == key));
+    assert!(matches!(via_native, k3rs_storage::WatchEvent::Added(ref k, _) if k == key));
 }

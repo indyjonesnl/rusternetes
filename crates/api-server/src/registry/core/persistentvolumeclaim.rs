@@ -5,17 +5,17 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::volume::{
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::volume::{
     PersistentVolumeClaimSpec, TypedLocalObjectReference, TypedObjectReference,
 };
-use rusternetes_common::resources::{PersistentVolumeClaim, PersistentVolumeClaimStatus};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::pvc::{
+use k3rs_common::resources::{PersistentVolumeClaim, PersistentVolumeClaimStatus};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::pvc::{
     validate_persistent_volume_claim, validate_persistent_volume_claim_status_update,
     validate_persistent_volume_claim_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -51,8 +51,8 @@ fn drop_disabled_fields(
         .and_then(|r| r.namespace.as_deref())
         .is_some_and(|ns| !ns.is_empty());
     let ref_in_use = old.is_some_and(|o| o.data_source_ref.is_some());
-    if !rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+    if !k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
     ) && cross_namespace
         && !ref_in_use
     {

@@ -1,4 +1,4 @@
-# A rusternetes node, kind-style: containerd (CRI + crun + CNI) AND the kubelet
+# A k3rs node, kind-style: containerd (CRI + crun + CNI) AND the kubelet
 # in one container, so the kubelet and the runtime share a filesystem (required
 # for Calico's hostPath CNI install and for pod hostPath volumes to resolve).
 #
@@ -8,7 +8,7 @@
 # Both image refs are ARGs so the build can point at whatever tags exist (the
 # compose build tags them per project).
 ARG KUBELET_IMAGE=isolated-work-kubelet:latest
-ARG CONTAINERD_IMAGE=rusternetes-containerd:latest
+ARG CONTAINERD_IMAGE=k3rs-containerd:latest
 
 FROM ${KUBELET_IMAGE} AS kubeletbin
 
@@ -25,7 +25,7 @@ RUN apt-get update \
 # Pod networking comes from Calico (installed by its DaemonSet into
 # /etc/cni/net.d + /opt/cni/bin at runtime), so drop the standalone bridge conf
 # the containerd image ships — otherwise both configs would race.
-RUN rm -f /etc/cni/net.d/10-rusternetes.conflist
+RUN rm -f /etc/cni/net.d/10-k3rs.conflist
 
 COPY deploy/node/entrypoint.sh /usr/local/bin/node-entrypoint.sh
 RUN chmod +x /usr/local/bin/node-entrypoint.sh

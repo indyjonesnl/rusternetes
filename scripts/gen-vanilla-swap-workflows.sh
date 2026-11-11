@@ -58,7 +58,7 @@ $GENERATED_MARKER
 name: vanilla-swap-$module
 
 # Independent single-module vanilla-swap run: an UNMODIFIED upstream Kubernetes
-# cluster (kind) with exactly ONE rusternetes component — $module — swapped in,
+# cluster (kind) with exactly ONE k3rs component — $module — swapped in,
 # then the test subset scoped to that component. Nightly runs refresh the
 # $module badge; workflow_dispatch runs it on demand.
 # All logic lives in the reusable .github/workflows/vanilla-swap-module.yml engine.
@@ -68,7 +68,7 @@ on:
   workflow_dispatch:
     inputs:
       image-tag:
-        description: "GHCR rusternetes image tag to swap in (default main)."
+        description: "GHCR k3rs image tag to swap in (default main)."
         required: false
         default: main
       k8s-version:

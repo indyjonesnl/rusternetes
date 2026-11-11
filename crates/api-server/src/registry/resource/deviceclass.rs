@@ -9,15 +9,13 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::DeviceClass;
-use rusternetes_common::validation::deviceclass::{
-    validate_device_class, validate_device_class_update,
-};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::resources::DeviceClass;
+use k3rs_common::validation::deviceclass::{validate_device_class, validate_device_class_update};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

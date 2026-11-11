@@ -1,6 +1,6 @@
-# Rūsternetes Console
+# k3rs Console
 
-The rusternetes console is a web-based cluster management dashboard served directly from the API server. It provides real-time topology visualization, live metrics, pod log streaming, and full resource management — with zero external dependencies.
+The k3rs console is a web-based cluster management dashboard served directly from the API server. It provides real-time topology visualization, live metrics, pod log streaming, and full resource management — with zero external dependencies.
 
 ## Accessing the Console
 
@@ -202,7 +202,7 @@ For LoadBalancer services on bare-metal clusters (no cloud provider), configure 
 
 ### CNI Plugins
 
-Rusternetes implements the standard CNI specification. On Linux with network namespace support, you can use third-party CNI plugins:
+k3rs implements the standard CNI specification. On Linux with network namespace support, you can use third-party CNI plugins:
 - **Calico** — BGP-based networking with full NetworkPolicy support
 - **Cilium** — eBPF-based high-performance networking
 - **Flannel** — simple overlay networking
@@ -236,13 +236,13 @@ Shows what the cluster supports:
 
 ### Default StorageClass
 
-Rusternetes bootstraps a `standard` StorageClass on startup with the `rusternetes.io/hostpath` provisioner. When you create a PVC referencing this class, the Dynamic Provisioner controller automatically creates a PV backed by a host directory.
+k3rs bootstraps a `standard` StorageClass on startup with the `k3rs.io/hostpath` provisioner. When you create a PVC referencing this class, the Dynamic Provisioner controller automatically creates a PV backed by a host directory.
 
 ### How to Create a StorageClass
 
 1. Click **+ StorageClass** on the Storage page
 2. **Name**: e.g., `fast-storage`
-3. **Provisioner**: choose `rusternetes.io/hostpath` (auto-provisions directories) or `kubernetes.io/no-provisioner` (manual PV binding)
+3. **Provisioner**: choose `k3rs.io/hostpath` (auto-provisions directories) or `kubernetes.io/no-provisioner` (manual PV binding)
 4. **Reclaim Policy**: `Delete` or `Retain`
 5. **Volume Binding Mode**: `WaitForFirstConsumer` (recommended — binds when a pod actually uses it) or `Immediate`
 6. Click **Create StorageClass**
@@ -259,7 +259,7 @@ Success message appears at the top of the page. The new class appears in the Sto
 6. **Access Mode**: ReadWriteOnce (RWO), ReadOnlyMany (ROX), or ReadWriteMany (RWX)
 7. Click **Create PVC**
 
-If the selected StorageClass has a dynamic provisioner (like `rusternetes.io/hostpath`), a PV is automatically created and the PVC transitions from Pending → Bound. Without a provisioner, the PVC stays Pending until you manually create a matching PV.
+If the selected StorageClass has a dynamic provisioner (like `k3rs.io/hostpath`), a PV is automatically created and the PVC transitions from Pending → Bound. Without a provisioner, the PVC stays Pending until you manually create a matching PV.
 
 ### PVC Lifecycle
 
@@ -287,7 +287,7 @@ Reference the PVC name in your pod spec:
 
 ### Volume Snapshots and Expansion
 
-Rusternetes supports volume snapshots (point-in-time copies) and online volume expansion (resize PVCs without downtime). Create VolumeSnapshot resources via **Explore All > VolumeSnapshots** or the JSON editor.
+k3rs supports volume snapshots (point-in-time copies) and online volume expansion (resize PVCs without downtime). Create VolumeSnapshot resources via **Explore All > VolumeSnapshots** or the JSON editor.
 
 ---
 
@@ -301,7 +301,7 @@ The Nodes page shows every node in the cluster with real-time resource utilizati
 - **Name** (clickable → detail view) and **Ready/NotReady** status badge
 - **Role badges** (e.g., "control-plane") from `node-role.kubernetes.io/` labels
 - **"cordoned"** badge if the node is marked unschedulable
-- **Version** — kubelet version (e.g., v1.35.0-rusternetes)
+- **Version** — kubelet version (e.g., v1.35.0-k3rs)
 - **OS/Architecture** — e.g., linux/amd64
 - **Pod count** — number of pods scheduled to this node
 - **Age** — how long the node has been registered
@@ -400,9 +400,9 @@ By default, `--skip-auth` is enabled — all requests are treated as admin with 
 
 1. **Generate RSA signing keys** for JWT token signing:
    ```bash
-   mkdir -p .rusternetes/certs
-   openssl genrsa -out .rusternetes/certs/sa.key 2048
-   openssl rsa -in .rusternetes/certs/sa.key -pubout -out .rusternetes/certs/sa.pub
+   mkdir -p .k3rs/certs
+   openssl genrsa -out .k3rs/certs/sa.key 2048
+   openssl rsa -in .k3rs/certs/sa.key -pubout -out .k3rs/certs/sa.pub
    ```
 
 2. **Create an admin ServiceAccount** (while still in skip-auth mode):
@@ -428,14 +428,14 @@ By default, `--skip-auth` is enabled — all requests are treated as admin with 
 
    TOKEN=$(kubectl get secret cluster-admin-token -n kube-system \
      -o jsonpath='{.data.token}' | base64 -d)
-   kubectl config set-credentials rusternetes-admin --token="$TOKEN"
+   kubectl config set-credentials k3rs-admin --token="$TOKEN"
    ```
 
 4. **Restart without `--skip-auth`** — edit `docker-compose.yml` to replace the `--skip-auth` line with `--authorization-mode=Node,RBAC` (the default mode is `AlwaysAllow`), rebuild, and redeploy the API server.
 
 5. **Verify**: `curl -k https://localhost:6443/api/v1/pods` should return 401 Unauthorized.
 
-For the console in auth mode, set the token in the browser: `sessionStorage.setItem('rusternetes-token', '<TOKEN>')`.
+For the console in auth mode, set the token in the browser: `sessionStorage.setItem('k3rs-token', '<TOKEN>')`.
 
 ### TLS and mTLS
 
@@ -543,7 +543,7 @@ Click any resource name to see:
 
 ## Custom Resource Definitions (CRDs)
 
-CRDs let you extend the Kubernetes API with your own resource types. Rusternetes supports the full CRD lifecycle:
+CRDs let you extend the Kubernetes API with your own resource types. k3rs supports the full CRD lifecycle:
 
 - **Create a CRD** via kubectl or the JSON editor — defines a new resource type with its own API group, version, kind, schema, and subresources
 - **Auto-discovery** — the Resource Explorer discovers new CRDs within 5 minutes (discovery cache TTL)
@@ -592,7 +592,7 @@ When utilization is very low (< 1%), the gauge shows one decimal place (e.g., `0
 
 ## Multi-Cluster (Fleet Mode)
 
-The console supports managing multiple rusternetes clusters from a single browser tab.
+The console supports managing multiple k3rs clusters from a single browser tab.
 
 ### Enable Fleet Mode
 
@@ -632,7 +632,7 @@ The dropdown is populated live from the cluster's namespace list. Namespace filt
 ### Console shows "Loading..." forever
 - Check that the API server is running: `curl -k https://localhost:6443/healthz`
 - Check browser developer console for errors (F12 > Console tab)
-- If using auth, ensure a valid token is in sessionStorage: `sessionStorage.getItem('rusternetes-token')`
+- If using auth, ensure a valid token is in sessionStorage: `sessionStorage.getItem('k3rs-token')`
 
 ### Console shows stale data
 - The namespace filter may be set to a specific namespace — check the dropdown in the header

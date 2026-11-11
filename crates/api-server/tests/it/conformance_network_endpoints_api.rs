@@ -23,7 +23,7 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "endpoints-e2e";

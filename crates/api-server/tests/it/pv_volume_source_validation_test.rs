@@ -14,7 +14,7 @@
 //! (`:8701-8714`) requires `required` and hands it to `ValidateNodeSelector`
 //! (`:5034-5048`). This test is the wire-level contract for that port.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// A PV spec with the always-required scalars filled in, plus `source` merged

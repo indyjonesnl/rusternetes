@@ -15,7 +15,7 @@
 //! `{"apiVersion","kind","metadata"}` only, so it cannot see a field inside a
 //! status (#1939).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// Whatever the answer is, it must not be the decoder's: a 400 here means the

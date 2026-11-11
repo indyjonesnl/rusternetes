@@ -10,11 +10,11 @@ use super::replicaset::{
 use crate::controllers::worker_pool::spawn_workers;
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::{
+use k3rs_common::{
     resources::{Pod, PodStatus, ReplicationController, ReplicationControllerCondition},
     types::{label_selector_as_selector, ObjectMeta, OwnerReference, Phase, Selector},
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
@@ -64,7 +64,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         }
     }
 
-    pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
+    pub async fn run(self: Arc<Self>) -> k3rs_common::Result<()> {
         info!("ReplicationController controller started (watch-based)");
 
         let queue = WorkQueue::named("replicationmanager");
@@ -168,11 +168,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
 
     /// One pod watch event through the informer handlers: `addPod`,
     /// `updatePod` or `deletePod`, whichever the pod cache says it is.
-    pub async fn enqueue_owner_rc(
-        &self,
-        queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
-    ) {
+    pub async fn enqueue_owner_rc(&self, queue: &WorkQueue, event: &k3rs_storage::WatchEvent) {
         if let Some(observation) = self.pod_informer.cache().on_event(event) {
             self.apply_observation(queue, &observation).await;
         }
@@ -243,7 +239,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     /// then sync every object once. The informer step is what lowers the
     /// expectations for pods created by an earlier pass, as the pod watch's
     /// Added events do in [`Self::run`] (replica_set.go:436).
-    pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
+    pub async fn reconcile_all(&self) -> k3rs_common::Result<()> {
         debug!("Reconciling all replicationcontrollers");
         self.relist_pods(&WorkQueue::new()).await;
 
@@ -266,7 +262,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
     pub async fn reconcile_rc(
         &self,
         rc: &ReplicationController,
-    ) -> rusternetes_common::Result<Option<Duration>> {
+    ) -> k3rs_common::Result<Option<Duration>> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let rc_key = format!("{}/{}", namespace, rc.metadata.name);
 
@@ -457,7 +453,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         // status update (replica_set.go:772-774): the error requeues the key
         // with rate-limited backoff (see `worker`).
         if let Some(e) = manage_error {
-            return Err(rusternetes_common::Error::Internal(e));
+            return Err(k3rs_common::Error::Internal(e));
         }
 
         // Plan the next availability check (replica_set.go:775-788).
@@ -587,7 +583,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                     // The informer will not observe this deletion
                     // (replica_set.go:679-686).
                     self.expectations.deletion_observed_of(&rc_key, pod_key);
-                    if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                    if !matches!(e, k3rs_common::Error::NotFound(_)) {
                         manage_error.get_or_insert_with(|| e.to_string());
                     }
                 }
@@ -621,7 +617,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             .iter()
             .map(|c| RelatedSet {
                 metadata: &c.metadata,
-                selector: rusternetes_common::types::LabelSelector {
+                selector: k3rs_common::types::LabelSelector {
                     match_labels: c.spec.selector.clone(),
                     match_expressions: None,
                 },
@@ -665,7 +661,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         selector: &Selector,
         mut all_pods: Vec<Pod>,
         namespace: &str,
-    ) -> rusternetes_common::Result<Vec<Pod>> {
+    ) -> k3rs_common::Result<Vec<Pod>> {
         #[allow(clippy::needless_range_loop)]
         for i in 0..all_pods.len() {
             let pod = &all_pods[i];
@@ -748,11 +744,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         Ok(all_pods)
     }
 
-    async fn create_pod(
-        &self,
-        rc: &ReplicationController,
-        _index: i32,
-    ) -> rusternetes_common::Result<()> {
+    async fn create_pod(&self, rc: &ReplicationController, _index: i32) -> k3rs_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
 
         // Name is generated per attempt below, so a collision can be retried
@@ -784,10 +776,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         // DefaultTolerationSeconds admission (#442): controllers bypass the
         // api-server admission path that adds these NoExecute tolerations.
         let mut pod_spec = rc.spec.template.spec.clone();
-        rusternetes_common::tolerations::add_default_tolerations(&mut pod_spec);
+        k3rs_common::tolerations::add_default_tolerations(&mut pod_spec);
 
         let mut pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -821,10 +813,10 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         // bypass that admission path; mirrors the ReplicaSet wiring — upstream
         // Go's RC controller IS the ReplicaSet controller via adapters.
         if let Some(spec) = pod.spec.as_mut() {
-            let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
+            let sa_name = k3rs_common::serviceaccount::ensure_service_account_name(spec);
             let service_account = self
                 .storage
-                .get::<rusternetes_common::resources::ServiceAccount>(&build_key(
+                .get::<k3rs_common::resources::ServiceAccount>(&build_key(
                     "serviceaccounts",
                     Some(namespace),
                     &sa_name,
@@ -832,7 +824,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 .await
                 .ok();
 
-            rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+            k3rs_common::serviceaccount::propagate_image_pull_secrets(
                 spec,
                 service_account
                     .as_ref()
@@ -845,7 +837,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                 None => sa_automount.unwrap_or(true),
             };
             if should_mount {
-                rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
+                k3rs_common::serviceaccount::add_kube_api_access_volume(spec);
             }
         }
 
@@ -869,7 +861,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
                     );
                     return Ok(());
                 }
-                Err(rusternetes_common::Error::AlreadyExists(_))
+                Err(k3rs_common::Error::AlreadyExists(_))
                     if attempt + 1 < MAX_NAME_GENERATION_CREATE_ATTEMPTS =>
                 {
                     debug!(
@@ -884,13 +876,13 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             }
         }
 
-        Err(rusternetes_common::Error::AlreadyExists(format!(
+        Err(k3rs_common::Error::AlreadyExists(format!(
             "could not generate a free pod name for {}/{} after {} attempts",
             namespace, rc.metadata.name, MAX_NAME_GENERATION_CREATE_ATTEMPTS
         )))
     }
 
-    async fn delete_pod(&self, name: &str, namespace: &str) -> rusternetes_common::Result<()> {
+    async fn delete_pod(&self, name: &str, namespace: &str) -> k3rs_common::Result<()> {
         let key = build_key("pods", Some(namespace), name);
         // Upstream `RealPodControl.DeletePod` is a graceful delete,
         // `Pods(ns).Delete(ctx, podID, metav1.DeleteOptions{})`
@@ -908,7 +900,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         counts: PodCounts,
         failure_message: Option<&str>,
         failure_reason: Option<&str>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let namespace = rc.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("replicationcontrollers", Some(namespace), &rc.metadata.name);
 
@@ -957,7 +949,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
             Some(conditions)
         };
 
-        let new_status = rusternetes_common::resources::ReplicationControllerStatus {
+        let new_status = k3rs_common::resources::ReplicationControllerStatus {
             replicas: counts.replicas,
             fully_labeled_replicas: Some(counts.fully_labeled),
             ready_replicas: Some(counts.ready),
@@ -987,7 +979,7 @@ impl<S: Storage + 'static> ReplicationControllerController<S> {
         // the workqueue; NotFound means deleted mid-sync.
         match self.storage.update_status_cas(&key, &updated_rc).await {
             Ok(_) => {}
-            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
 
@@ -1010,7 +1002,7 @@ fn rc_selector_of(rc: &ReplicationController) -> Result<Selector, String> {
         rc.spec
             .selector
             .as_ref()
-            .map(|match_labels| rusternetes_common::types::LabelSelector {
+            .map(|match_labels| k3rs_common::types::LabelSelector {
                 match_labels: Some(match_labels.clone()),
                 match_expressions: None,
             });
@@ -1147,8 +1139,8 @@ pub fn slow_start_batches_capped(
 /// api-server emits (crates/middleware/src/lib.rs, added in #1849). Both
 /// spellings are accepted so this keeps working if the cause is ever surfaced
 /// structurally.
-pub fn is_namespace_terminating_rejection(err: &rusternetes_common::Error) -> bool {
-    let rusternetes_common::Error::Forbidden(message) = err else {
+pub fn is_namespace_terminating_rejection(err: &k3rs_common::Error) -> bool {
+    let k3rs_common::Error::Forbidden(message) = err else {
         return false;
     };
     message.contains("NamespaceTerminating") || message.contains("because it is being terminated")

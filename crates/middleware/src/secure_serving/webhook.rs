@@ -95,7 +95,7 @@ impl std::error::Error for ReviewError {}
 pub fn default_should_retry(err: &ReviewError) -> bool {
     // IsConnectionReset || IsHTTP2ConnectionLost || IsInternalError ||
     // IsTimeout || IsTooManyRequests, then SuggestsClientDelay.
-    let unknown = !rusternetes_client::api_status::KNOWN_REASONS.contains(&err.reason.as_str());
+    let unknown = !k3rs_client::api_status::KNOWN_REASONS.contains(&err.reason.as_str());
     err.connection_reset
         || err.http2_connection_lost
         // IsInternalError (errors.go:711-720)
@@ -165,7 +165,7 @@ pub trait ReviewClient: Send + Sync {
 }
 
 /// [`ReviewClient`] over the repo's API client.
-pub struct ApiClientReviewClient(pub std::sync::Arc<rusternetes_client::http::ApiClient>);
+pub struct ApiClientReviewClient(pub std::sync::Arc<k3rs_client::http::ApiClient>);
 
 #[async_trait]
 impl ReviewClient for ApiClientReviewClient {
@@ -181,7 +181,7 @@ impl ReviewClient for ApiClientReviewClient {
 /// (`reasonAndCodeForError`, `IsConnectionReset`, `IsHTTP2ConnectionLost`,
 /// `SuggestsClientDelay`; webhook.go:63-73).
 pub fn review_error_from(e: &anyhow::Error) -> ReviewError {
-    use rusternetes_client::api_status;
+    use k3rs_client::api_status;
     let (reason, code) = api_status::reason_and_code_for_error(e);
     let connection_reset = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()

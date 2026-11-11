@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::go_duration::*;
+    use k3rs_common::go_duration::*;
 
     const NS: i64 = 1;
     const US: i64 = 1_000;

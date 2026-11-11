@@ -1,5 +1,5 @@
-use rusternetes_common::resources::workloads::{StatefulSet, StatefulSetStatus};
-use rusternetes_common::validation::apps::{
+use k3rs_common::resources::workloads::{StatefulSet, StatefulSetStatus};
+use k3rs_common::validation::apps::{
     validate_statefulset, validate_statefulset_status_update, validate_statefulset_update,
 };
 
@@ -71,7 +71,7 @@ fn mutable_fields_allowed() {
     assert!(validate_statefulset_update(&new, &old).is_empty());
 }
 
-fn aggregate(errs: &[rusternetes_common::validation::field::Error]) -> String {
+fn aggregate(errs: &[k3rs_common::validation::field::Error]) -> String {
     errs.iter()
         .map(|e| e.to_string())
         .collect::<Vec<_>>()

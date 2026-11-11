@@ -1,10 +1,10 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::Utc;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::quota;
-use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::quota;
+use k3rs_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -57,9 +57,9 @@ const QUOTA_COMPUTE_KEYS: &[&str] = &[
 /// Returns `Some(event)` while the stream is alive, `None` once it has been
 /// retired (the caller should reconnect).
 pub async fn next_aux_event(
-    aux: &mut Option<rusternetes_storage::WatchStream>,
+    aux: &mut Option<k3rs_storage::WatchStream>,
     what: &str,
-) -> Option<rusternetes_storage::WatchEvent> {
+) -> Option<k3rs_storage::WatchEvent> {
     use futures::StreamExt;
 
     let stream = aux.as_mut()?;
@@ -118,8 +118,8 @@ impl ReplenishFilter {
     /// * configmaps, secrets and the rest: never (the filter returns false).
     ///
     /// An update for an object never seen before (no `oldObj`) enqueues.
-    pub fn should_replenish(&mut self, ev: &rusternetes_storage::WatchEvent) -> bool {
-        use rusternetes_storage::WatchEvent;
+    pub fn should_replenish(&mut self, ev: &k3rs_storage::WatchEvent) -> bool {
+        use k3rs_storage::WatchEvent;
         let key = extract_key(ev);
         let kind = key.split('/').next().unwrap_or("");
         match (kind, ev) {
@@ -164,10 +164,8 @@ impl ReplenishFilter {
                     return !is_add;
                 };
                 let new = match svc.spec.service_type {
-                    Some(rusternetes_common::resources::ServiceType::NodePort) => "NodePort",
-                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
-                        "LoadBalancer"
-                    }
+                    Some(k3rs_common::resources::ServiceType::NodePort) => "NodePort",
+                    Some(k3rs_common::resources::ServiceType::LoadBalancer) => "LoadBalancer",
                     _ => "",
                 };
                 let old = self.services.insert(key, new);
@@ -352,7 +350,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     pub async fn enqueue_quotas_for_event(
         &self,
         queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
+        event: &k3rs_storage::WatchEvent,
     ) {
         let key = extract_key(event);
         // Key format: "{resource_type}/{namespace}/{name}"
@@ -529,7 +527,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                 // Deleted concurrently (e.g. a DeleteCollection racing this
                 // reconcile): nothing to update, and update_status never
                 // re-creates, so the quota stays deleted (no resurrection).
-                Err(rusternetes_common::Error::NotFound(_)) => {}
+                Err(k3rs_common::Error::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
         }
@@ -541,14 +539,14 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
     /// `generic.CalculateUsageStats` (`staging/src/k8s.io/apiserver/pkg/quota/
     /// v1/generic/evaluator.go`) through `podMatchesScopeFunc`
     /// (`pkg/quota/v1/evaluator/core/pods.go:331-356`), which the api-server's
-    /// quota admission shares (`rusternetes_common::quota`), so admission and
+    /// quota admission shares (`k3rs_common::quota`), so admission and
     /// this controller agree on which pods a scoped quota covers.
     pub fn pod_matches_scopes(
         pod: &Pod,
         scopes: &[String],
-        scope_selector: Option<&rusternetes_common::resources::ScopeSelector>,
+        scope_selector: Option<&k3rs_common::resources::ScopeSelector>,
     ) -> bool {
-        let spec = rusternetes_common::resources::ResourceQuotaSpec {
+        let spec = k3rs_common::resources::ResourceQuotaSpec {
             hard: None,
             scopes: Some(scopes.to_vec()),
             scope_selector: scope_selector.cloned(),
@@ -562,7 +560,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
         &self,
         namespace: &str,
         scopes: &[String],
-        scope_selector: Option<&rusternetes_common::resources::ScopeSelector>,
+        scope_selector: Option<&k3rs_common::resources::ScopeSelector>,
         hard_keys: &[String],
     ) -> Result<HashMap<String, String>> {
         let mut usage = HashMap::new();
@@ -653,10 +651,8 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             let nodeport_count: usize = services
                 .iter()
                 .map(|s| match s.spec.service_type {
-                    Some(rusternetes_common::resources::ServiceType::NodePort) => {
-                        s.spec.ports.len()
-                    }
-                    Some(rusternetes_common::resources::ServiceType::LoadBalancer) => {
+                    Some(k3rs_common::resources::ServiceType::NodePort) => s.spec.ports.len(),
+                    Some(k3rs_common::resources::ServiceType::LoadBalancer) => {
                         if s.spec.allocate_load_balancer_node_ports == Some(false) {
                             s.spec
                                 .ports
@@ -678,7 +674,7 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
                 .filter(|s| {
                     matches!(
                         s.spec.service_type,
-                        Some(rusternetes_common::resources::ServiceType::LoadBalancer)
+                        Some(k3rs_common::resources::ServiceType::LoadBalancer)
                     )
                 })
                 .count();
@@ -730,14 +726,14 @@ impl<S: Storage + 'static> ResourceQuotaController<S> {
             {
                 totals.insert(key.clone(), zero);
             }
-            let spec = rusternetes_common::resources::ResourceQuotaSpec {
+            let spec = k3rs_common::resources::ResourceQuotaSpec {
                 hard: None,
                 scopes: Some(scopes.to_vec()),
                 scope_selector: scope_selector.cloned(),
             };
             let selectors = quota::scope_selectors_from_quota(&spec);
             let pvc_prefix = format!("/registry/persistentvolumeclaims/{}/", namespace);
-            let pvcs: Vec<rusternetes_common::resources::PersistentVolumeClaim> =
+            let pvcs: Vec<k3rs_common::resources::PersistentVolumeClaim> =
                 self.storage.list(&pvc_prefix).await.unwrap_or_default();
             // An erroring scope function ends the walk with what has been
             // summed so far (evaluator.go:203-205, `return result, nil`).

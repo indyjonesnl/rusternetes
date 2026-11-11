@@ -67,7 +67,7 @@ pub struct ControllerExpectations {
     /// `UIDTrackingControllerExpectations.uidStore`
     /// (`controller_utils.go:343-409`).
     uids: Mutex<HashMap<String, HashSet<String>>>,
-    /// Rusternetes-only: pod keys a controller created and has not yet seen
+    /// k3rs-only: pod keys a controller created and has not yet seen
     /// arrive. The creation-side twin of `uids`, so a watch `Added` event and
     /// a fresh listing each lower the creation count at most once per pod
     /// (upstream's `addPod` lowers it unconditionally per event).
@@ -179,7 +179,7 @@ impl ControllerExpectations {
         self.created.lock().unwrap().remove(key);
     }
 
-    /// Rusternetes-only: remember that `pod_key` was created for `key` and its
+    /// k3rs-only: remember that `pod_key` was created for `key` and its
     /// arrival is still awaited. Call after the matching `expect_creations`.
     pub fn record_created(&self, key: &str, pod_key: &str) {
         self.created
@@ -190,7 +190,7 @@ impl ControllerExpectations {
             .insert(pod_key.to_string());
     }
 
-    /// Rusternetes-only: lower the creation count for `key`, but only if
+    /// k3rs-only: lower the creation count for `key`, but only if
     /// `pod_key` is still awaited, so an `Added` event and a fresh listing of
     /// the same pod never both count it.
     pub fn creation_observed_of(&self, key: &str, pod_key: &str) {
@@ -205,7 +205,7 @@ impl ControllerExpectations {
         }
     }
 
-    /// Rusternetes-only: created pod keys for `key` not yet observed.
+    /// k3rs-only: created pod keys for `key` not yet observed.
     pub fn pending_creations(&self, key: &str) -> Vec<String> {
         self.created
             .lock()
@@ -215,7 +215,7 @@ impl ControllerExpectations {
             .unwrap_or_default()
     }
 
-    /// Rusternetes-only: forget the awaited-creation set for `key` (call when
+    /// k3rs-only: forget the awaited-creation set for `key` (call when
     /// a fresh `expect_creations` replaces the record).
     pub fn clear_created(&self, key: &str) {
         self.created.lock().unwrap().remove(key);
@@ -248,7 +248,7 @@ impl ControllerExpectations {
 
     /// Controllee keys still expected to be seen deleted for `key`.
     ///
-    /// Rusternetes-only (no upstream equivalent): lets a controller that can
+    /// k3rs-only (no upstream equivalent): lets a controller that can
     /// list its controllees fresh from storage settle an expectation from
     /// that listing when a pod is already gone or terminating, instead of
     /// waiting for the watch event (see the DaemonSet controller).

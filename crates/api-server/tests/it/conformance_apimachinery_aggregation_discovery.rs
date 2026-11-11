@@ -61,7 +61,7 @@
 //!
 //! Defect found: `list_apiservices` did not apply `?labelSelector=` — only the
 //! watch path did. Upstream's `checkApiServiceListQuantity` lists *with* the
-//! selector and waits for zero, so against Rusternetes it would have counted
+//! selector and waits for zero, so against k3rs it would have counted
 //! every APIService in the cluster and never converged. Fixed in
 //! `crates/api-server/src/handlers/generic.rs` in the same change; the test
 //! that catches it is `aggregator_apiservice_patch_list_and_delete_collection`,
@@ -82,8 +82,8 @@
 //! `tower::ServiceExt::oneshot`. No Docker, no etcd, no kubelet.
 
 use axum::http::StatusCode;
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -700,7 +700,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     );
 
     let (mock_addr, mock_handle) =
-        rusternetes_test_support::mock_http::serve_graceful_handle(route, async {
+        k3rs_test_support::mock_http::serve_graceful_handle(route, async {
             shutdown_rx.await.ok();
         });
 
@@ -828,10 +828,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     });
     state
         .storage
-        .create::<rusternetes_common::resources::Service>(
-            &svc_key,
-            &serde_json::from_value(svc).unwrap(),
-        )
+        .create::<k3rs_common::resources::Service>(&svc_key, &serde_json::from_value(svc).unwrap())
         .await
         .expect("seed sample-apiserver Service");
 
@@ -839,22 +836,21 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
     // plain HTTP. We can't override the AggregatorTarget.scheme through the
     // router, so this sub-assertion exercises `resolve_aggregator_target`
     // via the public helper directly (the routed call would fail TLS).
-    let resolved =
-        rusternetes_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
-            state.storage.as_ref(),
-            "wardle.example.com",
-            "v1alpha1",
-        )
-        .await
-        .expect("resolver Ok")
-        .expect("resolved target");
+    let resolved = k3rs_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
+        state.storage.as_ref(),
+        "wardle.example.com",
+        "v1alpha1",
+    )
+    .await
+    .expect("resolver Ok")
+    .expect("resolved target");
     assert_eq!(resolved.host, "127.0.0.1");
     assert_eq!(resolved.port, mock_addr.port());
 
     // Now forward over HTTP through the public helper (test-only scheme
     // override), and verify the mock observed the proxied request with the
     // correct path and impersonation header.
-    let target = rusternetes_api_server::handlers::aggregator::AggregatorTarget {
+    let target = k3rs_api_server::handlers::aggregator::AggregatorTarget {
         host: resolved.host.clone(),
         port: resolved.port,
         insecure_skip_tls_verify: true,
@@ -862,15 +858,15 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
         scheme: "http",
         server_name: None,
     };
-    let auth = rusternetes_api_server::middleware::AuthContext {
-        user: rusternetes_common::auth::UserInfo {
+    let auth = k3rs_api_server::middleware::AuthContext {
+        user: k3rs_common::auth::UserInfo {
             username: "system:admin".to_string(),
             uid: "uid-admin".to_string(),
             groups: vec!["system:masters".to_string()],
             extra: std::collections::HashMap::new(),
         },
     };
-    let resp = rusternetes_api_server::handlers::aggregator::forward_to_aggregator(
+    let resp = k3rs_api_server::handlers::aggregator::forward_to_aggregator(
         &target,
         &auth,
         axum::http::Method::GET,
@@ -906,7 +902,7 @@ async fn aggregator_sample_apiserver_full_lifecycle() {
         .delete(&svc_key)
         .await
         .expect("delete service");
-    let err = rusternetes_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
+    let err = k3rs_api_server::handlers::aggregator::resolve_aggregator_target_with_storage(
         state.storage.as_ref(),
         "wardle.example.com",
         "v1alpha1",

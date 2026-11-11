@@ -1,10 +1,8 @@
 //! Tests for VolumeAttachment validation (port of upstream `ValidateVolumeAttachment`).
 
-use rusternetes_common::resources::csi::{
-    VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec,
-};
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::volumeattachment::validate_volume_attachment;
+use k3rs_common::resources::csi::{VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec};
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::volumeattachment::validate_volume_attachment;
 
 fn va(attacher: &str, node: &str, source: VolumeAttachmentSource) -> VolumeAttachment {
     let mut x = VolumeAttachment {
@@ -28,7 +26,7 @@ fn pv_source(name: &str) -> VolumeAttachmentSource {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field == field)
 }
 

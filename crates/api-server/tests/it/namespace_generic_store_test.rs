@@ -7,7 +7,7 @@
 //! (storage/storage.go), whose `Delete` runs the namespace lifecycle.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NSS: &str = "/api/v1/namespaces";

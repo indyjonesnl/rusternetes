@@ -4,18 +4,18 @@
 //! `pkg/scheduler/framework/plugins/volumebinding/{volume_binding.go,binder.go}`
 //! and `staging/src/k8s.io/component-helpers/storage/volume/pv_helpers.go`.
 
-use rusternetes_common::affinity::matches_node_selector;
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::volume::{
+use k3rs_common::affinity::matches_node_selector;
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::volume::{
     PersistentVolumeClaimPhase, PersistentVolumeMode, PersistentVolumePhase, TopologySelectorTerm,
     VolumeBindingMode,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CSIDriver, CSINode, CSIStorageCapacity, Node, PersistentVolume, PersistentVolumeClaim, Pod,
     StorageClass, Volume,
 };
-use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
+use k3rs_common::types::{label_selector_as_selector, LabelSelector};
 use std::collections::HashMap;
 
 pub const ERR_REASON_BIND_CONFLICT: &str =

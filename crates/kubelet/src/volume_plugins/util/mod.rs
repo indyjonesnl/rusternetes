@@ -28,8 +28,8 @@ pub mod volumepathhandler;
 
 use crate::volume_plugins::plugin::{Spec, VolumePlugin};
 use crate::volume_plugins::registry::VolumePluginMgr;
-use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
-use rusternetes_common::resources::{Pod, Volume};
+use k3rs_common::resources::volume::PersistentVolumeAccessMode;
+use k3rs_common::resources::{Pod, Volume};
 use types::{UniquePodName, UniqueVolumeName};
 
 /// Port of `GetUniquePodName` (`pkg/volume/util/util.go:250-253`):
@@ -220,16 +220,13 @@ pub fn get_pod_volume_names(
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
-    std::collections::HashMap<
-        String,
-        Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>>,
-    >,
+    std::collections::HashMap<String, Vec<Option<k3rs_common::resources::pod::SELinuxOptions>>>,
 ) {
     let mut mounts = std::collections::HashSet::new();
     let mut devices = std::collections::HashSet::new();
     let mut contexts: std::collections::HashMap<
         String,
-        Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>>,
+        Vec<Option<k3rs_common::resources::pod::SELinuxOptions>>,
     > = std::collections::HashMap::new();
     let Some(spec) = pod.spec.as_ref() else {
         return (mounts, devices, contexts);
@@ -239,9 +236,9 @@ pub fn get_pod_volume_names(
         .as_ref()
         .and_then(|sc| sc.se_linux_options.clone());
     let mut visit =
-        |c_mounts: &Option<Vec<rusternetes_common::resources::pod::VolumeMount>>,
-         c_devices: &Option<Vec<rusternetes_common::resources::pod::VolumeDevice>>,
-         container_opts: Option<rusternetes_common::resources::pod::SELinuxOptions>| {
+        |c_mounts: &Option<Vec<k3rs_common::resources::pod::VolumeMount>>,
+         c_devices: &Option<Vec<k3rs_common::resources::pod::VolumeDevice>>,
+         container_opts: Option<k3rs_common::resources::pod::SELinuxOptions>| {
             let opts = if collect_selinux_options {
                 container_opts.or_else(|| pod_opts.clone())
             } else {
@@ -301,7 +298,7 @@ pub fn get_pod_volume_names(
 pub fn selinux_container_contexts(
     pod: &Pod,
     volume_name: &str,
-) -> Vec<Option<rusternetes_common::resources::pod::SELinuxOptions>> {
+) -> Vec<Option<k3rs_common::resources::pod::SELinuxOptions>> {
     let Some(spec) = pod.spec.as_ref() else {
         return Vec::new();
     };
@@ -311,8 +308,8 @@ pub fn selinux_container_contexts(
         .and_then(|sc| sc.se_linux_options.clone());
     let mut out = Vec::new();
     let mut visit =
-        |mounts: &Option<Vec<rusternetes_common::resources::pod::VolumeMount>>,
-         opts: Option<rusternetes_common::resources::pod::SELinuxOptions>| {
+        |mounts: &Option<Vec<k3rs_common::resources::pod::VolumeMount>>,
+         opts: Option<k3rs_common::resources::pod::SELinuxOptions>| {
             let Some(opts) = opts.or_else(|| pod_opts.clone()) else {
                 return;
             };
@@ -519,14 +516,14 @@ pub async fn new_wrapper_mounter(
     host: &std::sync::Arc<dyn crate::volume_plugins::VolumeHost>,
     vol_name: &str,
     medium: Option<&str>,
-    pod: &rusternetes_common::resources::Pod,
+    pod: &k3rs_common::resources::Pod,
 ) -> anyhow::Result<Box<dyn crate::volume_plugins::Mounter>> {
     use crate::volume_plugins::VolumePlugin;
     let mut empty_dir = serde_json::json!({});
     if let Some(m) = medium {
         empty_dir["medium"] = m.into();
     }
-    let volume: rusternetes_common::resources::Volume = serde_json::from_value(
+    let volume: k3rs_common::resources::Volume = serde_json::from_value(
         serde_json::json!({"name": format!("wrapped_{vol_name}"), "emptyDir": empty_dir}),
     )
     .expect("static emptyDir volume");

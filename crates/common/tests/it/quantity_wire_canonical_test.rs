@@ -3,7 +3,7 @@
 //! `staging/src/k8s.io/apimachinery/pkg/api/resource/quantity.go:694`,
 //! `:733`). Issue #2956.
 
-use rusternetes_common::resources::{CSIStorageCapacity, PersistentVolume, Pod};
+use k3rs_common::resources::{CSIStorageCapacity, PersistentVolume, Pod};
 use serde_json::json;
 
 fn roundtrip<T: serde::de::DeserializeOwned + serde::Serialize>(
@@ -77,7 +77,7 @@ fn csi_storage_capacity_canonical() {
 
 #[test]
 fn downward_api_divisor_canonical_and_validated() {
-    use rusternetes_common::resources::pod::ResourceFieldSelector;
+    use k3rs_common::resources::pod::ResourceFieldSelector;
     let out = roundtrip::<ResourceFieldSelector>(
         json!({"resource": "limits.memory", "divisor": "1024Mi"}),
     );
@@ -93,7 +93,7 @@ fn downward_api_divisor_canonical_and_validated() {
 
 #[test]
 fn runtime_class_pod_fixed_canonical_and_validated() {
-    use rusternetes_common::resources::runtimeclass::RuntimeClass;
+    use k3rs_common::resources::runtimeclass::RuntimeClass;
     let out = roundtrip::<RuntimeClass>(json!({
         "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
         "metadata": {"name": "rc"}, "handler": "h",
@@ -111,7 +111,7 @@ fn runtime_class_pod_fixed_canonical_and_validated() {
 
 #[test]
 fn metrics_usage_canonical_and_validated() {
-    use rusternetes_common::resources::metrics::PodMetrics;
+    use k3rs_common::resources::metrics::PodMetrics;
     let _ = std::any::type_name::<PodMetrics>();
     let out = roundtrip::<PodMetrics>(json!({
         "metadata": {"name": "p"}, "window": "15s",

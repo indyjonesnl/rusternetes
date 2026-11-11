@@ -1,10 +1,10 @@
 // Integration tests for Garbage Collector and Finalizers
 // Tests cascade deletion, orphaning, and owner reference handling
 
-use rusternetes_common::deletion::{process_deletion, DeleteOptions, DeletionResult};
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::deletion::{process_deletion, DeleteOptions, DeletionResult};
+use k3rs_common::resources::pod::*;
+use k3rs_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -274,7 +274,7 @@ async fn test_block_owner_deletion() {
 
 #[tokio::test]
 async fn test_cascade_deletion_propagation_policies() {
-    use rusternetes_common::types::DeletionPropagation;
+    use k3rs_common::types::DeletionPropagation;
 
     let _storage = setup_test().await;
 
@@ -334,7 +334,7 @@ async fn test_precondition_checks() {
 
     // Test with wrong UID precondition
     let options = DeleteOptions {
-        preconditions: Some(rusternetes_common::deletion::Preconditions {
+        preconditions: Some(k3rs_common::deletion::Preconditions {
             uid: Some("wrong-uid".to_string()),
             resource_version: None,
         }),
@@ -351,7 +351,7 @@ async fn test_precondition_checks() {
 
     // Test with correct UID precondition
     let options2 = DeleteOptions {
-        preconditions: Some(rusternetes_common::deletion::Preconditions {
+        preconditions: Some(k3rs_common::deletion::Preconditions {
             uid: Some(pod_uid),
             resource_version: None,
         }),
@@ -386,7 +386,7 @@ async fn test_metadata_finalizer_helpers() {
 mod garbage_collector_integration {
     use super::*;
     use chrono::Utc;
-    use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
+    use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
 
     #[tokio::test]
     async fn test_gc_deletes_orphaned_pods() {

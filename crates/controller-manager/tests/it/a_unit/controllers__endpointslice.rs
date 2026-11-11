@@ -4,18 +4,16 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::endpointslice::{
+    pub use k3rs_common::resources::endpointslice::{
         Endpoint, EndpointConditions, EndpointPort, EndpointReference,
     };
-    pub use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service};
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_controller_manager::controllers::endpointslice_tracker::EndpointSliceTracker;
-    pub use rusternetes_controller_manager::controllers::trigger_time_tracker::{
+    pub use k3rs_common::resources::{EndpointSlice, Endpoints, Pod, Service};
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_controller_manager::controllers::endpointslice_tracker::EndpointSliceTracker;
+    pub use k3rs_controller_manager::controllers::trigger_time_tracker::{
         format_rfc3339_nano, TriggerTimeTracker,
     };
-    pub use rusternetes_storage::{
-        build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue,
-    };
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info};
@@ -23,10 +21,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{ContainerPort, ServicePort, ServiceSpec};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::endpointslice::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::{ContainerPort, ServicePort, ServiceSpec};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::endpointslice::*;
+    use k3rs_storage::MemoryStorage;
 
     /// Port of `TestSyncServiceMissing`
     /// (endpointslice_controller_test.go:318-350): syncing a Service that no
@@ -38,7 +36,7 @@ mod tests {
         let controller = EndpointSliceController::new(Arc::clone(&storage));
 
         let existing = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -100,7 +98,7 @@ mod tests {
 
         // Create a service with two named target ports
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -110,7 +108,7 @@ mod tests {
                     ServicePort {
                         name: Some("portname1".to_string()),
                         port: 80,
-                        target_port: Some(rusternetes_common::resources::IntOrString::String(
+                        target_port: Some(k3rs_common::resources::IntOrString::String(
                             "svc1".to_string(),
                         )),
                         protocol: "TCP".to_string(),
@@ -120,7 +118,7 @@ mod tests {
                     ServicePort {
                         name: Some("portname2".to_string()),
                         port: 81,
-                        target_port: Some(rusternetes_common::resources::IntOrString::String(
+                        target_port: Some(k3rs_common::resources::IntOrString::String(
                             "svc2".to_string(),
                         )),
                         protocol: "TCP".to_string(),
@@ -136,15 +134,15 @@ mod tests {
 
         // Pod1 only has containerPort named "svc1" (serves portname1 only)
         let pod1 = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: ObjectMeta::new("pod1")
                 .with_namespace("default")
                 .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "c1".to_string(),
                     ports: Some(vec![ContainerPort {
                         container_port: 100,
@@ -221,7 +219,7 @@ mod tests {
 
         // 1. Create a service with one port (port 80, no targetPort)
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -259,15 +257,15 @@ mod tests {
 
         // 3. Create a matching pod with IP and Ready condition
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: ObjectMeta::new("pod1")
                 .with_namespace("test-ns")
                 .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "agnhost".to_string(),
                     ports: Some(vec![ContainerPort {
                         container_port: 80,
@@ -280,10 +278,10 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Running),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Running),
                 pod_ip: Some("10.89.0.22".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,
@@ -328,7 +326,7 @@ mod tests {
         let controller = EndpointSliceController::new(Arc::clone(&storage));
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -358,22 +356,22 @@ mod tests {
             .with_labels(HashMap::from([("app".to_string(), "test".to_string())]));
         pod_meta.deletion_timestamp = Some(chrono::Utc::now());
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: pod_meta,
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "c".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
+            status: Some(k3rs_common::resources::PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.0.0.1".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,
@@ -426,7 +424,7 @@ mod tests {
         let controller = EndpointSliceController::new(Arc::clone(&storage));
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -453,24 +451,24 @@ mod tests {
 
         // A pod that is Running but NOT Ready
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: ObjectMeta::new("p1")
                 .with_namespace("default")
                 .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "c".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
+            status: Some(k3rs_common::resources::PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.0.0.2".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "False".to_string(),
                     reason: None,
@@ -537,19 +535,19 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Storage for CountingStorage {
-            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
                 self.inner.create(key, value).await
             }
-            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
             where
                 T: serde::de::DeserializeOwned + Send + Sync,
             {
                 self.inner.get(key).await
             }
-            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
@@ -559,13 +557,13 @@ mod tests {
                 &self,
                 key: &str,
                 value: &serde_json::Value,
-            ) -> rusternetes_common::Result<()> {
+            ) -> k3rs_common::Result<()> {
                 self.inner.update_raw(key, value).await
             }
-            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
                 self.inner.delete(key).await
             }
-            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
@@ -574,26 +572,20 @@ mod tests {
                 }
                 self.inner.list(prefix).await
             }
-            async fn watch(
-                &self,
-                prefix: &str,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
                 self.inner.watch(prefix).await
             }
             async fn watch_from_revision(
                 &self,
                 prefix: &str,
                 revision: i64,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
                 self.inner.watch_from_revision(prefix, revision).await
             }
-            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            async fn current_revision(&self) -> k3rs_common::Result<i64> {
                 self.inner.current_revision().await
             }
-            async fn is_revision_compacted(
-                &self,
-                revision: i64,
-            ) -> rusternetes_common::Result<bool> {
+            async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
                 self.inner.is_revision_compacted(revision).await
             }
         }
@@ -609,7 +601,7 @@ mod tests {
         let mut pod_labels = HashMap::new();
         pod_labels.insert("app".to_string(), "latency".to_string());
         let mut pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -626,7 +618,7 @@ mod tests {
         for i in 0..SERVICES {
             let name = format!("latency-svc-{i}");
             let service = Service {
-                type_meta: rusternetes_common::types::TypeMeta {
+                type_meta: k3rs_common::types::TypeMeta {
                     kind: "Service".to_string(),
                     api_version: "v1".to_string(),
                 },
@@ -683,19 +675,19 @@ mod tests {
 
         #[async_trait::async_trait]
         impl Storage for SlowStorage {
-            async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
                 self.inner.create(key, value).await
             }
-            async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+            async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
             where
                 T: serde::de::DeserializeOwned + Send + Sync,
             {
                 self.inner.get(key).await
             }
-            async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+            async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
@@ -705,13 +697,13 @@ mod tests {
                 &self,
                 key: &str,
                 value: &serde_json::Value,
-            ) -> rusternetes_common::Result<()> {
+            ) -> k3rs_common::Result<()> {
                 self.inner.update_raw(key, value).await
             }
-            async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+            async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
                 self.inner.delete(key).await
             }
-            async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+            async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
             where
                 T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
             {
@@ -723,26 +715,20 @@ mod tests {
                 }
                 self.inner.list(prefix).await
             }
-            async fn watch(
-                &self,
-                prefix: &str,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
                 self.inner.watch(prefix).await
             }
             async fn watch_from_revision(
                 &self,
                 prefix: &str,
                 revision: i64,
-            ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+            ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
                 self.inner.watch_from_revision(prefix, revision).await
             }
-            async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+            async fn current_revision(&self) -> k3rs_common::Result<i64> {
                 self.inner.current_revision().await
             }
-            async fn is_revision_compacted(
-                &self,
-                revision: i64,
-            ) -> rusternetes_common::Result<bool> {
+            async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
                 self.inner.is_revision_compacted(revision).await
             }
         }
@@ -759,7 +745,7 @@ mod tests {
         for i in 0..20 {
             let name = format!("svc-{i}");
             let service = Service {
-                type_meta: rusternetes_common::types::TypeMeta {
+                type_meta: k3rs_common::types::TypeMeta {
                     kind: "Service".to_string(),
                     api_version: "v1".to_string(),
                 },
@@ -805,19 +791,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for PodListCounter {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create(key, value).await
         }
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.get(key).await
         }
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -827,13 +813,13 @@ mod tests {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -843,30 +829,27 @@ mod tests {
             }
             self.inner.list(prefix).await
         }
-        async fn watch(
-            &self,
-            prefix: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
         async fn watch_from_revision(
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }
 
     fn snapshot_service(name: &str) -> Service {
         Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -889,24 +872,24 @@ mod tests {
 
     fn snapshot_pod(name: &str, ip: &str) -> Pod {
         Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: ObjectMeta::new(name)
                 .with_namespace("ns")
                 .with_labels(HashMap::from([("app".to_string(), "snap".to_string())])),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "c".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Running),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Running),
                 pod_ip: Some(ip.to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,
@@ -1420,13 +1403,13 @@ mod tests {
     /// content: the sig-network regression after #2108.
     #[tokio::test]
     async fn updating_an_existing_slice_keeps_its_uid() {
-        use rusternetes_controller_manager::controllers::uid_precondition_double::UidPreconditionStorage;
+        use k3rs_controller_manager::controllers::uid_precondition_double::UidPreconditionStorage;
 
         let storage = Arc::new(UidPreconditionStorage::new());
         let controller = EndpointSliceController::new(Arc::clone(&storage));
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1458,24 +1441,24 @@ mod tests {
 
         // A ready pod appears: the existing slice must be updated.
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: ObjectMeta::new("p1")
                 .with_namespace("default")
                 .with_labels(HashMap::from([("app".to_string(), "test".to_string())])),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "c".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
+            status: Some(k3rs_common::resources::PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.0.0.1".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,

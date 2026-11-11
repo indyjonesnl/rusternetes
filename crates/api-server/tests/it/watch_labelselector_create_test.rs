@@ -24,11 +24,11 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
+use k3rs_api_server::{router::build_router, state::ApiServerState};
+use k3rs_common::{
     auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
 };
-use rusternetes_storage::{RhinoStorage, Storage, StorageBackend};
+use k3rs_storage::{RhinoStorage, Storage, StorageBackend};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,7 @@ use tower::ServiceExt;
 
 fn fresh_db_path() -> String {
     let mut p = std::env::temp_dir();
-    p.push(format!("rusternetes-watch-ls-{}.db", uuid::Uuid::new_v4()));
+    p.push(format!("k3rs-watch-ls-{}.db", uuid::Uuid::new_v4()));
     p.to_string_lossy().into_owned()
 }
 
@@ -129,7 +129,7 @@ async fn label_selected_secret_watch_delivers_create_after_list_rv() {
     let _ = state
         .storage
         .create(
-            &rusternetes_storage::build_key("namespaces", None, "cert-manager"),
+            &k3rs_storage::build_key("namespaces", None, "cert-manager"),
             &json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"cert-manager"}}),
         )
         .await;

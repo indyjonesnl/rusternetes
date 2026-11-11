@@ -9,7 +9,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::jsonpath::*;
+    use k3rs_common::jsonpath::*;
 
     fn text(s: &str) -> Node {
         Node::Text(s.into())

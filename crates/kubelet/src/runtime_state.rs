@@ -21,8 +21,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::resources::NodeCondition;
-use rusternetes_cri::v1;
+use k3rs_common::resources::NodeCondition;
+use k3rs_cri::v1;
 
 /// `maxWaitForContainerRuntime` (pkg/kubelet/kubelet.go:150): how long a
 /// successful runtime sync stays valid before the runtime is deemed down.
@@ -229,18 +229,18 @@ pub const EVENT_NODE_NOT_READY: &str = "NodeNotReady";
 /// event on `nodeRef` (`kubelet.go:552`, no UID or namespace) with the message
 /// `Node %s status is now: %s`.
 pub async fn record_node_status_event(
-    recorder: &rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>,
+    recorder: &k3rs_storage::EventRecorder<k3rs_storage::StorageBackend>,
     node_name: &str,
     event: &str,
 ) {
-    let node_ref = rusternetes_common::resources::ObjectReference {
+    let node_ref = k3rs_common::resources::ObjectReference {
         api_version: Some("v1".to_string()),
         kind: Some("Node".to_string()),
         name: Some(node_name.to_string()),
         namespace: Some(String::new()),
         ..Default::default()
     };
-    let source = rusternetes_common::resources::EventSource {
+    let source = k3rs_common::resources::EventSource {
         component: crate::events::KUBELET_COMPONENT.to_string(),
         host: Some(node_name.to_string()),
     };
@@ -248,7 +248,7 @@ pub async fn record_node_status_event(
         .event(
             &node_ref,
             &source,
-            rusternetes_common::resources::EventType::Normal,
+            k3rs_common::resources::EventType::Normal,
             event,
             &format!("Node {node_name} status is now: {event}"),
         )

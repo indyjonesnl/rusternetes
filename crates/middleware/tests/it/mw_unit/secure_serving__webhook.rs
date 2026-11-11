@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::secure_serving::webhook::*;
+    use k3rs_middleware::secure_serving::webhook::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn err(code: u16, reason: &str) -> ReviewError {
@@ -74,7 +74,7 @@ mod tests {
     // Status (code/reason/details) and the transport failure text.
     #[test]
     fn review_error_from_classifies_client_errors() {
-        use rusternetes_client::api_status::ApiStatusError;
+        use k3rs_client::api_status::ApiStatusError;
         let status = |reason: &str, code: u16, retry: Option<i32>| {
             anyhow::Error::new(ApiStatusError {
                 code,

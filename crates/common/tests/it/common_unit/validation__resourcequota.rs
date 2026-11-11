@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::policy::{ResourceQuota, ResourceQuotaSpec};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::policy::{ResourceQuota, ResourceQuotaSpec};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
     pub use std::collections::HashMap;
@@ -14,7 +14,7 @@ mod __parent {
 
 mod scope_selector_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::resourcequota::*;
+    use k3rs_common::validation::resourcequota::*;
 
     fn errs(json: serde_json::Value) -> Vec<String> {
         let spec: ResourceQuotaSpec = serde_json::from_value(json).unwrap();
@@ -93,7 +93,7 @@ mod scope_selector_tests {
 
 mod hard_resource_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::resourcequota::*;
+    use k3rs_common::validation::resourcequota::*;
 
     fn errs(json: serde_json::Value) -> Vec<String> {
         let spec: ResourceQuotaSpec = serde_json::from_value(json).unwrap();
@@ -195,7 +195,7 @@ mod hard_resource_tests {
 
 mod status_update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::resourcequota::*;
+    use k3rs_common::validation::resourcequota::*;
 
     fn rq(json: serde_json::Value) -> ResourceQuota {
         serde_json::from_value(json).unwrap()

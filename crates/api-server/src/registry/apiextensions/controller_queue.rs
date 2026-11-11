@@ -27,7 +27,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use tokio::sync::Notify;
 use tracing::warn;
 

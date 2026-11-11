@@ -16,9 +16,9 @@
 //! is silently accepted — which is exactly the conformance failure we are
 //! fixing.
 
-use rusternetes_common::resources::{CustomResource, CustomResourceDefinition};
-use rusternetes_common::schema_validation::SchemaValidator;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{CustomResource, CustomResourceDefinition};
+use k3rs_common::schema_validation::SchemaValidator;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 /// Returns the canonical schemaFoo CRD body used by the upstream
@@ -88,7 +88,7 @@ fn validate_cr_against_stored_crd(
     crd: &CustomResourceDefinition,
     version: &str,
     cr: &CustomResource,
-) -> Result<(), rusternetes_common::Error> {
+) -> Result<(), k3rs_common::Error> {
     let crd_version = crd
         .spec
         .versions
@@ -165,7 +165,7 @@ async fn cr_with_unknown_enum_value_is_rejected() {
         .unwrap();
     let items = bars_schema.items.as_ref().expect("bars.items preserved");
     let item_schema = match items.as_ref() {
-        rusternetes_common::resources::crd::JSONSchemaPropsOrArray::Schema(s) => s,
+        k3rs_common::resources::crd::JSONSchemaPropsOrArray::Schema(s) => s,
         _ => panic!("items must be a single schema"),
     };
     let feeling = item_schema
@@ -284,7 +284,7 @@ async fn crd_update_reflects_in_stored_schema_for_openapi_publish() {
         .unwrap();
     let items = bars.items.as_ref().expect("bars.items must still exist");
     let item_schema = match items.as_ref() {
-        rusternetes_common::resources::crd::JSONSchemaPropsOrArray::Schema(s) => s,
+        k3rs_common::resources::crd::JSONSchemaPropsOrArray::Schema(s) => s,
         _ => panic!("items must be a single schema"),
     };
     let item_props = item_schema.properties.as_ref().unwrap();

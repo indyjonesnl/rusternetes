@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use rusternetes_common::resources::APIService;
-use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent};
+use k3rs_common::resources::APIService;
+use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent};
 
 use crate::crdregistration::WorkQueue;
 use crate::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
@@ -377,8 +377,7 @@ pub async fn spawn_api_service_event_handlers<S: Storage + 'static>(
     });
 }
 
-type ApiServiceWatch =
-    futures::stream::BoxStream<'static, Result<WatchEvent, rusternetes_common::Error>>;
+type ApiServiceWatch = futures::stream::BoxStream<'static, Result<WatchEvent, k3rs_common::Error>>;
 
 /// One `Reflector.ListAndWatch`: start the watch, then replay the list as Adds
 /// so no event falls between the two. `None` when the watch cannot be started.
@@ -422,11 +421,11 @@ impl crate::crdregistration::AutoAPIServiceRegistration for AutoRegisterControll
 /// loopback client; creates stamp the system fields as `FillObjectMetaSystemFields`).
 pub struct StorageAPIServiceClient<S: Storage>(pub std::sync::Arc<S>);
 
-fn map_err(e: rusternetes_common::Error) -> ClientError {
+fn map_err(e: k3rs_common::Error) -> ClientError {
     match e {
-        rusternetes_common::Error::NotFound(_) => ClientError::NotFound,
-        rusternetes_common::Error::AlreadyExists(_) => ClientError::AlreadyExists,
-        rusternetes_common::Error::Conflict(_) => ClientError::Conflict,
+        k3rs_common::Error::NotFound(_) => ClientError::NotFound,
+        k3rs_common::Error::AlreadyExists(_) => ClientError::AlreadyExists,
+        k3rs_common::Error::Conflict(_) => ClientError::Conflict,
         other => ClientError::Other(other.to_string()),
     }
 }
@@ -440,7 +439,7 @@ impl<S: Storage + 'static> APIServiceClient for StorageAPIServiceClient<S> {
             .await
         {
             Ok(a) => Ok(Some(a)),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(None),
             Err(e) => Err(map_err(e)),
         }
     }
@@ -633,8 +632,7 @@ impl APIServiceAvailableCheck {
             return;
         }
         if service.status.conditions.iter().any(|c| {
-            c.type_ == rusternetes_common::resources::apiregistration::AVAILABLE
-                && c.status == "True"
+            c.type_ == k3rs_common::resources::apiregistration::AVAILABLE && c.status == "True"
         }) {
             pending.remove(&service.metadata.name);
         }

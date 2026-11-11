@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::event::{Event, EventType};
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::event::{Event, EventType};
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
+    pub use k3rs_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
 }
@@ -24,10 +24,10 @@ mod tests {
 
     use super::__parent::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use rusternetes_common::resources::event::{EventSeries, EventSource, EventType};
-    use rusternetes_common::resources::ObjectReference;
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_common::validation::events::*;
+    use k3rs_common::resources::event::{EventSeries, EventSource, EventType};
+    use k3rs_common::resources::ObjectReference;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_common::validation::events::*;
 
     /// `time.Unix(1505828956, 0)` upstream — the canonical "someTime".
     fn some_time() -> DateTime<Utc> {

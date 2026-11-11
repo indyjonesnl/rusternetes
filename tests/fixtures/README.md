@@ -1,6 +1,6 @@
 # Test Fixtures
 
-This directory contains YAML manifests used for testing Rusternetes functionality.
+This directory contains YAML manifests used for testing k3rs functionality.
 
 ## Available Fixtures
 
@@ -24,4 +24,4 @@ These fixtures can be applied using kubectl:
 
 ## Purpose
 
-These fixtures are used by test scripts and for manual testing of Rusternetes features. They are kept separate from the examples directory as they are specifically for testing rather than demonstration purposes.
+These fixtures are used by test scripts and for manual testing of k3rs features. They are kept separate from the examples directory as they are specifically for testing rather than demonstration purposes.

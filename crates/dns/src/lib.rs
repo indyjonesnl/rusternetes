@@ -1,10 +1,10 @@
-//! Rusternetes cluster DNS server.
+//! k3rs cluster DNS server.
 //!
 //! Standalone authoritative DNS server for the `cluster.local` zone (and
 //! its `in-addr.arpa`/`ip6.arpa` reverse counterparts). Replaces the
 //! CoreDNS pod that ships in `bootstrap-cluster.yaml`; runs as a separate
 //! container that watches `Service`, `EndpointSlice`, and `Pod` resources
-//! from the rusternetes storage backend and serves DNS responses over
+//! from the k3rs storage backend and serves DNS responses over
 //! UDP+TCP/53.
 //!
 //! ### Crate layout
@@ -18,10 +18,10 @@
 //!
 //! ### Integration shapes
 //!
-//! - **Standalone binary** (`bin/rusternetes-dns`, see `src/main.rs`):
+//! - **Standalone binary** (`bin/k3rs-dns`, see `src/main.rs`):
 //!   one container per cluster, the original delivery vehicle.
 //! - **In-process library** ([`run`] called from
-//!   `crates/rusternetes/src/main.rs`): the all-in-one binary spawns the
+//!   `crates/k3rs/src/main.rs`): the all-in-one binary spawns the
 //!   DNS server as a tokio task that shares the storage backend with
 //!   apiserver / kubelet / kube-proxy. No extra container.
 //!
@@ -44,7 +44,7 @@ pub mod watcher;
 pub mod zone;
 
 use anyhow::Result;
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
@@ -85,9 +85,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: DnsConfig) -> Result<()> 
 
 /// Run the DNS server until the process is signalled, reading cluster
 /// state from the api-server (list + watch over REST). This is the mode
-/// the in-cluster `rusternetes-dns` Deployment uses.
+/// the in-cluster `k3rs-dns` Deployment uses.
 pub async fn run_with_api(
-    client: Arc<rusternetes_client::http::ApiClient>,
+    client: Arc<k3rs_client::http::ApiClient>,
     config: DnsConfig,
 ) -> Result<()> {
     run_with_source(watcher::DnsSource::Api(client), config).await
@@ -96,7 +96,7 @@ pub async fn run_with_api(
 /// Shared server wiring for both data sources.
 async fn run_with_source(source: watcher::DnsSource, config: DnsConfig) -> Result<()> {
     info!(
-        "Starting rusternetes-dns serving zone {} on UDP {} / TCP {}",
+        "Starting k3rs-dns serving zone {} on UDP {} / TCP {}",
         config.cluster_zone, config.udp_bind, config.tcp_bind
     );
 

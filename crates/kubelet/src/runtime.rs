@@ -1,5 +1,5 @@
-use rusternetes_common::quantity::parse_resource_value;
-use rusternetes_common::resources::Pod;
+use k3rs_common::quantity::parse_resource_value;
+use k3rs_common::resources::Pod;
 use tracing::{info, warn};
 
 /// Set up an EmptyDir volume directory with mode 0o777, matching upstream

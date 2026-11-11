@@ -1,16 +1,16 @@
 //! Tests for Job validation (port of upstream batch `ValidateJob`).
 
-use rusternetes_common::resources::workloads::{Job, JobSpec};
-use rusternetes_common::resources::PodTemplateSpec;
-use rusternetes_common::types::LabelSelector;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::job::JobValidationOptions;
+use k3rs_common::resources::workloads::{Job, JobSpec};
+use k3rs_common::resources::PodTemplateSpec;
+use k3rs_common::types::LabelSelector;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::job::JobValidationOptions;
 
 /// The create path's options: `RequirePrefixedLabels: true`
 /// (pkg/registry/batch/job/strategy.go `validationOptionsForJob`).
 fn validate_job(job: &Job) -> ErrorList {
-    rusternetes_common::validation::job::validate_job(
+    k3rs_common::validation::job::validate_job(
         job,
         &JobValidationOptions {
             require_prefixed_labels: true,
@@ -29,7 +29,7 @@ fn template_with_labels(restart_policy: &str, labels: &[(&str, &str)]) -> PodTem
     }
     t.spec.restart_policy = Some(restart_policy.to_string());
     // The job's template is validated like a standalone pod now.
-    t.spec.containers = vec![rusternetes_common::resources::Container {
+    t.spec.containers = vec![k3rs_common::resources::Container {
         name: "c".to_string(),
         image: "nginx".to_string(),
         ..Default::default()
@@ -90,7 +90,7 @@ fn valid_job() -> Job {
     job
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field_substr: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field_substr: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field_substr))
 }
 
@@ -190,7 +190,7 @@ fn indexed_name_too_long_for_hostname_rejected() {
 }
 
 // --- policy sub-objects (#1326) ---
-use rusternetes_common::resources::workloads::{
+use k3rs_common::resources::workloads::{
     PodFailurePolicy, PodFailurePolicyOnExitCodesRequirement, PodFailurePolicyRule, SuccessPolicy,
     SuccessPolicyRule,
 };
@@ -266,7 +266,7 @@ fn pfp_zero_value_for_in_rejected() {
 
 #[test]
 fn pfp_both_exit_and_conditions_rejected() {
-    use rusternetes_common::resources::workloads::PodFailurePolicyOnPodConditionsPattern;
+    use k3rs_common::resources::workloads::PodFailurePolicyOnPodConditionsPattern;
     let mut j = valid_job();
     j.spec.pod_failure_policy = Some(PodFailurePolicy {
         rules: vec![PodFailurePolicyRule {

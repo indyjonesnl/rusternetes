@@ -9,8 +9,8 @@
 // Unlike the unit tests in admission_webhook.rs which test individual functions,
 // these E2E tests verify the complete integration including HTTP communication.
 
-use rusternetes_api_server::admission_webhook::{AdmissionWebhookClient, AdmissionWebhookManager};
-use rusternetes_common::{
+use k3rs_api_server::admission_webhook::{AdmissionWebhookClient, AdmissionWebhookManager};
+use k3rs_common::{
     admission::{
         AdmissionReview, AdmissionReviewRequest, AdmissionReviewResponse, GroupVersionKind,
         GroupVersionResource, Operation, PatchOp, PatchOperation, UserInfo,
@@ -22,8 +22,8 @@ use rusternetes_common::{
     },
     types::ObjectMeta,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::mock_http::*;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -78,7 +78,7 @@ async fn start_mock_validating_deny_server(reason: String) -> (String, oneshot::
             AdmissionReviewResponse {
                 uid: "unknown".to_string(),
                 allowed: false,
-                status: Some(rusternetes_common::admission::AdmissionStatus {
+                status: Some(k3rs_common::admission::AdmissionStatus {
                     status: "Failure".to_string(),
                     code: Some(403),
                     message: Some(reason.clone()),
@@ -608,10 +608,10 @@ async fn test_webhook_manager_runs_validating_webhooks() {
         .unwrap();
 
     match response {
-        rusternetes_common::admission::AdmissionResponse::Allow => {
+        k3rs_common::admission::AdmissionResponse::Allow => {
             // Expected
         }
-        rusternetes_common::admission::AdmissionResponse::Deny(reason) => {
+        k3rs_common::admission::AdmissionResponse::Deny(reason) => {
             panic!("Webhook should allow request, but denied with: {}", reason);
         }
         _ => {
@@ -698,17 +698,17 @@ async fn test_webhook_manager_runs_mutating_webhooks() {
         .unwrap();
 
     match response {
-        rusternetes_common::admission::AdmissionResponse::AllowWithPatch(patches) => {
+        k3rs_common::admission::AdmissionResponse::AllowWithPatch(patches) => {
             assert!(!patches.is_empty(), "Should have patches");
             assert!(mutated_object.is_some(), "Object should be mutated");
             let obj = mutated_object.unwrap();
             // Verify the label was added
             assert!(obj["metadata"]["labels"]["injected"] == json!("true"));
         }
-        rusternetes_common::admission::AdmissionResponse::Allow => {
+        k3rs_common::admission::AdmissionResponse::Allow => {
             panic!("Expected AllowWithPatch but got Allow");
         }
-        rusternetes_common::admission::AdmissionResponse::Deny(reason) => {
+        k3rs_common::admission::AdmissionResponse::Deny(reason) => {
             panic!("Webhook should allow request, but denied with: {}", reason);
         }
     }
@@ -790,10 +790,10 @@ async fn test_webhook_manager_denial_stops_request() {
         .unwrap();
 
     match response {
-        rusternetes_common::admission::AdmissionResponse::Deny(reason) => {
+        k3rs_common::admission::AdmissionResponse::Deny(reason) => {
             assert!(reason.contains("Resource not allowed"));
         }
-        rusternetes_common::admission::AdmissionResponse::Allow => {
+        k3rs_common::admission::AdmissionResponse::Allow => {
             panic!("Expected Deny but got Allow");
         }
         _ => {

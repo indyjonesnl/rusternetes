@@ -5,7 +5,7 @@
 //!
 //! Mechanism note: upstream registers a `metrics.StableCollector` with
 //! `legacyregistry.CustomMustRegister`; the kubelet's `/metrics` endpoint here
-//! serves `rusternetes_common::observability::MetricsRegistry`, a
+//! serves `k3rs_common::observability::MetricsRegistry`, a
 //! `prometheus::Registry`, so the collector implements
 //! `prometheus::core::Collector` and is registered there.
 

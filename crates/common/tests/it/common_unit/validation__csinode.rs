@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::csi::{CSINode, CSINodeDriver};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1123_subdomain, is_qualified_name};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::csi::{CSINode, CSINodeDriver};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1123_subdomain, is_qualified_name};
+    pub use k3rs_common::validation::objectmeta::{
         validate_immutable_field, validate_nonnegative_field,
     };
     pub use std::collections::HashSet;
@@ -13,8 +13,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::csi::{CSINodeSpec, VolumeNodeResources};
-    use rusternetes_common::validation::csinode::*;
+    use k3rs_common::resources::csi::{CSINodeSpec, VolumeNodeResources};
+    use k3rs_common::validation::csinode::*;
 
     const LONG: CsiNodeValidationOptions = CsiNodeValidationOptions {
         allow_long_node_id: true,

@@ -5,7 +5,7 @@
 //! where `metadata.uid`, `metadata.creationTimestamp` and `metadata.generation`
 //! are assigned for *every* resource — no individual handler can forget.
 //!
-//! In rusternetes the equivalent chokepoint is `Storage::create`. Stamping here
+//! In k3rs the equivalent chokepoint is `Storage::create`. Stamping here
 //! (rather than ad-hoc in each HTTP handler) guarantees that resources written
 //! directly to storage — e.g. the scheduler POSTing a raw `default-scheduler`
 //! Event, or bootstrap namespaces — still receive a `creationTimestamp`, so

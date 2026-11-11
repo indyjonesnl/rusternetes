@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::plugins::*;
+    use k3rs_api_server::admission::plugins::*;
 
     fn help_of(flag: &str) -> String {
         use clap::Args;

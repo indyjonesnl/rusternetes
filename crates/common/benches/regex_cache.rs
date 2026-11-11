@@ -8,12 +8,12 @@
 // per call (the pre-cache baseline).
 //
 // Run:
-//   cargo bench -p rusternetes-common --bench regex_cache
-//   cargo bench -p rusternetes-common --bench regex_cache -- --quick
+//   cargo bench -p k3rs-common --bench regex_cache
+//   cargo bench -p k3rs-common --bench regex_cache -- --quick
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rusternetes_common::resources::crd::JSONSchemaProps;
-use rusternetes_common::schema_validation::SchemaValidator;
+use k3rs_common::resources::crd::JSONSchemaProps;
+use k3rs_common::schema_validation::SchemaValidator;
 
 // A pattern with character classes + quantifiers + anchors so compile work is
 // non-trivial. Same shape as common K8s patterns (DNS label, semver,

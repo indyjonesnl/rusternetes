@@ -13,11 +13,11 @@
 use anyhow::Result;
 use futures::StreamExt;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use rusternetes_common::resources::Service;
-use rusternetes_common::resources::ServiceType;
-use rusternetes_common::resources::{IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy};
-use rusternetes_common::service_ip_ranges::ServiceIpRanges;
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::Service;
+use k3rs_common::resources::ServiceType;
+use k3rs_common::resources::{IPFamily, IPFamilyPolicy, ServiceExternalTrafficPolicy};
+use k3rs_common::service_ip_ranges::ServiceIpRanges;
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

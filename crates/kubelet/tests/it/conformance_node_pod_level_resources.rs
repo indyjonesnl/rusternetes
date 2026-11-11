@@ -12,9 +12,9 @@
 //!
 //! All tests are pure (no storage, no runtime).
 
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-use rusternetes_kubelet::eviction::{get_qos_class, QoSClass};
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+use k3rs_kubelet::eviction::{get_qos_class, QoSClass};
 use std::collections::HashMap;
 
 fn rr(req: &[(&str, &str)], lim: &[(&str, &str)]) -> ResourceRequirements {

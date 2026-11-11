@@ -1,7 +1,7 @@
-# Research: Talos Linux install model → a Rusternetes worker USB image
+# Research: Talos Linux install model → a k3rs worker USB image
 
 > Research + design note for [#1036]. **No code** — this establishes how Talos
-> ships Kubernetes on an immutable OS, then proposes a concrete Rusternetes
+> ships Kubernetes on an immutable OS, then proposes a concrete k3rs
 > worker-node USB image that follows the same shape without reinventing it.
 
 ## 1. Why look at Talos
@@ -9,9 +9,9 @@
 Talos Linux is the reference design for "the OS *is* the Kubernetes node": a
 minimal, immutable, API-driven Linux distribution with no shell and no SSH,
 whose entire job is to boot and run a kubelet. That is exactly the shape we
-want for a single-USB Rusternetes worker — plug it in, it boots, it joins.
+want for a single-USB k3rs worker — plug it in, it boots, it joins.
 Rather than invent a bespoke installer, we mirror Talos's proven mechanism and
-swap the Kubernetes payload for Rusternetes' own binaries.
+swap the Kubernetes payload for k3rs' own binaries.
 
 ## 2. How Talos works
 
@@ -95,13 +95,13 @@ and rebooting rebuilds the node; wiping `STATE` de-identifies it.
 - System extensions are baked at **build time** so they persist across
   reboots/upgrades with no re-download.
 
-## 3. Proposal: a Rusternetes worker USB image
+## 3. Proposal: a k3rs worker USB image
 
 ### 3.1 Scope — what a *worker* actually needs
 
-A Rusternetes worker node is far smaller than the control plane. It needs only:
+A k3rs worker node is far smaller than the control plane. It needs only:
 
-- **`rusternetes-kubelet`** and **`rusternetes-kube-proxy`** (existing crates);
+- **`k3rs-kubelet`** and **`k3rs-kube-proxy`** (existing crates);
 - a **CRI runtime** — the project's target stack is **containerd + crun**
   (see `CLAUDE.md` / the CRI migration), talked to over the CRI gRPC socket;
 - **CNI plugins** + a CNI network config (per the non-negotiable CNI contract);
@@ -111,7 +111,7 @@ A Rusternetes worker node is far smaller than the control plane. It needs only:
   kube-proxy).
 
 Explicitly **out of scope for the worker image**: the api-server, scheduler,
-controller-manager, and storage backend. (The all-in-one `rusternetes` binary
+controller-manager, and storage backend. (The all-in-one `k3rs` binary
 targets the *control-plane-in-a-box* case, not a pure worker — see §3.6.)
 
 ### 3.2 Partition layout (mirror Talos)
@@ -132,22 +132,22 @@ squashfs; only STATE carries identity, only EPHEMERAL carries bulk.
 
 Adopt Talos's read-only-squashfs-into-RAM + overlay design:
 
-- Read-only **squashfs** rootfs built from an existing Rusternetes container
-  image (we already build `rusternetes-kubelet` / `-kube-proxy` / containerd
+- Read-only **squashfs** rootfs built from an existing k3rs container
+  image (we already build `k3rs-kubelet` / `-kube-proxy` / containerd
   images — §3.5), plus busybox/Alpine userland, containerd, crun, CNI plugins,
   and iptables.
 - `tmpfs` for `/run`, `/tmp`; **overlayfs on `EPHEMERAL` (`/var`)** for
   persistence (containerd state, kubelet state).
 - `STATE` mounted read-only-until-needed at a fixed path (e.g.
-  `/etc/rusternetes`).
+  `/etc/k3rs`).
 
 ### 3.4 How the worker binaries run — pick the pragmatic path first
 
 Two options, mirroring the two Talos models:
 
-- **(A) Host services (recommended for v1).** Rusternetes binaries are Rust and
+- **(A) Host services (recommended for v1).** k3rs binaries are Rust and
   can be built as **static musl** binaries (tracked in **#1041**). Ship
-  `rusternetes-kubelet` and `rusternetes-kube-proxy` directly in the squashfs
+  `k3rs-kubelet` and `k3rs-kube-proxy` directly in the squashfs
   and start them from a tiny supervisor (a minimal init, or systemd if the base
   distro has it). No system-containerd needed; the *only* containerd is the CRI
   one the kubelet drives. Simplest to build and reason about.
@@ -165,7 +165,7 @@ We already build worker images with hand-listed crate Dockerfiles. Rather than
 a bespoke installer, build an **imager-style OCI job**:
 
 1. Assemble a rootfs dir: minimal userland + `containerd` + `crun` + CNI
-   plugins + `iptables` + the static `rusternetes-kubelet` / `-kube-proxy`
+   plugins + `iptables` + the static `k3rs-kubelet` / `-kube-proxy`
    binaries + a first-boot supervisor unit.
 2. `mksquashfs` → read-only rootfs image.
 3. Assemble a bootable artifact (kernel + initramfs that loop-mounts the
@@ -187,7 +187,7 @@ credential.** Delivery options (support the first, allow the second):
   + bootstrap token or a pre-issued kubelet kubeconfig). Zero network
   dependency at first boot; dead simple to author and to burn onto the USB
   alongside the image.
-- **(2) Kernel-cmdline config URL:** `rusternetes.config=https://…` fetched in
+- **(2) Kernel-cmdline config URL:** `k3rs.config=https://…` fetched in
   the initramfs — good for PXE/fleet scenarios.
 
 Join sequence:
@@ -195,7 +195,7 @@ Join sequence:
 1. First boot reads the config from `STATE`/config partition.
 2. If only a **bootstrap token** is present, the kubelet uses it to submit a
    **CSR** and obtain its client cert (standard kubelet TLS bootstrap); if a
-   full **kubeconfig** is present, use it directly. Rusternetes already grew
+   full **kubeconfig** is present, use it directly. k3rs already grew
    **kubeconfig-server-based API-mode node registration** (commit `5ea1e662`,
    #1594) and **client-certificate mTLS in `ApiClient`** (#1578/#1585) — the
    worker join path builds directly on those.
@@ -209,18 +209,18 @@ Join sequence:
 - Read-only rootfs; only `STATE` (identity) and `EPHEMERAL` (bulk) are
   writable, and both are re-creatable.
 - Minimal package set — kernel, containerd, crun, CNI, iptables, the two
-  Rusternetes binaries, a supervisor. Nothing else.
+  k3rs binaries, a supervisor. Nothing else.
 
 ## 4. Phased roadmap
 
 1. **P0 — static worker binaries.** Land musl static builds of
-   `rusternetes-kubelet` + `-kube-proxy` (**#1041**). Hard prerequisite for a
+   `k3rs-kubelet` + `-kube-proxy` (**#1041**). Hard prerequisite for a
    self-contained squashfs.
 2. **P1 — bootable rootfs.** Imager-style OCI job → squashfs → ISO + raw image
    that boots to a shell-less node with containerd + crun + CNI up. No join
    yet.
 3. **P2 — config + join.** NoCloud config partition → kubelet TLS bootstrap →
-   node registers against an existing Rusternetes control plane and runs a pod.
+   node registers against an existing k3rs control plane and runs a pod.
    This is the MVP "worker USB".
 4. **P3 — immutability + upgrades.** A/B or installer-image upgrade flow,
    Secure-Boot UKI, `STATE`/`EPHEMERAL` wipe-and-rebuild semantics.
@@ -240,7 +240,7 @@ Join sequence:
   kubeconfig for single-node demos.
 - **Secure Boot:** target UKI now or later? (P3.)
 
-## 6. Related Rusternetes work
+## 6. Related k3rs work
 
 - **#1041** musl + mimalloc static builds + arm64 — **prerequisite** for the
   self-contained rootfs (§3.4-A, §4-P0).

@@ -1,4 +1,4 @@
-use rusternetes_kubelet::static_pods::{
+use k3rs_kubelet::static_pods::{
     is_mirror_pod, load_static_pods, make_mirror_pod, normalize_static_pod, parse_manifest,
     pod_config_hash, CONFIG_HASH_ANNOTATION, CONFIG_MIRROR_ANNOTATION, CONFIG_SOURCE_ANNOTATION,
 };
@@ -73,7 +73,7 @@ fn committed_kube_scheduler_manifest_parses_and_suffixes_to_node_1() {
     );
     let raw = std::fs::read_to_string(manifest_path)
         .expect("committed kube-scheduler static pod manifest must exist");
-    let templated = raw.replace("@CERTS_PATH@", "/host/.rusternetes/certs");
+    let templated = raw.replace("@CERTS_PATH@", "/host/.k3rs/certs");
     let pod = parse_manifest(templated.as_bytes(), "kube-scheduler.yaml")
         .expect("manifest must parse against the Pod schema");
     let pod = normalize_static_pod(pod, "node-1").unwrap();
@@ -92,10 +92,7 @@ fn committed_kube_scheduler_manifest_parses_and_suffixes_to_node_1() {
         .iter()
         .find(|v| v.name == "certs")
         .expect("certs volume");
-    assert_eq!(
-        certs.host_path.as_ref().unwrap().path,
-        "/host/.rusternetes/certs"
-    );
+    assert_eq!(certs.host_path.as_ref().unwrap().path, "/host/.k3rs/certs");
 }
 
 #[test]
@@ -168,10 +165,10 @@ fn load_static_pods_reads_dir_skips_invalid_sorted() {
     assert_eq!(names, vec!["aaa-node-1", "bbb-node-1"]);
 }
 
-use rusternetes_kubelet::static_pods::reconcile_mirror_pods;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_kubelet::static_pods::reconcile_mirror_pods;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 
-fn static_pod(name: &str, image: &str) -> rusternetes_common::resources::Pod {
+fn static_pod(name: &str, image: &str) -> k3rs_common::resources::Pod {
     let yaml = YAML_POD
         .replace("kube-scheduler", name)
         .replace(":latest", image);
@@ -186,7 +183,7 @@ async fn creates_missing_mirror() {
         .await
         .unwrap();
     let key = build_key("pods", Some("kube-system"), "sch-node-1");
-    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     assert!(is_mirror_pod(&mirror));
 }
 
@@ -202,7 +199,7 @@ async fn recreates_mirror_on_hash_change() {
         .await
         .unwrap();
     let key = build_key("pods", Some("kube-system"), "sch-node-1");
-    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     let ann = mirror.metadata.annotations.as_ref().unwrap();
     assert_eq!(
         ann.get(CONFIG_MIRROR_ANNOTATION),
@@ -217,7 +214,7 @@ async fn recreates_mirror_on_hash_change() {
 
 #[tokio::test]
 async fn unchanged_manifest_does_not_clobber_mirror_status() {
-    use rusternetes_common::types::Phase;
+    use k3rs_common::types::Phase;
     let storage = MemoryStorage::new();
     let desired = vec![static_pod("sch", ":v1")];
     reconcile_mirror_pods(&storage, "node-1", &desired)
@@ -225,7 +222,7 @@ async fn unchanged_manifest_does_not_clobber_mirror_status() {
         .unwrap();
     let key = build_key("pods", Some("kube-system"), "sch-node-1");
     // simulate kubelet status sync writing phase=Running onto the mirror
-    let mut mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mut mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     let mut status = mirror.status.clone().unwrap_or_default();
     status.phase = Some(Phase::Running);
     mirror.status = Some(status);
@@ -234,7 +231,7 @@ async fn unchanged_manifest_does_not_clobber_mirror_status() {
     reconcile_mirror_pods(&storage, "node-1", &desired)
         .await
         .unwrap();
-    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     assert_eq!(
         mirror.status.as_ref().and_then(|s| s.phase.clone()),
         Some(Phase::Running)
@@ -252,7 +249,7 @@ async fn deletes_stale_mirror_when_manifest_removed() {
         .await
         .unwrap();
     let key = build_key("pods", Some("kube-system"), "sch-node-1");
-    let got: Result<rusternetes_common::resources::Pod, _> = storage.get(&key).await;
+    let got: Result<k3rs_common::resources::Pod, _> = storage.get(&key).await;
     assert!(got.is_err());
 }
 
@@ -270,12 +267,12 @@ async fn does_not_touch_other_nodes_or_regular_pods() {
         .await
         .unwrap();
     assert!(storage
-        .get::<rusternetes_common::resources::Pod>(&rkey)
+        .get::<k3rs_common::resources::Pod>(&rkey)
         .await
         .is_ok());
 }
 
-use rusternetes_kubelet::static_pods::merge_node_pods;
+use k3rs_kubelet::static_pods::merge_node_pods;
 
 #[test]
 fn merge_prefers_file_version_and_drops_mirror_duplicates() {
@@ -319,14 +316,14 @@ async fn recreates_mirror_that_has_a_deletion_timestamp() {
         .await
         .unwrap();
     let key = build_key("pods", Some("kube-system"), "sch-node-1");
-    let mut mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mut mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     mirror.metadata.deletion_timestamp = Some(chrono::Utc::now());
     storage.update(&key, &mirror).await.unwrap();
 
     reconcile_mirror_pods(&storage, "node-1", &desired)
         .await
         .unwrap();
-    let mirror: rusternetes_common::resources::Pod = storage.get(&key).await.unwrap();
+    let mirror: k3rs_common::resources::Pod = storage.get(&key).await.unwrap();
     assert!(mirror.metadata.deletion_timestamp.is_none());
     assert!(is_mirror_pod(&mirror));
 }

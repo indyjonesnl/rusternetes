@@ -160,7 +160,7 @@ export function TopologyView() {
     queryKey: ["k8s", "pod-metrics"],
     queryFn: async () => {
       const h: Record<string, string> = { Accept: "application/json" };
-      const t = sessionStorage.getItem("rusternetes-token");
+      const t = sessionStorage.getItem("k3rs-token");
       if (t) h["Authorization"] = `Bearer ${t}`;
       const r = await fetch("/apis/metrics.k8s.io/v1beta1/pods", { headers: h });
       return r.ok ? r.json() : { items: [] };
@@ -172,7 +172,7 @@ export function TopologyView() {
     queryKey: ["k8s", "node-metrics-topo"],
     queryFn: async () => {
       const h: Record<string, string> = { Accept: "application/json" };
-      const t = sessionStorage.getItem("rusternetes-token");
+      const t = sessionStorage.getItem("k3rs-token");
       if (t) h["Authorization"] = `Bearer ${t}`;
       const r = await fetch("/apis/metrics.k8s.io/v1beta1/nodes", { headers: h });
       return r.ok ? r.json() : { items: [] };
@@ -206,7 +206,7 @@ export function TopologyView() {
     let cancelled = false;
     const fetchLogs = async () => {
       const headers: Record<string, string> = { Accept: "text/plain" };
-      const token = sessionStorage.getItem("rusternetes-token");
+      const token = sessionStorage.getItem("k3rs-token");
       if (token) headers["Authorization"] = `Bearer ${token}`;
       try {
         const res = await fetch(`/api/v1/namespaces/${logPodNs}/pods/${logPodName}/log?tailLines=30&timestamps=true`, { headers });

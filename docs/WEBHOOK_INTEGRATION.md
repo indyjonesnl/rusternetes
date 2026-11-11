@@ -4,7 +4,7 @@
 > **Tip:** You can manage related resources through the [web console](CONSOLE_USER_GUIDE.md).
 ## Summary
 
-The admission webhook infrastructure has been successfully integrated into the Rusternetes API server request pipeline. Webhooks are now called during resource creation and update operations.
+The admission webhook infrastructure has been successfully integrated into the k3rs API server request pipeline. Webhooks are now called during resource creation and update operations.
 
 ## What Was Implemented
 
@@ -76,13 +76,13 @@ Example denial handling:
 match mutation_response {
     AdmissionResponse::Deny(reason) => {
         warn!("Mutating webhooks denied pod creation: {}", reason);
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
     AdmissionResponse::Allow | AdmissionResponse::AllowWithPatch(_) => {
         // Continue with the mutated object
         if let Some(mutated_value) = mutated_pod_value {
             pod = serde_json::from_value(mutated_value)
-                .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))?;
+                .map_err(|e| k3rs_common::Error::Internal(e.to_string()))?;
         }
     }
 }
@@ -261,7 +261,7 @@ To apply webhooks to other resources (Deployments, Services, etc.):
 Example template:
 ```rust
 // Convert user info
-let user_info = rusternetes_common::admission::UserInfo {
+let user_info = k3rs_common::admission::UserInfo {
     username: auth_ctx.user.username.clone(),
     uid: auth_ctx.user.uid.clone(),
     groups: auth_ctx.user.groups.clone(),

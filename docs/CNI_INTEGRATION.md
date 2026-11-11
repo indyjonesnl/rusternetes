@@ -1,10 +1,10 @@
 # CNI Integration Guide
 
-This document describes the CNI (Container Network Interface) framework integration in Rusternetes and how it enables Kubernetes conformance testing.
+This document describes the CNI (Container Network Interface) framework integration in k3rs and how it enables Kubernetes conformance testing.
 
 ## Overview
 
-Rusternetes implements a complete CNI framework that follows the [CNI Specification v1.0.0+](https://www.cni.dev/docs/spec/). This allows Rusternetes to work with any CNI-compliant network plugin, making it fully compatible with Kubernetes networking requirements and conformance tests.
+k3rs implements a complete CNI framework that follows the [CNI Specification v1.0.0+](https://www.cni.dev/docs/spec/). This allows k3rs to work with any CNI-compliant network plugin, making it fully compatible with Kubernetes networking requirements and conformance tests.
 
 ## What is CNI?
 
@@ -106,7 +106,7 @@ sudo mkdir -p /etc/cni/net.d
 sudo cat > /etc/cni/net.d/10-bridge.conflist <<'EOF'
 {
   "cniVersion": "1.0.0",
-  "name": "rusternetes-bridge",
+  "name": "k3rs-bridge",
   "plugins": [
     {
       "type": "bridge",
@@ -155,7 +155,7 @@ sudo cat > /etc/cni/net.d/99-loopback.conf <<'EOF'
 EOF
 ```
 
-### 3. Configure Rusternetes Kubelet
+### 3. Configure k3rs Kubelet
 
 The kubelet will automatically discover and use CNI configurations. You can optionally specify custom paths:
 
@@ -260,7 +260,7 @@ Sets up networking for a new container:
 ```json
 {
   "cniVersion": "1.0.0",
-  "name": "rusternetes-bridge",
+  "name": "k3rs-bridge",
   "type": "bridge",
   "bridge": "cni0",
   "isGateway": true,
@@ -384,7 +384,7 @@ The CNI framework passes tests in these categories:
 
 ## Supported CNI Plugins
 
-Rusternetes CNI framework works with any CNI v0.4.0+ compliant plugin:
+k3rs CNI framework works with any CNI v0.4.0+ compliant plugin:
 
 ### Reference Plugins (containernetworking/plugins)
 

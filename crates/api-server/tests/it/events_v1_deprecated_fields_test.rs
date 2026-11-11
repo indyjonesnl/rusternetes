@@ -16,13 +16,13 @@
 //! Because the strict branch of `ValidateEventCreate`
 //! (`pkg/apis/core/validation/events.go:41-71`) then requires
 //! `firstTimestamp`, `lastTimestamp`, `count` and `source` to be unset, a
-//! create that sets any `deprecated*` field must be rejected. Rusternetes
+//! create that sets any `deprecated*` field must be rejected. k3rs
 //! models both API versions with one `Event` struct, so without the
 //! conversion the `deprecated*` names decode into nothing and every strict
 //! rule reads a zero value — the request is accepted (#1914).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

@@ -1,16 +1,16 @@
 // End-to-End Workflow Tests
 // Note: These tests use in-memory storage for fast, isolated testing
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
-use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_controller_manager::controllers::volume_snapshot::VolumeSnapshotController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::dynamic_provisioner::DynamicProvisionerController;
+use k3rs_controller_manager::controllers::pv_binder::PVBinderController;
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_controller_manager::controllers::volume_snapshot::VolumeSnapshotController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -399,13 +399,10 @@ async fn test_dynamic_pvc_workflow() {
             api_version: "storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("fast"),
-        provisioner: "rusternetes.io/hostpath".to_string(),
+        provisioner: "k3rs.io/hostpath".to_string(),
         parameters: Some({
             let mut params = HashMap::new();
-            params.insert(
-                "path".to_string(),
-                "/tmp/rusternetes/test-volumes".to_string(),
-            );
+            params.insert("path".to_string(), "/tmp/k3rs/test-volumes".to_string());
             params
         }),
         reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
@@ -506,7 +503,7 @@ async fn test_snapshot_workflow() {
             api_version: "snapshot.storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("snapshot-class"),
-        driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+        driver: "k3rs.io/hostpath-snapshotter".to_string(),
         parameters: None,
         deletion_policy: DeletionPolicy::Delete,
     };

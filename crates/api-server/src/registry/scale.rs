@@ -10,11 +10,11 @@
 //! `spec.replicas` managedFields entries to and from the Scale (#1996).
 
 use async_trait::async_trait;
-use rusternetes_common::deletion::Preconditions;
-use rusternetes_common::resources::Scale;
-use rusternetes_common::validation::hpa::validate_scale;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::deletion::Preconditions;
+use k3rs_common::resources::Scale;
+use k3rs_common::validation::hpa::validate_scale;
+use k3rs_common::{Error, Result};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::{Store, UpdateOptions};
 use crate::registry::rest::{

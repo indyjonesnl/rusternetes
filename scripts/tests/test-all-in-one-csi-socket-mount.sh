@@ -3,7 +3,7 @@
 #
 # The all-in-one binary runs the controller-manager in-process, and with
 # `--csi-attacher DRIVER=SOCKET` it dials that driver socket from inside the
-# `rusternetes` container. So the socket's directory has to be bind-mounted into
+# `k3rs` container. So the socket's directory has to be bind-mounted into
 # the container at the same path, read-write. This is how kubeadm makes a host
 # plugin-socket dir reachable to the kube-controller-manager: the flexvolume dir
 # is a read-write DirectoryOrCreate hostPath "as it is used for third-party
@@ -59,12 +59,12 @@ render() {
         --project-directory "$dir" -f "$1" config --format json 2>/dev/null
 }
 
-# One fact per line about the `rusternetes` service: the CSI flags in its
+# One fact per line about the `k3rs` service: the CSI flags in its
 # command, and every bind mount as source:target:read_only.
 service_facts() {
     python3 -c '
 import json, os, sys
-svc = json.load(sys.stdin)["services"]["rusternetes"]
+svc = json.load(sys.stdin)["services"]["k3rs"]
 cmd = svc.get("command") or []
 for i, a in enumerate(cmd):
     if a == "--csi-attacher":

@@ -22,7 +22,7 @@ use crate::volume_plugins::util::{device_util::new_os_device_handler, mount_opti
 use crate::volume_plugins::{Spec, VolumeHost};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::Arc;

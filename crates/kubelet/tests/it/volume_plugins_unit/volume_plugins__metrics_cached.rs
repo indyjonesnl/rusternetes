@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
+    pub use k3rs_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::metrics_cached::*;
+    use k3rs_kubelet::volume_plugins::metrics_cached::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -26,9 +26,9 @@ mod tests {
                 return Err(anyhow::anyhow!("not yet"));
             }
             Ok(Metrics {
-                inodes_used: Some(rusternetes_common::quantity::Quantity::from_value(
+                inodes_used: Some(k3rs_common::quantity::Quantity::from_value(
                     n as i64,
-                    rusternetes_common::quantity::Format::DecimalSI,
+                    k3rs_common::quantity::Format::DecimalSI,
                 )),
                 ..Default::default()
             })

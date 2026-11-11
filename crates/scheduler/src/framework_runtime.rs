@@ -12,7 +12,7 @@
 //!   the `var _ fwk.XPlugin = &Name{}` assertions of each in-tree plugin for
 //!   which extension points it implements.
 //!
-//! Rusternetes has no per-plugin objects (the filter/score pipeline in
+//! k3rs has no per-plugin objects (the filter/score pipeline in
 //! `scheduler.rs` is compiled in), so a plugin's "implementation" here is the
 //! set of extension points it implements; the resolved [`Framework`] is what
 //! the pipeline consults to decide which stages run for a profile.
@@ -22,9 +22,9 @@ use crate::fwk::{
     PodSignature, PostBindPlugin, PreBindPlugin, PreFilterPlugin, PreFilterResult, PreScorePlugin,
     QueueSortPlugin, ReservePlugin, ScorePlugin, SignPlugin, Status,
 };
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::resources::pod::NodeAffinity;
-use rusternetes_common::resources::{Node, Pod};
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::resources::pod::NodeAffinity;
+use k3rs_common::resources::{Node, Pod};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -434,7 +434,7 @@ impl PluginInstance {
 
 /// `runtime.PluginFactory` (registry.go): builds a plugin from its
 /// `pluginConfig` args (`None` when the profile has no entry for it).
-/// Deviation: upstream also passes the `fwk.Handle`; Rusternetes plugin
+/// Deviation: upstream also passes the `fwk.Handle`; k3rs plugin
 /// objects receive their [`Handle`] per call instead.
 pub type PluginFactory =
     Arc<dyn Fn(Option<&serde_json::Value>) -> Result<PluginInstance, String> + Send + Sync>;
@@ -1212,7 +1212,7 @@ impl Framework {
 
     /// `computeBatchablePlugins` (framework.go:757-803): signatures are only
     /// enabled when every PreFilter, Filter, PreScore and Score plugin can
-    /// sign. (Rusternetes has no extenders to disable them.)
+    /// sign. (k3rs has no extenders to disable them.)
     fn compute_batchable_plugins(&mut self) {
         self.enable_signatures = true;
         self.batchable_plugins = SignPluginObjects::default();
@@ -1665,7 +1665,7 @@ impl Framework {
     }
 }
 
-/// `NewFramework` (framework.go:306-452), minus the parts with no Rusternetes
+/// `NewFramework` (framework.go:306-452), minus the parts with no k3rs
 /// counterpart (plugin factories/handles, metrics, parallelizer).
 pub fn new_framework(r: &Registry, profile: &ProfileSpec<'_>) -> Result<Framework, String> {
     let mut f = Framework {

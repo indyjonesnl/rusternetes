@@ -6,8 +6,8 @@
 // - Orphan deletion
 // - Finalizer handling for deletion protection
 
-use rusternetes_common::types::{DeletionPropagation, ObjectMeta};
-use rusternetes_storage::Storage;
+use k3rs_common::types::{DeletionPropagation, ObjectMeta};
+use k3rs_storage::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -91,12 +91,12 @@ pub enum DependentOp {
 async fn delete_orphan_verified<S: Storage>(
     storage: &S,
     orphan: &ResourceInfo,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     // Re-read the resource from storage to get fresh ownerReferences.
     // It may have been updated since the scan snapshot.
     let fresh: Value = match storage.get(&orphan.key).await {
         Ok(v) => v,
-        Err(rusternetes_common::Error::NotFound(_)) => return Ok(()), // already gone
+        Err(k3rs_common::Error::NotFound(_)) => return Ok(()), // already gone
         Err(e) => return Err(e),
     };
     let fresh_meta: ObjectMeta = match fresh
@@ -154,7 +154,7 @@ async fn delete_orphan_verified<S: Storage>(
                     // The old owner is gone, this ownerRef is dangling.
                 }
             }
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 // Owner not found — this ownerRef is dangling
             }
             Err(_) => {
@@ -246,7 +246,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         let base = self.scan_interval;
         let max = self.max_scan_interval;
         let mut interval = base;
-        let mut watch: Option<rusternetes_storage::WatchStream> = None;
+        let mut watch: Option<k3rs_storage::WatchStream> = None;
         loop {
             match self.scan_and_collect_inner().await {
                 Ok(did_work) => interval = next_scan_interval(interval, did_work, base, max),
@@ -284,7 +284,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     async fn wait_for_next_scan(
         &self,
         interval: Duration,
-        watch: &mut Option<rusternetes_storage::WatchStream>,
+        watch: &mut Option<k3rs_storage::WatchStream>,
     ) {
         use futures::StreamExt;
         let deadline = tokio::time::Instant::now() + interval;
@@ -324,14 +324,14 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// [`scan_and_collect_inner`](Self::scan_and_collect_inner) carries the
     /// did-work signal the adaptive [`run`](Self::run) loop needs. Only the
     /// tests call this now (production `run` uses the inner method directly).
-    pub async fn scan_and_collect(&self) -> rusternetes_common::Result<()> {
+    pub async fn scan_and_collect(&self) -> k3rs_common::Result<()> {
         self.scan_and_collect_inner().await.map(|_| ())
     }
 
     /// Scan all resources and collect orphans, returning whether the scan did
     /// any work (found orphans to delete, or resources pending deletion). The
     /// adaptive `run` loop uses this to decide whether to back off.
-    async fn scan_and_collect_inner(&self) -> rusternetes_common::Result<bool> {
+    async fn scan_and_collect_inner(&self) -> k3rs_common::Result<bool> {
         debug!("Running garbage collection scan");
 
         // Get all resources from storage
@@ -496,7 +496,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// Get all resources from storage
-    async fn get_all_resources(&self) -> rusternetes_common::Result<Vec<ResourceInfo>> {
+    async fn get_all_resources(&self) -> k3rs_common::Result<Vec<ResourceInfo>> {
         self.list_passes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resources = Vec::new();
@@ -566,7 +566,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         prefix: &str,
         resource_type: &str,
-    ) -> rusternetes_common::Result<Vec<ResourceInfo>> {
+    ) -> k3rs_common::Result<Vec<ResourceInfo>> {
         let values: Vec<Value> = self.storage.list(prefix).await?;
         let mut resources = Vec::new();
 
@@ -598,13 +598,13 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     }
 
     /// Extract metadata from a resource
-    fn extract_metadata(&self, value: &Value) -> rusternetes_common::Result<ObjectMeta> {
-        let metadata = value.get("metadata").ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource("Missing metadata".to_string())
-        })?;
+    fn extract_metadata(&self, value: &Value) -> k3rs_common::Result<ObjectMeta> {
+        let metadata = value
+            .get("metadata")
+            .ok_or_else(|| k3rs_common::Error::InvalidResource("Missing metadata".to_string()))?;
 
         serde_json::from_value(metadata.clone())
-            .map_err(|e| rusternetes_common::Error::Internal(e.to_string()))
+            .map_err(|e| k3rs_common::Error::Internal(e.to_string()))
     }
 
     /// Build owner-dependent relationship maps
@@ -724,7 +724,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         resource: &ResourceInfo,
         dependent_map: &HashMap<String, Vec<String>>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         // Check deletion propagation policy from finalizers
         let propagation_policy = self.determine_propagation_policy(&resource.metadata);
 
@@ -772,7 +772,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         }
 
         // Re-read the resource to see if it still has finalizers
-        let current: rusternetes_common::Result<Value> = self.storage.get(&resource.key).await;
+        let current: k3rs_common::Result<Value> = self.storage.get(&resource.key).await;
         match current {
             Ok(value) => {
                 if let Ok(meta) = self.extract_metadata(&value) {
@@ -852,7 +852,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         resource: &ResourceInfo,
         finalizer: &str,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         // Re-read the resource to get the latest version
         let current: Value = self.storage.get(&resource.key).await?;
         let mut updated = current;
@@ -897,7 +897,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         resource: &ResourceInfo,
         dependent_map: &HashMap<String, Vec<String>>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         // ONE snapshot for the whole cascade. Re-listing per level made the
         // cost of deleting an owner scale with its dependent count — see
         // `delete_dependents_foreground_visiting`.
@@ -954,7 +954,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                 let outcome = match &op {
                     DependentOp::Delete(key) => match storage.delete(key).await {
                         Ok(_) => None,
-                        Err(rusternetes_common::Error::NotFound(_)) => {
+                        Err(k3rs_common::Error::NotFound(_)) => {
                             debug!("Dependent {} already gone", key);
                             None
                         }
@@ -998,7 +998,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                         for attempt in 0..GC_CONFLICT_RETRY_ATTEMPTS {
                             let current: Value = match storage.get(key).await {
                                 Ok(v) => v,
-                                Err(rusternetes_common::Error::NotFound(_)) => {
+                                Err(k3rs_common::Error::NotFound(_)) => {
                                     debug!("Dependent {} already gone, nothing to strip", key);
                                     break;
                                 }
@@ -1015,12 +1015,12 @@ impl<S: Storage + 'static> GarbageCollector<S> {
                                     outcome = None;
                                     break;
                                 }
-                                Err(rusternetes_common::Error::NotFound(_)) => {
+                                Err(k3rs_common::Error::NotFound(_)) => {
                                     debug!("Dependent {} already gone, nothing to strip", key);
                                     outcome = None;
                                     break;
                                 }
-                                Err(rusternetes_common::Error::Conflict(msg))
+                                Err(k3rs_common::Error::Conflict(msg))
                                     if attempt + 1 < GC_CONFLICT_RETRY_ATTEMPTS =>
                                 {
                                     debug!(
@@ -1206,7 +1206,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
     /// `BlockOwnerDeletion` does not block, so `None` here does not either.
     /// Counting every dependent instead held an owner open on dependents that
     /// never asked to block it (#1829).
-    pub async fn still_has_dependents(&self, owner_uid: &str) -> rusternetes_common::Result<bool> {
+    pub async fn still_has_dependents(&self, owner_uid: &str) -> k3rs_common::Result<bool> {
         let all_resources = self.get_all_resources().await?;
         Ok(all_resources.iter().any(|r| {
             r.metadata.owner_references.as_ref().is_some_and(|refs| {
@@ -1223,7 +1223,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         &self,
         resource: &ResourceInfo,
         _dependent_map: &HashMap<String, Vec<String>>,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let resource_uid = &resource.metadata.uid;
 
         // Find all resources that reference this resource as an owner
@@ -1291,7 +1291,7 @@ impl<S: Storage + 'static> GarbageCollector<S> {
         // A non-empty result means the orphan finalizer stays on, so the owner
         // is not deleted while a dependent still references it.
         if !failures.is_empty() {
-            return Err(rusternetes_common::Error::Internal(format!(
+            return Err(k3rs_common::Error::Internal(format!(
                 "failed to orphan {} dependent(s) of {}: {}",
                 failures.len(),
                 resource.key,
@@ -1500,7 +1500,7 @@ fn kind_to_plural(kind: &str) -> &str {
 /// Mirrors upstream garbage collector's workqueue rate-limiter
 /// (`pkg/controller/garbagecollector/garbagecollector.go`: `Forget` on an
 /// actionable item, `AddRateLimited` otherwise): a scan that did work resets
-/// to `base`; an idle scan doubles the interval, clamped to `max`. Rusternetes
+/// to `base`; an idle scan doubles the interval, clamped to `max`. k3rs
 /// has no dependency-graph informer to make GC fully event-driven (tracked in
 /// #1039), so a scan-based GC approximates "silent when idle" (#1040) by
 /// stretching the poll interval when there is nothing to collect.
@@ -1585,8 +1585,8 @@ fn spec_finalizers_remain(resource_type: &str, value: &Value) -> bool {
 ///
 /// Everything else (creates, status writes) waits for the poll, preserving the
 /// idle-quiet property the backoff buys (#1040).
-pub fn event_warrants_scan(event: &rusternetes_storage::WatchEvent) -> bool {
-    use rusternetes_storage::WatchEvent;
+pub fn event_warrants_scan(event: &k3rs_storage::WatchEvent) -> bool {
+    use k3rs_storage::WatchEvent;
     match event {
         WatchEvent::Deleted(..) => true,
         WatchEvent::Modified(_, value) => value_has_deletion_timestamp(value),

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Generate a kubeconfig that embeds the rusternetes CA certificate.
+# Generate a kubeconfig that embeds the k3rs CA certificate.
 #
 # Why not just `--insecure-skip-tls-verify`? kubectl tolerates that
 # kubeconfig shape, but other Kubernetes tooling does not — notably
@@ -22,10 +22,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CA_CERT="${PROJECT_ROOT}/.rusternetes/certs/ca.crt"
-KUBECONFIG_OUT="${1:-${KUBECONFIG_OUT:-$HOME/.kube/rusternetes-config}}"
+CA_CERT="${PROJECT_ROOT}/.k3rs/certs/ca.crt"
+KUBECONFIG_OUT="${1:-${KUBECONFIG_OUT:-$HOME/.kube/k3rs-config}}"
 API_SERVER="${API_SERVER:-https://localhost:6443}"
-CLUSTER_NAME="${CLUSTER_NAME:-rusternetes}"
+CLUSTER_NAME="${CLUSTER_NAME:-k3rs}"
 USER_NAME="${USER_NAME:-admin}"
 USER_TOKEN="${USER_TOKEN:-anonymous}"
 

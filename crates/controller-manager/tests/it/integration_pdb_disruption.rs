@@ -28,19 +28,19 @@
 //! features (e.g. CRD scale subresource for `expectedPods`) and stay
 //! discoverable via `cargo test -- --ignored`.
 
-use rusternetes_common::resources::pod::{Container, Pod, PodCondition, PodSpec, PodStatus};
-use rusternetes_common::resources::{
+use k3rs_common::resources::pod::{Container, Pod, PodCondition, PodSpec, PodStatus};
+use k3rs_common::resources::{
     CustomResource, CustomResourceDefinition, CustomResourceDefinitionVersion,
     CustomResourceSubresourceScale, CustomResourceSubresources, IntOrString, PodDisruptionBudget,
     PodDisruptionBudgetSpec, PodDisruptionBudgetStatus,
 };
-use rusternetes_common::types::{
+use k3rs_common::types::{
     LabelSelector, LabelSelectorRequirement, ObjectMeta, OwnerReference, Phase, TypeMeta,
 };
-use rusternetes_controller_manager::controllers::pod_disruption_budget::{
+use k3rs_controller_manager::controllers::pod_disruption_budget::{
     PodDisruptionBudgetController, StalePodDisruptionController,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -250,7 +250,7 @@ fn assert_pdb_status(
 // expectedPods=4, currentHealthy=4, desiredHealthy=2, disruptionsAllowed=2.
 //
 // The variant that uses an arbitrary CRD with a scale subresource is marked
-// `#[ignore]` until rusternetes grows that surface.
+// `#[ignore]` until k3rs grows that surface.
 #[tokio::test]
 async fn test_pdb_with_scale_subresource() {
     let storage = new_storage();
@@ -345,9 +345,9 @@ async fn test_pdb_with_scale_subresource_crd_variant() {
         api_version: "apiextensions.k8s.io/v1".to_string(),
         kind: "CustomResourceDefinition".to_string(),
         metadata: ObjectMeta::new("scalecrds.example.com"),
-        spec: rusternetes_common::resources::CustomResourceDefinitionSpec {
+        spec: k3rs_common::resources::CustomResourceDefinitionSpec {
             group: "example.com".to_string(),
-            names: rusternetes_common::resources::CustomResourceDefinitionNames {
+            names: k3rs_common::resources::CustomResourceDefinitionNames {
                 plural: "scalecrds".to_string(),
                 singular: Some("scalecrd".to_string()),
                 kind: "ScaleCRD".to_string(),
@@ -355,7 +355,7 @@ async fn test_pdb_with_scale_subresource_crd_variant() {
                 categories: None,
                 list_kind: Some("ScaleCRDList".to_string()),
             },
-            scope: rusternetes_common::resources::ResourceScope::Namespaced,
+            scope: k3rs_common::resources::ResourceScope::Namespaced,
             versions: vec![CustomResourceDefinitionVersion {
                 name: "v1".to_string(),
                 served: true,
@@ -463,7 +463,7 @@ async fn test_pdb_with_scale_subresource_crd_variant() {
 //   - policy/v1   with an empty selector: SHOULD target every pod in the
 //     namespace (currentHealthy = 4).
 //
-// rusternetes only ships policy/v1 PDB types; the v1beta1 case is pinned as
+// k3rs only ships policy/v1 PDB types; the v1beta1 case is pinned as
 // `#[ignore]` and the v1 case is exercised directly.
 #[tokio::test]
 async fn test_empty_selector_v1_targets_all_pods() {
@@ -567,7 +567,7 @@ async fn test_empty_selector_v1beta1_targets_no_pods() {
 //   2. v1 PDB with DoesNotExist expression → currentHealthy = 1
 //   3. v1beta1 PDB with DoesNotExist expr  → currentHealthy = 1
 //
-// rusternetes' current selector matcher rejects pods that have no labels
+// k3rs' current selector matcher rejects pods that have no labels
 // (`pod.metadata.labels == None`). The first sub-case is the canonical pin —
 // it MUST be observable. The other two require selector parity and v1beta1
 // compat, both of which are pinned as `#[ignore]` for now.
@@ -732,13 +732,11 @@ async fn test_patch_compatibility_selector_round_trip() {
                     "basematch".to_string(),
                     "true".to_string(),
                 )])),
-                match_expressions: Some(vec![
-                    rusternetes_common::types::LabelSelectorRequirement {
-                        key: "baseexpression".to_string(),
-                        operator: "In".to_string(),
-                        values: Some(vec!["true".to_string()]),
-                    },
-                ]),
+                match_expressions: Some(vec![k3rs_common::types::LabelSelectorRequirement {
+                    key: "baseexpression".to_string(),
+                    operator: "In".to_string(),
+                    values: Some(vec!["true".to_string()]),
+                }]),
             }),
             unhealthy_pod_eviction_policy: None,
         },

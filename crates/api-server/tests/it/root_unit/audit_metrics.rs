@@ -4,9 +4,9 @@
 //! deltas since the counters are process-global.
 
 use axum::{body::Body, routing::get, Router};
-use rusternetes_api_server::audit::{with_audit, AuditConfig, Policy};
-use rusternetes_api_server::audit_metrics::*;
-use rusternetes_common::audit::{AuditBackend, AuditEvent, AuditLevel};
+use k3rs_api_server::audit::{with_audit, AuditConfig, Policy};
+use k3rs_api_server::audit_metrics::*;
+use k3rs_common::audit::{AuditBackend, AuditEvent, AuditLevel};
 use std::sync::Arc;
 use tower::ServiceExt;
 

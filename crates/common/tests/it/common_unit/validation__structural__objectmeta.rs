@@ -3,13 +3,11 @@
 
 mod __parent {
     pub use chrono::NaiveDate;
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1035_label;
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_path_segment, validate_object_meta,
-    };
-    pub use rusternetes_common::validation::structural::Structural;
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1035_label;
+    pub use k3rs_common::validation::objectmeta::{name_is_path_segment, validate_object_meta};
+    pub use k3rs_common::validation::structural::Structural;
     pub use serde_json::{Map, Value};
 }
 
@@ -26,8 +24,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::__parent::*;
-    use rusternetes_common::validation::structural::objectmeta::*;
-    use rusternetes_common::validation::structural::{Extensions, Generic};
+    use k3rs_common::validation::structural::objectmeta::*;
+    use k3rs_common::validation::structural::{Extensions, Generic};
 
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
@@ -583,7 +581,7 @@ mod tests {
     // validation_test.go.
     // ---------------------------------------------------------------------------
 
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_common::validation::field::ErrorType;
 
     /// `validationMatch`: (field path, error type).
     type Match = (&'static str, ErrorType);
@@ -696,7 +694,7 @@ mod tests {
                     "additionalProperties".to_string(),
                     Structural {
                         additional_properties: Some(Box::new(
-                            rusternetes_common::validation::structural::StructuralOrBool {
+                            k3rs_common::validation::structural::StructuralOrBool {
                                 structural: Some(embedded_leaf()),
                                 bool_: false,
                             },

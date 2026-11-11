@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::{PodAffinityTerm, WeightedPodAffinityTerm};
-    pub use rusternetes_common::resources::{Namespace, Node, Pod};
-    pub use rusternetes_common::types::{label_selector_as_selector, Phase, Selector};
+    pub use k3rs_common::resources::pod::{PodAffinityTerm, WeightedPodAffinityTerm};
+    pub use k3rs_common::resources::{Namespace, Node, Pod};
+    pub use k3rs_common::types::{label_selector_as_selector, Phase, Selector};
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::inter_pod_affinity_score::*;
-    use rusternetes_scheduler::score::{normalize_inter_pod_affinity, MAX_NODE_SCORE};
+    use k3rs_scheduler::inter_pod_affinity_score::*;
+    use k3rs_scheduler::score::{normalize_inter_pod_affinity, MAX_NODE_SCORE};
     use serde_json::{json, Value};
 
     fn ns(name: &str, team: &str) -> Namespace {

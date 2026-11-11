@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rusternetes_common::fieldmanager::schema::Type;
+use k3rs_common::fieldmanager::schema::Type;
 
 /// `Pod`'s root is not vendored, but its `metadata` and `spec` types are;
 /// `status` (and anything else) stays name-driven.

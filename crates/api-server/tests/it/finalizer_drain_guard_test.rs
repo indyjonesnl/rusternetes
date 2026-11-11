@@ -7,7 +7,7 @@
 //! upstream — PUT, PATCH and apply all funnel through that `Update` — so this
 //! holds for every resource and every verb by construction.
 //!
-//! Rusternetes has one handler per resource per verb; the ones on the generic
+//! k3rs has one handler per resource per verb; the ones on the generic
 //! Store get this from `Store.Update`, and the rest finish the deletion
 //! themselves after they persist.
 //!

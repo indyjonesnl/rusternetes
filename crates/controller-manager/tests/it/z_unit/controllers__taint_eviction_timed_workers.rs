@@ -15,7 +15,7 @@ mod tests {
     //! Cases ported from `timed_workers_test.go`: TestExecute (:30),
     //! TestExecuteDelayed (:53), TestCancel (:85), TestCancelAndRead (:119).
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::taint_eviction_timed_workers::*;
+    use k3rs_controller_manager::controllers::taint_eviction_timed_workers::*;
     use std::time::Duration;
 
     fn counting_queue() -> (TimedWorkerQueue, Arc<AtomicUsize>) {

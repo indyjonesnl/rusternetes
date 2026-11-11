@@ -4,13 +4,13 @@
 //! mounted again through the plugin's `SetUp`, and an unknown one is attached
 //! and mounted.
 
-use rusternetes_common::resources::{ConfigMap, Pod};
-use rusternetes_kubelet::podcertificate::PodManager;
-use rusternetes_kubelet::volume_manager::populator::PodStateProvider;
-use rusternetes_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
-use rusternetes_kubelet::volume_plugins::util::get_unique_pod_name;
-use rusternetes_kubelet::volumes::VolumeManager;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{ConfigMap, Pod};
+use k3rs_kubelet::podcertificate::PodManager;
+use k3rs_kubelet::volume_manager::populator::PodStateProvider;
+use k3rs_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
+use k3rs_kubelet::volume_plugins::util::get_unique_pod_name;
+use k3rs_kubelet::volumes::VolumeManager;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -93,7 +93,7 @@ async fn fx_inner() -> Fx {
         VolumeManager::new_with_recording_empty_dir_mounts(
             dir.path().display().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name("node-rc"),
     );
@@ -253,7 +253,7 @@ async fn wait_for_attach_and_mount_times_out_naming_the_unmounted_volume() {
         .await
         .unwrap_err();
     assert!(
-        rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err),
+        k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err),
         "{err:#}"
     );
     assert!(

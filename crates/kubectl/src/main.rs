@@ -5,12 +5,12 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use rusternetes_kubectl::{commands, types};
+use k3rs_kubectl::{commands, types};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rusternetes_client::http::ApiClient;
-use rusternetes_client::kubeconfig::KubeConfig;
+use k3rs_client::http::ApiClient;
+use k3rs_client::kubeconfig::KubeConfig;
 use types::{
     ApplyCommands, AuthCommands, CertificateCommands, ConfigCommands, CreateCommands,
     KubercCommands, PluginCommands, RolloutCommands, SetCommands, TopCommands,
@@ -18,7 +18,7 @@ use types::{
 
 #[derive(Parser)]
 #[command(name = "kubectl")]
-#[command(about = "Rusternetes kubectl - Command line tool for Rusternetes")]
+#[command(about = "k3rs kubectl - Command line tool for k3rs")]
 struct Cli {
     /// Path to kubeconfig file
     #[arg(long, global = true)]
@@ -1180,7 +1180,7 @@ async fn main() -> Result<()> {
         token,
     )?
     // `rest.SetKubernetesDefaults`: the component's default User-Agent.
-    .with_default_user_agent(rusternetes_common::compatibility::default_kubernetes_user_agent());
+    .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent());
 
     match cli.command {
         Commands::Get {

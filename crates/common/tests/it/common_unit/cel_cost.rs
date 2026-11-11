@@ -14,8 +14,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cel::{CELContext, CELEvaluator};
-    use rusternetes_common::cel_cost::*;
+    use k3rs_common::cel::{CELContext, CELEvaluator};
+    use k3rs_common::cel_cost::*;
     use serde_json::json;
     use std::sync::Arc;
 

@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusternetes_common::resources::APIService;
+use k3rs_common::resources::APIService;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -517,11 +517,11 @@ impl AggregationController {
 /// [`crate::handlers::aggregator::resolve_aggregator_target_for_handler`],
 /// then [`crate::handlers::aggregator::forward_to_aggregator`] (which dials
 /// through the egress selector's `Cluster` dialer, as `proxyTransportDial`).
-pub struct ProxySpecServer<S: rusternetes_storage::Storage + Send + Sync + 'static> {
+pub struct ProxySpecServer<S: k3rs_storage::Storage + Send + Sync + 'static> {
     storage: Arc<S>,
 }
 
-impl<S: rusternetes_storage::Storage + Send + Sync + 'static> ProxySpecServer<S> {
+impl<S: k3rs_storage::Storage + Send + Sync + 'static> ProxySpecServer<S> {
     pub fn new(storage: Arc<S>) -> Self {
         Self { storage }
     }
@@ -554,7 +554,7 @@ pub(crate) async fn response_to_handler_response(
 }
 
 #[async_trait]
-impl<S: rusternetes_storage::Storage + Send + Sync + 'static> SpecServer for ProxySpecServer<S> {
+impl<S: k3rs_storage::Storage + Send + Sync + 'static> SpecServer for ProxySpecServer<S> {
     async fn serve(
         &self,
         handler: &ProxyHandler,
@@ -597,7 +597,7 @@ pub async fn forward_handler_request(
     dialer: Option<Option<crate::egress_selector::Dialer>>,
 ) -> HandlerResponse {
     let auth_ctx = crate::middleware::AuthContext {
-        user: rusternetes_common::auth::UserInfo {
+        user: k3rs_common::auth::UserInfo {
             username: req.user.clone(),
             uid: String::new(),
             groups: req.groups.clone(),

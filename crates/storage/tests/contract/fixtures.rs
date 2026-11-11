@@ -4,7 +4,7 @@
 //! the cacher); kine compiles the same suite and points it at itself. We do the
 //! same across MemoryStorage, etcd and kine.
 
-use rusternetes_storage::{etcd::EtcdStorage, MemoryStorage};
+use k3rs_storage::{etcd::EtcdStorage, MemoryStorage};
 use serde_json::{json, Value};
 use testcontainers::{
     core::{IntoContainerPort, WaitFor},
@@ -136,7 +136,7 @@ pub async fn kine() -> Option<Fixture<EtcdStorage>> {
 ///
 /// etcd and kine cover the wire protocol, and neither covers this code path.
 #[cfg(feature = "sqlite")]
-pub async fn rhino_sqlite() -> Option<Fixture<rusternetes_storage::RhinoStorage>> {
+pub async fn rhino_sqlite() -> Option<Fixture<k3rs_storage::RhinoStorage>> {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir
         .path()
@@ -147,7 +147,7 @@ pub async fn rhino_sqlite() -> Option<Fixture<rusternetes_storage::RhinoStorage>
     // the end of each test and the temp dir goes with the process.
     std::mem::forget(dir);
     Some(Fixture {
-        storage: rusternetes_storage::RhinoStorage::new(&path)
+        storage: k3rs_storage::RhinoStorage::new(&path)
             .await
             .expect("rhino sqlite backend"),
         _container: None,

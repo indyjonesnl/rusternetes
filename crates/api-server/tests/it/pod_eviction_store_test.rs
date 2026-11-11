@@ -16,18 +16,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusternetes_api_server::registry::core::pod::{
+use k3rs_api_server::registry::core::pod::{
     new_eviction_rest, EvictionPodStore, EvictionRest, PdbClient, StoreEvictionRest,
 };
-use rusternetes_api_server::registry::core::pod::{new_status_store, Backoff};
-use rusternetes_api_server::registry::rest::{RequestContext, UpdatedObjectInfo};
-use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-use rusternetes_common::resources::{Eviction, Pod, PodDisruptionBudget};
-use rusternetes_common::types::Phase;
-use rusternetes_common::validation::metav1::CreateOptions;
-use rusternetes_common::{Error, Status};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::registry::core::pod::{new_status_store, Backoff};
+use k3rs_api_server::registry::rest::{RequestContext, UpdatedObjectInfo};
+use k3rs_common::deletion::{DeleteOptions, Preconditions};
+use k3rs_common::resources::{Eviction, Pod, PodDisruptionBudget};
+use k3rs_common::types::Phase;
+use k3rs_common::validation::metav1::CreateOptions;
+use k3rs_common::{Error, Status};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ fn ctx() -> RequestContext {
 fn delete_options(grace: i64) -> DeleteOptions {
     DeleteOptions {
         grace_period_seconds: Some(grace),
-        ..rusternetes_api_server::registry::rest::zero_delete_options()
+        ..k3rs_api_server::registry::rest::zero_delete_options()
     }
 }
 
@@ -63,7 +63,7 @@ fn rv_precondition(rv: &str) -> DeleteOptions {
             uid: None,
             resource_version: Some(rv.to_string()),
         }),
-        ..rusternetes_api_server::registry::rest::zero_delete_options()
+        ..k3rs_api_server::registry::rest::zero_delete_options()
     }
 }
 
@@ -627,11 +627,7 @@ impl StoreFixture {
         }
     }
 
-    async fn set_status(
-        &self,
-        name: &str,
-        f: impl FnOnce(&mut rusternetes_common::resources::PodStatus),
-    ) {
+    async fn set_status(&self, name: &str, f: impl FnOnce(&mut k3rs_common::resources::PodStatus)) {
         let key = build_key("pods", Some("default"), name);
         let mut pod: Pod = self.mem().get(&key).await.unwrap();
         f(pod.status.get_or_insert_with(Default::default));
@@ -647,10 +643,8 @@ impl StoreFixture {
     fn rest(
         &self,
         client: FakePdbClient,
-    ) -> EvictionRest<
-        rusternetes_api_server::registry::generic::Store<Pod, StorageBackend>,
-        FakePdbClient,
-    > {
+    ) -> EvictionRest<k3rs_api_server::registry::generic::Store<Pod, StorageBackend>, FakePdbClient>
+    {
         {
             let mut rest = EvictionRest::new(new_status_store(self.backend.clone()), client);
             rest.retry = no_pause();
@@ -825,7 +819,7 @@ async fn test_eviction_with_delete_options() {
         dry_run: bool,
     }
     let all = || Some(vec!["All".to_string()]);
-    let zero = rusternetes_api_server::registry::rest::zero_delete_options;
+    let zero = k3rs_api_server::registry::rest::zero_delete_options;
     let cases =
         vec![
         Case {
@@ -967,7 +961,7 @@ async fn non_matching_dry_run_options_are_refused() {
                 "foo",
                 Some(DeleteOptions {
                     dry_run: Some(vec!["Other".to_string()]),
-                    ..rusternetes_api_server::registry::rest::zero_delete_options()
+                    ..k3rs_api_server::registry::rest::zero_delete_options()
                 }),
             ),
             None,
@@ -1056,7 +1050,7 @@ async fn test_eviction_pdb_status() {
 }
 
 fn zero_options() -> DeleteOptions {
-    rusternetes_api_server::registry::rest::zero_delete_options()
+    k3rs_api_server::registry::rest::zero_delete_options()
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,8 +1507,8 @@ fn the_router_serves_the_store_backed_rest(storage: Arc<StorageBackend>) -> Stor
 /// `PrepareForUpdate` keeps the stored spec (#2087, #2156).
 #[tokio::test]
 async fn the_pdb_status_write_runs_the_status_strategy() {
-    use rusternetes_api_server::registry::core::pod::StorePdbClient;
-    use rusternetes_common::resources::IntOrString;
+    use k3rs_api_server::registry::core::pod::StorePdbClient;
+    use k3rs_common::resources::IntOrString;
     let api = TestApiServer::new();
     seed_pdb(
         &api,

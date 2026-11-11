@@ -7,7 +7,7 @@
 //! (`staging/src/k8s.io/apiextensions-apiserver/pkg/registry/customresource/strategy.go`)
 //! is what the strategy here ports, for the subresources the CRD declares
 //! (none). The schema rules are in
-//! `rusternetes_common::validation::referencegrant`.
+//! `k3rs_common::validation::referencegrant`.
 
 pub mod referencegrant;
 

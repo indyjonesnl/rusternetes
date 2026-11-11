@@ -21,10 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ipnet::IpNet;
+use k3rs_common::resources::{IPAddress, IPAddressSpec, ParentReference, Service};
+use k3rs_common::Error;
+use k3rs_storage::{build_key, Storage};
 use rand::Rng;
-use rusternetes_common::resources::{IPAddress, IPAddressSpec, ParentReference, Service};
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, Storage};
 
 /// `ControllerName` (ipallocator.go:44), the `managed-by` label value.
 pub const CONTROLLER_NAME: &str = "ipallocator.k8s.io";
@@ -68,8 +68,8 @@ impl fmt::Display for IpError {
 /// (`Create`, `Delete`; ipallocator.go:155, :382).
 #[async_trait::async_trait]
 pub trait IpAddressClient: Send + Sync {
-    async fn create(&self, ip: IPAddress) -> rusternetes_common::Result<()>;
-    async fn delete(&self, name: &str) -> rusternetes_common::Result<()>;
+    async fn create(&self, ip: IPAddress) -> k3rs_common::Result<()>;
+    async fn delete(&self, name: &str) -> k3rs_common::Result<()>;
 }
 
 /// Where the api-server installs its loopback client after construction
@@ -179,11 +179,11 @@ pub fn new_ip_address(name: &str, svc: Option<&Service>) -> IPAddress {
     // An allocation made without a Service (upstream's test-only
     // `Allocate`) has no parent reference.
     let mut ip = IPAddress {
-        type_meta: rusternetes_common::types::TypeMeta {
+        type_meta: k3rs_common::types::TypeMeta {
             kind: "IPAddress".to_string(),
             api_version: "networking.k8s.io/v1".to_string(),
         },
-        metadata: rusternetes_common::types::ObjectMeta::new(name),
+        metadata: k3rs_common::types::ObjectMeta::new(name),
         spec: Some(IPAddressSpec {
             parent_ref: svc.map(service_to_ref),
         }),

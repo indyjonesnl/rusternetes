@@ -26,8 +26,8 @@
 //! echoed object carries the spec fields, not an empty stub).
 
 use axum::http::StatusCode;
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_test_support::harness::TestApiServer;
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";
 

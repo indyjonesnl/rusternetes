@@ -2,32 +2,32 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::deployment::{
+    pub use k3rs_common::resources::deployment::{
         Deployment, DeploymentStatus, DeploymentStrategy, RollingUpdateDeployment,
     };
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::resources::workloads::{
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::resources::workloads::{
         DaemonSet, DaemonSetSpec, DaemonSetStatus, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
         RollingUpdateStatefulSetStrategy, StatefulSet,
         StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec, StatefulSetStatus,
     };
-    pub use rusternetes_common::types::LabelSelector;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::label_selector_matches_labels as selector_matches_labels;
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::types::LabelSelector;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::label_selector_matches_labels as selector_matches_labels;
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, validate_label_selector, validate_labels, LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_label, name_is_dns_subdomain, validate_annotations, validate_immutable_field,
         validate_nonnegative_field, validate_object_meta, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::podtemplate::validate_pod_template_spec;
-    pub use rusternetes_common::validation::pvc::validate_persistent_volume_claim_spec;
+    pub use k3rs_common::validation::podtemplate::validate_pod_template_spec;
+    pub use k3rs_common::validation::pvc::validate_persistent_volume_claim_spec;
 }
 
 mod selector_match_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::apps::*;
+    use k3rs_common::validation::apps::*;
 
     fn labels(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
@@ -112,7 +112,7 @@ mod selector_match_tests {
 
 mod workload_parity_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::apps::*;
+    use k3rs_common::validation::apps::*;
 
     fn agg(errs: &ErrorList) -> String {
         errs.iter()
@@ -553,7 +553,7 @@ mod workload_parity_tests {
     fn selector_invalids(errs: &ErrorList) -> Vec<(String, BadValue)> {
         errs.iter()
             .filter(|e| {
-                e.error_type == rusternetes_common::validation::field::ErrorType::Invalid
+                e.error_type == k3rs_common::validation::field::ErrorType::Invalid
                     && e.field == "spec.selector"
             })
             .map(|e| (e.detail.clone(), e.bad_value.clone()))
@@ -646,7 +646,7 @@ mod workload_parity_tests {
 /// (pkg/apis/apps/validation/validation_test.go:1504-1878, 1879-2341).
 mod daemonset_update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::apps::*;
+    use k3rs_common::validation::apps::*;
 
     fn ds(template_generation: i64, image: &str, app: &str) -> DaemonSet {
         let mut ds: DaemonSet = serde_json::from_value(serde_json::json!({

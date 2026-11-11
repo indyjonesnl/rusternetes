@@ -14,7 +14,7 @@
 //! ```
 //!
 //! `AllowCreateOnUpdate()` returns `true` for ten resources in the whole
-//! upstream tree. Rusternetes had it the other way round: thirty update
+//! upstream tree. k3rs had it the other way round: thirty update
 //! handlers carried an `Err(NotFound) => storage.create(...)` fallback, so any
 //! PUT created the object with server-assigned metadata the client never asked
 //! for (#1905).
@@ -22,7 +22,7 @@
 //! The sweep enumerates resources from the server's own discovery rather than a
 //! fixed list, so a resource added later is covered without editing this file.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

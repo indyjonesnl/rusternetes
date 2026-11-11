@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::{Container, PodSpec};
+    pub use k3rs_common::resources::pod::{Container, PodSpec};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::defaults::*;
-    use rusternetes_common::types::ResourceRequirements;
+    use k3rs_common::defaults::*;
+    use k3rs_common::types::ResourceRequirements;
     use std::collections::HashMap;
 
     fn container(
@@ -148,7 +148,7 @@ mod tests {
     // quantities present in the actual object; these assert the exact map so an
     // extra or missing key also fails.
 
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     use serial_test::serial;
 
     fn map(kv: &[(&str, &str)]) -> HashMap<String, String> {

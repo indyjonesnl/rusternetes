@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_kubelet::server_metrics::collect_volume_stat_cal_duration;
-    pub use rusternetes_kubelet::volume_plugins::metrics_statfs::{
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_kubelet::server_metrics::collect_volume_stat_cal_duration;
+    pub use k3rs_kubelet::volume_plugins::metrics_statfs::{
         fs_info, fs_info_failed_error, no_path_defined_error,
     };
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
+    pub use k3rs_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
     pub use std::collections::HashSet;
     pub use std::os::unix::fs::MetadataExt;
     pub use std::path::Path;
@@ -17,15 +17,15 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::metrics_du::*;
-    use rusternetes_kubelet::volume_plugins::metrics_statfs::MetricsErrorCode;
+    use k3rs_kubelet::volume_plugins::metrics_du::*;
+    use k3rs_kubelet::volume_plugins::metrics_statfs::MetricsErrorCode;
 
     fn blocks_bytes(p: &Path) -> i64 {
         std::fs::symlink_metadata(p).unwrap().blocks() as i64 * 512
     }
 
     fn du_count() -> f64 {
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         body.lines()
             .find(|l| {
                 l.starts_with(
@@ -69,8 +69,7 @@ mod tests {
     #[test]
     fn metrics_du_require_path() {
         let err = MetricsDu::new("").get_metrics().unwrap_err();
-        let me =
-            err.downcast_ref::<rusternetes_kubelet::volume_plugins::metrics_statfs::MetricsError>();
+        let me = err.downcast_ref::<k3rs_kubelet::volume_plugins::metrics_statfs::MetricsError>();
         assert_eq!(me.map(|m| m.code), Some(MetricsErrorCode::NoPathDefined));
     }
 

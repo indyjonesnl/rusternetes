@@ -1,7 +1,7 @@
 //! `TestFilterByPattern` of structured-merge-diff `fieldpath/set_test.go`
 //! (v6.3.0), over `Set::filter_include_matches` / `Filter`.
 
-use rusternetes_common::fieldmanager::fieldset::{Filter, PathElementMatcher, Set, SetMatcher};
+use k3rs_common::fieldmanager::fieldset::{Filter, PathElementMatcher, Set, SetMatcher};
 use serde_json::json;
 
 /// A path element as a test spells it.
@@ -292,7 +292,7 @@ fn an_exclude_filter_removes_a_path_and_what_is_under_it() {
 /// `ResetFieldsFilterStrategy`, not both.
 #[test]
 fn a_storage_may_not_provide_both_a_set_and_a_filter() {
-    use rusternetes_common::fieldmanager::ResetFields;
+    use k3rs_common::fieldmanager::ResetFields;
     let sets = ResetFields::new().with("v1", &[&["status"]]);
     let filters = ResetFields::new().with_filter("v1", Filter::include_matcher(&[]));
     let err = ResetFields::combine(sets.clone(), filters.clone()).unwrap_err();

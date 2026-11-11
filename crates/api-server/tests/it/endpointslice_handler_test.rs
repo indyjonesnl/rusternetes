@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for EndpointSlices
 
-use rusternetes_common::resources::endpointslice::{Endpoint, EndpointPort, EndpointSlice};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::endpointslice::{Endpoint, EndpointPort, EndpointSlice};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -107,7 +107,7 @@ async fn test_endpointslice_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify it's deleted
-    let result: rusternetes_common::Result<EndpointSlice> = storage.get(&key).await;
+    let result: k3rs_common::Result<EndpointSlice> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -307,7 +307,7 @@ async fn test_endpointslice_with_endpoint_conditions() {
         endpoints: vec![
             Endpoint {
                 addresses: vec!["10.0.0.1".to_string()],
-                conditions: Some(rusternetes_common::resources::EndpointConditions {
+                conditions: Some(k3rs_common::resources::EndpointConditions {
                     ready: Some(true),
                     serving: Some(true),
                     terminating: Some(false),
@@ -321,7 +321,7 @@ async fn test_endpointslice_with_endpoint_conditions() {
             },
             Endpoint {
                 addresses: vec!["10.0.0.2".to_string()],
-                conditions: Some(rusternetes_common::resources::EndpointConditions {
+                conditions: Some(k3rs_common::resources::EndpointConditions {
                     ready: Some(false),
                     serving: Some(false),
                     terminating: Some(true),
@@ -618,7 +618,7 @@ async fn test_endpointslice_not_found() {
     let namespace = "test-endpointslice-not-found";
     let key = build_key("endpointslices", Some(namespace), "nonexistent");
 
-    let result: rusternetes_common::Result<EndpointSlice> = storage.get(&key).await;
+    let result: k3rs_common::Result<EndpointSlice> = storage.get(&key).await;
     assert!(result.is_err());
 }
 

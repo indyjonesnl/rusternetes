@@ -8,7 +8,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== Rusternetes Basic Conformance Tests ===${NC}\n"
+echo -e "${GREEN}=== k3rs Basic Conformance Tests ===${NC}\n"
 
 KCTL="./target/release/kubectl --insecure-skip-tls-verify"
 

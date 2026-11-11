@@ -1,5 +1,5 @@
 [package]
-name = "rusternetes-storage"
+name = "k3rs-storage"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,12 +18,12 @@ redis = ["dep:rhino", "rhino/redis"]
 # over the api-server REST client). Opt-in so the default storage build (and
 # leaf consumers like the api-server) stay lean. Components running as
 # api-server clients (kubelet/controller-manager/kube-proxy, the all-in-one)
-# enable it via `rusternetes-storage/api-client`.
-api-client = ["dep:rusternetes-client"]
+# enable it via `k3rs-storage/api-client`.
+api-client = ["dep:k3rs-client"]
 
 [dependencies]
-rusternetes-common = { path = "../common" }
-rusternetes-client = { path = "../client", optional = true }
+k3rs-common = { path = "../common" }
+k3rs-client = { path = "../client", optional = true }
 # Pinned by commit; Cargo.lock holds the same rev. Bump both this and
 # `ARG RHINO_REV` in rhino.Dockerfile together (scripts/check-rhino-rev.sh
 # guards the pair). To hack on rhino locally, add an uncommitted

@@ -1,6 +1,6 @@
 //! Tests for `/metrics/cadvisor` (`cri_metrics.go` collector).
-use rusternetes_cri::v1;
-use rusternetes_kubelet::server_cri_metrics::*;
+use k3rs_cri::v1;
+use k3rs_kubelet::server_cri_metrics::*;
 
 fn desc(name: &str, help: &str, keys: &[&str]) -> v1::MetricDescriptor {
     v1::MetricDescriptor {

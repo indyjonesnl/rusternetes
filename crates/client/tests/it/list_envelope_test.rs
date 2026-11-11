@@ -1,4 +1,4 @@
-use rusternetes_client::http::KubernetesList;
+use k3rs_client::http::KubernetesList;
 
 #[test]
 fn list_envelope_captures_resource_version() {

@@ -1,10 +1,10 @@
 //! Tests for StorageClass validation (port of upstream `ValidateStorageClass`).
 
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     PersistentVolumeReclaimPolicy, StorageClass, VolumeBindingMode,
 };
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::storageclass::validate_storage_class;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::storageclass::validate_storage_class;
 use std::collections::HashMap;
 
 fn valid_sc() -> StorageClass {
@@ -21,7 +21,7 @@ fn valid_sc() -> StorageClass {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], substr: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], substr: &str) -> bool {
     errs.iter().any(|e| e.field.contains(substr))
 }
 
@@ -112,9 +112,7 @@ fn oversize_parameters_rejected() {
 }
 
 // --- allowedTopologies (#1330) ---
-use rusternetes_common::resources::volume::{
-    TopologySelectorLabelRequirement, TopologySelectorTerm,
-};
+use k3rs_common::resources::volume::{TopologySelectorLabelRequirement, TopologySelectorTerm};
 
 fn term(key: &str, values: &[&str]) -> TopologySelectorTerm {
     TopologySelectorTerm {

@@ -2,25 +2,25 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::Node;
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::validation::ipaddress::get_warnings_for_cidr;
-    pub use rusternetes_common::validation::node::{validate_node, validate_node_update};
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::Node;
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::validation::ipaddress::get_warnings_for_cidr;
+    pub use k3rs_common::validation::node::{validate_node, validate_node_update};
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::node::*;
-    use rusternetes_common::resources::NodeStatus;
+    use k3rs_api_server::registry::core::node::*;
+    use k3rs_common::resources::NodeStatus;
 
     fn node(status: serde_json::Value) -> Node {
         let mut node: Node = serde_json::from_value(serde_json::json!({

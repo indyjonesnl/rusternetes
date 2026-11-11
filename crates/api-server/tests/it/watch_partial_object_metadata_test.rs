@@ -1,7 +1,7 @@
 //! #1628: a metadata-only WATCH (`Accept: ...;as=PartialObjectMetadata`, what
 //! cert-manager's cainjector uses for its Secret cache) must stream.
 //!
-//! The Accept-`as=` conversion in `rusternetes-middleware` buffered the whole
+//! The Accept-`as=` conversion in `k3rs-middleware` buffered the whole
 //! response with `axum::body::to_bytes`, which on an open-ended watch blocks
 //! until the stream ends. The informer therefore saw no event for the life of
 //! the watch: an object created after its LIST (the webhook CA Secret created
@@ -16,7 +16,7 @@
 //! are passed through.
 
 use futures::StreamExt;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::time::Duration;
 

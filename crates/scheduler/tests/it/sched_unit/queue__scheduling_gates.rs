@@ -2,20 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_scheduler::framework_runtime::{names, ExtensionPoint};
-    pub use rusternetes_scheduler::profile::Profile;
-    pub use rusternetes_scheduler::queue::scheduling_queue::{
-        PreEnqueuePlugin, PreEnqueuePluginMap,
-    };
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_scheduler::framework_runtime::{names, ExtensionPoint};
+    pub use k3rs_scheduler::profile::Profile;
+    pub use k3rs_scheduler::queue::scheduling_queue::{PreEnqueuePlugin, PreEnqueuePluginMap};
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::PodSchedulingGate;
-    use rusternetes_common::resources::PodSpec;
-    use rusternetes_scheduler::queue::scheduling_gates::*;
+    use k3rs_common::resources::pod::PodSchedulingGate;
+    use k3rs_common::resources::PodSpec;
+    use k3rs_scheduler::queue::scheduling_gates::*;
 
     fn pod_with_gates(gates: Option<&[&str]>) -> Pod {
         let spec = PodSpec {
@@ -38,8 +36,8 @@ mod tests {
         assert!(pl.pre_enqueue(&pod_with_gates(None)).is_success());
         assert_eq!(
             pl.pre_enqueue(&pod_with_gates(Some(&["foo", "bar"]))),
-            rusternetes_scheduler::fwk::Status::new(
-                rusternetes_scheduler::fwk::Code::UnschedulableAndUnresolvable,
+            k3rs_scheduler::fwk::Status::new(
+                k3rs_scheduler::fwk::Code::UnschedulableAndUnresolvable,
                 vec!["waiting for scheduling gates: [foo bar]".to_string()]
             )
         );
@@ -62,8 +60,8 @@ mod tests {
     /// `UpdatePodSchedulingGatesEliminated` event once its gates are gone.
     #[tokio::test]
     async fn gated_pod_stays_out_of_active_q_until_ungated() {
-        use rusternetes_scheduler::queue::hints::build_queueing_hint_map_per_profile;
-        use rusternetes_scheduler::queue::scheduling_queue::{
+        use k3rs_scheduler::queue::hints::build_queueing_hint_map_per_profile;
+        use k3rs_scheduler::queue::scheduling_queue::{
             priority_sort_less, PriorityQueue, PriorityQueueOptions,
         };
         let profile = Profile::named("default-scheduler");

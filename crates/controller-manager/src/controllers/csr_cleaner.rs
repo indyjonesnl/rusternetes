@@ -11,10 +11,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusternetes_common::resources::{
-    CertificateSigningRequest, CertificateSigningRequestCondition,
-};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::resources::{CertificateSigningRequest, CertificateSigningRequestCondition};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};

@@ -5,25 +5,23 @@ mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::devicetaintrule::DeviceTaintRule;
-    pub use rusternetes_common::resources::dra::{
+    pub use k3rs_common::resources::devicetaintrule::DeviceTaintRule;
+    pub use k3rs_common::resources::dra::{
         AllocationResult, Device, DeviceRequestAllocationResult, DeviceTaint, DeviceTaintEffect,
         DeviceToleration, ResourceClaim, ResourceSlice, TolerationOperator,
     };
-    pub use rusternetes_common::resources::pod::PodResourceClaim;
-    pub use rusternetes_common::resources::{
-        EventSource, EventType, ObjectReference, Pod, PodCondition,
-    };
-    pub use rusternetes_common::types::Condition;
-    pub use rusternetes_common::Error;
-    pub use rusternetes_controller_manager::controllers::device_taint_eviction_metrics::{
+    pub use k3rs_common::resources::pod::PodResourceClaim;
+    pub use k3rs_common::resources::{EventSource, EventType, ObjectReference, Pod, PodCondition};
+    pub use k3rs_common::types::Condition;
+    pub use k3rs_common::Error;
+    pub use k3rs_controller_manager::controllers::device_taint_eviction_metrics::{
         self as metrics, Metrics,
     };
-    pub use rusternetes_controller_manager::controllers::taint_eviction::update_pod_condition;
-    pub use rusternetes_controller_manager::controllers::typed_workqueue::{
+    pub use k3rs_controller_manager::controllers::taint_eviction::update_pod_condition;
+    pub use k3rs_controller_manager::controllers::typed_workqueue::{
         NopQueue, RateLimitingQueue, WorkItemQueue,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+    pub use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::atomic::{AtomicBool, Ordering};
     pub use std::sync::{Arc, Mutex};
@@ -46,10 +44,10 @@ mod tests {
     use super::__parent::*;
     use chrono::TimeZone;
     use futures::future::BoxFuture;
-    use rusternetes_common::resources::dra::ResourceClaimConsumerReference;
-    use rusternetes_controller_manager::controllers::device_taint_eviction::*;
-    use rusternetes_controller_manager::controllers::typed_workqueue::WorkItemQueue;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::dra::ResourceClaimConsumerReference;
+    use k3rs_controller_manager::controllers::device_taint_eviction::*;
+    use k3rs_controller_manager::controllers::typed_workqueue::WorkItemQueue;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::json;
 
     const NODE_NAME: &str = "worker";
@@ -286,7 +284,7 @@ mod tests {
             .collect();
         let status = claim.status.get_or_insert_with(Default::default);
         status.allocation = Some(AllocationResult {
-            devices: rusternetes_common::resources::dra::DeviceAllocationResult {
+            devices: k3rs_common::resources::dra::DeviceAllocationResult {
                 results,
                 config: vec![],
             },
@@ -616,23 +614,21 @@ mod tests {
                 .status
                 .as_mut()
                 .unwrap()
-                .resource_claim_statuses = Some(vec![
-                rusternetes_common::resources::pod::PodResourceClaimStatus {
+                .resource_claim_statuses =
+                Some(vec![k3rs_common::resources::pod::PodResourceClaimStatus {
                     name: RESOURCE_NAME.to_string(),
                     resource_claim_name: Some(cn.clone()),
-                },
-            ]);
+                }]);
             let mut pod_template_no_claim = pod_template.clone();
             pod_template_no_claim
                 .status
                 .as_mut()
                 .unwrap()
-                .resource_claim_statuses = Some(vec![
-                rusternetes_common::resources::pod::PodResourceClaimStatus {
+                .resource_claim_statuses =
+                Some(vec![k3rs_common::resources::pod::PodResourceClaimStatus {
                     name: RESOURCE_NAME.to_string(),
                     resource_claim_name: None,
-                },
-            ]);
+                }]);
 
             Fx {
                 simple_slice: Arc::new(mk_slice(NODE_NAME, DRIVER, vec![("instance", vec![])])),

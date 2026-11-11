@@ -32,7 +32,7 @@
 //! fail on `fork/main` HEAD as of 2026-05-21.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TEST_NS: &str = "default";

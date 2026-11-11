@@ -13,11 +13,11 @@
 
 use crate::cel_evaluators::VapAuthorizer;
 use crate::AdmissionWebhookManager;
-use rusternetes_common::admission::{GroupVersionKind, Operation};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer};
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::Storage;
+use k3rs_common::admission::{GroupVersionKind, Operation};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer};
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::Storage;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -63,7 +63,7 @@ async fn manager(spec: Value) -> AdmissionWebhookManager<MemoryStorage> {
 async fn run(
     m: &AdmissionWebhookManager<MemoryStorage>,
     a: Option<&VapAuthorizer>,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     let gvk = GroupVersionKind {
         group: String::new(),
         version: "v1".into(),

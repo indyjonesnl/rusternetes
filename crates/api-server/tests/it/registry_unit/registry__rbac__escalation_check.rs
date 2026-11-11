@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::rest::RequestContext;
-    pub use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-    pub use rusternetes_common::resources::RoleRef;
+    pub use k3rs_api_server::registry::rest::RequestContext;
+    pub use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+    pub use k3rs_common::resources::RoleRef;
     pub use serde::Serialize;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::rbac::escalation_check::*;
-    use rusternetes_common::resources::Role;
-    use rusternetes_common::types::OwnerReference;
+    use k3rs_api_server::registry::rbac::escalation_check::*;
+    use k3rs_common::resources::Role;
+    use k3rs_common::types::OwnerReference;
 
     fn role() -> Role {
         Role::new("r", "ns")
@@ -44,7 +44,7 @@ mod tests {
         assert!(!is_only_mutating_gc_fields(&annotated, &base));
 
         let mut other = both;
-        other.rules = vec![rusternetes_common::resources::PolicyRule {
+        other.rules = vec![k3rs_common::resources::PolicyRule {
             verbs: vec!["get".into()],
             api_groups: None,
             resources: None,
@@ -58,7 +58,7 @@ mod tests {
     fn superusers_are_system_masters_members() {
         let mut ctx = RequestContext::new(None);
         assert!(!escalation_allowed(&ctx));
-        let user = |groups: &[&str]| rusternetes_common::auth::UserInfo {
+        let user = |groups: &[&str]| k3rs_common::auth::UserInfo {
             username: "u".into(),
             uid: String::new(),
             groups: groups.iter().map(|g| g.to_string()).collect(),

@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_middleware::request_header::RequestHeaderConfig;
+    pub use k3rs_middleware::request_header::RequestHeaderConfig;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
     use clap::Parser;
-    use rusternetes_api_server::request_header_authentication::*;
+    use k3rs_api_server::request_header_authentication::*;
 
     #[derive(Parser, Debug)]
     struct Cli {

@@ -51,16 +51,16 @@ use crate::controllers::typed_workqueue::{NopQueue, RateLimitingQueue, WorkItemQ
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
-use rusternetes_common::resources::devicetaintrule::DeviceTaintRule;
-use rusternetes_common::resources::dra::{
+use k3rs_common::resources::devicetaintrule::DeviceTaintRule;
+use k3rs_common::resources::dra::{
     AllocationResult, Device, DeviceRequestAllocationResult, DeviceTaint, DeviceTaintEffect,
     DeviceToleration, ResourceClaim, ResourceSlice, TolerationOperator,
 };
-use rusternetes_common::resources::pod::PodResourceClaim;
-use rusternetes_common::resources::{EventSource, EventType, ObjectReference, Pod, PodCondition};
-use rusternetes_common::types::Condition;
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+use k3rs_common::resources::pod::PodResourceClaim;
+use k3rs_common::resources::{EventSource, EventType, ObjectReference, Pod, PodCondition};
+use k3rs_common::types::Condition;
+use k3rs_common::Error;
+use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1285,8 +1285,8 @@ impl<S: Storage + 'static> DeviceTaintEvictionController<S> {
     /// [`run`](Self::run)). The `DeviceTaintRule` handling is only enabled
     /// when the `DRADeviceTaintRules` feature gate is.
     pub fn new(storage: Arc<S>) -> Self {
-        let rules_enabled = rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::DRADeviceTaintRules,
+        let rules_enabled = k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::DRADeviceTaintRules,
         );
         Self::with_parts(
             storage,
@@ -2030,6 +2030,6 @@ pub async fn run_informer<S, T, F>(
 /// (`cmd/kube-controller-manager/app/core.go:255-259`):
 /// `DynamicResourceAllocation` and `DRADeviceTaints`.
 pub fn feature_enabled() -> bool {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     enabled(Feature::DynamicResourceAllocation) && enabled(Feature::DRADeviceTaints)
 }

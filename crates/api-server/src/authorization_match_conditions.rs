@@ -3,16 +3,16 @@
 //! Ported from `staging/src/k8s.io/apiserver/pkg/authorization/cel/`
 //! (`matcher.go` `CELMatcher.Eval`, `compile.go` `convertObjectToUnstructured`)
 //! and `pkg/apis/apiserver/validation/validation.go` `compileMatchConditions`
-//! :778-820. The typed environment is `rusternetes_common::cel_authz`
+//! :778-820. The typed environment is `k3rs_common::cel_authz`
 //! (`compile.go` `mustBuildEnv`, :173-268): declarations, field selection and
 //! selector-usage detection are ported; cel-go's type inference is not (the
 //! `cel` crate has no checker), so an expression whose output type needs
 //! inference is still reported at evaluation, which `Eval` treats as an error.
 
-use rusternetes_common::cel::{compile_failure, CELContext, CELEvaluator};
-use rusternetes_common::cel_authz::compile_authorization_expression;
-use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::cel::{compile_failure, CELContext, CELEvaluator};
+use k3rs_common::cel_authz::compile_authorization_expression;
+use k3rs_common::cel_versions::{self, EnvSet, EnvType};
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
 use std::collections::HashSet;
 use std::sync::Mutex;
 

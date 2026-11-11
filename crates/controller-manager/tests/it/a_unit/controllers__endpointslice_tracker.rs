@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::EndpointSlice;
+    pub use k3rs_common::resources::EndpointSlice;
     pub use std::collections::HashMap;
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::endpointslice_tracker::*;
+    use k3rs_controller_manager::controllers::endpointslice_tracker::*;
 
     fn slice(svc: &str, uid: &str, generation: i64) -> EndpointSlice {
         let mut es = EndpointSlice::new(format!("{svc}-{uid}"), "IPv4");

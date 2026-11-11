@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::static_pods::{parse_http_manifest, MAX_CONFIG_LENGTH};
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::static_pods::{parse_http_manifest, MAX_CONFIG_LENGTH};
     pub use std::sync::Mutex;
     pub use std::time::Duration;
     pub use tracing::{debug, info};
@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::static_pod_url::*;
+    use k3rs_kubelet::static_pod_url::*;
     use std::collections::BTreeMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

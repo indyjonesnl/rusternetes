@@ -24,7 +24,7 @@
 
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use rusternetes_common::types::Status;
+use k3rs_common::types::Status;
 use std::collections::HashMap;
 
 const JSON: &str = "application/json";
@@ -298,7 +298,7 @@ fn write_object_negotiated(
     };
     let mut audit_response = None;
     if let Ok(v) = serde_json::to_value(status) {
-        audit_response = Some(rusternetes_common::audit::AuditResponseObject(v));
+        audit_response = Some(k3rs_common::audit::AuditResponseObject(v));
     }
     let mut resp = match serializer.media_type {
         JSON => {
@@ -364,9 +364,9 @@ pub async fn negotiate_error_middleware(
     let headers = req.headers().clone();
     let query = req.uri().query().map(str::to_owned);
     let mut resp = next.run(req).await;
-    let Some(rusternetes_common::error::ErrorStatus(status)) =
+    let Some(k3rs_common::error::ErrorStatus(status)) =
         resp.extensions_mut()
-            .remove::<rusternetes_common::error::ErrorStatus>()
+            .remove::<k3rs_common::error::ErrorStatus>()
     else {
         return resp;
     };

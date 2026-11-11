@@ -48,8 +48,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use rusternetes_common::resources::APIService;
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+use k3rs_common::resources::APIService;
+use k3rs_storage::{build_prefix, Storage, WatchEvent};
 use tokio::sync::watch;
 
 use crate::aggregated_discovery::{
@@ -373,7 +373,7 @@ pub struct ServiceKey {
     pub port: i32,
 }
 
-fn new_service_key(s: &rusternetes_common::resources::APIServiceReference) -> ServiceKey {
+fn new_service_key(s: &k3rs_common::resources::APIServiceReference) -> ServiceKey {
     ServiceKey {
         namespace: s.namespace.clone(),
         name: s.name.clone(),

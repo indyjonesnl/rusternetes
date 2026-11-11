@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusternetes_common::resources::{Pod, PriorityClass};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::resources::{Pod, PriorityClass};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

@@ -4,7 +4,7 @@
 //! pkg/controller/job/job_controller.go:1954-1965) removes one finalizer and
 //! keeps the others, instead of replacing the whole list.
 
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_storage::{MemoryStorage, Storage};
 use serde_json::json;
 
 #[tokio::test]

@@ -1,13 +1,13 @@
 use crate::controllers::worker_pool::spawn_workers;
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::{
+use k3rs_common::{
     resources::{
         Deployment, DeploymentCondition, DeploymentStatus, Pod, ReplicaSet, ReplicaSetSpec,
     },
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -72,7 +72,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         self.own_writes.lock().ok()?.remove(key)
     }
 
-    pub async fn run(self: Arc<Self>) -> rusternetes_common::Result<()> {
+    pub async fn run(self: Arc<Self>) -> k3rs_common::Result<()> {
         info!("Deployment controller started (watch-based)");
 
         let queue = WorkQueue::named("deployment");
@@ -216,11 +216,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
 
     /// When a ReplicaSet changes, check its ownerReferences for a Deployment owner
     /// and enqueue that Deployment for reconciliation.
-    async fn enqueue_owner_deployment(
-        &self,
-        queue: &WorkQueue,
-        event: &rusternetes_storage::WatchEvent,
-    ) {
+    async fn enqueue_owner_deployment(&self, queue: &WorkQueue, event: &k3rs_storage::WatchEvent) {
         let rs_key = extract_key(event);
         let parts: Vec<&str> = rs_key.splitn(3, '/').collect();
         let ns = match parts.get(1) {
@@ -258,7 +254,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         }
     }
 
-    pub async fn reconcile_all(&self) -> rusternetes_common::Result<()> {
+    pub async fn reconcile_all(&self) -> k3rs_common::Result<()> {
         debug!("Reconciling all deployments");
 
         // Get all deployments
@@ -277,10 +273,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         Ok(())
     }
 
-    pub async fn reconcile_deployment(
-        &self,
-        deployment: &Deployment,
-    ) -> rusternetes_common::Result<()> {
+    pub async fn reconcile_deployment(&self, deployment: &Deployment) -> k3rs_common::Result<()> {
         let namespace = deployment
             .metadata
             .namespace
@@ -345,7 +338,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
             if labels_match {
                 // Adopt: add ownerReference
                 let mut adopted = rs.clone();
-                let owner_ref = rusternetes_common::types::OwnerReference {
+                let owner_ref = k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "Deployment".to_string(),
                     name: deployment.metadata.name.clone(),
@@ -1172,7 +1165,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         matches
     }
 
-    async fn create_replicaset(&self, deployment: &Deployment) -> rusternetes_common::Result<()> {
+    async fn create_replicaset(&self, deployment: &Deployment) -> k3rs_common::Result<()> {
         self.create_replicaset_with_replicas(deployment, deployment.spec.replicas.unwrap_or(1))
             .await
     }
@@ -1195,7 +1188,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         &self,
         deployment: &Deployment,
         replicas: i32,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let namespace = deployment
             .metadata
             .namespace
@@ -1307,7 +1300,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         }
 
         // Set owner reference to the deployment
-        metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+        metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
             api_version: "apps/v1".to_string(),
             kind: "Deployment".to_string(),
             name: deployment.metadata.name.clone(),
@@ -1415,7 +1408,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         &self,
         rs: &ReplicaSet,
         replicas: i32,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let namespace = rs.metadata.namespace.as_deref().unwrap_or("default");
         let key = build_key("replicasets", Some(namespace), &rs.metadata.name);
 
@@ -1462,7 +1455,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
         desired_replicas: i32,
         max_unavailable: i32,
         namespace: &str,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let min_available = (desired_replicas - max_unavailable).max(0);
         let old_rs_list: Vec<ReplicaSet> = owned_replicasets
             .iter()
@@ -1649,7 +1642,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
     pub async fn update_deployment_status(
         &self,
         deployment: &Deployment,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let namespace = deployment
             .metadata
             .namespace
@@ -1966,8 +1959,7 @@ impl<S: Storage + 'static> DeploymentController<S> {
                 if let Some(ref phase) = status.phase {
                     if matches!(
                         phase,
-                        rusternetes_common::types::Phase::Failed
-                            | rusternetes_common::types::Phase::Succeeded
+                        k3rs_common::types::Phase::Failed | k3rs_common::types::Phase::Succeeded
                     ) {
                         continue;
                     }

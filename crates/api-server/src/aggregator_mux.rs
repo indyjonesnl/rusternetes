@@ -27,9 +27,9 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 
-use rusternetes_common::resources::apiregistration::AVAILABLE;
-use rusternetes_common::resources::APIService;
-use rusternetes_discovery::kube_version::compare_kube_aware_version_strings;
+use k3rs_common::resources::apiregistration::AVAILABLE;
+use k3rs_common::resources::APIService;
+use k3rs_discovery::kube_version::compare_kube_aware_version_strings;
 use serde_json::{json, Value};
 
 use crate::apiservice_registration::AggregatorHandlerManager;

@@ -15,7 +15,7 @@ contract_suite!(etcd, crate::contract::fixtures::etcd(), revisions: true, snapsh
 contract_suite!(kine, crate::contract::fixtures::kine(), revisions: true, snapshot_paging: true);
 
 // The rhino/SQLite backend the cluster actually runs. Feature-gated, so a
-// default `cargo test -p rusternetes-storage` compiles it out; CI's nextest
+// default `cargo test -p k3rs-storage` compiles it out; CI's nextest
 // job builds with all features and runs it.
 #[cfg(feature = "sqlite")]
 contract_suite!(rhino_sqlite, crate::contract::fixtures::rhino_sqlite(), revisions: true, snapshot_paging: true);

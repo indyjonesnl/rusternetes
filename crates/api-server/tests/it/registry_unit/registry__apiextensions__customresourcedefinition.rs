@@ -3,33 +3,31 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::registry::apiextensions::controllers::{
+    pub use k3rs_api_server::registry::apiextensions::controllers::{
         self, condition, crd_has_finalizer, crd_remove_finalizer, set_crd_condition, ESTABLISHED,
         TERMINATING,
     };
-    pub use rusternetes_api_server::registry::apiextensions::finalizer_queue;
-    pub use rusternetes_api_server::registry::generic::{
-        CreateOptions, Deleted, Store, UpdateOptions,
-    };
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::apiextensions::finalizer_queue;
+    pub use k3rs_api_server::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo, ValidateObject,
         ValidateObjectUpdate,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::deletion::{DeleteOptions, Preconditions};
+    pub use k3rs_common::resources::{
         CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
         JSONSchemaPropsOrStringArray,
     };
-    pub use rusternetes_common::validation::crd::{
+    pub use k3rs_common::validation::crd::{
         is_crd_condition_true, validate_custom_resource_definition,
         validate_custom_resource_definition_update,
         validate_update_custom_resource_definition_status, CUSTOM_RESOURCE_CLEANUP_FINALIZER,
     };
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{build_prefix, Storage, StorageBackend};
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{build_prefix, Storage, StorageBackend};
     pub use std::sync::Arc;
     pub use tracing::warn;
 }
@@ -39,7 +37,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn crd_informer_synced_polls_until_synced() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        rusternetes_api_server::registry::apiextensions::customresourcedefinition::wait_for_crd_informer_synced(|| {
+        k3rs_api_server::registry::apiextensions::customresourcedefinition::wait_for_crd_informer_synced(|| {
             let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { n >= 3 }
         })
@@ -47,7 +45,7 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::customresourcedefinition::*;
+    use k3rs_api_server::registry::apiextensions::customresourcedefinition::*;
 
     /// The drain wait polls at once, then every interval, until a list is
     /// empty (crd_finalizer.go:253-267).
@@ -155,7 +153,7 @@ mod tests {
     async fn hook_started_informer_establishes_a_crd_written_to_storage() {
         let storage = Arc::new(StorageBackend::new_memory());
         let controllers: Arc<
-            rusternetes_api_server::registry::apiextensions::controller_queue::CrdControllers,
+            k3rs_api_server::registry::apiextensions::controller_queue::CrdControllers,
         > = Default::default();
         let _h = start_controllers_loop(storage.clone(), controllers.clone());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -170,7 +168,7 @@ mod tests {
         let rest = CrdRest::with_controllers(storage.clone(), controllers);
         for _ in 0..100 {
             if let Some(c) = rest.get_crd("widgets.example.com").await.unwrap() {
-                if rusternetes_api_server::registry::apiextensions::controllers::find_crd_condition(
+                if k3rs_api_server::registry::apiextensions::controllers::find_crd_condition(
                     &c,
                     "Established",
                 )
@@ -226,8 +224,8 @@ mod tests {
     /// (validation.go:158-163) even below the library's introduced version.
     #[test]
     fn update_compiles_preexisting_rules_in_the_stored_environment() {
-        use rusternetes_common::cel_versions::EnvSet;
-        use rusternetes_common::feature_gates::Version;
+        use k3rs_common::cel_versions::EnvSet;
+        use k3rs_common::feature_gates::Version;
         let rule = "semver('1.2.3').major() > 0";
         let env_set = EnvSet::must_base_env_set(Version::major_minor(1, 32));
         let new = crd_with_rule(rule);
@@ -254,9 +252,9 @@ mod tests {
     const SEMVER_RULE: &str = "semver('1.2.3').major() > 0";
     const P: &str = "spec.versions[0].schema.openAPIV3Schema";
 
-    fn env_1_32() -> rusternetes_common::cel_versions::EnvSet {
-        rusternetes_common::cel_versions::EnvSet::must_base_env_set(
-            rusternetes_common::feature_gates::Version::major_minor(1, 32),
+    fn env_1_32() -> k3rs_common::cel_versions::EnvSet {
+        k3rs_common::cel_versions::EnvSet::must_base_env_set(
+            k3rs_common::feature_gates::Version::major_minor(1, 32),
         )
     }
 

@@ -8,7 +8,7 @@
 //! halves: the rejection where upstream rejects, and the accept where it does
 //! not.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 /// `TokenReview` with no token. Upstream answers this from the registry, not
@@ -133,10 +133,8 @@ async fn an_endpoint_port_that_is_absent_is_invalid_not_undecodable() {
 /// not that they are rejected.
 #[tokio::test]
 async fn the_metrics_response_types_decode_when_fields_are_absent() {
-    use rusternetes_common::resources::custom_metrics::{MetricValue, MetricValueList};
-    use rusternetes_common::resources::external_metrics::{
-        ExternalMetricValue, ExternalMetricValueList,
-    };
+    use k3rs_common::resources::custom_metrics::{MetricValue, MetricValueList};
+    use k3rs_common::resources::external_metrics::{ExternalMetricValue, ExternalMetricValueList};
 
     let value: MetricValue = serde_json::from_value(json!({})).expect("MetricValue");
     assert!(value.metric.name.is_empty());

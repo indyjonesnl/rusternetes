@@ -21,7 +21,7 @@
 //! `find_unknown_fields_recursive` accepts both forms.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TEST_NS: &str = "default";

@@ -17,18 +17,18 @@
 //! pods, while an empty ({}) selector will select all pods within the
 //! namespace" (`staging/src/k8s.io/api/policy/v1/types.go:36-42`).
 //!
-//! Rusternetes collapsed the middle case into the first, so a
+//! k3rs collapsed the middle case into the first, so a
 //! `PodDisruptionBudget` with `selector: {}` protected nothing and eviction let
 //! through a disruption upstream refuses (#2012). Eviction reads the selector
 //! through `LabelSelectorAsSelector` with no `selector.Empty()` guard
 //! (`pkg/registry/core/pod/storage/eviction.go:498-505`).
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 fn running_pod(name: &str, namespace: &str) -> Pod {

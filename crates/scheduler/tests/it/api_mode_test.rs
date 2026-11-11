@@ -38,7 +38,7 @@
 //! `EventRecorder` (correlator); API mode POSTs via `ClientEventRecorder`
 //! through `data.emit_event_api`.
 
-use rusternetes_scheduler::data_plane::binding_body;
+use k3rs_scheduler::data_plane::binding_body;
 
 #[test]
 fn binding_body_matches_apiserver_contract() {
@@ -61,7 +61,7 @@ fn binding_body_matches_apiserver_contract() {
 /// object conflicts on resourceVersion and was silently swallowed (#3055).
 #[test]
 fn preemption_disruption_condition_matches_upstream() {
-    use rusternetes_scheduler::data_plane::{
+    use k3rs_scheduler::data_plane::{
         disruption_target_status_patch, preemption_disruption_condition,
     };
     let c = preemption_disruption_condition("default-scheduler");

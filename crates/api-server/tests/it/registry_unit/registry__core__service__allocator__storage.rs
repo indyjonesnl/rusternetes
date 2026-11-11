@@ -3,12 +3,10 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::registry::core::service::allocator::{
-        AllocationBitmap, Interface,
-    };
-    pub use rusternetes_common::resources::rangeallocation::RangeAllocation;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_api_server::registry::core::service::allocator::{AllocationBitmap, Interface};
+    pub use k3rs_common::resources::rangeallocation::RangeAllocation;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::Storage;
     pub use std::sync::Arc;
     pub use tokio::sync::Mutex;
 }
@@ -16,8 +14,8 @@ mod __parent {
 mod tests {
     //! Ports of allocator/storage/storage_test.go.
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::allocator::storage::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::registry::core::service::allocator::storage::*;
+    use k3rs_storage::MemoryStorage;
 
     const KEY: &str = "/registry/ranges/serviceips";
 

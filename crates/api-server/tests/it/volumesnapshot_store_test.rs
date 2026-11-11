@@ -11,7 +11,7 @@
 //! `decideSnapshotClassV1`, release-6.3).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SNAPSHOTS: &str = "/apis/snapshot.storage.k8s.io/v1/namespaces/default/volumesnapshots";

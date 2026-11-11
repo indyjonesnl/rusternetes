@@ -1,11 +1,11 @@
 // Integration tests for PV Binder Controller
 // Note: These tests use in-memory storage for fast, isolated testing
 
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::pv_binder::PVBinderController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::*;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::pv_binder::PVBinderController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};

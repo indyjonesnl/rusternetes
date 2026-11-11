@@ -7,11 +7,11 @@
 #   * `docker compose ... pull` fetches prebuilt images instead of compiling
 #     (consume path — ci/actions/bring-up-cluster with image-tag set).
 #
-# Tag selection: RUSTERNETES_IMAGE_TAG (default `main`, the latest published
+# Tag selection: K3RS_IMAGE_TAG (default `main`, the latest published
 # main build). Every main commit also gets an immutable `sha-<full-sha>` tag —
 # the historic record. Bisect example:
 #
-#   RUSTERNETES_IMAGE_TAG=sha-<commit> \
+#   K3RS_IMAGE_TAG=sha-<commit> \
 #   docker compose -f compose.sqlite.yml -f compose.ghcr.yml up -d
 #
 # Keep the service list in sync with compose.sqlite.yml —
@@ -19,27 +19,27 @@
 
 services:
   rhino:
-    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/rhino:${K3RS_IMAGE_TAG:-main}"
   api-server:
-    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/api-server:${K3RS_IMAGE_TAG:-main}"
   scheduler:
-    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/scheduler:${K3RS_IMAGE_TAG:-main}"
   controller-manager:
-    image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/controller-manager:${K3RS_IMAGE_TAG:-main}"
   kubelet:
-    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${K3RS_IMAGE_TAG:-main}"
   kubelet2:
-    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/kubelet:${K3RS_IMAGE_TAG:-main}"
   kube-proxy:
-    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${K3RS_IMAGE_TAG:-main}"
   # node-2's kube-proxy — same image, different node (#1691).
   kube-proxy2:
-    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/kube-proxy:${K3RS_IMAGE_TAG:-main}"
   dns:
-    image: "ghcr.io/indyjonesnl/rusternetes/dns:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/dns:${K3RS_IMAGE_TAG:-main}"
   # CRI runtime image (containerd + crun + CNI) the kubelet talks to. One per
   # node: each owns its netns, CNI bridge and image store (#1691).
   containerd:
-    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${K3RS_IMAGE_TAG:-main}"
   containerd2:
-    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${RUSTERNETES_IMAGE_TAG:-main}"
+    image: "ghcr.io/indyjonesnl/rusternetes/containerd:${K3RS_IMAGE_TAG:-main}"

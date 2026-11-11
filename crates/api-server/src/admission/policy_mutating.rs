@@ -24,7 +24,7 @@
 //!   dispatcher.go:196, :205) are ported (#3229, `policy_mutating_metrics.rs`).
 //!   `NewCachingAuthorizer` is (#3228, `caching_authorizer.rs`) and reaches
 //!   the matcher and, as `OptionalVariables.Authorizer`, the `Patcher`; the CEL
-//!   `authorizer` library it feeds is `rusternetes_common::cel_authz_library` (#3300).
+//!   `authorizer` library it feeds is `k3rs_common::cel_authz_library` (#3300).
 //! - `CompositionEnv.CreateContext` (:131-133) belongs to the CEL compiler and
 //!   is the evaluator's business, not the dispatcher's.
 
@@ -34,12 +34,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
-use rusternetes_common::resources::mutating_admission_policy::ReinvocationPolicyType;
-use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
-use rusternetes_common::Error;
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::authz::Authorizer;
+use k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+use k3rs_common::resources::mutating_admission_policy::ReinvocationPolicyType;
+use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+use k3rs_common::Error;
 use serde_json::Value;
 
 use super::caching_authorizer::new_caching_authorizer;
@@ -63,7 +63,7 @@ pub struct ReinvocationContext {
     /// The `MutatingAdmissionWebhook` plugin's value
     /// (`reinvokeCtx.SetValue(PluginName, webhookReinvokeCtx)`,
     /// webhook/mutating/dispatcher.go:108-113). Typed rather than keyed.
-    pub webhook_value: Mutex<rusternetes_admission_webhook::WebhookReinvokeContext>,
+    pub webhook_value: Mutex<k3rs_admission_webhook::WebhookReinvokeContext>,
 }
 
 impl ReinvocationContext {
@@ -89,13 +89,10 @@ impl ReinvocationContext {
     /// Takes the webhook plugin's context out so it can be held across an
     /// `.await`; hand it back with [`Self::restore_webhook_context`]. The
     /// chain of one request is sequential, so nothing reads it in between.
-    pub fn take_webhook_context(&self) -> rusternetes_admission_webhook::WebhookReinvokeContext {
+    pub fn take_webhook_context(&self) -> k3rs_admission_webhook::WebhookReinvokeContext {
         std::mem::take(&mut *self.webhook_value.lock().unwrap())
     }
-    pub fn restore_webhook_context(
-        &self,
-        ctx: rusternetes_admission_webhook::WebhookReinvokeContext,
-    ) {
+    pub fn restore_webhook_context(&self, ctx: k3rs_admission_webhook::WebhookReinvokeContext) {
         *self.webhook_value.lock().unwrap() = ctx;
     }
     /// Runs `f` on this plugin's context, creating it on first use
@@ -209,7 +206,7 @@ pub struct MutatingEvaluator {
 pub fn compile_policy(policy: &MutatingAdmissionPolicy) -> MutatingEvaluator {
     use super::policy_apply_config::ApplyConfigPatcher;
     use super::policy_json_patch::JsonPatcher;
-    use rusternetes_common::resources::mutating_admission_policy::PatchType;
+    use k3rs_common::resources::mutating_admission_policy::PatchType;
 
     let Some(spec) = policy.spec.as_ref() else {
         return MutatingEvaluator::default();

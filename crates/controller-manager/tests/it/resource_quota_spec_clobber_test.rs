@@ -7,9 +7,9 @@
 //! from CPU=1/500Mi to CPU=2/1Gi and then GETs it; a racing status write that
 //! carried a stale spec reverted the GET to the old values (resource_quota.go:984).
 
-use rusternetes_common::resources::{ResourceQuota, ResourceQuotaSpec};
-use rusternetes_controller_manager::controllers::resource_quota::ResourceQuotaController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{ResourceQuota, ResourceQuotaSpec};
+use k3rs_controller_manager::controllers::resource_quota::ResourceQuotaController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

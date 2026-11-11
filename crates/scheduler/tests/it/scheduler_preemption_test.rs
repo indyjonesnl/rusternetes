@@ -25,13 +25,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::preempt_support::{check_preemption, check_preemption_with_pdbs};
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
     PriorityClass,
 };
-use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
-use rusternetes_scheduler::scheduler::Scheduler;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, Phase, ResourceRequirements};
+use k3rs_scheduler::scheduler::Scheduler;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
 // Test fixtures (mirrors `preemption_test.rs` so the new file can stand alone
@@ -85,8 +85,8 @@ fn make_container(cpu: &str, memory: &str) -> Container {
 
 /// A node as the kubelet reports it: `NodeResourcesFit` counts `pods` against
 /// the node's allocatable, so a node without it admits no pod.
-fn make_node(name: &str, cpu: &str, memory: &str) -> rusternetes_common::resources::Node {
-    let mut node = rusternetes_test_support::node_with_resources(name, cpu, memory);
+fn make_node(name: &str, cpu: &str, memory: &str) -> k3rs_common::resources::Node {
+    let mut node = k3rs_test_support::node_with_resources(name, cpu, memory);
     for q in node
         .status
         .iter_mut()

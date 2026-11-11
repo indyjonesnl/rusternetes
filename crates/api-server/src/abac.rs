@@ -6,9 +6,9 @@
 //! the policy file is read once at startup (no hot reload; `reload.go:118-123`
 //! reuses the `PolicyList` loaded at initial startup).
 
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::resources::{NonResourceRule, ResourceRule};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::resources::{NonResourceRule, ResourceRule};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -40,15 +40,15 @@ pub struct PolicySpec {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V0Policy {
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub user: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub group: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub readonly: bool,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub resource: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub namespace: String,
 }
 
@@ -56,31 +56,31 @@ pub struct V0Policy {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V1beta1Policy {
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub spec: V1beta1PolicySpec,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct V1beta1PolicySpec {
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub user: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub group: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub readonly: bool,
     #[serde(
         rename = "apigroup",
-        deserialize_with = "rusternetes_common::serde_helpers::null_default"
+        deserialize_with = "k3rs_common::serde_helpers::null_default"
     )]
     pub api_group: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub resource: String,
-    #[serde(deserialize_with = "rusternetes_common::serde_helpers::null_default")]
+    #[serde(deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub namespace: String,
     #[serde(
         rename = "nonresourcepath",
-        deserialize_with = "rusternetes_common::serde_helpers::null_default"
+        deserialize_with = "k3rs_common::serde_helpers::null_default"
     )]
     pub non_resource_path: String,
 }
@@ -402,10 +402,7 @@ impl Authorizer for PolicyList {
     /// `DecisionNoOpinion`; our [`Decision`] has no `NoOpinion` and
     /// `UnionAuthorizer` treats `Deny` as "fall through" (see
     /// `PrivilegedGroupAuthorizer`), so `Deny("No policy matched.")`.
-    async fn authorize(
-        &self,
-        attrs: &RequestAttributes,
-    ) -> rusternetes_common::error::Result<Decision> {
+    async fn authorize(&self, attrs: &RequestAttributes) -> k3rs_common::error::Result<Decision> {
         for p in &self.0 {
             if matches(p, attrs) {
                 return Ok(Decision::Allow);
@@ -416,10 +413,7 @@ impl Authorizer for PolicyList {
 
     // abac.go:229-235: allow reason is empty; abstention is exactly
     // "No policy matched.". Do not manufacture an ABAC allow description.
-    async fn authorize_opinion(
-        &self,
-        attrs: &RequestAttributes,
-    ) -> rusternetes_common::Result<Opinion> {
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> k3rs_common::Result<Opinion> {
         Ok(match self.authorize(attrs).await? {
             Decision::Allow => Opinion::Allow(String::new()),
             Decision::Deny(reason) => Opinion::NoOpinion {
@@ -434,7 +428,7 @@ impl Authorizer for PolicyList {
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> rusternetes_common::error::Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> k3rs_common::error::Result<k3rs_common::authz::UserRulesOutcome> {
         let mut resource_rules = Vec::new();
         let mut non_resource_rules = Vec::new();
         for p in &self.0 {
@@ -457,7 +451,7 @@ impl Authorizer for PolicyList {
                 }
             }
         }
-        Ok(rusternetes_common::authz::UserRulesOutcome {
+        Ok(k3rs_common::authz::UserRulesOutcome {
             resource_rules,
             non_resource_rules,
             ..Default::default()

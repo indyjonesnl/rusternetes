@@ -13,7 +13,7 @@
 //! because defaulting them with nothing to check would convert serde's 400 into
 //! a silent accept.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CLAIMS: &str = "/apis/resource.k8s.io/v1/namespaces/default/resourceclaims";

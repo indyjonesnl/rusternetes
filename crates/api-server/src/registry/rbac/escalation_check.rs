@@ -1,8 +1,8 @@
 //! Port of `pkg/registry/rbac/escalation_check.go` and `helpers.go`: the
 //! checks the policybased storages run before the privilege-escalation rule.
 
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::resources::RoleRef;
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_common::resources::RoleRef;
 use serde::Serialize;
 
 use crate::registry::rest::RequestContext;

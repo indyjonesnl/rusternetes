@@ -3,9 +3,9 @@
 //! (`TestTypeChecking`, release-1.35) plus the `reconcile` / queue branches of
 //! `controller.go`.
 
-use rusternetes_common::resources::{ExpressionWarning, ValidatingAdmissionPolicy};
-use rusternetes_controller_manager::controllers::vap_status::VapStatusController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{ExpressionWarning, ValidatingAdmissionPolicy};
+use k3rs_controller_manager::controllers::vap_status::VapStatusController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;

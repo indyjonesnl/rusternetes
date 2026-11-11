@@ -55,7 +55,7 @@
 //! kubectl sends by default since v1.25 — **rejects** it. Both are asserted.
 //!
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS_URI: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
@@ -78,7 +78,7 @@ fn spawn_state() -> TestApiServer {
 /// the CRD the way a cluster that already holds one behaves, rather than
 /// weakening the validator to accept a URL no real cluster would.
 async fn seed_crd(state: &TestApiServer, crd_body: &Value) {
-    use rusternetes_storage::Storage;
+    use k3rs_storage::Storage;
     let name = crd_body["metadata"]["name"].as_str().expect("crd name");
     // A CRD already held by a cluster is Established; custom resources are
     // 404 until then (customresource_handler.go:288-293).
@@ -91,7 +91,7 @@ async fn seed_crd(state: &TestApiServer, crd_body: &Value) {
     state
         .storage
         .create(
-            &rusternetes_storage::build_key("customresourcedefinitions", None, name),
+            &k3rs_storage::build_key("customresourcedefinitions", None, name),
             crd_body,
         )
         .await

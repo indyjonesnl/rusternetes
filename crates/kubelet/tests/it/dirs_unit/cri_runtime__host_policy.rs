@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::RuntimeClass;
-    pub use rusternetes_storage::{build_key, Storage};
+    pub use k3rs_common::resources::RuntimeClass;
+    pub use k3rs_storage::{build_key, Storage};
     pub use std::path::Path;
     pub use std::sync::OnceLock;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::cri_runtime::host_policy::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_kubelet::cri_runtime::host_policy::*;
+    use k3rs_storage::MemoryStorage;
 
     #[test]
     fn parses_cpu_ranges_like_upstream() {

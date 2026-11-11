@@ -4,7 +4,7 @@
 //! `config.go` (`LoadConfiguration`), `apis/resourcequota/types.go`
 //! (`Configuration`, `LimitedResource`) and `apis/resourcequota/validation`.
 
-use rusternetes_common::resources::ScopedResourceSelectorRequirement;
+use k3rs_common::resources::ScopedResourceSelectorRequirement;
 use serde::Deserialize;
 
 /// `resourcequotaapi.LimitedResource` (types.go:36-69): a resource whose

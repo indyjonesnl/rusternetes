@@ -7,7 +7,7 @@
 //! - <https://github.com/kubernetes/kubernetes/blob/master/pkg/scheduler/framework/plugins/interpodaffinity/filtering_test.go>
 //! - <https://github.com/kubernetes/kubernetes/blob/master/pkg/scheduler/framework/plugins/interpodaffinity/scoring_test.go>
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     node::Taint,
     pod::{
         Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
@@ -16,8 +16,8 @@ use rusternetes_common::resources::{
     },
     Node, Pod,
 };
-use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
-use rusternetes_scheduler::advanced::{
+use k3rs_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+use k3rs_scheduler::advanced::{
     check_node_affinity, check_pod_affinity, check_pod_anti_affinity, check_taints_tolerations,
 };
 use std::collections::HashMap;
@@ -52,7 +52,7 @@ fn node_with_labels(name: &str, labels: &[(&str, &str)]) -> Node {
 
 /// Create a Node with taints and (optionally) labels.
 fn node_with_taints(name: &str, labels: &[(&str, &str)], taints: Vec<Taint>) -> Node {
-    use rusternetes_common::resources::node::NodeSpec;
+    use k3rs_common::resources::node::NodeSpec;
     let mut n = node_with_labels(name, labels);
     n.spec = Some(NodeSpec {
         pod_cidr: None,
@@ -886,7 +886,7 @@ fn pod_affinity_required_matching_scheduled_pod_found() {
 /// Topology-CORRECT expectation for pod affinity: a matching pod in a DIFFERENT
 /// topology domain (different hostname) must NOT satisfy hostname-scoped affinity,
 /// so scheduling onto n1 (which has no co-located matching pod) should FAIL.
-/// Rusternetes currently treats it as satisfied because it ignores topologyKey.
+/// k3rs currently treats it as satisfied because it ignores topologyKey.
 #[test]
 fn pod_affinity_required_matching_pod_different_topology_should_fail() {
     let n = node_with_labels("n1", &[("kubernetes.io/hostname", "n1")]);
@@ -1229,7 +1229,7 @@ fn taints_exists_with_effect_filter() {
 fn node_affinity_and_taint_both_must_pass() {
     // Node: zone=us-east-1a and has a NoSchedule taint
     let n = {
-        use rusternetes_common::resources::node::NodeSpec;
+        use k3rs_common::resources::node::NodeSpec;
         let mut n = node_with_labels("n1", &[("zone", "us-east-1a")]);
         n.spec = Some(NodeSpec {
             pod_cidr: None,

@@ -9,7 +9,7 @@ mod tests {
     //! evanphx `patch.go` semantics the `jsonPatch` patcher relies on.
 
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_json_patch_ops::*;
+    use k3rs_api_server::admission::policy_json_patch_ops::*;
     use serde_json::json;
 
     fn op(op: &str, path: &str, value: Option<Value>) -> Operation {

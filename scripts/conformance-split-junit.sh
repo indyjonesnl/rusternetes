@@ -11,8 +11,8 @@
 #
 # Defaults:
 #   --input:      newest `junit_01.xml` under
-#                 `.rusternetes/volumes/sonobuoy-e2e-job-*/results/`
-#   --output-dir: `.rusternetes/volumes/conformance-per-test/`
+#                 `.k3rs/volumes/sonobuoy-e2e-job-*/results/`
+#   --output-dir: `.k3rs/volumes/conformance-per-test/`
 #
 # Without `--all`, only failing/erroring testcases are emitted.
 
@@ -31,9 +31,9 @@ Usage: $SCRIPT_NAME [--all] [--input <junit_01.xml>] [--output-dir <dir>]
 Options:
   --all              Emit one file per testcase, not only failures/errors.
   --input PATH       Path to junit_01.xml. Default: auto-discover newest under
-                     .rusternetes/volumes/sonobuoy-e2e-job-*/results/.
+                     .k3rs/volumes/sonobuoy-e2e-job-*/results/.
   --output-dir DIR   Where to write per-test files. Default:
-                     .rusternetes/volumes/conformance-per-test/
+                     .k3rs/volumes/conformance-per-test/
   -h, --help         Show this help.
 EOF
 }
@@ -73,7 +73,7 @@ fi
 
 # Auto-discover the newest junit_01.xml if --input wasn't given.
 if [ -z "$INPUT" ]; then
-    SEARCH_ROOT=".rusternetes/volumes"
+    SEARCH_ROOT=".k3rs/volumes"
     if [ ! -d "$SEARCH_ROOT" ]; then
         echo "error: no junit_01.xml provided and $SEARCH_ROOT does not exist." >&2
         echo "Run a conformance suite first: bash scripts/run-conformance.sh" >&2
@@ -111,7 +111,7 @@ if [ ! -f "$INPUT" ]; then
 fi
 
 if [ -z "$OUTPUT_DIR" ]; then
-    OUTPUT_DIR=".rusternetes/volumes/conformance-per-test"
+    OUTPUT_DIR=".k3rs/volumes/conformance-per-test"
 fi
 
 mkdir -p "$OUTPUT_DIR"

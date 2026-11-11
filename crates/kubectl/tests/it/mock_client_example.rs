@@ -48,7 +48,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_pod_with_mock_client() {
-        use rusternetes_common::resources::Pod;
+        use k3rs_common::resources::Pod;
 
         // Create mock client
         let mut client = MockApiClient::new();
@@ -88,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_pods_with_mock_client() {
-        use rusternetes_common::resources::Pod;
+        use k3rs_common::resources::Pod;
 
         let mut client = MockApiClient::new();
 

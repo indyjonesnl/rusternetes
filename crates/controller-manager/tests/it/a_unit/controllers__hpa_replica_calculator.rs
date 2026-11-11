@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_controller_manager::controllers::hpa_metrics_client::PodMetricsInfo;
+    pub use k3rs_controller_manager::controllers::hpa_metrics_client::PodMetricsInfo;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
-    use rusternetes_controller_manager::controllers::hpa_replica_calculator::*;
+    use k3rs_controller_manager::controllers::hpa_metrics_client::FakeMetricsClient;
+    use k3rs_controller_manager::controllers::hpa_replica_calculator::*;
 
     #[test]
     fn pods_metric_doubles_replicas() {

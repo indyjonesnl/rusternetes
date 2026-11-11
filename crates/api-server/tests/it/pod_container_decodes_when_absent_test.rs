@@ -2,13 +2,13 @@
 //! answer comes from a validator, with a field path, not from serde.
 //!
 //! Go has no required JSON fields: `decoder.Decode(body, &defaultGVK, obj)`
-//! fills the zero value and validation answers. Rusternetes modelled 33
+//! fills the zero value and validation answers. k3rs modelled 33
 //! container-side fields of `resources/pod.rs` as bare non-`Option`, so an
 //! omitted `image`, `containerPort`, `mountPath`, `devicePath`, resize policy,
 //! restart-rule action, probe port or profile `type` was a serde 400
 //! BadRequest — no `reason`, no `details.causes`, no field path (#1939).
 //!
-//! Making them reachable exposed six validators upstream has and Rusternetes
+//! Making them reachable exposed six validators upstream has and k3rs
 //! did not have at all — `ValidateEnvFrom`, `ValidateVolumeDevices`,
 //! `validateResizePolicy`, the rules half of `validateContainerRestartPolicy`,
 //! `validateSeccompProfileField` and `ValidateAppArmorProfileField` — each
@@ -19,7 +19,7 @@
 //! The table below is the whole audited surface: one row per field, asserted
 //! against the error a client actually reads.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 /// `(label, pod spec, substring the answer must contain)`.

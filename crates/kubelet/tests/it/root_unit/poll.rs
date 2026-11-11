@@ -5,7 +5,7 @@ mod __parent {}
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::poll::*;
+    use k3rs_kubelet::poll::*;
     use std::cell::Cell;
 
     /// Returns None on the first two calls, then Some — the helper must keep

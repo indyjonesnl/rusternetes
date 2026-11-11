@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde_json::{json, Value};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::autoscale::*;
+    use k3rs_kubectl::commands::autoscale::*;
 
     #[test]
     fn test_build_hpa_v1() {

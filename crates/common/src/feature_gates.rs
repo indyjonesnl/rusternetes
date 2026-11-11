@@ -7,15 +7,15 @@
 //! `feature_gates::enabled(Feature::RelaxedDNSSearchValidation)` without
 //! threading flags through every function signature.
 //!
-//! Each [`Feature`] variant carries its rusternetes default, which mirrors the
-//! upstream default at the version rusternetes targets (currently v1.35).
+//! Each [`Feature`] variant carries its k3rs default, which mirrors the
+//! upstream default at the version k3rs targets (currently v1.35).
 //! Tests that need to flip a gate should use [`with_feature`] (the RAII guard
 //! restores the previous value on drop) and pair the test with
 //! `#[serial_test::serial]` because the registry is process-wide.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Enum of all rusternetes feature gates. Adding a gate is two lines: a variant
+/// Enum of all k3rs feature gates. Adding a gate is two lines: a variant
 /// here plus a slot in [`STATES`]; the `idx` <-> default mapping in
 /// [`Feature::idx`] and [`Feature::default_enabled`] keeps them in sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub enum Feature {
     /// strict RFC1123-subdomain validator.
     ///
     /// Upstream: `pkg/features/kube_features.go::RelaxedDNSSearchValidation`.
-    /// GA + locked-to-default in v1.34; rusternetes targets v1.35 so the
+    /// GA + locked-to-default in v1.34; k3rs targets v1.35 so the
     /// default is `true`.
     RelaxedDNSSearchValidation,
 
@@ -46,7 +46,7 @@ pub enum Feature {
     /// mutation is admitted to a node that has not declared support.
     ///
     /// Upstream: `pkg/features/kube_features.go::NodeDeclaredFeatures` —
-    /// KEP-5328. Alpha in v1.34; rusternetes targets v1.35 where the gate is
+    /// KEP-5328. Alpha in v1.34; k3rs targets v1.35 where the gate is
     /// still off-by-default.
     NodeDeclaredFeatures,
 
@@ -56,7 +56,7 @@ pub enum Feature {
     /// has not declared `GuaranteedQoSPodCPUResize`.
     ///
     /// Upstream: `pkg/features/kube_features.go::InPlacePodVerticalScaling`.
-    /// Beta + default-on in v1.33; rusternetes targets v1.35 so the default
+    /// Beta + default-on in v1.33; k3rs targets v1.35 so the default
     /// is `true`.
     InPlacePodVerticalScaling,
 
@@ -187,7 +187,7 @@ pub enum Feature {
     /// the admission plugin (`admission/plugin/policy/mutating/plugin.go:124`);
     /// the REST resource is gated by the `admissionregistration.k8s.io/v1beta1`
     /// API group, which is in `betaAPIGroupVersionsDisabledByDefault`
-    /// (`pkg/controlplane/instance.go`). Rusternetes has no `--runtime-config`,
+    /// (`pkg/controlplane/instance.go`). k3rs has no `--runtime-config`,
     /// so this gate stands in for both, as `ClusterTrustBundle` does for
     /// `certificates.k8s.io/v1beta1`.
     MutatingAdmissionPolicy,
@@ -1106,7 +1106,7 @@ pub fn validate() -> Vec<String> {
     }
 }
 
-/// Reset every feature gate to its rusternetes default. Useful between tests
+/// Reset every feature gate to its k3rs default. Useful between tests
 /// that flip gates without going through [`FeatureGuard`].
 ///
 /// Iterates [`ALL_FEATURES`] so adding a new gate requires only the enum +

@@ -3,26 +3,24 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::admission::admission_metrics::{
+    pub use k3rs_api_server::admission::admission_metrics::{
         observe_match_condition_eval_error, observe_match_condition_evaluation_time, KIND_POLICY,
         STEP_VALIDATE,
     };
-    pub use rusternetes_api_server::admission::policy_json_patch::{
+    pub use k3rs_api_server::admission::policy_json_patch::{
         evaluate_expression_costed, CostReport,
     };
-    pub use rusternetes_api_server::admission::policy_matching::Attributes;
-    pub use rusternetes_api_server::admission::policy_mutating::{
+    pub use k3rs_api_server::admission::policy_matching::Attributes;
+    pub use k3rs_api_server::admission::policy_mutating::{
         ConditionMatcher, MatchResult, PatchError, PatchRequest, VersionedAttributes,
     };
-    pub use rusternetes_common::admission::Operation;
-    pub use rusternetes_common::authz::Authorizer;
-    pub use rusternetes_common::cel::CELEvaluator;
-    pub use rusternetes_common::cel_cost::{
-        charge_budget, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
-    };
-    pub use rusternetes_common::cel_struct::TypeCheck;
-    pub use rusternetes_common::resources::admission_webhook::MatchCondition;
-    pub use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
+    pub use k3rs_common::admission::Operation;
+    pub use k3rs_common::authz::Authorizer;
+    pub use k3rs_common::cel::CELEvaluator;
+    pub use k3rs_common::cel_cost::{charge_budget, RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS};
+    pub use k3rs_common::cel_struct::TypeCheck;
+    pub use k3rs_common::resources::admission_webhook::MatchCondition;
+    pub use k3rs_common::resources::validating_admission_policy::FailurePolicy;
     pub use serde_json::Value;
     pub use std::collections::HashSet;
     pub use std::sync::{Arc, Mutex};
@@ -31,9 +29,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_match_conditions::*;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_api_server::admission::policy_match_conditions::*;
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
     use serde_json::json;
 
     struct Fake {
@@ -363,7 +361,7 @@ mod tests {
 
     /// `(eval errors, evaluation-time samples)` for `name` / CREATE.
     fn observed(name: &str) -> (u64, u64) {
-        use rusternetes_api_server::admission::admission_metrics::{
+        use k3rs_api_server::admission::admission_metrics::{
             MATCH_CONDITION_EVALUATION_SECONDS, MATCH_CONDITION_EVAL_ERRORS,
         };
         let l = [name, KIND_POLICY, STEP_VALIDATE, "CREATE"];
@@ -441,9 +439,9 @@ mod tests {
     /// that hands `Match`'s `authz` to the activation (matcher.go:80-86).
     mod authorizer_library {
         use super::*;
-        use rusternetes_common::auth::UserInfo;
-        use rusternetes_common::authz::{Decision, Opinion, RequestAttributes};
-        use rusternetes_common::Error;
+        use k3rs_common::auth::UserInfo;
+        use k3rs_common::authz::{Decision, Opinion, RequestAttributes};
+        use k3rs_common::Error;
 
         type Outcome = Result<Opinion, String>;
 
@@ -483,10 +481,7 @@ mod tests {
 
         #[async_trait]
         impl Authorizer for Fake {
-            async fn authorize(
-                &self,
-                attrs: &RequestAttributes,
-            ) -> rusternetes_common::Result<Decision> {
+            async fn authorize(&self, attrs: &RequestAttributes) -> k3rs_common::Result<Decision> {
                 match self.authorize_opinion(attrs).await? {
                     Opinion::Allow(_) => Ok(Decision::Allow),
                     Opinion::Deny(r) => Ok(Decision::Deny(r)),
@@ -496,7 +491,7 @@ mod tests {
             async fn authorize_opinion(
                 &self,
                 attrs: &RequestAttributes,
-            ) -> rusternetes_common::Result<Opinion> {
+            ) -> k3rs_common::Result<Opinion> {
                 let matched = self
                     .expect
                     .as_ref()
@@ -512,9 +507,8 @@ mod tests {
                 &self,
                 _: &UserInfo,
                 _: &str,
-            ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome>
-            {
-                Ok(rusternetes_common::authz::UserRulesOutcome::default())
+            ) -> k3rs_common::Result<k3rs_common::authz::UserRulesOutcome> {
+                Ok(k3rs_common::authz::UserRulesOutcome::default())
             }
         }
 
@@ -748,9 +742,9 @@ mod budget_tests {
     //! `activation.Evaluate` (`activation.go:132-189`).
 
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_match_conditions::*;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_api_server::admission::policy_match_conditions::*;
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
     use serde_json::json;
 
     fn attrs(object: Value) -> (Attributes, VersionedAttributes) {

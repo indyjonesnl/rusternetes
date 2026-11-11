@@ -3,12 +3,10 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_kubelet::pluginmanager::cache::PluginHandler;
-    pub use rusternetes_kubelet::volume_plugins::csi_client::{CsiDriverClient, CSI_TIMEOUT};
-    pub use rusternetes_kubelet::volume_plugins::csi_drivers_store::{
-        csi_drivers, Driver, DriversStore,
-    };
-    pub use rusternetes_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
+    pub use k3rs_kubelet::pluginmanager::cache::PluginHandler;
+    pub use k3rs_kubelet::volume_plugins::csi_client::{CsiDriverClient, CSI_TIMEOUT};
+    pub use k3rs_kubelet::volume_plugins::csi_drivers_store::{csi_drivers, Driver, DriversStore};
+    pub use k3rs_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
     pub use std::cmp::Ordering;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -18,8 +16,8 @@ mod tests {
     use super::__parent::*;
     use crate::csi_fake;
     use csi_fake::FakeDriver;
-    use rusternetes_kubelet::pluginmanager::csi_handler::*;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::{NodeGetInfoResponse, Topology};
+    use k3rs_kubelet::pluginmanager::csi_handler::*;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::{NodeGetInfoResponse, Topology};
     use std::collections::HashMap;
     use std::sync::Mutex;
 

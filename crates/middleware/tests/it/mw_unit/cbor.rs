@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::cbor::*;
+    use k3rs_middleware::cbor::*;
     use serde_json::json;
 
     /// Round-trip a representative ConfigMap shape through CBOR and JSON

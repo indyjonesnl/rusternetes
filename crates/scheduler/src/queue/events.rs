@@ -26,7 +26,7 @@
 //! `NodeDeclaredFeatures`' `extractNodeFeaturesChange` is omitted (that gate is
 //! off / the resource is not scheduled here yet).
 
-use rusternetes_common::resources::{Node, Pod};
+use k3rs_common::resources::{Node, Pod};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
@@ -475,8 +475,8 @@ pub fn pod_scheduling_properties_change(new_pod: &Pod, old_pod: &Pod) -> Vec<Clu
 /// resource request is removed or reduced. `InPlacePodVerticalScaling` is on
 /// by default in 1.35, so requests are read with `UseStatusResources`.
 fn extract_pod_scale_down(new_pod: &Pod, old_pod: &Pod) -> ActionType {
-    let new_requests = rusternetes_common::quota::pod_requests_opts(new_pod, None, true);
-    let old_requests = rusternetes_common::quota::pod_requests_opts(old_pod, None, true);
+    let new_requests = k3rs_common::quota::pod_requests_opts(new_pod, None, true);
+    let old_requests = k3rs_common::quota::pod_requests_opts(old_pod, None, true);
 
     for (name, old_req) in &old_requests {
         let Some(new_req) = new_requests.get(name) else {

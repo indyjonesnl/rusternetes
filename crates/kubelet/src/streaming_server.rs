@@ -17,8 +17,8 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use rusternetes_common::resources::Pod;
-use rusternetes_common::types::ObjectMeta;
+use k3rs_common::resources::Pod;
+use k3rs_common::types::ObjectMeta;
 use tracing::{info, warn};
 
 /// Query parameters for exec/attach requests, mirroring upstream
@@ -67,7 +67,7 @@ impl ExecParams {
                 // ExecStdoutParam="output", ExecStderrParam="error",
                 // ExecTTYParam="tty" (k8s.io/api/core/v1/types.go). Also accept
                 // the raw stream names (stdin/stdout/stderr) that the
-                // rusternetes api-server forwards verbatim, so the kubelet works
+                // k3rs api-server forwards verbatim, so the kubelet works
                 // behind BOTH a vanilla control plane and the native stack.
                 // Without "input"/"output"/"error", a vanilla api-server's exec
                 // request parses to all-false streams and the CRI rejects it
@@ -97,7 +97,7 @@ impl ExecParams {
 /// `"false"` are false. The previous `"true"`/`"1"`-only comparison dropped
 /// `?follow=t` and `?follow=yes`, which upstream treats as true.
 pub fn is_true(s: &str) -> bool {
-    rusternetes_common::query::k8s_query_bool(s)
+    k3rs_common::query::k8s_query_bool(s)
 }
 
 /// Minimal percent-decode: replace `+` with space and `%XX` hex sequences.
@@ -202,8 +202,8 @@ impl LogParams {
     }
 }
 
-/// Map [`LogParams`] to [`rusternetes_cri::stream::LogReadOptions`].
-pub fn log_read_options(params: &LogParams) -> rusternetes_cri::stream::LogReadOptions {
+/// Map [`LogParams`] to [`k3rs_cri::stream::LogReadOptions`].
+pub fn log_read_options(params: &LogParams) -> k3rs_cri::stream::LogReadOptions {
     // sinceTime wins when both are present (upstream validation forbids that
     // combination outright); otherwise sinceSeconds becomes an absolute cutoff
     // relative to now, which is what the CRI log reader filters on.
@@ -220,7 +220,7 @@ pub fn log_read_options(params: &LogParams) -> rusternetes_cri::stream::LogReadO
                 .since_seconds
                 .map(|secs| chrono::Utc::now().timestamp() - secs)
         });
-    rusternetes_cri::stream::LogReadOptions {
+    k3rs_cri::stream::LogReadOptions {
         timestamps: params.timestamps,
         tail_lines: params.tail_lines,
         limit_bytes: params.limit_bytes,
@@ -248,7 +248,7 @@ pub struct ExecPath4 {
 /// Build a minimal [`Pod`] value sufficient for [`resolve_container_id`].
 fn pod_for_resolve(namespace: &str, pod_name: &str, uid: &str) -> Pod {
     Pod {
-        type_meta: rusternetes_common::types::TypeMeta {
+        type_meta: k3rs_common::types::TypeMeta {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
         },
@@ -272,7 +272,7 @@ async fn exec_proxy(
     params: &ExecParams,
     req: axum::extract::Request,
 ) -> Response {
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => {
             warn!("exec_proxy: CRI connect failed: {e}");
@@ -281,32 +281,32 @@ async fn exec_proxy(
     };
 
     let pod = pod_for_resolve(namespace, pod_name, uid);
-    let container_id =
-        match rusternetes_cri::stream::resolve_container_id(&mut cri, &pod, container).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                warn!(
-                    "exec_proxy: container not found: ns={namespace} pod={pod_name} \
+    let container_id = match k3rs_cri::stream::resolve_container_id(&mut cri, &pod, container).await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            warn!(
+                "exec_proxy: container not found: ns={namespace} pod={pod_name} \
                      container={container}"
-                );
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!(
-                        "container {container:?} not found in pod {pod_name:?} \
+            );
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "container {container:?} not found in pod {pod_name:?} \
                          (namespace {namespace:?})"
-                    ),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                warn!("exec_proxy: resolve_container_id failed: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        };
+                ),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("exec_proxy: resolve_container_id failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
 
     // Call CRI Exec → get the runtime stream URL.
     let stream_url = match cri
-        .exec(rusternetes_cri::v1::ExecRequest {
+        .exec(k3rs_cri::v1::ExecRequest {
             container_id: container_id.clone(),
             cmd: params.command.clone(),
             tty: params.tty,
@@ -326,8 +326,8 @@ async fn exec_proxy(
     };
 
     // Rewrite the stream URL to the node-local streaming server port.
-    let (host, port) = rusternetes_cri::stream::stream_target();
-    let rewritten = match rusternetes_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
+    let (host, port) = k3rs_cri::stream::stream_target();
+    let rewritten = match k3rs_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
         Ok(u) => u,
         Err(e) => {
             warn!("exec_proxy: rewrite_stream_url failed: {e}");
@@ -348,7 +348,7 @@ async fn exec_proxy(
         }
     };
 
-    rusternetes_streamproxy::proxy_upgrade(target, req).await
+    k3rs_streamproxy::proxy_upgrade(target, req).await
 }
 
 /// Resolve the container id and proxy an attach request to the CRI stream.
@@ -360,7 +360,7 @@ async fn attach_proxy(
     params: &ExecParams,
     req: axum::extract::Request,
 ) -> Response {
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => {
             warn!("attach_proxy: CRI connect failed: {e}");
@@ -369,32 +369,32 @@ async fn attach_proxy(
     };
 
     let pod = pod_for_resolve(namespace, pod_name, uid);
-    let container_id =
-        match rusternetes_cri::stream::resolve_container_id(&mut cri, &pod, container).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                warn!(
-                    "attach_proxy: container not found: ns={namespace} pod={pod_name} \
+    let container_id = match k3rs_cri::stream::resolve_container_id(&mut cri, &pod, container).await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            warn!(
+                "attach_proxy: container not found: ns={namespace} pod={pod_name} \
                      container={container}"
-                );
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!(
-                        "container {container:?} not found in pod {pod_name:?} \
+            );
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "container {container:?} not found in pod {pod_name:?} \
                          (namespace {namespace:?})"
-                    ),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                warn!("attach_proxy: resolve_container_id failed: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        };
+                ),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("attach_proxy: resolve_container_id failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
 
     // Call CRI Attach → get the runtime stream URL.
     let stream_url = match cri
-        .attach(rusternetes_cri::v1::AttachRequest {
+        .attach(k3rs_cri::v1::AttachRequest {
             container_id: container_id.clone(),
             stdin: params.stdin,
             tty: params.tty,
@@ -410,8 +410,8 @@ async fn attach_proxy(
         }
     };
 
-    let (host, port) = rusternetes_cri::stream::stream_target();
-    let rewritten = match rusternetes_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
+    let (host, port) = k3rs_cri::stream::stream_target();
+    let rewritten = match k3rs_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
         Ok(u) => u,
         Err(e) => {
             warn!("attach_proxy: rewrite_stream_url failed: {e}");
@@ -432,7 +432,7 @@ async fn attach_proxy(
         }
     };
 
-    rusternetes_streamproxy::proxy_upgrade(target, req).await
+    k3rs_streamproxy::proxy_upgrade(target, req).await
 }
 
 /// Path parameters for the portForward routes (2-segment variant: no uid).
@@ -480,7 +480,7 @@ async fn portforward_proxy(
     req: axum::extract::Request,
 ) -> Response {
     let query = req.uri().query().unwrap_or("").to_string();
-    let ports = match rusternetes_cri::stream::parse_port_forward_ports(
+    let ports = match k3rs_cri::stream::parse_port_forward_ports(
         &query,
         is_websocket_request(req.headers()),
     ) {
@@ -491,7 +491,7 @@ async fn portforward_proxy(
         }
     };
 
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => {
             warn!("portforward_proxy: CRI connect failed: {e}");
@@ -500,7 +500,7 @@ async fn portforward_proxy(
     };
 
     let pod = pod_for_resolve(namespace, pod_name, uid);
-    let sandbox_id = match rusternetes_cri::stream::resolve_sandbox_id(&mut cri, &pod).await {
+    let sandbox_id = match k3rs_cri::stream::resolve_sandbox_id(&mut cri, &pod).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             warn!("portforward_proxy: no sandbox for ns={namespace} pod={pod_name}");
@@ -524,8 +524,8 @@ async fn portforward_proxy(
         }
     };
 
-    let (host, port) = rusternetes_cri::stream::stream_target();
-    let rewritten = match rusternetes_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
+    let (host, port) = k3rs_cri::stream::stream_target();
+    let rewritten = match k3rs_cri::stream::rewrite_stream_url(&stream_url, &host, port) {
         Ok(u) => u,
         Err(e) => {
             warn!("portforward_proxy: rewrite_stream_url failed: {e}");
@@ -544,7 +544,7 @@ async fn portforward_proxy(
         }
     };
 
-    rusternetes_streamproxy::proxy_upgrade(target, req).await
+    k3rs_streamproxy::proxy_upgrade(target, req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +608,7 @@ pub async fn handle_container_logs(
     let query = req.uri().query().unwrap_or("").to_string();
     let params = LogParams::from_query(&query);
 
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => {
             warn!("handle_container_logs: CRI connect failed: {e}");
@@ -618,7 +618,7 @@ pub async fn handle_container_logs(
 
     let pod = pod_for_resolve(&p.namespace, &p.pod, "");
     let container_id =
-        match rusternetes_cri::stream::resolve_container_id(&mut cri, &pod, &p.container).await {
+        match k3rs_cri::stream::resolve_container_id(&mut cri, &pod, &p.container).await {
             Ok(Some(id)) => id,
             Ok(None) => {
                 warn!(
@@ -640,22 +640,21 @@ pub async fn handle_container_logs(
             }
         };
 
-    let log_path =
-        match rusternetes_cri::stream::resolve_log_path(&mut cri, &pod, &container_id).await {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                warn!("handle_container_logs: no log_path for container_id={container_id}");
-                return (
-                    StatusCode::NOT_FOUND,
-                    "container log file not available".to_string(),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                warn!("handle_container_logs: resolve_log_path failed: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        };
+    let log_path = match k3rs_cri::stream::resolve_log_path(&mut cri, &pod, &container_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            warn!("handle_container_logs: no log_path for container_id={container_id}");
+            return (
+                StatusCode::NOT_FOUND,
+                "container log file not available".to_string(),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!("handle_container_logs: resolve_log_path failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
 
     info!(
         "handle_container_logs: ns={} pod={} container={} container_id={} log_path={} follow={}",
@@ -685,7 +684,7 @@ pub async fn handle_container_logs(
 
     // Non-follow: read current log contents and return in one shot.
     let opts = log_read_options(&params);
-    match rusternetes_cri::stream::read_log_file(&log_path, &opts) {
+    match k3rs_cri::stream::read_log_file(&log_path, &opts) {
         Ok(bytes) => container_logs_response(bytes),
         Err(e) => {
             warn!("handle_container_logs: read_log_file failed: {e}");
@@ -767,8 +766,8 @@ async fn find_container(
     if !pod_uid.is_empty() && pod.metadata.uid != pod_uid {
         return Ok(None);
     }
-    let mut cri = rusternetes_cri::stream::connect().await?;
-    rusternetes_cri::stream::resolve_container_id(&mut cri, pod, container).await
+    let mut cri = k3rs_cri::stream::connect().await?;
+    k3rs_cri::stream::resolve_container_id(&mut cri, pod, container).await
 }
 
 /// `(*Server).getRun` (server.go:992-1008): run a command synchronously and
@@ -804,11 +803,11 @@ async fn run_in_container(
         }
         Err(e) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    match rusternetes_cri::stream::exec_sync(&mut cri, &container_id, &cmd, 0).await {
+    match k3rs_cri::stream::exec_sync(&mut cri, &container_id, &cmd, 0).await {
         Ok((mut stdout, stderr, exit_code)) => {
             if exit_code != 0 {
                 // remote_runtime.go ExecSync: `exec.CodeExitError`.
@@ -914,7 +913,7 @@ pub async fn handle_checkpoint(
         chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
     ));
     let location = location.to_string_lossy().into_owned();
-    let mut cri = match rusternetes_cri::stream::connect().await {
+    let mut cri = match k3rs_cri::stream::connect().await {
         Ok(c) => c,
         Err(e) => return failed(e.to_string()),
     };
@@ -993,7 +992,7 @@ fn render_cri_lines(complete: &[u8], timestamps: bool, since_unix: Option<i64>) 
         if line.is_empty() {
             continue;
         }
-        let parsed = rusternetes_cri::stream::parse_cri_log_line(line);
+        let parsed = k3rs_cri::stream::parse_cri_log_line(line);
         if let Some(since) = since_unix {
             if let Some(ts) = parsed.timestamp_unix {
                 if ts < since {
@@ -1042,7 +1041,7 @@ where
     async_stream::stream! {
         // Emit existing backlog; a missing file is non-fatal (container may
         // not have written yet — fall through to the tail loop).
-        match rusternetes_cri::stream::read_log_file(&log_path, &opts) {
+        match k3rs_cri::stream::read_log_file(&log_path, &opts) {
             Ok(bytes) if !bytes.is_empty() => {
                 yield Ok(bytes::Bytes::from(bytes));
             }
@@ -1141,16 +1140,14 @@ fn cri_container_gone(
     move || {
         let container_id = container_id.clone();
         Box::pin(async move {
-            let mut cri = match rusternetes_cri::stream::connect().await {
+            let mut cri = match k3rs_cri::stream::connect().await {
                 Ok(c) => c,
                 Err(_) => return false,
             };
             match cri.container_status(&container_id, false).await {
                 Ok(resp) => resp
                     .status
-                    .map(|s| {
-                        s.state != rusternetes_cri::v1::ContainerState::ContainerRunning as i32
-                    })
+                    .map(|s| s.state != k3rs_cri::v1::ContainerState::ContainerRunning as i32)
                     .unwrap_or(false),
                 Err(_) => false,
             }

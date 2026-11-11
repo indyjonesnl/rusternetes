@@ -352,7 +352,7 @@ impl ApiClient {
 
     /// Set the component's default `User-Agent` and send it on every request
     /// (`SetKubernetesDefaults`, `rest/config.go:484-489`). Pass
-    /// `rusternetes_common::compatibility::default_kubernetes_user_agent()`.
+    /// `k3rs_common::compatibility::default_kubernetes_user_agent()`.
     pub fn with_default_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         let ua = user_agent.into();
         self.user_agent = Some(ua.clone());

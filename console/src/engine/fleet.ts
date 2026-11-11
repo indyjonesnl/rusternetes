@@ -1,5 +1,5 @@
 // Multi-cluster fleet management.
-// Tracks connections to multiple rusternetes clusters and routes API calls.
+// Tracks connections to multiple k3rs clusters and routes API calls.
 
 export interface ClusterInfo {
   id: string;

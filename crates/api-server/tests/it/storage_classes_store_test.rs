@@ -4,7 +4,7 @@
 //! `Store.Update`, and both stores set `ReturnDeletedObject`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SCS: &str = "/apis/storage.k8s.io/v1/storageclasses";

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use rusternetes_common::authz::AuthzStorage;
-use rusternetes_common::{Error, Result};
+use k3rs_common::authz::AuthzStorage;
+use k3rs_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
@@ -214,7 +214,7 @@ pub trait Storage: Send + Sync {
     /// `PATCH` with `Content-Type: application/strategic-merge-patch+json` so
     /// the api-server applies it. Direct backends have no schema at this layer,
     /// so the default re-reads, applies the shared strategic-merge applier
-    /// (`rusternetes_common::patch`, merge keys and `$deleteFromPrimitiveList`
+    /// (`k3rs_common::patch`, merge keys and `$deleteFromPrimitiveList`
     /// directives included) and writes with the fresh resourceVersion,
     /// retrying on [`Error::Conflict`] (upstream `GuaranteedUpdate`).
     async fn patch_strategic_merge<T>(&self, key: &str, patch: &serde_json::Value) -> Result<T>
@@ -263,7 +263,7 @@ pub trait Storage: Send + Sync {
     /// parameters, so the api-server's field manager records the `Apply`
     /// managedFields entry. Direct backends have no api-server in the path, so
     /// the default re-reads and runs the shared apply engine
-    /// (`rusternetes_common::fieldmanager`, the engine the api-server applies with), creating the object when it
+    /// (`k3rs_common::fieldmanager`, the engine the api-server applies with), creating the object when it
     /// does not exist (as SSA does), CAS-retrying on [`Error::Conflict`].
     async fn apply<T>(
         &self,
@@ -287,7 +287,7 @@ pub trait Storage: Send + Sync {
     /// `full` is the complete desired object the patch was computed to
     /// produce. API-backed storage ignores it and sends the delta. Direct
     /// backends re-read, apply `patch` with the shared strategic-merge applier
-    /// (`rusternetes_common::patch`) onto the CURRENT object and write only
+    /// (`k3rs_common::patch`) onto the CURRENT object and write only
     /// `.status` back, CAS-retrying on conflict; `full` is unused.
     async fn patch_status_strategic_merge<T>(
         &self,
@@ -506,7 +506,7 @@ pub trait Storage: Send + Sync {
     /// may override for efficiency.
     ///
     /// This is a *storage-level* primitive that resumes by sort key. The
-    /// handler-level offset-based helper in `rusternetes_common::pagination`
+    /// handler-level offset-based helper in `k3rs_common::pagination`
     /// (see `paginate`) operates on already-fetched `Vec<T>` and is used by
     /// resource handlers that need to filter/decorate items before paging.
     async fn list_paginated<T>(
@@ -822,7 +822,7 @@ where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
-    use rusternetes_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
+    use k3rs_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
         let mut current: serde_json::Value = storage.get(key).await?;
@@ -856,7 +856,7 @@ where
 /// would. `FieldManager.Apply`
 /// (staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/fieldmanager.go:183-209)
 /// over `Updater.Apply` (sigs.k8s.io/structured-merge-diff/v6/merge/update.go:209-254),
-/// via the same `rusternetes_common::fieldmanager` the api-server's apply
+/// via the same `k3rs_common::fieldmanager` the api-server's apply
 /// handlers use (`ssa::apply_legacy`): structured `fieldsV1`, list-map merge by
 /// key (e.g. `status.conditions` by `type`). Creates the object when absent
 /// (apply creates, `handlers/patch.go` `applyPatcher`), CAS-retrying on
@@ -877,9 +877,9 @@ where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
-    use rusternetes_common::fieldmanager::apply::retain_live_system_metadata;
-    use rusternetes_common::fieldmanager::versionconverter::UpdateFailure;
-    use rusternetes_common::fieldmanager::{FieldManager, ResetFields};
+    use k3rs_common::fieldmanager::apply::retain_live_system_metadata;
+    use k3rs_common::fieldmanager::versionconverter::UpdateFailure;
+    use k3rs_common::fieldmanager::{FieldManager, ResetFields};
     const MAX_ATTEMPTS: usize = 8;
     for attempt in 0..MAX_ATTEMPTS {
         let current: Option<serde_json::Value> = match storage.get(key).await {
@@ -950,7 +950,7 @@ where
     S: Storage + ?Sized,
     T: Serialize + DeserializeOwned + Send + Sync,
 {
-    use rusternetes_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
+    use k3rs_common::patch::{apply_patch_with_schema, PatchSchema, PatchType};
     const MAX_ATTEMPTS: usize = 8;
     let typed_schema = serde_json::to_value(full)
         .ok()
@@ -1336,7 +1336,7 @@ impl StorageBackend {
     /// api-server over REST. The component keeps an ordinary
     /// `Arc<StorageBackend>` and never touches a real store directly.
     #[cfg(feature = "api-client")]
-    pub fn new_api(client: Arc<rusternetes_client::http::ApiClient>) -> Self {
+    pub fn new_api(client: Arc<k3rs_client::http::ApiClient>) -> Self {
         StorageBackend::Api(api_storage::ApiStorage::new(client))
     }
 
@@ -1462,7 +1462,7 @@ impl StorageBackend {
 /// where Go's etcd3 store observes `ctx.Done()` (staging/.../storage/etcd3/
 /// store.go: each `client.KV` call takes the request `ctx`, and
 /// `clientv3` returns `ctx.Err()` once it is done). The context is the
-/// task-local [`rusternetes_common::cancellation`] one the api-server's
+/// task-local [`k3rs_common::cancellation`] one the api-server's
 /// timeout filter installs (request_deadline.go:91-96); outside a request
 /// (controllers, tests) there is none and this is just `op`.
 ///
@@ -1470,7 +1470,7 @@ impl StorageBackend {
 /// half-done, exactly as Go does when `ctx` is cancelled between two etcd
 /// calls; a write already submitted to the backend may still be applied.
 pub async fn cancellable<T>(op: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    match rusternetes_common::cancellation::run_until_done(op).await {
+    match k3rs_common::cancellation::run_until_done(op).await {
         Ok(r) => r,
         Err(done) => Err(done.into()),
     }
@@ -2084,7 +2084,7 @@ impl Storage for StorageBackend {
 
 // AuthzStorage for StorageBackend — delegates to the inner implementation.
 #[async_trait]
-impl rusternetes_common::authz::AuthzStorage for StorageBackend {
+impl k3rs_common::authz::AuthzStorage for StorageBackend {
     async fn get<T>(&self, key: &str, namespace: Option<&str>) -> Result<T>
     where
         T: DeserializeOwned + Send + Sync,

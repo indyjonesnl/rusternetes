@@ -2,22 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::authorization_match_conditions::{
-        CelMatcher, WebhookMatchCondition,
-    };
-    pub use rusternetes_api_server::authorizer::{AUTHORIZATION_MODE_CHOICES, MODE_WEBHOOK};
-    pub use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
-    pub use rusternetes_common::validation::field::{
-        BadValue, Error as FieldError, ErrorList, Path,
-    };
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
+    pub use k3rs_api_server::authorization_match_conditions::{CelMatcher, WebhookMatchCondition};
+    pub use k3rs_api_server::authorizer::{AUTHORIZATION_MODE_CHOICES, MODE_WEBHOOK};
+    pub use k3rs_common::go_duration::{format_go_duration, parse_go_duration};
+    pub use k3rs_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
     pub use std::collections::BTreeSet;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::authorization_config::*;
-    use rusternetes_common::validation::field::{ErrorType, Path};
+    use k3rs_api_server::authorization_config::*;
+    use k3rs_common::validation::field::{ErrorType, Path};
 
     const SEC: i64 = 1_000_000_000;
 

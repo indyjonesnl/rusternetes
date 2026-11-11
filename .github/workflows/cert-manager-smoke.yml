@@ -1,7 +1,7 @@
 name: cert-manager Smoke
 
 # Proves a real third-party operator (cert-manager) installs and functions
-# end-to-end on Rusternetes: CRDs, admission + cainjector webhooks, leader
+# end-to-end on k3rs: CRDs, admission + cainjector webhooks, leader
 # leases, and the SelfSigned Issuer -> Certificate -> Secret reconcile path.
 # See scripts/run-cert-manager-smoke.sh and docs/PRODUCTION_READINESS.md.
 
@@ -59,8 +59,8 @@ jobs:
         id: smoke
         env:
           CONTAINER_RUNTIME: docker
-          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
-          KUBECONFIG: ${{ github.workspace }}/.kube/rusternetes-config
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.k3rs/volumes
+          KUBECONFIG: ${{ github.workspace }}/.kube/k3rs-config
           CERT_MANAGER_VERSION: ${{ github.event.inputs.cert_manager_version || 'v1.16.2' }}
         run: bash scripts/run-cert-manager-smoke.sh
 
@@ -94,6 +94,6 @@ jobs:
       - name: Tear down stack
         if: always()
         env:
-          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.k3rs/volumes
         run: |
           docker compose -f compose.sqlite.yml down -v --remove-orphans || true

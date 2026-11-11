@@ -28,8 +28,8 @@
 //!    `rules` field on `PodFailurePolicy`/`SuccessPolicy`, decoding would
 //!    succeed (no error) but yield an empty JSON object — the silent drop.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_common::resources::{
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_common::resources::{
     JobSpec, PodFailurePolicy, PodFailurePolicyOnExitCodesRequirement,
     PodFailurePolicyOnPodConditionsPattern, PodFailurePolicyRule, SuccessPolicy, SuccessPolicyRule,
 };

@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::storageversion::{StorageVersion, StorageVersionStatus};
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::storageversion::{
+use k3rs_common::resources::storageversion::{StorageVersion, StorageVersionStatus};
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::storageversion::{
     validate_storage_version, validate_storage_version_status_update,
     validate_storage_version_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

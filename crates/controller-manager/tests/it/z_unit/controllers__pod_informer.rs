@@ -3,10 +3,10 @@
 
 mod __parent {
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_controller_manager::controllers::controller_utils::is_pod_ready;
-    pub use rusternetes_controller_manager::controllers::job_tracking::has_job_tracking_finalizer;
-    pub use rusternetes_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_controller_manager::controllers::controller_utils::is_pod_ready;
+    pub use k3rs_controller_manager::controllers::job_tracking::has_job_tracking_finalizer;
+    pub use k3rs_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
     pub use std::collections::hash_map::DefaultHasher;
     pub use std::collections::HashMap;
     pub use std::future::Future;
@@ -20,7 +20,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::pod_informer::*;
+    use k3rs_controller_manager::controllers::pod_informer::*;
     use serde_json::json;
 
     fn pod_json_with(
@@ -495,7 +495,7 @@ mod tests {
     /// vanished across a re-list as a delete for both.
     #[tokio::test]
     async fn every_target_sees_the_same_add_update_and_relist_delete() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let informer = Arc::new(SharedPodInformer::new(
             storage.clone(),
@@ -547,7 +547,7 @@ mod tests {
     /// (`AddEventHandlerWithOptions`), so it does not miss a creation.
     #[tokio::test]
     async fn a_late_handler_is_replayed_the_held_pods() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let informer = Arc::new(SharedPodInformer::new(
             Arc::new(MemoryStorage::new()),
             Duration::from_millis(10),
@@ -604,7 +604,7 @@ mod tests {
     /// in flight is delivered to the new handler afterwards, never lost.
     #[tokio::test]
     async fn an_event_during_a_late_handlers_replay_is_not_lost() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
         let informer = Arc::new(SharedPodInformer::new(
             Arc::new(MemoryStorage::new()),
             Duration::from_millis(10),

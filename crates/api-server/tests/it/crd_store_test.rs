@@ -8,7 +8,7 @@
 //! and the validation in `pkg/apis/apiextensions/validation/validation.go`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";

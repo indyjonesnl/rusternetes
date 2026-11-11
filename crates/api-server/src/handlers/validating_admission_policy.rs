@@ -19,13 +19,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::{ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding},
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use k3rs_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -67,7 +67,7 @@ macro_rules! store_crud_handlers {
                 std::collections::HashMap<String, String>,
             >,
             body: axum::body::Bytes,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::create_resource(
                 &state,
@@ -91,7 +91,7 @@ macro_rules! store_crud_handlers {
             axum::extract::Query(params): axum::extract::Query<
                 std::collections::HashMap<String, String>,
             >,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::get_resource(
                 &state,
@@ -116,7 +116,7 @@ macro_rules! store_crud_handlers {
                 std::collections::HashMap<String, String>,
             >,
             body: axum::body::Bytes,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::update_resource(
                 &state,
@@ -143,7 +143,7 @@ macro_rules! store_crud_handlers {
             >,
             headers: axum::http::HeaderMap,
             body: axum::body::Bytes,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::patch_resource(
                 &state,
@@ -170,7 +170,7 @@ macro_rules! store_crud_handlers {
                 std::collections::HashMap<String, String>,
             >,
             body: axum::body::Bytes,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::delete_resource(
                 &state,
@@ -195,7 +195,7 @@ macro_rules! store_crud_handlers {
                 std::collections::HashMap<String, String>,
             >,
             body: axum::body::Bytes,
-        ) -> rusternetes_common::Result<axum::response::Response> {
+        ) -> k3rs_common::Result<axum::response::Response> {
             $( $gate()?; )?
             let out = $crate::endpoints::handlers::delete_collection(
                 &state,
@@ -290,7 +290,7 @@ pub async fn list_validating_admission_policies(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -442,7 +442,7 @@ pub async fn list_validating_admission_policy_bindings(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 

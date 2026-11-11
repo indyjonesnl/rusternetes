@@ -7,11 +7,9 @@
 //! `legacy_tokens_total` for a token without an audience).
 
 use base64::Engine;
-use rusternetes_common::auth::{ServiceAccountClaims, LEGACY_ISSUER};
-use rusternetes_middleware::{
-    serviceaccount_metrics, validate_service_account_token, AuthObservations,
-};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::auth::{ServiceAccountClaims, LEGACY_ISSUER};
+use k3rs_middleware::{serviceaccount_metrics, validate_service_account_token, AuthObservations};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::{json, Value};
 
 const INVALID_SINCE: &str = "kubernetes.io/legacy-token-invalid-since";

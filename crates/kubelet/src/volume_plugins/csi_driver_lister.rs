@@ -9,8 +9,8 @@
 //! methods that use it (`RequiresRemount`, `SupportsSELinuxContextMount`) are
 //! synchronous, as upstream's are, so the store is read under a std lock.
 
-use rusternetes_common::resources::CSIDriver;
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+use k3rs_common::resources::CSIDriver;
+use k3rs_storage::{build_prefix, Storage, WatchEvent};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};

@@ -7,7 +7,7 @@
 //! `todo!("Support structs!")` in `objects.rs` when executing, which would take
 //! down the admission path.
 
-use rusternetes_common::cel::{CELContext, CELEvaluator};
+use k3rs_common::cel::{CELContext, CELEvaluator};
 use serde_json::{json, Value};
 
 fn eval(expr: &str) -> anyhow::Result<Value> {
@@ -128,7 +128,7 @@ fn rejected_initializers_are_errors_not_panics() {
 /// rejected by evaluation.
 #[test]
 fn validation_and_evaluation_compose() {
-    use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+    use k3rs_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
     let env = MutationEnv {
         has_params: false,
         has_authorizer: true,
@@ -196,7 +196,7 @@ fn object_is_not_equal_to_a_plain_map() {
 /// (json_patch.go:162-173) and ApplyConfiguration root (smd.go:99-102).
 #[test]
 fn type_names_are_checked_on_the_evaluated_result() {
-    use rusternetes_common::cel_struct::{compile, execute_checked, new_context_for, TypeCheck};
+    use k3rs_common::cel_struct::{compile, execute_checked, new_context_for, TypeCheck};
     let run = |src: &str, mode| {
         let c = compile(src).unwrap();
         execute_checked(&c, &new_context_for(&c), mode)
@@ -295,7 +295,7 @@ fn struct_values_keep_their_type_when_bound_into_another_evaluation() {
 /// `StructCreateBaseCost` (`interpreter/runtimecost.go` `InterpretableConstructor`).
 #[test]
 fn struct_construction_is_costed() {
-    use rusternetes_common::cel_cost::{CostOptions, STRUCT_CREATE_BASE_COST};
+    use k3rs_common::cel_cost::{CostOptions, STRUCT_CREATE_BASE_COST};
     let mut ev = CELEvaluator::new();
     let ctx = CELContext::for_admission(&json!({"spec": {"replicas": 2}}), None, None).unwrap();
     let mut cost = |expr: &str| {

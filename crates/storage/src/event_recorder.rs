@@ -27,12 +27,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rusternetes_common::event_correlator::{
+use k3rs_common::event_correlator::{
     CorrelatorEvent, CorrelatorEventSource, CorrelatorEventType, CorrelatorObjectReference,
     EventCorrelator, RealClock,
 };
-use rusternetes_common::resources::{Event, EventSeries, EventSource, EventType, ObjectReference};
-use rusternetes_common::Result;
+use k3rs_common::resources::{Event, EventSeries, EventSource, EventType, ObjectReference};
+use k3rs_common::Result;
 
 use crate::Storage;
 

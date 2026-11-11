@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::flow_control_object_count::ObjectCountTracker;
-    pub use rusternetes_api_server::flow_control_work_estimator::Stats;
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_api_server::flow_control_object_count::ObjectCountTracker;
+    pub use k3rs_api_server::flow_control_work_estimator::Stats;
+    pub use k3rs_storage::Storage;
     pub use std::sync::Arc;
     pub use std::time::Duration;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::flow_control_stats_poller::*;
-    use rusternetes_api_server::flow_control_work_estimator::StatsError;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::flow_control_stats_poller::*;
+    use k3rs_api_server::flow_control_work_estimator::StatsError;
+    use k3rs_storage::memory::MemoryStorage;
 
     async fn seed(s: &MemoryStorage, key: &str) {
         let v = serde_json::json!({"metadata": {"name": "x"}});

@@ -5,16 +5,16 @@ mod __parent {
     pub use chrono::{DateTime, Utc};
     pub use futures::StreamExt;
     pub use ipnet::IpNet;
-    pub use rusternetes_api_server::registry::core::service::ipallocator::{
+    pub use k3rs_api_server::registry::core::service::ipallocator::{
         family_of, ip_address_key, new_ip_address, prefix_contains_ip, IpAddressClient,
         CONTROLLER_NAME, IP_ADDRESS_PREFIX, LABEL_IP_ADDRESS_FAMILY, LABEL_MANAGED_BY,
     };
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         EventSource, EventType, IPAddress, ObjectReference, Service, ServiceCIDR,
     };
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::workqueue::{extract_key, WorkQueue};
-    pub use rusternetes_storage::{build_key, EventRecorder, Storage};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::workqueue::{extract_key, WorkQueue};
+    pub use k3rs_storage::{build_key, EventRecorder, Storage};
     pub use std::net::IpAddr;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -25,9 +25,9 @@ mod tests {
     //! Ports of controller/repairip_test.go.
     use super::__parent::*;
     use chrono::TimeZone;
-    use rusternetes_api_server::registry::core::service::ipallocator::repair::*;
-    use rusternetes_common::resources::Event;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::registry::core::service::ipallocator::repair::*;
+    use k3rs_common::resources::Event;
+    use k3rs_storage::MemoryStorage;
     use serde_json::json;
 
     /// `fake.NewSimpleClientset()` with the create/delete reactors of

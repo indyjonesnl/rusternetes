@@ -14,9 +14,9 @@
 //! by stuffing a real VAP + binding into MemoryStorage and invoking
 //! `AdmissionWebhookManager::run_validating_admission_policies_ext`.
 
-use rusternetes_api_server::admission_webhook::AdmissionWebhookManager;
-use rusternetes_common::admission::{GroupVersionKind, Operation};
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_api_server::admission_webhook::AdmissionWebhookManager;
+use k3rs_common::admission::{GroupVersionKind, Operation};
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use serde_json::json;
 use std::sync::Arc;
 

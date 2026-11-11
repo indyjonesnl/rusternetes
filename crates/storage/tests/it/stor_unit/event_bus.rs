@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{WatchEvent, WatchStream};
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{WatchEvent, WatchStream};
     pub use tokio::sync::broadcast;
 }
 
 mod tests {
     use super::__parent::*;
     use futures::StreamExt;
-    use rusternetes_storage::event_bus::*;
-    use rusternetes_storage::WatchEvent;
+    use k3rs_storage::event_bus::*;
+    use k3rs_storage::WatchEvent;
 
     #[tokio::test]
     async fn delivers_and_filters_by_prefix() {

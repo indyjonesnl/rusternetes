@@ -7,16 +7,16 @@
 //! mutating chain first with `admission.Create` on the `Binding`.
 
 use axum::http::StatusCode;
-use rusternetes_common::{
+use k3rs_common::{
     admission::{AdmissionReview, AdmissionReviewResponse},
     resources::{
         FailurePolicy, OperationType, Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook,
         ValidatingWebhookConfiguration, WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
+use k3rs_test_support::mock_http::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -48,7 +48,7 @@ async fn install_webhook(api: &TestApiServer, url: String) {
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "ValidatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("deny-binding"),
+        metadata: k3rs_common::types::ObjectMeta::new("deny-binding"),
         webhooks: Some(vec![ValidatingWebhook {
             name: "deny.binding.io".into(),
             client_config: WebhookClientConfig {

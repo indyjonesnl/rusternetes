@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_api_server::registry::rbac::reconciliation::AUTOUPDATE_ANNOTATION;
-    pub use rusternetes_api_server::registry::rbac::reconciliation::{
+    pub use k3rs_api_server::registry::rbac::reconciliation::AUTOUPDATE_ANNOTATION;
+    pub use k3rs_api_server::registry::rbac::reconciliation::{
         compute_reconciled_role, compute_reconciled_role_binding, ReconcileOperation,
     };
-    pub use rusternetes_common::resources::{EndpointSlice, Endpoints};
-    pub use rusternetes_storage::Storage;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::resources::{EndpointSlice, Endpoints};
+    pub use k3rs_storage::Storage;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tracing::{info, warn};
@@ -17,9 +17,9 @@ mod __parent {
 
 mod system_priority_class_tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_common::resources::PriorityClass;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_common::resources::PriorityClass;
+    use k3rs_storage::memory::MemoryStorage;
 
     /// `AddSystemPriorityClasses` seeds `SystemPriorityClasses()`.
     #[tokio::test]
@@ -105,9 +105,9 @@ mod system_priority_class_tests {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_common::resources::rbac::{ClusterRole, ClusterRoleBinding};
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_common::resources::rbac::{ClusterRole, ClusterRoleBinding};
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn creates_endpoints_and_slice_when_missing() {
@@ -143,7 +143,7 @@ mod tests {
         bootstrap_system_namespaces(storage.as_ref()).await.unwrap();
         bootstrap_system_namespaces(storage.as_ref()).await.unwrap();
         for ns in ["default", "kube-system", "kube-public"] {
-            let key = rusternetes_storage::build_key("namespaces", None, ns);
+            let key = k3rs_storage::build_key("namespaces", None, ns);
             let got: serde_json::Value = storage.get(&key).await.unwrap();
             assert_eq!(got["status"]["phase"], "Active", "{ns}");
         }
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cluster_roles_with_feature_gates_enabled_match_upstream_testdata() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let _g: Vec<_> = [
             Feature::ClusterTrustBundle,
             Feature::PodCertificateRequest,
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cluster_roles_with_default_gates_match_upstream_testdata() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let mut got: Vec<_> = bootstrap_policy_items()
             .unwrap()
             .into_iter()
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cluster_trust_bundle_discovery_binding_follows_the_gate() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let has = || {
             bootstrap_policy_items().unwrap().iter().any(|i| {
                 i["kind"] == "ClusterRoleBinding"
@@ -380,9 +380,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn device_taint_eviction_controller_role_follows_dra_gates() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         const R: &str = "device-taint-eviction-controller";
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         assert_no_controller_role(R);
         let _a = with_feature(Feature::DRADeviceTaints, true);
         let mut rules = vec![
@@ -405,8 +405,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn certificate_controller_roles_follow_their_gates() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
-        rusternetes_common::feature_gates::reset_to_defaults();
+        use k3rs_common::feature_gates::{with_feature, Feature};
+        k3rs_common::feature_gates::reset_to_defaults();
         assert_no_controller_role("podcertificaterequestcleaner");
         assert_no_controller_role("kube-apiserver-serving-clustertrustbundle-publisher");
         let _a = with_feature(Feature::PodCertificateRequest, true);
@@ -433,9 +433,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn storage_version_gc_role_needs_both_gates() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         const R: &str = "storage-version-garbage-collector";
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         assert_no_controller_role(R);
         {
             let _a = with_feature(Feature::StorageVersionAPI, true);
@@ -457,9 +457,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn storage_version_migrator_role_follows_the_gate() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         const R: &str = "storage-version-migrator-controller";
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         assert_no_controller_role(R);
         let _a = with_feature(Feature::StorageVersionMigrator, true);
         assert_controller_role(
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_on_controller_roles_are_present() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         for r in [
             "resource-claim-controller",
             "service-cidrs-controller",
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn controller_roles_with_default_gates_match_upstream_testdata() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         for (kind, yaml) in [
             (
                 "ClusterRole",
@@ -619,10 +619,12 @@ mod tests {
         let admin: ClusterRole = storage.get("/registry/clusterroles/admin").await.unwrap();
         assert!(admin.aggregation_rule.is_some());
         assert!(admin.rules.is_empty(), "seeded without rules");
-        rusternetes_controller_core::clusterrole_aggregation::ClusterRoleAggregationController::new(storage.clone())
-            .sync_all()
-            .await
-            .unwrap();
+        k3rs_controller_core::clusterrole_aggregation::ClusterRoleAggregationController::new(
+            storage.clone(),
+        )
+        .sync_all()
+        .await
+        .unwrap();
         for name in ["admin", "edit", "view"] {
             let role: ClusterRole = storage
                 .get(&format!("/registry/clusterroles/{name}"))
@@ -639,10 +641,10 @@ mod tests {
     /// address (`cp.ServiceIPRange`, options.go:378-382) and its family.
     #[tokio::test]
     async fn kubernetes_service_follows_an_ipv6_primary_range() {
-        use rusternetes_common::resources::service::IPFamily;
+        use k3rs_common::resources::service::IPFamily;
 
         let storage = MemoryStorage::new();
-        let ip = rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
+        let ip = k3rs_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
             "fd00:10:96::/112",
         )
         .unwrap()
@@ -650,7 +652,7 @@ mod tests {
         reconcile_kubernetes_service(&storage, 6443, ip)
             .await
             .unwrap();
-        let svc: rusternetes_common::resources::Service =
+        let svc: k3rs_common::resources::Service =
             storage.get(SERVICE_KEY).await.expect("kubernetes Service");
         assert_eq!(svc.spec.cluster_ip.as_deref(), Some("fd00:10:96::1"));
         assert_eq!(
@@ -686,7 +688,7 @@ mod tests {
             .await
             .unwrap();
 
-        let svc: rusternetes_common::resources::Service =
+        let svc: k3rs_common::resources::Service =
             storage.get(SERVICE_KEY).await.expect("kubernetes Service");
         assert_eq!(svc.spec.cluster_ip.as_deref(), Some(KUBERNETES_SERVICE_IP));
         let ports = &svc.spec.ports;
@@ -695,7 +697,7 @@ mod tests {
             ports[0].target_port.as_ref().map(|t| format!("{t:?}")),
             Some(format!(
                 "{:?}",
-                rusternetes_common::resources::policy::IntOrString::Int(6443)
+                k3rs_common::resources::policy::IntOrString::Int(6443)
             ))
         );
         let labels = svc.metadata.labels.as_ref().expect("labels");
@@ -725,13 +727,13 @@ mod tests {
     /// had none of them and did not.
     #[tokio::test]
     async fn kubernetes_service_carries_the_ip_family_fields_kube_proxy_needs() {
-        use rusternetes_common::resources::service::{IPFamily, IPFamilyPolicy};
+        use k3rs_common::resources::service::{IPFamily, IPFamilyPolicy};
 
         let storage = MemoryStorage::new();
         reconcile_kubernetes_service(&storage, 6443, test_service_ip())
             .await
             .unwrap();
-        let svc: rusternetes_common::resources::Service =
+        let svc: k3rs_common::resources::Service =
             storage.get(SERVICE_KEY).await.expect("kubernetes Service");
 
         assert_eq!(
@@ -765,12 +767,11 @@ mod tests {
         reconcile_kubernetes_service(&storage, 6443, test_service_ip())
             .await
             .unwrap();
-        let first: rusternetes_common::resources::Service = storage.get(SERVICE_KEY).await.unwrap();
+        let first: k3rs_common::resources::Service = storage.get(SERVICE_KEY).await.unwrap();
         reconcile_kubernetes_service(&storage, 6443, test_service_ip())
             .await
             .unwrap();
-        let second: rusternetes_common::resources::Service =
-            storage.get(SERVICE_KEY).await.unwrap();
+        let second: k3rs_common::resources::Service = storage.get(SERVICE_KEY).await.unwrap();
         assert_eq!(first.metadata.uid, second.metadata.uid, "must not recreate");
         assert_eq!(
             second.spec.cluster_ip.as_deref(),
@@ -789,7 +790,7 @@ mod tests {
         reconcile_kubernetes_service(&storage, 6443, test_service_ip())
             .await
             .unwrap();
-        let svc: rusternetes_common::resources::Service = storage
+        let svc: k3rs_common::resources::Service = storage
             .get(SERVICE_KEY)
             .await
             .expect("Service must be recreated after deletion");
@@ -822,7 +823,7 @@ mod tests {
         // An endpoint stuck with no subsets — the failure mode the old one-shot
         // bootstrap could not repair (its update path only touched an existing
         // first address).
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
         let mut metadata = ObjectMeta::new("kubernetes");
         metadata.namespace = Some("default".to_string());
         let broken = Endpoints {
@@ -854,7 +855,7 @@ mod tests {
 
     // --- default ServiceCIDR controller -----------------------------------
 
-    use rusternetes_common::resources::{ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus};
+    use k3rs_common::resources::{ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus};
 
     fn default_cidrs() -> Vec<String> {
         DEFAULT_SERVICE_CIDRS
@@ -864,7 +865,7 @@ mod tests {
     }
 
     fn sc_key() -> String {
-        rusternetes_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
+        k3rs_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
     }
 
     fn controller(
@@ -1013,8 +1014,8 @@ mod tests {
 
 mod post_start_hook_registration_tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_api_server::post_start_hooks::global;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_api_server::post_start_hooks::global;
 
     async fn finished(name: &str) -> bool {
         for _ in 0..200 {
@@ -1035,15 +1036,15 @@ mod post_start_hook_registration_tests {
         spawn_endpoint_reconciler(
             storage.clone(),
             6443,
-            rusternetes_api_server::bootstrap::test_service_ip(),
+            k3rs_api_server::bootstrap::test_service_ip(),
             AdvertiseAddress::default(),
         );
         spawn_apiservice_availability_controller(storage.clone());
-        rusternetes_api_server::registry::apiextensions::customresourcedefinition::start_controllers(
+        k3rs_api_server::registry::apiextensions::customresourcedefinition::start_controllers(
             storage.clone(),
             Default::default(),
         );
-        rusternetes_api_server::registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
+        k3rs_api_server::registry::apiextensions::customresourcedefinition::spawn_crd_informer_synced_hook(
             storage.clone(),
         );
         spawn_cluster_authentication_trust_controller(
@@ -1107,12 +1108,12 @@ mod post_start_hook_registration_tests {
 /// exactly the missing system namespaces and leaves existing ones alone.
 mod system_namespaces_tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_common::resources::Namespace;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_common::resources::Namespace;
 
     async fn seed(storage: &StorageBackend, ns: &str) -> String {
         create_namespace_if_needed(storage, ns).await.unwrap();
-        let key = rusternetes_storage::build_key("namespaces", None, ns);
+        let key = k3rs_storage::build_key("namespaces", None, ns);
         storage
             .get::<Namespace>(&key)
             .await
@@ -1147,7 +1148,7 @@ mod system_namespaces_tests {
             let errs = sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
             assert!(errs.is_empty(), "{errs:?}");
             for ns in SYSTEM_NAMESPACES {
-                let key = rusternetes_storage::build_key("namespaces", None, ns);
+                let key = k3rs_storage::build_key("namespaces", None, ns);
                 let got: Namespace = storage.get(&key).await.unwrap();
                 assert_eq!(got.metadata.name, ns);
             }
@@ -1161,7 +1162,7 @@ mod system_namespaces_tests {
         let before = seed(&storage, "kube-system").await;
         sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
         sync_system_namespaces(&storage, &SYSTEM_NAMESPACES).await;
-        let key = rusternetes_storage::build_key("namespaces", None, "kube-system");
+        let key = k3rs_storage::build_key("namespaces", None, "kube-system");
         let got: Namespace = storage.get(&key).await.unwrap();
         assert_eq!(got.metadata.uid, before);
     }
@@ -1172,8 +1173,8 @@ mod system_namespaces_tests {
 /// `TestMemberOf`) plus `ResolveBindAddress` / `AdvertiseAddress` semantics.
 mod advertise_address_tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_storage::memory::MemoryStorage;
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
@@ -1319,8 +1320,8 @@ mod advertise_address_tests {
 /// non-nil, i.e. `--requestheader-client-ca-file` is set.
 mod cluster_authentication_info_tests {
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_api_server::request_header_authentication::RequestHeaderAuthenticationArgs;
 
     const CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
     const FRONT_PROXY_PEM: &str = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
@@ -1387,9 +1388,9 @@ mod bootstrap_policy_tests {
     //! ported in `bootstrap.rs` (`*_match_upstream_testdata`).
 
     use super::__parent::*;
-    use rusternetes_api_server::bootstrap::*;
-    use rusternetes_api_server::registry::rbac::policy_comparator::covers;
-    use rusternetes_common::resources::PolicyRule;
+    use k3rs_api_server::bootstrap::*;
+    use k3rs_api_server::registry::rbac::policy_comparator::covers;
+    use k3rs_common::resources::PolicyRule;
 
     /// `ClusterRoles()`: every ClusterRole except `system:controller:*`
     /// (`ControllerRoles()`).
@@ -1434,7 +1435,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn view_role_has_no_escalating_or_ungettable_powers() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let roles = cluster_roles();
         let view = roles
             .iter()
@@ -1473,7 +1474,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn cluster_roles_and_bindings_carry_the_bootstrapping_label() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         for role in cluster_roles() {
             assert_eq!(
                 role["metadata"]["labels"]["kubernetes.io/bootstrapping"], "rbac-defaults",
@@ -1505,7 +1506,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn node_rules_list_implies_watch() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let roles = cluster_roles();
         let node = roles
             .iter()
@@ -1518,7 +1519,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn cluster_role_rules_list_implies_watch() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         for role in cluster_roles() {
             assert!(
                 !list_without_watch(&rules_of(&role)),
@@ -1532,7 +1533,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn namespace_role_rules_list_implies_watch() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let roles: Vec<_> = bootstrap_policy_items()
             .unwrap()
             .into_iter()
@@ -1563,7 +1564,7 @@ mod bootstrap_policy_tests {
     #[test]
     #[serial_test::serial]
     fn bindings_and_namespace_objects_match_upstream_testdata() {
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let is_controller = |i: &serde_json::Value| {
             i["metadata"]["name"]
                 .as_str()

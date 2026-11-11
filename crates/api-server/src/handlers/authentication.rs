@@ -4,8 +4,8 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
-use rusternetes_common::{
+use k3rs_common::dump::DumpingJson;
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     resources::{
         SelfSubjectReview, SelfSubjectReviewStatus, TokenRequest, TokenRequestStatus, TokenReview,
@@ -13,7 +13,7 @@ use rusternetes_common::{
     },
     Result,
 };
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -41,14 +41,14 @@ pub async fn create_token_review(
         .with_api_group("authentication.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // A TokenReview with no token is a 400 from the registry, not a 422 from a
     // validator: `TokenREST.Create` checks it before touching the
     // authenticator (`pkg/registry/authentication/tokenreview/storage.go:79-81`).
     if token_review.spec.token.is_empty() {
-        return Err(rusternetes_common::Error::BadRequest(
+        return Err(k3rs_common::Error::BadRequest(
             "token is required for TokenReview in authentication".to_string(),
         ));
     }
@@ -60,7 +60,7 @@ pub async fn create_token_review(
     // JWT authenticator verifies signature + issuer + audience and the
     // validator checks the bound objects (jwt.go:334-411, claims.go:144-263).
     let requested_audiences = token_review.spec.audiences.clone().unwrap_or_default();
-    let mut observations = rusternetes_middleware::AuthObservations::default();
+    let mut observations = k3rs_middleware::AuthObservations::default();
     // jwt.go:383-387 observes a legacy token before the audience check, so
     // one rejected for its audience is still annotated and counted.
     let authenticated = state.token_manager.authenticate_token_observed(
@@ -70,7 +70,7 @@ pub async fn create_token_review(
     );
     let authn = match authenticated {
         Ok((claims, matched)) => {
-            match rusternetes_middleware::validate_service_account_token(
+            match k3rs_middleware::validate_service_account_token(
                 &state.storage,
                 &token_review.spec.token,
                 &claims,
@@ -101,8 +101,7 @@ pub async fn create_token_review(
                     let mut extra = std::collections::HashMap::new();
                     // `ServiceAccountInfo.UserInfo` (util.go:147-151): only when the
                     // token carries a `jti` (claims.go:279-290).
-                    let credential_id =
-                        rusternetes_common::auth::credential_id_for_jti(&claims.jti);
+                    let credential_id = k3rs_common::auth::credential_id_for_jti(&claims.jti);
                     if !credential_id.is_empty() {
                         extra.insert(
                             "authentication.kubernetes.io/credential-id".to_string(),
@@ -191,7 +190,7 @@ pub async fn create_token_request(
             body.len(),
             e
         );
-        rusternetes_common::Error::InvalidResource(format!("failed to decode: {}", e))
+        k3rs_common::Error::InvalidResource(format!("failed to decode: {}", e))
     })?;
     // create.go:161: `audit.LogRequestObject`, once the body is decoded; the
     // TokenRequest is the `serviceaccounts/token` subresource's object.
@@ -209,7 +208,7 @@ pub async fn create_token_request(
         .with_name(&service_account_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Set metadata from path params so response includes them
@@ -218,8 +217,8 @@ pub async fn create_token_request(
 
     // Verify the service account exists
     let sa_key =
-        rusternetes_storage::build_key("serviceaccounts", Some(&namespace), &service_account_name);
-    let sa: rusternetes_common::resources::ServiceAccount = state.storage.get(&sa_key).await?;
+        k3rs_storage::build_key("serviceaccounts", Some(&namespace), &service_account_name);
+    let sa: k3rs_common::resources::ServiceAccount = state.storage.get(&sa_key).await?;
 
     // Calculate expiration time
     let expiration_seconds = token_request.spec.expiration_seconds.unwrap_or(3600);
@@ -227,26 +226,24 @@ pub async fn create_token_request(
     // TokenRequest.spec.expirationSeconds bounds (upstream ValidateTokenRequest):
     // >= 10 minutes and <= 2^32 seconds.
     if expiration_seconds < 600 {
-        return Err(rusternetes_common::Error::new_invalid(
+        return Err(k3rs_common::Error::new_invalid(
             "authentication.k8s.io",
             "TokenRequest",
             "",
-            vec![rusternetes_common::validation::field::Error::invalid(
-                &rusternetes_common::validation::field::Path::new("spec")
-                    .child("expirationSeconds"),
+            vec![k3rs_common::validation::field::Error::invalid(
+                &k3rs_common::validation::field::Path::new("spec").child("expirationSeconds"),
                 expiration_seconds,
                 "may not specify a duration less than 10 minutes",
             )],
         ));
     }
     if expiration_seconds > (1_i64 << 32) {
-        return Err(rusternetes_common::Error::new_invalid(
+        return Err(k3rs_common::Error::new_invalid(
             "authentication.k8s.io",
             "TokenRequest",
             "",
-            vec![rusternetes_common::validation::field::Error::invalid(
-                &rusternetes_common::validation::field::Path::new("spec")
-                    .child("expirationSeconds"),
+            vec![k3rs_common::validation::field::Error::invalid(
+                &k3rs_common::validation::field::Path::new("spec").child("expirationSeconds"),
                 expiration_seconds,
                 "may not specify a duration larger than 2^32 seconds",
             )],
@@ -263,16 +260,16 @@ pub async fn create_token_request(
             &namespace,
             &service_account_name,
             &token_request,
-            rusternetes_common::feature_gates::enabled(
-                rusternetes_common::feature_gates::Feature::ServiceAccountNodeAudienceRestriction,
+            k3rs_common::feature_gates::enabled(
+                k3rs_common::feature_gates::Feature::ServiceAccountNodeAudienceRestriction,
             ),
         )
         .await
         .map_err(|e| match e {
             // `admission.NewForbidden(a, err)` (attributes.go): `<resource> "<name>" is forbidden: <err>`.
-            rusternetes_common::Error::Forbidden(m) => rusternetes_common::Error::Forbidden(
-                format!("serviceaccounts \"{service_account_name}\" is forbidden: {m}"),
-            ),
+            k3rs_common::Error::Forbidden(m) => k3rs_common::Error::Forbidden(format!(
+                "serviceaccounts \"{service_account_name}\" is forbidden: {m}"
+            )),
             other => other,
         })?;
     }
@@ -287,11 +284,11 @@ pub async fn create_token_request(
     let expiration_timestamp = now
         .checked_add_signed(chrono::Duration::seconds(expiration_seconds))
         .ok_or_else(|| {
-            rusternetes_common::Error::Internal("Failed to calculate expiration time".to_string())
+            k3rs_common::Error::Internal("Failed to calculate expiration time".to_string())
         })?;
 
     // Generate a proper JWT service account token using direct seconds for precision
-    let mut claims = rusternetes_common::auth::ServiceAccountClaims {
+    let mut claims = k3rs_common::auth::ServiceAccountClaims {
         sub: format!(
             "system:serviceaccount:{}:{}",
             namespace, service_account_name
@@ -301,10 +298,10 @@ pub async fn create_token_request(
         iat: now.timestamp(),
         exp: expiration_timestamp.timestamp(),
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-        aud: vec!["rusternetes".to_string()],
-        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+        aud: vec!["k3rs".to_string()],
+        kubernetes: Some(k3rs_common::auth::KubernetesClaims {
             namespace: namespace.clone(),
-            svcacct: rusternetes_common::auth::KubeRef {
+            svcacct: k3rs_common::auth::KubeRef {
                 name: service_account_name.clone(),
                 uid: sa.metadata.uid.clone(),
             },
@@ -344,15 +341,15 @@ pub async fn create_token_request(
         let uid: String;
         match (core_group, kind.as_str()) {
             (true, "Pod") => {
-                let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), &ref_name);
-                let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+                let pod_key = k3rs_storage::build_key("pods", Some(&namespace), &ref_name);
+                let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
                 let pod_sa = pod
                     .spec
                     .as_ref()
                     .and_then(|s| s.service_account_name.clone())
                     .unwrap_or_else(|| "default".to_string());
                 if pod_sa != service_account_name {
-                    return Err(rusternetes_common::Error::BadRequest(format!(
+                    return Err(k3rs_common::Error::BadRequest(format!(
                         "cannot bind token for serviceaccount {:?} to pod running with different serviceaccount name.",
                         service_account_name
                     )));
@@ -363,11 +360,10 @@ pub async fn create_token_request(
                 let mut node_ref = None;
                 if let Some(node_name) = pod.spec.as_ref().and_then(|s| s.node_name.clone()) {
                     // A missing Node still records its name (token.go:196-202).
-                    let node_key =
-                        rusternetes_storage::build_key("nodes", None::<&str>, &node_name);
+                    let node_key = k3rs_storage::build_key("nodes", None::<&str>, &node_name);
                     let node_uid = state
                         .storage
-                        .get::<rusternetes_common::resources::Node>(&node_key)
+                        .get::<k3rs_common::resources::Node>(&node_key)
                         .await
                         .map(|n| n.metadata.uid)
                         .unwrap_or_default();
@@ -375,13 +371,13 @@ pub async fn create_token_request(
                     if !node_uid.is_empty() {
                         claims.node_uid = Some(node_uid.clone());
                     }
-                    node_ref = Some(rusternetes_common::auth::KubeRef {
+                    node_ref = Some(k3rs_common::auth::KubeRef {
                         name: node_name,
                         uid: node_uid,
                     });
                 }
                 if let Some(k) = claims.kubernetes.as_mut() {
-                    k.pod = Some(rusternetes_common::auth::KubeRef {
+                    k.pod = Some(k3rs_common::auth::KubeRef {
                         name: ref_name.clone(),
                         uid: uid.clone(),
                     });
@@ -389,39 +385,38 @@ pub async fn create_token_request(
                 }
             }
             (true, "Node") => {
-                let node_key = rusternetes_storage::build_key("nodes", None::<&str>, &ref_name);
-                let node: rusternetes_common::resources::Node =
-                    state.storage.get(&node_key).await?;
+                let node_key = k3rs_storage::build_key("nodes", None::<&str>, &ref_name);
+                let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
                 uid = node.metadata.uid.clone();
                 claims.node_name = Some(ref_name.clone());
                 claims.node_uid = Some(uid.clone());
                 if let Some(k) = claims.kubernetes.as_mut() {
-                    k.node = Some(rusternetes_common::auth::KubeRef {
+                    k.node = Some(k3rs_common::auth::KubeRef {
                         name: ref_name.clone(),
                         uid: uid.clone(),
                     });
                 }
             }
             (true, "Secret") => {
-                let key = rusternetes_storage::build_key("secrets", Some(&namespace), &ref_name);
-                let secret: rusternetes_common::resources::Secret = state.storage.get(&key).await?;
+                let key = k3rs_storage::build_key("secrets", Some(&namespace), &ref_name);
+                let secret: k3rs_common::resources::Secret = state.storage.get(&key).await?;
                 uid = secret.metadata.uid.clone();
                 if let Some(k) = claims.kubernetes.as_mut() {
-                    k.secret = Some(rusternetes_common::auth::KubeRef {
+                    k.secret = Some(k3rs_common::auth::KubeRef {
                         name: ref_name.clone(),
                         uid: uid.clone(),
                     });
                 }
             }
             _ => {
-                return Err(rusternetes_common::Error::BadRequest(format!(
+                return Err(k3rs_common::Error::BadRequest(format!(
                     "cannot bind token to object of type {}, Kind={}",
                     api_version, kind
                 )));
             }
         }
         if !ref_uid.is_empty() && uid != ref_uid {
-            return Err(rusternetes_common::Error::Conflict(format!(
+            return Err(k3rs_common::Error::Conflict(format!(
                 "the UID in the bound object reference ({}) does not match the UID in record. The object might have been deleted and then recreated",
                 ref_uid
             )));
@@ -441,9 +436,7 @@ pub async fn create_token_request(
         let ext = now
             .checked_add_signed(chrono::Duration::seconds(exp_seconds))
             .ok_or_else(|| {
-                rusternetes_common::Error::Internal(
-                    "Failed to calculate expiration time".to_string(),
-                )
+                k3rs_common::Error::Internal("Failed to calculate expiration time".to_string())
             })?;
         claims.exp = ext.timestamp();
         if let Some(k) = claims.kubernetes.as_mut() {
@@ -457,8 +450,8 @@ pub async fn create_token_request(
     // token.go:254-256: audit the identifier of the credential just issued.
     if !claims.jti.is_empty() {
         crate::audit::add_audit_annotation(
-            rusternetes_common::auth::ISSUED_CREDENTIAL_ID_AUDIT_ANNOTATION_KEY,
-            &rusternetes_common::auth::credential_id_for_jti(&claims.jti),
+            k3rs_common::auth::ISSUED_CREDENTIAL_ID_AUDIT_ANNOTATION_KEY,
+            &k3rs_common::auth::credential_id_for_jti(&claims.jti),
         );
     }
 
@@ -473,7 +466,7 @@ pub async fn create_token_request(
         token,
         // `TokenRequestStatus.expirationTimestamp` is a `metav1.Time` upstream,
         // so it goes on the wire as RFC3339 at second precision with a `Z`
-        // suffix. Rusternetes carries it as a `String` with no normalising
+        // suffix. k3rs carries it as a `String` with no normalising
         // serializer, so the format has to be chosen here — chrono's plain
         // `to_rfc3339()` would emit `…:00.123456789+00:00`.
         expiration_timestamp: expiration_timestamp
@@ -509,7 +502,7 @@ pub async fn create_self_subject_review(
         .with_api_group("authentication.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Return the current user's information
@@ -533,7 +526,7 @@ pub async fn create_self_subject_review(
 mod tests {
     use super::*;
     use crate::state::MockAuth;
-    use rusternetes_common::resources::TokenReviewSpec;
+    use k3rs_common::resources::TokenReviewSpec;
 
     #[tokio::test]
     async fn test_token_review_authenticated() {

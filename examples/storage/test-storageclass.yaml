@@ -2,10 +2,10 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: fast-storage
-provisioner: rusternetes.io/hostpath
+provisioner: k3rs.io/hostpath
 parameters:
   type: local
-  path: /tmp/rusternetes-storage
+  path: /tmp/k3rs-storage
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true

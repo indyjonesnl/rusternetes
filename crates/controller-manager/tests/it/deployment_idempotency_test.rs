@@ -12,11 +12,11 @@
 // full serialized object via serde_json::to_string and assert byte-equality
 // across reconcile invocations.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -328,7 +328,7 @@ async fn snapshot(storage: &Arc<MemoryStorage>, key: &str) -> String {
 /// Only the RS `.status` fields the deployment controller reads in
 /// `reconcileNewReplicaSet` / `reconcileOldReplicaSets` are updated.
 async fn simulate_kubelet_convergence(storage: &Arc<MemoryStorage>, namespace: &str) {
-    let rs_prefix = rusternetes_storage::build_prefix("replicasets", Some(namespace));
+    let rs_prefix = k3rs_storage::build_prefix("replicasets", Some(namespace));
     let all_rs: Vec<ReplicaSet> = storage.list(&rs_prefix).await.unwrap_or_default();
     for mut rs in all_rs {
         let target = rs.spec.replicas;

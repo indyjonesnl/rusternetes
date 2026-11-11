@@ -3,13 +3,13 @@
 //! `volumeAttachLimitExceededError`), and the kubelet's side of it
 //! (`kubelet.go:2126-2131`).
 
-use rusternetes_common::resources::Pod;
-use rusternetes_kubelet::podcertificate::PodManager;
-use rusternetes_kubelet::volume_manager::populator::PodStateProvider;
-use rusternetes_kubelet::volume_manager::{VolumeAttachLimitExceededError, VolumeManager};
-use rusternetes_kubelet::volume_plugins::csi::get_attachment_name;
-use rusternetes_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::Pod;
+use k3rs_kubelet::podcertificate::PodManager;
+use k3rs_kubelet::volume_manager::populator::PodStateProvider;
+use k3rs_kubelet::volume_manager::{VolumeAttachLimitExceededError, VolumeManager};
+use k3rs_kubelet::volume_plugins::csi::get_attachment_name;
+use k3rs_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -139,10 +139,10 @@ async fn started(attach_error_code: i32) -> (Arc<VolumeManager>, Pod, Arc<Instal
 
     let dir = tempfile::tempdir().unwrap();
     let mounter = Arc::new(
-        rusternetes_kubelet::volumes::VolumeManager::new(
+        k3rs_kubelet::volumes::VolumeManager::new(
             dir.path().display().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name(NODE),
     );
@@ -179,7 +179,7 @@ async fn exhausted_attachment_rejects_the_pod() {
         "Node has reached its volume attachment limit, rejecting pod. unmounted volumes=[\"data\"]"
     ));
     assert!(
-        !rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err),
+        !k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err),
         "a rejection, not a wait"
     );
 }
@@ -194,7 +194,7 @@ async fn other_attach_failure_is_a_volume_wait() {
         .await
         .unwrap_err();
     assert!(
-        rusternetes_kubelet::lifecycle::is_volume_wait_anyhow(&err),
+        k3rs_kubelet::lifecycle::is_volume_wait_anyhow(&err),
         "{err:#}"
     );
     assert!(

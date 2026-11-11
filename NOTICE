@@ -1,4 +1,9 @@
-Rusternetes
+k3rs
+
+k3rs is an independent open-source project. It is not affiliated with, endorsed by, or sponsored by k3s, SUSE, Rancher, or the CNCF. k3s is a trademark of its respective owners; the name k3rs only describes the goal of reimplementing k3s in Rust.
+
+k3rs derives from rusternetes by calfonso (https://github.com/calfonso/rusternetes),
+licensed under the Apache License 2.0. See LICENSE.
 
 This repository vendors test fixtures and OpenAPI specifications from
 Kubernetes (https://github.com/kubernetes/kubernetes), Copyright The

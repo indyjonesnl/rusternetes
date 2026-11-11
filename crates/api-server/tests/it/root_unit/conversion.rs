@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         CustomResource, CustomResourceDefinition, WebhookClientConfig,
     };
-    pub use rusternetes_common::Result;
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_common::Result;
+    pub use k3rs_storage::Storage;
     pub use serde::{Deserialize, Serialize};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -15,12 +15,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::conversion::*;
-    use rusternetes_common::resources::{
+    use k3rs_api_server::conversion::*;
+    use k3rs_common::resources::{
         ConversionStrategyType, CustomResourceConversion, CustomResourceDefinitionNames,
         CustomResourceDefinitionSpec, CustomResourceDefinitionVersion, ResourceScope,
     };
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_common::types::ObjectMeta;
 
     fn create_test_crd() -> CustomResourceDefinition {
         CustomResourceDefinition {
@@ -109,7 +109,7 @@ mod tests {
             extra: std::collections::HashMap::new(),
         };
 
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let result = convert_custom_resource(&crd, resource.clone(), "v1", &storage).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().api_version, resource.api_version);
@@ -120,7 +120,7 @@ mod tests {
         let client = ConversionWebhookClient::new();
         let config = WebhookClientConfig {
             url: None,
-            service: Some(rusternetes_common::resources::ServiceReference {
+            service: Some(k3rs_common::resources::ServiceReference {
                 namespace: "default".to_string(),
                 name: "converter".to_string(),
                 path: Some("/convert".to_string()),

@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::resources::{
         CSINode, CSINodeDriver, PersistentVolumeClaim, Pod, Volume, VolumeAttachment,
     };
-    pub use rusternetes_scheduler::queue::events::*;
+    pub use k3rs_scheduler::queue::events::*;
     pub use std::collections::HashMap;
     pub use tracing::debug;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::csi_hints::*;
+    use k3rs_scheduler::queue::csi_hints::*;
     use serde_json::{json, Value};
 
     fn pod(ns: &str, name: &str, node: &str, vols: Value) -> Pod {

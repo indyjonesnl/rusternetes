@@ -30,10 +30,10 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusternetes_common::lru_expire_cache::LruExpireCache;
-use rusternetes_common::resources::Pod;
-use rusternetes_common::wait::Backoff;
-use rusternetes_common::Error;
+use k3rs_common::lru_expire_cache::LruExpireCache;
+use k3rs_common::resources::Pod;
+use k3rs_common::wait::Backoff;
+use k3rs_common::Error;
 use serde::{Deserialize, Serialize};
 
 use super::builtin_plugins::{attr_name, new_forbidden};

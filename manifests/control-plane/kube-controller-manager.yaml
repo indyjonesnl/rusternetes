@@ -12,7 +12,7 @@
 # `hostPath` is resolved by the Docker daemon on the HOST and also
 # fs::metadata-checked inside the kubelet container, so the path must exist
 # identically on both. `@CERTS_PATH@` is a placeholder that bootstrap-cluster.sh
-# rewrites (sed) to the host-absolute path of `.rusternetes/certs`; the same
+# rewrites (sed) to the host-absolute path of `.k3rs/certs`; the same
 # host path is mounted at the same path inside the node-1 kubelet. The
 # committed manifest keeps the placeholder so it is not machine-specific.
 apiVersion: v1
@@ -39,7 +39,7 @@ spec:
   containers:
   - name: kube-controller-manager
     # @CONTROL_PLANE_IMAGE@ is templated by bootstrap-cluster.sh: the local
-    # build path leaves rusternetes-controller-manager:latest (imported into
+    # build path leaves k3rs-controller-manager:latest (imported into
     # containerd from the docker/podman daemon), the CI prebuilt path swaps in
     # the GHCR ref so the containerd CRI service pulls it directly. See
     # bootstrap-cluster.sh "control-plane image resolution".
@@ -48,7 +48,7 @@ spec:
     # API mode: every controller's Storage calls proxy to the api-server via
     # ApiStorage (no direct storage handle). The api-server runs with
     # --skip-auth, so the kubeconfig only needs the CA to validate the server's
-    # TLS cert. The static pod joins rusternetes-network, where `api-server`
+    # TLS cert. The static pod joins k3rs-network, where `api-server`
     # resolves to the api-server container (cert SANs include `api-server`).
     # Node IPAM (--allocate-node-cidrs etc.) is opt-in: bootstrap-cluster.sh
     # replaces the placeholder line at the end of args (the NODE_IPAM_ARGS token)

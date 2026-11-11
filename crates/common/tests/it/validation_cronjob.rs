@@ -1,14 +1,14 @@
 //! Tests for CronJob validation (port of upstream batch `ValidateCronJobCreate`).
 
-use rusternetes_common::resources::workloads::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
-use rusternetes_common::resources::PodTemplateSpec;
-use rusternetes_common::validation::cronjob::validate_cron_job_create as validate_cron_job;
+use k3rs_common::resources::workloads::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
+use k3rs_common::resources::PodTemplateSpec;
+use k3rs_common::validation::cronjob::validate_cron_job_create as validate_cron_job;
 
 fn job_template() -> JobTemplateSpec {
     let mut t = PodTemplateSpec::default();
     t.spec.restart_policy = Some("OnFailure".to_string());
     // The jobTemplate's pod template is validated like a standalone pod now.
-    t.spec.containers = vec![rusternetes_common::resources::Container {
+    t.spec.containers = vec![k3rs_common::resources::Container {
         name: "c".to_string(),
         image: "nginx".to_string(),
         ..Default::default()
@@ -52,7 +52,7 @@ fn valid_cronjob() -> CronJob {
     cj
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], substr: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], substr: &str) -> bool {
     errs.iter().any(|e| e.field.contains(substr))
 }
 
@@ -116,7 +116,7 @@ fn negative_history_limit_rejected() {
 #[test]
 fn job_template_with_selector_rejected() {
     let mut cj = valid_cronjob();
-    cj.spec.job_template.spec.selector = Some(rusternetes_common::types::LabelSelector {
+    cj.spec.job_template.spec.selector = Some(k3rs_common::types::LabelSelector {
         match_labels: Some(std::collections::HashMap::new()),
         match_expressions: None,
     });

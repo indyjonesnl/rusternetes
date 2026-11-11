@@ -19,17 +19,17 @@
 
 use std::sync::Arc;
 
+use k3rs_api_server::request_header_authentication::{mtls_acceptor, RequestHeaderTrust};
+use k3rs_api_server::router::build_router;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::auth::TokenManager;
+use k3rs_common::authz::AlwaysAllowAuthorizer;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::tls::TlsConfig;
+use k3rs_middleware::request_header::RequestHeaderConfig;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::StorageBackend;
 use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rusternetes_api_server::request_header_authentication::{mtls_acceptor, RequestHeaderTrust};
-use rusternetes_api_server::router::build_router;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::tls::TlsConfig;
-use rusternetes_middleware::request_header::RequestHeaderConfig;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::StorageBackend;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{json, Value};
 
@@ -86,9 +86,9 @@ fn write_ca(ca: &TestCa) -> std::path::PathBuf {
 
 async fn start(allowed_names: &[&str]) -> Harness {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let client_ca = TestCa::new("rusternetes-client-ca");
-    let proxy_ca = TestCa::new("rusternetes-front-proxy-ca");
-    let server = client_ca.issue("rusternetes-apiserver", vec!["127.0.0.1".into()], false);
+    let client_ca = TestCa::new("k3rs-client-ca");
+    let proxy_ca = TestCa::new("k3rs-front-proxy-ca");
+    let server = client_ca.issue("k3rs-apiserver", vec!["127.0.0.1".into()], false);
 
     let client_ca_path = write_ca(&client_ca);
     let proxy_ca_path = write_ca(&proxy_ca);

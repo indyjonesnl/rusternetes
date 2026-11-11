@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::crd::{
+    pub use k3rs_common::resources::crd::{
         CustomResourceDefinitionSpec, JSONSchemaProps, JSONSchemaPropsOrArray,
         JSONSchemaPropsOrBool,
     };
-    pub use rusternetes_common::schema_validation::{PathSeg, SchemaValidator};
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::structural::objectmeta::{
+    pub use k3rs_common::schema_validation::{PathSeg, SchemaValidator};
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::structural::objectmeta::{
         coerce_without_paths, validate as object_meta_validate,
     };
-    pub use rusternetes_common::validation::structural::prune::prune_with_options;
-    pub use rusternetes_common::validation::structural::{
+    pub use k3rs_common::validation::structural::prune::prune_with_options;
+    pub use k3rs_common::validation::structural::{
         new_structural, validate_structural, Structural,
     };
     pub use serde_json::{Map, Value};
@@ -20,8 +20,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::structural::defaulting::*;
-    use rusternetes_common::validation::structural::{Generic, StructuralOrBool};
+    use k3rs_common::validation::structural::defaulting::*;
+    use k3rs_common::validation::structural::{Generic, StructuralOrBool};
     use serde_json::json;
     use std::collections::BTreeMap;
 

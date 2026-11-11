@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::types::ObjectMeta;
     pub use serde::{Deserialize, Serialize};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::table::*;
+    use k3rs_middleware::table::*;
     use serde_json::json;
 
     #[test]
@@ -119,8 +119,8 @@ mod tests {
                     {"type": "Hostname", "address": "node-1"}
                 ],
                 "nodeInfo": {
-                    "kubeletVersion": "v1.35.0-rusternetes",
-                    "osImage": "Rusternetes OS",
+                    "kubeletVersion": "v1.35.0-k3rs",
+                    "osImage": "k3rs OS",
                     "kernelVersion": "6.1.0",
                     "containerRuntimeVersion": "containerd://1.7.0"
                 }
@@ -130,10 +130,10 @@ mod tests {
         assert_eq!(cells[0], json!("node-1")); // NAME
         assert_eq!(cells[1], json!("Ready,SchedulingDisabled")); // STATUS
         assert_eq!(cells[2], json!("control-plane")); // ROLES
-        assert_eq!(cells[4], json!("v1.35.0-rusternetes")); // VERSION
+        assert_eq!(cells[4], json!("v1.35.0-k3rs")); // VERSION
         assert_eq!(cells[5], json!("172.18.0.8")); // INTERNAL-IP (wide)
         assert_eq!(cells[6], json!("<none>")); // EXTERNAL-IP (wide)
-        assert_eq!(cells[7], json!("Rusternetes OS")); // OS-IMAGE (wide)
+        assert_eq!(cells[7], json!("k3rs OS")); // OS-IMAGE (wide)
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn pods_table_matches_printer_columns() {
-        use rusternetes_common::resources::Pod;
+        use k3rs_common::resources::Pod;
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "smoke", "namespace": "default"},
             "spec": {"containers": [{"name": "c", "image": "nginx"}], "nodeName": "node-1"},

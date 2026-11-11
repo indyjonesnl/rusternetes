@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::dump::*;
+    use k3rs_common::dump::*;
 
     #[test]
     fn dumps_enabled_reads_env_once() {

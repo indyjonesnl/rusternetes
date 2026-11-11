@@ -2,7 +2,7 @@
 //! `staging/src/k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition/strategy.go`
 //! and `.../etcd.go`, with the validation of
 //! `pkg/apis/apiextensions/validation/validation.go` (in
-//! `rusternetes_common::validation::crd`) and the controllers of
+//! `k3rs_common::validation::crd`) and the controllers of
 //! [`super::controllers`].
 //!
 //! Not modelled:
@@ -23,19 +23,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-use rusternetes_common::resources::{
+use k3rs_common::deletion::{DeleteOptions, Preconditions};
+use k3rs_common::resources::{
     CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
     JSONSchemaPropsOrStringArray,
 };
-use rusternetes_common::validation::crd::{
+use k3rs_common::validation::crd::{
     is_crd_condition_true, validate_custom_resource_definition,
     validate_custom_resource_definition_update, validate_update_custom_resource_definition_status,
     CUSTOM_RESOURCE_CLEANUP_FINALIZER,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_prefix, Storage, StorageBackend};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_prefix, Storage, StorageBackend};
 use tracing::warn;
 
 use super::controllers::{
@@ -53,7 +53,7 @@ use crate::ssa::ResetFields;
 /// `SetDefaults_CustomResourceDefinition` (apiextensions/v1/defaults.go:30-40),
 /// run by the codec on every decode.
 pub fn convert_to_internal(crd: &mut CustomResourceDefinition) {
-    rusternetes_common::validation::crd::set_defaults_custom_resource_definition(crd);
+    k3rs_common::validation::crd::set_defaults_custom_resource_definition(crd);
 }
 
 /// `IsStoredVersion` (helpers.go:145-152).
@@ -90,8 +90,8 @@ fn schema_rule_errors(
     schema_rule_errors_in(
         crd,
         old,
-        &rusternetes_common::cel_versions::EnvSet::must_base_env_set(
-            rusternetes_common::cel_versions::default_compatibility_version(),
+        &k3rs_common::cel_versions::EnvSet::must_base_env_set(
+            k3rs_common::cel_versions::default_compatibility_version(),
         ),
     )
 }
@@ -100,7 +100,7 @@ fn schema_rule_errors(
 pub fn schema_rule_errors_in(
     crd: &CustomResourceDefinition,
     old: Option<&CustomResourceDefinition>,
-    env_set: &rusternetes_common::cel_versions::EnvSet,
+    env_set: &k3rs_common::cel_versions::EnvSet,
 ) -> ErrorList {
     // `findPreexistingExpressions(&oldObj.Spec)` (validation.go:241); empty
     // on create (validation.go:153).
@@ -890,7 +890,7 @@ impl CrdRest {
     ) -> std::result::Result<
         (),
         Box<(
-            rusternetes_common::resources::CustomResourceDefinitionCondition,
+            k3rs_common::resources::CustomResourceDefinitionCondition,
             Error,
         )>,
     > {
@@ -1730,7 +1730,7 @@ async fn run_crd_informer(
     controllers: Arc<super::controller_queue::CrdControllers>,
 ) {
     use futures::StreamExt;
-    use rusternetes_storage::WatchEvent;
+    use k3rs_storage::WatchEvent;
     let rest = CrdRest::with_controllers(storage.clone(), controllers);
     let prefix = build_prefix("customresourcedefinitions", None);
     let mut cache = std::collections::HashMap::new();

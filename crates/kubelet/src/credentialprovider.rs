@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use rusternetes_common::resources::Secret;
+use k3rs_common::resources::Secret;
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;

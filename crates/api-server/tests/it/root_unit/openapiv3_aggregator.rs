@@ -7,16 +7,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_api_server::aggregated_discovery::{HandlerRequest, HandlerResponse};
-use rusternetes_api_server::aggregator_mux::ProxyHandler;
-use rusternetes_api_server::apiservice_registration::{
-    APIHandlerManager, AggregatorHandlerManager,
-};
-use rusternetes_api_server::openapiv3_aggregator::{
+use k3rs_api_server::aggregated_discovery::{HandlerRequest, HandlerResponse};
+use k3rs_api_server::aggregator_mux::ProxyHandler;
+use k3rs_api_server::apiservice_registration::{APIHandlerManager, AggregatorHandlerManager};
+use k3rs_api_server::openapiv3_aggregator::{
     AggregationController, Downloader, SpecProxier, SpecServer, SyncAction, UpdateError,
     AGGREGATOR_USER,
 };
-use rusternetes_common::resources::{APIService, APIServiceReference};
+use k3rs_common::resources::{APIService, APIServiceReference};
 
 const ETAG: &str = "6E8F849B434D4B98A569B9D7718876E9-356ECAB19D7FBE";
 

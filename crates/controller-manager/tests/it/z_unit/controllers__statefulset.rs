@@ -4,18 +4,18 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         PersistentVolumeClaim, Pod, PodStatus, StatefulSet, StatefulSetStatus,
     };
-    pub use rusternetes_common::types::{
+    pub use k3rs_common::types::{
         label_selector_as_selector, ObjectMeta, OwnerReference, Phase, Selector, TypeMeta,
     };
-    pub use rusternetes_controller_manager::controllers::pod_informer::{
+    pub use k3rs_controller_manager::controllers::pod_informer::{
         ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer,
     };
-    pub use rusternetes_controller_manager::controllers::replicationcontroller::slow_start_batches_capped;
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::replicationcontroller::slow_start_batches_capped;
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -25,15 +25,15 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::workloads::{
+    use k3rs_common::resources::workloads::{
         RollingUpdateStatefulSetStrategy, StatefulSetUpdateStrategy,
     };
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         Container, PodCondition, PodSpec, PodTemplateSpec, StatefulSetSpec,
     };
-    use rusternetes_common::types::LabelSelector;
-    use rusternetes_controller_manager::controllers::statefulset::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::types::LabelSelector;
+    use k3rs_controller_manager::controllers::statefulset::*;
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashMap;
 
     #[test]
@@ -184,17 +184,16 @@ mod tests {
         let ns = "default";
 
         // Default StorageClass present in the cluster.
-        let sc: rusternetes_common::resources::StorageClass =
-            serde_json::from_value(serde_json::json!({
-                "apiVersion": "storage.k8s.io/v1",
-                "kind": "StorageClass",
-                "metadata": {
-                    "name": "standard",
-                    "annotations": {"storageclass.kubernetes.io/is-default-class": "true"}
-                },
-                "provisioner": "rusternetes.io/hostpath"
-            }))
-            .unwrap();
+        let sc: k3rs_common::resources::StorageClass = serde_json::from_value(serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": {
+                "name": "standard",
+                "annotations": {"storageclass.kubernetes.io/is-default-class": "true"}
+            },
+            "provisioner": "k3rs.io/hostpath"
+        }))
+        .unwrap();
         storage
             .create("/registry/storageclasses/standard", &sc)
             .await
@@ -278,9 +277,9 @@ mod tests {
         let controller = StatefulSetController::new(storage.clone());
         let ns = "default";
 
-        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", ns);
+        let mut sa = k3rs_common::resources::ServiceAccount::new("default", ns);
         sa.image_pull_secrets = Some(vec![
-            rusternetes_common::resources::service_account::LocalObjectReference {
+            k3rs_common::resources::service_account::LocalObjectReference {
                 name: "regcred".to_string(),
             },
         ]);
@@ -1117,7 +1116,7 @@ mod tests {
     // --- pod event handlers on the shared pod informer (#3724) -------------
     // stateful_set.go addPod :202, updatePod :236, deletePod :296.
 
-    use rusternetes_storage::WatchEvent;
+    use k3rs_storage::WatchEvent;
 
     fn sts_pod_json(name: &str, owner: Option<(&str, &str)>, labels: &[(&str, &str)]) -> String {
         let labels: HashMap<&str, &str> = labels.iter().copied().collect();

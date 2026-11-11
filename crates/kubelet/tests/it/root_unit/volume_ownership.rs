@@ -9,7 +9,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_ownership::*;
+    use k3rs_kubelet::volume_ownership::*;
     use std::os::unix::fs::MetadataExt;
 
     fn tmp(tag: &str) -> std::path::PathBuf {

@@ -32,9 +32,9 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::StreamExt;
 use ipnet::IpNet;
-use rusternetes_common::resources::{EventSource, EventType, Node, ObjectReference};
-use rusternetes_common::Error;
-use rusternetes_storage::{
+use k3rs_common::resources::{EventSource, EventType, Node, ObjectReference};
+use k3rs_common::Error;
+use k3rs_storage::{
     build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
 };
 use tracing::{debug, error, info, warn};

@@ -3,27 +3,27 @@
 
 mod __parent {
     pub use chrono::Utc;
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         resources::{EventSource, EventType, Node, ObjectReference, Pod, PriorityClass},
         types::Phase,
     };
-    pub use rusternetes_scheduler::advanced::{
+    pub use k3rs_scheduler::advanced::{
         check_host_port_conflicts, check_node_affinity, check_pod_affinity,
         check_pod_anti_affinity, check_taints_tolerations, check_topology_spread_constraints,
         parse_resource_quantity,
     };
-    pub use rusternetes_scheduler::data_plane::{ApiBackend, DataPlane};
-    pub use rusternetes_scheduler::diagnosis::{fit_error_message, Diagnosis};
-    pub use rusternetes_scheduler::framework_runtime::{names, ExtensionPoint};
-    pub use rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME;
-    pub use rusternetes_scheduler::queue::{
+    pub use k3rs_scheduler::data_plane::{ApiBackend, DataPlane};
+    pub use k3rs_scheduler::diagnosis::{fit_error_message, Diagnosis};
+    pub use k3rs_scheduler::framework_runtime::{names, ExtensionPoint};
+    pub use k3rs_scheduler::profile::DEFAULT_SCHEDULER_NAME;
+    pub use k3rs_scheduler::queue::{
         hints, node_scheduling_properties_change, pod_scheduling_properties_change,
         priority_sort_less, ActionType, ClusterEvent, EventObject, EventResource, NominatingInfo,
         PriorityQueue, PriorityQueueOptions, QueuedPodInfo, EVENT_ASSIGNED_POD_ADD,
         EVENT_ASSIGNED_POD_DELETE,
     };
-    pub use rusternetes_scheduler::volume_binding::{self, PreFilterOutcome};
-    pub use rusternetes_storage::{
+    pub use k3rs_scheduler::volume_binding::{self, PreFilterOutcome};
+    pub use k3rs_storage::{
         build_key, build_prefix, EventRecorder, Storage, StorageBackend, WatchEvent,
     };
     pub use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,14 +38,14 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_common::resources::{Container, PodSpec, PodStatus};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_scheduler::scheduler::*;
-    use rusternetes_storage::{MemoryStorage, WatchStream};
+    use k3rs_common::resources::{Container, PodSpec, PodStatus};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_scheduler::scheduler::*;
+    use k3rs_storage::{MemoryStorage, WatchStream};
 
     fn make_node(name: &str) -> Node {
         Node {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Node".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -61,8 +61,8 @@ mod tests {
                 m
             },
             spec: None,
-            status: Some(rusternetes_common::resources::NodeStatus {
-                conditions: Some(vec![rusternetes_common::resources::NodeCondition {
+            status: Some(k3rs_common::resources::NodeStatus {
+                conditions: Some(vec![k3rs_common::resources::NodeCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: Some("KubeletReady".to_string()),
@@ -100,7 +100,7 @@ mod tests {
 
     fn make_pending_pod(name: &str, ns: &str) -> Pod {
         Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -110,7 +110,7 @@ mod tests {
                 m
             },
             spec: Some(PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+                containers: vec![k3rs_common::resources::Container {
                     name: "main".to_string(),
                     image: "busybox".to_string(),
                     command: None,
@@ -296,7 +296,7 @@ mod tests {
             "pod with a missing PVC must not be scheduled"
         );
 
-        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+        let pvc: k3rs_common::resources::PersistentVolumeClaim =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {"name": "claim", "namespace": "default",
@@ -310,7 +310,7 @@ mod tests {
             .create("/registry/persistentvolumeclaims/default/claim", &pvc)
             .await
             .unwrap();
-        let pv: rusternetes_common::resources::PersistentVolume =
+        let pv: k3rs_common::resources::PersistentVolume =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolume",
                 "metadata": {"name": "pv1"},
@@ -343,8 +343,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_volume_binding_score_prefers_node_with_more_free_capacity() {
-        let _gate = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+        let _gate = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::StorageCapacityScoring,
             true,
         );
         let storage = Arc::new(MemoryStorage::new());
@@ -359,7 +359,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let class: rusternetes_common::resources::StorageClass =
+        let class: k3rs_common::resources::StorageClass =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
                 "metadata": {"name": "wait"},
@@ -371,7 +371,7 @@ mod tests {
             .create("/registry/storageclasses/wait", &class)
             .await
             .unwrap();
-        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+        let pvc: k3rs_common::resources::PersistentVolumeClaim =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {"name": "claim", "namespace": "default"},
@@ -385,7 +385,7 @@ mod tests {
             .await
             .unwrap();
         for (node, size) in [("node-1", "1Gi"), ("node-2", "10Gi")] {
-            let pv: rusternetes_common::resources::PersistentVolume =
+            let pv: k3rs_common::resources::PersistentVolume =
                 serde_json::from_value(serde_json::json!({
                     "apiVersion": "v1", "kind": "PersistentVolume",
                     "metadata": {"name": format!("pv-{node}")},
@@ -434,7 +434,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let class: rusternetes_common::resources::StorageClass =
+        let class: k3rs_common::resources::StorageClass =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
                 "metadata": {"name": "wait"},
@@ -446,7 +446,7 @@ mod tests {
             .create("/registry/storageclasses/wait", &class)
             .await
             .unwrap();
-        let pvc: rusternetes_common::resources::PersistentVolumeClaim =
+        let pvc: k3rs_common::resources::PersistentVolumeClaim =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {"name": "claim", "namespace": "default", "uid": "claim-uid"},
@@ -459,7 +459,7 @@ mod tests {
             .create("/registry/persistentvolumeclaims/default/claim", &pvc)
             .await
             .unwrap();
-        let pv: rusternetes_common::resources::PersistentVolume =
+        let pv: k3rs_common::resources::PersistentVolume =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolume",
                 "metadata": {"name": "pv-node-2"},
@@ -506,12 +506,12 @@ mod tests {
         let controller = tokio::spawn(async move {
             for _ in 0..250 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                let pv: rusternetes_common::resources::PersistentVolume = st
+                let pv: k3rs_common::resources::PersistentVolume = st
                     .get("/registry/persistentvolumes/pv-node-2")
                     .await
                     .unwrap();
                 if pv.spec.claim_ref.is_some() {
-                    let mut pvc: rusternetes_common::resources::PersistentVolumeClaim = st
+                    let mut pvc: k3rs_common::resources::PersistentVolumeClaim = st
                         .get("/registry/persistentvolumeclaims/default/claim")
                         .await
                         .unwrap();
@@ -534,7 +534,7 @@ mod tests {
             .unwrap();
         controller.await.unwrap();
 
-        let pv: rusternetes_common::resources::PersistentVolume = storage
+        let pv: k3rs_common::resources::PersistentVolume = storage
             .get("/registry/persistentvolumes/pv-node-2")
             .await
             .unwrap();
@@ -625,8 +625,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_try_schedule_pod_does_not_nominate_without_the_gate() {
-        rusternetes_common::feature_gates::set_from_str("NominatedNodeNameForExpectation=false")
-            .unwrap();
+        k3rs_common::feature_gates::set_from_str("NominatedNodeNameForExpectation=false").unwrap();
         let storage = Arc::new(MemoryStorage::new());
         let mut scheduler =
             Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
@@ -640,7 +639,7 @@ mod tests {
         let _ = scheduler
             .try_schedule_pod(&test_queue(), "pods/default/wffc-pod")
             .await;
-        rusternetes_common::feature_gates::reset_to_defaults();
+        k3rs_common::feature_gates::reset_to_defaults();
         let p: Pod = storage
             .get("/registry/pods/default/wffc-pod")
             .await
@@ -699,7 +698,7 @@ mod tests {
             .create("/registry/nodes/node-1", &make_node("node-1"))
             .await
             .unwrap();
-        let claim: rusternetes_common::resources::ResourceClaim =
+        let claim: k3rs_common::resources::ResourceClaim =
             serde_json::from_value(serde_json::json!({
                 "metadata": {"name": "c", "namespace": "default"},
                 "spec": {"devices": {}},
@@ -731,7 +730,7 @@ mod tests {
             bound.spec.as_ref().and_then(|s| s.node_name.as_deref()),
             Some("node-1")
         );
-        let claim: rusternetes_common::resources::ResourceClaim = storage
+        let claim: k3rs_common::resources::ResourceClaim = storage
             .get("/registry/resourceclaims/default/c")
             .await
             .unwrap();
@@ -760,7 +759,7 @@ mod tests {
             let held = stored_pod(storage, "held", "node-1", 0, None).await;
             let mut held = held;
             held.spec.as_mut().unwrap().containers[0].resources =
-                Some(rusternetes_common::types::ResourceRequirements {
+                Some(k3rs_common::types::ResourceRequirements {
                     requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
                     limits: None,
                     claims: None,
@@ -773,7 +772,7 @@ mod tests {
         let mut p = stored_pod(storage, "nominated", "", 1000, Some("node-1")).await;
         {
             let spec = p.spec.as_mut().unwrap();
-            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+            spec.containers[0].resources = Some(k3rs_common::types::ResourceRequirements {
                 requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
                 limits: None,
                 claims: None,
@@ -826,7 +825,7 @@ mod tests {
             .unwrap();
         queue.add_nominated_pod(
             &pod,
-            Some(&rusternetes_scheduler::queue::nominator::NominatingInfo::noop()),
+            Some(&k3rs_scheduler::queue::nominator::NominatingInfo::noop()),
         );
         assert_eq!(
             queue
@@ -964,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_emits_scheduled_event_via_recorder() {
-        use rusternetes_common::resources::{Event, EventType, ObjectReference};
+        use k3rs_common::resources::{Event, EventType, ObjectReference};
 
         let storage = Arc::new(MemoryStorage::new());
         let scheduler =
@@ -1031,11 +1030,11 @@ mod tests {
     /// of unknown scheduler names alone.
     #[tokio::test]
     async fn test_multi_profile_routes_pods_by_scheduler_name() {
-        use rusternetes_common::resources::{Event, ObjectReference};
+        use k3rs_common::resources::{Event, ObjectReference};
         let storage = Arc::new(MemoryStorage::new());
-        let profiles = rusternetes_scheduler::profile::Map::new_map(vec![
-            rusternetes_scheduler::profile::Profile::named("default-scheduler"),
-            rusternetes_scheduler::profile::Profile::named("my-sched"),
+        let profiles = k3rs_scheduler::profile::Map::new_map(vec![
+            k3rs_scheduler::profile::Profile::named("default-scheduler"),
+            k3rs_scheduler::profile::Profile::named("my-sched"),
         ])
         .unwrap();
         let scheduler = Scheduler::new_with_profiles(storage.clone(), 1, profiles);
@@ -1094,10 +1093,10 @@ mod tests {
     /// profile (each profile has its own framework + plugin args).
     #[tokio::test]
     async fn test_profile_for_pod_resolves_per_profile_args() {
-        let mut slow = rusternetes_scheduler::profile::Profile::named("slow");
+        let mut slow = k3rs_scheduler::profile::Profile::named("slow");
         slow.volume_bind_timeout = Duration::from_secs(7);
-        let profiles = rusternetes_scheduler::profile::Map::new_map(vec![
-            rusternetes_scheduler::profile::Profile::named("default-scheduler"),
+        let profiles = k3rs_scheduler::profile::Map::new_map(vec![
+            k3rs_scheduler::profile::Profile::named("default-scheduler"),
             slow,
         ])
         .unwrap();
@@ -1143,10 +1142,11 @@ mod tests {
     #[tokio::test]
     async fn test_fair_evaluation_for_nodes() {
         let num_all_nodes = 500usize;
-        let mut profiles = rusternetes_scheduler::profile::Map::new_map(vec![
-            rusternetes_scheduler::profile::Profile::named(DEFAULT_SCHEDULER_NAME),
-        ])
-        .unwrap();
+        let mut profiles =
+            k3rs_scheduler::profile::Map::new_map(vec![k3rs_scheduler::profile::Profile::named(
+                DEFAULT_SCHEDULER_NAME,
+            )])
+            .unwrap();
         profiles.percentage_of_nodes_to_score = 30;
         let scheduler = Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
         let nodes: Vec<Node> = (0..num_all_nodes)
@@ -1287,7 +1287,7 @@ mod tests {
             .await;
         assert!(picked.is_none());
         assert_eq!(
-            rusternetes_scheduler::diagnosis::fit_error_message(nodes.len(), &diag),
+            k3rs_scheduler::diagnosis::fit_error_message(nodes.len(), &diag),
             "0/3 nodes are available: 3 node(s) didn't satisfy plugin(s) [NodeAffinity]."
         );
         assert!(diag.unschedulable_plugins.contains("NodeAffinity"));
@@ -1372,7 +1372,7 @@ mod tests {
         let mut preemptor = make_pending_pod("hi", "default");
         preemptor.spec.as_mut().unwrap().priority = Some(1000);
         preemptor.spec.as_mut().unwrap().containers[0].resources =
-            Some(rusternetes_common::types::ResourceRequirements {
+            Some(k3rs_common::types::ResourceRequirements {
                 requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
                 limits: None,
                 claims: None,
@@ -1382,12 +1382,12 @@ mod tests {
             1,
             "default-scheduler".to_string(),
         );
-        let mut diag = rusternetes_scheduler::diagnosis::Diagnosis::default();
+        let mut diag = k3rs_scheduler::diagnosis::Diagnosis::default();
         let picked = scheduler
             .select_node_inner(&preemptor, &nodes, &all_pods, &HashMap::new(), &mut diag)
             .await;
         assert!(picked.is_none());
-        use rusternetes_scheduler::fwk::Code;
+        use k3rs_scheduler::fwk::Code;
         assert_eq!(diag.node_code("full"), Code::Unschedulable);
         assert_eq!(
             diag.node_code("cordoned"),
@@ -1402,7 +1402,7 @@ mod tests {
             .map(|(node, victims)| (node, victims.len()));
         assert_eq!(preempted, Some(("full".to_string(), 1)));
         // With every node unresolvable, preemption is not attempted.
-        let none = rusternetes_scheduler::diagnosis::Diagnosis::default();
+        let none = k3rs_scheduler::diagnosis::Diagnosis::default();
         assert!(scheduler
             .try_preempt(&preemptor, &nodes, &all_pods, &HashMap::new(), &[], &none)
             .await
@@ -1414,7 +1414,7 @@ mod tests {
     /// is now unresolvable does not wait for that node's terminating victim.
     #[tokio::test]
     async fn test_try_preempt_ignores_victims_on_an_unresolvable_nominated_node() {
-        use rusternetes_scheduler::fwk::Code;
+        use k3rs_scheduler::fwk::Code;
         let node = |name: &str| -> Node {
             serde_json::from_value(serde_json::json!({
                 "metadata": {"name": name},
@@ -1435,13 +1435,13 @@ mod tests {
         {
             let spec = preemptor.spec.as_mut().unwrap();
             spec.priority = Some(1000);
-            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+            spec.containers[0].resources = Some(k3rs_common::types::ResourceRequirements {
                 requests: Some(HashMap::from([("cpu".to_string(), "1".to_string())])),
                 limits: None,
                 claims: None,
             });
         }
-        preemptor.status = Some(rusternetes_common::resources::PodStatus {
+        preemptor.status = Some(k3rs_common::resources::PodStatus {
             nominated_node_name: Some("gone".to_string()),
             ..Default::default()
         });
@@ -1451,7 +1451,7 @@ mod tests {
             "default-scheduler".to_string(),
         );
         let run = |gone: Code| {
-            let mut diag = rusternetes_scheduler::diagnosis::Diagnosis::default();
+            let mut diag = k3rs_scheduler::diagnosis::Diagnosis::default();
             diag.set_node_code("full", Code::Unschedulable);
             diag.set_node_code("gone", gone);
             let (scheduler, preemptor, nodes, all_pods) =
@@ -1495,7 +1495,7 @@ mod tests {
         {
             let spec = preemptor.spec.as_mut().unwrap();
             spec.priority = Some(1000);
-            spec.containers[0].resources = Some(rusternetes_common::types::ResourceRequirements {
+            spec.containers[0].resources = Some(k3rs_common::types::ResourceRequirements {
                 requests: Some(HashMap::from([("cpu".to_string(), "4".to_string())])),
                 limits: None,
                 claims: None,
@@ -1507,8 +1507,7 @@ mod tests {
             let preemptor = preemptor.clone();
             async move {
                 let profiles =
-                    rusternetes_scheduler::scheduler_config::profiles_from_config(doc, false)
-                        .unwrap();
+                    k3rs_scheduler::scheduler_config::profiles_from_config(doc, false).unwrap();
                 let scheduler =
                     Scheduler::new_with_profiles(Arc::new(MemoryStorage::new()), 1, profiles);
                 scheduler
@@ -1521,11 +1520,9 @@ mod tests {
                         &all_pods,
                         &HashMap::new(),
                         &[],
-                        &rusternetes_scheduler::diagnosis::Diagnosis {
+                        &k3rs_scheduler::diagnosis::Diagnosis {
                             // As after a PreFilter rejection: every node is Unschedulable.
-                            absent_nodes_code: Some(
-                                rusternetes_scheduler::fwk::Code::Unschedulable,
-                            ),
+                            absent_nodes_code: Some(k3rs_scheduler::fwk::Code::Unschedulable),
                             ..Default::default()
                         },
                     )
@@ -1754,7 +1751,7 @@ mod tests {
     /// the queue's nominator and on the pod; others keep theirs.
     #[tokio::test]
     async fn test_prepare_candidate_clears_lower_priority_nominations() {
-        use rusternetes_scheduler::queue::nominator::NominatingInfo;
+        use k3rs_scheduler::queue::nominator::NominatingInfo;
         let storage = Arc::new(MemoryStorage::new());
         let scheduler =
             Scheduler::new_with_name(storage.clone(), 1, "default-scheduler".to_string());
@@ -1847,7 +1844,7 @@ mod tests {
 
         // Create a pod with nodeName="" (empty string, not None)
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1965,7 +1962,7 @@ mod tests {
             "status": {"phase": "Pending"}
         }))
         .unwrap();
-        let claim: rusternetes_common::resources::PersistentVolumeClaim =
+        let claim: k3rs_common::resources::PersistentVolumeClaim =
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": {"name": "abc-xyz", "namespace": "default"},
@@ -1983,16 +1980,16 @@ mod tests {
         // Take VolumeBinding's PreFilter/Filter out so that NodeVolumeLimits
         // is the plugin that sees the un-owned claim (csi_test.go drives the
         // plugin alone).
-        let mut profile = rusternetes_scheduler::profile::Profile::named(DEFAULT_SCHEDULER_NAME);
+        let mut profile = k3rs_scheduler::profile::Profile::named(DEFAULT_SCHEDULER_NAME);
         let mut plugins = profile.plugins.take().unwrap();
-        plugins.pre_filter.disabled = vec![rusternetes_scheduler::framework_runtime::Plugin::new(
+        plugins.pre_filter.disabled = vec![k3rs_scheduler::framework_runtime::Plugin::new(
             names::VOLUME_BINDING,
         )];
-        plugins.filter.disabled = vec![rusternetes_scheduler::framework_runtime::Plugin::new(
+        plugins.filter.disabled = vec![k3rs_scheduler::framework_runtime::Plugin::new(
             names::VOLUME_BINDING,
         )];
         profile.plugins = Some(plugins);
-        let profiles = rusternetes_scheduler::profile::Map::new_map(vec![profile]).unwrap();
+        let profiles = k3rs_scheduler::profile::Map::new_map(vec![profile]).unwrap();
         let scheduler = Scheduler::new_with_profiles(Arc::clone(&storage), 60, profiles);
         let err = scheduler
             .try_schedule_pod(&test_queue(), "pods/default/abc")
@@ -2072,21 +2069,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for FlakyStorage {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create(key, value).await
         }
 
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
             if key == self.fail_key {
                 let n = self.gets.fetch_add(1, Ordering::SeqCst) + 1;
                 if n == self.fail_on_nth_get {
-                    return Err(rusternetes_common::Error::Internal(
+                    return Err(k3rs_common::Error::Internal(
                         "transient: connection reset".to_string(),
                     ));
                 }
@@ -2094,7 +2091,7 @@ mod tests {
             self.inner.get(key).await
         }
 
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -2105,15 +2102,15 @@ mod tests {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
 
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
 
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -2124,14 +2121,14 @@ mod tests {
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<Vec<T>>
+        ) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.list_at_revision(prefix, revision).await
         }
 
-        async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
             self.inner.watch(prefix).await
         }
 
@@ -2139,15 +2136,15 @@ mod tests {
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<WatchStream> {
+        ) -> k3rs_common::Result<WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
 
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
 
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }
@@ -2248,7 +2245,7 @@ mod tests {
                     DEFAULT_SCHEDULER_NAME.to_string(),
                     HashMap::from([(
                         ClusterEvent::new(EventResource::Pod, ActionType::UPDATE),
-                        vec![rusternetes_scheduler::queue::QueueingHintFunction {
+                        vec![k3rs_scheduler::queue::QueueingHintFunction {
                             plugin_name: "fooPlugin".to_string(),
                             queueing_hint_fn: hints::default_queueing_hint_fn(),
                         }],

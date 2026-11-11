@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::resources::{
         CSIDriver, CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod, StorageClass,
         Volume, VolumeAttachment,
     };
-    pub use rusternetes_scheduler::volume_binding::{
+    pub use k3rs_scheduler::volume_binding::{
         claim_class, ephemeral_volume_is_for_pod, pod_volumes, volume_pvc_name,
     };
     pub use std::collections::HashMap;
@@ -15,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::node_volume_limits::*;
+    use k3rs_scheduler::node_volume_limits::*;
     use serde_json::{json, Value};
 
     const EBS: &str = "ebs.csi.aws.com";

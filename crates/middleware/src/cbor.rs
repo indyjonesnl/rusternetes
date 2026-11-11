@@ -10,7 +10,7 @@
 //! - `application/cbor` — full object encoding for create/update/get/list.
 //! - `application/apply-patch+cbor` — CBOR-encoded server-side apply patch;
 //!   the constant is exported as
-//!   [`rusternetes_common::validation::metav1::APPLY_CBOR_PATCH_TYPE`].
+//!   [`k3rs_common::validation::metav1::APPLY_CBOR_PATCH_TYPE`].
 //!
 //! Our strategy is "decode CBOR → JSON value, re-encode as JSON" on the
 //! request side, and "encode JSON value → CBOR" on the response side. This
@@ -33,7 +33,7 @@ pub const CBOR_CONTENT_TYPE: &str = "application/cbor";
 /// MIME type for CBOR-encoded server-side apply patches.
 ///
 /// Mirrors `APPLY_CBOR_PATCH_TYPE` exported from
-/// `rusternetes_common::validation::metav1`. Kept here as a sibling
+/// `k3rs_common::validation::metav1`. Kept here as a sibling
 /// constant so the codec module can be used standalone in tests.
 pub const APPLY_PATCH_CBOR_CONTENT_TYPE: &str = "application/apply-patch+cbor";
 

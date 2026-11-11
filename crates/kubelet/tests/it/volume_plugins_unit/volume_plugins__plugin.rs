@@ -4,13 +4,13 @@
 mod __parent {
     pub use anyhow::Result;
     pub use async_trait::async_trait;
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::{PersistentVolume, Pod, Volume};
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::{PersistentVolume, Pod, Volume};
 }
 
 mod block_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::plugin::*;
+    use k3rs_kubelet::volume_plugins::plugin::*;
 
     struct Plain;
     impl MetricsProvider for Plain {

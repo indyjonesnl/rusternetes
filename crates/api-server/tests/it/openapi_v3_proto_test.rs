@@ -16,9 +16,9 @@
 //! `StorageBackend::Memory`, driven via `tower::ServiceExt::oneshot`).
 
 use axum::http::{header, StatusCode};
+use k3rs_api_server::gnostic::openapi_v3::Document;
+use k3rs_test_support::harness::TestApiServer;
 use prost::Message;
-use rusternetes_api_server::gnostic::openapi_v3::Document;
-use rusternetes_test_support::harness::TestApiServer;
 
 // ---------------------------------------------------------------------------
 // HTTP harness — thin shims over the shared `TestApiServer`.

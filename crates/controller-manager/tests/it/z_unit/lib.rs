@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_controller_manager::controllers::*;
-    pub use rusternetes_controller_manager::controllers::{
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_controller_manager::controllers::*;
+    pub use k3rs_controller_manager::controllers::{
         apiservice::APIServiceAvailabilityController,
         certificate_signing_request::CertificateSigningRequestController,
         clusterrole_aggregation::ClusterRoleAggregationController,
@@ -44,8 +44,8 @@ mod __parent {
         volume_snapshot::VolumeSnapshotController,
         vpa::VerticalPodAutoscalerController,
     };
-    pub use rusternetes_storage::api_storage::ApiStorage;
-    pub use rusternetes_storage::{Storage, StorageBackend};
+    pub use k3rs_storage::api_storage::ApiStorage;
+    pub use k3rs_storage::{Storage, StorageBackend};
     pub use std::sync::Arc;
     pub use tracing::{error, info};
 }
@@ -64,7 +64,7 @@ mod supervisor_tests {
         let attempts = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&attempts);
 
-        rusternetes_controller_manager::supervise_controller(
+        k3rs_controller_manager::supervise_controller(
             "test controller",
             Some(3),
             std::time::Duration::ZERO,
@@ -92,7 +92,7 @@ mod supervisor_tests {
         let attempts = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&attempts);
 
-        rusternetes_controller_manager::supervise_controller(
+        k3rs_controller_manager::supervise_controller(
             "test controller",
             Some(2),
             std::time::Duration::ZERO,
@@ -123,8 +123,8 @@ mod supervisor_tests {
 
 mod per_controller_client_tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_controller_manager::*;
+    use k3rs_storage::MemoryStorage;
     use std::sync::Mutex;
 
     /// #1863: the number of controllers started equals the number of clients
@@ -198,8 +198,8 @@ mod per_controller_client_tests {
 
 mod csi_attach_wiring_tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_controller_manager::*;
+    use k3rs_storage::MemoryStorage;
 
     fn count(csi_attachers: Vec<(String, String)>, attach_detach_controller: bool) -> usize {
         let storage = Arc::new(MemoryStorage::new());

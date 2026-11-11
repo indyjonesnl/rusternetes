@@ -11,19 +11,19 @@
 //! Source: kubernetes/test/e2e/apps/statefulset.go
 //!         kubernetes/pkg/controller/statefulset/stateful_set_controller_test.go
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::volume::{
     PersistentVolumeAccessMode, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     ResourceRequirements,
 };
-use rusternetes_common::resources::workloads::{
+use k3rs_common::resources::workloads::{
     RollingUpdateStatefulSetStrategy, StatefulSetPersistentVolumeClaimRetentionPolicy,
     StatefulSetUpdateStrategy,
 };
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::statefulset::StatefulSetController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::statefulset::StatefulSetController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -269,8 +269,8 @@ async fn statefulset_should_create_pvcs_in_order_before_pods() {
     let pvc_key = build_key("persistentvolumeclaims", Some(ns), "data-ordered-pvc-0");
     let mut pvc: PersistentVolumeClaim = storage.get(&pvc_key).await.unwrap();
     pvc.status = Some(
-        rusternetes_common::resources::volume::PersistentVolumeClaimStatus {
-            phase: rusternetes_common::resources::volume::PersistentVolumeClaimPhase::Bound,
+        k3rs_common::resources::volume::PersistentVolumeClaimStatus {
+            phase: k3rs_common::resources::volume::PersistentVolumeClaimPhase::Bound,
             access_modes: None,
             capacity: None,
             conditions: None,
@@ -803,7 +803,7 @@ async fn statefulset_should_respect_revision_history_limit() {
     }
 
     // Count ControllerRevisions
-    let revisions: Vec<rusternetes_common::resources::ControllerRevision> = storage
+    let revisions: Vec<k3rs_common::resources::ControllerRevision> = storage
         .list("/registry/controllerrevisions/default/")
         .await
         .unwrap_or_default();

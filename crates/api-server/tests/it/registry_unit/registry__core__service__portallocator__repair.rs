@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::core::service::allocator::storage::RangeRegistry;
-    pub use rusternetes_api_server::registry::core::service::portallocator::{
+    pub use k3rs_api_server::registry::core::service::allocator::storage::RangeRegistry;
+    pub use k3rs_api_server::registry::core::service::portallocator::{
         PortAllocator, PortError, PortRange,
     };
-    pub use rusternetes_common::resources::{EventSource, EventType, ObjectReference, Service};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{EventRecorder, Storage};
+    pub use k3rs_common::resources::{EventSource, EventType, ObjectReference, Service};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{EventRecorder, Storage};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -19,9 +19,9 @@ mod tests {
     //! Ports of portallocator/controller/repair_test.go.
     use super::__parent::*;
     use async_trait::async_trait;
-    use rusternetes_api_server::registry::core::service::portallocator::repair::*;
-    use rusternetes_common::resources::rangeallocation::RangeAllocation;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::registry::core::service::portallocator::repair::*;
+    use k3rs_common::resources::rangeallocation::RangeAllocation;
+    use k3rs_storage::MemoryStorage;
     use serde_json::json;
     use std::sync::Mutex;
 

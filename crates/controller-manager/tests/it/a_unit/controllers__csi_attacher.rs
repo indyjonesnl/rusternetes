@@ -4,28 +4,28 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use futures::StreamExt;
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::resources::csi::{
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::resources::csi::{
         CSINode, VolumeAttachment, VolumeAttachmentStatus, VolumeError,
     };
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::volume::{
         CSIVolumeSource, PersistentVolumeMode, PersistentVolumeSpec,
     };
-    pub use rusternetes_common::resources::{PersistentVolume, Secret};
-    pub use rusternetes_controller_manager::controllers::csi_provisioner::to_csi_access_mode;
-    pub use rusternetes_controller_manager::controllers::pvc_protection::update_or_reap;
-    pub use rusternetes_csi::controller_client::{
+    pub use k3rs_common::resources::{PersistentVolume, Secret};
+    pub use k3rs_controller_manager::controllers::csi_provisioner::to_csi_access_mode;
+    pub use k3rs_controller_manager::controllers::pvc_protection::update_or_reap;
+    pub use k3rs_csi::controller_client::{
         ControllerError, CsiControllerClient, DriverCapabilities,
     };
-    pub use rusternetes_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
-    pub use rusternetes_csi::proto::plugin_capability::service::Type as PluginService;
-    pub use rusternetes_csi::proto::volume_capability::{
+    pub use k3rs_csi::proto::controller_service_capability::rpc::Type as ControllerRpc;
+    pub use k3rs_csi::proto::plugin_capability::service::Type as PluginService;
+    pub use k3rs_csi::proto::volume_capability::{
         AccessMode, AccessType, BlockVolume, MountVolume,
     };
-    pub use rusternetes_csi::proto::{
+    pub use k3rs_csi::proto::{
         ControllerPublishVolumeRequest, ControllerUnpublishVolumeRequest, VolumeCapability,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::{Arc, Mutex};
     pub use std::time::{Duration, Instant};
@@ -34,7 +34,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::csi_attacher::*;
+    use k3rs_controller_manager::controllers::csi_attacher::*;
 
     /// `TestSanitizeDriverName` (`util_test.go`).
     #[test]
@@ -51,7 +51,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_sync_flag_sets_next_reconcile() {
         let a = CsiAttacher::new(
-            Arc::new(rusternetes_storage::memory::MemoryStorage::new()),
+            Arc::new(k3rs_storage::memory::MemoryStorage::new()),
             "d.example.com",
             CsiControllerClient::with_endpoint("/nonexistent.sock"),
         )

@@ -2,20 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::policy::{LimitRange, LimitRangeItem};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_dns_subdomain, validate_object_meta,
-    };
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::policy::{LimitRange, LimitRangeItem};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
     pub use std::cmp::Ordering;
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::policy::{LimitRange, LimitRangeItem, LimitRangeSpec};
-    use rusternetes_common::validation::limitrange::*;
+    use k3rs_common::resources::policy::{LimitRange, LimitRangeItem, LimitRangeSpec};
+    use k3rs_common::validation::limitrange::*;
 
     fn map(pairs: &[(&str, &str)]) -> Option<HashMap<String, String>> {
         Some(
@@ -67,7 +65,7 @@ mod tests {
 
     #[test]
     fn limit_range_duplicate_type_rejected() {
-        use rusternetes_common::validation::field::ErrorType;
+        use k3rs_common::validation::field::ErrorType;
         let errs = validate_limit_range(&lr(vec![item("Container"), item("Container")]));
         assert!(
             errs.iter()

@@ -7,7 +7,7 @@ mod __parent {
     pub use hyper::Uri;
     pub use hyper_util::client::legacy::connect::{Connected, Connection};
     pub use hyper_util::rt::{TokioExecutor, TokioIo};
-    pub use rusternetes_api_server::egress_selector::{Conn, Dialer};
+    pub use k3rs_api_server::egress_selector::{Conn, Dialer};
     pub use std::future::Future;
     pub use std::pin::Pin;
     pub use std::sync::Arc;
@@ -17,8 +17,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::egress_http::*;
-    use rusternetes_api_server::egress_selector::{
+    use k3rs_api_server::egress_http::*;
+    use k3rs_api_server::egress_selector::{
         DialerCreator, MetricsOptions, Proxier, ProxyServerConnector,
     };
     use std::sync::Mutex;

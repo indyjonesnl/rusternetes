@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::logs::*;
+    use k3rs_kubectl::commands::logs::*;
 
     #[test]
     fn test_log_url_basic() {

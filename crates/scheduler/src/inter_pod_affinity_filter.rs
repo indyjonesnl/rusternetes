@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rusternetes_common::resources::{Namespace, Node, Pod};
+use k3rs_common::resources::{Namespace, Node, Pod};
 
 use crate::inter_pod_affinity_score::{pod_namespace, AffinityTerm, PodInfo};
 use crate::pod_topology_spread_score::pods_by_node;

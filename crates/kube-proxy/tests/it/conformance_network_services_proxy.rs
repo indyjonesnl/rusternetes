@@ -21,15 +21,15 @@
 //! exercises the `/proxy` subresource (pod proxy + service proxy) at the
 //! handler/storage seam.
 
-use rusternetes_common::resources::endpointslice::EndpointPort as ESEndpointPort;
-use rusternetes_common::resources::service::{ClientIPConfig, SessionAffinityConfig};
-use rusternetes_common::resources::{
+use k3rs_common::resources::endpointslice::EndpointPort as ESEndpointPort;
+use k3rs_common::resources::service::{ClientIPConfig, SessionAffinityConfig};
+use k3rs_common::resources::{
     Endpoint, EndpointConditions, EndpointSlice, IntOrString, Service, ServicePort, ServiceSpec,
     ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kube_proxy::iptables::IptablesManager;
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kube_proxy::iptables::IptablesManager;
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -389,12 +389,8 @@ async fn services_with_no_endpoints_emit_no_dnat_rules() {
         .build_nat_rules(&[svc], &map, &[], "test-node")
         .await;
     // Chain headers must always be present
-    assert!(rules.contains(":RUSTERNETES-SERVICES - [0:0]"), "{}", rules);
-    assert!(
-        rules.contains(":RUSTERNETES-NODEPORTS - [0:0]"),
-        "{}",
-        rules
-    );
+    assert!(rules.contains(":K3RS-SERVICES - [0:0]"), "{}", rules);
+    assert!(rules.contains(":K3RS-NODEPORTS - [0:0]"), "{}", rules);
     // But no DNAT rule pointing at 10.96.0.50
     assert!(!rules.contains("10.96.0.50/32 -p tcp --dport 80 -j DNAT"));
     assert!(rules.ends_with("COMMIT\n"));
@@ -464,9 +460,9 @@ async fn services_should_expose_service_on_nodeport() {
         .build_nat_rules(&[svc], &map, &[], "test-node")
         .await;
     // ClusterIP rule
-    assert!(rules.contains("-A RUSTERNETES-SERVICES -d 10.96.0.70/32"));
+    assert!(rules.contains("-A K3RS-SERVICES -d 10.96.0.70/32"));
     // NodePort rule
-    assert!(rules.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30080"));
+    assert!(rules.contains("-A K3RS-NODEPORTS -p tcp --dport 30080"));
     assert!(rules.contains("--to-destination 10.244.0.11:8080"));
 }
 
@@ -533,12 +529,12 @@ async fn services_should_complete_service_status_lifecycle() {
         .build_nat_rules(std::slice::from_ref(&svc), &map, &[], "test-node")
         .await;
     assert!(
-        rules_present.contains("-A RUSTERNETES-SERVICES -d 10.96.0.150/32"),
+        rules_present.contains("-A K3RS-SERVICES -d 10.96.0.150/32"),
         "ClusterIP DNAT rule must exist while LB Service is present:\n{}",
         rules_present
     );
     assert!(
-        rules_present.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30150"),
+        rules_present.contains("-A K3RS-NODEPORTS -p tcp --dport 30150"),
         "NodePort DNAT rule must exist while LB Service is present:\n{}",
         rules_present
     );
@@ -588,8 +584,8 @@ async fn services_loadbalancer_programs_clusterip_and_nodeport() {
     let rules = test_iptables()
         .build_nat_rules(&[svc], &map, &[], "test-node")
         .await;
-    assert!(rules.contains("-A RUSTERNETES-SERVICES -d 10.96.0.100/32"));
-    assert!(rules.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30100"));
+    assert!(rules.contains("-A K3RS-SERVICES -d 10.96.0.100/32"));
+    assert!(rules.contains("-A K3RS-NODEPORTS -p tcp --dport 30100"));
     assert!(rules.contains("--to-destination 10.244.2.2:8080"));
 }
 
@@ -714,7 +710,7 @@ async fn services_should_switch_session_affinity_nodeport() {
 
     // Sanity: both rule sets touch the NODEPORTS chain on the right dport.
     assert!(
-        r_none.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30130"),
+        r_none.contains("-A K3RS-NODEPORTS -p tcp --dport 30130"),
         "no-affinity rules missing NODEPORTS dport entry:\n{}",
         r_none
     );
@@ -751,10 +747,10 @@ async fn services_should_switch_session_affinity_nodeport() {
         .expect("affinity variant must contain --rcheck rule");
     let first_fallback_jump = r_aff
         .find(&format!(
-            "-A RUSTERNETES-NODEPORTS -p tcp --dport 30130 -j {}-",
+            "-A K3RS-NODEPORTS -p tcp --dport 30130 -j {}-",
             sep_prefix
         ))
-        .or_else(|| r_aff.find("-A RUSTERNETES-NODEPORTS -p tcp --dport 30130 -m statistic"))
+        .or_else(|| r_aff.find("-A K3RS-NODEPORTS -p tcp --dport 30130 -m statistic"))
         .expect("affinity variant must contain probability fallback rule");
     assert!(
         first_rcheck < first_fallback_jump,
@@ -765,7 +761,7 @@ async fn services_should_switch_session_affinity_nodeport() {
     // Affinity variant must NOT emit a direct `-j DNAT --to-destination`
     // line in the NODEPORTS chain — backends are reached via SEP chains.
     for line in r_aff.lines() {
-        if line.contains("RUSTERNETES-NODEPORTS") && line.contains("--dport 30130") {
+        if line.contains("K3RS-NODEPORTS") && line.contains("--dport 30130") {
             assert!(
                 !line.contains("-j DNAT"),
                 "affinity NODEPORTS chain must not contain direct DNAT:\n{}",
@@ -840,7 +836,7 @@ async fn services_should_have_session_affinity_for_nodeport() {
         .build_nat_rules(&[svc], &map, &[], "test-node")
         .await;
     for line in rules_no_recent.lines() {
-        if line.contains("RUSTERNETES-NODEPORTS") && line.contains("--dport 30140") {
+        if line.contains("K3RS-NODEPORTS") && line.contains("--dport 30140") {
             assert!(
                 !line.contains("KUBE-SEP-"),
                 "recent_available=false NODEPORTS chain must not reference SEP chains:\n{}",
@@ -859,7 +855,7 @@ async fn services_should_have_session_affinity_for_nodeport() {
         rules_no_recent
     );
     assert!(
-        rules_no_recent.contains("-A RUSTERNETES-NODEPORTS -p tcp --dport 30140"),
+        rules_no_recent.contains("-A K3RS-NODEPORTS -p tcp --dport 30140"),
         "direct-DNAT fallback missing NODEPORTS dport rule:\n{}",
         rules_no_recent
     );
@@ -918,7 +914,7 @@ async fn services_session_affinity_timeout_propagates_when_recent_available() {
 /// `syncProxyRules`) throttles `syncProxyRules` by `minSyncPeriod`, so back-
 /// to-back Service+EndpointSlice creations are coalesced and the p99
 /// service-becomes-reachable latency drifts above the upstream threshold
-/// (~20s). Rusternetes' kube-proxy run loop (`crates/kube-proxy/src/lib.rs`)
+/// (~20s). k3rs' kube-proxy run loop (`crates/kube-proxy/src/lib.rs`)
 /// uses a `WorkQueue` that coalesces with sentinel `RECONCILE_ALL` but does
 /// NOT add a minSyncPeriod throttle — every Service/EndpointSlice watch event
 /// results in a re-queued sync. Combined with the order-independent state

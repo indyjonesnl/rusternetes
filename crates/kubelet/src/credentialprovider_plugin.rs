@@ -23,8 +23,8 @@
 
 use crate::credentialprovider::{AuthConfig, DockerConfig};
 use anyhow::{anyhow, Result};
-use rusternetes_common::go_duration::{format_go_duration, parse_go_duration};
-use rusternetes_common::validation::metav1::is_qualified_name;
+use k3rs_common::go_duration::{format_go_duration, parse_go_duration};
+use k3rs_common::validation::metav1::is_qualified_name;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value;

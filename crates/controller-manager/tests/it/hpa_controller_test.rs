@@ -1,16 +1,16 @@
-use rusternetes_common::resources::pod::{Pod, PodCondition, PodSpec, PodStatus};
-use rusternetes_common::resources::{
+use k3rs_common::resources::pod::{Pod, PodCondition, PodSpec, PodStatus};
+use k3rs_common::resources::{
     Container, CrossVersionObjectReference, Deployment, DeploymentSpec, ExternalMetricSource,
     HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler, HorizontalPodAutoscalerBehavior,
     HorizontalPodAutoscalerSpec, MetricIdentifier, MetricSpec, MetricTarget, ObjectMetricSource,
     PodTemplateSpec, PodsMetricSource, ResourceMetricSource,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
-use rusternetes_controller_manager::controllers::hpa_metrics_client::{
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::hpa::HorizontalPodAutoscalerController;
+use k3rs_controller_manager::controllers::hpa_metrics_client::{
     FakeMetricsClient, MetricsClient, PodMetricsInfo,
 };
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -763,7 +763,7 @@ async fn test_hpa_current_metrics_populated() {
 // Mirrors upstream `kubernetes/test/e2e/apps/hpa.go` behavioural assertions.
 //
 // Tests marked `#[ignore = "RED-state: ..."]` describe upstream-compatible
-// behaviour that the rusternetes HPA controller does NOT yet implement
+// behaviour that the k3rs HPA controller does NOT yet implement
 // (custom metrics API integration, behaviour policies, stabilization
 // windows, multi-metric AND/OR logic, etc.). They serve as a TODO ratchet:
 // remove the `#[ignore]` attribute once the corresponding controller logic
@@ -1240,7 +1240,7 @@ async fn test_hpa_tolerance_threshold() {
 /// 60s" or "+50% every 60s"). The first reconcile after a large desired
 /// jump must respect the policy and only scale by the allowed delta.
 ///
-/// RED-state: rusternetes ignores `behavior` entirely — the field is
+/// RED-state: k3rs ignores `behavior` entirely — the field is
 /// accepted on the spec but never consulted in
 /// `calculate_desired_replicas`.
 #[tokio::test]
@@ -1307,7 +1307,7 @@ async fn test_hpa_behavior_scale_up_policy() {
 }
 
 /// HPA accepts behavior fields (defensive deserialization). Even before
-/// rusternetes enforces `behavior.scaleUp` / `behavior.scaleDown`, the API
+/// k3rs enforces `behavior.scaleUp` / `behavior.scaleDown`, the API
 /// must accept HPAs that declare them — otherwise upstream manifests fail
 /// to apply.
 ///

@@ -21,10 +21,10 @@
 //! `TestIsSchedulableAfterPersistentVolumeChange` tables.
 
 use super::events::{as_typed, EventObject, QueueingHint};
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     PersistentVolume, PersistentVolumeClaim, StorageClass, VolumeBindingMode,
 };
-use rusternetes_common::resources::{Pod, Volume};
+use k3rs_common::resources::{Pod, Volume};
 use std::collections::BTreeSet;
 use tracing::debug;
 

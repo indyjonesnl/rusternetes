@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{Node, Pod};
+    pub use k3rs_common::resources::{Node, Pod};
     pub use std::any::Any;
     pub use std::collections::HashMap;
     pub use std::fmt;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::events::*;
+    use k3rs_scheduler::queue::events::*;
 
     fn pod_json(v: serde_json::Value) -> Pod {
         serde_json::from_value(v).unwrap()

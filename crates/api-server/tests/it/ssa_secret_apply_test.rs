@@ -25,7 +25,7 @@
 //! same shape as the ConfigMap test so the regression guard is symmetric.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn make_state() -> TestApiServer {
@@ -375,7 +375,7 @@ async fn ssa_secret_type_field_is_immutable_post_create() {
 //    Upstream pin:
 //    `pkg/apis/core/strategy.go` Secret `PrepareForCreate` /
 //    `PrepareForUpdate` (and the `normalize()` shim on
-//    `rusternetes_common::resources::Secret`) fold `stringData` entries
+//    `k3rs_common::resources::Secret`) fold `stringData` entries
 //    into base64-encoded `data` entries — later entries (stringData) win.
 //    SSA must produce the same effective storage state.
 // ---------------------------------------------------------------------------

@@ -2,30 +2,28 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::admissionregistration::authz::{
+    pub use k3rs_api_server::registry::admissionregistration::authz::{
         authorize_mutating_param_ref, ParamAuthz,
     };
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy, ValidateFuture,
     };
-    pub use rusternetes_common::authz::Authorizer;
-    pub use rusternetes_common::resources::MutatingAdmissionPolicyBinding;
-    pub use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-    pub use rusternetes_common::validation::mutating_admission_policy::{
+    pub use k3rs_common::authz::Authorizer;
+    pub use k3rs_common::resources::MutatingAdmissionPolicyBinding;
+    pub use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+    pub use k3rs_common::validation::mutating_admission_policy::{
         set_defaults_mutating_admission_policy_binding, validate_mutating_admission_policy_binding,
     };
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_dns_subdomain, validate_object_meta,
-    };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::admissionregistration::mutatingadmissionpolicybinding::*;
+    use k3rs_api_server::registry::admissionregistration::mutatingadmissionpolicybinding::*;
     use serde_json::json;
 
     /// `validPolicyBindings` (strategy_test.go:60-).
@@ -86,12 +84,12 @@ mod tests {
 
 mod invalid_status_tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::admissionregistration::mutatingadmissionpolicybinding::*;
-    use rusternetes_api_server::registry::generic::store::{CreateOptions, UpdateOptions};
-    use rusternetes_api_server::registry::rest::DefaultUpdatedObjectInfo;
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_common::authz::AlwaysDenyAuthorizer;
-    use rusternetes_common::Error;
+    use k3rs_api_server::registry::admissionregistration::mutatingadmissionpolicybinding::*;
+    use k3rs_api_server::registry::generic::store::{CreateOptions, UpdateOptions};
+    use k3rs_api_server::registry::rest::DefaultUpdatedObjectInfo;
+    use k3rs_common::auth::UserInfo;
+    use k3rs_common::authz::AlwaysDenyAuthorizer;
+    use k3rs_common::Error;
 
     /// `MutatingAdmissionPolicyBinding` strategy `Validate` appends the authz error as a
     /// `field.Forbidden`, and `BeforeCreate` / `BeforeUpdate` wrap the list in
@@ -104,7 +102,7 @@ mod invalid_status_tests {
             "policyName": "p.example.com",
             "paramRef": {"name": "x", "parameterNotFoundAction": "Deny"}}})).unwrap();
         let storage = Arc::new(StorageBackend::Memory(Arc::new(
-            rusternetes_storage::MemoryStorage::new(),
+            k3rs_storage::MemoryStorage::new(),
         )));
         let store = new_store(storage, Arc::new(AlwaysDenyAuthorizer));
         let user = UserInfo {

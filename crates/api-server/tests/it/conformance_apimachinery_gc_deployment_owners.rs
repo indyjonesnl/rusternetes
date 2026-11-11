@@ -21,13 +21,13 @@
 
 use std::sync::Arc;
 
-use rusternetes_client::http::ApiClient;
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_controller_manager::controllers::replicationcontroller::ReplicationControllerController;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_controller_manager::controllers::replicationcontroller::ReplicationControllerController;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// Upper bound on controller passes standing in for one upstream poll budget.
@@ -222,7 +222,7 @@ async fn gc_deletes_rs_created_by_deployment_when_not_orphaning() {
     let ns = "gc-delete-rs";
     // The controllers' pods need the account upstream's ServiceAccount controller
     // creates (ServiceAccount admission, admission.go:160-163).
-    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
+    k3rs_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let deploys = format!("/apis/apps/v1/namespaces/{ns}/deployments");
     let rss = format!("/apis/apps/v1/namespaces/{ns}/replicasets");
 
@@ -281,7 +281,7 @@ async fn gc_orphans_rs_created_by_deployment_when_propagation_is_orphan() {
     let ns = "gc-orphan-rs";
     // The controllers' pods need the account upstream's ServiceAccount controller
     // creates (ServiceAccount admission, admission.go:160-163).
-    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
+    k3rs_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let deploys = format!("/apis/apps/v1/namespaces/{ns}/deployments");
     let rss = format!("/apis/apps/v1/namespaces/{ns}/replicasets");
 
@@ -373,7 +373,7 @@ async fn gc_keeps_dependents_with_a_valid_owner_during_foreground_delete() {
     let ns = "gc-valid-and-pending";
     // The controllers' pods need the account upstream's ServiceAccount controller
     // creates (ServiceAccount admission, admission.go:160-163).
-    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
+    k3rs_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let rcs = format!("/api/v1/namespaces/{ns}/replicationcontrollers");
     let pods = format!("/api/v1/namespaces/{ns}/pods");
 
@@ -510,7 +510,7 @@ async fn gc_is_not_blocked_by_dependency_circle() {
     let ns = "gc-circle";
     // The controllers' pods need the account upstream's ServiceAccount controller
     // creates (ServiceAccount admission, admission.go:160-163).
-    rusternetes_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
+    k3rs_test_support::harness::seed_default_service_account(&*api.storage, ns).await;
     let pods = format!("/api/v1/namespaces/{ns}/pods");
 
     // Create pod1, pod2, pod3 (:829-840).

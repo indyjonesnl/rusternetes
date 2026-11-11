@@ -8,7 +8,7 @@
 //! * `staging/src/k8s.io/apimachinery/pkg/util/version/version.go`
 //! * `staging/src/k8s.io/apiserver/pkg/util/compatibility/version.go`
 //!
-//! Reduction: rusternetes registers exactly one component (`kube`), so
+//! Reduction: k3rs registers exactly one component (`kube`), so
 //! `SetVersionMapping` / `dependentComponentVersion` (aggregated apiservers
 //! such as `wardle`) are not ported; every other component name fails with
 //! `component not registered: <name>` exactly as an unregistered one does
@@ -22,7 +22,7 @@ pub const DEFAULT_KUBE_COMPONENT: &str = "kube";
 
 /// `DefaultKubeBinaryVersion` (component-base/version/base.go:60-63): the
 /// hard-coded binary version. Upstream falls back to it whenever the build has
-/// no git tag (apiserver/pkg/util/compatibility/version.go:34-39); rusternetes
+/// no git tag (apiserver/pkg/util/compatibility/version.go:34-39); k3rs
 /// builds never carry a Kubernetes git tag, so it is always the binary version.
 pub const DEFAULT_KUBE_BINARY_VERSION: Version = Version::major_minor(1, 35);
 
@@ -359,13 +359,13 @@ pub struct VersionInfo {
 }
 
 /// `baseversion.Get()` (component-base/version/base.go): the build-stamped
-/// info. Rusternetes stamps these as constants.
+/// info. k3rs stamps these as constants.
 fn base_version_get() -> VersionInfo {
     VersionInfo {
         major: "1".to_string(),
         minor: "35".to_string(),
         git_version: "v1.35.0".to_string(),
-        git_commit: "rusternetes-v0.1.0".to_string(),
+        git_commit: "k3rs-v0.1.0".to_string(),
         git_tree_state: "clean".to_string(),
         build_date: "2026-03-10T00:00:00Z".to_string(),
         go_version: "rust1.83".to_string(),

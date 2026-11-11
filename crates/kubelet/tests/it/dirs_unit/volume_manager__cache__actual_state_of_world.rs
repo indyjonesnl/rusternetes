@@ -2,15 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{BlockVolumeMapper, Mounter, OwnedSpec};
-    pub use rusternetes_kubelet::volume_plugins::registry::VolumePluginMgr;
-    pub use rusternetes_kubelet::volume_plugins::util::get_unique_volume_name_from_spec;
-    pub use rusternetes_kubelet::volume_plugins::util::operation_executor::{
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_kubelet::volume_plugins::plugin::{BlockVolumeMapper, Mounter, OwnedSpec};
+    pub use k3rs_kubelet::volume_plugins::registry::VolumePluginMgr;
+    pub use k3rs_kubelet::volume_plugins::util::get_unique_volume_name_from_spec;
+    pub use k3rs_kubelet::volume_plugins::util::operation_executor::{
         self, DeviceMountState, MarkVolumeOpts, VolumeMountState,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
+    pub use k3rs_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
     pub use std::collections::{HashMap, HashSet};
     pub use std::ops::{Deref, DerefMut};
     pub use std::sync::{Arc, RwLock};
@@ -43,14 +43,14 @@ mod tests {
     use super::__parent::*;
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
-    use rusternetes_common::feature_gates::with_feature;
-    use rusternetes_common::quantity::Format;
-    use rusternetes_common::resources::Pod;
-    use rusternetes_kubelet::volume_manager::cache::actual_state_of_world::*;
-    use rusternetes_kubelet::volume_plugins::plugin::{
+    use k3rs_common::feature_gates::with_feature;
+    use k3rs_common::quantity::Format;
+    use k3rs_common::resources::Pod;
+    use k3rs_kubelet::volume_manager::cache::actual_state_of_world::*;
+    use k3rs_kubelet::volume_plugins::plugin::{
         Mounter, NodeExpandableVolumePlugin, NodeResizeOptions, Spec, VolumePlugin,
     };
-    use rusternetes_kubelet::volume_plugins::util::get_unique_pod_name;
+    use k3rs_kubelet::volume_plugins::util::get_unique_pod_name;
 
     /// Port of `volumetesting.FakeVolumePlugin`
     /// (`pkg/volume/testing/testing.go`), trimmed to what the
@@ -122,7 +122,7 @@ mod tests {
             &self,
             _vol_name: &str,
             _pod_uid: &str,
-        ) -> Result<Box<dyn rusternetes_kubelet::volume_plugins::Unmounter>> {
+        ) -> Result<Box<dyn k3rs_kubelet::volume_plugins::Unmounter>> {
             unimplemented!("test plugin never unmounts")
         }
 
@@ -130,7 +130,7 @@ mod tests {
             &self,
             _vol_name: &str,
             _mount_path: &str,
-        ) -> Result<rusternetes_kubelet::volume_plugins::ReconstructedVolume> {
+        ) -> Result<k3rs_kubelet::volume_plugins::ReconstructedVolume> {
             unimplemented!("test plugin never reconstructs")
         }
     }
@@ -153,10 +153,8 @@ mod tests {
         id: &'static str,
     }
 
-    impl rusternetes_kubelet::volume_plugins::plugin::MetricsProvider for FakeMounter {
-        fn get_metrics(
-            &self,
-        ) -> anyhow::Result<rusternetes_kubelet::volume_plugins::plugin::Metrics> {
+    impl k3rs_kubelet::volume_plugins::plugin::MetricsProvider for FakeMounter {
+        fn get_metrics(&self) -> anyhow::Result<k3rs_kubelet::volume_plugins::plugin::Metrics> {
             Ok(Default::default())
         }
     }
@@ -167,14 +165,14 @@ mod tests {
             self.id.to_string()
         }
 
-        fn get_attributes(&self) -> rusternetes_kubelet::volume_plugins::plugin::Attributes {
+        fn get_attributes(&self) -> k3rs_kubelet::volume_plugins::plugin::Attributes {
             Default::default()
         }
 
         async fn set_up_at(
             &self,
             _dir: &str,
-            _args: &rusternetes_kubelet::volume_plugins::MounterArgs,
+            _args: &k3rs_kubelet::volume_plugins::MounterArgs,
         ) -> Result<()> {
             Ok(())
         }
@@ -183,8 +181,8 @@ mod tests {
     /// Stands in for whatever `plugin.NewBlockVolumeMapper` returns upstream.
     struct FakeBlockVolumeMapper;
 
-    impl rusternetes_kubelet::volume_plugins::plugin::MetricsProvider for FakeBlockVolumeMapper {
-        fn get_metrics(&self) -> Result<rusternetes_kubelet::volume_plugins::plugin::Metrics> {
+    impl k3rs_kubelet::volume_plugins::plugin::MetricsProvider for FakeBlockVolumeMapper {
+        fn get_metrics(&self) -> Result<k3rs_kubelet::volume_plugins::plugin::Metrics> {
             Ok(Default::default())
         }
     }

@@ -1,11 +1,11 @@
 use crate::controllers::device_taint_eviction::tolerates_taint;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     AllocationResult, DeviceAllocationResult, DeviceClass, DeviceRequestAllocationResult,
     DeviceToleration, ResourceClaim, ResourceClaimStatus, ResourceSlice,
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;

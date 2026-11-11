@@ -11,14 +11,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use rusternetes_common::resources::endpointslice::EndpointSlice;
-use rusternetes_common::validation::endpointslice::{
+use k3rs_common::resources::endpointslice::EndpointSlice;
+use k3rs_common::validation::endpointslice::{
     validate_endpoint_slice, validate_endpoint_slice_update,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::metav1::get_warnings_for_ip;
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::metav1::get_warnings_for_ip;
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -84,7 +84,7 @@ fn drop_topology_on_v1(old: Option<&EndpointSlice>, new: &mut EndpointSlice) {
         if let Some(node) = topology_node {
             if ep.node_name.is_none()
                 && prev_node_names.contains(&node)
-                && rusternetes_common::validation::objectmeta::name_is_dns_subdomain(&node, false)
+                && k3rs_common::validation::objectmeta::name_is_dns_subdomain(&node, false)
                     .is_empty()
             {
                 ep.node_name = Some(node);

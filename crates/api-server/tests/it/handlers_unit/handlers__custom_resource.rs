@@ -8,23 +8,23 @@ mod __parent {
         response::Response,
         Extension, Json,
     };
-    pub use rusternetes_api_server::endpoints::handlers::{self as endpoints, RequestScope};
-    pub use rusternetes_api_server::registry::apiextensions::controllers::{
+    pub use k3rs_api_server::endpoints::handlers::{self as endpoints, RequestScope};
+    pub use k3rs_api_server::registry::apiextensions::controllers::{
         find_crd_condition, ESTABLISHED, NAMES_ACCEPTED, TERMINATING,
     };
-    pub use rusternetes_api_server::registry::apiextensions::customresource::{
+    pub use k3rs_api_server::registry::apiextensions::customresource::{
         new_scale_rest, CustomResourceRest, StrictMode,
     };
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    pub use rusternetes_common::validation::crd::is_crd_condition_true;
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    pub use k3rs_common::validation::crd::is_crd_condition_true;
+    pub use k3rs_common::{
         authz::{Decision, RequestAttributes},
         resources::{CustomResource, CustomResourceDefinition, Scale},
         schema_validation::SchemaValidator,
         List, Result,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, info, warn};
@@ -32,12 +32,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::custom_resource::*;
-    use rusternetes_common::resources::{
+    use k3rs_api_server::handlers::custom_resource::*;
+    use k3rs_common::resources::{
         CustomResourceDefinitionNames, CustomResourceDefinitionSpec,
         CustomResourceDefinitionVersion, ResourceScope,
     };
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_common::types::ObjectMeta;
     use serde_json::json;
 
     fn create_test_crd() -> CustomResourceDefinition {
@@ -94,21 +94,17 @@ mod tests {
 
     fn crd_with_conditions(conds: &[(&str, &str)]) -> CustomResourceDefinition {
         let mut crd = create_test_crd();
-        crd.status = Some(
-            rusternetes_common::resources::CustomResourceDefinitionStatus {
-                conditions: Some(
-                    conds
-                        .iter()
-                        .map(|(t, s)| {
-                            serde_json::from_value(json!({"type": t, "status": s})).unwrap()
-                        })
-                        .collect(),
-                ),
-                accepted_names: None,
-                observed_generation: None,
-                stored_versions: None,
-            },
-        );
+        crd.status = Some(k3rs_common::resources::CustomResourceDefinitionStatus {
+            conditions: Some(
+                conds
+                    .iter()
+                    .map(|(t, s)| serde_json::from_value(json!({"type": t, "status": s})).unwrap())
+                    .collect(),
+            ),
+            accepted_names: None,
+            observed_generation: None,
+            stored_versions: None,
+        });
         crd
     }
 
@@ -154,8 +150,8 @@ mod tests {
 
     /// Helper: create a CRD with a schema that has default values
     fn create_crd_with_defaults() -> CustomResourceDefinition {
-        use rusternetes_common::resources::crd::JSONSchemaProps;
-        use rusternetes_common::resources::CustomResourceValidation;
+        use k3rs_common::resources::crd::JSONSchemaProps;
+        use k3rs_common::resources::CustomResourceValidation;
 
         let mut spec_properties = std::collections::HashMap::new();
         spec_properties.insert(
@@ -328,9 +324,8 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("fieldValidation".to_string(), "Strict".to_string());
 
-        let result = rusternetes_api_server::handlers::validation::validate_strict_fields(
-            &params, body, &cr,
-        );
+        let result =
+            k3rs_api_server::handlers::validation::validate_strict_fields(&params, body, &cr);
         assert!(
             result.is_err(),
             "Strict validation should reject unknown fields"
@@ -364,9 +359,8 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("fieldValidation".to_string(), "Strict".to_string());
 
-        let result = rusternetes_api_server::handlers::validation::validate_strict_fields(
-            &params, body, &cr,
-        );
+        let result =
+            k3rs_api_server::handlers::validation::validate_strict_fields(&params, body, &cr);
         assert!(
             result.is_ok(),
             "Strict validation should pass for valid CR: {:?}",

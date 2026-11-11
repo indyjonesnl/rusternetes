@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::patch::mergepatch::*;
+    use k3rs_common::patch::mergepatch::*;
     use serde_json::json;
 
     #[test]

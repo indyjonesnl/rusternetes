@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use cel::common::ast::{EntryExpr, Expr, IdedExpr};
-    pub use rusternetes_common::feature_gates::{self, Feature, Version};
+    pub use k3rs_common::feature_gates::{self, Feature, Version};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cel_versions::*;
-    use rusternetes_common::feature_gates::{with_feature, Version};
+    use k3rs_common::cel_versions::*;
+    use k3rs_common::feature_gates::{with_feature, Version};
     use serial_test::serial;
 
     fn v(minor: u32) -> Version {
@@ -199,7 +199,7 @@ mod tests {
     fn default_compatibility_version_is_the_min_compatibility_version() {
         assert_eq!(
             default_compatibility_version(),
-            rusternetes_common::feature_gates::min_compatibility_version()
+            k3rs_common::feature_gates::min_compatibility_version()
         );
     }
 }

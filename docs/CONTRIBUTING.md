@@ -1,6 +1,6 @@
-# Contributing to Rūsternetes
+# Contributing to k3rs
 
-Thank you for your interest in contributing to Rusternetes. This is a Rust reimplementation of Kubernetes spanning 10 crates, 216,000+ lines of code, and 3,100+ tests. This document covers everything you need to get started.
+Thank you for your interest in contributing to k3rs. This is a Rust reimplementation of Kubernetes spanning 10 crates, 216,000+ lines of code, and 3,100+ tests. This document covers everything you need to get started.
 
 ## Prerequisites
 
@@ -67,7 +67,7 @@ mod tests {
 To run tests for a single crate (note: use underscores in the package name):
 
 ```bash
-cargo test -p rusternetes-api-server
+cargo test -p k3rs-api-server
 ```
 
 To run a single test with output:
@@ -119,7 +119,7 @@ New controllers go in `crates/controller-manager/src/controllers/` and are regis
 For integration testing against a full cluster:
 
 ```bash
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 podman compose build        # or: docker compose build
 podman compose up -d        # or: docker compose up -d
 bash scripts/bootstrap-cluster.sh
@@ -128,7 +128,7 @@ bash scripts/bootstrap-cluster.sh
 Then interact with it:
 
 ```bash
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 kubectl get pods -A
 ```
 
@@ -155,7 +155,7 @@ The e2e log is written to `/tmp/sonobuoy/results/e2e.log` inside the e2e contain
 | `kube-proxy` | iptables-based service routing |
 | `scheduler` | Pod scheduling with affinity, taints, tolerations, preemption |
 | `kubectl` | CLI tool |
-| `rusternetes` | All-in-one binary (all components as tokio tasks, embedded SQLite or Redis) |
+| `k3rs` | All-in-one binary (all components as tokio tasks, embedded SQLite or Redis) |
 
 ## Code Style
 
@@ -174,4 +174,4 @@ The e2e log is written to `/tmp/sonobuoy/results/e2e.log` inside the e2e contain
 
 ## License
 
-By contributing to Rusternetes, you agree that your contributions will be licensed under the Apache-2.0 License.
+By contributing to k3rs, you agree that your contributions will be licensed under the Apache-2.0 License.

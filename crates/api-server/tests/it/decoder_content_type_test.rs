@@ -12,7 +12,7 @@
 //!   `update.go` — pick a decoder based on `Content-Type` (JSON, YAML,
 //!   protobuf). Unsupported types return 415.
 //!
-//! In rusternetes the dispatch sites are:
+//! In k3rs the dispatch sites are:
 //! - `crates/api-server/src/middleware.rs::normalize_content_type_middleware`
 //!   — preserves the original Content-Type in `x-original-content-type` for
 //!   the three patch types, and forwards `application/apply-patch+yaml`
@@ -33,8 +33,8 @@
 //!     arrays-of-maps with a `name` merge key).
 
 use axum::http::Method;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -200,12 +200,12 @@ async fn test_content_type_application_json_create_succeeds() {
     assert_eq!(stored["metadata"]["name"], "json-pod");
 }
 
-/// `application/xml` on POST is unsupported. rusternetes' middleware
+/// `application/xml` on POST is unsupported. k3rs' middleware
 /// rewrites the Content-Type to `application/json` while leaving the body
 /// untouched. With an XML body, the JSON decoder then fails. We assert
 /// the observable contract: a 4xx status and no object persisted.
 ///
-/// Upstream apiserver returns 415 Unsupported Media Type; rusternetes
+/// Upstream apiserver returns 415 Unsupported Media Type; k3rs
 /// returns 400 (InvalidResource) because the rewrite happens before the
 /// handler can inspect the original Content-Type. The status-class check
 /// pins the rejection regardless of which 4xx code is chosen.
@@ -258,7 +258,7 @@ async fn test_content_type_text_plain_returns_4xx() {
     );
 }
 
-/// `application/yaml` on POST. The current rusternetes middleware does
+/// `application/yaml` on POST. The current k3rs middleware does
 /// NOT translate YAML to JSON — it only rewrites the Content-Type header,
 /// so a YAML body fails JSON decoding. The test accepts either outcome
 /// (2xx + persisted, or 4xx + nothing stored) so it stays green if YAML
@@ -611,7 +611,7 @@ async fn test_content_type_patch_unsupported_content_type_rejected() {
 
 /// `application/apply-patch+yaml` with `?fieldManager=<name>` routes to the
 /// server-side apply code path. The body here is the JSON encoding of an
-/// apply document (apiserver accepts JSON-flavored YAML); rusternetes'
+/// apply document (apiserver accepts JSON-flavored YAML); k3rs'
 /// SSA implementation reads it as JSON.
 ///
 /// Success criterion: the PATCH returns 2xx and a `managedFields` entry
@@ -672,7 +672,7 @@ async fn test_content_type_apply_patch_yaml_routes_to_ssa() {
 }
 
 /// `application/apply-patch+yaml` WITHOUT `?fieldManager`. Upstream
-/// requires fieldManager for apply requests. rusternetes' pod handler
+/// requires fieldManager for apply requests. k3rs' pod handler
 /// falls through to the regular patch dispatcher, which then fails to
 /// map `apply-patch+yaml` onto a `PatchType` and returns a 4xx.
 #[tokio::test]

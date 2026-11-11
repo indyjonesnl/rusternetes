@@ -4,16 +4,16 @@
 //! garbage collector's monitor and the dynamic client's apply `Patch`.
 
 use async_trait::async_trait;
-use rusternetes_common::resources::storageversionmigration::StorageVersionMigration;
-use rusternetes_controller_manager::controllers::storage_version_migrator_rv::SvmDiscovery;
-use rusternetes_controller_manager::controllers::storage_version_migrator_svm::{
+use k3rs_common::resources::storageversionmigration::StorageVersionMigration;
+use k3rs_controller_manager::controllers::storage_version_migrator_rv::SvmDiscovery;
+use k3rs_controller_manager::controllers::storage_version_migrator_svm::{
     GraphMonitor, MigrationPatcher, Monitor, MonitoredObject, PatchError, SvmController,
 };
-use rusternetes_discovery::restmapper::{
+use k3rs_discovery::restmapper::{
     new_discovery_rest_mapper, ApiGroupResources, ApiResource, Gvr, PriorityRestMapper,
     ServedResource,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -391,7 +391,7 @@ async fn incomparable_object_resource_version_fails_the_migration() {
 
 #[tokio::test]
 async fn storage_monitor_lists_every_namespace_with_uid_and_resource_version() {
-    use rusternetes_controller_manager::controllers::storage_version_migrator_svm::StorageGraphMonitor;
+    use k3rs_controller_manager::controllers::storage_version_migrator_svm::StorageGraphMonitor;
     let storage = Arc::new(MemoryStorage::new());
     for (ns, name) in [("a", "one"), ("b", "two")] {
         storage

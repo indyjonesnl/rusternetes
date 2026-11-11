@@ -11,19 +11,19 @@ mod __parent {
     pub use base64::Engine;
     pub use futures::future::{BoxFuture, FutureExt, Shared};
     pub use hmac::{Hmac, Mac};
-    pub use rusternetes_client::api_status;
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer, Decision, Opinion};
-    pub use rusternetes_common::lru_expire_cache::LruExpireCache;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_client::api_status;
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer, Decision, Opinion};
+    pub use k3rs_common::lru_expire_cache::LruExpireCache;
+    pub use k3rs_common::resources::{
         NonResourceAttributes, ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
         TokenReview, TokenReviewSpec,
     };
-    pub use rusternetes_common::wait::Backoff;
-    pub use rusternetes_kubelet::config::KubeletConfiguration;
-    pub use rusternetes_kubelet::server::{get_request_attributes, RequestAttributes};
-    pub use rusternetes_middleware::{user_from_client_cert_der, PeerCertificates};
+    pub use k3rs_common::wait::Backoff;
+    pub use k3rs_kubelet::config::KubeletConfiguration;
+    pub use k3rs_kubelet::server::{get_request_attributes, RequestAttributes};
+    pub use k3rs_middleware::{user_from_client_cert_der, PeerCertificates};
     pub use rustls::pki_types::{CertificateDer, UnixTime};
     pub use rustls::server::danger::ClientCertVerifier;
     pub use sha2::Sha256;
@@ -65,8 +65,8 @@ mod tests {
     use super::__parent::*;
     use axum::routing::get;
     use axum::Router;
-    use rusternetes_common::resources::{SubjectAccessReviewStatus, TokenReviewStatus};
-    use rusternetes_kubelet::server_auth::*;
+    use k3rs_common::resources::{SubjectAccessReviewStatus, TokenReviewStatus};
+    use k3rs_kubelet::server_auth::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
@@ -104,7 +104,7 @@ mod tests {
             let status = match review.spec.token.as_str() {
                 "good" => TokenReviewStatus {
                     authenticated: Some(true),
-                    user: Some(rusternetes_common::resources::authentication::UserInfo {
+                    user: Some(k3rs_common::resources::authentication::UserInfo {
                         username: Some("alice".into()),
                         uid: Some("u1".into()),
                         groups: Some(vec!["dev".into()]),
@@ -608,7 +608,7 @@ mod tests {
                 groups: vec![],
                 extra: Default::default(),
             };
-            let mut a = rusternetes_common::authz::RequestAttributes::new(user, "get", "nodes");
+            let mut a = k3rs_common::authz::RequestAttributes::new(user, "get", "nodes");
             a.api_version = "v1".into();
             a.subresource = Some(sub.into());
             a.name = Some("n1".into());
@@ -951,7 +951,7 @@ mod tests {
     }
 
     fn pki() -> Pki {
-        rusternetes_common::tls::TlsConfig::generate_self_signed("x", vec!["x".into()]).ok();
+        k3rs_common::tls::TlsConfig::generate_self_signed("x", vec!["x".into()]).ok();
         let mut p = rcgen::CertificateParams::default();
         p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -1057,7 +1057,7 @@ mod tests {
                 authorizer: Arc::new(AlwaysAllowAuthorizer),
             })),
         );
-        let tls = rusternetes_kubelet::serving_tls::kubelet_serving_tls_with_client_ca(
+        let tls = k3rs_kubelet::serving_tls::kubelet_serving_tls_with_client_ca(
             "node-1",
             Some(ca_path.to_str().unwrap()),
         )
@@ -1067,7 +1067,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         tokio::spawn(
             axum_server::from_tcp_rustls(listener, tls.clone())
-                .acceptor(rusternetes_kubelet::serving_tls::PeerCertAcceptor::new(tls))
+                .acceptor(k3rs_kubelet::serving_tls::PeerCertAcceptor::new(tls))
                 .serve(app.into_make_service()),
         );
 

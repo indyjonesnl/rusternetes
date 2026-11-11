@@ -30,7 +30,7 @@ use anyhow::{anyhow, Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::StreamExt;
 use inotify::{EventMask, Inotify, WatchMask};
-use rusternetes_common::tls::{client_cert_verifier_for_ca_bundle, TlsConfig};
+use k3rs_common::tls::{client_cert_verifier_for_ca_bundle, TlsConfig};
 use rustls::server::danger::ClientCertVerifier;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;

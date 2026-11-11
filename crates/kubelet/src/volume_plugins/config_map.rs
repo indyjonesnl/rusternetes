@@ -2,8 +2,8 @@ use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin}
 use crate::volumes::build_configmap_payload;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{ConfigMap, ConfigMapVolumeSource, Pod};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{ConfigMap, ConfigMapVolumeSource, Pod};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::info;
 
@@ -125,8 +125,8 @@ impl VolumePlugin for ConfigMapPlugin {
 /// is tolerated (empty volume) only when the ConfigMap is optional AND the
 /// failure is NotFound. Any other error (storage down, decode failure) fails
 /// the mount rather than silently projecting nothing.
-pub fn tolerate_get_error(err: &rusternetes_common::Error, optional: bool) -> bool {
-    optional && matches!(err, rusternetes_common::Error::NotFound(_))
+pub fn tolerate_get_error(err: &k3rs_common::Error, optional: bool) -> bool {
+    optional && matches!(err, k3rs_common::Error::NotFound(_))
 }
 
 pub struct ConfigMapMounter {

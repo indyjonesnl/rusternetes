@@ -20,7 +20,7 @@
 
 x-sccache-args: &sccache-args
   USE_SCCACHE: "${USE_SCCACHE-${GITHUB_ACTIONS:+1}}"
-  RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+  K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
 
 # Shared build config for the two node containers.
 x-node-build: &node-build
@@ -28,21 +28,21 @@ x-node-build: &node-build
   dockerfile: node.Dockerfile
   args:
     KUBELET_IMAGE: "${KUBELET_IMAGE:-isolated-work-kubelet:latest}"
-    CONTAINERD_IMAGE: "${CONTAINERD_IMAGE:-rusternetes-containerd:latest}"
+    CONTAINERD_IMAGE: "${CONTAINERD_IMAGE:-k3rs-containerd:latest}"
 
 services:
   rhino:
     build:
       context: .
       dockerfile: rhino.Dockerfile
-    container_name: rusternetes-rhino
+    container_name: k3rs-rhino
     restart: unless-stopped
     ports:
       - "2379:2379"
     volumes:
       - rhino-data:/data/db
     networks:
-      - rusternetes-net
+      - k3rs-net
     command: ["--listen-address", "0.0.0.0:2379", "--endpoint", "/data/db/state.db", "--max-connections", "20"]
     healthcheck:
       test: ["CMD-SHELL", "true"]
@@ -58,7 +58,7 @@ services:
       args: *sccache-args
       target: api-server
     image: isolated-work-api-server:latest
-    container_name: rusternetes-api-server
+    container_name: k3rs-api-server
     restart: unless-stopped
     ports:
       - "6443:6443"
@@ -66,11 +66,11 @@ services:
       rhino:
         condition: service_healthy
     networks:
-      rusternetes-net:
+      k3rs-net:
         aliases:
           - api-server
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
     command:
@@ -108,22 +108,22 @@ services:
   # Control-plane node: runs the kube-scheduler static pod.
   node-1:
     build: *node-build
-    image: rusternetes-node:latest
-    container_name: rusternetes-node-1
+    image: k3rs-node:latest
+    container_name: k3rs-node-1
     restart: unless-stopped
     privileged: true
     depends_on:
       - rhino
       - api-server
     networks:
-      - rusternetes-net
+      - k3rs-net
     volumes:
       - containerd-run-1:/run/containerd
       - containerd-data-1:/var/lib/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
-      - ./.rusternetes/manifests:/etc/rusternetes/manifests:ro
-      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+      - ./.k3rs/certs:/root/.k3rs/certs:ro
+      - ./.k3rs/manifests:/etc/k3rs/manifests:ro
+      - ${CERTS_PATH:-./.k3rs/certs}:${CERTS_PATH:-/etc/k3rs/certs}:ro
     environment:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
@@ -135,32 +135,32 @@ services:
     # evict every running pod — including calico-node — into Failed, and the
     # DaemonSet controller then GCs and recreates them in a tight loop. kind
     # disables eviction the same way for local clusters.
-    command: ["--hostname-override", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests", "--eviction-hard", ""]
+    command: ["--hostname-override", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.k3rs/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/k3rs/manifests", "--eviction-hard", ""]
 
   # Worker node.
   node-2:
     build: *node-build
-    image: rusternetes-node:latest
-    container_name: rusternetes-node-2
+    image: k3rs-node:latest
+    container_name: k3rs-node-2
     restart: unless-stopped
     privileged: true
     depends_on:
       - rhino
       - api-server
     networks:
-      - rusternetes-net
+      - k3rs-net
     volumes:
       - containerd-run-2:/run/containerd
       - containerd-data-2:/var/lib/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      - ./.k3rs/certs:/root/.k3rs/certs:ro
     environment:
       - RUST_LOG=info
       - RUST_MIN_STACK=8388608
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-2
     # See node-1: eviction disabled because the shared host disk is ~99% full.
-    command: ["--hostname-override", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.rusternetes/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
+    command: ["--hostname-override", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/root/.k3rs/certs/kubelet.conf", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--eviction-hard", ""]
 
   # kube-proxy per node, in that node's network namespace, so its Service
   # iptables apply where the node's pods live (Calico pod network).
@@ -171,7 +171,7 @@ services:
       args: *sccache-args
       target: kube-proxy
     image: isolated-work-kube-proxy:latest
-    container_name: rusternetes-kube-proxy-1
+    container_name: k3rs-kube-proxy-1
     restart: unless-stopped
     privileged: true
     network_mode: "service:node-1"
@@ -181,14 +181,14 @@ services:
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     volumes:
       - /lib/modules:/lib/modules:ro
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
 
   kube-proxy-2:
     image: isolated-work-kube-proxy:latest
-    container_name: rusternetes-kube-proxy-2
+    container_name: k3rs-kube-proxy-2
     restart: unless-stopped
     privileged: true
     network_mode: "service:node-2"
@@ -198,24 +198,24 @@ services:
     cap_add: [NET_ADMIN, NET_RAW, SYS_ADMIN]
     volumes:
       - /lib/modules:/lib/modules:ro
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
 
 networks:
-  rusternetes-net:
+  k3rs-net:
     driver: bridge
-    name: rusternetes-network
+    name: k3rs-network
 
 volumes:
   rhino-data:
-    name: rusternetes-rhino-data
+    name: k3rs-rhino-data
   containerd-run-1:
-    name: rusternetes-containerd-run-1
+    name: k3rs-containerd-run-1
   containerd-data-1:
-    name: rusternetes-containerd-data-1
+    name: k3rs-containerd-data-1
   containerd-run-2:
-    name: rusternetes-containerd-run-2
+    name: k3rs-containerd-run-2
   containerd-data-2:
-    name: rusternetes-containerd-data-2
+    name: k3rs-containerd-data-2

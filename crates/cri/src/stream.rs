@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 
 use crate::{v1, CriClient};
 
 /// CRI pod/container labels the kubelet stamps on every sandbox/container.
-/// Kept in sync with `rusternetes_kubelet::cri_runtime::translate::labels`.
+/// Kept in sync with `k3rs_kubelet::cri_runtime::translate::labels`.
 pub mod labels {
     pub const POD_NAME: &str = "io.kubernetes.pod.name";
     pub const POD_NAMESPACE: &str = "io.kubernetes.pod.namespace";

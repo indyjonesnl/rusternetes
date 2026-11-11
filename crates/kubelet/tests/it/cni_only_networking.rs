@@ -11,7 +11,7 @@
 //! future change reintroduces an in-process networking field, this test stops
 //! compiling — the intended tripwire.
 
-use rusternetes_kubelet::KubeletConfig;
+use k3rs_kubelet::KubeletConfig;
 
 #[test]
 fn kubelet_config_is_cni_only_no_netstack_surface() {
@@ -23,7 +23,7 @@ fn kubelet_config_is_cni_only_no_netstack_surface() {
         volume_dir: "./volumes".to_string(),
         cluster_dns: "10.96.0.10".to_string(),
         cluster_domain: "cluster.local".to_string(),
-        network: "rusternetes-network".to_string(),
+        network: "k3rs-network".to_string(),
         sync_interval: 3,
         metrics_port: 10250,
         kubernetes_service_host: "10.96.0.1".to_string(),

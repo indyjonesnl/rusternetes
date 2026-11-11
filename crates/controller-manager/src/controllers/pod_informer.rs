@@ -17,7 +17,7 @@
 //! (`delta_fifo.go:555`, `Replace`), so no creation or deletion is lost to the
 //! expectations.
 //!
-//! Rusternetes' controllers consume a raw storage watch with no indexer, so
+//! k3rs' controllers consume a raw storage watch with no indexer, so
 //! this cache is that indexer, restricted to what the handlers read: per pod,
 //! its controller reference (`metav1.GetControllerOf`), a digest of its labels
 //! and its resourceVersion. The three handlers themselves are
@@ -29,8 +29,8 @@
 use super::controller_utils::is_pod_ready;
 use super::job_tracking::has_job_tracking_finalizer;
 use futures::StreamExt;
-use rusternetes_common::resources::Pod;
-use rusternetes_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
+use k3rs_common::resources::Pod;
+use k3rs_storage::{build_prefix, Storage, WatchEvent, WorkQueue};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::future::Future;

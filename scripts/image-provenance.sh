@@ -10,7 +10,7 @@
 # they differ, i.e. `:main` has not caught up and the run tests old binaries.
 # Warn-only (always exits 0): provenance must never redden a conformance run.
 #
-# No upstream Kubernetes equivalent (Rusternetes-only CI concern).
+# No upstream Kubernetes equivalent (k3rs-only CI concern).
 set -uo pipefail
 
 TAG="${1:?usage: image-provenance.sh <image-tag> <expected-main-sha>}"

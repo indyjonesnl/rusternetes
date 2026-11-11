@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use anyhow::{bail, Context, Result};
-    pub use rusternetes_kubelet::volume_plugins::util::exec::{Exec, RealExec};
-    pub use rusternetes_kubelet::volume_plugins::util::mount_interface::MountInterface;
-    pub use rusternetes_kubelet::volume_plugins::util::mount_ops::{
+    pub use k3rs_kubelet::volume_plugins::util::exec::{Exec, RealExec};
+    pub use k3rs_kubelet::volume_plugins::util::mount_interface::MountInterface;
+    pub use k3rs_kubelet::volume_plugins::util::mount_ops::{
         detect_safe_not_mounted_behavior, Mounter,
     };
     pub use std::fs;
@@ -18,7 +18,7 @@ mod tests {
     //! Ported from `volume_path_handler_test.go` (`TestMapDevice`,
     //! `TestUnmapDevice`, `TestRemoveMapPath`, `TestIsSymlinkExist`).
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::volumepathhandler::*;
+    use k3rs_kubelet::volume_plugins::util::volumepathhandler::*;
     use tempfile::tempdir;
 
     fn err_of(r: Result<()>) -> String {
@@ -161,12 +161,10 @@ mod bind_mount_and_loop_tests {
     //! standing in for `mount.New("")` / `exec.Command`; `cleanBackingFilePath`
     //! cases from `volume_path_handler_linux_test.go:TestCleanBackingFilePath`.
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::exec::testing::{script, FakeExec};
-    use rusternetes_kubelet::volume_plugins::util::exec::ExecError;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::testing::{
-        FakeMounter, MountPoint,
-    };
-    use rusternetes_kubelet::volume_plugins::util::volumepathhandler::*;
+    use k3rs_kubelet::volume_plugins::util::exec::testing::{script, FakeExec};
+    use k3rs_kubelet::volume_plugins::util::exec::ExecError;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::testing::{FakeMounter, MountPoint};
+    use k3rs_kubelet::volume_plugins::util::volumepathhandler::*;
     use tempfile::tempdir;
 
     #[test]

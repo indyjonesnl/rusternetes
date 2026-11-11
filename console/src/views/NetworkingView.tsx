@@ -35,7 +35,7 @@ function NetworkConfigPanel() {
     queryKey: ["k8s", "servicecidrs"],
     queryFn: async () => {
       const h: Record<string, string> = { Accept: "application/json" };
-      const t = sessionStorage.getItem("rusternetes-token");
+      const t = sessionStorage.getItem("k3rs-token");
       if (t) h["Authorization"] = `Bearer ${t}`;
       const r = await fetch("/apis/networking.k8s.io/v1/servicecidrs", { headers: h });
       return r.ok ? r.json() : { items: [] };
@@ -46,7 +46,7 @@ function NetworkConfigPanel() {
     queryKey: ["k8s", "kube-dns"],
     queryFn: async () => {
       const h: Record<string, string> = { Accept: "application/json" };
-      const t = sessionStorage.getItem("rusternetes-token");
+      const t = sessionStorage.getItem("k3rs-token");
       if (t) h["Authorization"] = `Bearer ${t}`;
       const r = await fetch("/api/v1/namespaces/kube-system/services/kube-dns", { headers: h });
       return r.ok ? r.json() : null;

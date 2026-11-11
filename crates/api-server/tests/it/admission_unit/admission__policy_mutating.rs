@@ -3,23 +3,21 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::admission::caching_authorizer::new_caching_authorizer;
-    pub use rusternetes_api_server::admission::policy_dispatch::{
+    pub use k3rs_api_server::admission::caching_authorizer::new_caching_authorizer;
+    pub use k3rs_api_server::admission::policy_dispatch::{
         BindingAccessor, DispatchDelegate, NamespacedName, PolicyAccessor, PolicyError,
         PolicyInvocation, PolicyKey, PolicyReinvokeContext, VersionedAttributeAccessor,
     };
-    pub use rusternetes_api_server::admission::policy_matching::Attributes;
-    pub use rusternetes_api_server::admission::policy_mutating_metrics::{
+    pub use k3rs_api_server::admission::policy_matching::Attributes;
+    pub use k3rs_api_server::admission::policy_mutating_metrics::{
         observe_admission, observe_rejection, MutationErrorType,
     };
-    pub use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    pub use rusternetes_common::authz::Authorizer;
-    pub use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
-    pub use rusternetes_common::resources::mutating_admission_policy::ReinvocationPolicyType;
-    pub use rusternetes_common::resources::{
-        MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
-    };
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    pub use k3rs_common::authz::Authorizer;
+    pub use k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+    pub use k3rs_common::resources::mutating_admission_policy::ReinvocationPolicyType;
+    pub use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+    pub use k3rs_common::Error;
     pub use serde_json::Value;
     pub use std::collections::HashMap;
     pub use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,13 +27,13 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_dispatch::IdentityConverter;
-    use rusternetes_api_server::admission::policy_mutating::*;
-    use rusternetes_common::admission::Operation;
-    use rusternetes_common::resources::mutating_admission_policy::{
+    use k3rs_api_server::admission::policy_dispatch::IdentityConverter;
+    use k3rs_api_server::admission::policy_mutating::*;
+    use k3rs_common::admission::Operation;
+    use k3rs_common::resources::mutating_admission_policy::{
         MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
     };
-    use rusternetes_common::resources::validating_admission_policy::FailurePolicy;
+    use k3rs_common::resources::validating_admission_policy::FailurePolicy;
     use serde_json::json;
 
     fn deployment_gvk() -> GroupVersionKind {
@@ -232,7 +230,7 @@ mod tests {
             type_converters: Arc::new(AllConverters),
             defaulter: Arc::new(DefaultStrategy),
             reinvocation,
-            authz: Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+            authz: Arc::new(k3rs_common::authz::AlwaysAllowAuthorizer),
         }
     }
     async fn run(
@@ -601,7 +599,7 @@ mod tests {
     }
 
     fn compiled_policy(variables: &[(&str, &str)], mutations: Vec<Mutation>) -> MutatingEvaluator {
-        use rusternetes_common::resources::validating_admission_policy::Variable;
+        use k3rs_common::resources::validating_admission_policy::Variable;
         let mut p = MutatingAdmissionPolicy::new("p");
         p.spec = Some(MutatingAdmissionPolicySpec {
             variables: Some(
@@ -619,7 +617,7 @@ mod tests {
         compile_policy(&p)
     }
     fn json_mutation(expr: &str) -> Mutation {
-        use rusternetes_common::resources::mutating_admission_policy::JsonPatch;
+        use k3rs_common::resources::mutating_admission_policy::JsonPatch;
         Mutation {
             patch_type: Some(PatchType::JsonPatch),
             json_patch: Some(JsonPatch {
@@ -629,7 +627,7 @@ mod tests {
         }
     }
     fn apply_mutation(expr: &str) -> Mutation {
-        use rusternetes_common::resources::mutating_admission_policy::ApplyConfiguration;
+        use k3rs_common::resources::mutating_admission_policy::ApplyConfiguration;
         Mutation {
             patch_type: Some(PatchType::ApplyConfiguration),
             apply_configuration: Some(ApplyConfiguration {
@@ -726,7 +724,7 @@ mod tests {
     /// compilation.go:47-54: `spec.matchConditions` compile to a matcher.
     #[test]
     fn compile_policy_builds_matcher_from_match_conditions() {
-        use rusternetes_common::resources::admission_webhook::MatchCondition;
+        use k3rs_common::resources::admission_webhook::MatchCondition;
         let mut p = policy("p", 0, None);
         assert!(compile_policy(&p).matcher.is_none());
         p.spec.as_mut().unwrap().match_conditions = Some(vec![MatchCondition {
@@ -738,11 +736,9 @@ mod tests {
 
     fn mutation_metrics(
         policy: &str,
-        et: rusternetes_api_server::admission::policy_mutating_metrics::MutationErrorType,
+        et: k3rs_api_server::admission::policy_mutating_metrics::MutationErrorType,
     ) -> (u64, u64) {
-        use rusternetes_api_server::admission::policy_mutating_metrics::{
-            POLICY_CHECK, POLICY_LATENCY,
-        };
+        use k3rs_api_server::admission::policy_mutating_metrics::{POLICY_CHECK, POLICY_LATENCY};
         let l = [policy, "binding", et.as_str()];
         (
             POLICY_CHECK.with_label_values(&l).get(),
@@ -754,7 +750,7 @@ mod tests {
     /// `MutationNoError`.
     #[tokio::test]
     async fn successful_mutation_observes_admission() {
-        use rusternetes_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
+        use k3rs_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
         let mut a = attr(deployment(None));
         let c = case("metrics-ok", mutators(vec![set_label("a", "1")]));
         run(&dispatcher(ctx()), &mut a, &[c]).await.unwrap();
@@ -766,7 +762,7 @@ mod tests {
     /// `ErrorType(err)`, whether it becomes a config error or a status error.
     #[tokio::test]
     async fn failing_mutation_observes_rejection() {
-        use rusternetes_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
+        use k3rs_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
         let mut a = attr(deployment(None));
         let c = case(
             "metrics-cfg",
@@ -789,7 +785,7 @@ mod tests {
     /// errors.go `ErrorType`.
     #[test]
     fn error_type_decodes_the_message_prefix() {
-        use rusternetes_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
+        use k3rs_api_server::admission::policy_mutating_metrics::MutationErrorType::*;
         assert_eq!(error_type(None), NoError);
         assert_eq!(error_type(Some("compilation failed: x")), CompileError);
         assert_eq!(

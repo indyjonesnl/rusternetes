@@ -2,12 +2,12 @@
 //! composition of the policy environment (`plugin/cel/compile.go`,
 //! `composition.go`).
 
-use rusternetes_cel_checker::DType;
-use rusternetes_common::cel_policy_types::{
+use k3rs_cel_checker::DType;
+use k3rs_common::cel_policy_types::{
     check_policy_expression, check_policy_expression_with, convert_output_type, namespace_type,
     request_type, CheckOptions, DeclType, ParamsType, PolicyTypeContext,
 };
-use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
+use k3rs_common::cel_versions::{self, EnvSet, EnvType};
 
 fn set() -> EnvSet {
     EnvSet::must_base_env_set(cel_versions::default_compatibility_version())

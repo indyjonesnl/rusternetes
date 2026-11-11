@@ -8,14 +8,14 @@
 //!   * `insecureSkipTLSVerify` / `caBundle` choice is honoured.
 
 use axum::http::{HeaderMap, HeaderValue, Method};
-use rusternetes_api_server::handlers::aggregator::{
+use k3rs_api_server::handlers::aggregator::{
     build_proxy_headers, decode_ca_bundle_for_test, forward_to_aggregator,
     list_registered_apiservice_groups_with_storage, resolve_aggregator_target_with_storage,
     AggregatorTarget,
 };
-use rusternetes_api_server::middleware::AuthContext;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_api_server::middleware::AuthContext;
+use k3rs_common::auth::UserInfo;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,10 +92,7 @@ async fn seed_service(
     });
     let key = build_key("services", Some(namespace), name);
     storage
-        .create::<rusternetes_common::resources::Service>(
-            &key,
-            &serde_json::from_value(svc).unwrap(),
-        )
+        .create::<k3rs_common::resources::Service>(&key, &serde_json::from_value(svc).unwrap())
         .await
         .unwrap();
 }
@@ -402,10 +399,9 @@ async fn forward_to_aggregator_forwards_body_and_impersonation() {
         },
     );
 
-    let (addr, server_handle) =
-        rusternetes_test_support::mock_http::serve_graceful_handle(route, async {
-            shutdown_rx.await.ok();
-        });
+    let (addr, server_handle) = k3rs_test_support::mock_http::serve_graceful_handle(route, async {
+        shutdown_rx.await.ok();
+    });
 
     let target = AggregatorTarget {
         host: addr.ip().to_string(),
@@ -563,10 +559,8 @@ struct ClusterProxier {
     seen: Arc<std::sync::Mutex<Vec<String>>>,
 }
 #[async_trait::async_trait]
-impl rusternetes_api_server::egress_selector::ProxyServerConnector for ClusterTunnel {
-    async fn connect(
-        &self,
-    ) -> Result<Box<dyn rusternetes_api_server::egress_selector::Proxier>, String> {
+impl k3rs_api_server::egress_selector::ProxyServerConnector for ClusterTunnel {
+    async fn connect(&self) -> Result<Box<dyn k3rs_api_server::egress_selector::Proxier>, String> {
         Ok(Box::new(ClusterProxier {
             target: self.target.clone(),
             seen: self.seen.clone(),
@@ -574,11 +568,8 @@ impl rusternetes_api_server::egress_selector::ProxyServerConnector for ClusterTu
     }
 }
 #[async_trait::async_trait]
-impl rusternetes_api_server::egress_selector::Proxier for ClusterProxier {
-    async fn proxy(
-        &self,
-        addr: &str,
-    ) -> Result<rusternetes_api_server::egress_selector::Conn, String> {
+impl k3rs_api_server::egress_selector::Proxier for ClusterProxier {
+    async fn proxy(&self, addr: &str) -> Result<k3rs_api_server::egress_selector::Conn, String> {
         self.seen.lock().unwrap().push(addr.to_string());
         let c = tokio::net::TcpStream::connect(&self.target)
             .await
@@ -610,19 +601,17 @@ async fn forward_to_aggregator_dials_through_cluster_dialer() {
                 .unwrap()
         },
     );
-    let (addr, _h) = rusternetes_test_support::mock_http::serve_graceful_handle(
-        route,
-        std::future::pending::<()>(),
-    );
+    let (addr, _h) =
+        k3rs_test_support::mock_http::serve_graceful_handle(route, std::future::pending::<()>());
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let dialer = rusternetes_api_server::egress_selector::DialerCreator {
+    let dialer = k3rs_api_server::egress_selector::DialerCreator {
         connector: Some(Arc::new(ClusterTunnel {
             target: addr.to_string(),
             seen: seen.clone(),
         })),
         direct: false,
-        options: rusternetes_api_server::egress_selector::MetricsOptions {
+        options: k3rs_api_server::egress_selector::MetricsOptions {
             transport: "tcp".into(),
             protocol: "HTTPConnect".into(),
         },
@@ -639,7 +628,7 @@ async fn forward_to_aggregator_dials_through_cluster_dialer() {
         server_name: None,
     };
     let auth = test_user("alice", &[], &[]);
-    let resp = rusternetes_api_server::handlers::aggregator::forward_to_aggregator_with_dialer(
+    let resp = k3rs_api_server::handlers::aggregator::forward_to_aggregator_with_dialer(
         &target,
         &auth,
         Method::GET,
@@ -666,7 +655,7 @@ async fn forward_to_aggregator_dials_through_cluster_dialer() {
 /// resolved endpoint's address.
 #[tokio::test]
 async fn proxy_discovery_handler_dials_through_cluster_dialer() {
-    use rusternetes_api_server::aggregated_discovery::{
+    use k3rs_api_server::aggregated_discovery::{
         AggregatorHandler, HandlerRequest, ProxyDiscoveryHandler,
     };
     let storage = Arc::new(MemoryStorage::new());
@@ -684,14 +673,14 @@ async fn proxy_discovery_handler_dials_through_cluster_dialer() {
     .await;
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let dialer = rusternetes_api_server::egress_selector::DialerCreator {
+    let dialer = k3rs_api_server::egress_selector::DialerCreator {
         connector: Some(Arc::new(ClusterTunnel {
             // Nothing listens here: the dial is observed, then fails.
             target: "127.0.0.1:1".to_string(),
             seen: seen.clone(),
         })),
         direct: false,
-        options: rusternetes_api_server::egress_selector::MetricsOptions {
+        options: k3rs_api_server::egress_selector::MetricsOptions {
             transport: "tcp".into(),
             protocol: "HTTPConnect".into(),
         },
@@ -720,7 +709,7 @@ async fn proxy_discovery_handler_dials_through_cluster_dialer() {
 /// aggregator identity) reaches the backend through the proxy's forward.
 #[tokio::test]
 async fn forward_handler_request_sends_identity_accept_and_if_none_match() {
-    use rusternetes_api_server::aggregated_discovery::HandlerRequest;
+    use k3rs_api_server::aggregated_discovery::HandlerRequest;
     let route = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
         let h = |n: &str| {
             headers
@@ -740,10 +729,8 @@ async fn forward_handler_request_sends_identity_accept_and_if_none_match() {
             )))
             .unwrap()
     });
-    let (addr, _h) = rusternetes_test_support::mock_http::serve_graceful_handle(
-        route,
-        std::future::pending::<()>(),
-    );
+    let (addr, _h) =
+        k3rs_test_support::mock_http::serve_graceful_handle(route, std::future::pending::<()>());
     let target = AggregatorTarget {
         host: addr.ip().to_string(),
         port: addr.port(),
@@ -752,7 +739,7 @@ async fn forward_handler_request_sends_identity_accept_and_if_none_match() {
         scheme: "http",
         server_name: None,
     };
-    let resp = rusternetes_api_server::openapiv3_aggregator::forward_handler_request(
+    let resp = k3rs_api_server::openapiv3_aggregator::forward_handler_request(
         &target,
         &HandlerRequest {
             path: "/apis".to_string(),
@@ -779,7 +766,7 @@ mod upgrade_aware_proxy {
     use axum::body::Body;
     use axum::extract::Request;
     use axum::response::Response;
-    use rusternetes_api_server::upgrade_aware::{
+    use k3rs_api_server::upgrade_aware::{
         cached_transport_count, serve_proxy_with, set_auth_proxy_headers,
     };
     use std::sync::Mutex;

@@ -24,7 +24,7 @@
 //!   - kine red, etcd green  → we drifted outside the upstream subset.
 //!   - etcd red              → we broke the backend outright.
 
-use rusternetes_storage::{etcd::EtcdStorage, Storage, WatchEvent};
+use k3rs_storage::{etcd::EtcdStorage, Storage, WatchEvent};
 use serde_json::json;
 use std::time::Duration;
 use testcontainers::{
@@ -148,7 +148,7 @@ async fn exercise_storage_surface(storage: &EtcdStorage, backend: &str) {
     // Creating the same key twice must conflict, not overwrite.
     let dup = storage.create(key, &json!({"spec": {"replicas": 9}})).await;
     assert!(
-        matches!(dup, Err(rusternetes_common::Error::AlreadyExists(_))),
+        matches!(dup, Err(k3rs_common::Error::AlreadyExists(_))),
         "[{backend}] duplicate create should be AlreadyExists, got {dup:?}"
     );
 
@@ -185,7 +185,7 @@ async fn exercise_storage_surface(storage: &EtcdStorage, backend: &str) {
     stale["spec"]["replicas"] = json!(99);
     let conflict = storage.update(key, &stale).await;
     assert!(
-        matches!(conflict, Err(rusternetes_common::Error::Conflict(_))),
+        matches!(conflict, Err(k3rs_common::Error::Conflict(_))),
         "[{backend}] stale update should Conflict, got {conflict:?}"
     );
 
@@ -210,7 +210,7 @@ async fn exercise_storage_surface(storage: &EtcdStorage, backend: &str) {
         .update("/registry/pods/default/ghost", &json!({"spec": {}}))
         .await;
     assert!(
-        matches!(missing, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(missing, Err(k3rs_common::Error::NotFound(_))),
         "[{backend}] update of a missing key should be NotFound, got {missing:?}"
     );
 
@@ -242,12 +242,12 @@ async fn exercise_storage_surface(storage: &EtcdStorage, backend: &str) {
         .unwrap_or_else(|e| panic!("[{backend}] delete failed: {e}"));
     let gone = storage.get::<serde_json::Value>(key).await;
     assert!(
-        matches!(gone, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(gone, Err(k3rs_common::Error::NotFound(_))),
         "[{backend}] delete left the key readable, got {gone:?}"
     );
     let twice = storage.delete(key).await;
     assert!(
-        matches!(twice, Err(rusternetes_common::Error::NotFound(_))),
+        matches!(twice, Err(k3rs_common::Error::NotFound(_))),
         "[{backend}] second delete should be NotFound, got {twice:?}"
     );
 }

@@ -2,16 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::volume_plugins::util::exec::{Exec, RealExec};
-    pub use rusternetes_kubelet::volume_plugins::util::mount_interface::get_disk_format;
+    pub use k3rs_kubelet::volume_plugins::util::exec::{Exec, RealExec};
+    pub use k3rs_kubelet::volume_plugins::util::mount_interface::get_disk_format;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::exec::testing::{
-        script, CommandScript, FakeExec,
-    };
-    use rusternetes_kubelet::volume_plugins::util::resizefs::*;
+    use k3rs_kubelet::volume_plugins::util::exec::testing::{script, CommandScript, FakeExec};
+    use k3rs_kubelet::volume_plugins::util::resizefs::*;
 
     fn out(mut s: CommandScript, o: &str) -> CommandScript {
         s.output = o.to_string();

@@ -6,9 +6,9 @@
 //! `system:masters`, which `rbacregistry.EscalationAllowed` always lets through.
 
 use axum::http::StatusCode;
-use rusternetes_common::resources::{ClusterRole, ClusterRoleBinding};
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::resources::{ClusterRole, ClusterRoleBinding};
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const VAP: &str = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies";
@@ -331,8 +331,8 @@ async fn binding_to_an_unknown_policy_needs_permission_on_everything() {
 // ---- the policy plugin's `authorizer` binding (#3528, of #3446) ----------
 
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -353,15 +353,12 @@ impl CountingAuthorizer {
 
 #[async_trait]
 impl Authorizer for CountingAuthorizer {
-    async fn authorize(&self, attrs: &RequestAttributes) -> rusternetes_common::Result<Decision> {
+    async fn authorize(&self, attrs: &RequestAttributes) -> k3rs_common::Result<Decision> {
         self.count(attrs);
         self.inner.authorize(attrs).await
     }
 
-    async fn authorize_opinion(
-        &self,
-        attrs: &RequestAttributes,
-    ) -> rusternetes_common::Result<Opinion> {
+    async fn authorize_opinion(&self, attrs: &RequestAttributes) -> k3rs_common::Result<Opinion> {
         self.count(attrs);
         self.inner.authorize_opinion(attrs).await
     }
@@ -370,7 +367,7 @@ impl Authorizer for CountingAuthorizer {
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> rusternetes_common::Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> k3rs_common::Result<k3rs_common::authz::UserRulesOutcome> {
         self.inner.get_user_rules_outcome(user, namespace).await
     }
 }

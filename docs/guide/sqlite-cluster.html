@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Compose Cluster with SQLite - Rūsternetes</title>
+  <title>Compose Cluster with SQLite - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Compose Cluster with SQLite (Rhino)</h1>
       <p class="lead">
-        Run a multi-node Rūsternetes cluster with SQLite as the storage backend instead of etcd.
+        Run a multi-node k3rs cluster with SQLite as the storage backend instead of etcd.
         The <a href="https://github.com/calfonso/rhino">Rhino</a> server provides an etcd-compatible
         gRPC API backed by SQLite, giving you the same multi-node architecture with simpler operations
         and a smaller footprint.
@@ -123,7 +123,7 @@
       </ul>
 
       <p>
-        From the Rūsternetes components' perspective, Rhino is indistinguishable from etcd. The
+        From the k3rs components' perspective, Rhino is indistinguishable from etcd. The
         API server, scheduler, controller manager, kubelets, and kube-proxy all connect to Rhino
         using the standard etcd client library. No code changes are needed &mdash; you simply
         swap the service in your compose file.
@@ -213,7 +213,7 @@
           </tr>
           <tr>
             <td><code>endpoint</code></td>
-            <td><code>sqlite:///data/rusternetes.db</code></td>
+            <td><code>sqlite:///data/k3rs.db</code></td>
             <td>Database connection string. For SQLite, this is a file path. For PostgreSQL, use <code>postgres://user:pass@host/db</code>.</td>
           </tr>
           <tr>
@@ -237,12 +237,12 @@ services:
     image: ghcr.io/calfonso/rhino:latest
     command:
       - <span class="flag">--listen-address</span>=<span class="value">0.0.0.0:2379</span>
-      - <span class="flag">--endpoint</span>=<span class="value">sqlite:///data/rusternetes.db</span>
+      - <span class="flag">--endpoint</span>=<span class="value">sqlite:///data/k3rs.db</span>
       - <span class="flag">--max-connections</span>=<span class="value">20</span>
     volumes:
       - rhino-data:/data
     networks:
-      - rusternetes-net
+      - k3rs-net
 
   api-server:
     <span class="comment"># Connects to rhino:2379 — same as etcd:2379</span>
@@ -265,7 +265,7 @@ services:
           <span class="code-title">terminal</span>
         </div>
         <code>
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 mkdir -p $KUBELET_VOLUMES_PATH
 </code>
       </pre>
@@ -323,7 +323,7 @@ podman compose -f compose.sqlite.yml up -d
 bash scripts/bootstrap-cluster.sh
 
 <span class="comment"># Verify</span>
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 kubectl get nodes
 kubectl get pods -A
 </code>
@@ -374,10 +374,10 @@ kubectl get pods -A
         <code>
 <span class="comment"># Connect to the Rhino container's database</span>
 podman compose -f compose.sqlite.yml exec rhino \
-  sqlite3 /data/rusternetes.db
+  sqlite3 /data/k3rs.db
 
 <span class="comment"># Or copy the database locally and inspect</span>
-podman compose -f compose.sqlite.yml cp rhino:/data/rusternetes.db ./state.db
+podman compose -f compose.sqlite.yml cp rhino:/data/k3rs.db ./state.db
 sqlite3 ./state.db
 
 <span class="comment"># List all resources</span>
@@ -489,7 +489,7 @@ podman compose -f compose.yml up -d
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

@@ -6,8 +6,8 @@
 //! `DRAConsumableCapacity` (request capacity, `distinctAttribute`) gates are
 //! off.
 
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::resources::dra::ResourceClaimSpec;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::resources::dra::ResourceClaimSpec;
 
 /// `draDeviceTaintsInUse` (util.go:57-72).
 fn device_taints_in_use(spec: Option<&ResourceClaimSpec>) -> bool {

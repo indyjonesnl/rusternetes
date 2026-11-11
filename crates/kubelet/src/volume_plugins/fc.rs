@@ -40,10 +40,10 @@ use super::{
 };
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     FCVolumeSource, PersistentVolumeAccessMode, PersistentVolumeMode,
 };
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{error, warn};
@@ -357,8 +357,8 @@ impl VolumePlugin for FcPlugin {
         let mut reconstructed =
             super::util::reconstructed_volume(volume_name, serde_json::json!({ "fc": fc_source }))?;
         // `fc.go:283-294`: the `-o context=` the pod mount carries.
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             reconstructed.selinux_mount_context = self
                 .host
@@ -626,8 +626,8 @@ impl super::Mounter for FcDiskMounter {
             error!("fc: failed to setup");
         }
 
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             // The volume must have been mounted in MountDevice with -o context.
             self.mounted_with_selinux_context
@@ -780,12 +780,11 @@ pub fn create_persistent_volume_from_fc_volume_source(
     volume_name: &str,
     fc: FCVolumeSource,
 ) -> Result<OwnedSpec> {
-    let pv: rusternetes_common::resources::PersistentVolume =
-        serde_json::from_value(serde_json::json!({
-            "metadata": {"name": volume_name},
-            "spec": {"fc": serde_json::to_value(&fc)?, "volumeMode": "Block"}
-        }))?;
-    let volume: rusternetes_common::resources::Volume =
+    let pv: k3rs_common::resources::PersistentVolume = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": volume_name},
+        "spec": {"fc": serde_json::to_value(&fc)?, "volumeMode": "Block"}
+    }))?;
+    let volume: k3rs_common::resources::Volume =
         serde_json::from_value(serde_json::json!({"name": volume_name}))?;
     Ok(OwnedSpec {
         volume,

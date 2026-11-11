@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_common::compatibility::EffectiveVersion;
     pub use prometheus::{GaugeVec, Opts};
-    pub use rusternetes_common::compatibility::EffectiveVersion;
     pub use std::sync::LazyLock;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::compat_version_metrics::*;
+    use k3rs_common::compat_version_metrics::*;
     use serial_test::serial;
 
     fn gather_version_info() -> String {
@@ -43,7 +43,7 @@ version_info{binary=\"1.28\",component=\"name\",emulation=\"1.27\",min_compat=\"
     #[serial]
     fn add_metrics_records_effective_version() {
         reset_compat_version_info_metric();
-        let ev = rusternetes_common::compatibility::default_build_effective_version();
+        let ev = k3rs_common::compatibility::default_build_effective_version();
         add_metrics("kube", &ev);
         let got = gather_version_info();
         assert!(

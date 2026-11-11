@@ -4,16 +4,16 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::pod_warnings::get_warnings_for_pod_template;
-use rusternetes_common::resources::{Deployment, DeploymentStatus, Scale, ScaleSpec, ScaleStatus};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_common::validation::apps::{
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::pod_warnings::get_warnings_for_pod_template;
+use k3rs_common::resources::{Deployment, DeploymentStatus, Scale, ScaleSpec, ScaleStatus};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::validation::apps::{
     validate_deployment, validate_deployment_status_update, validate_deployment_update,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::metav1::is_dns1123_label;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::metav1::is_dns1123_label;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -43,10 +43,7 @@ impl RestCreateStrategy<Deployment> for Strategy {
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut Deployment) {
         obj.status = Some(DeploymentStatus::default());
         obj.metadata.generation = Some(1);
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
-            &mut obj.spec.template,
-            None,
-        );
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(&mut obj.spec.template, None);
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &Deployment) -> ErrorList {
@@ -83,7 +80,7 @@ impl RestUpdateStrategy<Deployment> for Strategy {
     /// generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Deployment, old: &Deployment) {
         obj.status = old.status.clone();
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(
             &mut obj.spec.template,
             Some(&old.spec.template),
         );
@@ -250,8 +247,8 @@ fn drop_disabled_status_fields(
     status: &mut Option<DeploymentStatus>,
     old: &Option<DeploymentStatus>,
 ) {
-    if !rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::DeploymentReplicaSetTerminatingReplicas,
+    if !k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::DeploymentReplicaSetTerminatingReplicas,
     ) && old
         .as_ref()
         .is_none_or(|o| o.terminating_replicas.is_none())

@@ -19,17 +19,17 @@
 //!      tests with a one-line reason so they can be unignored as each
 //!      feature lands.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerStatus, Endpoints, IPFamily, IPFamilyPolicy, IntOrString, Node,
     NodeAddress, NodeStatus, Pod, PodCondition, PodSpec, PodStatus, Service,
     ServiceExternalTrafficPolicy, ServiceInternalTrafficPolicy, ServicePort, ServiceSpec,
     ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_controller_manager::controllers::loadbalancer::LoadBalancerController;
-use rusternetes_controller_manager::controllers::service::ServiceController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_controller_manager::controllers::loadbalancer::LoadBalancerController;
+use k3rs_controller_manager::controllers::service::ServiceController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -409,8 +409,7 @@ async fn test_loadbalancer_assignment_uses_registered_node_internal_ips() {
         storage.create(&key, &node).await.unwrap();
     }
 
-    let controller =
-        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
+    let controller = LoadBalancerController::new(storage.clone(), "k3rs-test".to_string(), 30);
 
     let mut svc = make_service("lb-with-nodes", "default", HashMap::new());
     svc.spec.service_type = Some(ServiceType::LoadBalancer);
@@ -654,7 +653,7 @@ async fn test_service_internal_traffic_policy_local_filters_by_node() {
 /// slices.
 #[tokio::test]
 async fn test_service_topology_keys_emit_for_zone_hints() {
-    use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
+    use k3rs_controller_manager::controllers::endpointslice::EndpointSliceController;
 
     let storage = setup_test().await;
     let controller = EndpointsController::new(storage.clone());
@@ -702,7 +701,7 @@ async fn test_service_topology_keys_emit_for_zone_hints() {
     controller.reconcile_all().await.unwrap();
     slice_controller.reconcile_all().await.unwrap();
 
-    let slices: Vec<rusternetes_common::resources::EndpointSlice> = storage
+    let slices: Vec<k3rs_common::resources::EndpointSlice> = storage
         .list("/registry/endpointslices/default/")
         .await
         .unwrap_or_default();
@@ -741,8 +740,7 @@ async fn test_service_topology_keys_emit_for_zone_hints() {
 async fn test_loadbalancer_health_check_gates_status_on_endpoint_readiness() {
     let storage = setup_test().await;
     let endpoints_controller = EndpointsController::new(storage.clone());
-    let lb_controller =
-        LoadBalancerController::new(storage.clone(), "rusternetes-test".to_string(), 30);
+    let lb_controller = LoadBalancerController::new(storage.clone(), "k3rs-test".to_string(), 30);
 
     let mut selector = HashMap::new();
     selector.insert("app".to_string(), "lb-health".to_string());
@@ -780,7 +778,7 @@ async fn test_loadbalancer_health_check_gates_status_on_endpoint_readiness() {
         .map(|lb| lb.ingress.is_empty())
         .unwrap_or(true);
     let has_warning = storage
-        .list::<rusternetes_common::resources::Event>("/registry/events/default/")
+        .list::<k3rs_common::resources::Event>("/registry/events/default/")
         .await
         .unwrap_or_default()
         .iter()

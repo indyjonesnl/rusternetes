@@ -16,8 +16,8 @@
 # ---------------------------------------------------------------------------
 VS_EX_TESTFAIL=1   # module came up, scoped tests failed
 VS_EX_USAGE=2      # usage / preflight / missing tool
-VS_EX_GUARD=3      # more than one rusternetes component present
-VS_EX_SKEW=4       # baseline version incompatible with the rusternetes build
+VS_EX_GUARD=3      # more than one k3rs component present
+VS_EX_SKEW=4       # baseline version incompatible with the k3rs build
 VS_EX_NOTUP=5      # module never reached readiness within timeout
 
 VS_MODULES="api-server kubelet scheduler controller-manager kube-proxy"
@@ -48,13 +48,13 @@ vs_die() {
 # Pure, unit-testable functions
 # ---------------------------------------------------------------------------
 
-# vs_count_rusternetes_images  — read image refs on stdin (one per line), print
-# how many DISTINCT refs contain the substring "rusternetes". Distinct, not
+# vs_count_k3rs_images  — read image refs on stdin (one per line), print
+# how many DISTINCT refs contain "k3rs" or "rusternetes" (the published registry path keeps the old name until the repo rename). Distinct, not
 # occurrences: a DaemonSet/Deployment legitimately runs one image across N pods,
-# so N copies of the same rusternetes image is still ONE component. Two
-# different rusternetes images means two components (guard violation).
-vs_count_rusternetes_images() {
-  grep -E 'rusternetes' 2>/dev/null | sort -u | grep -c . || true
+# so N copies of the same k3rs image is still ONE component. Two
+# different k3rs images means two components (guard violation).
+vs_count_k3rs_images() {
+  grep -E 'k3rs|rusternetes' 2>/dev/null | sort -u | grep -c . || true
 }
 
 # vs_validate_registry [registry-path]
@@ -117,12 +117,12 @@ vs_resolve_target() {
 
 # vs_resolved_image — full image ref for the module under test.
 vs_resolved_image() {
-  printf '%s:%s\n' "$VS_IMAGE_REPO" "${RUSTERNETES_IMAGE_TAG:-main}"
+  printf '%s:%s\n' "$VS_IMAGE_REPO" "${K3RS_IMAGE_TAG:-main}"
 }
 
 # vs_guard_recipe <module> [registry-path]
 # PRE-bring-up guard: the requested module must resolve to exactly ONE registry
-# entry. Rejects anything that would place more than one rusternetes component
+# entry. Rejects anything that would place more than one k3rs component
 # in the cluster. Exits VS_EX_GUARD on violation.
 vs_guard_recipe() {
   local module="$1" reg="${2:-$(vs_registry_path)}"
@@ -180,8 +180,8 @@ vs_teardown() {
   fi
   vs_log "tearing down cluster '$cluster'"
   kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
-  # Remove any rusternetes side-containers (the kubelet node + its CRI runtime).
-  docker ps -aq --filter "label=rusternetes-swap-cluster=$cluster" 2>/dev/null \
+  # Remove any k3rs side-containers (the kubelet node + its CRI runtime).
+  docker ps -aq --filter "label=k3rs-swap-cluster=$cluster" 2>/dev/null \
     | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri" >/dev/null 2>&1 || true
   docker volume rm "vanilla-swap-${cluster}-cri-data" >/dev/null 2>&1 || true
@@ -270,7 +270,7 @@ vs_control_plane_node() { printf '%s-control-plane\n' "$1"; }
 # --preflight-arg pairs for conformance-target-run.sh that describe THIS
 # cluster to conformance-preflight.sh (#1777). The gate's defaults describe the
 # compose stack — kube-scheduler-node-1 / kube-controller-manager-node-1 and the
-# rusternetes-dns Deployment — none of which exist in a kind cluster, where the
+# k3rs-dns Deployment — none of which exist in a kind cluster, where the
 # static-pod mirrors are named after the kind control-plane node and DNS is
 # CoreDNS. Left unset, the gate refused every vanilla-swap leg on three FAILs
 # describing the harness rather than the module under test.
@@ -290,7 +290,7 @@ vs_preflight_args() {
   node="$(vs_control_plane_node "$cluster")"
   pods="kube-scheduler-${node},kube-controller-manager-${node}"
   dns="coredns"
-  # Swapping the api-server swaps the OBJECT STORE with it: the rusternetes
+  # Swapping the api-server swaps the OBJECT STORE with it: the k3rs
   # api-server starts on an empty database, so kind's control-plane mirror pods
   # and the CoreDNS Deployment are not visible through it. That is the leg's
   # subject, not a broken environment — asserting them refuses the run before a
@@ -332,7 +332,7 @@ vs_recipe_field() {
 # vs_swap_static_pod <cluster> <recipe> <image>
 # Replaces one control-plane static-pod manifest. If the recipe carries a
 # `template:` block (preferred), the whole manifest is rendered from it (the
-# rusternetes component runs in API mode using an on-node kubeconfig); otherwise
+# k3rs component runs in API mode using an on-node kubeconfig); otherwise
 # falls back to an in-place image rewrite + extraArgs append. Either way the
 # node kubelet restarts just that static pod.
 vs_swap_static_pod() {
@@ -345,7 +345,7 @@ vs_swap_static_pod() {
   path="/etc/kubernetes/manifests/$manifest"
 
   if grep -qE '^template: \|' "$root/$recipe"; then
-    vs_log "replacing static pod $manifest with rusternetes manifest ($image) on $node"
+    vs_log "replacing static pod $manifest with k3rs manifest ($image) on $node"
     export VS_IMAGE="$image"
     vs_render_recipe_template "$root/$recipe" VS_IMAGE \
       | docker exec -i "$node" sh -c "cat >'$path'"
@@ -365,10 +365,10 @@ vs_swap_static_pod() {
 }
 
 # vs_swap_daemonset <cluster> <recipe> <image> <kubeconfig>
-# Replaces the vanilla kube-proxy DaemonSet with a rusternetes API-mode
-# DaemonSet. The rusternetes component authenticates to the vanilla api-server
+# Replaces the vanilla kube-proxy DaemonSet with a k3rs API-mode
+# DaemonSet. The k3rs component authenticates to the vanilla api-server
 # with client-cert auth from the control-plane admin kubeconfig (kind's
-# kube-proxy uses a projected tokenFile, unsupported by the rusternetes
+# kube-proxy uses a projected tokenFile, unsupported by the k3rs
 # kubeconfig loader), so we copy admin.conf into a Secret and mount it.
 vs_swap_daemonset() {
   local cluster="$1" recipe="$2" image="$3" kubeconfig="$4"
@@ -398,11 +398,11 @@ vs_swap_daemonset() {
     | KUBECONFIG="$kubeconfig" kubectl apply -f -
   rm -f "$tmpkc"
 
-  vs_log "applying rusternetes API-mode DaemonSet (api=$VS_APISERVER_URL cidr=$VS_CLUSTER_CIDR)"
+  vs_log "applying k3rs API-mode DaemonSet (api=$VS_APISERVER_URL cidr=$VS_CLUSTER_CIDR)"
   vs_render_recipe_template "$root/$recipe" \
     VS_IMAGE VS_APISERVER_URL VS_CLUSTER_CIDR VS_NODEPORT_RANGE \
     | KUBECONFIG="$kubeconfig" kubectl apply -f -
-  KUBECONFIG="$kubeconfig" kubectl -n "$ns" rollout status "daemonset/rusternetes-kube-proxy" --timeout=120s
+  KUBECONFIG="$kubeconfig" kubectl -n "$ns" rollout status "daemonset/k3rs-kube-proxy" --timeout=120s
 }
 
 # vs_service_cidr <cluster> <kubeconfig> — read --service-cluster-ip-range off the
@@ -467,7 +467,7 @@ vs_node_net_agent_docker_args() {
   printf '%s\n' \
     --privileged \
     --network "container:vanilla-swap-${cluster}-containerd" \
-    --label "rusternetes-swap-cluster=$cluster" \
+    --label "k3rs-swap-cluster=$cluster" \
     -v "vanilla-swap-${cluster}-cni-conf:/etc/cni/net.d" \
     -v /lib/modules:/lib/modules:ro \
     "$image" \
@@ -495,12 +495,12 @@ vs_start_node_net_agent() {
 }
 
 # vs_swap_join_worker <cluster> <recipe> <image> <kubeconfig>
-# Attaches ONE extra node running the rusternetes kubelet to the vanilla control
+# Attaches ONE extra node running the k3rs kubelet to the vanilla control
 # plane, as CONTAINERS on the kind network (the kubelet binary needs a newer
 # glibc than a kind node provides, so it runs from its image with its own CRI
 # runtime). Interoperates over the Kubernetes API + CRI/CNI only.
 #
-# NOTE: currently blocked by rusternetes #1638 (kubelet crashes on a 409 Conflict
+# NOTE: currently blocked by k3rs #1638 (kubelet crashes on a 409 Conflict
 # during node status-update). The node registers and briefly reports Ready; the
 # node-ready readiness signal then flaps until the bug is fixed.
 vs_swap_join_worker() {
@@ -514,11 +514,11 @@ vs_swap_join_worker() {
   export VS_NODE_NAME
   cri="$(vs_recipe_field "$root/$recipe" criSocket)"
   clusterdns="$(vs_recipe_field "$root/$recipe" clusterDns)"
-  # CRI runtime image = sibling of the kubelet imageRepo (.../rusternetes/containerd).
+  # CRI runtime image = sibling of the kubelet imageRepo (.../k3rs/containerd).
   cri_repo="${VS_IMAGE_REPO%/*}/$(vs_recipe_field "$root/$recipe" criImageRepoSuffix)"
-  local cri_image="${cri_repo}:${RUSTERNETES_IMAGE_TAG:-main}"
+  local cri_image="${cri_repo}:${K3RS_IMAGE_TAG:-main}"
 
-  local kp_image="${VS_IMAGE_REPO%/*}/kube-proxy:${RUSTERNETES_IMAGE_TAG:-main}"
+  local kp_image="${VS_IMAGE_REPO%/*}/kube-proxy:${K3RS_IMAGE_TAG:-main}"
   local cp node_ip vol="vanilla-swap-${cluster}-cri" datavol="vanilla-swap-${cluster}-cri-data"
   local -a cni_args
   mapfile -t cni_args < <(vs_cri_cni_docker_args "$cluster")
@@ -546,7 +546,7 @@ vs_swap_join_worker() {
   local volsdir="$VS_WORKDIR/kubelet-volumes"
   mkdir -p "$volsdir"
 
-  vs_log "starting rusternetes CRI runtime ($cri_image)"
+  vs_log "starting k3rs CRI runtime ($cri_image)"
   docker volume create "$vol" >/dev/null
   docker volume create "$datavol" >/dev/null
   # /var/lib/containerd (the overlayfs snapshotter root) MUST live on a real
@@ -557,7 +557,7 @@ vs_swap_join_worker() {
   # containerd-data:/var/lib/containerd for the same reason.
   docker run -d --privileged --network kind \
     --name "vanilla-swap-${cluster}-containerd" \
-    --label "rusternetes-swap-cluster=$cluster" \
+    --label "k3rs-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
     -v "${datavol}:/var/lib/containerd" \
     -v "${volsdir}:/app/volumes:rshared" \
@@ -573,7 +573,7 @@ vs_swap_join_worker() {
   local kc="$VS_WORKDIR/node-admin.conf"
   docker exec "$cp" cat /etc/kubernetes/admin.conf >"$kc"
 
-  vs_log "starting rusternetes kubelet node '$node_name' ($image) in API mode"
+  vs_log "starting k3rs kubelet node '$node_name' ($image) in API mode"
   # Run the kubelet in the CRI container's network namespace, not its own
   # `kind` netns. The bridge CNI creates the pod bridge (10.244.0.0/24) inside
   # the containerd container's netns; a kubelet in a SEPARATE netns has no route
@@ -614,7 +614,7 @@ vs_swap_join_worker() {
   docker create --privileged \
     --network "container:vanilla-swap-${cluster}-containerd" \
     --name "$node_container" \
-    --label "rusternetes-swap-cluster=$cluster" \
+    --label "k3rs-swap-cluster=$cluster" \
     -v "${vol}:/run/containerd" \
     -v "${volsdir}:/app/volumes:rshared" \
     -e "CONTAINER_RUNTIME_ENDPOINT=$cri" \
@@ -647,7 +647,7 @@ vs_swap_join_worker() {
 
   # Scope kube-proxy OFF the swapped node. This harness isolates the *kubelet*;
   # kube-proxy is a separate component and currently crash-loops on the
-  # rusternetes node from a spurious config-watch wakeup specific to the CRI
+  # k3rs node from a spurious config-watch wakeup specific to the CRI
   # ConfigMap mount (#1652), which would otherwise wedge the e2e "all system
   # pods ready" gate and prevent ANY NodeConformance spec from running. Exclude
   # it via nodeAffinity (before it schedules) and drop any pod already placed
@@ -679,7 +679,7 @@ vs_apply_swap() {
 }
 
 # ---------------------------------------------------------------------------
-# Post-swap guard: exactly one rusternetes image in the whole cluster
+# Post-swap guard: exactly one k3rs image in the whole cluster
 # ---------------------------------------------------------------------------
 
 # vs_collect_cluster_images <cluster> <kubeconfig> — print every image ref in
@@ -692,12 +692,12 @@ vs_collect_cluster_images() {
   # Static-pod manifest images straight from the control-plane node (belt & braces).
   node="$(vs_control_plane_node "$cluster")"
   docker exec "$node" sh -c 'grep -h -E "^[[:space:]]*image:" /etc/kubernetes/manifests/*.yaml 2>/dev/null | sed -E "s/^[[:space:]]*image:[[:space:]]*//"' 2>/dev/null || true
-  # Node container images (the rusternetes kubelet node, if any).
-  docker ps -aq --filter "label=rusternetes-swap-cluster=$cluster" 2>/dev/null \
+  # Node container images (the k3rs kubelet node, if any).
+  docker ps -aq --filter "label=k3rs-swap-cluster=$cluster" 2>/dev/null \
     | xargs -r docker inspect --format '{{.Config.Image}}' 2>/dev/null || true
 }
 
-# vs_guard_cluster <cluster> <kubeconfig> — assert exactly one rusternetes module
+# vs_guard_cluster <cluster> <kubeconfig> — assert exactly one k3rs module
 # image. The CRI runtime (*/containerd) is infrastructure the kubelet node needs,
 # not a module under test, so it is excluded from the count.
 vs_guard_cluster() {
@@ -707,10 +707,10 @@ vs_guard_cluster() {
   # the kubelet leg: on the kube-proxy leg kube-proxy IS the module under test.
   local -a excl=(-e '/containerd')
   [ "${VS_MODULE:-}" = "kube-proxy" ] || excl+=(-e '/kube-proxy')
-  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | grep -v "${excl[@]}" | vs_count_rusternetes_images)"
+  count="$(vs_collect_cluster_images "$cluster" "$kubeconfig" | grep -v "${excl[@]}" | vs_count_k3rs_images)"
   count="${count:-0}"
-  vs_log "post-swap guard: $count rusternetes image(s) present"
-  [ "$count" -eq 1 ] || vs_die "single-module guard: expected exactly 1 rusternetes image in cluster, found $count" "$VS_EX_GUARD"
+  vs_log "post-swap guard: $count k3rs image(s) present"
+  [ "$count" -eq 1 ] || vs_die "single-module guard: expected exactly 1 k3rs image in cluster, found $count" "$VS_EX_GUARD"
 }
 
 # ---------------------------------------------------------------------------
@@ -1208,14 +1208,14 @@ vs_dump_readiness_diagnostics() {
   # The object the readiness probe was watching, in detail.
   case "$VS_READINESS" in
     node-ready)
-      echo "--- describe node rusternetes-node ---" >&2
-      KUBECONFIG="$kubeconfig" kubectl describe node rusternetes-node >&2 2>&1 || true ;;
+      echo "--- describe node k3rs-node ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl describe node k3rs-node >&2 2>&1 || true ;;
     readyz)
       echo "--- /readyz ---" >&2
       KUBECONFIG="$kubeconfig" kubectl get --raw=/readyz?verbose >&2 2>&1 || true ;;
     service-programmed)
-      echo "--- rusternetes-kube-proxy daemonset ---" >&2
-      KUBECONFIG="$kubeconfig" kubectl -n kube-system describe daemonset rusternetes-kube-proxy >&2 2>&1 || true ;;
+      echo "--- k3rs-kube-proxy daemonset ---" >&2
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system describe daemonset k3rs-kube-proxy >&2 2>&1 || true ;;
     pod-scheduled)
       echo "--- describe canary pod ---" >&2
       KUBECONFIG="$kubeconfig" kubectl -n default describe pod vanilla-swap-canary >&2 2>&1 || true ;;
@@ -1234,7 +1234,7 @@ vs_dump_readiness_diagnostics() {
 # its logs come from the node's container runtime.
 #
 # The container list is ENUMERATED, not guessed: the first version of this dump
-# probed fixed names ("rusternetes-node", …), matched nothing, and printed an
+# probed fixed names ("k3rs-node", …), matched nothing, and printed an
 # empty section for the one failure it existed to explain (run 30439140932).
 #
 # Shared by the readiness-timeout dump and the test-failure dump — the module's
@@ -1257,7 +1257,7 @@ vs_dump_module_logs() {
   KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail="$tail" \
     "-l=component=kube-${VS_MODULE}" >&2 2>&1 || true
   KUBECONFIG="$kubeconfig" kubectl -n kube-system logs --tail="$tail" \
-    "-l=app=rusternetes-${VS_MODULE}" >&2 2>&1 || true
+    "-l=app=k3rs-${VS_MODULE}" >&2 2>&1 || true
 
   # A swapped STATIC-POD module (api-server) is invisible to the two kubectl
   # lookups above: when the swapped api-server cannot persist the kubelet's
@@ -1370,8 +1370,8 @@ vs_readiness_probe() {
   local cluster="$1" kubeconfig="$2"
   case "$VS_READINESS" in
     node-ready)
-      # The rusternetes kubelet self-registers the node named in the recipe.
-      KUBECONFIG="$kubeconfig" kubectl get node rusternetes-node \
+      # The k3rs kubelet self-registers the node named in the recipe.
+      KUBECONFIG="$kubeconfig" kubectl get node k3rs-node \
         -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
         | grep -q True ;;
     readyz)
@@ -1387,11 +1387,11 @@ vs_readiness_probe() {
       [ -n "$(KUBECONFIG="$kubeconfig" kubectl -n kube-system get lease "$lease" \
         -o 'jsonpath={.spec.holderIdentity}' 2>/dev/null)" ] ;;
     service-programmed)
-      # rusternetes kube-proxy DaemonSet fully rolled out on every node.
-      KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/rusternetes-kube-proxy --timeout=5s >/dev/null 2>&1 ;;
+      # k3rs kube-proxy DaemonSet fully rolled out on every node.
+      KUBECONFIG="$kubeconfig" kubectl -n kube-system rollout status daemonset/k3rs-kube-proxy --timeout=5s >/dev/null 2>&1 ;;
     pod-scheduled)
       # The scheduler works iff a pending, unscheduled pod gets a nodeName.
-      # API-mode rusternetes control-plane components do no leader election, so
+      # API-mode k3rs control-plane components do no leader election, so
       # there is no lease to check — prove scheduling directly with a canary.
       KUBECONFIG="$kubeconfig" kubectl -n default get pod vanilla-swap-canary >/dev/null 2>&1 || \
         KUBECONFIG="$kubeconfig" kubectl -n default run vanilla-swap-canary \

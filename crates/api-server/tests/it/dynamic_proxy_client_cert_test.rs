@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rusternetes_api_server::dynamic_certificates::{DynamicCertKeyPairContent, Listener};
-use rusternetes_api_server::handlers::aggregator::{
+use k3rs_api_server::dynamic_certificates::{DynamicCertKeyPairContent, Listener};
+use k3rs_api_server::handlers::aggregator::{
     availability_discovery_request, current_proxy_client_identity_pem, install_proxy_client_certs,
     proxy_current_cert_key_content, AggregatorTarget,
 };
-use rusternetes_api_server::post_start_hooks::{
+use k3rs_api_server::post_start_hooks::{
     register_aggregator_reload_proxy_client_cert_hook, PostStartHooks,
     AGGREGATOR_RELOAD_PROXY_CLIENT_CERT_HOOK,
 };
@@ -365,7 +365,7 @@ async fn rotated_cert_is_what_the_next_proxied_connection_presents() {
     std::fs::write(&k, &a.key).unwrap();
 
     assert!(install_proxy_client_certs(Some(&c), Some(&k)).unwrap());
-    let certs = rusternetes_api_server::handlers::aggregator::proxy_client_certs().unwrap();
+    let certs = k3rs_api_server::handlers::aggregator::proxy_client_certs().unwrap();
     // The aggregator-reload-proxy-client-cert hook starts the reloader.
     let registry = PostStartHooks::new();
     register_aggregator_reload_proxy_client_cert_hook(&registry, certs.clone());

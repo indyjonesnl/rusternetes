@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Networking - Rūsternetes</title>
+  <title>Networking - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Networking</h1>
       <p class="lead">
-        Rūsternetes implements the Kubernetes networking model: every pod gets its own IP address,
+        k3rs implements the Kubernetes networking model: every pod gets its own IP address,
         Services provide stable endpoints for sets of pods, and kube-proxy programs iptables rules
         for in-cluster routing. CoreDNS provides service discovery via DNS.
       </p>
@@ -307,7 +307,7 @@ kubectl describe endpoints <span class="value">web</span></code>
         <p>
           EndpointSlice <code>port.name</code> must always be present, even as an empty string.
           If it is null/nil, <code>kubectl describe</code> will crash with a nil pointer dereference.
-          Rūsternetes always sets port names on EndpointSlices.
+          k3rs always sets port names on EndpointSlices.
         </p>
       </div>
 
@@ -328,7 +328,7 @@ kubectl get endpointslices <span class="flag">-l</span> <span class="value">kube
       <!-- ───────────────────── DNS ───────────────────── -->
       <h2 id="dns">DNS (CoreDNS)</h2>
       <p>
-        Rūsternetes deploys CoreDNS as a pod in <code>kube-system</code> with a pinned ClusterIP
+        k3rs deploys CoreDNS as a pod in <code>kube-system</code> with a pinned ClusterIP
         of <code>10.96.0.10</code>. The kubelet configures each pod's <code>/etc/resolv.conf</code>
         to point to this address.
       </p>
@@ -727,7 +727,7 @@ kubectl get servicecidr</code>
       <!-- ───────────────────── CNI ───────────────────── -->
       <h2 id="cni">CNI (Container Network Interface)</h2>
       <p>
-        Rūsternetes implements the standard CNI specification (v0.4.0+). The kubelet executes
+        k3rs implements the standard CNI specification (v0.4.0+). The kubelet executes
         CNI plugin binaries from <code>/opt/cni/bin/</code> using configuration from
         <code>/etc/cni/net.d/</code> to set up pod networking.
       </p>
@@ -824,7 +824,7 @@ EOF</code>
       <h3>Troubleshooting CNI</h3>
       <ul>
         <li><strong>Pods stuck in ContainerCreating</strong> &mdash; Check kubelet logs for CNI errors:
-          <code>docker logs rusternetes-kubelet 2&gt;&amp;1 | grep -i cni</code></li>
+          <code>docker logs k3rs-kubelet 2&gt;&amp;1 | grep -i cni</code></li>
         <li><strong>Pods can&rsquo;t reach each other</strong> &mdash; Verify pod IPs with
           <code>kubectl get pods -o wide</code> and test connectivity with
           <code>kubectl exec pod-a -- ping &lt;pod-b-ip&gt;</code></li>
@@ -846,7 +846,7 @@ EOF</code>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

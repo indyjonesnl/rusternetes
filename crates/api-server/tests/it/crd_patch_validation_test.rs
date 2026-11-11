@@ -16,7 +16,7 @@
 //!    rejects a path that does not exist, one that points into `metadata`, and
 //!    one whose leaf is not a scalar.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";

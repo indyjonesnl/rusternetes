@@ -7,7 +7,7 @@
 //! The upstream test lists PodTemplates with `?limit`, follows every
 //! `continue` token to the end, and asserts that **all** items are returned
 //! exactly once **in key order**. The api-server LIST handler paginates with
-//! the offset-based `rusternetes_common::paginate` helper over
+//! the offset-based `k3rs_common::paginate` helper over
 //! `Storage::list`. `MemoryStorage::list` iterates a `HashMap`, so its
 //! iteration order is NOT key order — without a deterministic sort in the
 //! handler the continue chain returns items out of order (and, once the map
@@ -22,10 +22,10 @@
 //! Harness mirrors `list_resource_version_router_test.rs`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
-// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// Harness: `TestApiServer` (k3rs-test-support) — `build_router` on
 // `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 
 async fn post_podtemplate(state: &TestApiServer, namespace: &str, name: &str) {

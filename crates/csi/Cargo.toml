@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-csi"
+name = "k3rs-csi"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_csi"
+name = "k3rs_csi"
 path = "src/lib.rs"
 
 [dependencies]

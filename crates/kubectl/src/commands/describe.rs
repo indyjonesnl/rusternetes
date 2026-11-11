@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
-use rusternetes_client::http::{ApiClient, GetError};
-use rusternetes_common::resources::{Deployment, Namespace, Node, Pod, Service};
+use k3rs_client::http::{ApiClient, GetError};
+use k3rs_common::resources::{Deployment, Namespace, Node, Pod, Service};
 
 pub async fn execute_enhanced(
     client: &ApiClient,
@@ -258,8 +258,8 @@ pub fn describe_service(service: &Service) {
                 p.port,
                 p.protocol.as_str(),
                 match &p.target_port {
-                    Some(rusternetes_common::resources::IntOrString::Int(tp)) => tp.to_string(),
-                    Some(rusternetes_common::resources::IntOrString::String(tp)) => tp.clone(),
+                    Some(k3rs_common::resources::IntOrString::Int(tp)) => tp.to_string(),
+                    Some(k3rs_common::resources::IntOrString::String(tp)) => tp.clone(),
                     None => "default".to_string(),
                 }
             ))

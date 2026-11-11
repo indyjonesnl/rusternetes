@@ -6,7 +6,7 @@
 /// 3. StorageClass CRUD operations
 /// 4. RBAC authorization for volume resources
 /// 5. Serialization/deserialization of volume types
-use rusternetes_common::{
+use k3rs_common::{
     auth::UserInfo,
     authz::RequestAttributes,
     resources::volume::{
@@ -149,7 +149,7 @@ fn test_storageclass_creation() {
             api_version: "storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new("fast-storage"),
-        provisioner: "rusternetes.io/hostpath".to_string(),
+        provisioner: "k3rs.io/hostpath".to_string(),
         parameters: Some(parameters),
         reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
         volume_binding_mode: Some(VolumeBindingMode::Immediate),
@@ -160,13 +160,13 @@ fn test_storageclass_creation() {
 
     // Verify basic fields
     assert_eq!(sc.metadata.name, "fast-storage");
-    assert_eq!(sc.provisioner, "rusternetes.io/hostpath");
+    assert_eq!(sc.provisioner, "k3rs.io/hostpath");
     assert_eq!(sc.allow_volume_expansion, Some(true));
 
     // Verify serialization
     let json = serde_json::to_string(&sc).expect("Failed to serialize StorageClass");
     assert!(json.contains("fast-storage"));
-    assert!(json.contains("rusternetes.io/hostpath"));
+    assert!(json.contains("k3rs.io/hostpath"));
     assert!(json.contains("Immediate"));
 
     // Verify deserialization

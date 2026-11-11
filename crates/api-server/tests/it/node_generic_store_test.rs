@@ -7,7 +7,7 @@
 //! (storage/storage.go) and `ValidateNode`/`ValidateNodeUpdate`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NODES: &str = "/api/v1/nodes";

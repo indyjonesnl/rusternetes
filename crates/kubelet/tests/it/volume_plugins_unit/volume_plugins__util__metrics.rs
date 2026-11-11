@@ -3,10 +3,10 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_kubelet::server_metrics::collect_volume_stat_cal_duration;
+    pub use k3rs_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
     pub use prometheus::{HistogramOpts, HistogramVec};
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_kubelet::server_metrics::collect_volume_stat_cal_duration;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
     pub use std::io::{Seek, SeekFrom};
     pub use std::sync::{LazyLock, Once};
     pub use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::metrics::*;
+    use k3rs_kubelet::volume_plugins::util::metrics::*;
 
     /// `metrics_block.go:62-64`: an empty device is `NoPathDefined`.
     #[test]
@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn block_metrics_observes_volume_stat_duration() {
         let _ = new_metrics_block("").get_metrics();
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains(
             "kubelet_volume_metric_collection_duration_seconds_count{metric_source=\"block\"}"
         ));
@@ -86,7 +86,7 @@ mod tests {
             Duration::from_millis(5),
             "true",
         );
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains("# HELP csi_operations_seconds [ALPHA] Container Storage Interface operation duration with gRPC error code status total"));
         assert!(body.contains("csi_operations_seconds_count{driver_name=\"util.metrics.test.driver\",grpc_status_code=\"OK\",method_name=\"/csi.v1.Node/NodeStageVolume\",migrated=\"true\"} 1"), "{body}");
     }
@@ -98,7 +98,7 @@ mod tests {
         let h = operation_complete_hook("util.metrics.test/plugin", "unmount_device");
         h.complete(None, None);
         h.complete(Some(&anyhow::anyhow!("boom")), Some(true));
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains(
             "# HELP storage_operation_duration_seconds [ALPHA] Storage operation duration"
         ));
@@ -109,8 +109,8 @@ mod tests {
     /// `GetFullQualifiedPluginNameForVolume` (`metrics.go:127-139`).
     #[test]
     fn csi_plugin_name_carries_the_driver() {
-        use rusternetes_kubelet::volume_plugins::plugin::OwnedSpec;
-        let pv: rusternetes_common::resources::volume::PersistentVolume =
+        use k3rs_kubelet::volume_plugins::plugin::OwnedSpec;
+        let pv: k3rs_common::resources::volume::PersistentVolume =
             serde_json::from_value(serde_json::json!({
                 "metadata": {"name": "pv"},
                 "spec": {"csi": {"driver": "d.example.com", "volumeHandle": "h"}}

@@ -15,10 +15,8 @@ pub fn generate_openapi_spec() -> OpenAPI {
     OpenAPI {
         openapi: "3.0.0".to_string(),
         info: Info {
-            title: "Rusternetes Kubernetes API".to_string(),
-            description: Some(
-                "OpenAPI specification for Rusternetes Kubernetes API server".to_string(),
-            ),
+            title: "k3rs Kubernetes API".to_string(),
+            description: Some("OpenAPI specification for k3rs Kubernetes API server".to_string()),
             terms_of_service: None,
             contact: None,
             license: None,
@@ -27,7 +25,7 @@ pub fn generate_openapi_spec() -> OpenAPI {
         },
         servers: vec![Server {
             url: "/".to_string(),
-            description: Some("Rusternetes API Server".to_string()),
+            description: Some("k3rs API Server".to_string()),
             variables: Some(IndexMap::new()),
             extensions: IndexMap::new(),
         }],

@@ -4,8 +4,8 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::Secret;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_common::resources::Secret;
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tracing::{error, info};
@@ -14,8 +14,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::Duration as D;
-    use rusternetes_controller_manager::controllers::bootstrap_token_cleaner::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::bootstrap_token_cleaner::*;
+    use k3rs_storage::memory::MemoryStorage;
     use std::collections::HashMap;
 
     /// `newTokenSecret` (common_test.go).
@@ -50,8 +50,8 @@ mod tests {
         (TokenCleaner::new(st.clone()), st, key)
     }
 
-    fn q() -> rusternetes_storage::WorkQueue {
-        rusternetes_storage::WorkQueue::new()
+    fn q() -> k3rs_storage::WorkQueue {
+        k3rs_storage::WorkQueue::new()
     }
 
     async fn exists(st: &MemoryStorage, key: &str) -> bool {
@@ -227,7 +227,7 @@ mod tests {
     async fn bad_key_is_rate_limited_not_forgotten() {
         let st = Arc::new(MemoryStorage::new());
         let c = TokenCleaner::new(st);
-        let queue = rusternetes_storage::WorkQueue::named(QUEUE_NAME);
+        let queue = k3rs_storage::WorkQueue::named(QUEUE_NAME);
         assert!(c.sync_func(&queue, "no-slash", Utc::now()).await.is_err());
         queue.add("no-slash".into()).await;
         assert!(c.process_next_work_item(&queue).await);

@@ -15,7 +15,7 @@
 //! * and this plugin narrows them to the node's own mirror pods
 //!   (`plugin/pkg/admission/noderestriction/admission.go:252-275`).
 //!
-//! Rusternetes had neither: the authorizer denied node pod writes outright,
+//! k3rs had neither: the authorizer denied node pod writes outright,
 //! with a comment saying the grant would be unsafe until this plugin existed
 //! (#1721). A real kubelet against our api-server then looped on
 //!
@@ -27,17 +27,17 @@
 //! so static-pod lifecycle was broken (#1906). This module is the missing half;
 //! the authorizer grant is restored alongside it.
 
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::resources::csi::CSIDriver;
-use rusternetes_common::resources::pod::Volume;
-use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-use rusternetes_common::resources::{
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::resources::csi::CSIDriver;
+use k3rs_common::resources::pod::Volume;
+use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+use k3rs_common::resources::{
     Node, PersistentVolume, PersistentVolumeClaim, Pod, ServiceAccount, TokenRequest,
 };
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_common::{Error, Result};
-use rusternetes_middleware::AuthContext;
+use k3rs_common::types::ObjectMeta;
+use k3rs_common::{Error, Result};
+use k3rs_middleware::AuthContext;
 
 /// `api.MirrorPodAnnotationKey` (`pkg/apis/core/annotation_key_constants.go:27`).
 pub const MIRROR_POD_ANNOTATION_KEY: &str = "kubernetes.io/config.mirror";
@@ -72,7 +72,7 @@ fn spec_node_name(pod: &Pod) -> &str {
 /// and passes through.
 pub async fn admit_pod_create<S>(storage: &S, auth: &AuthContext, pod: &Pod) -> Result<()>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let Some(node_name) = node_identity(auth) else {
         return Ok(());
@@ -114,7 +114,7 @@ where
 /// `blockOwnerDeletion`, with a matching uid.
 async fn check_owner_references<S>(storage: &S, node_name: &str, meta: &ObjectMeta) -> Result<()>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let owners = meta.owner_references.as_deref().unwrap_or(&[]);
     if owners.len() > 1 {
@@ -145,8 +145,8 @@ where
     }
 
     // Verify the node UID.
-    let node_key = rusternetes_storage::build_key("nodes", None, node_name);
-    let node: rusternetes_common::resources::Node = storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None, node_name);
+    let node: k3rs_common::resources::Node = storage.get(&node_key).await?;
     if owner.uid != node.metadata.uid {
         return Err(Error::Forbidden(format!(
             "node {} UID mismatch: expected {} got {}",
@@ -199,7 +199,7 @@ pub async fn admit_pod_certificate_request<S>(
     req: &PodCertificateRequest,
 ) -> Result<()>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let Some(node_name) = node_identity(auth) else {
         return Ok(());
@@ -223,11 +223,7 @@ where
         )));
     }
     let node: Node = match storage
-        .get(&rusternetes_storage::build_key(
-            "nodes",
-            None,
-            &spec.node_name,
-        ))
+        .get(&k3rs_storage::build_key("nodes", None, &spec.node_name))
         .await
     {
         Ok(n) => n,
@@ -253,7 +249,7 @@ where
 
     // Cross-check that the pod is a real pod, running on the node.
     let pod: Pod = match storage
-        .get(&rusternetes_storage::build_key(
+        .get(&k3rs_storage::build_key(
             "pods",
             Some(namespace),
             &spec.pod_name,
@@ -310,7 +306,7 @@ where
     }
     let sa_ref = format!("{namespace}/{}", spec.service_account_name);
     let sa: ServiceAccount = match storage
-        .get(&rusternetes_storage::build_key(
+        .get(&k3rs_storage::build_key(
             "serviceaccounts",
             Some(namespace),
             &spec.service_account_name,
@@ -361,7 +357,7 @@ pub async fn admit_service_account_token<S>(
     audience_restriction: bool,
 ) -> Result<()>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let Some(node_name) = node_identity(auth) else {
         return Ok(());
@@ -371,7 +367,7 @@ where
     // scheduled on the node.
     let bound = tr.spec.bound_object_ref.as_ref();
     let get = |f: fn(
-        &rusternetes_common::resources::authentication::BoundObjectReference,
+        &k3rs_common::resources::authentication::BoundObjectReference,
     ) -> &Option<String>| {
         bound
             .and_then(|b| f(b).as_deref())
@@ -393,11 +389,7 @@ where
         ));
     }
     let pod: Pod = storage
-        .get(&rusternetes_storage::build_key(
-            "pods",
-            Some(namespace),
-            &ref_name,
-        ))
+        .get(&k3rs_storage::build_key("pods", Some(namespace), &ref_name))
         .await
         .map_err(|e| match e {
             Error::NotFound(m) => Error::NotFound(m),
@@ -433,7 +425,7 @@ async fn validate_node_service_account_audience<S>(
     pod: &Pod,
 ) -> std::result::Result<(), String>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let requested_audience = match tr.spec.audiences.len() {
         0 => "",
@@ -480,7 +472,7 @@ async fn pod_references_audience<S>(
     audience: &str,
 ) -> std::result::Result<bool, String>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let translator = CsiTranslator::new();
     let namespace = pod.metadata.namespace.as_deref().unwrap_or("");
@@ -559,10 +551,10 @@ async fn get_csi_from_pvc<S>(
     claim_name: &str,
 ) -> std::result::Result<String, String>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let pvc: PersistentVolumeClaim = storage
-        .get(&rusternetes_storage::build_key(
+        .get(&k3rs_storage::build_key(
             "persistentvolumeclaims",
             Some(namespace),
             claim_name,
@@ -571,7 +563,7 @@ where
         .map_err(|e| e.to_string())?;
     let pv_name = pvc.spec.volume_name.clone().unwrap_or_default();
     let pv: PersistentVolume = storage
-        .get(&rusternetes_storage::build_key(
+        .get(&k3rs_storage::build_key(
             "persistentvolumes",
             None,
             &pv_name,
@@ -597,14 +589,10 @@ async fn csi_driver_has_audience<S>(
     audience: &str,
 ) -> std::result::Result<bool, String>
 where
-    S: rusternetes_storage::Storage,
+    S: k3rs_storage::Storage,
 {
     let driver: CSIDriver = storage
-        .get(&rusternetes_storage::build_key(
-            "csidrivers",
-            None,
-            driver_name,
-        ))
+        .get(&k3rs_storage::build_key("csidrivers", None, driver_name))
         .await
         .map_err(|e| e.to_string())?;
     Ok(driver

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Monitoring & Observability - Rūsternetes</title>
+  <title>Monitoring & Observability - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -102,7 +102,7 @@
     <main class="doc-content">
       <h1>Monitoring &amp; Observability</h1>
       <p class="lead">
-        Health checks, Prometheus metrics, structured logging, and tracing for every Rūsternetes component.
+        Health checks, Prometheus metrics, structured logging, and tracing for every k3rs component.
       </p>
 
       <h2>Health Endpoints</h2>
@@ -238,7 +238,7 @@ curl http://localhost:8081/metrics</code>
 
       <h2>Tracing</h2>
       <p>
-        Rūsternetes uses the <code>tracing</code> and <code>tracing-subscriber</code> crates for
+        k3rs uses the <code>tracing</code> and <code>tracing-subscriber</code> crates for
         structured logging and distributed tracing. OpenTelemetry integration is available via
         <code>tracing-opentelemetry</code> for exporting spans to Jaeger, Zipkin, or any
         OTLP-compatible collector.
@@ -253,12 +253,12 @@ curl http://localhost:8081/metrics</code>
         </div>
         <code><span class="comment"># Enable OpenTelemetry export to a local collector</span>
 export OTEL_EXPORTER_OTLP_ENDPOINT=<span class="value">http://localhost:4317</span>
-export OTEL_SERVICE_NAME=<span class="value">rusternetes-api-server</span></code>
+export OTEL_SERVICE_NAME=<span class="value">k3rs-api-server</span></code>
       </pre>
 
       <h2>Logging</h2>
       <p>
-        All Rūsternetes components use Rust's <code>tracing</code> framework for structured logging.
+        All k3rs components use Rust's <code>tracing</code> framework for structured logging.
         Log levels and component-specific filtering are controlled via the <code>RUST_LOG</code>
         environment variable or the <code>--log-level</code> CLI flag.
       </p>
@@ -308,21 +308,21 @@ export OTEL_SERVICE_NAME=<span class="value">rusternetes-api-server</span></code
 export RUST_LOG=<span class="value">debug</span>
 
 <span class="comment"># Component-specific logging</span>
-export RUST_LOG=<span class="value">rusternetes_api_server=debug</span>
+export RUST_LOG=<span class="value">k3rs_api_server=debug</span>
 
 <span class="comment"># Multiple components at different levels</span>
-export RUST_LOG=<span class="value">rusternetes_api_server=debug,rusternetes_scheduler=info,rusternetes_kubelet=trace</span>
+export RUST_LOG=<span class="value">k3rs_api_server=debug,k3rs_scheduler=info,k3rs_kubelet=trace</span>
 
 <span class="comment"># Via CLI flag</span>
-./rusternetes-api-server <span class="flag">--log-level</span> <span class="value">debug</span></code>
+./k3rs-api-server <span class="flag">--log-level</span> <span class="value">debug</span></code>
       </pre>
 
       <div class="admonition note">
         <div class="admonition-title">RUST_LOG syntax</div>
         <p>
           The <code>RUST_LOG</code> variable uses the <code>tracing-subscriber</code> filter syntax.
-          Crate names use underscores (e.g., <code>rusternetes_api_server</code>), not hyphens.
-          You can also filter by module path: <code>rusternetes_api_server::handlers=trace</code>.
+          Crate names use underscores (e.g., <code>k3rs_api_server</code>), not hyphens.
+          You can also filter by module path: <code>k3rs_api_server::handlers=trace</code>.
         </p>
       </div>
 
@@ -368,10 +368,10 @@ podman compose -f compose.yml logs <span class="flag">-f</span> <span class="fla
         <code>services:
   api-server:
     environment:
-      - RUST_LOG=<span class="value">rusternetes_api_server=debug</span>
+      - RUST_LOG=<span class="value">k3rs_api_server=debug</span>
   scheduler:
     environment:
-      - RUST_LOG=<span class="value">rusternetes_scheduler=debug</span></code>
+      - RUST_LOG=<span class="value">k3rs_scheduler=debug</span></code>
       </pre>
 
       <div class="admonition warning">
@@ -407,7 +407,7 @@ podman compose -f compose.yml logs <span class="flag">-f</span> <span class="fla
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

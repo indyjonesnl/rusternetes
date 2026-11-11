@@ -264,7 +264,7 @@ fn is_missing_declaration(err: &str) -> bool {
 /// Why `expression` does not compile, if it does not.
 ///
 /// Upstream compiles against a typed CEL environment
-/// (`validateMatchConditionsExpression`, validation.go:1100). Rusternetes has
+/// (`validateMatchConditionsExpression`, validation.go:1100). k3rs has
 /// no typed environment, so this compiles with the plain `cel` crate and
 /// tolerates the errors that come from the missing declarations rather than
 /// from the expression itself.

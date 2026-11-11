@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{Pod, ResourceClaim};
-    pub use rusternetes_scheduler::queue::events::*;
+    pub use k3rs_common::resources::{Pod, ResourceClaim};
+    pub use k3rs_scheduler::queue::events::*;
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, RwLock};
     pub use tracing::debug;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::dra_hints::*;
+    use k3rs_scheduler::queue::dra_hints::*;
     use serde_json::{json, Value};
 
     const POD_UID: &str = "1234";

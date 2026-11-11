@@ -3,9 +3,9 @@
 //! Mirrors upstream `ValidateLimitRange`
 //! (`pkg/apis/core/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::policy::LimitRange;
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::limitrange::validate_limit_range;
+use k3rs_common::resources::policy::LimitRange;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::limitrange::validate_limit_range;
 use serde_json::json;
 
 fn lr(limits: serde_json::Value) -> LimitRange {

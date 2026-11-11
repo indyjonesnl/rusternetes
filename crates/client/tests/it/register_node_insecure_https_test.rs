@@ -15,8 +15,8 @@
 
 use std::sync::Arc;
 
-use rusternetes_client::config::ClientConfig;
-use rusternetes_client::http::ApiClient;
+use k3rs_client::config::ClientConfig;
+use k3rs_client::http::ApiClient;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

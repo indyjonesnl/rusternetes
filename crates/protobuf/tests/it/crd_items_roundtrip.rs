@@ -4,7 +4,7 @@
 //! client-go negotiates protobuf for CRDs, so a lost `items.type` makes the
 //! follow-up `Update` fail structural validation ("must not be empty for
 //! specified array items").
-use rusternetes_protobuf::ProtoRegistry;
+use k3rs_protobuf::ProtoRegistry;
 use serde_json::json;
 
 #[test]

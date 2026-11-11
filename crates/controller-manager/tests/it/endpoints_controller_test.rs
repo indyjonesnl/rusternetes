@@ -1,10 +1,10 @@
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerStatus, IntOrString, Pod, PodCondition, PodSpec, PodStatus, Service,
     ServicePort, ServiceSpec,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -249,7 +249,7 @@ async fn test_endpoints_created_for_service_with_matching_pods() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints were created
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "web-service"))
         .await
         .unwrap();
@@ -317,7 +317,7 @@ async fn test_endpoints_separates_ready_and_not_ready_pods() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "db-service"))
         .await
         .unwrap();
@@ -384,7 +384,7 @@ async fn test_endpoints_skips_pods_without_ip() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints only includes pod with IP
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "api-service"))
         .await
         .unwrap();
@@ -454,7 +454,7 @@ async fn test_endpoints_respects_service_selector() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints only includes matching pod
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "frontend-service"))
         .await
         .unwrap();
@@ -490,7 +490,7 @@ async fn test_endpoints_skips_service_without_selector() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints were NOT created
-    let result: Result<rusternetes_common::resources::Endpoints, _> = storage
+    let result: Result<k3rs_common::resources::Endpoints, _> = storage
         .get(&build_key("endpoints", Some("default"), "headless-service"))
         .await;
 
@@ -534,7 +534,7 @@ async fn test_endpoints_updates_when_pods_change() {
     controller.reconcile_all().await.unwrap();
 
     // Verify initial endpoints
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "cache-service"))
         .await
         .unwrap();
@@ -557,7 +557,7 @@ async fn test_endpoints_updates_when_pods_change() {
     controller.reconcile_all().await.unwrap();
 
     // Verify updated endpoints
-    let updated_endpoints: rusternetes_common::resources::Endpoints = storage
+    let updated_endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "cache-service"))
         .await
         .unwrap();
@@ -628,7 +628,7 @@ async fn test_endpoints_multiple_namespaces() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints in ns1
-    let endpoints_ns1: rusternetes_common::resources::Endpoints = storage
+    let endpoints_ns1: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("ns1"), "worker-service"))
         .await
         .unwrap();
@@ -643,7 +643,7 @@ async fn test_endpoints_multiple_namespaces() {
     );
 
     // Verify endpoints in ns2
-    let endpoints_ns2: rusternetes_common::resources::Endpoints = storage
+    let endpoints_ns2: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("ns2"), "worker-service"))
         .await
         .unwrap();
@@ -693,7 +693,7 @@ async fn test_endpoints_includes_target_ref() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints include target_ref
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key("endpoints", Some("default"), "metrics-service"))
         .await
         .unwrap();
@@ -766,7 +766,7 @@ async fn test_endpoints_includes_port_mapping() {
     controller.reconcile_all().await.unwrap();
 
     // Verify endpoints include port mappings
-    let endpoints: rusternetes_common::resources::Endpoints = storage
+    let endpoints: k3rs_common::resources::Endpoints = storage
         .get(&build_key(
             "endpoints",
             Some("default"),

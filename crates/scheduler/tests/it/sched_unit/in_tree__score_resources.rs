@@ -2,9 +2,9 @@
 //! plugin objects and `Framework::run_score_plugins`
 //! (`noderesources/least_allocated_test.go`, `balanced_allocation_test.go`).
 use super::listers::EmptyListers;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::CycleState;
-use rusternetes_scheduler::profile::Profile;
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::CycleState;
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
 fn pod(name: &str, node: &str, requests: Value) -> Pod {

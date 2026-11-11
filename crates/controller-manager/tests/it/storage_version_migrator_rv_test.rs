@@ -4,15 +4,15 @@
 //! seams the upstream test fakes (discovery and the metadata list).
 
 use async_trait::async_trait;
-use rusternetes_common::resources::storageversionmigration::StorageVersionMigration;
-use rusternetes_controller_manager::controllers::storage_version_migrator_rv::{
+use k3rs_common::resources::storageversionmigration::StorageVersionMigration;
+use k3rs_controller_manager::controllers::storage_version_migrator_rv::{
     LatestResourceVersion, ResourceVersionController, SvmDiscovery, FAKE_SVM_NAMESPACE_NAME,
 };
-use rusternetes_discovery::restmapper::{
+use k3rs_discovery::restmapper::{
     new_discovery_rest_mapper, ApiGroupResources, ApiResource, Gvr, PriorityRestMapper,
     ServedResource,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

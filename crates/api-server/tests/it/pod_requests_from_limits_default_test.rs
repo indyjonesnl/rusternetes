@@ -8,7 +8,7 @@
 //! (defaults.go:166-167).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";
@@ -151,8 +151,8 @@ async fn pod_templates_are_not_defaulted() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pod_level_requests_default_to_aggregated_container_requests() {
-    let _g = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodLevelResources,
+    let _g = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodLevelResources,
         true,
     );
     let state = TestApiServer::new();
@@ -188,8 +188,8 @@ async fn pod_level_requests_default_to_aggregated_container_requests() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pod_level_requests_default_to_pod_limits_when_containers_have_none() {
-    let _g = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodLevelResources,
+    let _g = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodLevelResources,
         true,
     );
     let state = TestApiServer::new();
@@ -213,8 +213,8 @@ async fn pod_level_requests_default_to_pod_limits_when_containers_have_none() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pod_level_requests_not_defaulted_when_gate_off() {
-    let _g = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodLevelResources,
+    let _g = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodLevelResources,
         false,
     );
     let state = TestApiServer::new();

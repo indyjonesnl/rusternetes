@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for Endpoints
 
-use rusternetes_common::resources::{EndpointAddress, EndpointPort, EndpointSubset, Endpoints};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{EndpointAddress, EndpointPort, EndpointSubset, Endpoints};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -102,7 +102,7 @@ async fn test_endpoints_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify it's deleted
-    let result: rusternetes_common::Result<Endpoints> = storage.get(&key).await;
+    let result: k3rs_common::Result<Endpoints> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -513,6 +513,6 @@ async fn test_endpoints_not_found() {
     let namespace = "test-endpoints-not-found";
     let key = build_key("endpoints", Some(namespace), "nonexistent");
 
-    let result: rusternetes_common::Result<Endpoints> = storage.get(&key).await;
+    let result: k3rs_common::Result<Endpoints> = storage.get(&key).await;
     assert!(result.is_err());
 }

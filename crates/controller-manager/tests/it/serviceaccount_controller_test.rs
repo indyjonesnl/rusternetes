@@ -1,18 +1,18 @@
 //! Integration tests for ServiceAccountController
 //!
 //! Mirrors behaviour exercised by upstream `kubernetes/test/e2e/auth/serviceaccount.go`
-//! against rusternetes' in-process controller. Extended coverage includes
+//! against k3rs' in-process controller. Extended coverage includes
 //! automount preservation, imagePullSecrets retention, multi-namespace fan-out,
 //! token-secret annotations, and RED-state gaps for bound-token projection and
 //! pod-spec propagation of SA-level imagePullSecrets.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     namespace::{NamespaceSpec, NamespaceStatus},
     LocalObjectReference, Namespace, Secret, ServiceAccount,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::serviceaccount::ServiceAccountController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 /// Build an Active Namespace ready for use in tests.
@@ -40,7 +40,7 @@ fn active_namespace(name: &str) -> Namespace {
         },
         spec: Some(NamespaceSpec { finalizers: None }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
+            phase: Some(k3rs_common::types::Phase::Active),
             conditions: None,
         }),
     }
@@ -110,7 +110,7 @@ async fn test_serviceaccount_creates_default_in_namespace() {
         },
         spec: Some(NamespaceSpec { finalizers: None }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
+            phase: Some(k3rs_common::types::Phase::Active),
             conditions: None,
         }),
     };
@@ -169,7 +169,7 @@ async fn test_serviceaccount_does_not_recreate_existing() {
         },
         spec: Some(NamespaceSpec { finalizers: None }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
+            phase: Some(k3rs_common::types::Phase::Active),
             conditions: None,
         }),
     };
@@ -248,7 +248,7 @@ async fn test_serviceaccount_skips_terminating_namespaces() {
         },
         spec: Some(NamespaceSpec { finalizers: None }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Terminating),
+            phase: Some(k3rs_common::types::Phase::Terminating),
             conditions: None,
         }),
     };
@@ -316,7 +316,7 @@ async fn test_serviceaccount_automount_disable_is_preserved() {
 /// SA-level `imagePullSecrets` set by the user must round-trip through reconcile
 /// unchanged. Upstream Kubernetes additionally propagates these into pods via
 /// the ServiceAccount admission plugin (`plugin/pkg/admission/serviceaccount`),
-/// which rusternetes does not implement in the controller-manager. The
+/// which k3rs does not implement in the controller-manager. The
 /// propagation half is marked `#[ignore]` as a RED-state spec.
 #[tokio::test]
 async fn test_serviceaccount_image_pull_secrets_persist_through_reconcile() {
@@ -370,7 +370,7 @@ async fn test_serviceaccount_image_pull_secrets_persist_through_reconcile() {
 // NOTE: SA `imagePullSecrets` propagation onto pods is an **admission** concern,
 // not a controller one — upstream does it in the ServiceAccount admission plugin
 // at pod CREATE (plugin/pkg/admission/serviceaccount/admission.go:167), not in a
-// reconcile loop. In rusternetes it runs in
+// reconcile loop. In k3rs it runs in
 // `admission::inject_service_account_token` via
 // `serviceaccount::propagate_image_pull_secrets`, and is covered end-to-end by
 // `api-server/tests/integration_serviceaccount_token.rs::
@@ -718,7 +718,7 @@ fn sa_with_secret_refs(ns: &str, name: &str, refs: &[&str]) -> ServiceAccount {
     sa.secrets = Some(
         refs.iter()
             .map(
-                |r| rusternetes_common::resources::service_account::ObjectReference {
+                |r| k3rs_common::resources::service_account::ObjectReference {
                     name: Some(r.to_string()),
                     ..Default::default()
                 },

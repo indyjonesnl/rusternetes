@@ -2,12 +2,12 @@ use super::endpointslice_tracker::EndpointSliceTracker;
 use super::trigger_time_tracker::{format_rfc3339_nano, TriggerTimeTracker};
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::endpointslice::{
+use k3rs_common::resources::endpointslice::{
     Endpoint, EndpointConditions, EndpointPort, EndpointReference,
 };
-use rusternetes_common::resources::{EndpointSlice, Endpoints, Pod, Service};
-use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
+use k3rs_common::resources::{EndpointSlice, Endpoints, Pod, Service};
+use k3rs_common::types::Phase;
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -210,9 +210,7 @@ fn pod_endpoints_changed(old: &Pod, new: &Pod) -> (bool, bool) {
     if new.metadata.deletion_timestamp.is_some() || old.metadata.deletion_timestamp.is_some() {
         return (true, labels_changed);
     }
-    if rusternetes_common::podutil::is_pod_ready(old)
-        != rusternetes_common::podutil::is_pod_ready(new)
-    {
+    if k3rs_common::podutil::is_pod_ready(old) != k3rs_common::podutil::is_pod_ready(new) {
         return (true, labels_changed);
     }
     let ips = |p: &Pod| -> Vec<String> {
@@ -447,11 +445,8 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// Returns `(old, new)` as the informer's update handler sees them: `old`
     /// is the snapshot's previous copy (`None` for an add), `new` is `None`
     /// for a delete.
-    fn apply_pod_event(
-        &self,
-        event: &rusternetes_storage::WatchEvent,
-    ) -> (Option<Pod>, Option<Pod>) {
-        use rusternetes_storage::WatchEvent;
+    fn apply_pod_event(&self, event: &k3rs_storage::WatchEvent) -> (Option<Pod>, Option<Pod>) {
+        use k3rs_storage::WatchEvent;
         let (value, deleted) = match event {
             WatchEvent::Added(_, v) | WatchEvent::Modified(_, v) => (v, false),
             WatchEvent::Deleted(_, v) => (v, true),
@@ -915,15 +910,14 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 "endpointslice-mirroring-controller.k8s.io".to_string(),
             );
 
-            slice.metadata.owner_references =
-                Some(vec![rusternetes_common::types::OwnerReference {
-                    api_version: "v1".to_string(),
-                    kind: "Endpoints".to_string(),
-                    name: name.to_string(),
-                    uid: ep.metadata.uid.clone(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                }]);
+            slice.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "Endpoints".to_string(),
+                name: name.to_string(),
+                uid: ep.metadata.uid.clone(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
 
             let slice_key = build_key("endpointslices", Some(ns), &slice_name);
             match self.storage.get::<EndpointSlice>(&slice_key).await {
@@ -1117,15 +1111,14 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                     "endpointslice-mirroring-controller.k8s.io".to_string(),
                 );
 
-                slice.metadata.owner_references =
-                    Some(vec![rusternetes_common::types::OwnerReference {
-                        api_version: "v1".to_string(),
-                        kind: "Endpoints".to_string(),
-                        name: ep_name.clone(),
-                        uid: ep.metadata.uid.clone(),
-                        controller: Some(true),
-                        block_owner_deletion: Some(true),
-                    }]);
+                slice.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
+                    api_version: "v1".to_string(),
+                    kind: "Endpoints".to_string(),
+                    name: ep_name.clone(),
+                    uid: ep.metadata.uid.clone(),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }]);
 
                 let slice_key = build_key("endpointslices", Some(ns), &slice_name);
                 match self.storage.get::<EndpointSlice>(&slice_key).await {
@@ -1235,7 +1228,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
         // Skip ExternalName services (K8s: services with Type ExternalName receive no endpoints)
         if matches!(
             service.spec.service_type,
-            Some(rusternetes_common::resources::ServiceType::ExternalName)
+            Some(k3rs_common::resources::ServiceType::ExternalName)
         ) {
             return Ok(());
         }
@@ -1405,16 +1398,15 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 if let Some(node_name) = endpoint.node_name.as_ref() {
                     if let Some(zone) = node_zones.get(node_name) {
                         endpoint.zone = Some(zone.clone());
-                        endpoint.hints = Some(
-                            rusternetes_common::resources::endpointslice::EndpointHints {
+                        endpoint.hints =
+                            Some(k3rs_common::resources::endpointslice::EndpointHints {
                                 for_zones: Some(vec![
-                                    rusternetes_common::resources::endpointslice::ForZone {
+                                    k3rs_common::resources::endpointslice::ForZone {
                                         name: zone.clone(),
                                     },
                                 ]),
                                 for_nodes: None,
-                            },
-                        );
+                            });
                     }
                 }
             }
@@ -1473,15 +1465,14 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
             );
 
             // Set owner reference to the Service
-            slice.metadata.owner_references =
-                Some(vec![rusternetes_common::types::OwnerReference {
-                    api_version: "v1".to_string(),
-                    kind: "Service".to_string(),
-                    name: service_name.clone(),
-                    uid: service.metadata.uid.clone(),
-                    controller: Some(true),
-                    block_owner_deletion: Some(true),
-                }]);
+            slice.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
+                api_version: "v1".to_string(),
+                kind: "Service".to_string(),
+                name: service_name.clone(),
+                uid: service.metadata.uid.clone(),
+                controller: Some(true),
+                block_owner_deletion: Some(true),
+            }]);
 
             let slice_key = build_key("endpointslices", Some(namespace), &slice_name);
 
@@ -1513,7 +1504,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 // an endless create/AlreadyExists loop that never updated the
                 // slice, so endpoints went stale for as long as the error
                 // lasted.
-                Err(rusternetes_common::Error::NotFound(_)) => {
+                Err(k3rs_common::Error::NotFound(_)) => {
                     slice.metadata.resource_version = None;
                     // reconciler.go:444.
                     add_trigger_time_annotation(&mut slice, last_change_trigger_time);
@@ -1611,7 +1602,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     /// Build a map of node name -> zone from the `topology.kubernetes.io/zone`
     /// label on each Node. Nodes without the label are omitted.
     async fn build_node_zone_map(&self) -> HashMap<String, String> {
-        let nodes: Vec<rusternetes_common::resources::Node> = self
+        let nodes: Vec<k3rs_common::resources::Node> = self
             .storage
             .list(&build_prefix("nodes", None))
             .await
@@ -1667,10 +1658,10 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
     fn find_port(
         &self,
         pod: &Pod,
-        service_port: &rusternetes_common::resources::ServicePort,
+        service_port: &k3rs_common::resources::ServicePort,
     ) -> Option<i32> {
         match &service_port.target_port {
-            Some(rusternetes_common::resources::IntOrString::String(name)) => {
+            Some(k3rs_common::resources::IntOrString::String(name)) => {
                 // Named port — search pod containers
                 if let Ok(port_num) = name.parse::<i32>() {
                     // It's actually a numeric string
@@ -1690,7 +1681,7 @@ impl<S: Storage + 'static> EndpointSliceController<S> {
                 }
                 None // Pod doesn't have this named port
             }
-            Some(rusternetes_common::resources::IntOrString::Int(port)) => Some(*port),
+            Some(k3rs_common::resources::IntOrString::Int(port)) => Some(*port),
             None => Some(service_port.port as i32), // Default to service port
         }
     }

@@ -23,7 +23,7 @@
 //! Each test uses minimal hand-rolled JSON so failure messages are
 //! localised — if a single FieldType regresses, exactly one test fails.
 
-use rusternetes_api_server::protobuf::PROTO_REGISTRY;
+use k3rs_api_server::protobuf::PROTO_REGISTRY;
 use serde_json::{json, Value};
 
 /// Round-trip a JSON value through encode_message → decode_message for
@@ -391,11 +391,11 @@ fn encode_decode_through_unknown_envelope() {
     // End-to-end: build a Pod JSON, encode to native proto, wrap in the
     // Unknown envelope, then unwrap and decode. Exercises the full path
     // used by `NativePodProtoEncoder` in production.
-    use prost::Message;
-    use rusternetes_api_server::response::{
+    use k3rs_api_server::response::{
         wrap_native_proto_in_envelope, NativePodProtoEncoder, ProtoEncoder,
     };
-    use rusternetes_common::protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC};
+    use k3rs_common::protobuf::{is_protobuf, Unknown, PROTOBUF_MAGIC};
+    use prost::Message;
 
     let pod = json!({
         "metadata": {"name": "envelope-roundtrip"},

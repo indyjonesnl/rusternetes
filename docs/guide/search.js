@@ -1,4 +1,4 @@
-// Rusternetes Documentation Search
+// k3rs Documentation Search
 // Pure vanilla JS — no dependencies
 (function() {
   'use strict';

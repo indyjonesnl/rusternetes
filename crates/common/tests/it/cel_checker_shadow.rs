@@ -1,9 +1,9 @@
-//! `RUSTERNETES_CEL_CHECKER=shadow`: the checker port compared with the
+//! `K3RS_CEL_CHECKER=shadow`: the checker port compared with the
 //! compile probe (`cel_versions::compile_failure`), without affecting it.
 
-use rusternetes_common::cel_checker_shadow::{check_expression, divergence, Mode};
-use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
-use rusternetes_common::feature_gates::Version;
+use k3rs_common::cel_checker_shadow::{check_expression, divergence, Mode};
+use k3rs_common::cel_versions::{compile_failure, EnvSet, EnvType};
+use k3rs_common::feature_gates::Version;
 
 fn set(minor: u32) -> EnvSet {
     EnvSet::must_base_env_set(Version::major_minor(1, minor))

@@ -20,7 +20,7 @@ use axum::{
     routing::any,
     Router,
 };
-use rusternetes_cri::CriClient;
+use k3rs_cri::CriClient;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -332,7 +332,7 @@ fn sum_samples(items: impl Iterator<Item = Option<Sample>>) -> Option<Sample> {
 /// kubelet-managed pods and are dropped, as upstream's `buildPodStats` only
 /// reports containers belonging to a pod sandbox.
 pub fn pods_from_cri(
-    stats: &[rusternetes_cri::v1::ContainerStats],
+    stats: &[k3rs_cri::v1::ContainerStats],
     start_times_ns: &HashMap<String, i64>,
 ) -> Vec<PodSummary> {
     let mut pods: BTreeMap<(String, String), PodSummary> = BTreeMap::new();
@@ -462,7 +462,7 @@ fn node_stats() -> UsageStats {
 }
 
 /// `GetCPUAndMemoryStats`: CRI-backed pod stats plus procfs node stats.
-pub async fn get_cpu_and_memory_stats(cri: &mut CriClient) -> rusternetes_cri::Result<Summary> {
+pub async fn get_cpu_and_memory_stats(cri: &mut CriClient) -> k3rs_cri::Result<Summary> {
     let stats = cri.list_container_stats(None).await?;
     let containers = cri.list_containers(None).await?;
     let start_times: HashMap<String, i64> = containers

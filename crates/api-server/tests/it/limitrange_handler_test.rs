@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for LimitRanges
 
-use rusternetes_common::resources::{LimitRange, LimitRangeItem, LimitRangeSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{LimitRange, LimitRangeItem, LimitRangeSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -113,7 +113,7 @@ async fn test_limitrange_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify it's deleted
-    let result: rusternetes_common::Result<LimitRange> = storage.get(&key).await;
+    let result: k3rs_common::Result<LimitRange> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -591,6 +591,6 @@ async fn test_limitrange_not_found() {
     let namespace = "test-limitrange-not-found";
     let key = build_key("limitranges", Some(namespace), "nonexistent");
 
-    let result: rusternetes_common::Result<LimitRange> = storage.get(&key).await;
+    let result: k3rs_common::Result<LimitRange> = storage.get(&key).await;
     assert!(result.is_err());
 }

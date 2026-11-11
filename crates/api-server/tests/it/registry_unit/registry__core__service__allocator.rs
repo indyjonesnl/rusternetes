@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use async_trait::async_trait;
+    pub use k3rs_common::{Error, Result};
     pub use rand::Rng;
-    pub use rusternetes_common::{Error, Result};
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::allocator::*;
+    use k3rs_api_server::registry::core::service::allocator::*;
 
     /// `TestAllocate` (bitmap_test.go:26-62).
     #[test]

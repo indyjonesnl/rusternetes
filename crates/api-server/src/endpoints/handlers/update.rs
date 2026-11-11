@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::Response;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::validation::metav1::{validate_update_options, UpdateOptions};
-use rusternetes_common::{Error, Result};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::validation::metav1::{validate_update_options, UpdateOptions};
+use k3rs_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{

@@ -13,7 +13,7 @@
 //! ```
 //!
 //! These tests pin the JSON wire fidelity of both fields against the typed
-//! `rusternetes_common::resources::Secret` decoder + encoder. For each
+//! `k3rs_common::resources::Secret` decoder + encoder. For each
 //! fixture we assert that:
 //!
 //! 1. `serde_json::from_str::<Secret>` succeeds.
@@ -37,7 +37,7 @@
 //!     "tls" pattern) — both must survive the wire trip independently.
 
 use base64::Engine;
-use rusternetes_common::resources::Secret;
+use k3rs_common::resources::Secret;
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Same shape as `assert_roundtrip` in `roundtrip_core_v1.rs`. Re-implemented

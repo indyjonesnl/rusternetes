@@ -5,7 +5,7 @@
 #  2. Every buildable service in the base file has an image: entry in the
 #     overlay (catches new services that would silently skip publishing).
 #  3. The merged config resolves image names with both a default tag and an
-#     explicit RUSTERNETES_IMAGE_TAG.
+#     explicit K3RS_IMAGE_TAG.
 # Requires: docker compose v2, jq.
 set -euo pipefail
 
@@ -29,7 +29,7 @@ check_pair() {
     # Render merged config once per tag scenario. KUBELET_VOLUMES_PATH and
     # DOCKER_GATEWAY are interpolated by the base files; give them dummies.
     local cfg
-    cfg=$(KUBELET_VOLUMES_PATH=/tmp/kv DOCKER_GATEWAY=10.0.0.1 RUSTERNETES_IMAGE_TAG=sha-deadbeef \
+    cfg=$(KUBELET_VOLUMES_PATH=/tmp/kv DOCKER_GATEWAY=10.0.0.1 K3RS_IMAGE_TAG=sha-deadbeef \
         docker compose -f "$base" -f "$overlay" config --format json)
 
     # 1+2. Service sets: overlay services ⊆ base services, and every service
@@ -62,11 +62,11 @@ check_pair() {
         fi
     done
 
-    # 3. Default tag must resolve to :main when RUSTERNETES_IMAGE_TAG unset.
-    # `env -u` clears any RUSTERNETES_IMAGE_TAG exported by the caller, which
+    # 3. Default tag must resolve to :main when K3RS_IMAGE_TAG unset.
+    # `env -u` clears any K3RS_IMAGE_TAG exported by the caller, which
     # would otherwise leak in and make this check fail spuriously.
     local default_img
-    default_img=$(env -u RUSTERNETES_IMAGE_TAG \
+    default_img=$(env -u K3RS_IMAGE_TAG \
         KUBELET_VOLUMES_PATH=/tmp/kv DOCKER_GATEWAY=10.0.0.1 \
         docker compose -f "$base" -f "$overlay" config --format json \
         | jq -r '.services["api-server"].image')

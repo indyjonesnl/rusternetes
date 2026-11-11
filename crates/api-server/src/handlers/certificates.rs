@@ -17,13 +17,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::CertificateSigningRequest,
     List, Result,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use k3rs_storage::{build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -205,7 +205,7 @@ pub async fn list_certificate_signing_requests(
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
+        Decision::Deny(reason) => return Err(k3rs_common::Error::Forbidden(reason)),
     }
 
     let prefix = build_prefix("certificatesigningrequests", None);

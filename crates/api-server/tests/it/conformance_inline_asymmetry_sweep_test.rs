@@ -43,7 +43,7 @@
 //! here too — losing inline on any of them would break read-back of
 //! configmap-/secret-projected pods.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 
 // ---------- tiny wire-bytes helpers -------------------------------------
 
@@ -367,12 +367,12 @@ fn test_ephemeral_container_inlines_common() {
 // ---------- Round-trip through the typed deserialiser -------------------
 
 /// End-to-end shape check: a `Probe` decoded from proto must feed straight
-/// into `rusternetes_common::resources::Probe`. This mirrors the
+/// into `k3rs_common::resources::Probe`. This mirrors the
 /// `Container with envFrom` round-trip in
 /// `conformance_configmap_envfrom_prefixes_test.rs`.
 #[test]
 fn test_probe_proto_decode_round_trips_through_typed_deserializer() {
-    use rusternetes_common::resources::Probe;
+    use k3rs_common::resources::Probe;
 
     let exec_payload = {
         // ExecAction.command (repeated string, field 1) — two entries.

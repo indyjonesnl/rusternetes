@@ -2,47 +2,45 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::policy_dispatch::{dispatch, PolicyHook};
-    pub use rusternetes_api_server::admission::policy_matching::{
+    pub use k3rs_api_server::admission::policy_dispatch::{dispatch, PolicyHook};
+    pub use k3rs_api_server::admission::policy_matching::{
         Attributes, EquivalentResourceMapper, Matcher, NamespaceLister,
     };
-    pub use rusternetes_api_server::admission::policy_mutating::{
+    pub use k3rs_api_server::admission::policy_mutating::{
         MutatingDispatcher, MutatingEvaluator, NamespaceObjects, ObjectDefaulter,
         ReinvocationContext, TypeConverters,
     };
-    pub use rusternetes_api_server::admission::policy_source::Hooks;
-    pub use rusternetes_api_server::registry::rest::GroupResource;
-    pub use rusternetes_common::admission::Operation;
-    pub use rusternetes_common::authz::Authorizer;
-    pub use rusternetes_common::feature_gates::Feature;
-    pub use rusternetes_common::resources::{
-        MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
-    };
-    pub use rusternetes_common::Error;
+    pub use k3rs_api_server::admission::policy_source::Hooks;
+    pub use k3rs_api_server::registry::rest::GroupResource;
+    pub use k3rs_common::admission::Operation;
+    pub use k3rs_common::authz::Authorizer;
+    pub use k3rs_common::feature_gates::Feature;
+    pub use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+    pub use k3rs_common::Error;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_plugin::*;
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_api_server::admission::policy_plugin::*;
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
     use std::collections::HashMap;
 
     use async_trait::async_trait;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::resources::mutating_admission_policy::{
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::resources::mutating_admission_policy::{
         MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
     };
-    use rusternetes_common::resources::validating_admission_policy::{
+    use k3rs_common::resources::validating_admission_policy::{
         MatchPolicyType, NamedRuleWithOperations, OperationType, RuleWithOperations,
     };
-    use rusternetes_common::resources::{LabelSelector, MatchResources};
+    use k3rs_common::resources::{LabelSelector, MatchResources};
     use serde_json::{json, Value};
     use serial_test::serial;
 
-    use rusternetes_api_server::admission::policy_dispatch::ParamScope;
-    use rusternetes_api_server::admission::policy_mutating::{
+    use k3rs_api_server::admission::policy_dispatch::ParamScope;
+    use k3rs_api_server::admission::policy_mutating::{
         PatchError, PatchRequest, Patcher, VersionedAttributes,
     };
 
@@ -71,10 +69,7 @@ mod tests {
     struct Namespaces;
     #[async_trait]
     impl NamespaceLister for Namespaces {
-        async fn namespace_labels(
-            &self,
-            _: &str,
-        ) -> rusternetes_common::Result<HashMap<String, String>> {
+        async fn namespace_labels(&self, _: &str) -> k3rs_common::Result<HashMap<String, String>> {
             Ok(HashMap::new())
         }
     }

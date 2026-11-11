@@ -13,7 +13,7 @@
 //! ([`super::apply_via_schema`]) iterates the schema rather than hard-coding
 //! ConfigMap-specific groups. Today ConfigMap and Secret are registered;
 //! other resources go through [`super::apply_legacy`], which applies via the
-//! field manager (`rusternetes_common::fieldmanager`).
+//! field manager (`k3rs_common::fieldmanager`).
 //!
 //! The full upstream merge algorithm in
 //! `staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`
@@ -228,7 +228,7 @@ pub struct PathConflict {
 ///
 /// `StringData` is Secret-specific — it's a write-only sibling of `data`
 /// whose entries are base64-encoded and merged into `data` at storage time
-/// (see [`rusternetes_common::resources::Secret::normalize`]). SSA still
+/// (see [`k3rs_common::resources::Secret::normalize`]). SSA still
 /// tracks ownership of the raw `/stringData/<key>` paths so a manager that
 /// applied via `stringData` can later release those entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +316,7 @@ impl LeafGroup {
 /// iterates this schema rather than hard-coding per-kind logic, so adding a
 /// new resource is purely a matter of declaring its schema.
 ///
-/// This is the rusternetes equivalent of the OpenAPI-driven type converter
+/// This is the k3rs equivalent of the OpenAPI-driven type converter
 /// in `staging/src/k8s.io/apimachinery/pkg/util/managedfields/internal/typeconverter.go`
 /// — except we curate the schema by hand per resource we want to support,
 /// which keeps the implementation small while still being general enough

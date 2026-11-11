@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::dra::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::dra::{
         CapacityRequestPolicy, CapacityRequestPolicyRange, CounterSet, Device, DeviceCapacity,
         DeviceCounterConsumption, DeviceTaint, DeviceTaintEffect,
     };
-    pub use rusternetes_common::resources::{ResourceSlice, ResourceSliceSpec};
-    pub use rusternetes_common::validation::csinode::validate_csi_driver_name;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::resources::{ResourceSlice, ResourceSliceSpec};
+    pub use k3rs_common::validation::csinode::validate_csi_driver_name;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_label_name,
     };
-    pub use rusternetes_common::validation::resourceclaim::too_many_max_items;
+    pub use k3rs_common::validation::resourceclaim::too_many_max_items;
     pub use std::collections::HashSet;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::resourceslice::*;
+    use k3rs_common::validation::resourceslice::*;
 
     fn slice(json: serde_json::Value) -> ResourceSlice {
         serde_json::from_value(json).unwrap()
@@ -348,7 +348,7 @@ mod tests {
         v["spec"] = spec;
         let mut out: Vec<(String, String)> = validate_resource_slice(&slice(v))
             .into_iter()
-            .filter(|e| e.error_type == rusternetes_common::validation::field::ErrorType::TooMany)
+            .filter(|e| e.error_type == k3rs_common::validation::field::ErrorType::TooMany)
             .map(|e| (e.field, e.origin))
             .collect();
         out.sort();
@@ -608,7 +608,7 @@ mod tests {
 /// the zero-step behaviour (#3250).
 mod device_capacity_scenarios {
     use super::__parent::*;
-    use rusternetes_common::validation::resourceslice::*;
+    use k3rs_common::validation::resourceslice::*;
     use serde_json::{json, Value};
 
     const ONE: &str = "1Gi";

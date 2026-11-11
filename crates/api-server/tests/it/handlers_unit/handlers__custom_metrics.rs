@@ -8,12 +8,12 @@ mod __parent {
         Extension, Json,
     };
     pub use chrono::Utc;
-    pub use rusternetes_api_server::handlers::metric_selectors::{
+    pub use k3rs_api_server::handlers::metric_selectors::{
         decode_list_options, decode_metric_label_selector, metric_not_found, metric_selector_echo,
         unknown_error,
     };
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::{
         authz::{Decision, RequestAttributes},
         label_selector::LabelSelector,
         resources::custom_metrics::{
@@ -21,13 +21,13 @@ mod __parent {
         },
         Result,
     };
-    pub use rusternetes_discovery::deferred_restmapper::{
+    pub use k3rs_discovery::deferred_restmapper::{
         DeferredRestMapper, DiscoveryClient, MemCacheClient, RESET_PERIOD,
     };
-    pub use rusternetes_discovery::restmapper::{
+    pub use k3rs_discovery::restmapper::{
         is_builtin_group, served_group_resources, ApiGroupResources, Gvr, MapperError,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
+    pub use k3rs_storage::{build_key, build_prefix, Storage, StorageBackend};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, info, warn};
@@ -35,7 +35,7 @@ mod __parent {
 
 mod served_mapper_tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::custom_metrics::*;
+    use k3rs_api_server::handlers::custom_metrics::*;
 
     fn crd() -> serde_json::Value {
         serde_json::json!({

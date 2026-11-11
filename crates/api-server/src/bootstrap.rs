@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{EndpointSlice, Endpoints};
-use rusternetes_storage::Storage;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::{EndpointSlice, Endpoints};
+use k3rs_storage::Storage;
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -61,7 +61,7 @@ fn policy_key(item: &serde_json::Value) -> Option<(String, String)> {
     let name = item["metadata"]["name"].as_str()?;
     let ns = item["metadata"]["namespace"].as_str();
     Some((
-        rusternetes_storage::build_key(plural, ns, name),
+        k3rs_storage::build_key(plural, ns, name),
         item["kind"].as_str()?.to_string(),
     ))
 }
@@ -128,7 +128,7 @@ fn insert_before_node_serviceaccounts_rule(
 /// `MultiCIDRServiceAllocator`, `KubeletFineGrainedAuthz`) are GA/on in v1.35
 /// and so need no branch here.
 fn apply_feature_gated_policy(items: &mut Vec<serde_json::Value>) {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     const READ: [&str; 3] = ["get", "list", "watch"];
     const CERTS: [&str; 1] = ["certificates.k8s.io"];
 
@@ -269,7 +269,7 @@ fn add_controller_role(
 /// (`DynamicResourceAllocation`, `MultiCIDRServiceAllocator`,
 /// `VolumeAttributesClass`, `SELinuxChangePolicy`) are in the YAML already.
 fn apply_feature_gated_controller_roles(items: &mut Vec<serde_json::Value>) {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     const READ: [&str; 3] = ["get", "list", "watch"];
     const CERTS: [&str; 1] = ["certificates.k8s.io"];
     const DRA: [&str; 1] = ["resource.k8s.io"];
@@ -470,7 +470,7 @@ pub async fn bootstrap_default_rbac(storage: Arc<StorageBackend>) -> Result<()> 
                         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                         .into();
                     match storage.create(&key, &item).await {
-                        Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+                        Ok(_) | Err(k3rs_common::Error::AlreadyExists(_)) => {}
                         Err(e) => {
                             return Err(anyhow::Error::from(e))
                                 .with_context(|| format!("create {key}"))
@@ -696,8 +696,8 @@ fn split_host_port(s: &str) -> bool {
 /// `masterCount == 1` shape of upstream's `masterCountEndpointReconciler`
 /// (`pkg/controlplane/reconcilers/instancecount.go`) — we always force the
 /// endpoint to our own address.
-fn desired_subsets(ip: &str, port: u16) -> Vec<rusternetes_common::resources::EndpointSubset> {
-    use rusternetes_common::resources::{EndpointAddress, EndpointPort, EndpointSubset};
+fn desired_subsets(ip: &str, port: u16) -> Vec<k3rs_common::resources::EndpointSubset> {
+    use k3rs_common::resources::{EndpointAddress, EndpointPort, EndpointSubset};
     vec![EndpointSubset {
         addresses: Some(vec![EndpointAddress {
             ip: ip.to_string(),
@@ -717,7 +717,7 @@ fn desired_subsets(ip: &str, port: u16) -> Vec<rusternetes_common::resources::En
 
 /// Ensure the skip-mirror label is `"true"`. Returns whether the labels changed
 /// (so the caller knows a write is needed).
-fn ensure_skip_mirror(metadata: &mut rusternetes_common::types::ObjectMeta) -> bool {
+fn ensure_skip_mirror(metadata: &mut k3rs_common::types::ObjectMeta) -> bool {
     let labels = metadata.labels.get_or_insert_with(Default::default);
     if labels.get(SKIP_MIRROR_LABEL).map(String::as_str) == Some("true") {
         false
@@ -753,7 +753,7 @@ async fn reconcile_endpoints<S: Storage + ?Sized>(storage: &S, ip: &str, port: u
             }
         }
         Err(_) => {
-            use rusternetes_common::types::{ObjectMeta, TypeMeta};
+            use k3rs_common::types::{ObjectMeta, TypeMeta};
 
             let mut metadata = ObjectMeta::new("kubernetes");
             metadata.namespace = Some("default".to_string());
@@ -789,9 +789,7 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
     ip: &str,
     port: u16,
 ) -> Result<()> {
-    use rusternetes_common::resources::endpointslice::{
-        Endpoint, EndpointConditions, EndpointPort,
-    };
+    use k3rs_common::resources::endpointslice::{Endpoint, EndpointConditions, EndpointPort};
 
     let desired_endpoints = vec![Endpoint {
         addresses: vec![ip.to_string()],
@@ -870,10 +868,10 @@ async fn reconcile_endpointslice<S: Storage + ?Sized>(
 async fn create_kubernetes_endpointslice<S: Storage + ?Sized>(
     storage: &S,
     address_type: &str,
-    desired_endpoints: Vec<rusternetes_common::resources::endpointslice::Endpoint>,
-    desired_ports: Vec<rusternetes_common::resources::endpointslice::EndpointPort>,
+    desired_endpoints: Vec<k3rs_common::resources::endpointslice::Endpoint>,
+    desired_ports: Vec<k3rs_common::resources::endpointslice::EndpointPort>,
 ) -> Result<()> {
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
 
     let mut metadata = ObjectMeta::new("kubernetes");
     metadata.namespace = Some("default".to_string());
@@ -932,9 +930,9 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
     api_server_port: u16,
     service_ip: std::net::IpAddr,
 ) -> Result<()> {
-    use rusternetes_common::resources::policy::IntOrString;
-    use rusternetes_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_common::resources::policy::IntOrString;
+    use k3rs_common::resources::{Service, ServicePort, ServiceSpec, ServiceType};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
 
     if storage.get::<Service>(SERVICE_KEY).await.is_ok() {
         return Ok(());
@@ -944,9 +942,9 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
     // 378-382): the first address of the primary range; the family follows.
     let service_ip_str = service_ip.to_string();
     let family = if service_ip.is_ipv6() {
-        rusternetes_common::resources::service::IPFamily::IPv6
+        k3rs_common::resources::service::IPFamily::IPv6
     } else {
-        rusternetes_common::resources::service::IPFamily::IPv4
+        k3rs_common::resources::service::IPFamily::IPv4
     };
     let mut metadata = ObjectMeta::new("kubernetes");
     metadata.namespace = Some("default".to_string());
@@ -999,9 +997,7 @@ pub async fn reconcile_kubernetes_service<S: Storage + ?Sized>(
             // set here or nothing sets them at all.
             cluster_ips: Some(vec![service_ip_str.clone()]),
             ip_families: Some(vec![family]),
-            ip_family_policy: Some(
-                rusternetes_common::resources::service::IPFamilyPolicy::SingleStack,
-            ),
+            ip_family_policy: Some(k3rs_common::resources::service::IPFamilyPolicy::SingleStack),
             session_affinity: Some("None".to_string()),
             ..Default::default()
         },
@@ -1136,22 +1132,21 @@ pub fn spawn_apiservice_availability_controller(
 }
 
 fn spawn_apiservice_availability_loop(storage: Arc<StorageBackend>) -> tokio::task::JoinHandle<()> {
-    use rusternetes_controller_core::apiservice::APIServiceAvailabilityController;
+    use k3rs_controller_core::apiservice::APIServiceAvailabilityController;
     tokio::spawn(async move {
         // `serviceResolver` + `proxyTransportDial` of the aggregator's
         // availability controller (kube-aggregator apiserver.go:339-366).
         let probe_storage = storage.clone();
-        let probe: rusternetes_controller_core::apiservice::DiscoveryProbe =
-            Arc::new(move |apiservice| {
-                let storage = probe_storage.clone();
-                Box::pin(async move {
-                    crate::handlers::aggregator::availability_discovery_attempt(
-                        storage.as_ref(),
-                        &apiservice,
-                    )
-                    .await
-                })
-            });
+        let probe: k3rs_controller_core::apiservice::DiscoveryProbe = Arc::new(move |apiservice| {
+            let storage = probe_storage.clone();
+            Box::pin(async move {
+                crate::handlers::aggregator::availability_discovery_attempt(
+                    storage.as_ref(),
+                    &apiservice,
+                )
+                .await
+            })
+        });
         let controller = Arc::new(APIServiceAvailabilityController::with_discovery_probe(
             storage, probe,
         ));
@@ -1211,7 +1206,7 @@ pub struct DefaultServiceCIDRController<S: Storage + ?Sized> {
     storage: Arc<S>,
     /// Order matters: the first CIDR defines the default IP family.
     cidrs: Vec<String>,
-    recorder: rusternetes_storage::EventRecorder<S>,
+    recorder: k3rs_storage::EventRecorder<S>,
     reported_mismatched_cidrs: bool,
     reported_not_ready_condition: bool,
 }
@@ -1219,7 +1214,7 @@ pub struct DefaultServiceCIDRController<S: Storage + ?Sized> {
 impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
     pub fn new(storage: Arc<S>, cidrs: Vec<String>) -> Self {
         Self {
-            recorder: rusternetes_storage::EventRecorder::new(Arc::clone(&storage)),
+            recorder: k3rs_storage::EventRecorder::new(Arc::clone(&storage)),
             storage,
             cidrs,
             reported_mismatched_cidrs: false,
@@ -1228,13 +1223,13 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
     }
 
     fn key() -> String {
-        rusternetes_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
+        k3rs_storage::build_key("servicecidrs", None, DEFAULT_SERVICE_CIDR_NAME)
     }
 
     fn object_ref(
-        sc: &rusternetes_common::resources::ServiceCIDR,
-    ) -> rusternetes_common::resources::ObjectReference {
-        rusternetes_common::resources::ObjectReference {
+        sc: &k3rs_common::resources::ServiceCIDR,
+    ) -> k3rs_common::resources::ObjectReference {
+        k3rs_common::resources::ObjectReference {
             kind: Some("ServiceCIDR".to_string()),
             namespace: None,
             name: Some(sc.metadata.name.clone()),
@@ -1247,11 +1242,11 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
 
     async fn warn_event(
         &self,
-        sc: &rusternetes_common::resources::ServiceCIDR,
+        sc: &k3rs_common::resources::ServiceCIDR,
         reason: &str,
         message: &str,
     ) {
-        let source = rusternetes_common::resources::EventSource {
+        let source = k3rs_common::resources::EventSource {
             component: DEFAULT_SERVICE_CIDR_CONTROLLER.to_string(),
             host: None,
         };
@@ -1260,7 +1255,7 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
             .event(
                 &Self::object_ref(sc),
                 &source,
-                rusternetes_common::resources::EventType::Warning,
+                k3rs_common::resources::EventType::Warning,
                 reason,
                 message,
             )
@@ -1275,8 +1270,8 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
 
     /// Upstream `sync` (`default_servicecidr_controller.go:142-185`).
     pub async fn sync(&mut self) -> Result<()> {
-        use rusternetes_common::resources::{ServiceCIDR, ServiceCIDRSpec};
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::resources::{ServiceCIDR, ServiceCIDRSpec};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
 
         let key = Self::key();
         match self.storage.get::<ServiceCIDR>(&key).await {
@@ -1319,7 +1314,7 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
                 }
                 return Ok(());
             }
-            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(k3rs_common::Error::NotFound(_)) => {}
             // Unknown error: retry on the next tick rather than racing a create
             // against a backend that is merely unreachable.
             Err(e) => return Err(e.into()),
@@ -1347,7 +1342,7 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
         let created = match self.storage.create(&key, &service_cidr).await {
             Ok(created) => created,
             // Another api-server replica won the race; fall through to status.
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+            Err(k3rs_common::Error::AlreadyExists(_)) => {
                 self.storage.get::<ServiceCIDR>(&key).await?
             }
             Err(e) => {
@@ -1365,8 +1360,8 @@ impl<S: Storage + ?Sized> DefaultServiceCIDRController<S> {
     }
 
     /// Upstream `syncStatus` (`default_servicecidr_controller.go:187-245`).
-    async fn sync_status(&mut self, sc: &rusternetes_common::resources::ServiceCIDR) {
-        use rusternetes_common::resources::{ServiceCIDRCondition, ServiceCIDRStatus};
+    async fn sync_status(&mut self, sc: &k3rs_common::resources::ServiceCIDR) {
+        use k3rs_common::resources::{ServiceCIDRCondition, ServiceCIDRStatus};
 
         // A ServiceCIDR being deleted belongs to the controller-manager's
         // service-cidr-controller; never fight it over the condition.
@@ -1527,7 +1522,7 @@ const INITIAL_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 // Used by the test harness (test_support), not by the binary.
 pub async fn repair_service_node_ports_once(
     state: &crate::state::ApiServerState,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     use crate::registry::core::service::portallocator::repair::Repair;
     Repair::new(
         state.storage.clone(),
@@ -1543,7 +1538,7 @@ pub async fn repair_service_node_ports_once(
 // Used by the test harness (test_support), not by the binary.
 pub async fn repair_service_cluster_ips_once(
     state: &Arc<crate::state::ApiServerState>,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     use crate::registry::core::service::ipallocator::repair::RepairIpAddress;
     RepairIpAddress::new(state.storage.clone(), ip_address_loopback(state))
         .run_once()
@@ -1571,7 +1566,7 @@ fn spawn_repair_loop<F, Fut>(
 )
 where
     F: FnMut() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = rusternetes_common::Result<()>> + Send,
+    Fut: std::future::Future<Output = k3rs_common::Result<()>> + Send,
 {
     use crate::registry::core::service::portallocator::repair::REPAIR_INTERVAL;
     let (first_success, first) = tokio::sync::oneshot::channel();
@@ -1667,7 +1662,7 @@ fn resolve_cluster_ca(ca_cert_pem: Option<&str>) -> Option<String> {
     [
         "/etc/kubernetes/pki/ca.crt",
         "/etc/kubernetes/pki/api-server.crt",
-        "/root/.rusternetes/certs/ca.crt",
+        "/root/.k3rs/certs/ca.crt",
     ]
     .iter()
     .find_map(|p| std::fs::read_to_string(p).ok())
@@ -1695,7 +1690,7 @@ pub fn cluster_authentication_info(
     ca_cert_pem: Option<&str>,
     client_ca_file: Option<&str>,
     request_header: Option<&crate::request_header_authentication::RequestHeaderTrust>,
-) -> rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+) -> k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
     let ca = resolve_cluster_ca(ca_cert_pem);
     let client_ca = client_ca_file
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1703,7 +1698,7 @@ pub fn cluster_authentication_info(
         .or_else(|| ca.clone());
     if let Some(trust) = request_header {
         let cfg = &trust.config;
-        return rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+        return k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
             client_ca,
             request_header_username_headers: Some(cfg.username_headers.clone()),
             request_header_uid_headers: Some(cfg.uid_headers.clone()),
@@ -1715,7 +1710,7 @@ pub fn cluster_authentication_info(
                 .filter(|c| !c.is_empty()),
         };
     }
-    rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
+    k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo {
         client_ca,
         ..Default::default()
     }
@@ -1737,8 +1732,8 @@ pub async fn bootstrap_system_namespaces(storage: &StorageBackend) -> Result<()>
 }
 
 pub async fn create_namespace_if_needed(storage: &StorageBackend, ns: &str) -> Result<()> {
-    use rusternetes_common::resources::Namespace;
-    let key = rusternetes_storage::build_key("namespaces", None, ns);
+    use k3rs_common::resources::Namespace;
+    let key = k3rs_storage::build_key("namespaces", None, ns);
     if storage.get::<Namespace>(&key).await.is_ok() {
         return Ok(());
     }
@@ -1755,7 +1750,7 @@ pub async fn create_namespace_if_needed(storage: &StorageBackend, ns: &str) -> R
         "status": {"phase": "Active"}
     });
     match storage.create(&key, &namespace).await {
-        Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => Ok(()),
+        Ok(_) | Err(k3rs_common::Error::AlreadyExists(_)) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }
@@ -1810,18 +1805,17 @@ pub fn spawn_system_namespaces_controller(storage: Arc<StorageBackend>) {
 /// `writeConfigMap` (:199-220): update, or create when absent.
 pub async fn sync_cluster_authentication_trust(
     storage: &StorageBackend,
-    required: &rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+    required: &k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
 ) -> Result<()> {
-    use rusternetes_common::clusterauthenticationtrust::{
+    use k3rs_common::clusterauthenticationtrust::{
         sync_config_map_data, CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE,
     };
-    use rusternetes_common::resources::ConfigMap;
+    use k3rs_common::resources::ConfigMap;
 
-    let key =
-        rusternetes_storage::build_key("configmaps", Some(CONFIG_MAP_NAMESPACE), CONFIG_MAP_NAME);
+    let key = k3rs_storage::build_key("configmaps", Some(CONFIG_MAP_NAMESPACE), CONFIG_MAP_NAME);
     let existing = match storage.get::<ConfigMap>(&key).await {
         Ok(cm) => Some(cm),
-        Err(rusternetes_common::Error::NotFound(_)) => None,
+        Err(k3rs_common::Error::NotFound(_)) => None,
         Err(e) => return Err(e.into()),
     };
     let existing_data = existing
@@ -1847,11 +1841,11 @@ pub async fn sync_cluster_authentication_trust(
         }
         None => {
             let mut cm = ConfigMap {
-                type_meta: rusternetes_common::types::TypeMeta {
+                type_meta: k3rs_common::types::TypeMeta {
                     kind: "ConfigMap".to_string(),
                     api_version: "v1".to_string(),
                 },
-                metadata: rusternetes_common::types::ObjectMeta::new(CONFIG_MAP_NAME)
+                metadata: k3rs_common::types::ObjectMeta::new(CONFIG_MAP_NAME)
                     .with_namespace(CONFIG_MAP_NAMESPACE.to_string()),
                 data: Some(data),
                 binary_data: None,
@@ -1873,7 +1867,7 @@ pub async fn sync_cluster_authentication_trust(
 /// add or delete of that ConfigMap (:117-135), and every minute (:470-476).
 pub fn spawn_cluster_authentication_trust_controller(
     storage: Arc<StorageBackend>,
-    required: rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+    required: k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
 ) -> tokio::task::JoinHandle<()> {
     crate::post_start_hooks::spawn_starting_hook(CLUSTER_AUTHENTICATION_INFO_HOOK, move || {
         spawn_cluster_authentication_trust_loop(storage, required);
@@ -1882,18 +1876,15 @@ pub fn spawn_cluster_authentication_trust_controller(
 
 fn spawn_cluster_authentication_trust_loop(
     storage: Arc<StorageBackend>,
-    required: rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
+    required: k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo,
 ) -> tokio::task::JoinHandle<()> {
     use futures::StreamExt;
-    use rusternetes_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
-    use rusternetes_storage::WatchEvent;
+    use k3rs_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
+    use k3rs_storage::WatchEvent;
 
     tokio::spawn(async move {
-        let key = rusternetes_storage::build_key(
-            "configmaps",
-            Some(CONFIG_MAP_NAMESPACE),
-            CONFIG_MAP_NAME,
-        );
+        let key =
+            k3rs_storage::build_key("configmaps", Some(CONFIG_MAP_NAMESPACE), CONFIG_MAP_NAME);
         let mut ticker = tokio::time::interval(CLUSTER_AUTHENTICATION_TRUST_RESYNC);
         let mut watch = None;
         loop {
@@ -1937,14 +1928,14 @@ fn spawn_cluster_authentication_trust_loop(
 pub async fn bootstrap_extension_apiserver_authentication_rbac(
     storage: Arc<StorageBackend>,
 ) -> Result<()> {
-    use rusternetes_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
+    use k3rs_common::clusterauthenticationtrust::{CONFIG_MAP_NAME, CONFIG_MAP_NAMESPACE};
 
     const ROLE: &str = "extension-apiserver-authentication-reader";
     const BINDING: &str = "system::extension-apiserver-authentication-reader";
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let objects = [
         (
-            rusternetes_storage::build_key("roles", Some(CONFIG_MAP_NAMESPACE), ROLE),
+            k3rs_storage::build_key("roles", Some(CONFIG_MAP_NAMESPACE), ROLE),
             serde_json::json!({
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "Role",
@@ -1965,7 +1956,7 @@ pub async fn bootstrap_extension_apiserver_authentication_rbac(
             }),
         ),
         (
-            rusternetes_storage::build_key("rolebindings", Some(CONFIG_MAP_NAMESPACE), BINDING),
+            k3rs_storage::build_key("rolebindings", Some(CONFIG_MAP_NAMESPACE), BINDING),
             serde_json::json!({
                 "apiVersion": "rbac.authorization.k8s.io/v1",
                 "kind": "RoleBinding",
@@ -1995,7 +1986,7 @@ pub async fn bootstrap_extension_apiserver_authentication_rbac(
             continue;
         }
         match storage.create(&key, &obj).await {
-            Ok(_) | Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+            Ok(_) | Err(k3rs_common::Error::AlreadyExists(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -2005,8 +1996,8 @@ pub async fn bootstrap_extension_apiserver_authentication_rbac(
 /// `SystemPriorityClasses()` (pkg/apis/scheduling/v1/helpers.go:29-54): the
 /// classes the api-server seeds. `SystemCriticalPriority` is 2 * 10^9
 /// (pkg/apis/scheduling/types.go); node-critical adds 1000.
-fn system_priority_classes() -> [rusternetes_common::resources::PriorityClass; 2] {
-    use rusternetes_common::resources::PriorityClass;
+fn system_priority_classes() -> [k3rs_common::resources::PriorityClass; 2] {
+    use k3rs_common::resources::PriorityClass;
     let mut node = PriorityClass::new("system-node-critical", 2_000_001_000);
     node.description = Some(
         "Used for system critical pods that must not be moved from their current node.".into(),
@@ -2027,13 +2018,13 @@ fn system_priority_classes() -> [rusternetes_common::resources::PriorityClass; 2
 /// `SetDefaults_PriorityClass`).
 pub async fn bootstrap_system_priority_classes<S: Storage + ?Sized>(storage: &S) -> Result<()> {
     for mut pc in system_priority_classes() {
-        let key = rusternetes_storage::build_key("priorityclasses", None, &pc.metadata.name);
+        let key = k3rs_storage::build_key("priorityclasses", None, &pc.metadata.name);
         match storage
-            .get::<rusternetes_common::resources::PriorityClass>(&key)
+            .get::<k3rs_common::resources::PriorityClass>(&key)
             .await
         {
             Ok(_) => continue,
-            Err(rusternetes_common::Error::NotFound(_)) => {}
+            Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
         pc.metadata.generation = Some(1);
@@ -2043,7 +2034,7 @@ pub async fn bootstrap_system_priority_classes<S: Storage + ?Sized>(storage: &S)
                 "created PriorityClass {} with value {}",
                 pc.metadata.name, pc.value
             ),
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {}
+            Err(k3rs_common::Error::AlreadyExists(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }

@@ -6,24 +6,24 @@ use crate::registry::rest::{
 };
 use crate::ssa::ResetFields;
 
-use rusternetes_common::resources::Ingress;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::ingress::{validate_ingress_create, validate_ingress_update};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Ingress;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::ingress::{validate_ingress_create, validate_ingress_update};
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 
 /// Compare Go value fields and nil/empty slices without erasing struct pointers.
 /// pkg/registry/networking/ingress/strategy.go:89;
 /// api/networking/v1/types.go:331,416,485,531,540-545;
 /// apimachinery/third_party/forked/golang/reflect/deep_equal.go:159-207.
-fn normalized_spec(obj: &Ingress) -> rusternetes_common::resources::ingress::IngressSpec {
+fn normalized_spec(obj: &Ingress) -> k3rs_common::resources::ingress::IngressSpec {
     let mut spec = obj.spec.clone().unwrap_or_default();
     fn zero_string(value: &mut Option<String>) {
         if value.as_ref().is_some_and(String::is_empty) {
             *value = None;
         }
     }
-    fn backend(value: &mut rusternetes_common::resources::ingress::IngressBackend) {
+    fn backend(value: &mut k3rs_common::resources::ingress::IngressBackend) {
         if let Some(service) = &mut value.service {
             if let Some(port) = &mut service.port {
                 zero_string(&mut port.name);
@@ -76,10 +76,10 @@ impl NamespaceScopedStrategy for Strategy {
 impl RestCreateStrategy<Ingress> for Strategy {
     /// PrepareForCreate (pkg/registry/networking/ingress/strategy.go:71-77).
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut Ingress) {
-        obj.status = Some(rusternetes_common::resources::ingress::IngressStatus {
-            load_balancer: Some(
-                rusternetes_common::resources::ingress::IngressLoadBalancerStatus { ingress: None },
-            ),
+        obj.status = Some(k3rs_common::resources::ingress::IngressStatus {
+            load_balancer: Some(k3rs_common::resources::ingress::IngressLoadBalancerStatus {
+                ingress: None,
+            }),
         });
         obj.metadata.generation = Some(1);
     }
@@ -155,7 +155,7 @@ impl RestUpdateStrategy<Ingress> for StatusStrategy {
         obj.spec = old.spec.clone();
     }
     fn validate_update(&self, _ctx: &RequestContext, obj: &Ingress, old: &Ingress) -> ErrorList {
-        rusternetes_common::validation::ingress::validate_ingress_status_update(obj, old)
+        k3rs_common::validation::ingress::validate_ingress_status_update(obj, old)
     }
     fn allow_unconditional_update(&self) -> bool {
         true
@@ -184,7 +184,7 @@ impl RestUpdateStrategy<Ingress> for StatusStrategy {
         {
             for (i, point) in points.iter().enumerate() {
                 if let Some(ip) = point.ip.as_deref().filter(|ip| !ip.is_empty()) {
-                    warnings.extend(rusternetes_common::validation::metav1::get_warnings_for_ip(
+                    warnings.extend(k3rs_common::validation::metav1::get_warnings_for_ip(
                         &format!("status.loadBalancer.ingress[{i}]"),
                         ip,
                     ));

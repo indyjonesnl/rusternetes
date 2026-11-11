@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test script for MetalLB integration with Rusternetes
+# Test script for MetalLB integration with k3rs
 #
 # This script:
 # 1. Installs MetalLB

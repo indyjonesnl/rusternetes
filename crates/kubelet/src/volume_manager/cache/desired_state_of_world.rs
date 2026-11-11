@@ -19,12 +19,12 @@ use crate::volume_plugins::util::{
     get_unique_volume_name_from_spec_with_pod, is_attachable_volume, is_device_mountable_volume,
     is_local_ephemeral_volume,
 };
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::quota::pod_limits;
-use rusternetes_common::resources::pod::SELinuxOptions;
-use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
-use rusternetes_common::resources::Pod;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::quota::pod_limits;
+use k3rs_common::resources::pod::SELinuxOptions;
+use k3rs_common::resources::volume::PersistentVolumeAccessMode;
+use k3rs_common::resources::Pod;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
@@ -463,7 +463,7 @@ impl DesiredStateOfWorld {
         &self,
         volume_spec: &Spec<'_>,
         selinux_container_contexts: &[Option<SELinuxOptions>],
-        pod_security_context: Option<&rusternetes_common::resources::pod::PodSecurityContext>,
+        pod_security_context: Option<&k3rs_common::resources::pod::PodSecurityContext>,
     ) -> Result<(String, bool), DesiredStateOfWorldError> {
         get_selinux_label(
             &self.volume_plugin_mgr,
@@ -780,7 +780,7 @@ pub fn get_selinux_label(
     selinux_translator: &dyn SELinuxLabelTranslator,
     volume_spec: &Spec<'_>,
     selinux_container_contexts: &[Option<SELinuxOptions>],
-    pod_security_context: Option<&rusternetes_common::resources::pod::PodSecurityContext>,
+    pod_security_context: Option<&k3rs_common::resources::pod::PodSecurityContext>,
 ) -> Result<(String, bool), DesiredStateOfWorldError> {
     let (label_info, err) = get_mount_selinux_label(
         volume_spec,
@@ -849,10 +849,7 @@ pub fn effective_selinux_mount_label(volume_spec: &Spec<'_>, selinux_file_label:
 /// (`desired_state_of_world.go:297-322`): for a local ephemeral volume, the
 /// pod's ephemeral-storage limit, lowered to the emptyDir `sizeLimit` when
 /// that is smaller; `None` for any other volume.
-pub fn desired_size_limit(
-    pod: &Pod,
-    volume: &rusternetes_common::resources::Volume,
-) -> Option<Quantity> {
+pub fn desired_size_limit(pod: &Pod, volume: &k3rs_common::resources::Volume) -> Option<Quantity> {
     let mut size_limit: Option<Quantity> = None;
     if is_local_ephemeral_volume(volume) {
         let limits = pod_limits(pod);

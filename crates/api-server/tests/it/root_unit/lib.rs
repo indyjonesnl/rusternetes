@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use axum_server::tls_rustls::RustlsConfig;
-    pub use rusternetes_admission_webhook as admission_webhook;
-    pub use rusternetes_admission_webhook::cel_evaluators as cel;
-    pub use rusternetes_api_server::state::ApiServerState;
-    pub use rusternetes_common::auth::TokenManager;
-    pub use rusternetes_common::observability::MetricsRegistry;
-    pub use rusternetes_common::tls::TlsConfig;
-    pub use rusternetes_middleware as middleware;
-    pub use rusternetes_middleware::cbor;
-    pub use rusternetes_protobuf as protobuf;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_admission_webhook as admission_webhook;
+    pub use k3rs_admission_webhook::cel_evaluators as cel;
+    pub use k3rs_api_server::state::ApiServerState;
+    pub use k3rs_common::auth::TokenManager;
+    pub use k3rs_common::observability::MetricsRegistry;
+    pub use k3rs_common::tls::TlsConfig;
+    pub use k3rs_middleware as middleware;
+    pub use k3rs_middleware::cbor;
+    pub use k3rs_protobuf as protobuf;
+    pub use k3rs_storage::StorageBackend;
     pub use std::path::PathBuf;
     pub use std::sync::Arc;
     pub use tracing::{info, warn};
@@ -20,15 +20,15 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::*;
+    use k3rs_api_server::*;
 
     #[test]
     #[serial_test::serial]
     fn prepare_tls_for_self_signed_exposes_served_cert_as_ca() {
         let old_ca_cert_path = std::env::var_os("CA_CERT_PATH");
         let old_home = std::env::var_os("HOME");
-        std::env::set_var("CA_CERT_PATH", "/tmp/rusternetes-test-missing-ca-cert.pem");
-        std::env::set_var("HOME", "/tmp/rusternetes-test-missing-home");
+        std::env::set_var("CA_CERT_PATH", "/tmp/k3rs-test-missing-ca-cert.pem");
+        std::env::set_var("HOME", "/tmp/k3rs-test-missing-home");
 
         let config = ApiServerConfig {
             tls: true,
@@ -62,7 +62,7 @@ mod tests {
 mod service_account_args_tests {
     use super::__parent::*;
     use clap::Parser;
-    use rusternetes_api_server::*;
+    use k3rs_api_server::*;
 
     #[derive(Parser, Debug)]
     struct Wrap {

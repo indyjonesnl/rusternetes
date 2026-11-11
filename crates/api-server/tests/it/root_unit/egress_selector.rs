@@ -2,17 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::validation::field::{
-        BadValue, Error as FieldError, ErrorList, Path,
-    };
+    pub use k3rs_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
     pub use std::collections::BTreeSet;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::egress_selector::*;
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_api_server::egress_selector::*;
+    use k3rs_common::validation::field::ErrorType;
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

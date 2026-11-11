@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Namespace;
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::Namespace;
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::validation::objectmeta::{
         validate_namespace_name, validate_object_meta, validate_object_meta_update,
     };
 }
@@ -14,8 +14,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::Utc;
-    use rusternetes_common::resources::NamespaceStatus;
-    use rusternetes_common::validation::namespace::*;
+    use k3rs_common::resources::NamespaceStatus;
+    use k3rs_common::validation::namespace::*;
 
     fn ns_with(phase: Option<Phase>, deleting: bool) -> Namespace {
         let mut ns = Namespace::new("test");

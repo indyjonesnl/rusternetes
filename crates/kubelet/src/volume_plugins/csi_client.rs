@@ -11,18 +11,18 @@ use super::csi_drivers_store::csi_drivers;
 use super::plugin::{Metrics, Spec};
 use super::util::metrics::record_csi_operation_latency_metrics;
 use hyper_util::rt::TokioIo;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::PersistentVolumeAccessMode;
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::PersistentVolumeAccessMode;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-pub(crate) use rusternetes_csi::normalize_endpoint;
-/// The generated `csi.v1` proto lives in the shared `rusternetes-csi` crate
+pub(crate) use k3rs_csi::normalize_endpoint;
+/// The generated `csi.v1` proto lives in the shared `k3rs-csi` crate
 /// (the controller-manager's provisioner uses it too).
-pub use rusternetes_csi::proto;
+pub use k3rs_csi::proto;
 
 use proto::node_client::NodeClient;
 use proto::node_service_capability::rpc::Type as NodeRpcType;
@@ -220,7 +220,7 @@ impl CsiDriverClient {
 
     /// Port of `newV1NodeClient` + `newGrpcConn` (`csi_client.go:142-151`,
     /// `532-557`): dial the driver's unix socket. tonic 0.12 rides hyper 1.x, so
-    /// the tokio `UnixStream` is wrapped in `TokioIo` (same as `rusternetes-cri`).
+    /// the tokio `UnixStream` is wrapped in `TokioIo` (same as `k3rs-cri`).
     fn node_client(&self) -> Result<NodeClient<Channel>, CsiError> {
         let path = normalize_endpoint(&self.endpoint);
         // The URI is a placeholder; the connector always dials `path`.
@@ -566,7 +566,7 @@ impl CsiDriverClient {
 
         let mut is_support_node_volume_condition = false;
         // `utilfeature.DefaultFeatureGate.Enabled(features.CSIVolumeHealth)`
-        if rusternetes_common::feature_gates::gate_enabled("CSIVolumeHealth").unwrap_or(false) {
+        if k3rs_common::feature_gates::gate_enabled("CSIVolumeHealth").unwrap_or(false) {
             is_support_node_volume_condition = self.node_supports_volume_condition().await?;
             if is_support_node_volume_condition {
                 // `resp.VolumeCondition.GetAbnormal()` / `GetMessage()`: a nil

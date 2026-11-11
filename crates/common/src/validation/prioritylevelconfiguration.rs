@@ -6,7 +6,7 @@
 //! limitResponse + queuing), `exempt` numeric bounds, and `status.conditions`.
 //! ObjectMeta is validated separately (#1087 / #1277).
 //!
-//! Note: the rusternetes type carries `lendable_percent` (upstream
+//! Note: the k3rs type carries `lendable_percent` (upstream
 //! `lendablePercent`), validated 0–100 in `validate_limited` / `validate_exempt`
 //! (upstream lines 432-434 / 447-449). The legacy `lending_concurrency_limit`
 //! field is retained for wire/proto compatibility but is not range-checked. The

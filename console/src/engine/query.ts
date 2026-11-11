@@ -13,7 +13,7 @@ function headers(): HeadersInit {
   const h: Record<string, string> = {
     Accept: "application/json",
   };
-  const token = sessionStorage.getItem("rusternetes-token");
+  const token = sessionStorage.getItem("k3rs-token");
   if (token) {
     h["Authorization"] = `Bearer ${token}`;
   }

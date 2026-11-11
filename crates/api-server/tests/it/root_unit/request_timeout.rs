@@ -8,18 +8,16 @@ mod __parent {
     pub use axum::middleware::Next;
     pub use axum::response::{IntoResponse, Response};
     pub use futures::StreamExt;
-    pub use rusternetes_api_server::apiserver_request_metrics::{
+    pub use k3rs_api_server::apiserver_request_metrics::{
         record_request_abort, record_request_post_timeout, record_request_termination,
         request_meta, RequestMeta, POST_TIMEOUT_HANDLER_OK, POST_TIMEOUT_HANDLER_PANIC,
         POST_TIMEOUT_SOURCE_TIMEOUT_HANDLER,
     };
-    pub use rusternetes_api_server::flow_control_filter::{
-        is_long_running, DEFAULT_REQUEST_TIMEOUT,
-    };
-    pub use rusternetes_common::cancellation::{
+    pub use k3rs_api_server::flow_control_filter::{is_long_running, DEFAULT_REQUEST_TIMEOUT};
+    pub use k3rs_common::cancellation::{
         request_cancellation_with_deadline, with_request_cancellation, RequestCanceller,
     };
-    pub use rusternetes_common::types::{Status, StatusDetails};
+    pub use k3rs_common::types::{Status, StatusDetails};
     pub use std::future::Future;
     pub use std::pin::Pin;
     pub use std::sync::OnceLock;
@@ -30,8 +28,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use axum::body::Body;
-    use rusternetes_api_server::flow_control::metric_test_util::sample;
-    use rusternetes_api_server::request_timeout::*;
+    use k3rs_api_server::flow_control::metric_test_util::sample;
+    use k3rs_api_server::request_timeout::*;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -196,10 +194,10 @@ mod tests {
         assert_eq!(sample("apiserver_request_aborts_total", &l), before + 1.0);
     }
 
-    struct Capture(tokio::sync::Mutex<Vec<rusternetes_common::audit::AuditEvent>>);
+    struct Capture(tokio::sync::Mutex<Vec<k3rs_common::audit::AuditEvent>>);
     #[async_trait::async_trait]
-    impl rusternetes_common::audit::AuditBackend for Capture {
-        async fn log(&self, e: rusternetes_common::audit::AuditEvent) -> Result<(), String> {
+    impl k3rs_common::audit::AuditBackend for Capture {
+        async fn log(&self, e: k3rs_common::audit::AuditEvent) -> Result<(), String> {
             self.0.lock().await.push(e);
             Ok(())
         }
@@ -214,10 +212,10 @@ mod tests {
     // ResponseStatus carries the code and the statusErr message.
     #[tokio::test]
     async fn malformed_timeout_is_audited() {
-        use rusternetes_common::audit::AuditStage;
+        use k3rs_common::audit::AuditStage;
         let cap = Arc::new(Capture(Default::default()));
-        rusternetes_api_server::audit::install_audit(rusternetes_api_server::audit::AuditConfig {
-            policy: rusternetes_api_server::audit::Policy::from_yaml(
+        k3rs_api_server::audit::install_audit(k3rs_api_server::audit::AuditConfig {
+            policy: k3rs_api_server::audit::Policy::from_yaml(
                 "apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: RequestResponse\n",
             )
             .unwrap(),
@@ -367,7 +365,7 @@ mod tests {
     // instead of running to completion after the 504.
     #[tokio::test]
     async fn storage_call_after_deadline_fails_in_the_detached_handler() {
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_storage::{Storage, StorageBackend};
         let _g = POST_TIMEOUT.lock().await;
         let backend = Arc::new(StorageBackend::new_memory());
         let outcome = Arc::new(std::sync::Mutex::new(None::<bool>));
@@ -417,7 +415,7 @@ mod tests {
     // 504 termination and the handler's end is recorded as post-timeout.
     #[tokio::test]
     async fn client_disconnect_cancels_the_handler_context() {
-        use rusternetes_common::cancellation::current_request_cancellation;
+        use k3rs_common::cancellation::current_request_cancellation;
         let _g = POST_TIMEOUT.lock().await;
         let before = post_timeout("ok");
         let l = [
@@ -464,11 +462,11 @@ mod tests {
     // request context itself must be re-scoped inside it.
     #[tokio::test]
     async fn outer_task_locals_reach_the_spawned_handler() {
-        use rusternetes_common::cancellation::current_request_cancellation;
+        use k3rs_common::cancellation::current_request_cancellation;
         let app = axum::Router::new()
             .fallback(|| async {
-                let info = rusternetes_api_server::request_scope::current_request_info().is_some();
-                let payload = rusternetes_common::dump::current_payload();
+                let info = k3rs_api_server::request_scope::current_request_info().is_some();
+                let payload = k3rs_common::dump::current_payload();
                 let ctx = current_request_cancellation();
                 format!(
                     "{info} {} {}",
@@ -478,9 +476,9 @@ mod tests {
             })
             .layer(axum::middleware::from_fn(request_timeout_middleware))
             .layer(axum::middleware::from_fn(
-                rusternetes_api_server::request_scope::request_info_middleware,
+                k3rs_api_server::request_scope::request_info_middleware,
             ));
-        let resp = rusternetes_common::dump::with_payload(
+        let resp = k3rs_common::dump::with_payload(
             axum::body::Bytes::from_static(b"abcd"),
             app.oneshot(get("/api/v1/namespaces/default/locals?timeout=5s")),
         )

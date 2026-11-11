@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::resources::pod::{
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::resources::pod::{
         Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
         ContainerStateWaiting, ContainerStatus,
     };
-    pub use rusternetes_common::types::ResourceRequirements;
-    pub use rusternetes_cri::v1;
-    pub use rusternetes_kubelet::cri_runtime::translate::{
+    pub use k3rs_common::types::ResourceRequirements;
+    pub use k3rs_cri::v1;
+    pub use k3rs_kubelet::cri_runtime::translate::{
         MILLI_CPU_TO_CPU, MIN_MILLI_CPU_LIMIT, MIN_SHARES, SHARES_PER_CPU,
     };
     pub use std::collections::HashMap;
@@ -17,7 +17,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::cri_runtime::status::*;
+    use k3rs_kubelet::cri_runtime::status::*;
 
     fn cri_status(state: v1::ContainerState) -> v1::ContainerStatus {
         v1::ContainerStatus {

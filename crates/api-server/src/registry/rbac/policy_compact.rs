@@ -1,7 +1,7 @@
 //! Port of `pkg/registry/rbac/validation/policy_compact.go` and
 //! `CompactString` (`pkg/apis/rbac/v1/evaluation_helpers.go:111-132`).
 
-use rusternetes_common::resources::PolicyRule;
+use k3rs_common::resources::PolicyRule;
 
 /// `simpleResource`: the key rules are compacted by.
 #[derive(PartialEq, Eq)]

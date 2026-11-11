@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::response::*;
+    use k3rs_middleware::response::*;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,7 +37,7 @@ mod tests {
         let json = serde_json::to_vec(&tr).unwrap();
         let got = encode_native_or_wrapped(&json, "authentication.k8s.io/v1", "TokenRequest");
 
-        let expected_raw = rusternetes_protobuf::PROTO_REGISTRY
+        let expected_raw = k3rs_protobuf::PROTO_REGISTRY
             .encode_message("authentication.k8s.io/v1.TokenRequest", &tr)
             .expect("auth TokenRequest schema must encode");
         let expected = wrap_native_proto_in_envelope(
@@ -51,7 +51,7 @@ mod tests {
         );
 
         // The qualified schema actually preserves the status the CM reads.
-        let rt = rusternetes_protobuf::PROTO_REGISTRY
+        let rt = k3rs_protobuf::PROTO_REGISTRY
             .decode_message("authentication.k8s.io/v1.TokenRequest", &expected_raw)
             .expect("decode");
         assert!(rt.pointer("/status/expirationTimestamp").is_some());
@@ -164,10 +164,10 @@ mod tests {
 
     /// The default [`ProtoEncoder`] must emit a `k8s\0`-framed envelope and
     /// the body must round-trip back through
-    /// [`rusternetes_common::protobuf::decode_protobuf`] to the same value.
+    /// [`k3rs_common::protobuf::decode_protobuf`] to the same value.
     #[test]
     fn test_default_proto_encoder_roundtrips_via_decode_protobuf() {
-        use rusternetes_common::protobuf::{decode_protobuf, is_protobuf};
+        use k3rs_common::protobuf::{decode_protobuf, is_protobuf};
 
         let data = TestData {
             name: "rt".into(),
@@ -203,7 +203,7 @@ mod tests {
     /// only requires the `raw` field — empty TypeMeta is fine).
     #[test]
     fn test_wrap_envelope_without_type_meta() {
-        use rusternetes_common::protobuf::{decode_protobuf, is_protobuf};
+        use k3rs_common::protobuf::{decode_protobuf, is_protobuf};
 
         let data = TestData {
             name: "x".into(),
@@ -222,8 +222,8 @@ mod tests {
 
 mod latency_tests {
     use super::__parent::*;
-    use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
-    use rusternetes_middleware::response::*;
+    use k3rs_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+    use k3rs_middleware::response::*;
     use std::sync::Arc;
 
     /// `TrackSerializeResponseObjectLatency` (responsewriters/writers.go:354):

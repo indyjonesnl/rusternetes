@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::audit::field_selector_exact_match;
-    pub use rusternetes_api_server::flow_control_work_estimator::RequestInfo;
+    pub use k3rs_api_server::audit::field_selector_exact_match;
+    pub use k3rs_api_server::flow_control_work_estimator::RequestInfo;
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, Mutex};
     pub use tokio::sync::watch;
@@ -12,8 +12,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use axum::http::Method;
-    use rusternetes_api_server::audit::request_info;
-    use rusternetes_api_server::flow_control_watch_tracker::*;
+    use k3rs_api_server::audit::request_info;
+    use k3rs_api_server::flow_control_watch_tracker::*;
 
     /// `requestInfoFactory.NewRequestInfo` + `httpRequest` of the Go tests.
     fn info_of(method: &str, path: &str, query: &str) -> RequestInfo {

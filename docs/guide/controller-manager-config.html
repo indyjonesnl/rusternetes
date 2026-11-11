@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Controller Manager Configuration - Rūsternetes</title>
+  <title>Controller Manager Configuration - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -135,7 +135,7 @@
           <tr>
             <td><code>--data-dir</code></td>
             <td>String</td>
-            <td><code>./data/rusternetes.db</code></td>
+            <td><code>./data/k3rs.db</code></td>
             <td>SQLite database path (only with <code>--storage-backend=sqlite</code>)</td>
           </tr>
           <tr>
@@ -165,7 +165,7 @@
           <tr>
             <td><code>--cluster-name</code></td>
             <td>String</td>
-            <td><code>rusternetes</code></td>
+            <td><code>k3rs</code></td>
             <td>Cluster name</td>
           </tr>
           <tr>
@@ -183,7 +183,7 @@
           <tr>
             <td><code>--leader-election-lock-key</code></td>
             <td>String</td>
-            <td><code>/rusternetes/controller-manager/leader</code></td>
+            <td><code>/k3rs/controller-manager/leader</code></td>
             <td>etcd key used for the leader election lock</td>
           </tr>
           <tr>
@@ -205,12 +205,12 @@
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># Standard deployment with etcd</span>
-rusternetes-controller-manager \
+k3rs-controller-manager \
   <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span> \
   <span class="flag">--sync-interval</span> <span class="value">5</span>
 
 <span class="comment"># HA with leader election</span>
-rusternetes-controller-manager \
+k3rs-controller-manager \
   <span class="flag">--etcd-servers</span> <span class="value">http://etcd:2379</span> \
   <span class="flag">--enable-leader-election</span> \
   <span class="flag">--leader-election-identity</span> <span class="value">cm-1</span></code>
@@ -438,7 +438,7 @@ Retry interval:    <span class="value">2s</span>   (fixed)</code>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

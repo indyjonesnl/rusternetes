@@ -4,7 +4,7 @@
 //! These are pure functions over `(node, pod, all_pods, all_nodes)` with no
 //! scheduler-internal state. They were relocated from
 //! `crates/scheduler/src/advanced.rs` so that both the scheduler and the
-//! DaemonSet controller can depend on `rusternetes-common` instead of the
+//! DaemonSet controller can depend on `k3rs-common` instead of the
 //! controller-manager depending on the scheduler crate (which created a
 //! cross-crate dependency edge — the scheduler already dev-depends on the
 //! controller-manager).

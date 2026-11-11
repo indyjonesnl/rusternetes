@@ -8,7 +8,7 @@
 //! random for `Spec.NodeName` (:298-310, :190-196); the in-process server has
 //! no nodes, so a Node is created first as the stand-in.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(
