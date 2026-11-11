@@ -563,7 +563,7 @@ grep -qE "^save .*registry.k8s.io/pause:3.10.1" "$STUB_LOG" \
 
 # mirror pull failing falls back to registry.k8s.io and tags the mirror name; never fails
 : > "$STUB_LOG"
-STUB_FAIL="k3rs/mirror" CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
+STUB_FAIL="rusternetes/mirror" CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && grep -q "^pull --quiet registry.k8s.io/conformance:v1.35.0\$" "$STUB_LOG" \
   && grep -q "^tag registry.k8s.io/conformance:v1.35.0 $SLC\$" "$STUB_LOG" \
   && ok "sideload: mirror failure falls back to upstream, retagged as requested" || bad "sideload fallback: $(tr '\n' '|' < "$STUB_LOG" | head -c 400)"

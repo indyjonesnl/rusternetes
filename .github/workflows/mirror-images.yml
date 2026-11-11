@@ -7,7 +7,7 @@ name: Mirror e2e images
 # the copy is a registry-to-registry manifest-list copy, so mirror digests equal
 # upstream digests. Re-running is a no-op for images already up to date.
 #
-# One-time: each new package under .../k3rs/mirror/* must be set to
+# One-time: each new package under .../rusternetes/mirror/* must be set to
 # public in the GitHub package settings so containerd can pull anonymously.
 
 on:
