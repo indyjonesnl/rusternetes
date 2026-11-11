@@ -49,12 +49,12 @@ vs_die() {
 # ---------------------------------------------------------------------------
 
 # vs_count_k3rs_images  — read image refs on stdin (one per line), print
-# how many DISTINCT refs contain the substring "k3rs". Distinct, not
+# how many DISTINCT refs contain "k3rs" or "rusternetes" (the published registry path keeps the old name until the repo rename). Distinct, not
 # occurrences: a DaemonSet/Deployment legitimately runs one image across N pods,
 # so N copies of the same k3rs image is still ONE component. Two
 # different k3rs images means two components (guard violation).
 vs_count_k3rs_images() {
-  grep -E 'k3rs' 2>/dev/null | sort -u | grep -c . || true
+  grep -E 'k3rs|rusternetes' 2>/dev/null | sort -u | grep -c . || true
 }
 
 # vs_validate_registry [registry-path]

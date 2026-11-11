@@ -52,7 +52,7 @@ echo "==> Verifying images exist before save"
 for img in "${IMAGES[@]}"; do
   if ! docker image inspect "$img" >/dev/null 2>&1; then
     echo "image $img missing after build — compose tag scheme drifted?" >&2
-    docker image ls | grep -E "k3rs" || true
+    docker image ls | grep -E "k3rs|rusternetes" || true
     exit 1
   fi
 done
