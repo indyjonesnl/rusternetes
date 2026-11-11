@@ -715,9 +715,10 @@ impl<'a> Helper<'a> {
         );
         match self.client.get::<Value>(&path).await {
             Ok(_) => {}
-            Err(GetError::NotFound) => {
-                // apierrors.NewNotFound(daemonsets.apps, name).Error()
-                let msg = format!("daemonsets.apps {} not found", q(ds_name));
+            Err(GetError::NotFound(status)) => {
+                // filters.go daemonSetFilter: `apierrors.IsNotFound(err)`;
+                // the message is the server's `err.Error()`, not synthesized.
+                let msg = err_message(&anyhow::Error::new(status));
                 // remove orphaned pods with a warning if --force is used
                 if self.force {
                     return PodDeleteStatus::with_warning(true, msg);
@@ -809,7 +810,7 @@ impl<'a> Helper<'a> {
                 Ok(v) => v,
                 Err(e) => {
                     let e = match e {
-                        GetError::NotFound => anyhow!("Resource not found"),
+                        GetError::NotFound(_) => anyhow!("Resource not found"),
                         GetError::Other(e) => e,
                     };
                     // resource.EnhanceListError(err, options, "/v1, Resource=pods")
@@ -1059,7 +1060,7 @@ impl<'a> Helper<'a> {
             let mut pending: Vec<Value> = Vec::new();
             for pod in &pods {
                 match self.get_pod(pod_namespace(pod), pod_name(pod)).await {
-                    Err(GetError::NotFound) => {
+                    Err(GetError::NotFound(_)) => {
                         self.finished(pod, using_eviction, None);
                     }
                     Ok(p) if pod_uid(&p) != pod_uid(pod) => {
@@ -1485,12 +1486,8 @@ impl<'a> DrainCmdOptions<'a> {
                 };
                 match client.get::<Value>(&format!("/api/v1/nodes/{name}")).await {
                     Ok(obj) => infos.push(node_info(obj)),
-                    Err(GetError::NotFound) => {
-                        return Err(anyhow!(
-                            "Error from server (NotFound): nodes {} not found",
-                            q(name)
-                        ));
-                    }
+                    // The builder surfaces the server's StatusError as is.
+                    Err(GetError::NotFound(status)) => return Err(anyhow::Error::new(status)),
                     Err(GetError::Other(e)) => return Err(e),
                 }
             }

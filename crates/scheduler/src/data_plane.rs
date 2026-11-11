@@ -1034,7 +1034,7 @@ impl<S: Storage + Send + Sync + 'static> DataPlane<S> {
 /// that match on it behave identically to storage mode.
 fn get_err_to_common(e: GetError) -> Error {
     match e {
-        GetError::NotFound => Error::NotFound("resource not found".to_string()),
+        GetError::NotFound(_) => Error::NotFound("resource not found".to_string()),
         GetError::Other(err) => Error::Internal(err.to_string()),
     }
 }

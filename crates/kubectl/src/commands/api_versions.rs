@@ -29,7 +29,7 @@ pub async fn execute(client: &ApiClient) -> Result<()> {
 
     // Get API groups
     let api_groups: ApiGroupList = client.get("/apis").await.map_err(|e| match e {
-        rusternetes_client::http::GetError::NotFound => anyhow::anyhow!("API groups not found"),
+        rusternetes_client::http::GetError::NotFound(_) => anyhow::anyhow!("API groups not found"),
         rusternetes_client::http::GetError::Other(e) => e,
     })?;
 

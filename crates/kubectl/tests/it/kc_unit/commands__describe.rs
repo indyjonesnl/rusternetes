@@ -363,7 +363,15 @@ mod tests {
 
     #[test]
     fn test_map_get_error_not_found() {
-        let err = map_get_error(rusternetes_client::http::GetError::NotFound);
+        let err = map_get_error(rusternetes_client::http::GetError::NotFound(
+            rusternetes_client::api_status::ApiStatusError {
+                code: 404,
+                reason: "NotFound".into(),
+                message: "x".into(),
+                retry_after_seconds: None,
+                causes: vec![],
+            },
+        ));
         assert_eq!(err.to_string(), "Resource not found");
     }
 

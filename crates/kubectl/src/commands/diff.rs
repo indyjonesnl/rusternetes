@@ -57,7 +57,7 @@ async fn diff_resource(
     // a genuine 404 (resource doesn't exist yet → show a creation diff) from
     // any other error (connection failure, permission denied, etc.) which we
     // propagate to the caller.
-    // Can't use ops::get_value here — it erases GetError::NotFound, which we need
+    // Can't use ops::get_value here — it erases GetError::NotFound(_), which we need
     // for the creation-diff branch.
     let current_yaml = match client.get::<Value>(&api_path).await {
         Ok(mut current) => {
@@ -67,7 +67,7 @@ async fn diff_resource(
             // Convert to YAML for diffing
             serde_yaml::to_string(&current)?
         }
-        Err(GetError::NotFound) => {
+        Err(GetError::NotFound(_)) => {
             println!("--- /dev/null");
             println!("+++ {}/{} (create)", kind, name);
             // Round-trip through serde_json::Value so keys sort the same way the
