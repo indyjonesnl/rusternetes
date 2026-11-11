@@ -26,7 +26,7 @@ const KUBELET_CLIENT_KEY: &str = "/etc/kubernetes/pki/apiserver-kubelet-client.k
 
 /// Load the api-server's kubelet client identity (cert chain + key) from the
 /// standard kubeadm path, if present. Returns `None` when the files are absent
-/// (rusternetes' own cluster, whose kubelet accepts the api-server without a
+/// (k3rs' own cluster, whose kubelet accepts the api-server without a
 /// client cert) so the connector falls back to `.with_no_client_auth()`.
 fn load_kubelet_client_identity() -> Option<(
     Vec<rustls::pki_types::CertificateDer<'static>>,
@@ -62,7 +62,7 @@ pub fn kubelet_client_identity_pem() -> Option<Vec<u8>> {
 
 /// Build the shared kubelet-proxy connector. Presents the kubeadm
 /// `apiserver-kubelet-client` cert when it exists so a vanilla kubelet
-/// authenticates the api-server; otherwise no client auth (rusternetes' own
+/// authenticates the api-server; otherwise no client auth (k3rs' own
 /// kubelet does not require it).
 pub fn kubelet_proxy_connector() -> KubeletProxyConnector {
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(

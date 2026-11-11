@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::exponential_backoff::*;
+    use k3rs_kubelet::volume_plugins::util::exponential_backoff::*;
 
     #[test]
     fn doubles_from_500ms_and_caps() {

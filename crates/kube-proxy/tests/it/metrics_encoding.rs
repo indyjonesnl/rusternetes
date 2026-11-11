@@ -1,7 +1,7 @@
 //! Exposition negotiation from upstream promhttp/http.go:193-212 and
 //! prometheus/common/expfmt/encode.go:65-99.
 use axum::{body::Body, http::Request};
-use rusternetes_kube_proxy::serve_metrics::metrics_router;
+use k3rs_kube_proxy::serve_metrics::metrics_router;
 use tower::ServiceExt;
 
 async fn scrape(accept: &str, encoding: &str) -> (axum::http::HeaderMap, Vec<u8>) {

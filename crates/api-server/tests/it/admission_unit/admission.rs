@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         quantity::{parse_resource_value, Quantity},
         resources::{LimitRange, Pod, ServiceAccount},
         types::ResourceRequirements,
     };
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_storage::Storage;
     pub use std::collections::{BTreeMap, HashMap};
     pub use std::sync::Arc;
     pub use tracing::{info, warn};
@@ -15,9 +15,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::*;
-    use rusternetes_common::quota;
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_api_server::admission::*;
+    use k3rs_common::quota;
+    use k3rs_common::types::ObjectMeta;
 
     fn make_pod(name: &str, cpu_request: Option<&str>, cpu_limit: Option<&str>) -> Pod {
         let mut resources = serde_json::Map::new();
@@ -147,13 +147,13 @@ mod tests {
             max.insert("cpu".to_string(), v.to_string());
         }
         LimitRange {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 api_version: "v1".to_string(),
                 kind: "LimitRange".to_string(),
             },
             metadata: ObjectMeta::new("test-limit-range").with_namespace("default"),
-            spec: rusternetes_common::resources::LimitRangeSpec {
-                limits: vec![rusternetes_common::resources::LimitRangeItem {
+            spec: k3rs_common::resources::LimitRangeSpec {
+                limits: vec![k3rs_common::resources::LimitRangeItem {
                     item_type: "Container".to_string(),
                     default: if default.is_empty() {
                         None
@@ -177,7 +177,7 @@ mod tests {
     async fn test_limit_range_applies_default_request_cpu() {
         // Conformance test scenario: LimitRange with default=500m, defaultRequest=300m
         // Pod with NO resources should get requests.cpu=300m, limits.cpu=500m
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let lr = make_limit_range(Some("500m"), Some("300m"), Some("100m"), Some("1"));
         let lr_key = "/registry/limitranges/default/test-limit-range";
         storage.create(lr_key, &lr).await.unwrap();
@@ -211,7 +211,7 @@ mod tests {
     async fn test_limit_range_requests_fallback_to_limits_when_no_default_request() {
         // When defaultRequest is NOT set but default (limits) IS set,
         // requests should default to the limit value
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let lr = make_limit_range(Some("500m"), None, None, None);
         let lr_key = "/registry/limitranges/default/test-limit-range";
         storage.create(lr_key, &lr).await.unwrap();
@@ -240,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn test_limit_range_does_not_override_explicit_requests() {
         // Container with explicit requests.cpu=200m should NOT be overridden by defaultRequest
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let lr = make_limit_range(Some("500m"), Some("300m"), Some("100m"), Some("1"));
         let lr_key = "/registry/limitranges/default/test-limit-range";
         storage.create(lr_key, &lr).await.unwrap();
@@ -267,7 +267,7 @@ mod tests {
     async fn test_limit_range_limits_default_to_requests_when_unset() {
         // K8s rule: if limits are set (from LimitRange default) but container has no requests,
         // requests should default to the limits value
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         // Only default limits, no defaultRequest
         let lr = make_limit_range(Some("400m"), None, None, None);
         let lr_key = "/registry/limitranges/default/test-limit-range";
@@ -302,7 +302,7 @@ mod tests {
         // apply_limit_range only handles LimitRange defaults — the pod-level
         // limits→requests defaulting happens in the pod handler BEFORE this.
         // So apply_limit_range should set requests.cpu = 100m (from defaultRequest).
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let lr = make_limit_range(Some("500m"), Some("100m"), Some("50m"), Some("1"));
         let lr_key = "/registry/limitranges/default/test-limit-range";
         storage.create(lr_key, &lr).await.unwrap();
@@ -454,8 +454,8 @@ mod tests {
             "kind": "Namespace",
             "metadata": { "name": name, "labels": labels },
         });
-        let ns: rusternetes_common::resources::Namespace = serde_json::from_value(ns).unwrap();
-        let key = rusternetes_storage::build_key("namespaces", None, name);
+        let ns: k3rs_common::resources::Namespace = serde_json::from_value(ns).unwrap();
+        let key = k3rs_storage::build_key("namespaces", None, name);
         storage.create(&key, &ns).await.unwrap();
     }
 
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_privileged_namespace_allows_privileged_pod() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "ns", Some("privileged")).await;
         let pod = pod_from_spec(
             "p",
@@ -556,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_missing_enforce_label_allows() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "ns", None).await;
         let pod = pod_from_spec(
             "p",
@@ -575,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_restricted_admits_compliant_pod() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "ns", Some("restricted")).await;
         let pod = pod_from_spec(
             "p",
@@ -628,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_exempt_namespace_admits_violating_pod() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "exempt-ns", Some("restricted")).await;
         put_namespace(&storage, "other-ns", Some("restricted")).await;
         let psa = PodSecurityAdmission::with_exemptions(exemptions());
@@ -642,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_exempt_user_admits_violating_pod() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "ns", Some("restricted")).await;
         let psa = PodSecurityAdmission::with_exemptions(exemptions());
         psa.admit_as(&storage, "ns", &privileged_pod(None), "exempt-user")
@@ -658,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn psa_exempt_runtime_class_admits_violating_pod() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_namespace(&storage, "ns", Some("restricted")).await;
         let psa = PodSecurityAdmission::with_exemptions(exemptions());
         psa.admit_as(&storage, "ns", &privileged_pod(Some("exempt-rc")), "alice")
@@ -744,7 +744,7 @@ plugins:
 
     /// `makeNs(enforce, warn, audit)` (admission_test.go).
     async fn put_ns_modes(
-        storage: &Arc<rusternetes_storage::MemoryStorage>,
+        storage: &Arc<k3rs_storage::MemoryStorage>,
         name: &str,
         enforce: &str,
         warn: &str,
@@ -756,11 +756,11 @@ plugins:
                 labels.insert(format!("pod-security.kubernetes.io/{k}"), v.to_string());
             }
         }
-        let ns: rusternetes_common::resources::Namespace =
+        let ns: k3rs_common::resources::Namespace =
             serde_json::from_value(serde_json::json!({"apiVersion": "v1", "kind": "Namespace",
                 "metadata": {"name": name, "labels": labels}}))
             .unwrap();
-        let key = rusternetes_storage::build_key("namespaces", None, name);
+        let key = k3rs_storage::build_key("namespaces", None, name);
         storage.create(&key, &ns).await.unwrap();
     }
 
@@ -773,7 +773,7 @@ plugins:
 
     #[tokio::test]
     async fn psa_warn_deny_allows_with_warning() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "warn-ns", "", "baseline", "").await;
         let out = PodSecurityAdmission::new()
             .admit_outcome(&storage, "warn-ns", &privileged_pod(None), "alice")
@@ -790,7 +790,7 @@ plugins:
 
     #[tokio::test]
     async fn psa_audit_deny_allows_with_annotation() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "audit-ns", "", "", "baseline").await;
         let out = PodSecurityAdmission::new()
             .admit_outcome(&storage, "audit-ns", &privileged_pod(None), "alice")
@@ -808,7 +808,7 @@ plugins:
     /// annotation records the enforced policy.
     #[tokio::test]
     async fn psa_enforce_deny_message_names_level_and_version() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "r-ns", "restricted", "", "").await;
         let err = PodSecurityAdmission::new()
             .admit_outcome(&storage, "r-ns", &privileged_pod(None), "alice")
@@ -825,7 +825,7 @@ plugins:
     /// short-circuit is `privileged:latest` (response.go init).
     #[tokio::test]
     async fn psa_enforce_policy_audit_annotation() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "b-ns", "baseline", "", "").await;
         put_ns_modes(&storage, "p-ns", "", "", "").await;
         let psa = PodSecurityAdmission::new();
@@ -847,7 +847,7 @@ plugins:
     /// error is annotated (EvaluatePod :466-470).
     #[tokio::test]
     async fn psa_invalid_enforce_label_fails_closed() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "invalid-ns", "not-a-valid-level", "", "").await;
         let err = PodSecurityAdmission::new()
             .admit_outcome(&storage, "invalid-ns", &baseline_pod(), "alice")
@@ -859,7 +859,7 @@ plugins:
     /// An unparseable audit/warn level fails open and is annotated.
     #[tokio::test]
     async fn psa_invalid_warn_label_fails_open_with_error_annotation() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "w-ns", "", "bogus", "").await;
         let out = PodSecurityAdmission::new()
             .admit_outcome(&storage, "w-ns", &privileged_pod(None), "alice")
@@ -877,7 +877,7 @@ plugins:
     /// already denied carries no warning.
     #[tokio::test]
     async fn psa_enforce_defaults_warn_level() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "e-ns", "baseline", "", "").await;
         // restricted audit sees the baseline pod's missing runAsNonRoot.
         put_ns_modes(&storage, "ea-ns", "baseline", "", "restricted").await;
@@ -892,7 +892,7 @@ plugins:
     /// Exemptions annotate the reason (response.go init).
     #[tokio::test]
     async fn psa_exemption_audit_annotation() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_modes(&storage, "ns", "restricted", "", "").await;
         let psa = PodSecurityAdmission::with_exemptions(exemptions());
         let by = |ns: &'static str, user: &'static str, rc: Option<&'static str>| {
@@ -935,7 +935,7 @@ plugins:
 
     #[tokio::test]
     async fn imagepullsecrets_propagated_from_sa_when_pod_has_none() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_sa(&storage, "ns", "default", &["regcred", "ghcr"]).await;
         let mut pod = make_pod("p", None, None);
         inject_service_account_token(&storage, "ns", &mut pod)
@@ -946,15 +946,14 @@ plugins:
 
     #[tokio::test]
     async fn imagepullsecrets_pod_list_wins_no_merge() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_sa(&storage, "ns", "default", &["regcred"]).await;
         let mut pod = make_pod("p", None, None);
         // Pod already declares its own secret — SA list must NOT be appended.
-        pod.spec.as_mut().unwrap().image_pull_secrets = Some(vec![
-            rusternetes_common::resources::pod::LocalObjectReference {
+        pod.spec.as_mut().unwrap().image_pull_secrets =
+            Some(vec![k3rs_common::resources::pod::LocalObjectReference {
                 name: "pod-own".to_string(),
-            },
-        ]);
+            }]);
         inject_service_account_token(&storage, "ns", &mut pod)
             .await
             .unwrap();
@@ -963,7 +962,7 @@ plugins:
 
     #[tokio::test]
     async fn imagepullsecrets_noop_when_sa_has_none() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_sa(&storage, "ns", "default", &[]).await;
         let mut pod = make_pod("p", None, None);
         inject_service_account_token(&storage, "ns", &mut pod)
@@ -974,7 +973,7 @@ plugins:
 
     #[tokio::test]
     async fn imagepullsecrets_propagated_even_when_automount_disabled() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_sa(&storage, "ns", "default", &["regcred"]).await;
         let mut pod = make_pod("p", None, None);
         // automount off must not block imagePullSecrets propagation.
@@ -992,13 +991,12 @@ plugins:
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let ns: rusternetes_common::resources::Namespace =
-            serde_json::from_value(serde_json::json!({
-                "apiVersion": "v1", "kind": "Namespace",
-                "metadata": { "name": name, "labels": labels },
-            }))
-            .unwrap();
-        let key = rusternetes_storage::build_key("namespaces", None, name);
+        let ns: k3rs_common::resources::Namespace = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": { "name": name, "labels": labels },
+        }))
+        .unwrap();
+        let key = k3rs_storage::build_key("namespaces", None, name);
         storage.create(&key, &ns).await.unwrap();
     }
 
@@ -1006,7 +1004,7 @@ plugins:
     /// set in v1.32, so `baseline:v1.31` forbids it and `latest` allows it.
     #[tokio::test]
     async fn psa_enforce_version_label_selects_older_sysctls_check() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_labels(
             &storage,
             "old",
@@ -1047,7 +1045,7 @@ plugins:
     /// v1.19 / v1.22, so a pod that sets neither passes `restricted:v1.18`.
     #[tokio::test]
     async fn psa_restricted_old_version_lacks_newer_checks() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_labels(
             &storage,
             "old",
@@ -1072,7 +1070,7 @@ plugins:
     /// `AggregateCheckResult.ForbiddenDetail` does (checks.go:98-117).
     #[tokio::test]
     async fn psa_enforce_message_aggregates_all_violations() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         put_ns_labels(
             &storage,
             "ns",
@@ -1099,10 +1097,10 @@ plugins:
     /// InternalError, not an allow.
     #[tokio::test]
     async fn psa_namespace_lookup_failure_is_internal_error() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         // An unreadable (undecodable) Namespace record: a read error that is
         // not NotFound.
-        let key = rusternetes_storage::build_key("namespaces", None, "broken");
+        let key = k3rs_storage::build_key("namespaces", None, "broken");
         storage
             .create(&key, &serde_json::json!("not a namespace"))
             .await
@@ -1112,7 +1110,7 @@ plugins:
             .await
             .expect_err("an unreadable namespace must not fail open");
         assert!(
-            matches!(&err, rusternetes_common::Error::Internal(m)
+            matches!(&err, k3rs_common::Error::Internal(m)
                 if m.contains(r#"failed to lookup namespace "broken""#)),
             "{err:?}"
         );
@@ -1123,13 +1121,13 @@ plugins:
     /// first; here that plugin exists, so no NotFound arm remains.
     #[tokio::test]
     async fn psa_missing_namespace_is_internal_error() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         let err = PodSecurityAdmission::new()
             .admit_outcome(&storage, "missing", &privileged_pod(None), "alice")
             .await
             .expect_err("a missing namespace must not fail open");
         assert!(
-            matches!(&err, rusternetes_common::Error::Internal(m)
+            matches!(&err, k3rs_common::Error::Internal(m)
                 if m.contains(r#"failed to lookup namespace "missing""#)),
             "{err:?}"
         );

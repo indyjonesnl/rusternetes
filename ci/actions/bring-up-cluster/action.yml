@@ -1,4 +1,4 @@
-name: Bring up rusternetes cluster (sqlite + Hydrophone)
+name: Bring up k3rs cluster (sqlite + Hydrophone)
 description: >
   Confirm docker, install kubectl + Hydrophone, build images, bring up the
   compose.sqlite.yml stack, discover the bridge gateway,
@@ -11,7 +11,7 @@ inputs:
       Compose stack to bring up. Defaults to the rhino/SQLite stack; pass
       compose.kine.yml to run the same topology against kine instead. Any
       value must expose the same service names, since later steps address
-      services (kubelet, kube-proxy, rusternetes) by name.
+      services (kubelet, kube-proxy, k3rs) by name.
     required: false
     default: compose.sqlite.yml
   hydrophone-version:
@@ -82,16 +82,16 @@ runs:
     - name: Set KUBELET_VOLUMES_PATH and CERTS_PATH
       shell: bash
       run: |
-        echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.rusternetes/volumes" >> "$GITHUB_ENV"
-        mkdir -p "$GITHUB_WORKSPACE/.rusternetes/volumes"
+        echo "KUBELET_VOLUMES_PATH=$GITHUB_WORKSPACE/.k3rs/volumes" >> "$GITHUB_ENV"
+        mkdir -p "$GITHUB_WORKSPACE/.k3rs/volumes"
         # Pre-create every host dir that compose bind-mounts, so the Docker
         # daemon does not create it as root on `up` (the runner then can't
-        # write into it). .rusternetes/manifests holds the templated
+        # write into it). .k3rs/manifests holds the templated
         # control-plane static pod YAML written by bootstrap-cluster.sh AFTER
         # `compose up` — without this, that step dies with "Permission denied"
         # (conformance canary red since the static-pod control-plane landed,
         # 2026-06-12). Mirrors the volumes mkdir above.
-        mkdir -p "$GITHUB_WORKSPACE/.rusternetes/manifests"
+        mkdir -p "$GITHUB_WORKSPACE/.k3rs/manifests"
         # CERTS_PATH MUST be set before the first `compose up`. The kubelet
         # bind-mounts certs at ${CERTS_PATH}:${CERTS_PATH} (compose.sqlite.yml)
         # so the kube-scheduler / kube-controller-manager static pods can
@@ -99,17 +99,17 @@ runs:
         # identically inside the kubelet container and on the Docker host.
         # bootstrap-cluster.sh templates that same host-absolute path into the
         # static-pod manifests. If CERTS_PATH is unset at `up` time the kubelet
-        # falls back to mounting certs at /etc/rusternetes/certs, the manifest
-        # hostPath ($GITHUB_WORKSPACE/.rusternetes/certs) then fails the
+        # falls back to mounting certs at /etc/k3rs/certs, the manifest
+        # hostPath ($GITHUB_WORKSPACE/.k3rs/certs) then fails the
         # kubelet's existence check, and both control-plane static pods hang in
         # Pending forever — no scheduler, no controller-manager, broken cluster
         # under conformance (#1153). Export it here so every `up` in this action
         # (initial + gateway restart) mounts certs at the host-absolute path.
-        echo "CERTS_PATH=$GITHUB_WORKSPACE/.rusternetes/certs" >> "$GITHUB_ENV"
+        echo "CERTS_PATH=$GITHUB_WORKSPACE/.k3rs/certs" >> "$GITHUB_ENV"
 
     - name: Write kubeconfig
       # The repo doesn't ship a kubeconfig — it's user-maintained
-      # locally at ~/.kube/rusternetes-config. Construct a minimal
+      # locally at ~/.kube/k3rs-config. Construct a minimal
       # one for the runner. Inside the runner pod (which shares its
       # network namespace with the dind sidecar), the api-server's
       # published port 6443 is reachable on localhost. `--skip-auth`
@@ -119,27 +119,27 @@ runs:
       shell: bash
       run: |
         mkdir -p "$HOME/.kube"
-        cat > "$HOME/.kube/rusternetes-config" <<'EOF'
+        cat > "$HOME/.kube/k3rs-config" <<'EOF'
         apiVersion: v1
         kind: Config
         clusters:
-          - name: rusternetes
+          - name: k3rs
             cluster:
               insecure-skip-tls-verify: true
               server: https://localhost:6443
         contexts:
-          - name: rusternetes
+          - name: k3rs
             context:
-              cluster: rusternetes
+              cluster: k3rs
               user: admin
-        current-context: rusternetes
+        current-context: k3rs
         users:
           - name: admin
             user:
               token: anonymous
         EOF
-        echo "KUBECONFIG=$HOME/.kube/rusternetes-config" >> "$GITHUB_ENV"
-        echo "path=$HOME/.kube/rusternetes-config" >> "$GITHUB_OUTPUT"
+        echo "KUBECONFIG=$HOME/.kube/k3rs-config" >> "$GITHUB_ENV"
+        echo "path=$HOME/.kube/k3rs-config" >> "$GITHUB_OUTPUT"
 
     - name: Install kubectl
       # The ARC runner image (ci/arc-runner/Dockerfile) bakes Rust + protoc
@@ -164,7 +164,7 @@ runs:
     - name: Pull prebuilt images or build locally
       # With inputs.image-tag set, try the GHCR-published images first
       # (publish-images.yml pushes sha-<sha> + main tags on every main push).
-      # GHCR_OVERLAY + RUSTERNETES_IMAGE_TAG are exported to GITHUB_ENV so the
+      # GHCR_OVERLAY + K3RS_IMAGE_TAG are exported to GITHUB_ENV so the
       # up/restart steps below compose with the same image names. Pull failure
       # (tag missing, registry down, publish still running) falls back to the
       # local build — same path as image-tag="".
@@ -179,11 +179,11 @@ runs:
         # cluster reports exactly which commit it is built from. Only matters on
         # the local-build fallback below — GHCR images carry the SHA from their
         # own publish build.
-        export RUSTERNETES_GIT_SHA="${RUSTERNETES_GIT_SHA:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
+        export K3RS_GIT_SHA="${K3RS_GIT_SHA:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)}"
         # --profile build includes the build-only dns image: it runs as an
         # in-cluster Deployment (bootstrap-dns.yaml), not a compose container.
         if [ -n "$IMAGE_TAG" ]; then
-          export RUSTERNETES_IMAGE_TAG="$IMAGE_TAG"
+          export K3RS_IMAGE_TAG="$IMAGE_TAG"
           # compose.ghcr.yml pins prebuilt image refs per service and is only
           # valid for the default stack. Callers on another stack (the kine
           # leg) pass an empty image-tag, which skips this branch entirely and
@@ -193,7 +193,7 @@ runs:
           # layer per tick ("Extracting 3 s" x thousands). Errors still print.
           if docker compose --progress quiet -f "$COMPOSE_STACK" -f compose.ghcr.yml --profile build pull; then
             # The kube-scheduler / kube-controller-manager static pods and the
-            # rusternetes-dns Deployment run INSIDE the containerd CRI service
+            # k3rs-dns Deployment run INSIDE the containerd CRI service
             # (54bd2ee7, 2026-06-17), not as docker containers. containerd keeps
             # its own image store, so the previous `docker tag ... :latest`
             # retag on the docker daemon was invisible to it — the kubelet then
@@ -206,7 +206,7 @@ runs:
             # dns Deployment so containerd pulls them directly (the packages are
             # public). No cross-daemon retag needed.
             echo "GHCR_OVERLAY=-f compose.ghcr.yml" >> "$GITHUB_ENV"
-            echo "RUSTERNETES_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+            echo "K3RS_IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
             echo "CONTROL_PLANE_IMAGE_REGISTRY=ghcr.io/indyjonesnl/rusternetes" >> "$GITHUB_ENV"
             echo "using prebuilt images: tag=$IMAGE_TAG"
             exit 0
@@ -256,7 +256,7 @@ runs:
       name: Discover docker bridge gateway
       shell: bash
       run: |
-        GW=$(docker network inspect rusternetes-network -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "")
+        GW=$(docker network inspect k3rs-network -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "")
         if [ -z "$GW" ]; then
           GW=$(ip route show | grep "docker0" | grep -oP 'inet\K[0-9./]+' | head -1 | cut -d/ -f1 | rev | cut -d. -f2,3,4 | rev | sed 's/\.[0-9]*$/.1/')
         fi
@@ -281,8 +281,8 @@ runs:
         # too, so compose interpolation and any manual re-up keep mounting certs
         # at the host-absolute path the static-pod manifests reference (#1153).
         echo "CERTS_PATH=${CERTS_PATH}" >> .env
-        if [ -n "${RUSTERNETES_IMAGE_TAG:-}" ]; then
-          echo "RUSTERNETES_IMAGE_TAG=${RUSTERNETES_IMAGE_TAG}" >> .env
+        if [ -n "${K3RS_IMAGE_TAG:-}" ]; then
+          echo "K3RS_IMAGE_TAG=${K3RS_IMAGE_TAG}" >> .env
         fi
         docker compose -f "$COMPOSE_STACK" ${GHCR_OVERLAY:-} up -d --no-build
         docker compose -f "$COMPOSE_STACK" ${GHCR_OVERLAY:-} ps
@@ -320,7 +320,7 @@ runs:
         done
         echo "api-server never became healthy — dumping diagnostics:"
         docker compose -f "$COMPOSE_STACK" ${GHCR_OVERLAY:-} ps || true
-        docker compose -f "$COMPOSE_STACK" ${GHCR_OVERLAY:-} logs --tail=50 rusternetes || true
+        docker compose -f "$COMPOSE_STACK" ${GHCR_OVERLAY:-} logs --tail=50 k3rs || true
         curl -kv --max-time 5 https://127.0.0.1:6443/healthz || true
         curl -kv --max-time 5 https://localhost:6443/healthz || true
         exit 1
@@ -380,7 +380,7 @@ runs:
             [ -n "$cidr" ] || missing="$missing $n"
           done
           conf_ok=1
-          for rt in $(docker ps --format '{{.Names}}' | grep -E '^rusternetes-containerd[0-9]*$'); do
+          for rt in $(docker ps --format '{{.Names}}' | grep -E '^k3rs-containerd[0-9]*$'); do
             docker exec "$rt" sh -c 'ls /etc/cni/net.d/*.conflist >/dev/null 2>&1' || conf_ok=0
           done
           if [ -z "$missing" ] && [ "$conf_ok" -eq 1 ]; then
@@ -393,7 +393,7 @@ runs:
         echo "pod networking not ready — dumping diagnostics:"
         echo "nodes without a podCIDR:${missing:- none}"
         kubectl get nodes -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR || true
-        for rt in $(docker ps --format '{{.Names}}' | grep -E '^rusternetes-containerd[0-9]*$'); do
+        for rt in $(docker ps --format '{{.Names}}' | grep -E '^k3rs-containerd[0-9]*$'); do
           echo "--- $rt /etc/cni/net.d ---"
           docker exec "$rt" ls -l /etc/cni/net.d || true
         done

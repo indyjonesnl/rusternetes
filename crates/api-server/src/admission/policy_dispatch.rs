@@ -27,12 +27,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::resources::validating_admission_policy::{
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::resources::validating_admission_policy::{
     FailurePolicy, MatchResources, ParamKind, ParamRef, ParameterNotFoundAction,
 };
-use rusternetes_common::types::{Selector, Status, StatusCause, StatusDetails};
-use rusternetes_common::Error;
+use k3rs_common::types::{Selector, Status, StatusCause, StatusDetails};
+use k3rs_common::Error;
 use serde_json::Value;
 
 use super::policy_matching::{selector_of, Attributes, Matcher};

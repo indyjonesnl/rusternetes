@@ -14,12 +14,12 @@
 //! Upstream solved this by holding a finalizer on every Job pod until the pod
 //! has been recorded in the Job status. These tests pin that contract.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::workloads::*;
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::job::JobController;
-use rusternetes_controller_manager::controllers::job_tracking::JOB_TRACKING_FINALIZER;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::workloads::*;
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::job::JobController;
+use k3rs_controller_manager::controllers::job_tracking::JOB_TRACKING_FINALIZER;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -682,7 +682,7 @@ async fn a_job_is_never_written_finished_while_uids_are_still_uncounted() {
     while let Ok(Some(Ok(ev))) =
         tokio::time::timeout(std::time::Duration::from_millis(50), watch.next()).await
     {
-        let rusternetes_storage::WatchEvent::Modified(_, v) = ev else {
+        let k3rs_storage::WatchEvent::Modified(_, v) = ev else {
             continue;
         };
         let j: Job = serde_json::from_str(&v).unwrap();
@@ -717,7 +717,7 @@ async fn a_job_is_never_written_finished_while_uids_are_still_uncounted() {
 /// strips the finalizer, and a pod that is already gone is not an error.
 #[tokio::test]
 async fn orphan_pod_enqueues_and_the_worker_step_releases_it() {
-    use rusternetes_controller_manager::controllers::pod_informer::PodEventTarget;
+    use k3rs_controller_manager::controllers::pod_informer::PodEventTarget;
 
     let storage = setup().await;
     let job = make_job("orphanq", "default", 1, 1);

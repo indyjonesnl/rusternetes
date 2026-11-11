@@ -7,8 +7,8 @@ use crate::worker_pool::spawn_workers;
 /// K8s ref: staging/src/k8s.io/kube-aggregator/pkg/controllers/status/remote/remote_available_controller.go
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::EndpointSlice;
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::EndpointSlice;
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -263,7 +263,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
     /// and one-shot reconciliation; the production code path drives reconcile
     /// through the work-queue worker, which doesn't call this entry point.
     pub async fn reconcile(&self, name: &str) -> Result<()> {
-        let key = rusternetes_storage::build_key("apiservices", None, name);
+        let key = k3rs_storage::build_key("apiservices", None, name);
         let apiservice: serde_json::Value = self.storage.get(&key).await?;
         self.reconcile_one(&apiservice).await
     }
@@ -307,7 +307,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
             .to_string();
 
         // Check if the backing service exists
-        let svc_key = rusternetes_storage::build_key("services", Some(&svc_ns), &svc_name);
+        let svc_key = k3rs_storage::build_key("services", Some(&svc_ns), &svc_name);
         let svc = match self.storage.get::<serde_json::Value>(&svc_key).await {
             Ok(s) => s,
             Err(_) => {
@@ -481,7 +481,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         reason: &str,
         message: &str,
     ) -> Result<()> {
-        let key = rusternetes_storage::build_key("apiservices", None, apiservice_name);
+        let key = k3rs_storage::build_key("apiservices", None, apiservice_name);
         let mut apiservice: serde_json::Value = match self.storage.get(&key).await {
             Ok(v) => v,
             Err(_) => return Ok(()), // APIService was deleted
@@ -573,7 +573,7 @@ impl<S: Storage + 'static> APIServiceAvailabilityController<S> {
         );
         match self.storage.update(&key, &apiservice).await {
             Ok(_) => {}
-            Err(rusternetes_common::Error::Conflict(_)) => {
+            Err(k3rs_common::Error::Conflict(_)) => {
                 // Another writer raced — re-read and retry once in-place.
                 let mut fresh = self
                     .storage

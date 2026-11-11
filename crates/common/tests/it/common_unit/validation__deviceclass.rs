@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::cel_versions::{self, EnvSet};
-    pub use rusternetes_common::resources::{DeviceClass, DeviceClassSpec};
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::validation::resourceclaim::{
+    pub use k3rs_common::cel_versions::{self, EnvSet};
+    pub use k3rs_common::resources::{DeviceClass, DeviceClassSpec};
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::validation::resourceclaim::{
         too_many_max_items, validate_selector_slice_in,
     };
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::deviceclass::*;
-    use rusternetes_common::validation::resourceclaim::{
+    use k3rs_common::validation::deviceclass::*;
+    use k3rs_common::validation::resourceclaim::{
         CEL_SELECTOR_EXPRESSION_MAX_LENGTH, DEVICE_SELECTORS_MAX_SIZE,
     };
 
@@ -120,7 +120,7 @@ mod tests {
             serde_json::json!({"selectors": selectors, "config": config}),
         ))
         .into_iter()
-        .filter(|e| e.error_type == rusternetes_common::validation::field::ErrorType::TooMany)
+        .filter(|e| e.error_type == k3rs_common::validation::field::ErrorType::TooMany)
         .map(|e| (e.field, e.origin))
         .collect();
         got.sort();
@@ -133,9 +133,7 @@ mod tests {
     }
 
     fn env_1_32() -> EnvSet {
-        EnvSet::must_base_env_set(rusternetes_common::feature_gates::Version::major_minor(
-            1, 32,
-        ))
+        EnvSet::must_base_env_set(k3rs_common::feature_gates::Version::major_minor(1, 32))
     }
 
     /// `validateCELSelector` (validation.go:316-322) + `validateDeviceClassSpec`

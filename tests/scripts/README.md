@@ -1,6 +1,6 @@
 # Test Scripts
 
-This directory contains shell scripts for testing Rusternetes functionality.
+This directory contains shell scripts for testing k3rs functionality.
 
 ## Available Scripts
 
@@ -23,6 +23,6 @@ All scripts should be run from the project root directory:
 
 ## Requirements
 
-- Rusternetes cluster must be running
+- k3rs cluster must be running
 - kubectl binary built at `./target/release/kubectl` or `./target/debug/kubectl`
 - Required container runtime (podman or docker)

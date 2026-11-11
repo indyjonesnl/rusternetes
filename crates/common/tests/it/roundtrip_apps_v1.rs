@@ -17,10 +17,10 @@
 //! via `serde_json::Value` equality of two successive encodings. This is
 //! the same property upstream's `RoundTrip` helpers establish.
 
-use rusternetes_common::resources::controllerrevision::ControllerRevision;
-use rusternetes_common::resources::deployment::Deployment;
-use rusternetes_common::resources::workloads::{DaemonSet, ReplicaSet, StatefulSet};
-use rusternetes_common::types::List;
+use k3rs_common::resources::controllerrevision::ControllerRevision;
+use k3rs_common::resources::deployment::Deployment;
+use k3rs_common::resources::workloads::{DaemonSet, ReplicaSet, StatefulSet};
+use k3rs_common::types::List;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 

@@ -8,16 +8,16 @@
 //! one-shot init container that must exit before app containers run.
 //!
 //! These tests exercise the pure decision helper `decide_next_init_action`
-//! in `rusternetes_kubelet::runtime`, which captures the init-container
+//! in `k3rs_kubelet::runtime`, which captures the init-container
 //! restart state machine independently of the Docker runtime. The helper
 //! is called from `ContainerRuntime::compute_init_container_actions` after
 //! Docker observations have been gathered, so testing it directly gives
 //! us deterministic coverage of the restart semantics without needing a
 //! real container runtime.
 
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::runtime::{decide_next_init_action, InitAction, InitContainerObserved};
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::runtime::{decide_next_init_action, InitAction, InitContainerObserved};
 
 /// Build a minimal init container with the given name and optional
 /// per-container restart policy (which marks it as a sidecar when set

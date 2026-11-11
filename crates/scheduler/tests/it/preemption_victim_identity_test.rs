@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 
 use crate::preempt_support::check_preemption;
-use rusternetes_common::resources::{Container, Pod, PodSpec, PodStatus};
-use rusternetes_common::types::{Phase, ResourceRequirements};
-use rusternetes_test_support::node_with_resources as make_node;
+use k3rs_common::resources::{Container, Pod, PodSpec, PodStatus};
+use k3rs_common::types::{Phase, ResourceRequirements};
+use k3rs_test_support::node_with_resources as make_node;
 
 fn container(cpu: &str) -> Container {
     let mut requests = HashMap::new();

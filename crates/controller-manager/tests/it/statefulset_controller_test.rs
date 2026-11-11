@@ -2,12 +2,12 @@
 // Tests the StatefulSet controller's ability to manage stateful workloads with stable identities
 
 use crate::stale_list_double::StaleListStorage;
-use rusternetes_common::resources::pod::PodCondition;
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::statefulset::StatefulSetController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::PodCondition;
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::statefulset::StatefulSetController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

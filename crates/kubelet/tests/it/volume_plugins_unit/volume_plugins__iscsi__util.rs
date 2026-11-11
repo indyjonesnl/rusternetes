@@ -3,15 +3,15 @@
 
 mod __parent {
     pub use anyhow::{anyhow, bail, Result};
-    pub use rusternetes_common::resources::volume::PersistentVolumeMode;
-    pub use rusternetes_kubelet::volume_plugins::iscsi::{
+    pub use k3rs_common::resources::volume::PersistentVolumeMode;
+    pub use k3rs_kubelet::volume_plugins::iscsi::{
         uncertain_progress, DiskManager, IscsiDisk, IscsiDiskMounter, IscsiDiskUnmapper,
         IscsiDiskUnmounter, ISCSI_PLUGIN_NAME,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::device_util::DeviceUtil;
-    pub use rusternetes_kubelet::volume_plugins::util::exec::ExecError;
-    pub use rusternetes_kubelet::volume_plugins::util::mount_utils::path_exists;
-    pub use rusternetes_kubelet::volume_plugins::VolumeHost;
+    pub use k3rs_kubelet::volume_plugins::util::device_util::DeviceUtil;
+    pub use k3rs_kubelet::volume_plugins::util::exec::ExecError;
+    pub use k3rs_kubelet::volume_plugins::util::mount_utils::path_exists;
+    pub use k3rs_kubelet::volume_plugins::VolumeHost;
     pub use std::collections::BTreeMap;
     pub use std::io;
     pub use std::io::Write;
@@ -26,17 +26,15 @@ mod tests {
     //! exec-sequence test the Go suite lacks (it cannot run `AttachDisk`
     //! without a SCSI host).
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::iscsi::disk_manager::DiskManager;
-    use rusternetes_kubelet::volume_plugins::iscsi::util::*;
-    use rusternetes_kubelet::volume_plugins::iscsi::IscsiPlugin;
-    use rusternetes_kubelet::volume_plugins::util::device_util::DeviceUtil;
-    use rusternetes_kubelet::volume_plugins::util::exec::testing::{
-        script, CommandScript, FakeExec,
-    };
-    use rusternetes_kubelet::volume_plugins::util::exec::Exec;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
-    use rusternetes_kubelet::volume_plugins::util::mount_interface::SafeFormatAndMount;
-    use rusternetes_kubelet::volume_plugins::KubeletVolumeHost;
+    use k3rs_kubelet::volume_plugins::iscsi::disk_manager::DiskManager;
+    use k3rs_kubelet::volume_plugins::iscsi::util::*;
+    use k3rs_kubelet::volume_plugins::iscsi::IscsiPlugin;
+    use k3rs_kubelet::volume_plugins::util::device_util::DeviceUtil;
+    use k3rs_kubelet::volume_plugins::util::exec::testing::{script, CommandScript, FakeExec};
+    use k3rs_kubelet::volume_plugins::util::exec::Exec;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::testing::FakeMounter;
+    use k3rs_kubelet::volume_plugins::util::mount_interface::SafeFormatAndMount;
+    use k3rs_kubelet::volume_plugins::KubeletVolumeHost;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -211,7 +209,7 @@ mod tests {
         Arc::new(KubeletVolumeHost::new_for_tests(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         ))
     }

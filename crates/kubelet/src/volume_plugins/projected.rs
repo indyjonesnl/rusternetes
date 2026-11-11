@@ -2,8 +2,8 @@ use crate::atomic_writer::FileProjection;
 use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -278,7 +278,7 @@ pub fn secret_payload(
 /// errors are accumulated, not short-circuited; an item with neither ref
 /// projects an empty file; the path is `filepath.Clean`ed.
 fn downward_api_payload(
-    items: &[rusternetes_common::resources::DownwardAPIVolumeFile],
+    items: &[k3rs_common::resources::DownwardAPIVolumeFile],
     pod: &Pod,
     node_allocatable: &HashMap<String, String>,
     default_mode: u32,
@@ -384,7 +384,7 @@ impl ProjectedMounter {
                 let secret = match storage.get::<Secret>(&key).await {
                     Ok(s) => s,
                     // `!(errors.IsNotFound(err) && optional)` (`:243`).
-                    Err(rusternetes_common::Error::NotFound(_)) if optional => {
+                    Err(k3rs_common::Error::NotFound(_)) if optional => {
                         Secret::new(&name, &self.namespace)
                     }
                     Err(e) => {
@@ -403,7 +403,7 @@ impl ProjectedMounter {
                 let key = build_key("configmaps", Some(&self.namespace), &name);
                 let cm = match storage.get::<ConfigMap>(&key).await {
                     Ok(c) => c,
-                    Err(rusternetes_common::Error::NotFound(_)) if optional => {
+                    Err(k3rs_common::Error::NotFound(_)) if optional => {
                         ConfigMap::new(&name, &self.namespace)
                     }
                     Err(e) => {
@@ -496,7 +496,7 @@ impl ProjectedMounter {
     /// (`projected.go:289-318`): a token bound to this pod.
     async fn service_account_token(
         &self,
-        sa_token: &rusternetes_common::resources::ServiceAccountTokenProjection,
+        sa_token: &k3rs_common::resources::ServiceAccountTokenProjection,
     ) -> Result<String> {
         let sa_name = self
             .pod
@@ -506,7 +506,7 @@ impl ProjectedMounter {
             .unwrap_or("default");
         // `auds = []string{tp.Audience}` when set: exactly what the projection
         // asked for. Empty means the api-server's own default audience, which
-        // it then accepts - do NOT force "rusternetes", or a vanilla
+        // it then accepts - do NOT force "k3rs", or a vanilla
         // api-server issues a token whose audience it rejects on use.
         let audiences: Vec<String> = sa_token.audience.iter().cloned().collect();
         // TokenRequest requires expirationSeconds >= 600 (10m).
@@ -643,7 +643,7 @@ impl Mounter for ProjectedMounter {
 /// else an error. `allowEmpty` is `optional` (`:321-324`).
 pub(crate) async fn trust_anchors_for<S: Storage + ?Sized>(
     storage: &S,
-    ctb: &rusternetes_common::resources::ClusterTrustBundleProjection,
+    ctb: &k3rs_common::resources::ClusterTrustBundleProjection,
 ) -> Result<Vec<u8>> {
     let allow_empty = ctb.optional.unwrap_or(false);
     if let Some(name) = &ctb.name {
@@ -679,7 +679,7 @@ pub(crate) fn write_payload(
 /// The three file projections of a `podCertificate` source
 /// (`projected.go:403-427`): `credentialBundlePath` is key followed by chain.
 fn pod_certificate_files(
-    pc: &rusternetes_common::resources::pod::PodCertificateProjection,
+    pc: &k3rs_common::resources::pod::PodCertificateProjection,
     key: Vec<u8>,
     certificates: Vec<u8>,
     fs_user: Option<i64>,

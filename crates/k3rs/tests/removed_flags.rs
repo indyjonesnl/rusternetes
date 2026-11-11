@@ -8,10 +8,10 @@
 use std::process::Command;
 
 fn rejects_flag(flag: &str) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rusternetes"))
+    let out = Command::new(env!("CARGO_BIN_EXE_k3rs"))
         .arg(flag)
         .output()
-        .expect("spawn rusternetes binary");
+        .expect("spawn k3rs binary");
 
     assert!(
         !out.status.success(),

@@ -16,8 +16,8 @@
 //! Revert scenario: reverting the retry loop causes the Conflict to be surfaced
 //! to the client as HTTP 409 instead of the expected 200.
 
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------

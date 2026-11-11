@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::types::ObjectMeta;
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::authentication::*;
+    use k3rs_common::resources::authentication::*;
 
     #[test]
     fn test_token_review_serialization() {

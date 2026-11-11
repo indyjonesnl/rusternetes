@@ -4,8 +4,8 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
-use rusternetes_common::dump::DumpingJson;
-use rusternetes_common::{
+use k3rs_common::dump::DumpingJson;
+use k3rs_common::{
     auth::UserInfo,
     authz::{Decision, RequestAttributes},
     resources::{
@@ -37,7 +37,7 @@ pub async fn create_subject_access_review(
         .with_api_group("authorization.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // The whole spec, validated in one place. Upstream runs
@@ -46,10 +46,9 @@ pub async fn create_subject_access_review(
     // handler used to hand-roll only the "both set" clause and raise
     // `Error::Internal` -- a 500 -- for the "neither set" one (#1938).
     {
-        let errs =
-            rusternetes_common::validation::authorization::validate_subject_access_review(&sar);
+        let errs = k3rs_common::validation::authorization::validate_subject_access_review(&sar);
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::new_invalid(
+            return Err(k3rs_common::Error::new_invalid(
                 "authorization.k8s.io",
                 "SubjectAccessReview",
                 "",
@@ -139,7 +138,7 @@ pub async fn create_self_subject_access_review(
         .and_then(|v| v.to_str().ok())
     {
         if accept.contains("as=Table") || accept.contains("as=PartialObjectMetadata") {
-            return Err(rusternetes_common::Error::NotAcceptable(
+            return Err(k3rs_common::Error::NotAcceptable(
                 "the resource does not support the requested content type".to_string(),
             ));
         }
@@ -150,7 +149,7 @@ pub async fn create_self_subject_access_review(
         .with_api_group("authorization.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // `ValidateSelfSubjectAccessReviewSpec` (`validation.go:49-60`): the two
@@ -158,11 +157,9 @@ pub async fn create_self_subject_access_review(
     // caller, so there is no subject to name (#1938).
     {
         let errs =
-            rusternetes_common::validation::authorization::validate_self_subject_access_review(
-                &ssar,
-            );
+            k3rs_common::validation::authorization::validate_self_subject_access_review(&ssar);
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::new_invalid(
+            return Err(k3rs_common::Error::new_invalid(
                 "authorization.k8s.io",
                 "SelfSubjectAccessReview",
                 "",
@@ -242,7 +239,7 @@ pub async fn create_local_subject_access_review(
             .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Build the authorization request from the spec
@@ -267,12 +264,11 @@ pub async fn create_local_subject_access_review(
     )?;
 
     {
-        let errs =
-            rusternetes_common::validation::authorization::validate_local_subject_access_review(
-                &lsar, &namespace,
-            );
+        let errs = k3rs_common::validation::authorization::validate_local_subject_access_review(
+            &lsar, &namespace,
+        );
         if !errs.is_empty() {
-            return Err(rusternetes_common::Error::new_invalid(
+            return Err(k3rs_common::Error::new_invalid(
                 "authorization.k8s.io",
                 "LocalSubjectAccessReview",
                 "",
@@ -351,7 +347,7 @@ pub async fn create_self_subject_rules_review(
     // an absent `spec.namespace` would enumerate cluster-scoped rules under a
     // namespace named "".
     if ssrr.spec.namespace.is_empty() {
-        return Err(rusternetes_common::Error::BadRequest(
+        return Err(k3rs_common::Error::BadRequest(
             "no namespace on request".to_string(),
         ));
     }
@@ -361,7 +357,7 @@ pub async fn create_self_subject_rules_review(
         .with_api_group("authorization.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Get all rules that apply to the current user in the specified namespace

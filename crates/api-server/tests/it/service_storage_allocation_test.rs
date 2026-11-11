@@ -14,7 +14,7 @@
 //! into `10.96.0.0/12` / `2001:db8:1::/112`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SVCS: &str = "/api/v1/namespaces/default/services";

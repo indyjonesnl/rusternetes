@@ -77,14 +77,14 @@
 //! `#[ignore]`d test that documents the failure mode — the rest of the
 //! file demonstrates each individual lifecycle step still works.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, LimitRange, LimitRangeItem, LimitRangeSpec, Pod, PodSpec, PodStatus, ResourceQuota,
     ResourceQuotaSpec,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
-use rusternetes_controller_manager::controllers::resource_quota::ResourceQuotaController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+use k3rs_controller_manager::controllers::resource_quota::ResourceQuotaController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1789,7 +1789,7 @@ async fn pod_admission_applies_limitrange_defaults() {
         status: None,
     };
 
-    let admitted = rusternetes_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
+    let admitted = k3rs_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
         .expect("admission helper must succeed");
     assert!(
         admitted,
@@ -1928,7 +1928,7 @@ async fn pod_admission_rejects_pod_violating_limit_range_max() {
         }),
         status: None,
     };
-    let admitted = rusternetes_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
+    let admitted = k3rs_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
         .expect("helper returns Ok with bool, not Err");
     assert!(
         !admitted,
@@ -1989,7 +1989,7 @@ async fn pod_admission_rejects_pod_below_limit_range_min() {
         }),
         status: None,
     };
-    let admitted = rusternetes_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
+    let admitted = k3rs_api_server::admission::apply_limit_range_with(&mut pod, &vec![lr])
         .expect("helper returns Ok with bool, not Err");
     assert!(
         !admitted,
@@ -2024,7 +2024,7 @@ async fn pod_admission_passes_when_no_limit_range_present() {
         }),
         status: None,
     };
-    let admitted = rusternetes_api_server::admission::apply_limit_range_with(&mut pod, &vec![])
+    let admitted = k3rs_api_server::admission::apply_limit_range_with(&mut pod, &vec![])
         .expect("no LR present must not surface an error");
     assert!(admitted, "no LRs configured must admit any pod");
     assert!(

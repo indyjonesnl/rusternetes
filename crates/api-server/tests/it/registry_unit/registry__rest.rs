@@ -4,24 +4,24 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use chrono::{Duration, Utc};
-    pub use rusternetes_api_server::registry::metadata::HasMetadata;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_api_server::registry::metadata::HasMetadata;
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::deletion::{DeleteOptions, Preconditions};
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         validate_object_meta, validate_object_meta_update, validate_path_segment_name,
     };
-    pub use rusternetes_common::{Error, Result};
+    pub use k3rs_common::{Error, Result};
     pub use serde::{de::DeserializeOwned, Serialize};
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::rest::*;
-    use rusternetes_common::resources::ConfigMap;
-    use rusternetes_common::validation::field::Error as FieldError;
+    use k3rs_api_server::registry::rest::*;
+    use k3rs_common::resources::ConfigMap;
+    use k3rs_common::validation::field::Error as FieldError;
 
     /// A strategy with no opinions, to exercise the common rules alone.
     struct Plain {

@@ -15,8 +15,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::resources::{ObjectReference, Pod, PodCondition, PodStatus};
-use rusternetes_common::types::Phase;
+use k3rs_common::resources::{ObjectReference, Pod, PodCondition, PodStatus};
+use k3rs_common::types::Phase;
 
 use crate::config::ShutdownGracePeriodByPodPriority;
 
@@ -320,8 +320,8 @@ pub fn new_pod_manager(conf: &Config) -> PodManager {
     let mut by_priority = conf.shutdown_grace_period_by_pod_priority.clone();
 
     // Migration from the original configuration.
-    if !rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::GracefulNodeShutdownBasedOnPodPriority,
+    if !k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::GracefulNodeShutdownBasedOnPodPriority,
     ) || by_priority.is_empty()
     {
         by_priority = migrate_config(
@@ -524,7 +524,7 @@ fn pod_key(pod: &Pod) -> String {
 
 /// `podutil.UpdatePodCondition` (pkg/api/v1/pod/util.go): shared with the
 /// rest of the kubelet.
-pub(crate) use rusternetes_common::podutil::update_pod_condition;
+pub(crate) use k3rs_common::podutil::update_pod_condition;
 
 /// `podutil.CalculatePodConditionObservedGeneration`
 /// (pkg/api/v1/pod/util.go:533-546).
@@ -533,9 +533,7 @@ fn calculate_pod_condition_observed_generation(
     generation: i64,
     condition_type: &str,
 ) -> i64 {
-    if rusternetes_common::feature_gates::gate_enabled("PodObservedGenerationTracking")
-        .unwrap_or(false)
-    {
+    if k3rs_common::feature_gates::gate_enabled("PodObservedGenerationTracking").unwrap_or(false) {
         return generation;
     }
     if let Some(conds) = &status.conditions {

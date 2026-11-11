@@ -15,11 +15,11 @@
 // user scales the deployment to 5. The split must place 3 replicas on the
 // old RS and 4 on the new RS — not the inverse.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, OwnerReference, TypeMeta};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

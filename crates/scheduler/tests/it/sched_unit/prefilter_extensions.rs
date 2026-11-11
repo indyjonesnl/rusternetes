@@ -7,19 +7,17 @@
 //! (interpodaffinity/filtering_test.go) and `TestPreFilterStateAddPod` /
 //! `TestPreFilterStateRemovePod` (podtopologyspread/filtering_test.go).
 use super::listers::EmptyListers;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::default_preemption::{
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::default_preemption::{
     select_victims_on_node, select_victims_on_node_with_state,
 };
-use rusternetes_scheduler::fwk::{
+use k3rs_scheduler::fwk::{
     Code, CycleState, NoHandle, NodeInfo, PreFilterExtensions, PreFilterPlugin,
 };
-use rusternetes_scheduler::in_tree::{InterPodAffinity, PodTopologySpreadFilter};
-use rusternetes_scheduler::inter_pod_affinity_filter::{
-    CountsSnapshot, PreFilterState as IpaState,
-};
-use rusternetes_scheduler::pod_topology_spread_filter::PreFilterState as PtsState;
-use rusternetes_scheduler::profile::Profile;
+use k3rs_scheduler::in_tree::{InterPodAffinity, PodTopologySpreadFilter};
+use k3rs_scheduler::inter_pod_affinity_filter::{CountsSnapshot, PreFilterState as IpaState};
+use k3rs_scheduler::pod_topology_spread_filter::PreFilterState as PtsState;
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -622,10 +620,7 @@ async fn nominated_pods_count_for_inter_pod_affinity() {
 }
 
 fn victim_names(
-    r: Result<
-        rusternetes_scheduler::default_preemption::NodeVictims,
-        rusternetes_scheduler::fwk::Status,
-    >,
+    r: Result<k3rs_scheduler::default_preemption::NodeVictims, k3rs_scheduler::fwk::Status>,
 ) -> Vec<String> {
     r.unwrap_or_else(|s| panic!("{:?}: {}", s.code(), s.message()))
         .victims

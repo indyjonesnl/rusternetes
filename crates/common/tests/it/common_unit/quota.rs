@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use chrono::{DateTime, Duration, Utc};
-    pub use rusternetes_common::label_selector::{LabelOperator, LabelRequirement};
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::label_selector::{LabelOperator, LabelRequirement};
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::resources::{
         ContainerStatus, PersistentVolumeClaim, Pod, PodAffinityTerm, ResourceQuotaSpec,
         ScopedResourceSelectorRequirement,
     };
-    pub use rusternetes_common::types::{Phase, ResourceRequirements};
+    pub use k3rs_common::types::{Phase, ResourceRequirements};
     pub use std::collections::{BTreeMap, BTreeSet, HashMap};
 }
 
@@ -49,8 +49,8 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_common::quota::*;
-    use rusternetes_common::resources::{Container, PodSpec};
+    use k3rs_common::quota::*;
+    use k3rs_common::resources::{Container, PodSpec};
 
     fn q(s: &str) -> Quantity {
         Quantity::parse(s).unwrap_or_else(|e| panic!("parse {s:?}: {e}"))
@@ -600,7 +600,7 @@ mod tests {
     /// Port of upstream `QuotaV1Pod` (`pods.go:491-508`).
     #[test]
     fn test_is_quota_charged() {
-        use rusternetes_common::resources::PodStatus;
+        use k3rs_common::resources::PodStatus;
         let now = DateTime::parse_from_rfc3339("2026-01-01T00:10:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -645,7 +645,7 @@ mod tests {
     /// object-count quota tracks everything in storage (`pods.go:390-397`).
     #[test]
     fn test_pod_usage_count_pods_survives_terminal_phase() {
-        use rusternetes_common::resources::PodStatus;
+        use k3rs_common::resources::PodStatus;
         let now = Utc::now();
         let mut p = pod(vec![container("c1", &[("cpu", "1")], &[])], vec![]);
         let live = pod_usage(&p, now);
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_pod_requests_limits_skip_pod_level_when_gate_off() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let mut p = pod(
             vec![container("c1", &[("cpu", "1")], &[("cpu", "2")])],
             vec![],
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_pod_constraints_not_skipped_when_gate_off() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let mut p = pod(vec![container("c", &[], &[])], vec![]);
         p.spec.as_mut().unwrap().resources = Some(ResourceRequirements {
             requests: Some(raw(&[("cpu", "1")])),
@@ -829,7 +829,7 @@ mod tests {
         spec: serde_json::Value,
         status: serde_json::Value,
         ann: serde_json::Value,
-    ) -> rusternetes_common::resources::PersistentVolumeClaim {
+    ) -> k3rs_common::resources::PersistentVolumeClaim {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "PersistentVolumeClaim",
             "metadata": {"name": "c", "namespace": "ns", "annotations": ann},
@@ -906,11 +906,8 @@ mod tests {
         );
         assert_eq!(s(&pvc_usage(&c), "requests.storage"), "3Gi");
     }
-    fn sel(
-        op: &str,
-        values: &[&str],
-    ) -> rusternetes_common::resources::ScopedResourceSelectorRequirement {
-        rusternetes_common::resources::ScopedResourceSelectorRequirement {
+    fn sel(op: &str, values: &[&str]) -> k3rs_common::resources::ScopedResourceSelectorRequirement {
+        k3rs_common::resources::ScopedResourceSelectorRequirement {
             scope_name: "VolumeAttributesClass".to_string(),
             operator: op.to_string(),
             values: if values.is_empty() {
@@ -931,7 +928,7 @@ mod tests {
             out.push(sel("NotIn", &["class4"]));
             out
         };
-        let none = |c: &rusternetes_common::resources::PersistentVolumeClaim, s: &[_]| {
+        let none = |c: &k3rs_common::resources::PersistentVolumeClaim, s: &[_]| {
             pvc_matching_scopes(c, s).unwrap()
         };
 
@@ -1093,7 +1090,7 @@ mod tests {
     /// `getScopeSelectorsFromQuota` (generic/evaluator.go:171-181).
     #[test]
     fn scope_selectors_from_quota_cases() {
-        let spec: rusternetes_common::resources::ResourceQuotaSpec =
+        let spec: k3rs_common::resources::ResourceQuotaSpec =
             serde_json::from_value(serde_json::json!({
                 "scopes": ["BestEffort"],
                 "scopeSelector": {"matchExpressions": [
@@ -1232,7 +1229,7 @@ mod tests {
         let spec =
             |scopes: &[&str], exprs: Vec<ScopedResourceSelectorRequirement>| ResourceQuotaSpec {
                 scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
-                scope_selector: Some(rusternetes_common::resources::ScopeSelector {
+                scope_selector: Some(k3rs_common::resources::ScopeSelector {
                     match_expressions: exprs,
                 }),
                 ..Default::default()
@@ -1275,7 +1272,7 @@ mod tests {
         infeasible: bool,
     ) -> Pod {
         let mut p = pod(vec![container("c", requests, limits)], vec![]);
-        let mut status = rusternetes_common::resources::PodStatus::default();
+        let mut status = k3rs_common::resources::PodStatus::default();
         if let Some(mut cs) = status_json {
             cs["name"] = serde_json::json!("c");
             status.container_statuses = Some(vec![serde_json::from_value(cs).unwrap()]);
@@ -1299,8 +1296,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_charges_max_of_spec_and_actuated_requests() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             true,
         );
         let p = resized_pod(
@@ -1324,8 +1321,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_status_without_resources_uses_spec() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             true,
         );
         let p = resized_pod(
@@ -1342,8 +1339,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_requests_are_per_resource_max_of_spec_actuated_allocated() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             true,
         );
         let p = resized_pod(
@@ -1370,8 +1367,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_infeasible_resize_ignores_spec_request() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             true,
         );
         let p = resized_pod(
@@ -1400,8 +1397,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_limits_follow_actuated_status() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             true,
         );
         let status = serde_json::json!({"resources": {"limits": {"cpu": "300m"}}});
@@ -1415,8 +1412,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_usage_ignores_status_when_gate_off() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodVerticalScaling,
             false,
         );
         let p = resized_pod(

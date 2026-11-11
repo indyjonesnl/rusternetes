@@ -24,14 +24,14 @@ pub use config::LimitedResource;
 
 use std::collections::{BTreeSet, HashMap};
 
-use rusternetes_common::admission::Operation;
-use rusternetes_common::quota::{self, ResourceList};
-use rusternetes_common::resources::ResourceQuota;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::admission::Operation;
+use k3rs_common::quota::{self, ResourceList};
+use k3rs_common::resources::ResourceQuota;
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use serde_json::Value;
 
-use rusternetes_common::resources::ScopedResourceSelectorRequirement;
+use k3rs_common::resources::ScopedResourceSelectorRequirement;
 
 use self::evaluator::{status_hard_names, Evaluator};
 use crate::registry::rest::GroupResource;

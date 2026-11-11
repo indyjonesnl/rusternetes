@@ -2,7 +2,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: test-storage
-provisioner: rusternetes.io/hostpath
+provisioner: k3rs.io/hostpath
 parameters:
   type: "Directory"
 reclaimPolicy: Delete

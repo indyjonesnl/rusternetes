@@ -1,7 +1,7 @@
-use rusternetes_common::resources::admission_webhook::{
+use k3rs_common::resources::admission_webhook::{
     MutatingWebhookConfiguration, ValidatingWebhookConfiguration,
 };
-use rusternetes_common::validation::webhookconfiguration::{
+use k3rs_common::validation::webhookconfiguration::{
     validate_mutating_webhook_configuration, validate_validating_webhook_configuration,
 };
 use serde_json::json;
@@ -227,7 +227,7 @@ fn unknown_enum_values_round_trip() {
     w["failurePolicy"] = json!("other");
     w["sideEffects"] = json!("weird");
     w["rules"][0]["operations"] = json!(["PATCH"]);
-    let h: rusternetes_common::resources::admission_webhook::ValidatingWebhook =
+    let h: k3rs_common::resources::admission_webhook::ValidatingWebhook =
         serde_json::from_value(w.clone()).unwrap();
     let back = serde_json::to_value(&h).unwrap();
     assert_eq!(back["failurePolicy"], "other");

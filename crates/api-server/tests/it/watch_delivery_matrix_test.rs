@@ -17,8 +17,8 @@
 
 use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::time::timeout;

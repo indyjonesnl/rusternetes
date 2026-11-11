@@ -9,12 +9,12 @@
 //! decoded once, before the registry, in
 //! `endpoints/handlers/delete.go:86`.
 //!
-//! Rusternetes had neither property. Only 8 of ~50 delete handlers passed a
+//! k3rs had neither property. Only 8 of ~50 delete handlers passed a
 //! propagation policy at all, and only the pod handler read the request body —
 //! so `kubectl delete configmap --cascade=orphan` was silently a Background
 //! delete. Any object can be an owner, so that is wrong for every kind.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 /// Create an object, DELETE it with the given DeleteOptions **body**, and

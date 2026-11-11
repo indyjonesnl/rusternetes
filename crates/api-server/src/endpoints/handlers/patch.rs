@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::Response;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::validation::field::{Error as FieldError, Path};
-use rusternetes_common::validation::metav1::{
+use k3rs_common::auth::UserInfo;
+use k3rs_common::validation::field::{Error as FieldError, Path};
+use k3rs_common::validation::metav1::{
     validate_patch_options, PatchOptions, APPLY_YAML_PATCH_TYPE,
 };
-use rusternetes_common::{Error, Result};
+use k3rs_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation, MutatingAdmission, UpdateValidation};
 use super::rest::{
@@ -458,7 +458,7 @@ pub fn checked_patch_options(
         field_manager: params.get("fieldManager").cloned(),
         force: params
             .get("force")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+            .map(|v| k3rs_common::query::k8s_query_bool(v)),
         dry_run: dry_run_param(params),
         field_validation: params.get("fieldValidation").cloned(),
     };
@@ -496,7 +496,7 @@ fn patch_error(e: crate::patch::PatchError, patch_type: &PatchType) -> Error {
         (PatchType::JsonPatch, PatchError::DecodeFailed(msg)) => Error::BadRequest(msg),
         // patch.go:405-411, :408 `NewRequestEntityTooLargeError`.
         (_, PatchError::RequestEntityTooLarge(msg)) => {
-            Error::Status(Box::new(rusternetes_common::types::Status::failure(
+            Error::Status(Box::new(k3rs_common::types::Status::failure(
                 format!("Request entity too large: {msg}"),
                 "RequestEntityTooLarge",
                 413,

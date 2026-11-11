@@ -14,7 +14,7 @@
 //! enforces that exactly one kind is set. This test is the wire-level contract
 //! for that port: one row per rule, asserted against the error a client reads.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn containers() -> Value {
@@ -187,13 +187,13 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 #[serial_test::serial]
 async fn every_bad_volume_source_answers_422_with_a_field_path() {
     // Upstream dropDisabledClusterTrustBundleProjection (pkg/api/pod/util.go:1437) drops the projection while the gate (off in 1.35) is off, so validation only sees it with the gate on.
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundleProjection,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::ClusterTrustBundleProjection,
         true,
     );
     // Same for the podCertificate projection under PodCertificateRequest.
-    let _pod_certificate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    let _pod_certificate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
         true,
     );
     let api = TestApiServer::new();

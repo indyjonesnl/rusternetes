@@ -25,10 +25,8 @@
 //! Transition rules (CEL rules whose source references `oldSelf`) are
 //! *never* ratcheted — they are inherently update-only constraints.
 
-use rusternetes_common::resources::crd::{
-    JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
-};
-use rusternetes_common::schema_validation::PathSeg;
+use k3rs_common::resources::crd::{JSONSchemaProps, JSONSchemaPropsOrArray, JSONSchemaPropsOrBool};
+use k3rs_common::schema_validation::PathSeg;
 use serde_json::Value;
 
 /// Resolve a path against the schema/old/new triple, returning the correlated

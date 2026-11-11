@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::ControllerRevision;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::ControllerRevision;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
         validate_object_meta, validate_object_meta_update,
     };
@@ -12,7 +12,7 @@ mod __parent {
 
 mod update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::controllerrevision::*;
+    use k3rs_common::validation::controllerrevision::*;
 
     fn cr(rev: i64, data: serde_json::Value) -> ControllerRevision {
         serde_json::from_value(serde_json::json!({

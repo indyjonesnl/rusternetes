@@ -7,12 +7,12 @@
 //! controller runs against `MemoryStorage` through its reflector, so the
 //! `run()` tests drive the real list+watch -> store -> queue -> sync path.
 use chrono::{DateTime, Duration, Utc};
-use rusternetes_client::reflector::StoreEvent;
-use rusternetes_common::resources::workloads::Job;
-use rusternetes_controller_manager::controllers::ttl_after_finished::*;
-use rusternetes_controller_manager::controllers::worker_pool::test_support::template;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::{build_key, Preconditions, Storage};
+use k3rs_client::reflector::StoreEvent;
+use k3rs_common::resources::workloads::Job;
+use k3rs_controller_manager::controllers::ttl_after_finished::*;
+use k3rs_controller_manager::controllers::worker_pool::test_support::template;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::{build_key, Preconditions, Storage};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;
@@ -304,10 +304,7 @@ async fn foreground_delete_honours_the_uid_precondition() {
         .delete_foreground_with_preconditions(&key, &Preconditions::new_uid("someone-else"))
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
-        "{err}"
-    );
+    assert!(matches!(err, k3rs_common::Error::Conflict(_)), "{err}");
     assert!(!is_foreground_deleting(&get_job(&s, "j").await.unwrap()));
 
     s.delete_foreground_with_preconditions(&key, &Preconditions::new_uid("uid-j"))

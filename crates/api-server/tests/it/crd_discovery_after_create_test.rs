@@ -11,7 +11,7 @@
 //! discovery / the RESTMapper before listing it.
 //!
 //! Upstream apiextensions-apiserver registers a CRD's API group/version/resource
-//! dynamically the moment the CRD is created. Rusternetes synthesizes the same
+//! dynamically the moment the CRD is created. k3rs synthesizes the same
 //! discovery documents on-read from stored CRDs. These tests assert every
 //! discovery surface a client-go RESTMapper touches reflects the CRD right
 //! after `POST`:
@@ -27,7 +27,7 @@
 //! Harness mirrors `tests/conformance_apimachinery_crd_lifecycle.rs`.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn spawn_router() -> TestApiServer {
@@ -198,7 +198,7 @@ async fn crd_is_served_and_discoverable_immediately_after_create() {
     assert_eq!(
         res.get("storageVersionHash").and_then(|k| k.as_str()),
         Some(
-            rusternetes_common::resource_encoding::storage_version_hash::storage_version_hash(
+            k3rs_common::resource_encoding::storage_version_hash::storage_version_hash(
                 group, "v1", "Example"
             )
             .as_str()

@@ -3,10 +3,10 @@
 
 mod __parent {
     pub use ipnet::IpNet;
+    pub use k3rs_common::resources::{IPAddress, IPAddressSpec, ParentReference, Service};
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{build_key, Storage};
     pub use rand::Rng;
-    pub use rusternetes_common::resources::{IPAddress, IPAddressSpec, ParentReference, Service};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{build_key, Storage};
     pub use std::collections::{HashMap, HashSet};
     pub use std::fmt;
     pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -18,10 +18,10 @@ mod tests {
     //! Ports of ipallocator_test.go and cidrallocator_test.go.
 
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::ipallocator::cidr::MetaAllocator;
-    use rusternetes_api_server::registry::core::service::ipallocator::*;
-    use rusternetes_common::resources::ServiceCIDR;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::registry::core::service::ipallocator::cidr::MetaAllocator;
+    use k3rs_api_server::registry::core::service::ipallocator::*;
+    use k3rs_common::resources::ServiceCIDR;
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashSet;
 
     fn allocator(cidr: &str) -> Allocator<MemoryStorage> {
@@ -389,8 +389,8 @@ mod tests {
 
         let key = build_key("servicecidrs", None, "test");
         let mut sc: ServiceCIDR = storage.get(&key).await.unwrap();
-        sc.status = Some(rusternetes_common::resources::ServiceCIDRStatus {
-            conditions: Some(vec![rusternetes_common::resources::ServiceCIDRCondition {
+        sc.status = Some(k3rs_common::resources::ServiceCIDRStatus {
+            conditions: Some(vec![k3rs_common::resources::ServiceCIDRCondition {
                 condition_type: "Ready".to_string(),
                 status: "False".to_string(),
                 observed_generation: None,

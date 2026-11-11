@@ -1,4 +1,4 @@
-# Shared CRI runtime for the rusternetes cluster: containerd (with the CRI
+# Shared CRI runtime for the k3rs cluster: containerd (with the CRI
 # plugin) driving crun as the OCI runtime. The kubelets talk to this over CRI
 # v1 instead of the Docker/Podman socket the old bollard kubelet used.
 FROM debian:sid-slim
@@ -38,7 +38,7 @@ RUN mkdir -p /opt/cni/bin \
 RUN ln -sf "$(command -v crun)" /usr/local/sbin/runc
 
 COPY deploy/containerd/config.toml /etc/containerd/config.toml
-COPY deploy/containerd/cni/10-rusternetes.conflist /etc/cni/net.d/10-rusternetes.conflist
+COPY deploy/containerd/cni/10-k3rs.conflist /etc/cni/net.d/10-k3rs.conflist
 COPY deploy/containerd/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

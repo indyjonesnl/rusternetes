@@ -6,14 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::deletion::DeleteOptions;
-use rusternetes_common::resources::PriorityClass;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::priorityclass::{
+use k3rs_common::deletion::DeleteOptions;
+use k3rs_common::resources::PriorityClass;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::priorityclass::{
     validate_priority_class, validate_priority_class_update,
 };
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::{Error, Result};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
 use crate::registry::rest::{

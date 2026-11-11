@@ -1,9 +1,9 @@
 //! Kubernetes release-1.35 networking validation regressions.
 //! Upstream pkg/apis/networking/validation/validation_test.go:611,989,1240,2220.
 
-use rusternetes_common::resources::ingress::Ingress;
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::ingress::{
+use k3rs_common::resources::ingress::Ingress;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::ingress::{
     validate_ingress, validate_ingress_status_update, validate_ingress_update,
 };
 use serde_json::{json, Value};
@@ -376,7 +376,7 @@ fn ingress_explicit_empty_path_type_is_unsupported() {
 /// use ParseIPSloppy, including long leading-zero octets and IPv6 tails.
 #[test]
 fn ingress_status_ip_warnings_preserve_sloppy_parsing() {
-    use rusternetes_common::validation::metav1::get_warnings_for_ip;
+    use k3rs_common::validation::metav1::get_warnings_for_ip;
     for value in ["00010.0000.0000.0001", "::ffff:00010.0000.0000.0001"] {
         assert_eq!(
             get_warnings_for_ip("status.loadBalancer.ingress[0]", value),

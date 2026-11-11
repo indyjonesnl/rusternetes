@@ -1,4 +1,4 @@
-# Multi-stage build for Rusternetes components
+# Multi-stage build for k3rs components
 # This Dockerfile can build any component by specifying --build-arg COMPONENT=<name>
 
 FROM rust:latest AS builder

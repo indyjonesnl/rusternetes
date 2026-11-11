@@ -10,19 +10,19 @@
 use std::sync::Arc;
 
 use chrono::{SecondsFormat, Utc};
-use rusternetes_common::resources::certificates::CertificateSigningRequestCondition;
-use rusternetes_common::resources::{CertificateSigningRequest, CertificateSigningRequestStatus};
-use rusternetes_common::validation::certificatesigningrequest::{
+use k3rs_common::resources::certificates::CertificateSigningRequestCondition;
+use k3rs_common::resources::{CertificateSigningRequest, CertificateSigningRequestStatus};
+use k3rs_common::validation::certificatesigningrequest::{
     validate_certificate_signing_request_approval_update,
     validate_certificate_signing_request_create,
     validate_certificate_signing_request_status_update,
     validate_certificate_signing_request_update_main,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_unconstrained, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

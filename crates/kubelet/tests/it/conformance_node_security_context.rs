@@ -8,8 +8,8 @@
 // fields that kubelet forwards to the CRI runtime. The `privileged`
 // surface is covered in `conformance_node_privileged.rs`.
 
-use rusternetes_common::resources::pod::PodSecurityContext;
-use rusternetes_common::resources::{Capabilities, Container, SeccompProfile, SecurityContext};
+use k3rs_common::resources::pod::PodSecurityContext;
+use k3rs_common::resources::{Capabilities, Container, SeccompProfile, SecurityContext};
 
 fn empty_sc() -> SecurityContext {
     SecurityContext {

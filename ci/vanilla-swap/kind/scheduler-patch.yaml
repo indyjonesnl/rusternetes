@@ -1,14 +1,14 @@
-# Static-pod swap recipe: kube-scheduler -> rusternetes scheduler (API mode).
+# Static-pod swap recipe: kube-scheduler -> k3rs scheduler (API mode).
 #
 # Consumed by vs_swap_static_pod() in scripts/vanilla-swap-common.sh. When a
 # recipe carries a `template:` block, the swap REPLACES the whole static-pod
 # manifest (not just the image): it renders the VS_IMAGE template variable
 # with vs_render_recipe_template and writes it to
 # /etc/kubernetes/manifests/<manifest> inside the control-plane
-# node, so the node kubelet restarts that one static pod as the rusternetes
+# node, so the node kubelet restarts that one static pod as the k3rs
 # scheduler. Everything else in the control plane stays unmodified upstream.
 #
-# The rusternetes scheduler runs in API mode (reads pods/nodes informers, writes
+# The k3rs scheduler runs in API mode (reads pods/nodes informers, writes
 # via the binding subresource + status + events) using the kubeconfig kubeadm
 # already mounts on the node (/etc/kubernetes/scheduler.conf, client-cert auth as
 # system:kube-scheduler). API mode does no leader election, so readiness is
@@ -24,7 +24,7 @@ template: |
     labels:
       component: kube-scheduler
       tier: control-plane
-      rusternetes.io/module-under-test: scheduler
+      k3rs.io/module-under-test: scheduler
   spec:
     hostNetwork: true
     priorityClassName: system-node-critical

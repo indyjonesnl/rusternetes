@@ -13,7 +13,7 @@ spec:
         echo "Listing files in /host-data:"
         ls -la /host-data/
         echo "Writing test file..."
-        echo "Created by hostpath-test pod at $(date)" > /host-data/rusternetes-test.txt
+        echo "Created by hostpath-test pod at $(date)" > /host-data/k3rs-test.txt
         echo "File created successfully"
         sleep 3600
     volumeMounts:
@@ -22,5 +22,5 @@ spec:
   volumes:
   - name: host-volume
     hostPath:
-      path: /tmp/rusternetes-hostpath-test
+      path: /tmp/k3rs-hostpath-test
       type: DirectoryOrCreate

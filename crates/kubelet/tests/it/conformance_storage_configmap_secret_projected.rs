@@ -35,13 +35,13 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ConfigMap, ConfigMapProjection, ConfigMapVolumeSource, Pod, ProjectedVolumeSource, Secret,
     SecretProjection, SecretVolumeSource, Volume, VolumeProjection,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::volumes::VolumeManager;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::volumes::VolumeManager;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ impl Node {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             root.path().to_string_lossy().to_string(),
             Some(api.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         Self {
             _root: root,
@@ -603,7 +603,7 @@ async fn secret_volume_should_be_consumable_as_non_root_with_defaultmode_and_fsg
     // supplementary GID so the non-root reader joins the file's group.
     let p = pod("ns", "p", json!([]), fs_group(2000));
     assert_eq!(
-        rusternetes_kubelet::runtime::compute_group_add(&p),
+        k3rs_kubelet::runtime::compute_group_add(&p),
         Some(vec!["2000".to_string()])
     );
 }
@@ -1002,7 +1002,7 @@ async fn projected_secret_should_be_consumable_as_non_root_with_defaultmode_and_
     do_projected_secret_without_mapping(Some(0o440), true).await;
     let p = pod("ns", "p", json!([]), fs_group(2000));
     assert_eq!(
-        rusternetes_kubelet::runtime::compute_group_add(&p),
+        k3rs_kubelet::runtime::compute_group_add(&p),
         Some(vec!["2000".to_string()])
     );
 }
@@ -1351,7 +1351,7 @@ async fn projected_combined_should_project_all_components_into_same_directory() 
 // ===========================================================================
 
 fn make_pod_with_volumes(name: &str, namespace: &str, volumes: Vec<Volume>) -> Pod {
-    let mut spec = rusternetes_common::resources::PodSpec {
+    let mut spec = k3rs_common::resources::PodSpec {
         containers: Vec::new(),
         volumes: Some(volumes),
         ..Default::default()

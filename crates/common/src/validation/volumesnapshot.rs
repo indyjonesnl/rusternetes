@@ -11,7 +11,7 @@
 //! reproduced verbatim so a client sees what it would see against a real
 //! external-snapshotter install.
 //!
-//! Rusternetes serves these two natively rather than through the CRD machinery
+//! k3rs serves these two natively rather than through the CRD machinery
 //! (`router.rs`, `/apis/snapshot.storage.k8s.io/v1/...`), so nothing else
 //! applies the schema — without this, a `VolumeSnapshot` with no `spec.source`
 //! at all was written.

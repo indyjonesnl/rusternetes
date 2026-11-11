@@ -11,16 +11,16 @@
 
 use axum::http::StatusCode;
 use base64::Engine;
-use rusternetes_common::{
+use k3rs_common::{
     admission::{AdmissionReview, AdmissionReviewResponse, PatchOp, PatchOperation},
     resources::{
         FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
         RuleWithOperations, SideEffectClass, WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
+use k3rs_test_support::mock_http::*;
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -131,7 +131,7 @@ async fn a_key_a_webhook_adds_outside_the_schema_is_pruned_before_storage() {
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "MutatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mutate-widgets"),
+        metadata: k3rs_common::types::ObjectMeta::new("mutate-widgets"),
         webhooks: Some(vec![
             webhook("stage-1.widgets.io", url1),
             webhook("stage-2.widgets.io", url2),

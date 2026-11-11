@@ -32,9 +32,9 @@ use crate::controllers::podgc_metrics as metrics;
 use crate::controllers::taint_eviction::update_pod_condition;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rusternetes_common::resources::{Node, Pod, PodCondition};
-use rusternetes_common::types::Phase;
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::resources::{Node, Pod, PodCondition};
+use k3rs_common::types::Phase;
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -63,7 +63,7 @@ pub struct PodGcController<S: Storage> {
     /// `nodeQueue`: node name -> time it becomes ready for a live check.
     pub node_queue: Mutex<HashMap<String, DateTime<Utc>>>,
     /// Test seam standing in for the fake clientset's recorded actions.
-    pub patched: Mutex<Vec<(String, rusternetes_common::resources::PodStatus)>>,
+    pub patched: Mutex<Vec<(String, k3rs_common::resources::PodStatus)>>,
     pub deleted: Mutex<Vec<String>>,
     /// The controller talks to the storage backend directly (no api-server in
     /// the path), so the pod DELETE has to be emulated; see
@@ -331,7 +331,7 @@ impl<S: Storage + 'static> PodGcController<S> {
             .await
         {
             Ok(_) => Ok(true),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(false),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }
@@ -439,7 +439,7 @@ impl<S: Storage + 'static> PodGcController<S> {
         &self,
         pod: &Pod,
         key: &str,
-        new_status: rusternetes_common::resources::PodStatus,
+        new_status: k3rs_common::resources::PodStatus,
     ) -> Result<()> {
         let mut current: Pod = self
             .storage

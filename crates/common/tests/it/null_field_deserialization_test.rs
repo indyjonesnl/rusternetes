@@ -12,10 +12,8 @@
 //   ff43065  Fix #212: EndpointSlice ports field accepts null
 //   402d503  Fix CSINode null drivers + ResourceQuota status route
 
-use rusternetes_common::resources::{
-    CSINodeSpec, EndpointAddress, EndpointSlice, TokenRequestSpec,
-};
-use rusternetes_common::types::ObjectMeta;
+use k3rs_common::resources::{CSINodeSpec, EndpointAddress, EndpointSlice, TokenRequestSpec};
+use k3rs_common::types::ObjectMeta;
 use serde_json::json;
 
 // ---------------------------------------------------------------------------

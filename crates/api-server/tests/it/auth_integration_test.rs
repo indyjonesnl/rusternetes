@@ -4,7 +4,7 @@
 /// 1. Token generation and validation
 /// 2. RBAC permission checking
 /// 3. HTTP status codes (401 Unauthorized, 403 Forbidden)
-use rusternetes_common::{
+use k3rs_common::{
     auth::{ServiceAccountClaims, TokenManager, UserInfo},
     authz::{AlwaysAllowAuthorizer, Authorizer, Decision, RequestAttributes},
     resources::rbac::PolicyRule,

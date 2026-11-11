@@ -9,15 +9,15 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::storageversionmigration::{
+use k3rs_common::resources::storageversionmigration::{
     StorageVersionMigration, StorageVersionMigrationStatus,
 };
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::storageversionmigration::{
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::storageversionmigration::{
     validate_storage_version_migration, validate_storage_version_migration_status_update,
     validate_storage_version_migration_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

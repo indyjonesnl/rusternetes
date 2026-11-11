@@ -3,9 +3,9 @@
 //! Mirrors upstream `ValidateResourceQuotaSpec`
 //! (`pkg/apis/core/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::policy::ResourceQuota;
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::resourcequota::validate_resource_quota;
+use k3rs_common::resources::policy::ResourceQuota;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::resourcequota::validate_resource_quota;
 use serde_json::json;
 
 fn rq(spec: serde_json::Value) -> ResourceQuota {

@@ -4,15 +4,15 @@ use super::replicationcontroller::slow_start_batches_capped;
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::resources::node::Taint;
-use rusternetes_common::resources::pod::Toleration;
-use rusternetes_common::resources::policy::IntOrString;
-use rusternetes_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
-use rusternetes_common::resources::{
+use k3rs_common::resources::node::Taint;
+use k3rs_common::resources::pod::Toleration;
+use k3rs_common::resources::policy::IntOrString;
+use k3rs_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
+use k3rs_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
-use rusternetes_common::types::{label_selector_as_selector, OwnerReference, Phase, Selector};
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::types::{label_selector_as_selector, OwnerReference, Phase, Selector};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,7 +206,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                             .record_created(exp_key, &format!("{}/{}", namespace, pod_name));
                     }
                     Err(e) => {
-                        // Rusternetes deviation: upstream returns without
+                        // k3rs deviation: upstream returns without
                         // lowering for a NamespaceTerminating cause
                         // (:1034-1038); we lower for every failure so the
                         // record never waits out its TTL. AlreadyExists is
@@ -215,7 +215,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                         let text = e.to_string();
                         // Typed `apierrors.IsAlreadyExists` (errors.go:542-544);
                         // upstream pods use generateName so it never branches
-                        // here — a Rusternetes-only benign case (named pods).
+                        // here — a k3rs-only benign case (named pods).
                         if super::is_already_exists_anyhow(&e) {
                             debug!("DaemonSet pod already exists, skipping: {}", text);
                             continue;
@@ -239,7 +239,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let pod_key = build_key("pods", Some(namespace), name);
             if let Err(e) = self.storage.delete_gracefully(&pod_key).await {
                 self.expectations.deletion_observed_of(exp_key, observed);
-                if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                if !matches!(e, k3rs_common::Error::NotFound(_)) {
                     warn!(
                         "Failed to delete DaemonSet pod {}/{}: {}",
                         namespace, name, e
@@ -476,8 +476,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         let template_generation = get_template_generation(daemonset);
 
         // Check if ControllerRevision already exists before creating
-        let cr_key =
-            rusternetes_storage::build_key("controllerrevisions", Some(namespace), &cr_name);
+        let cr_key = k3rs_storage::build_key("controllerrevisions", Some(namespace), &cr_name);
         if self
             .storage
             .get::<ControllerRevision>(&cr_key)
@@ -502,8 +501,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
 
             // Count existing revisions to get the next revision number
-            let cr_prefix =
-                rusternetes_storage::build_prefix("controllerrevisions", Some(namespace));
+            let cr_prefix = k3rs_storage::build_prefix("controllerrevisions", Some(namespace));
             let existing_revisions: Vec<ControllerRevision> =
                 self.storage.list(&cr_prefix).await.unwrap_or_default();
             let max_revision = existing_revisions
@@ -611,10 +609,10 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 // Honour required nodeAffinity from the template. Upstream's
                 // `predicates()` calls
                 // `nodeaffinity.GetRequiredNodeAffinity(pod).Match(node)`; we
-                // reuse `rusternetes_common::affinity::check_node_affinity`,
+                // reuse `k3rs_common::affinity::check_node_affinity`,
                 // which evaluates the same required NodeSelectorTerms.
                 let (node_affinity_ok, _) =
-                    rusternetes_common::affinity::check_node_affinity(node, &candidate_pod);
+                    k3rs_common::affinity::check_node_affinity(node, &candidate_pod);
                 if !node_affinity_ok {
                     debug!(
                         "DaemonSet {}/{}: skipping node {} due to nodeAffinity mismatch",
@@ -625,9 +623,9 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 // Honour required podAntiAffinity: skip a node when an existing
                 // pod in the same topology domain matches the anti-affinity
                 // labelSelector. Reuses
-                // `rusternetes_common::affinity::check_pod_anti_affinity`
+                // `k3rs_common::affinity::check_pod_anti_affinity`
                 // (interpodaffinity predicate parity).
-                let (anti_affinity_ok, _) = rusternetes_common::affinity::check_pod_anti_affinity(
+                let (anti_affinity_ok, _) = k3rs_common::affinity::check_pod_anti_affinity(
                     node,
                     &candidate_pod,
                     &ns_pods,
@@ -667,7 +665,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         let pod_prefix = format!("/registry/pods/{}/", namespace);
         let all_pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
 
-        // Rusternetes deviation (no upstream equivalent; same intent as the
+        // k3rs deviation (no upstream equivalent; same intent as the
         // ReplicaSet controller's settle-from-observation step): a pod this
         // DaemonSet is still waiting to see deleted that the fresh listing
         // already shows gone or terminating HAS been deleted, so settle that
@@ -684,7 +682,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                 {
                     self.observe_creation(&exp_key, &pending);
                 } else {
-                    // Rusternetes deviation: upstream settles a creation from
+                    // k3rs deviation: upstream settles a creation from
                     // the pod informer's add event (`addPod` ->
                     // `CreationObserved`, daemon_controller.go:~360), which
                     // fires even if the pod is deleted right after (a Failed
@@ -698,7 +696,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     let pod_key = build_key("pods", Some(namespace), name);
                     if matches!(
                         self.storage.get::<Pod>(&pod_key).await,
-                        Err(rusternetes_common::Error::NotFound(_))
+                        Err(k3rs_common::Error::NotFound(_))
                     ) {
                         self.observe_creation(&exp_key, &pending);
                     }
@@ -1095,7 +1093,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     async fn delete_owned_pods(&self, daemonset: &DaemonSet) -> Result<()> {
         let ns = daemonset.metadata.namespace.as_deref().unwrap_or("default");
         let ds_name = &daemonset.metadata.name;
-        let pod_prefix = rusternetes_storage::build_prefix("pods", Some(ns));
+        let pod_prefix = k3rs_storage::build_prefix("pods", Some(ns));
         let pods: Vec<Pod> = self.storage.list(&pod_prefix).await?;
 
         for pod in &pods {
@@ -1121,7 +1119,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
 
     /// Garbage-collect ControllerRevisions owned by this DaemonSet that exceed
     /// `spec.revisionHistoryLimit`. Mirrors upstream `cleanupHistory`
-    /// (pkg/controller/daemon/update.go) with one rusternetes refinement: the
+    /// (pkg/controller/daemon/update.go) with one k3rs refinement: the
     /// limit caps the *total* number of retained revisions (current included),
     /// matching the controller-level contract our tests assert.
     ///
@@ -1146,7 +1144,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             None => return,
         };
 
-        let cr_prefix = rusternetes_storage::build_prefix("controllerrevisions", Some(namespace));
+        let cr_prefix = k3rs_storage::build_prefix("controllerrevisions", Some(namespace));
         let mut owned: Vec<ControllerRevision> = match self.storage.list(&cr_prefix).await {
             Ok(list) => list
                 .into_iter()
@@ -1223,7 +1221,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
                     continue;
                 }
             }
-            let cr_key = rusternetes_storage::build_key(
+            let cr_key = k3rs_storage::build_key(
                 "controllerrevisions",
                 Some(namespace),
                 &revision.metadata.name,
@@ -1367,7 +1365,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         // DefaultTolerationSeconds admission (#442): controllers write pods
         // straight to storage and bypass the api-server admission path that adds
         // these, so apply the same NotReady/Unreachable NoExecute tolerations.
-        rusternetes_common::tolerations::add_default_tolerations(&mut spec);
+        k3rs_common::tolerations::add_default_tolerations(&mut spec);
 
         // Debug: Check again after injection
         debug!("After injection - Checking environment variables:");
@@ -1393,7 +1391,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             }
         }
 
-        let mut metadata = rusternetes_common::types::ObjectMeta::new(pod_name.clone())
+        let mut metadata = k3rs_common::types::ObjectMeta::new(pod_name.clone())
             .with_namespace(namespace.to_string())
             .with_labels(labels)
             .with_owner_reference(OwnerReference {
@@ -1412,7 +1410,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         }
 
         let mut pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1454,7 +1452,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             let key = format!("/registry/pods/{}/{}", namespace, pod_name);
             match self.storage.create(&key, &pod).await {
                 Ok(_) => return Ok(pod_name),
-                Err(rusternetes_common::Error::AlreadyExists(_)) if attempt < attempts => {
+                Err(k3rs_common::Error::AlreadyExists(_)) if attempt < attempts => {
                     attempt += 1;
                     pod_name = next_name();
                     pod.metadata.name = pod_name.clone();
@@ -1473,14 +1471,14 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// (LegacyServiceAccountTokenNoAutoGeneration).
     async fn inject_service_account_token(
         &self,
-        spec: &mut rusternetes_common::resources::PodSpec,
+        spec: &mut k3rs_common::resources::PodSpec,
         namespace: &str,
     ) {
-        let sa_name = rusternetes_common::serviceaccount::ensure_service_account_name(spec);
+        let sa_name = k3rs_common::serviceaccount::ensure_service_account_name(spec);
         let sa_key = format!("/registry/serviceaccounts/{}/{}", namespace, sa_name);
         let sa_automount = self
             .storage
-            .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+            .get::<k3rs_common::resources::ServiceAccount>(&sa_key)
             .await
             .ok()
             .and_then(|sa| sa.automount_service_account_token);
@@ -1489,7 +1487,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             None => sa_automount.unwrap_or(true),
         };
         if should_mount {
-            rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
+            k3rs_common::serviceaccount::add_kube_api_access_volume(spec);
         }
     }
 
@@ -1511,7 +1509,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
             })
             .unwrap_or_default();
         Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -1524,7 +1522,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// Compute template hash matching K8s's controller.ComputeHash.
     /// K8s uses FNV-32a hash of DeepHashObject of the template.
     /// We approximate this with FNV-32a of the JSON-serialized template.
-    fn compute_template_hash(template: &rusternetes_common::resources::PodTemplateSpec) -> String {
+    fn compute_template_hash(template: &k3rs_common::resources::PodTemplateSpec) -> String {
         use std::hash::Hasher;
         let value = serde_json::to_value(template).unwrap_or_default();
         let serialized = serde_json::to_string(&value).unwrap_or_default();
@@ -1552,7 +1550,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// 2. Strip zero-value fields (empty strings, false bools, 0 ints, empty
     ///    arrays/maps, nulls) that Go's omitempty would drop
     pub fn build_patch_data(
-        template: &rusternetes_common::resources::PodTemplateSpec,
+        template: &k3rs_common::resources::PodTemplateSpec,
     ) -> Option<serde_json::Value> {
         let mut template_value = serde_json::to_value(template).ok()?;
         // Strip Go-omitempty zero values BEFORE adding $patch marker.
@@ -1652,7 +1650,7 @@ impl<S: Storage + 'static> DaemonSetController<S> {
     /// `bool`/`int*`; a `*bool`/`*int*` is omitted only when nil, so an
     /// explicit 0/false is kept (`TerminationGracePeriodSeconds *int64`
     /// types.go:2749, `RunAsUser *int64` :4826, `Privileged *bool` :8197).
-    /// Rusternetes serializes `None` as an absent key, so any zero scalar
+    /// k3rs serializes `None` as an absent key, so any zero scalar
     /// that is present is an explicit pointer value unless its key is one of
     /// the plain `omitempty` scalars below. Strings/arrays/maps/objects keep
     /// the previous behaviour (out of scope for #2954).

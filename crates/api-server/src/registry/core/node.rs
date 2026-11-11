@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::resources::Node;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::ipaddress::get_warnings_for_cidr;
-use rusternetes_common::validation::node::{validate_node, validate_node_update};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::resources::Node;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::ipaddress::get_warnings_for_cidr;
+use k3rs_common::validation::node::{validate_node, validate_node_update};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

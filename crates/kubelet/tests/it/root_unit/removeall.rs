@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::pod_dirs::is_likely_not_mount_point;
+    pub use k3rs_kubelet::pod_dirs::is_likely_not_mount_point;
     pub use std::io;
     pub use std::path::Path;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::removeall::*;
+    use k3rs_kubelet::removeall::*;
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("rn-removeall-{}-{tag}", std::process::id()));

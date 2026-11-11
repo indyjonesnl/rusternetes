@@ -5,7 +5,7 @@ mod __parent {}
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::query::*;
+    use k3rs_common::query::*;
 
     #[test]
     fn only_zero_and_false_are_false() {

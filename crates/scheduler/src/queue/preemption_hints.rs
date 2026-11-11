@@ -6,7 +6,7 @@
 //! (`:158-168`). Upstream has no unit test for either.
 
 use super::events::*;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 
 /// `isPodSchedulableAfterPodDeletion` (`default_preemption.go:158-168`):
 /// always `QueueSkip`. Pods rejected by DefaultPreemption (PreEnqueue, async

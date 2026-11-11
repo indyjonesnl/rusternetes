@@ -1,5 +1,5 @@
-use rusternetes_common::resources::ipaddress::IPAddress;
-use rusternetes_common::validation::ipaddress::validate_ip_address;
+use k3rs_common::resources::ipaddress::IPAddress;
+use k3rs_common::validation::ipaddress::validate_ip_address;
 use serde_json::json;
 
 fn ip(parent_ref: serde_json::Value) -> IPAddress {
@@ -105,7 +105,7 @@ fn name_must_be_canonical_ip() {
 /// ValidateIPAddressUpdate (validation.go:812-817): parentRef is immutable.
 #[test]
 fn update_parent_ref_is_immutable() {
-    use rusternetes_common::validation::ipaddress::validate_ip_address_update;
+    use k3rs_common::validation::ipaddress::validate_ip_address_update;
     let mut old = named("10.0.0.1");
     old.metadata.resource_version = Some("1".to_string());
     assert!(validate_ip_address_update(&old, &old).is_empty());

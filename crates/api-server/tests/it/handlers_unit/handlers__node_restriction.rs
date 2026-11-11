@@ -2,31 +2,31 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-    pub use rusternetes_common::csi_translation::CsiTranslator;
-    pub use rusternetes_common::resources::csi::CSIDriver;
-    pub use rusternetes_common::resources::pod::Volume;
-    pub use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+    pub use k3rs_common::csi_translation::CsiTranslator;
+    pub use k3rs_common::resources::csi::CSIDriver;
+    pub use k3rs_common::resources::pod::Volume;
+    pub use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+    pub use k3rs_common::resources::{
         Node, PersistentVolume, PersistentVolumeClaim, Pod, ServiceAccount, TokenRequest,
     };
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_middleware::AuthContext;
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_middleware::AuthContext;
 }
 
 /// Ports of the `serviceaccounts/token` rows of `TestAdmit`
 /// (`plugin/pkg/admission/noderestriction/admission_test.go:1342-1520`).
 mod service_account_token_tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::node_restriction::*;
-    use rusternetes_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer};
-    use rusternetes_storage::{MemoryStorage, Storage};
+    use k3rs_api_server::handlers::node_restriction::*;
+    use k3rs_common::authz::{AlwaysAllowAuthorizer, AlwaysDenyAuthorizer};
+    use k3rs_storage::{MemoryStorage, Storage};
     use serde_json::{json, Value};
 
     fn user(name: &str, groups: &[&str]) -> AuthContext {
         AuthContext {
-            user: rusternetes_common::auth::UserInfo {
+            user: k3rs_common::auth::UserInfo {
                 username: name.to_string(),
                 uid: String::new(),
                 groups: groups.iter().map(|g| g.to_string()).collect(),
@@ -49,7 +49,7 @@ mod service_account_token_tests {
         v: Value,
     ) {
         let obj: T = serde_json::from_value(v).unwrap();
-        s.create(&rusternetes_storage::build_key(resource, ns, name), &obj)
+        s.create(&k3rs_storage::build_key(resource, ns, name), &obj)
             .await
             .unwrap();
     }

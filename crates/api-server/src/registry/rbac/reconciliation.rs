@@ -7,8 +7,8 @@
 //! additive path is ported; the objects are handled as JSON so fields this
 //! crate does not model survive the round trip.
 
-use rusternetes_common::resources::rbac::{PolicyRule, Subject};
-use rusternetes_common::types::LabelSelector;
+use k3rs_common::resources::rbac::{PolicyRule, Subject};
+use k3rs_common::types::LabelSelector;
 use serde_json::{Map, Value};
 
 use super::policy_comparator::covers;

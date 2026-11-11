@@ -1,9 +1,9 @@
 use anyhow::Result;
 use futures::StreamExt;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use rusternetes_common::resources::{Namespace, Secret, ServiceAccount};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::{Namespace, Secret, ServiceAccount};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,8 +59,8 @@ struct LegacyTokenClaims<'a> {
 /// (pkg/controller/serviceaccount/serviceaccounts_controller.go), which
 /// enqueue the namespace name; there is no DeleteFunc, so deletions map to
 /// nothing.
-pub fn namespace_event_key(ev: &rusternetes_storage::WatchEvent) -> Option<String> {
-    use rusternetes_storage::WatchEvent;
+pub fn namespace_event_key(ev: &k3rs_storage::WatchEvent) -> Option<String> {
+    use k3rs_storage::WatchEvent;
     if matches!(ev, WatchEvent::Deleted(..)) {
         return None;
     }
@@ -119,11 +119,11 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
 
     /// Load the RSA private key for signing ServiceAccount tokens
     /// Looks for the key at SA_SIGNING_KEY_PATH environment variable
-    /// or defaults to ~/.rusternetes/keys/sa-signing-key.pem
+    /// or defaults to ~/.k3rs/keys/sa-signing-key.pem
     fn load_signing_key() -> Option<EncodingKey> {
         let key_path = std::env::var("SA_SIGNING_KEY_PATH").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            format!("{}/.rusternetes/keys/sa-signing-key.pem", home)
+            format!("{}/.k3rs/keys/sa-signing-key.pem", home)
         });
 
         match std::fs::read(&key_path) {
@@ -263,9 +263,9 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         &self,
         list_rev: i64,
     ) -> Result<(
-        rusternetes_storage::WatchStream,
-        rusternetes_storage::WatchStream,
-        rusternetes_storage::WatchStream,
+        k3rs_storage::WatchStream,
+        k3rs_storage::WatchStream,
+        k3rs_storage::WatchStream,
     )> {
         let from = list_rev + 1;
         let sa = self
@@ -430,7 +430,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 );
                 return Ok(());
             }
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 // ServiceAccount doesn't exist, create it
             }
             Err(e) => return Err(e.into()),
@@ -467,7 +467,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
 
         match self.storage.create(&sa_key, &service_account).await {
             Ok(_) => {}
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
+            Err(k3rs_common::Error::AlreadyExists(_)) => {
                 // Another reconciliation created it — this is fine
                 debug!(
                     "Default ServiceAccount already exists in namespace {}",
@@ -495,7 +495,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         // If we have a signing key, generate a proper JWT
         if let Some(ref signing_key) = self.signing_key {
             let claims = LegacyTokenClaims {
-                iss: rusternetes_common::auth::LEGACY_ISSUER,
+                iss: k3rs_common::auth::LEGACY_ISSUER,
                 sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
                 service_account_name: sa_name,
                 service_account_uid: sa_uid,
@@ -522,7 +522,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 namespace, sa_name
             );
             Ok(format!(
-                "rusternetes-sa-{}-{}-token-{}",
+                "k3rs-sa-{}-{}-token-{}",
                 namespace, sa_name, sa_uid
             ))
         }
@@ -548,7 +548,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             // A deleted token only has its reference removed from the
             // ServiceAccount's secrets list (`syncSecret`, secret == nil,
             // tokens_controller.go:295-304).
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 return self.sync_deleted_token(namespace, name).await;
             }
             Err(e) => return Err(e.into()),
@@ -574,7 +574,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         let sa: Option<ServiceAccount> = match self.storage.get::<ServiceAccount>(&sa_key).await {
             Ok(sa) if want_uid.is_empty() || want_uid == sa.metadata.uid => Some(sa),
             Ok(_) => None,
-            Err(rusternetes_common::Error::NotFound(_)) => None,
+            Err(k3rs_common::Error::NotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
         let Some(sa) = sa else {
@@ -621,8 +621,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             }
             // Conflict: someone else updated it, we are notified and retry.
             // NotFound: deleted meanwhile, nothing to populate.
-            Err(rusternetes_common::Error::Conflict(_))
-            | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Err(k3rs_common::Error::Conflict(_)) | Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -630,8 +629,8 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     /// `makeSecretQueueKey` (tokens_controller.go:599-607) for a deleted
     /// token Secret: the watch's previous value is the only place the
     /// ServiceAccount name and uid annotations survive the deletion.
-    fn note_deleted_token(&self, ev: &rusternetes_storage::WatchEvent) {
-        let rusternetes_storage::WatchEvent::Deleted(key, prev) = ev else {
+    fn note_deleted_token(&self, ev: &k3rs_storage::WatchEvent) {
+        let k3rs_storage::WatchEvent::Deleted(key, prev) = ev else {
             return;
         };
         let Ok(secret) = serde_json::from_str::<Secret>(prev) else {
@@ -708,12 +707,12 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         sa_name: &str,
         sa_uid: &str,
         secret_name: &str,
-    ) -> std::result::Result<(), rusternetes_common::Error> {
+    ) -> std::result::Result<(), k3rs_common::Error> {
         let key = build_key("serviceaccounts", Some(namespace), sa_name);
         let mut sa: ServiceAccount = match self.storage.get(&key).await {
             Ok(sa) => sa,
             // Ignore NotFound errors when attempting to remove a reference.
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e),
         };
         // Short-circuit if the UID doesn't match.
@@ -732,7 +731,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             .collect();
         sa.secrets = if kept.is_empty() { None } else { Some(kept) };
         match self.storage.update(&key, &sa).await {
-            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Ok(_) | Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -745,7 +744,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             match self.storage.get::<Secret>(&key).await {
                 Ok(live) if live.metadata.uid != uid => return Ok(()),
                 Ok(_) => {}
-                Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+                Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -754,7 +753,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             namespace, name
         );
         match self.storage.delete(&key).await {
-            Ok(_) | Err(rusternetes_common::Error::NotFound(_)) => Ok(()),
+            Ok(_) | Err(k3rs_common::Error::NotFound(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -800,7 +799,7 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                     .await
             }
             Ok(_) => Ok(()),
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 self.delete_tokens(namespace, sa_name, None).await
             }
             Err(e) => Err(e.into()),
@@ -808,6 +807,6 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     }
 }
 
-fn is_conflict(e: &rusternetes_common::Error) -> bool {
-    matches!(e, rusternetes_common::Error::Conflict(_))
+fn is_conflict(e: &k3rs_common::Error) -> bool {
+    matches!(e, k3rs_common::Error::Conflict(_))
 }

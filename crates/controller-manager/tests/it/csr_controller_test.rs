@@ -1,13 +1,13 @@
 // Integration tests for CertificateSigningRequest Controller
 // Tests validation and processing of certificate signing requests
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CertificateSigningRequest, CertificateSigningRequestCondition, CertificateSigningRequestSpec,
     CertificateSigningRequestStatus, KeyUsage,
 };
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_controller_manager::controllers::certificate_signing_request::CertificateSigningRequestController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::ObjectMeta;
+use k3rs_controller_manager::controllers::certificate_signing_request::CertificateSigningRequestController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 async fn setup_test() -> Arc<MemoryStorage> {

@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::ipaddress::{IPAddress, ParentReference};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::ipaddress::{IPAddress, ParentReference};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_ip, name_is_path_segment, validate_immutable_field, validate_object_meta,
         validate_object_meta_update,
     };
@@ -13,7 +13,7 @@ mod __parent {
 
 mod cidr_warning_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::ipaddress::*;
+    use k3rs_common::validation::ipaddress::*;
 
     /// `TestGetWarningsForCIDR` (apimachinery/pkg/util/validation/ip_test.go:530-605),
     /// less the leading-zero IPv4 cases the Rust parser rejects outright.

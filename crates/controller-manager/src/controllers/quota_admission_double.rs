@@ -15,7 +15,7 @@
 //! by the pods stored there, and counts the denials so a test can prove the
 //! controller really reached the "api-server".
 
-use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
+use k3rs_storage::{memory::MemoryStorage, Storage, WatchStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct QuotaAdmissionStorage {
@@ -33,7 +33,7 @@ impl QuotaAdmissionStorage {
     }
 
     /// The Forbidden `CheckRequest` returns when a `pods` quota is full.
-    async fn deny_pod_create(&self, key: &str) -> Option<rusternetes_common::Error> {
+    async fn deny_pod_create(&self, key: &str) -> Option<k3rs_common::Error> {
         let rest = key.strip_prefix("/registry/pods/")?;
         let (namespace, name) = rest.split_once('/')?;
         let quotas: Vec<serde_json::Value> = self
@@ -54,7 +54,7 @@ impl QuotaAdmissionStorage {
                 .len() as i64;
             if used + 1 > limit {
                 let quota_name = q.pointer("/metadata/name").and_then(|v| v.as_str())?;
-                return Some(rusternetes_common::Error::Forbidden(format!(
+                return Some(k3rs_common::Error::Forbidden(format!(
                     "pods \"{name}\" is forbidden: exceeded quota: {quota_name}, \
                      requested: pods=1, used: pods={used}, limited: pods={limit}"
                 )));
@@ -72,7 +72,7 @@ impl Default for QuotaAdmissionStorage {
 
 #[async_trait::async_trait]
 impl Storage for QuotaAdmissionStorage {
-    async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
@@ -83,40 +83,36 @@ impl Storage for QuotaAdmissionStorage {
         self.inner.create(key, value).await
     }
 
-    async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+    async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
     where
         T: serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.get(key).await
     }
 
-    async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.update(key, value).await
     }
 
-    async fn update_raw(
-        &self,
-        key: &str,
-        value: &serde_json::Value,
-    ) -> rusternetes_common::Result<()> {
+    async fn update_raw(&self, key: &str, value: &serde_json::Value) -> k3rs_common::Result<()> {
         self.inner.update_raw(key, value).await
     }
 
-    async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
         self.inner.delete(key).await
     }
 
-    async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+    async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.list(prefix).await
     }
 
-    async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+    async fn watch(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
         self.inner.watch(prefix).await
     }
 
@@ -124,15 +120,15 @@ impl Storage for QuotaAdmissionStorage {
         &self,
         prefix: &str,
         revision: i64,
-    ) -> rusternetes_common::Result<WatchStream> {
+    ) -> k3rs_common::Result<WatchStream> {
         self.inner.watch_from_revision(prefix, revision).await
     }
 
-    async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+    async fn current_revision(&self) -> k3rs_common::Result<i64> {
         self.inner.current_revision().await
     }
 
-    async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+    async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
         self.inner.is_revision_compacted(revision).await
     }
 }

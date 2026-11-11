@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::PriorityClass;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::resources::PriorityClass;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
 }
 
 mod update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::priorityclass::*;
+    use k3rs_common::validation::priorityclass::*;
 
     fn pc(value: i32, preemption: Option<&str>) -> PriorityClass {
         let mut v = serde_json::json!({

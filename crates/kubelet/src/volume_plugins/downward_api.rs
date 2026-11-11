@@ -1,7 +1,7 @@
 use crate::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{Pod, Volume};
+use k3rs_common::resources::{Pod, Volume};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
@@ -237,9 +237,9 @@ impl Mounter for DownwardApiMounter {
 /// Like upstream, a nil `defaultMode` is an error ("no defaultMode used, not
 /// even the default value for it"): the API server
 /// (`SetDefaults_DownwardAPIVolumeSource`) and the static-pod decoder
-/// (`rusternetes_common::defaults::default_volume_source_modes`) default it.
+/// (`k3rs_common::defaults::default_volume_source_modes`) default it.
 pub fn collect_data(
-    items: &[rusternetes_common::resources::DownwardAPIVolumeFile],
+    items: &[k3rs_common::resources::DownwardAPIVolumeFile],
     pod: &Pod,
     node_allocatable: &HashMap<String, String>,
     default_mode: Option<i32>,

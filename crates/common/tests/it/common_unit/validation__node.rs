@@ -2,19 +2,19 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::resources::node::{
+    pub use k3rs_common::resources::node::{
         ConfigMapNodeConfigSource, Node, NodeConfigSource, NodeConfigStatus, NodeSwapStatus, Taint,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_label_name,
     };
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::resourcequota::validate_resource_quantity_value;
+    pub use k3rs_common::validation::resourcequota::validate_resource_quantity_value;
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
     pub use serde::Deserialize;
     pub use std::collections::{HashMap, HashSet};
     pub use std::net::IpAddr;
@@ -22,7 +22,7 @@ mod __parent {
 
 mod status_update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::node::*;
+    use k3rs_common::validation::node::*;
 
     fn node_with_status(status: serde_json::Value) -> Node {
         serde_json::from_value(serde_json::json!({
@@ -171,7 +171,7 @@ mod status_update_tests {
 
 mod avoid_pods_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::node::*;
+    use k3rs_common::validation::node::*;
 
     const KEY: &str = "scheduler.alpha.kubernetes.io/preferAvoidPods";
 
@@ -246,8 +246,8 @@ mod avoid_pods_tests {
 
 mod pod_cidr_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::field::ErrorType;
-    use rusternetes_common::validation::node::*;
+    use k3rs_common::validation::field::ErrorType;
+    use k3rs_common::validation::node::*;
 
     fn node_with_cidrs(cidrs: &[&str]) -> Node {
         serde_json::from_value(serde_json::json!({

@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::apiextensions::condition_controllers::remove_crd_condition;
-    pub use rusternetes_api_server::registry::apiextensions::controllers::{
+    pub use k3rs_api_server::registry::apiextensions::condition_controllers::remove_crd_condition;
+    pub use k3rs_api_server::registry::apiextensions::controllers::{
         crd_has_finalizer, TERMINATING,
     };
-    pub use rusternetes_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
-    pub use rusternetes_common::resources::CustomResourceDefinition;
-    pub use rusternetes_common::validation::crd::CUSTOM_RESOURCE_CLEANUP_FINALIZER;
+    pub use k3rs_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
+    pub use k3rs_common::resources::CustomResourceDefinition;
+    pub use k3rs_common::validation::crd::CUSTOM_RESOURCE_CLEANUP_FINALIZER;
     pub use std::collections::{HashSet, VecDeque};
     pub use std::sync::{Arc, Mutex};
     pub use tokio::sync::Notify;
@@ -16,10 +16,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::controllers::{
-        condition, set_crd_condition,
-    };
-    use rusternetes_api_server::registry::apiextensions::finalizer_queue::*;
+    use k3rs_api_server::registry::apiextensions::controllers::{condition, set_crd_condition};
+    use k3rs_api_server::registry::apiextensions::finalizer_queue::*;
 
     fn deleting() -> CustomResourceDefinition {
         let mut c = CustomResourceDefinition::new("x", "example.com", "", "widgets");

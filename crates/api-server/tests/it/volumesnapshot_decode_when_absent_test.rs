@@ -8,11 +8,11 @@
 //! validator: the contract is the `required:` list and the
 //! `x-kubernetes-validations` CEL rules in `kubernetes-csi/external-snapshotter`
 //! (`client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml` and
-//! `…_volumesnapshotcontents.yaml`). Rusternetes serves both types natively
+//! `…_volumesnapshotcontents.yaml`). k3rs serves both types natively
 //! rather than through the CRD machinery, so before this slice a snapshot with
 //! no `spec.source` at all was simply written.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SNAPSHOTS: &str = "/apis/snapshot.storage.k8s.io/v1/namespaces/default/volumesnapshots";

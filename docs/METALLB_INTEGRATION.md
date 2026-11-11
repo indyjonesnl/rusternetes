@@ -1,8 +1,8 @@
-# MetalLB Integration with Rusternetes
+# MetalLB Integration with k3rs
 
 
 > **Tip:** You can manage related resources through the [web console](CONSOLE_USER_GUIDE.md).
-This guide explains how to use MetalLB with Rusternetes to provide LoadBalancer services without requiring a cloud provider. MetalLB is a production-ready, battle-tested load balancer implementation for bare-metal and on-premises Kubernetes clusters.
+This guide explains how to use MetalLB with k3rs to provide LoadBalancer services without requiring a cloud provider. MetalLB is a production-ready, battle-tested load balancer implementation for bare-metal and on-premises Kubernetes clusters.
 
 ## Overview
 
@@ -12,7 +12,7 @@ This guide explains how to use MetalLB with Rusternetes to provide LoadBalancer 
 - Automatically assigns external IPs to LoadBalancer services
 - Works with standard Kubernetes APIs (no custom changes needed)
 
-**Why use MetalLB with Rusternetes?**
+**Why use MetalLB with k3rs?**
 - Development and testing without cloud provider costs
 - On-premises deployments
 - Edge computing scenarios
@@ -27,7 +27,7 @@ MetalLB consists of two components:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Rusternetes Cluster                   │
+│                    k3rs Cluster                   │
 │                                                           │
 │  ┌──────────────┐      ┌─────────────────────────────┐  │
 │  │   MetalLB    │      │    LoadBalancer Service     │  │
@@ -60,12 +60,12 @@ MetalLB consists of two components:
 
 ## Prerequisites
 
-1. **Rusternetes cluster running** with:
+1. **k3rs cluster running** with:
    - API server accessible
    - kube-proxy running and configured
    - Nodes with network connectivity
 
-2. **kubectl configured** to access your Rusternetes cluster
+2. **kubectl configured** to access your k3rs cluster
 
 3. **IP address range** available on your network for LoadBalancer services
 
@@ -97,7 +97,7 @@ kubectl wait --namespace metallb-system \
 ### Step 2: Configure IP Address Pool
 
 Choose an IP range that:
-- Is on the same network as your Rusternetes nodes
+- Is on the same network as your k3rs nodes
 - Does NOT overlap with DHCP ranges
 - Is routable from clients that need to access services
 
@@ -301,11 +301,11 @@ spec:
 
 Both services will share the same external IP on different ports.
 
-## Rusternetes-Specific Considerations
+## k3rs-Specific Considerations
 
 ### kube-proxy Compatibility
 
-Rusternetes uses iptables-based kube-proxy, which works seamlessly with MetalLB. The flow is:
+k3rs uses iptables-based kube-proxy, which works seamlessly with MetalLB. The flow is:
 
 1. Client sends traffic to LoadBalancer external IP
 2. MetalLB speaker responds to ARP requests for that IP
@@ -315,7 +315,7 @@ Rusternetes uses iptables-based kube-proxy, which works seamlessly with MetalLB.
 
 ### Service NodePort Allocation
 
-Rusternetes automatically allocates NodePorts for LoadBalancer services. MetalLB relies on these NodePorts:
+k3rs automatically allocates NodePorts for LoadBalancer services. MetalLB relies on these NodePorts:
 
 ```
 External IP:80 → Node:30080 → Pod:8080
@@ -328,7 +328,7 @@ External IP:80 → Node:30080 → Pod:8080
 For local development with Podman:
 
 ```bash
-# Start Rusternetes cluster
+# Start k3rs cluster
 podman-compose -f compose.yml up -d
 
 # Install MetalLB
@@ -393,7 +393,7 @@ my-service   LoadBalancer   10.96.100.123   <pending>     80:30080/TCP
 
 3. **Check kube-proxy rules:**
    ```bash
-   # On a Rusternetes node
+   # On a k3rs node
    iptables-save | grep <NODEPORT>
    ```
 
@@ -498,7 +498,7 @@ spec:
 
 ## Next Steps
 
-1. Install MetalLB in your Rusternetes cluster
+1. Install MetalLB in your k3rs cluster
 2. Configure IP address pool for your network
 3. Test with the example LoadBalancer service
 4. Explore advanced features like IP sharing and BGP mode

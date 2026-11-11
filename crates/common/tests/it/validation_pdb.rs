@@ -3,12 +3,12 @@
 //! Mirrors upstream `ValidatePodDisruptionBudgetSpec`
 //! (`pkg/apis/policy/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::policy::PodDisruptionBudget;
-use rusternetes_common::resources::policy::{IntOrString, PodDisruptionBudgetSpec};
-use rusternetes_common::types::LabelSelector;
-use rusternetes_common::validation::field::Path;
-use rusternetes_common::validation::field::{BadValue, Error, ErrorType};
-use rusternetes_common::validation::pdb::{
+use k3rs_common::resources::policy::PodDisruptionBudget;
+use k3rs_common::resources::policy::{IntOrString, PodDisruptionBudgetSpec};
+use k3rs_common::types::LabelSelector;
+use k3rs_common::validation::field::Path;
+use k3rs_common::validation::field::{BadValue, Error, ErrorType};
+use k3rs_common::validation::pdb::{
     validate_pod_disruption_budget, validate_pod_disruption_budget_spec,
     PodDisruptionBudgetValidationOptions,
 };

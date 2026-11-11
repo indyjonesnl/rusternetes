@@ -4,11 +4,11 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::Utc;
-    pub use rusternetes_common::quantity::{Format, Quantity};
-    pub use rusternetes_common::quota;
-    pub use rusternetes_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_common::quantity::{Format, Quantity};
+    pub use k3rs_common::quota;
+    pub use k3rs_common::resources::{Pod, ResourceQuota, ResourceQuotaStatus, Service};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info};
@@ -16,12 +16,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         Container, PodSpec, ResourceQuotaSpec, ScopeSelector, ScopedResourceSelectorRequirement,
     };
-    use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-    use rusternetes_controller_manager::controllers::resource_quota::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+    use k3rs_controller_manager::controllers::resource_quota::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     fn make_container(name: &str, resources: Option<ResourceRequirements>) -> Container {
         Container {
@@ -410,7 +410,7 @@ mod tests {
 
         let queue = WorkQueue::new();
         // Simulate a pod create event in ns-1
-        let ev = rusternetes_storage::WatchEvent::Added(
+        let ev = k3rs_storage::WatchEvent::Added(
             "/registry/pods/ns-1/some-pod".to_string(),
             "{}".to_string(),
         );
@@ -534,7 +534,7 @@ mod tests {
     /// (spec, current or modify-target), and any other scope counts none.
     #[tokio::test]
     async fn test_calculate_usage_pvc_volume_attributes_class_scope() {
-        use rusternetes_common::resources::{ScopeSelector, ScopedResourceSelectorRequirement};
+        use k3rs_common::resources::{ScopeSelector, ScopedResourceSelectorRequirement};
         let storage = Arc::new(MemoryStorage::new());
         let controller = ResourceQuotaController::new(storage.clone());
         let claims = [
@@ -705,8 +705,8 @@ mod tests {
     /// the compute charge outright. `count/pods` is charged either way.
     #[tokio::test]
     async fn test_calculate_usage_terminal_and_terminating_pods() {
-        use rusternetes_common::resources::PodStatus;
-        use rusternetes_common::types::Phase;
+        use k3rs_common::resources::PodStatus;
+        use k3rs_common::types::Phase;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = ResourceQuotaController::new(storage.clone());
@@ -822,22 +822,19 @@ mod tests {
 
         // A stream that ends immediately, built the same way storage builds its
         // watches (unfold), so it carries the same "no polling after None" rule.
-        let make_stream = || -> rusternetes_storage::WatchStream {
+        let make_stream = || -> k3rs_storage::WatchStream {
             futures::stream::unfold(false, |done| async move {
                 if done {
                     None
                 } else {
                     // End on the first poll: no events, just termination.
-                    None::<(
-                        rusternetes_common::Result<rusternetes_storage::WatchEvent>,
-                        bool,
-                    )>
+                    None::<(k3rs_common::Result<k3rs_storage::WatchEvent>, bool)>
                 }
             })
             .boxed()
         };
 
-        let mut aux: Option<rusternetes_storage::WatchStream> = Some(make_stream());
+        let mut aux: Option<k3rs_storage::WatchStream> = Some(make_stream());
 
         // First call observes the end of the stream and retires it.
         let first = next_aux_event(&mut aux, "Pod").await;
@@ -863,11 +860,11 @@ mod tests {
     async fn an_erroring_auxiliary_watch_is_retired() {
         use futures::stream::StreamExt;
 
-        let stream: rusternetes_storage::WatchStream = futures::stream::once(async {
-            Err(rusternetes_common::Error::Storage("watch died".to_string()))
+        let stream: k3rs_storage::WatchStream = futures::stream::once(async {
+            Err(k3rs_common::Error::Storage("watch died".to_string()))
         })
         .boxed();
-        let mut aux: Option<rusternetes_storage::WatchStream> = Some(stream);
+        let mut aux: Option<k3rs_storage::WatchStream> = Some(stream);
 
         assert!(next_aux_event(&mut aux, "Pod").await.is_none());
         assert!(
@@ -882,11 +879,11 @@ mod tests {
     async fn a_live_auxiliary_watch_still_delivers_events() {
         use futures::stream::StreamExt;
 
-        let stream: rusternetes_storage::WatchStream = futures::stream::iter(vec![Ok(
-            rusternetes_storage::WatchEvent::Added("pods/default/p1".to_string(), "{}".to_string()),
+        let stream: k3rs_storage::WatchStream = futures::stream::iter(vec![Ok(
+            k3rs_storage::WatchEvent::Added("pods/default/p1".to_string(), "{}".to_string()),
         )])
         .boxed();
-        let mut aux: Option<rusternetes_storage::WatchStream> = Some(stream);
+        let mut aux: Option<k3rs_storage::WatchStream> = Some(stream);
 
         let ev = next_aux_event(&mut aux, "Pod").await;
         assert!(ev.is_some(), "a live stream's event must be delivered");
@@ -969,15 +966,15 @@ mod tests {
         assert_eq!(usage["count/jobs.batch"], "0");
     }
 
-    fn ev_pod(kind: &str, name: &str, phase: &str) -> rusternetes_storage::WatchEvent {
+    fn ev_pod(kind: &str, name: &str, phase: &str) -> k3rs_storage::WatchEvent {
         let v = format!(
             r#"{{"apiVersion":"v1","kind":"Pod","metadata":{{"name":"{name}","namespace":"ns"}},"spec":{{"containers":[{{"name":"c","image":"i"}}]}},"status":{{"phase":"{phase}"}}}}"#
         );
         let k = format!("/registry/pods/ns/{name}");
         match kind {
-            "add" => rusternetes_storage::WatchEvent::Added(k, v),
-            "mod" => rusternetes_storage::WatchEvent::Modified(k, v),
-            _ => rusternetes_storage::WatchEvent::Deleted(k, v),
+            "add" => k3rs_storage::WatchEvent::Added(k, v),
+            "mod" => k3rs_storage::WatchEvent::Modified(k, v),
+            _ => k3rs_storage::WatchEvent::Deleted(k, v),
         }
     }
 
@@ -1000,17 +997,11 @@ mod tests {
         let mut f = ReplenishFilter::default();
         for kind in ["configmaps", "secrets"] {
             let k = format!("/registry/{kind}/ns/x");
-            assert!(!f.should_replenish(&rusternetes_storage::WatchEvent::Added(
-                k.clone(),
-                "{}".into()
-            )));
+            assert!(!f.should_replenish(&k3rs_storage::WatchEvent::Added(k.clone(), "{}".into())));
             assert!(
-                !f.should_replenish(&rusternetes_storage::WatchEvent::Modified(
-                    k.clone(),
-                    "{}".into()
-                ))
+                !f.should_replenish(&k3rs_storage::WatchEvent::Modified(k.clone(), "{}".into()))
             );
-            assert!(f.should_replenish(&rusternetes_storage::WatchEvent::Deleted(k, "{}".into())));
+            assert!(f.should_replenish(&k3rs_storage::WatchEvent::Deleted(k, "{}".into())));
         }
     }
 }

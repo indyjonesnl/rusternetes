@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::flowcontrol::{
+    pub use k3rs_common::resources::flowcontrol::{
         ExemptPriorityLevelConfiguration, LimitResponse, LimitResponseType,
         LimitedPriorityLevelConfiguration, PriorityLevelConfiguration,
         PriorityLevelConfigurationCondition, PriorityLevelConfigurationStatus, PriorityLevelType,
         QueuingConfiguration,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::flowcontrol_bootstrap::{
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::flowcontrol_bootstrap::{
         mandatory_priority_level_configuration, semantic_equal,
     };
     pub use std::collections::HashSet;
@@ -17,8 +17,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::field::ErrorType;
-    use rusternetes_common::validation::prioritylevelconfiguration::*;
+    use k3rs_common::validation::field::ErrorType;
+    use k3rs_common::validation::prioritylevelconfiguration::*;
 
     fn cond(type_: &str) -> PriorityLevelConfigurationCondition {
         PriorityLevelConfigurationCondition {

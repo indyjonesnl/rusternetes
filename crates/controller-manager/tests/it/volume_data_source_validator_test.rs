@@ -3,11 +3,11 @@
 //! Ported from kubernetes-csi/volume-data-source-validator
 //! `pkg/data-source-validator/data_source_validator.go` (`syncPvcByKey`).
 
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::resources::Event;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::volume_data_source_validator::VolumeDataSourceValidator;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::volume::*;
+use k3rs_common::resources::Event;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::volume_data_source_validator::VolumeDataSourceValidator;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 const POPULATORS: &str = "populator_storage_k8s_io_volumepopulators";

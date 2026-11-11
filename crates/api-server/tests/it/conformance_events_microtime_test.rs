@@ -31,7 +31,7 @@
 //! `<apiVersion>.<kind>` with a bare-kind fallback, and a `MicroTime`
 //! special-case in `decode_field_value` that calls `decode_micro_timestamp`.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 
 /// Wire bytes for `MicroTime { seconds: <s>, nanos: <n> }`. Both fields are
 /// proto-encoded as varints under tags 0x08 (field 1) and 0x10 (field 2).

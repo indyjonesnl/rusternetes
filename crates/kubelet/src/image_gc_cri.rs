@@ -14,9 +14,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rusternetes_common::resources::{EventSource, EventType, ObjectReference};
-use rusternetes_cri::{v1, CriClient};
-use rusternetes_storage::{EventRecorder, StorageBackend};
+use k3rs_common::resources::{EventSource, EventType, ObjectReference};
+use k3rs_cri::{v1, CriClient};
+use k3rs_storage::{EventRecorder, StorageBackend};
 
 use crate::image_gc::{
     FsStats, GcContainer, GcPod, Image, ImageGcRuntime, ImageSpec, NodeEventSink, StatsProvider,

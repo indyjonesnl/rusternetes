@@ -19,7 +19,7 @@ target/
 *~
 .DS_Store
 
-# Rusternetes specific
+# k3rs specific
 *.log
 data/
 configs/local-*
@@ -32,7 +32,7 @@ configs/local-*
 # Podman/Docker volumes
 etcd-data/
 # Local development runtime state
-.rusternetes/
+.k3rs/
 
 # Work tracking (local only)
 .work/

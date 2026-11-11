@@ -8,17 +8,17 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::Result;
 use axum::{routing::get, Router};
 use clap::Parser;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_scheduler::scheduler::Scheduler;
-use rusternetes_scheduler::{data_plane, profile, scheduler_config};
-use rusternetes_storage::{StorageBackend, StorageConfig};
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_scheduler::scheduler::Scheduler;
+use k3rs_scheduler::{data_plane, profile, scheduler_config};
+use k3rs_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(name = "rusternetes-scheduler")]
-#[command(about = "Rusternetes Scheduler - Assigns pods to nodes")]
+#[command(name = "k3rs-scheduler")]
+#[command(about = "k3rs Scheduler - Assigns pods to nodes")]
 struct Args {
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
@@ -29,7 +29,7 @@ struct Args {
     storage_backend: String,
 
     /// SQLite database path (only used when --storage-backend=sqlite)
-    #[arg(long, default_value = "./data/rusternetes.db")]
+    #[arg(long, default_value = "./data/k3rs.db")]
     data_dir: String,
 
     /// Log level
@@ -91,15 +91,15 @@ struct Args {
     /// `SecureServing` (`--secure-port`, `--bind-address`, `--tls-cert-file`, ...)
     /// of kube-scheduler (cmd/kube-scheduler/app/options/options.go:119-128).
     #[command(flatten)]
-    secure_serving: rusternetes_middleware::secure_serving::options::SecureServingFlags,
+    secure_serving: k3rs_middleware::secure_serving::options::SecureServingFlags,
 
     /// `Authentication` (`--authentication-kubeconfig`, `--client-ca-file`, ...).
     #[command(flatten)]
-    authentication: rusternetes_middleware::secure_serving::options::AuthenticationFlags,
+    authentication: k3rs_middleware::secure_serving::options::AuthenticationFlags,
 
     /// `Authorization` (`--authorization-kubeconfig`, ...).
     #[command(flatten)]
-    authorization: rusternetes_middleware::secure_serving::options::AuthorizationFlags,
+    authorization: k3rs_middleware::secure_serving::options::AuthorizationFlags,
 
     /// Enable leader election (for HA)
     #[arg(long)]
@@ -197,7 +197,7 @@ impl Args {
                 match v {
                     None => Ok(std::time::Duration::from_secs(native)),
                     Some(s) => {
-                        let ns = rusternetes_common::go_duration::parse_go_duration(s)
+                        let ns = k3rs_common::go_duration::parse_go_duration(s)
                             .map_err(|e| format!("invalid value {s:?} for --{flag}: {e}"))?;
                         Ok(std::time::Duration::from_nanos(ns.max(0) as u64))
                     }
@@ -236,15 +236,14 @@ impl Args {
 /// `compatibility.DefaultBuildEffectiveVersion()` (not the flag-derived
 /// effective version) and `pathRecorderMux.ListedPaths()`; the only path this
 /// server lists is `/metrics`.
-fn install_statusz(app: Router, flags: rusternetes_common::flagz::NamedFlagSetsReader) -> Router {
+fn install_statusz(app: Router, flags: k3rs_common::flagz::NamedFlagSetsReader) -> Router {
     // `flagz.Install` behind the `ComponentFlagz` gate, before statusz
     // (cmd/kube-scheduler/app/server.go:388-392; reader from
     // cmd/kube-scheduler/app/options/options.go:270-274).
-    let app =
-        rusternetes_common::flagz::install_if_enabled(app, "kube-scheduler", Some(Box::new(flags)));
-    rusternetes_common::statusz::install_if_enabled(app, "kube-scheduler", || {
-        rusternetes_common::statusz::Registry::new(Some(
-            rusternetes_common::compatibility::default_build_effective_version(),
+    let app = k3rs_common::flagz::install_if_enabled(app, "kube-scheduler", Some(Box::new(flags)));
+    k3rs_common::statusz::install_if_enabled(app, "kube-scheduler", || {
+        k3rs_common::statusz::Registry::new(Some(
+            k3rs_common::compatibility::default_build_effective_version(),
         ))
         .with_listed_paths(vec!["/metrics".to_string()])
     })
@@ -255,8 +254,8 @@ fn install_statusz(app: Router, flags: rusternetes_common::flagz::NamedFlagSetsR
 /// (cmd/kube-scheduler/app/options/options.go:119-128).
 fn component_secure_serving(
     args: &Args,
-) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
-    let mut c = rusternetes_middleware::secure_serving::ComponentSecureServing::for_scheduler();
+) -> k3rs_middleware::secure_serving::ComponentSecureServing {
+    let mut c = k3rs_middleware::secure_serving::ComponentSecureServing::for_scheduler();
     c.apply_flags(
         &args.secure_serving,
         &args.authentication,
@@ -282,7 +281,7 @@ fn aggregate_errors(errs: &[String]) -> String {
 async fn serve_secure(
     args: &Args,
     gather: impl Fn() -> String + Clone + Send + Sync + 'static,
-    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+    flags: k3rs_common::flagz::NamedFlagSetsReader,
 ) -> Result<()> {
     let component = component_secure_serving(args);
     let errs = component.validate();
@@ -304,16 +303,16 @@ async fn serve_secure(
 async fn main() -> Result<()> {
     let cmd = <Args as clap::CommandFactory>::command();
     let matches = cmd.clone().get_matches();
-    let flags = rusternetes_common::flagz::flags_from_clap(&cmd, &matches);
+    let flags = k3rs_common::flagz::flags_from_clap(&cmd, &matches);
     let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
         .map_err(|e| e.exit())
         .unwrap();
 
-    rusternetes_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
+    k3rs_common::tracing::init_basic_tracing("scheduler", &args.log_level)?;
 
     // `ComponentGlobalsRegistry.Set()` (cmd/kube-scheduler/app/server.go:105) then
     // options `Validate` (compatibility/registry.go:430-451).
-    let effective_version = rusternetes_common::compatibility::apply_flags(
+    let effective_version = k3rs_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
@@ -321,8 +320,8 @@ async fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
     // `ComponentGlobalsRegistry.AddMetrics()` (cmd/kube-scheduler/app/server.go:165;
     // component-base/compatibility/registry.go:123-131): record `version_info`.
-    rusternetes_common::compat_version_metrics::add_metrics(
-        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+    k3rs_common::compat_version_metrics::add_metrics(
+        k3rs_common::compatibility::DEFAULT_KUBE_COMPONENT,
         &effective_version,
     );
 
@@ -344,8 +343,8 @@ async fn main() -> Result<()> {
     };
 
     info!(
-        "Starting Rusternetes Scheduler {}",
-        rusternetes_common::build_info::version_line()
+        "Starting k3rs Scheduler {}",
+        k3rs_common::build_info::version_line()
     );
 
     // API mode (in-cluster static pod): no storage backend, no leader election
@@ -383,7 +382,7 @@ async fn main() -> Result<()> {
 
     // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler (SIGTERM+SIGINT)
     // cancels the run context.
-    let ctx = rusternetes_common::signal::setup_signal_context();
+    let ctx = k3rs_common::signal::setup_signal_context();
 
     // Leader election
     if le.enabled {
@@ -399,10 +398,10 @@ async fn main() -> Result<()> {
         // cmd/kube-scheduler/app/server.go:310-322 OnStoppedLeading: exit 0 if
         // asked to terminate, otherwise "Leaderelection lost" and exit 1.
         let stopped_ctx = ctx.clone();
-        let elector = Arc::new(rusternetes_common::leaderelection::LeaderElector::new(
-            rusternetes_common::leaderelection::ElectionConfig {
+        let elector = Arc::new(k3rs_common::leaderelection::LeaderElector::new(
+            k3rs_common::leaderelection::ElectionConfig {
                 lock: Arc::new(
-                    rusternetes_storage::lease_lock::LeaseLock::new(
+                    k3rs_storage::lease_lock::LeaseLock::new(
                         storage.clone(),
                         args.leader_election_resource_namespace.clone(),
                         args.leader_election_resource_name.clone(),
@@ -410,7 +409,7 @@ async fn main() -> Result<()> {
                     )
                     // LockConfig.EventRecorder (options.go makeLeaderElectionConfig).
                     .with_event_recorder(
-                        rusternetes_storage::EventRecorder::new(storage.clone()),
+                        k3rs_storage::EventRecorder::new(storage.clone()),
                         "default-scheduler",
                     ),
                 ),
@@ -420,7 +419,7 @@ async fn main() -> Result<()> {
                 // ReleaseOnCancel: true (cmd/kube-scheduler/app/options/options.go:375).
                 release_on_cancel: true,
                 name: args.leader_election_resource_name.clone(),
-                callbacks: rusternetes_common::leaderelection::LeaderCallbacks {
+                callbacks: k3rs_common::leaderelection::LeaderCallbacks {
                     on_started_leading: Arc::new(|_| {}),
                     on_stopped_leading: Arc::new(move || {
                         if stopped_ctx.is_cancelled() {
@@ -505,10 +504,10 @@ async fn main() -> Result<()> {
 async fn run_api_mode(
     args: Args,
     profiles: &profile::Map,
-    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+    flags: k3rs_common::flagz::NamedFlagSetsReader,
 ) -> Result<()> {
-    use rusternetes_client::http::ApiClient;
-    use rusternetes_client::kubeconfig::KubeConfig;
+    use k3rs_client::http::ApiClient;
+    use k3rs_client::kubeconfig::KubeConfig;
 
     // Metrics server (same as storage mode).
     let metrics = Arc::new(MetricsRegistry::new().with_scheduler_metrics()?);
@@ -558,9 +557,7 @@ async fn run_api_mode(
             None,
         )?
         // `rest.SetKubernetesDefaults`: the component's default User-Agent.
-        .with_default_user_agent(
-            rusternetes_common::compatibility::default_kubernetes_user_agent(),
-        ),
+        .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent()),
     );
 
     let backend = data_plane::ApiBackend::new(client);
@@ -572,7 +569,7 @@ async fn run_api_mode(
     info!("Scheduler starting (API mode, single instance, no leader election)");
     // cmd/kube-scheduler/app/server.go:150-156: SetupSignalHandler cancels the
     // run context on SIGTERM/SIGINT.
-    let ctx = rusternetes_common::signal::setup_signal_context();
+    let ctx = k3rs_common::signal::setup_signal_context();
     tokio::select! {
         r = scheduler.run() => r?,
         _ = ctx.cancelled() => info!("Requested to terminate, exiting"),

@@ -9,7 +9,7 @@
 //! else.
 //!
 //! Like Go, the handler runs detached (`tokio::spawn`, timeout.go:101-116) and
-//! outlives the 504: its request context (`rusternetes_common::cancellation`,
+//! outlives the 504: its request context (`k3rs_common::cancellation`,
 //! the task-local counterpart of `req.Context()`) is done once the deadline
 //! passes or the client goes away, which ends the `StorageBackend` and webhook
 //! calls it is blocked in, and `RecordRequestPostTimeout` records how it
@@ -41,10 +41,10 @@ use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use rusternetes_common::cancellation::{
+use k3rs_common::cancellation::{
     request_cancellation_with_deadline, with_request_cancellation, RequestCanceller,
 };
-use rusternetes_common::types::{Status, StatusDetails};
+use k3rs_common::types::{Status, StatusDetails};
 use tracing::Instrument;
 
 use crate::apiserver_request_metrics::{
@@ -96,7 +96,7 @@ pub fn parse_timeout(query: Option<&str>) -> Result<Option<Duration>, String> {
     if value.is_empty() {
         return Ok(None);
     }
-    let ns = rusternetes_common::go_duration::parse_go_duration(&value)
+    let ns = k3rs_common::go_duration::parse_go_duration(&value)
         .map_err(|e| format!("{INVALID_TIMEOUT_IN_URL} - {e}"))?;
     Ok(Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(0))))
 }
@@ -188,14 +188,14 @@ pub async fn request_timeout_middleware(req: Request, next: Next) -> Response {
     // (timeout.go:98-116). Task-locals set by the filters OUTSIDE this one do
     // not cross `tokio::spawn`, so re-scope them inside.
     let request_info = crate::request_scope::current_request_info();
-    let payload = rusternetes_common::dump::current_payload();
+    let payload = k3rs_common::dump::current_payload();
     let handler = Box::pin(next.run(req)) as Pin<Box<dyn Future<Output = Response> + Send>>;
     let handler: Pin<Box<dyn Future<Output = Response> + Send>> = match request_info {
         Some(info) => Box::pin(crate::request_scope::with_request_info(info, handler)),
         None => handler,
     };
     let handler: Pin<Box<dyn Future<Output = Response> + Send>> = match payload {
-        Some(p) => Box::pin(rusternetes_common::dump::scope_payload(p, handler)),
+        Some(p) => Box::pin(k3rs_common::dump::scope_payload(p, handler)),
         None => handler,
     };
     let handler = crate::handlers::list_options::with_list_snapshot(handler);

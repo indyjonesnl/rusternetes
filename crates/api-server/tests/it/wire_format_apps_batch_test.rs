@@ -9,8 +9,8 @@
 //!   (staging/src/k8s.io/kube-openapi/pkg/handler3/handler.go) whose
 //!   `components.schemas` carry the generated definitions of every kind in it.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";

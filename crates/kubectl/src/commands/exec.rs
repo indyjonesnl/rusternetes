@@ -1,6 +1,6 @@
 use crate::websocket;
 use anyhow::Result;
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 
 /// Execute a command in a container
 pub async fn execute(

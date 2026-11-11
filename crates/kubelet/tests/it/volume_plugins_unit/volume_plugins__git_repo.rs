@@ -4,8 +4,8 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::volume_plugins::{
         Attributes, Mounter, MounterArgs, ReconstructedVolume, Spec, Unmounter, VolumeHost,
         VolumePlugin,
     };
@@ -16,10 +16,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::feature_gates::{reset_to_defaults, set_from_str};
-    use rusternetes_common::resources::Volume;
-    use rusternetes_kubelet::volume_plugins::git_repo::*;
-    use rusternetes_kubelet::volume_plugins::{KubeletVolumeHost, MounterArgs, VolumePluginMgr};
+    use k3rs_common::feature_gates::{reset_to_defaults, set_from_str};
+    use k3rs_common::resources::Volume;
+    use k3rs_kubelet::volume_plugins::git_repo::*;
+    use k3rs_kubelet::volume_plugins::{KubeletVolumeHost, MounterArgs, VolumePluginMgr};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -33,7 +33,7 @@ mod tests {
         let host: Arc<dyn VolumeHost> = Arc::new(KubeletVolumeHost::new_for_tests(
             root.path().to_string_lossy().into_owned(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             std::collections::HashMap::new(),
         ));
         (root, host)

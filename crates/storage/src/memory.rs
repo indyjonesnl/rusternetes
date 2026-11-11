@@ -1,6 +1,6 @@
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
-use rusternetes_common::{Error, Result};
+use k3rs_common::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -693,8 +693,8 @@ impl Storage for MemoryStorage {
 // The RBAC queries in tests use AlwaysAllowAuthorizer so these methods are
 // typically not called; they're implemented for completeness.
 #[async_trait::async_trait]
-impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
-    async fn get<T>(&self, key: &str, namespace: Option<&str>) -> rusternetes_common::Result<T>
+impl k3rs_common::authz::AuthzStorage for MemoryStorage {
+    async fn get<T>(&self, key: &str, namespace: Option<&str>) -> k3rs_common::Result<T>
     where
         T: serde::de::DeserializeOwned + Send + Sync,
     {
@@ -728,7 +728,7 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
         Storage::get(self, &full_key).await
     }
 
-    async fn list<T>(&self, namespace: Option<&str>) -> rusternetes_common::Result<Vec<T>>
+    async fn list<T>(&self, namespace: Option<&str>) -> k3rs_common::Result<Vec<T>>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {

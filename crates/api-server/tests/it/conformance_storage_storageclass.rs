@@ -7,7 +7,7 @@
 //! upstream does; the 30s `Eventually` polls collapse to one list because the
 //! in-process store is synchronous.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(

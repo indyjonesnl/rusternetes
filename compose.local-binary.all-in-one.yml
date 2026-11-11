@@ -1,21 +1,21 @@
 # Override: skip Docker cargo build, bind-mount host-built binary.
 #
 # Use with:
-#   cargo build --release -p rusternetes --features sqlite
+#   cargo build --release -p k3rs --features sqlite
 #   docker compose -f compose.all-in-one.yml \
 #                  -f compose.local-binary.all-in-one.yml \
 #                  up -d --no-build
 #
-# Reuses rusternetes-rusternetes:latest as runtime base (ships iptables,
+# Reuses k3rs-k3rs:latest as runtime base (ships iptables,
 # iproute2, libssl3, ca-certificates) and overlays the freshly-built
 # binary from target/release on the host.
 
 services:
-  rusternetes:
-    image: rusternetes-rusternetes:latest
+  k3rs:
+    image: k3rs-k3rs:latest
     pull_policy: never
     volumes:
-      - ./target/release/rusternetes:/app/rusternetes:ro
+      - ./target/release/k3rs:/app/k3rs:ro
     environment:
       # Pod-facing endpoint: Docker bridge gateway [subnet].1 (set by
       # bootstrap at runtime via discover-bridge-gateway.sh). The host's
@@ -26,7 +26,7 @@ services:
       - "--storage-backend"
       - "sqlite"
       - "--data-dir"
-      - "/data/db/rusternetes.db"
+      - "/data/db/k3rs.db"
       - "--tls"
       - "--enable-aggregator-routing=true"
       - "--tls-cert-file"
@@ -56,7 +56,7 @@ services:
       - "--console-dir"
       - "/app/console"
       - "--network"
-      - "rusternetes-network"
+      - "k3rs-network"
       - "--cluster-dns"
       - "10.96.0.10"
       - "--volume-dir"

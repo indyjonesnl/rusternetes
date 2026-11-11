@@ -3,12 +3,12 @@
 //! Tests all CRUD operations, edge cases, and error handling for volumeattachments.
 //! VolumeAttachment captures the intent to attach or detach volumes to/from nodes.
 
-use rusternetes_common::resources::csi::{
+use k3rs_common::resources::csi::{
     VolumeAttachment, VolumeAttachmentSource, VolumeAttachmentSpec, VolumeAttachmentStatus,
     VolumeError,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

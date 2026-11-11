@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         ConversionStrategyType, CustomResourceColumnDefinition, CustomResourceDefinition,
         CustomResourceDefinitionNames, CustomResourceDefinitionSpec, CustomResourceSubresources,
         JSONSchemaProps, JSONSchemaPropsOrBool, ResourceScope, SelectableField,
     };
-    pub use rusternetes_common::validation::crd_openapi_schema::OpenApiSchemaOptions;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
-    pub use rusternetes_common::validation::structural::Structural;
-    pub use rusternetes_common::validation::webhookconfiguration::{
+    pub use k3rs_common::validation::crd_openapi_schema::OpenApiSchemaOptions;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1035_label, is_dns1123_subdomain};
+    pub use k3rs_common::validation::structural::Structural;
+    pub use k3rs_common::validation::webhookconfiguration::{
         validate_webhook_service, validate_webhook_url,
     };
     pub use std::collections::HashSet;
@@ -19,7 +19,7 @@ mod __parent {
 
 mod whole_object_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::crd::*;
+    use k3rs_common::validation::crd::*;
 
     fn crd(group: &str) -> CustomResourceDefinition {
         let mut crd = CustomResourceDefinition::new("widget", group, "Widget", "widgets");
@@ -36,7 +36,7 @@ mod whole_object_tests {
     /// list in declaration order (`Cluster`, `Namespaced`, :364).
     #[test]
     fn unknown_scope_is_not_supported() {
-        let spec: rusternetes_common::resources::CustomResourceDefinitionSpec =
+        let spec: k3rs_common::resources::CustomResourceDefinitionSpec =
             serde_json::from_value(serde_json::json!({
                 "group": "example.com",
                 "names": {"kind": "Widget", "plural": "widgets"},
@@ -51,7 +51,7 @@ mod whole_object_tests {
             .unwrap_or_else(|| panic!("{errs:?}"));
         assert_eq!(
             e.error_type,
-            rusternetes_common::validation::field::ErrorType::NotSupported,
+            k3rs_common::validation::field::ErrorType::NotSupported,
             "{errs:?}"
         );
         assert!(
@@ -78,7 +78,7 @@ mod whole_object_tests {
             .unwrap_or_else(|| panic!("{errs:?}"));
         assert_eq!(
             e.error_type,
-            rusternetes_common::validation::field::ErrorType::NotSupported,
+            k3rs_common::validation::field::ErrorType::NotSupported,
             "{errs:?}"
         );
         assert!(
@@ -185,7 +185,7 @@ mod whole_object_tests {
 mod ca_bundle_tests {
     use super::__parent::*;
     use base64::Engine;
-    use rusternetes_common::validation::crd::*;
+    use k3rs_common::validation::crd::*;
 
     const CERT: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBbzCCARWgAwIBAgIUNlw6NuSK77Vukti6ud7ET7GhqoEwCgYIKoZIzj0EAwIw
@@ -209,10 +209,10 @@ AiEAhWF2/JiVNXisqXic1Dfy761y8wW/Io2IJoBMvcYxo4E=
             "schema": {"openAPIV3Schema": {"type": "object"}}
         }))
         .unwrap()];
-        c.spec.conversion = Some(rusternetes_common::resources::CustomResourceConversion {
+        c.spec.conversion = Some(k3rs_common::resources::CustomResourceConversion {
             strategy: Some(ConversionStrategyType::Webhook),
-            webhook: Some(rusternetes_common::resources::WebhookConversion {
-                client_config: rusternetes_common::resources::WebhookClientConfig {
+            webhook: Some(k3rs_common::resources::WebhookConversion {
+                client_config: k3rs_common::resources::WebhookClientConfig {
                     url: Some("https://example.com/convert".into()),
                     service: None,
                     ca_bundle: bundle,
@@ -316,7 +316,7 @@ mod structural_schema_tests {
     //! (`validation.go:1748-1777`).
 
     use super::__parent::*;
-    use rusternetes_common::validation::crd::*;
+    use k3rs_common::validation::crd::*;
     use serde_json::json;
 
     /// `validValidationSchema` (`validation_test.go:11487`), trimmed to the
@@ -623,7 +623,7 @@ mod selectable_fields_tests {
     //! (`validation.go:296-320`, `:847-890`; `schema/cel/validation.go:557-676`).
 
     use super::__parent::*;
-    use rusternetes_common::validation::crd::*;
+    use k3rs_common::validation::crd::*;
     use serde_json::json;
 
     fn crd_with_version(
@@ -811,8 +811,8 @@ mod defaults_tests {
     //! below `openAPIV3Schema`) pairs matched as a multiset.
 
     use super::__parent::*;
-    use rusternetes_common::validation::crd::*;
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_common::validation::crd::*;
+    use k3rs_common::validation::field::ErrorType;
     use serde_json::{json, Value};
 
     fn crd_with_schema(schema: Value) -> CustomResourceDefinition {
@@ -1185,9 +1185,7 @@ mod defaults_tests {
     fn require_pruned_defaults_ratchet_on_update() {
         let old = crd_with_schema(unpruned_default_schema());
         assert!(
-            !rusternetes_common::validation::structural::defaulting::require_pruned_defaults(
-                &old.spec
-            )
+            !k3rs_common::validation::structural::defaulting::require_pruned_defaults(&old.spec)
         );
         let new = old.clone();
         let errs: Vec<_> = validate_custom_resource_definition_update(&new, &old)
@@ -1200,9 +1198,7 @@ mod defaults_tests {
             "type": "object", "properties": {"a": {"type": "string"}},
             "default": {"a": "x"}}})));
         assert!(
-            rusternetes_common::validation::structural::defaulting::require_pruned_defaults(
-                &clean.spec
-            )
+            k3rs_common::validation::structural::defaulting::require_pruned_defaults(&clean.spec)
         );
         let mut bad = clean.clone();
         bad.spec = old.spec.clone();
@@ -1217,8 +1213,8 @@ mod defaults_tests {
     /// `PruneDefaults` (`prune.go`): prunes a default against the root schema.
     #[test]
     fn prune_defaults_prunes_unknown_fields() {
-        use rusternetes_common::validation::structural::{defaulting, new_structural};
-        let schema: rusternetes_common::resources::crd::JSONSchemaProps =
+        use k3rs_common::validation::structural::{defaulting, new_structural};
+        let schema: k3rs_common::resources::crd::JSONSchemaProps =
             serde_json::from_value(unpruned_default_schema()).unwrap();
         let mut ss = new_structural(&schema).unwrap();
         defaulting::prune_defaults(&mut ss).unwrap();
@@ -1238,7 +1234,7 @@ mod openapi_schema_tests {
     //! The CEL cases of that test belong to the api-server crate.
 
     use super::__parent::*;
-    use rusternetes_common::validation::crd::*;
+    use k3rs_common::validation::crd::*;
     use serde_json::json;
 
     fn run(

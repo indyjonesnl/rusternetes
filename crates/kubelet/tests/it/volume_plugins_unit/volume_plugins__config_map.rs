@@ -4,20 +4,18 @@
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::{ConfigMap, ConfigMapVolumeSource, Pod};
-    pub use rusternetes_kubelet::volume_plugins::{
-        Attributes, Mounter, Spec, VolumeHost, VolumePlugin,
-    };
-    pub use rusternetes_kubelet::volumes::build_configmap_payload;
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_common::resources::{ConfigMap, ConfigMapVolumeSource, Pod};
+    pub use k3rs_kubelet::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
+    pub use k3rs_kubelet::volumes::build_configmap_payload;
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use std::sync::Arc;
     pub use tracing::info;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Volume;
-    use rusternetes_kubelet::volume_plugins::config_map::*;
+    use k3rs_common::resources::Volume;
+    use k3rs_kubelet::volume_plugins::config_map::*;
     use serde_json::json;
 
     /// A host rooted beside `dir`, so the wrapped emptyDir's ready dir
@@ -25,10 +23,10 @@ mod tests {
     fn test_host(dir: &std::path::Path) -> Arc<dyn VolumeHost> {
         let root = format!("{}-kubelet-root", dir.to_string_lossy());
         Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root,
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         )
@@ -36,10 +34,10 @@ mod tests {
 
     fn plugin() -> ConfigMapPlugin {
         ConfigMapPlugin::new(std::sync::Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -81,10 +79,7 @@ mod tests {
 
     #[test]
     fn plugin_name_is_the_upstream_name() {
-        assert_eq!(
-            plugin().name(),
-            rusternetes_kubelet::pod_dirs::plugin::CONFIG_MAP
-        );
+        assert_eq!(plugin().name(), k3rs_kubelet::pod_dirs::plugin::CONFIG_MAP);
     }
 
     fn cm(pairs: &[(&str, &str)]) -> ConfigMap {
@@ -95,7 +90,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ktp(key: &str, path: &str) -> rusternetes_common::resources::KeyToPath {
+    fn ktp(key: &str, path: &str) -> k3rs_common::resources::KeyToPath {
         serde_json::from_value(json!({"key": key, "path": path})).unwrap()
     }
 
@@ -120,7 +115,7 @@ mod tests {
     #[test]
     fn empty_items_list_projects_every_key() {
         let c = cm(&[("a", "1"), ("b", "2")]);
-        let items: Vec<rusternetes_common::resources::KeyToPath> = vec![];
+        let items: Vec<k3rs_common::resources::KeyToPath> = vec![];
         let payload = build_configmap_payload(&c, Some(&items), "cm", false, 0o644).unwrap();
         assert_eq!(payload.len(), 2);
     }
@@ -144,7 +139,7 @@ mod tests {
     /// NotFound is tolerated for an optional ConfigMap; any other error fails.
     #[test]
     fn only_not_found_is_tolerated_when_optional() {
-        use rusternetes_common::Error;
+        use k3rs_common::Error;
         assert!(tolerate_get_error(&Error::NotFound("x".into()), true));
         assert!(!tolerate_get_error(&Error::NotFound("x".into()), false));
         assert!(!tolerate_get_error(&Error::Storage("boom".into()), true));
@@ -152,7 +147,7 @@ mod tests {
 
     fn mounter(dir: &std::path::Path, optional: bool) -> ConfigMapMounter {
         ConfigMapMounter {
-            metrics: rusternetes_kubelet::volume_plugins::metrics_cached::cached_du(
+            metrics: k3rs_kubelet::volume_plugins::metrics_cached::cached_du(
                 &dir.to_string_lossy(),
             ),
             path: dir.to_string_lossy().into_owned(),
@@ -161,7 +156,7 @@ mod tests {
             config_map: serde_json::from_value(json!({"name": "missing", "optional": optional}))
                 .unwrap(),
             storage: Some(Arc::new(StorageBackend::Memory(Arc::new(
-                rusternetes_storage::MemoryStorage::new(),
+                k3rs_storage::MemoryStorage::new(),
             )))),
             host: test_host(dir),
             pod: serde_json::from_value(json!({
@@ -226,14 +221,14 @@ mod tests {
             migrated: false,
             inline_volume_spec_for_csi_migration: false,
         };
-        let pod: rusternetes_common::resources::Pod = serde_json::from_value(
+        let pod: k3rs_common::resources::Pod = serde_json::from_value(
             json!({"metadata": {"name": "p", "namespace": "default", "uid": "u"}, "spec": {"containers": []}}),
         )
         .unwrap();
         let m = plugin().new_mounter(&spec, &pod).await.unwrap();
         assert_eq!(
             m.get_attributes(),
-            rusternetes_kubelet::volume_plugins::plugin::Attributes {
+            k3rs_kubelet::volume_plugins::plugin::Attributes {
                 read_only: true,
                 managed: true,
                 selinux_relabel: true
@@ -254,7 +249,7 @@ mod tests {
         let dir = tmp.path().join("vol");
         let gid = i64::from(std::fs::metadata(tmp.path()).unwrap().gid());
         let storage = Arc::new(StorageBackend::Memory(Arc::new(
-            rusternetes_storage::MemoryStorage::new(),
+            k3rs_storage::MemoryStorage::new(),
         )));
         let cm: ConfigMap = serde_json::from_value(json!({
             "metadata": {"name": "cm", "namespace": "ns"},
@@ -266,7 +261,7 @@ mod tests {
             .await
             .unwrap();
         let m = ConfigMapMounter {
-            metrics: rusternetes_kubelet::volume_plugins::metrics_cached::cached_du(""),
+            metrics: k3rs_kubelet::volume_plugins::metrics_cached::cached_du(""),
             path: dir.to_string_lossy().into_owned(),
             volume_name: "cfg".into(),
             namespace: "ns".into(),
@@ -279,7 +274,7 @@ mod tests {
             )
             .unwrap(),
         };
-        m.set_up_with(&rusternetes_kubelet::volume_plugins::MounterArgs {
+        m.set_up_with(&k3rs_kubelet::volume_plugins::MounterArgs {
             fs_group: Some(gid),
             ..Default::default()
         })

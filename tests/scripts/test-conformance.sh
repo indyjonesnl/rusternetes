@@ -8,7 +8,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== Rusternetes Conformance Test Runner ===${NC}\n"
+echo -e "${GREEN}=== k3rs Conformance Test Runner ===${NC}\n"
 
 # Check if KUBELET_VOLUMES_PATH is set
 if [ -z "$KUBELET_VOLUMES_PATH" ]; then
@@ -17,7 +17,7 @@ if [ -z "$KUBELET_VOLUMES_PATH" ]; then
     echo "You must set this to an absolute path before starting the cluster."
     echo ""
     echo "Example:"
-    echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes"
+    echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.k3rs/volumes"
     echo "  $0"
     echo ""
     exit 1
@@ -54,7 +54,7 @@ fi
 COMPOSE="$COMPOSE_CMD -f $COMPOSE_FILE"
 
 # Check if cluster is already running
-if $RUNTIME ps --filter "name=rusternetes" --format "{{.Names}}" | grep -q rusternetes; then
+if $RUNTIME ps --filter "name=k3rs" --format "{{.Names}}" | grep -q k3rs; then
     echo -e "${YELLOW}Cluster is already running${NC}"
     read -p "Do you want to restart it? (y/N): " -n 1 -r
     echo
@@ -65,7 +65,7 @@ if $RUNTIME ps --filter "name=rusternetes" --format "{{.Names}}" | grep -q ruste
         $COMPOSE up -d
     fi
 else
-    echo "Starting Rusternetes cluster..."
+    echo "Starting k3rs cluster..."
     $COMPOSE up -d
 fi
 
@@ -83,13 +83,13 @@ clusters:
 - cluster:
     insecure-skip-tls-verify: true
     server: https://localhost:6443
-  name: rusternetes
+  name: k3rs
 contexts:
 - context:
-    cluster: rusternetes
+    cluster: k3rs
     user: admin
-  name: rusternetes
-current-context: rusternetes
+  name: k3rs
+current-context: k3rs
 users:
 - name: admin
   user: {}
@@ -144,7 +144,7 @@ if [ -f "bootstrap-cluster.yaml" ]; then
     attempt=0
     while [ $attempt -lt $max_attempts ]; do
         if $KCTL get pods -n kube-system -l k8s-app=kube-dns 2>/dev/null | grep -q "Running"; then
-            echo -e "${GREEN}✓ cluster DNS (rusternetes-dns) is ready${NC}\n"
+            echo -e "${GREEN}✓ cluster DNS (k3rs-dns) is ready${NC}\n"
             break
         fi
         attempt=$((attempt + 1))
@@ -168,14 +168,14 @@ sonobuoy delete --wait 2>/dev/null || true
 
 # Clean up cluster-scoped RBAC resources that sonobuoy doesn't delete
 echo "Cleaning cluster-scoped Sonobuoy resources..."
-if docker exec rusternetes-etcd etcdctl --endpoints=http://localhost:2379 get --prefix "/registry/clusterrolebindings/sonobuoy" --keys-only 2>/dev/null | grep -q sonobuoy; then
+if docker exec k3rs-etcd etcdctl --endpoints=http://localhost:2379 get --prefix "/registry/clusterrolebindings/sonobuoy" --keys-only 2>/dev/null | grep -q sonobuoy; then
     echo "  - Deleting Sonobuoy ClusterRoleBindings..."
-    docker exec rusternetes-etcd etcdctl --endpoints=http://localhost:2379 del --prefix "/registry/clusterrolebindings/sonobuoy" >/dev/null 2>&1
+    docker exec k3rs-etcd etcdctl --endpoints=http://localhost:2379 del --prefix "/registry/clusterrolebindings/sonobuoy" >/dev/null 2>&1
 fi
 
-if docker exec rusternetes-etcd etcdctl --endpoints=http://localhost:2379 get --prefix "/registry/clusterroles/sonobuoy" --keys-only 2>/dev/null | grep -q sonobuoy; then
+if docker exec k3rs-etcd etcdctl --endpoints=http://localhost:2379 get --prefix "/registry/clusterroles/sonobuoy" --keys-only 2>/dev/null | grep -q sonobuoy; then
     echo "  - Deleting Sonobuoy ClusterRoles..."
-    docker exec rusternetes-etcd etcdctl --endpoints=http://localhost:2379 del --prefix "/registry/clusterroles/sonobuoy" >/dev/null 2>&1
+    docker exec k3rs-etcd etcdctl --endpoints=http://localhost:2379 del --prefix "/registry/clusterroles/sonobuoy" >/dev/null 2>&1
 fi
 
 # Delete namespace if it still exists (will cascade delete all namespaced resources)

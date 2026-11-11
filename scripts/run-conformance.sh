@@ -2,24 +2,24 @@
 set -e
 set -o pipefail
 
-# Conformance test runner for Rusternetes
+# Conformance test runner for k3rs
 # This script handles the full lifecycle of running Kubernetes conformance tests
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-echo "=== Rusternetes Conformance Test Runner ==="
+echo "=== k3rs Conformance Test Runner ==="
 echo ""
 
 # Setup kubeconfig
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 
 # Preflight: API server must be reachable, otherwise the cleanup step
 # silently aborts under `set -e` when kubectl can't connect.
 if ! curl -sk --max-time 5 https://localhost:6443/healthz >/dev/null 2>&1; then
     echo "ERROR: API server at https://localhost:6443 is not reachable." >&2
     echo "Start the cluster first, e.g.:" >&2
-    echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.rusternetes/volumes" >&2
+    echo "  export KUBELET_VOLUMES_PATH=\$(pwd)/.k3rs/volumes" >&2
     echo "  docker compose -f compose.all-in-one.yml up -d" >&2
     echo "  bash scripts/bootstrap-cluster.sh" >&2
     exit 1
@@ -54,7 +54,7 @@ curl -sk -X PATCH https://localhost:6443/api/v1/nodes/node-2 \
     -d '{"metadata":{"labels":{"kubernetes.io/os":"linux","kubernetes.io/arch":"amd64","kubernetes.io/hostname":"node-2"}}}' >/dev/null 2>&1 || echo "Warning: Could not label node-2"
 
 # Step 4: Ensure cluster DNS has a ready backend.
-# rusternetes-dns backs the kube-dns Service via EndpointSlices (CoreDNS has
+# k3rs-dns backs the kube-dns Service via EndpointSlices (CoreDNS has
 # been removed), so check for a ready kube-dns endpoint rather than a specific
 # DNS Pod.
 echo "[4/5] Checking cluster DNS (kube-dns endpoints) status..."
@@ -88,7 +88,7 @@ echo "Running: sonobuoy run --mode=${SONOBUOY_MODE} --wait"
 echo ""
 
 # Run sonobuoy and capture output
-# Force JSON encoding (rusternetes doesn't support protobuf, which is client-go's default)
+# Force JSON encoding (k3rs doesn't support protobuf, which is client-go's default)
 # The --kube-api-content-type flag tells the e2e test binary to use JSON for all API requests
 if sonobuoy run --mode="${SONOBUOY_MODE}" \
     --timeout 86400 \

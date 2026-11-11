@@ -2,17 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::resourcequota::config::LimitedResource;
-    pub use rusternetes_api_server::admission::resourcequota::evaluator::{
-        status_hard_names, Evaluator,
-    };
-    pub use rusternetes_api_server::registry::rest::GroupResource;
-    pub use rusternetes_common::admission::Operation;
-    pub use rusternetes_common::quota::{self, ResourceList};
-    pub use rusternetes_common::resources::ResourceQuota;
-    pub use rusternetes_common::resources::ScopedResourceSelectorRequirement;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_api_server::admission::resourcequota::config::LimitedResource;
+    pub use k3rs_api_server::admission::resourcequota::evaluator::{status_hard_names, Evaluator};
+    pub use k3rs_api_server::registry::rest::GroupResource;
+    pub use k3rs_common::admission::Operation;
+    pub use k3rs_common::quota::{self, ResourceList};
+    pub use k3rs_common::resources::ResourceQuota;
+    pub use k3rs_common::resources::ScopedResourceSelectorRequirement;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use serde_json::Value;
     pub use std::collections::{BTreeSet, HashMap};
 }
@@ -24,18 +22,18 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use rusternetes_common::admission::Operation;
-    use rusternetes_common::resources::{ResourceQuota, ResourceQuotaStatus};
-    use rusternetes_storage::{build_key, MemoryStorage, Storage};
+    use k3rs_common::admission::Operation;
+    use k3rs_common::resources::{ResourceQuota, ResourceQuotaStatus};
+    use k3rs_storage::{build_key, MemoryStorage, Storage};
     use serde_json::{json, Value};
 
-    use rusternetes_api_server::admission::resourcequota::evaluator::{
+    use k3rs_api_server::admission::resourcequota::evaluator::{
         evaluator_for, Evaluator, ObjectCountEvaluator, PodEvaluator, ServiceEvaluator,
     };
-    use rusternetes_api_server::admission::resourcequota::{
+    use k3rs_api_server::admission::resourcequota::{
         check_request, evaluate, Attributes, QuotaError,
     };
-    use rusternetes_api_server::registry::rest::GroupResource;
+    use k3rs_api_server::registry::rest::GroupResource;
 
     fn list(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -374,7 +372,7 @@ mod tests {
 
         let cm = configmap();
         let ev = evaluator_for(&GroupResource::new("", "configmaps")).unwrap();
-        rusternetes_api_server::admission::resourcequota::check_quotas(
+        k3rs_api_server::admission::resourcequota::check_quotas(
             &storage,
             vec![first],
             &attrs(Operation::Create, &cm, None),
@@ -412,8 +410,7 @@ mod tests {
         )
     }
 
-    fn pvc_evaluator(
-    ) -> Box<dyn rusternetes_api_server::admission::resourcequota::evaluator::Evaluator> {
+    fn pvc_evaluator() -> Box<dyn k3rs_api_server::admission::resourcequota::evaluator::Evaluator> {
         evaluator_for(&GroupResource::new("", "persistentvolumeclaims")).unwrap()
     }
 
@@ -769,7 +766,7 @@ mod tests {
     /// `TestPersistentVolumeClaimEvaluatorMatchingScopes` through the trait.
     #[test]
     fn pvc_evaluator_matching_scopes_and_uncovered() {
-        use rusternetes_common::resources::ScopedResourceSelectorRequirement as Sel;
+        use k3rs_common::resources::ScopedResourceSelectorRequirement as Sel;
         let ev = pvc_evaluator();
         let sel = |op: &str, v: &[&str]| Sel {
             scope_name: "VolumeAttributesClass".into(),
@@ -890,7 +887,7 @@ mod tests {
     /// `TestPodEvaluatorMatchingScopes`, a representative slice.
     #[test]
     fn pod_evaluator_matching_scopes() {
-        use rusternetes_common::resources::ScopedResourceSelectorRequirement as S;
+        use k3rs_common::resources::ScopedResourceSelectorRequirement as S;
         let sel = |name: &str, op: &str, values: Option<Vec<&str>>| S {
             scope_name: name.to_string(),
             operator: op.to_string(),
@@ -1066,11 +1063,11 @@ mod tests {
     // AllowDecrease}UsageWithoutCoveringQuota (plugin/pkg/admission/resourcequota)
     // ---------------------------------------------------------------------
 
-    use rusternetes_api_server::admission::resourcequota::config::{
+    use k3rs_api_server::admission::resourcequota::config::{
         from_admission_configuration, load_configuration,
     };
-    use rusternetes_api_server::admission::resourcequota::{evaluate_with, LimitedResource};
-    use rusternetes_common::resources::ScopedResourceSelectorRequirement;
+    use k3rs_api_server::admission::resourcequota::{evaluate_with, LimitedResource};
+    use k3rs_common::resources::ScopedResourceSelectorRequirement;
 
     fn limited(resource: &str, contains: &[&str]) -> LimitedResource {
         LimitedResource {

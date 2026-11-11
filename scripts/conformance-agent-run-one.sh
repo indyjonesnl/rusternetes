@@ -18,7 +18,7 @@
 # Optional env / flags:
 #   PER_TEST_TIMEOUT=300      seconds before SIGTERM (default 5 min)
 #   CONFORMANCE_IMAGE=…       defaults to v1.35.0
-#   RESULTS_CSV=<path>        defaults to ${AGENT_WORKDIR}/.rusternetes/agents/${AGENT_ID}/results/results.csv
+#   RESULTS_CSV=<path>        defaults to ${AGENT_WORKDIR}/.k3rs/agents/${AGENT_ID}/results/results.csv
 
 set -uo pipefail
 
@@ -91,12 +91,12 @@ START=$(date +%s)
 TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
 # Output dir for hydrophone inside the dind workspace.
-INNER_OUT="/workspace/.rusternetes/agents/${AGENT_ID}/per-test/${SLUG}"
+INNER_OUT="/workspace/.k3rs/agents/${AGENT_ID}/per-test/${SLUG}"
 
 set +e
 timeout --kill-after=15 "${PER_TEST_TIMEOUT}" docker exec \
   -w /workspace \
-  -e KUBECONFIG="/workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal" \
+  -e KUBECONFIG="/workspace/.k3rs/agents/${AGENT_ID}/kubeconfig-internal" \
   "$DIND_NAME" \
   hydrophone \
     --conformance-image "$CONFORMANCE_IMAGE" \
@@ -135,7 +135,7 @@ fi
 # Always cleanup so the next test starts fresh. Ignore errors — best effort.
 docker exec "$DIND_NAME" \
   hydrophone --cleanup \
-  --kubeconfig "/workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal" \
+  --kubeconfig "/workspace/.k3rs/agents/${AGENT_ID}/kubeconfig-internal" \
   >/dev/null 2>&1 || true
 
 # CSV-quote the upstream name (contains commas, brackets).

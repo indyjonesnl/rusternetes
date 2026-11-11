@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-    pub use rusternetes_common::resources::{NonResourceRule, ResourceRule};
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+    pub use k3rs_common::resources::{NonResourceRule, ResourceRule};
     pub use serde::Deserialize;
     pub use std::path::Path;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::abac::*;
+    use k3rs_api_server::abac::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ALL_AUTHENTICATED: &str = "system:authenticated";
@@ -355,7 +355,7 @@ mod tests {
             ),
         ];
         for (i, (u, ns, want_r, want_nr)) in cases.into_iter().enumerate() {
-            let rusternetes_common::authz::UserRulesOutcome {
+            let k3rs_common::authz::UserRulesOutcome {
                 resource_rules: rr,
                 non_resource_rules: nrr,
                 ..

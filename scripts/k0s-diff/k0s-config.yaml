@@ -7,7 +7,7 @@ spec:
     port: 6443
   # Embedded kine -> SQLite (all-Go) — the fixed datastore for every variant.
   # kine exposes the etcd v3 gRPC API in-process, so the later v1 variant
-  # (rusternetes-api-server) can point --etcd_servers at kine's endpoint.
+  # (k3rs-api-server) can point --etcd_servers at kine's endpoint.
   storage:
     type: kine
     kine:

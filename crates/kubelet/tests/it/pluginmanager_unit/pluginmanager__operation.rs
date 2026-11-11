@@ -3,14 +3,12 @@
 
 mod __parent {
     pub use hyper_util::rt::TokioIo;
-    pub use rusternetes_kubelet::pluginmanager::cache::{
-        ActualStateOfWorld, PluginHandler, PluginInfo,
-    };
-    pub use rusternetes_kubelet::pluginmanager::operation::registerapi::registration_client::RegistrationClient;
-    pub use rusternetes_kubelet::pluginmanager::operation::registerapi::{
+    pub use k3rs_kubelet::pluginmanager::cache::{ActualStateOfWorld, PluginHandler, PluginInfo};
+    pub use k3rs_kubelet::pluginmanager::operation::registerapi::registration_client::RegistrationClient;
+    pub use k3rs_kubelet::pluginmanager::operation::registerapi::{
         InfoRequest, RegistrationStatus,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::exponential_backoff::ExponentialBackoff;
+    pub use k3rs_kubelet::volume_plugins::util::exponential_backoff::ExponentialBackoff;
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, Mutex};
     pub use std::time::Duration;
@@ -20,7 +18,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pluginmanager::operation::*;
+    use k3rs_kubelet::pluginmanager::operation::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 

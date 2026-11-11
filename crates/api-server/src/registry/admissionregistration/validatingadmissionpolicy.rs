@@ -4,24 +4,24 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
-use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
+use k3rs_common::authz::Authorizer;
+use k3rs_common::cel_env::{mutation_env_failure, ExpectedOutput, MutationEnv};
+use k3rs_common::cel_versions::{self, EnvSet, EnvType};
 
-use rusternetes_common::cel_mutation_types::{observe_expression, PolicyExpression};
-use rusternetes_common::resources::validating_admission_policy::{
+use k3rs_common::cel_mutation_types::{observe_expression, PolicyExpression};
+use k3rs_common::resources::validating_admission_policy::{
     ValidatingAdmissionPolicySpec, ValidatingAdmissionPolicyStatus,
 };
-use rusternetes_common::resources::ValidatingAdmissionPolicy;
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::validation::validating_admission_policy::{
+use k3rs_common::resources::ValidatingAdmissionPolicy;
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_common::validation::validating_admission_policy::{
     find_validating_policy_preexisting_expressions,
     ignore_validating_admission_policy_match_conditions, set_defaults_validating_admission_policy,
     validate_validating_admission_policy, validate_validating_admission_policy_status_update,
     PreexistingExpressions, MAX_AUDIT_ANNOTATION_VALUE_EXPRESSION_LENGTH,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use super::authz::{authorize_param_kind, ParamAuthz};
 use crate::registry::generic::Store;

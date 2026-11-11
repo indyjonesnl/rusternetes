@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::admission::Operation;
+    pub use k3rs_common::admission::Operation;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::plugin_metrics::*;
+    use k3rs_api_server::admission::plugin_metrics::*;
 
     #[test]
     fn handlers_match_upstream_new_handler() {

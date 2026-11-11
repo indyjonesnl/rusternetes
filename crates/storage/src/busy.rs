@@ -27,8 +27,8 @@
 //! than the 409/503 the issue sketched, since 409 means "re-read and retry"
 //! and 503 has no apiserver storage mapping.
 
-use rusternetes_common::types::{Status, StatusDetails};
-use rusternetes_common::Error;
+use k3rs_common::types::{Status, StatusDetails};
+use k3rs_common::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;

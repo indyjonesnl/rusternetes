@@ -11,7 +11,7 @@
 //!   `admission.Connect`.
 
 use axum::http::StatusCode;
-use rusternetes_common::{
+use k3rs_common::{
     admission::{AdmissionReview, AdmissionReviewResponse, PatchOp, PatchOperation},
     resources::{
         FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
@@ -19,9 +19,9 @@ use rusternetes_common::{
         WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
+use k3rs_test_support::mock_http::*;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -66,7 +66,7 @@ async fn install_mutating(api: &TestApiServer, url: String, resource: &str) {
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "MutatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mutate-connect"),
+        metadata: k3rs_common::types::ObjectMeta::new("mutate-connect"),
         webhooks: Some(vec![MutatingWebhook {
             name: "mutate.connect.io".into(),
             client_config: WebhookClientConfig {
@@ -99,7 +99,7 @@ async fn install_validating(api: &TestApiServer, url: String, resource: &str) {
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "ValidatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("validate-connect"),
+        metadata: k3rs_common::types::ObjectMeta::new("validate-connect"),
         webhooks: Some(vec![ValidatingWebhook {
             name: "validate.connect.io".into(),
             client_config: WebhookClientConfig {

@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::volume_plugins::host::{KubeletVolumeHost, VolumeHost};
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
+    pub use k3rs_kubelet::volume_plugins::host::{KubeletVolumeHost, VolumeHost};
+    pub use k3rs_kubelet::volume_plugins::plugin::{
         Attributes, DeviceMounter, DeviceMounterArgs, DeviceUnmounter, Mounter, MounterArgs,
         OwnedSpec, ReconstructedVolume, Spec, Unmounter, VolumePlugin,
     };
-    pub use rusternetes_kubelet::volume_plugins::registry::{PluginLookupError, VolumePluginMgr};
+    pub use k3rs_kubelet::volume_plugins::registry::{PluginLookupError, VolumePluginMgr};
 }
 
 mod create_volume_tests {
@@ -25,10 +25,10 @@ mod create_volume_tests {
     //! `TestCollectDataWithServiceAccountToken`, and `requiresRefresh` in
     //! `pkg/kubelet/token/token_manager.go`).
 
-    use rusternetes_common::auth::{ServiceAccountClaims, TokenManager};
-    use rusternetes_common::resources::{ConfigMap, Pod, Secret, Volume};
-    use rusternetes_kubelet::volumes::VolumeManager;
-    use rusternetes_storage::{build_key, Storage, StorageBackend};
+    use k3rs_common::auth::{ServiceAccountClaims, TokenManager};
+    use k3rs_common::resources::{ConfigMap, Pod, Secret, Volume};
+    use k3rs_kubelet::volumes::VolumeManager;
+    use k3rs_storage::{build_key, Storage, StorageBackend};
     use serde_json::json;
     use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
@@ -375,7 +375,7 @@ mod create_volume_tests {
 
     /// `TestCollectDataWithServiceAccountToken`: the token lands at `path` with
     /// `defaultMode`; claims carry the pod/SA/node identity. Default lifetime is
-    /// 3600s, default audience (self-mint fallback) is "rusternetes".
+    /// 3600s, default audience (self-mint fallback) is "k3rs".
     #[tokio::test]
     async fn projected_sa_token_is_minted_with_bound_claims() {
         let e = env();
@@ -390,7 +390,7 @@ mod create_volume_tests {
         let c = read_claims(&file);
         assert_eq!(c.sub, "system:serviceaccount:default:sa1");
         assert_eq!(c.uid, "sa-uid-1");
-        assert_eq!(c.aud, vec!["rusternetes".to_string()]);
+        assert_eq!(c.aud, vec!["k3rs".to_string()]);
         assert_eq!(c.exp - c.iat, 3600);
         assert_eq!(c.pod_name.as_deref(), Some("p"));
         assert_eq!(c.pod_uid.as_deref(), Some("uid-1"));
@@ -481,13 +481,13 @@ mod mounter_args_tests {
     //! EMPTY args: nothing may be chowned/chmodded (setgid stays off). The mirror
     //! test builds it from a pod WITHOUT fsGroup and passes the group in args.
 
-    use rusternetes_common::resources::{Pod, Volume};
-    use rusternetes_kubelet::volume_plugins::plugin::{Mounter, MounterArgs, Spec, VolumePlugin};
-    use rusternetes_kubelet::volume_plugins::{
+    use k3rs_common::resources::{Pod, Volume};
+    use k3rs_kubelet::volume_plugins::plugin::{Mounter, MounterArgs, Spec, VolumePlugin};
+    use k3rs_kubelet::volume_plugins::{
         config_map::ConfigMapPlugin, downward_api::DownwardApiPlugin, empty_dir::EmptyDirPlugin,
         projected::ProjectedPlugin, secret::SecretPlugin, KubeletVolumeHost,
     };
-    use rusternetes_storage::{MemoryStorage, StorageBackend};
+    use k3rs_storage::{MemoryStorage, StorageBackend};
     use serde_json::json;
     use std::collections::HashMap;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -495,11 +495,11 @@ mod mounter_args_tests {
 
     fn host() -> Arc<KubeletVolumeHost> {
         Arc::new(KubeletVolumeHost::new_for_tests(
-            "/var/lib/rusternetes".to_string(),
+            "/var/lib/k3rs".to_string(),
             Some(Arc::new(StorageBackend::Memory(Arc::new(
                 MemoryStorage::new(),
             )))),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         ))
     }
@@ -508,12 +508,12 @@ mod mounter_args_tests {
     /// `pkg/kubelet/volume_host.go:294`) returns the kubelet's node name.
     #[test]
     fn get_node_name_returns_the_configured_node() {
-        use rusternetes_kubelet::volume_plugins::VolumeHost;
+        use k3rs_kubelet::volume_plugins::VolumeHost;
         assert_eq!(host().get_node_name(), "");
         let h = KubeletVolumeHost::new_for_tests(
-            "/var/lib/rusternetes".to_string(),
+            "/var/lib/k3rs".to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         )
         .with_node_name("node-7");
@@ -631,20 +631,20 @@ mod set_up_at_tests {
     //! `SetUp`); hostPath's `SetUpAt` is `"SetUpAt() does not make sense for host
     //! paths"` (`pkg/volume/hostpath/host_path.go:257-260`).
 
-    use rusternetes_common::resources::{Pod, Volume};
-    use rusternetes_kubelet::volume_plugins::empty_dir::EmptyDirPlugin;
-    use rusternetes_kubelet::volume_plugins::host_path::HostPathPlugin;
-    use rusternetes_kubelet::volume_plugins::plugin::{Mounter, MounterArgs, Spec, VolumePlugin};
+    use k3rs_common::resources::{Pod, Volume};
+    use k3rs_kubelet::volume_plugins::empty_dir::EmptyDirPlugin;
+    use k3rs_kubelet::volume_plugins::host_path::HostPathPlugin;
+    use k3rs_kubelet::volume_plugins::plugin::{Mounter, MounterArgs, Spec, VolumePlugin};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn host() -> Arc<rusternetes_kubelet::volume_plugins::KubeletVolumeHost> {
+    fn host() -> Arc<k3rs_kubelet::volume_plugins::KubeletVolumeHost> {
         Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         )
@@ -732,10 +732,8 @@ mod set_up_at_tests {
     async fn set_up_with_args_delegates_to_set_up_at_get_path() {
         use std::sync::Mutex;
         struct Rec(Mutex<Vec<(String, Option<i64>)>>);
-        impl rusternetes_kubelet::volume_plugins::plugin::MetricsProvider for Rec {
-            fn get_metrics(
-                &self,
-            ) -> anyhow::Result<rusternetes_kubelet::volume_plugins::plugin::Metrics> {
+        impl k3rs_kubelet::volume_plugins::plugin::MetricsProvider for Rec {
+            fn get_metrics(&self) -> anyhow::Result<k3rs_kubelet::volume_plugins::plugin::Metrics> {
                 Ok(Default::default())
             }
         }
@@ -749,7 +747,7 @@ mod set_up_at_tests {
                 self.0.lock().unwrap().push((dir.into(), args.fs_group));
                 Ok(())
             }
-            fn get_attributes(&self) -> rusternetes_kubelet::volume_plugins::plugin::Attributes {
+            fn get_attributes(&self) -> k3rs_kubelet::volume_plugins::plugin::Attributes {
                 Default::default()
             }
         }

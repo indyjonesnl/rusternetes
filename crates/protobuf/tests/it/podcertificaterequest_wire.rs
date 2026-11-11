@@ -5,7 +5,7 @@
 //! field 3, so `notBefore` is tag 4). The API server serves
 //! `/apis/certificates.k8s.io/v1beta1/.../podcertificaterequests`, so a
 //! protobuf client (Accept: application/vnd.kubernetes.protobuf) must work.
-use rusternetes_protobuf::ProtoRegistry;
+use k3rs_protobuf::ProtoRegistry;
 use serde_json::json;
 
 fn len_field(tag: u8, body: &[u8]) -> Vec<u8> {

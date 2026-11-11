@@ -2,7 +2,7 @@
 ///
 /// This module implements the Table output format that kubectl uses to display
 /// resources in a human-readable table format.
-use rusternetes_common::types::ObjectMeta;
+use k3rs_common::types::ObjectMeta;
 use serde::{Deserialize, Serialize};
 
 /// Table is the response format for kubectl get requests with Accept: application/json;as=Table
@@ -863,31 +863,31 @@ pub fn wants_table(accept_header: Option<&str>) -> bool {
 
 // Trait implementations for common resource types
 
-impl HasMetadata for rusternetes_common::resources::Pod {
+impl HasMetadata for k3rs_common::resources::Pod {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }
 }
 
-impl HasMetadata for rusternetes_common::resources::Deployment {
+impl HasMetadata for k3rs_common::resources::Deployment {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }
 }
 
-impl HasMetadata for rusternetes_common::resources::Service {
+impl HasMetadata for k3rs_common::resources::Service {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }
 }
 
-impl HasMetadata for rusternetes_common::resources::ReplicationController {
+impl HasMetadata for k3rs_common::resources::ReplicationController {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }
 }
 
-impl HasMetadata for rusternetes_common::resources::ReplicaSet {
+impl HasMetadata for k3rs_common::resources::ReplicaSet {
     fn metadata(&self) -> &ObjectMeta {
         &self.metadata
     }

@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::RuntimeClass;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::runtimeclass::{
+    pub use k3rs_common::resources::RuntimeClass;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::runtimeclass::{
         get_warnings_for_runtime_class, validate_runtime_class, validate_runtime_class_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::node::runtimeclass::*;
+    use k3rs_api_server::registry::node::runtimeclass::*;
 
     fn rc(handler: &str) -> RuntimeClass {
         serde_json::from_value(serde_json::json!({

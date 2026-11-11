@@ -25,11 +25,11 @@ use axum::{
     http::{Method, Request, StatusCode},
 };
 use futures::StreamExt;
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
+use k3rs_api_server::{router::build_router, state::ApiServerState};
+use k3rs_common::{
     auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
 };
-use rusternetes_storage::{build_key, RhinoStorage, Storage, StorageBackend};
+use k3rs_storage::{build_key, RhinoStorage, Storage, StorageBackend};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,10 +42,7 @@ const OBJ: &str = "w1";
 /// Fresh on-disk SQLite DB path per test, unique by uuid, under the temp dir.
 fn fresh_db_path() -> String {
     let mut p = std::env::temp_dir();
-    p.push(format!(
-        "rusternetes-watch-rhino-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    p.push(format!("k3rs-watch-rhino-{}.db", uuid::Uuid::new_v4()));
     p.to_string_lossy().into_owned()
 }
 
@@ -216,7 +213,7 @@ async fn run_case(case: &Case) -> Vec<String> {
             )
             .await;
         // ServiceAccount admission needs the account the SA controller makes.
-        rusternetes_test_support::harness::seed_default_service_account(&*state.storage, NS).await;
+        k3rs_test_support::harness::seed_default_service_account(&*state.storage, NS).await;
     }
 
     // Open the watch and start collecting (ADDED, MODIFIED, DELETED = 3).
@@ -544,8 +541,7 @@ async fn pod_status_patch_container_statuses_visible_on_rhino_reads() {
     )
     .await;
     assert!(s.is_success() || s == StatusCode::CONFLICT, "{s} {b}");
-    rusternetes_test_support::harness::seed_default_service_account(&*state.storage, "default")
-        .await;
+    k3rs_test_support::harness::seed_default_service_account(&*state.storage, "default").await;
     let pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"p"},
         "spec":{"nodeName":"n","containers":[{"name":"c","image":"busybox"}]}});
     let (s, b) = send(

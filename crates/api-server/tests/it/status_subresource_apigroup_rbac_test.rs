@@ -25,12 +25,12 @@
 //! The core-group cases in the same file guard the other direction: `/api/v1/…`
 //! must keep authorizing as `""`.
 
-use rusternetes_common::{
+use k3rs_common::{
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, ServiceAccount, Subject},
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TOKEN_SECRET: &[u8] = b"status-apigroup-rbac-secret";
@@ -75,7 +75,7 @@ async fn seed_sa(state: &TestApiServer, namespace: &str, name: &str) -> String {
 /// handler would (claim shape: upstream `pkg/serviceaccount/claims.go`).
 fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
     let now = chrono::Utc::now();
-    let claims = rusternetes_common::auth::ServiceAccountClaims {
+    let claims = k3rs_common::auth::ServiceAccountClaims {
         sub: format!("system:serviceaccount:{namespace}:{sa_name}"),
         namespace: namespace.to_string(),
         uid: uid.to_string(),
@@ -83,9 +83,9 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         exp: (now + chrono::Duration::hours(1)).timestamp(),
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
         aud: vec!["https://kubernetes.default.svc".to_string()],
-        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+        kubernetes: Some(k3rs_common::auth::KubernetesClaims {
             namespace: namespace.to_string(),
-            svcacct: rusternetes_common::auth::KubeRef {
+            svcacct: k3rs_common::auth::KubeRef {
                 name: sa_name.to_string(),
                 uid: uid.to_string(),
             },
@@ -100,7 +100,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         node_uid: None,
         jti: String::new(),
     };
-    rusternetes_common::auth::TokenManager::new(TOKEN_SECRET)
+    k3rs_common::auth::TokenManager::new(TOKEN_SECRET)
         .generate_token(claims)
         .unwrap()
 }

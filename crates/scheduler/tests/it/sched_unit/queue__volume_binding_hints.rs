@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::{
         CSIDriver, CSINode, CSIStorageCapacity, PersistentVolumeClaim, Pod, StorageClass,
     };
-    pub use rusternetes_scheduler::queue::events::*;
-    pub use rusternetes_scheduler::volume_binding::{pod_volumes, volume_pvc_name};
+    pub use k3rs_scheduler::queue::events::*;
+    pub use k3rs_scheduler::volume_binding::{pod_volumes, volume_pvc_name};
     pub use tracing::debug;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::volume_binding_hints::*;
+    use k3rs_scheduler::queue::volume_binding_hints::*;
     use serde_json::{json, Value};
 
     type HintFn =

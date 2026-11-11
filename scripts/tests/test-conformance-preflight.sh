@@ -46,7 +46,7 @@ case "$args" in
         printf '%s' "${SCHED_PHASE-Running}"; exit 0 ;;
     *"pod -n kube-system kube-controller-manager-node-1"*)
         printf '%s' "${CM_PHASE-Running}"; exit 0 ;;
-    *"deploy -n kube-system rusternetes-dns"*)
+    *"deploy -n kube-system k3rs-dns"*)
         printf '%s' "${DNS_READY-1}"; exit 0 ;;
     *"get pod -n kube-system"*)
         # Any other pod name: the caller overrode --control-plane-pods, so
@@ -90,10 +90,10 @@ case "${1:-}" in
         # Which containers exist. node-2 peers and the store are individually
         # switchable so the "no pair present" and "no store" paths get covered.
         case "$name" in
-            rusternetes-kubelet)   [ "${KUBELET_PRESENT:-1}"  = "1" ] || exit 1 ;;
-            rusternetes-kubelet2|rusternetes-kube-proxy2|rusternetes-containerd2)
+            k3rs-kubelet)   [ "${KUBELET_PRESENT:-1}"  = "1" ] || exit 1 ;;
+            k3rs-kubelet2|k3rs-kube-proxy2|k3rs-containerd2)
                                    [ "${NODE2_PRESENT:-1}"    = "1" ] || exit 1 ;;
-            rusternetes-rhino)     [ "${RHINO_PRESENT:-1}"    = "1" ] || exit 1 ;;
+            k3rs-rhino)     [ "${RHINO_PRESENT:-1}"    = "1" ] || exit 1 ;;
         esac
         case "$fmt" in
             "")
@@ -103,7 +103,7 @@ case "${1:-}" in
                 if [ "${CERTS_MOUNTED:-1}" = "1" ]; then
                     printf '%s:%s\n' "${CERTS_PATH}" "${CERTS_PATH}"
                 else
-                    printf '%s:/etc/rusternetes/certs\n' "${CERTS_PATH}"
+                    printf '%s:/etc/k3rs/certs\n' "${CERTS_PATH}"
                 fi
                 exit 0 ;;
         esac ;;
@@ -202,7 +202,7 @@ expect_case "absent static pod is refused" 2 "does not exist" \
     "SCHED_PHASE="
 
 # Trap 2: unresolvable control-plane images -> dns never becomes ready.
-expect_case "dns without a ready backend is refused" 2 "rusternetes-dns readyReplicas=0" \
+expect_case "dns without a ready backend is refused" 2 "k3rs-dns readyReplicas=0" \
     "DNS_READY=0"
 
 # Trap 3: host over the imagefs eviction threshold.
@@ -284,7 +284,7 @@ else
     fail=1
 fi
 
-# A cluster whose control plane is not rusternetes' (vanilla kind) can opt out
+# A cluster whose control plane is not k3rs' (vanilla kind) can opt out
 # of the assertion entirely — 'none' must not degrade into a pod literally
 # named "none".
 PREFLIGHT_FLAGS=(--control-plane-pods none)

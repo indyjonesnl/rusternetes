@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_common::error::Error;
+    pub use k3rs_common::resources::crd::JSONSchemaProps;
     pub use regex::Regex;
-    pub use rusternetes_common::error::Error;
-    pub use rusternetes_common::resources::crd::JSONSchemaProps;
     pub use serde_json::Value;
     pub use std::collections::HashMap;
     pub use std::sync::{LazyLock, RwLock};
@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::schema_validation::*;
+    use k3rs_common::schema_validation::*;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -170,12 +170,10 @@ mod tests {
         let schema = JSONSchemaProps {
             type_: Some("array".to_string()),
             items: Some(Box::new(
-                rusternetes_common::resources::crd::JSONSchemaPropsOrArray::Schema(
-                    JSONSchemaProps {
-                        type_: Some("string".to_string()),
-                        ..Default::default()
-                    },
-                ),
+                k3rs_common::resources::crd::JSONSchemaPropsOrArray::Schema(JSONSchemaProps {
+                    type_: Some("string".to_string()),
+                    ..Default::default()
+                }),
             )),
             ..Default::default()
         };
@@ -300,7 +298,7 @@ mod tests {
     /// Invalid value "NonExistentValue" should be rejected.
     #[test]
     fn test_validate_enum_in_array_items() {
-        use rusternetes_common::resources::crd::JSONSchemaPropsOrArray;
+        use k3rs_common::resources::crd::JSONSchemaPropsOrArray;
 
         // Build the schema matching the conformance test:
         // spec.bars[].feeling with enum: ["Great", "Down"]
@@ -441,5 +439,5 @@ mod tests {
 
     // Note: the `regex_cache_speedup` perf microbenchmark that used to live
     // here was moved to `crates/common/benches/regex_cache.rs` (criterion).
-    // Run with: `cargo bench -p rusternetes-common --bench regex_cache`.
+    // Run with: `cargo bench -p k3rs-common --bench regex_cache`.
 }

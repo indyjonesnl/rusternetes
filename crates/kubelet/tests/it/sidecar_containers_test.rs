@@ -1,8 +1,8 @@
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
     Pod, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
 
 /// Test helper to create a pod with sidecar containers
 fn create_pod_with_sidecar(

@@ -13,11 +13,11 @@
 // limitations under the License.
 //
 // Minimal subset of gnostic's openapiv3 proto schema, sufficient for serving
-// the rusternetes OpenAPI v3 sub-documents over the proto Accept header.
+// the k3rs OpenAPI v3 sub-documents over the proto Accept header.
 // The upstream file (github.com/google/gnostic openapiv3/OpenAPIv3.proto) is
 // ~700 messages; we only model `Document`, `Info`, `Paths`, `NamedPathItem`,
 // `PathItem`, plus the small `Any` / `NamedAny` envelopes that the upstream
-// types depend on. Decoding rusternetes' response with the full upstream
+// types depend on. Decoding k3rs' response with the full upstream
 // schema is wire-compatible because every field uses the gnostic field
 // numbers, and unknown fields are tolerated by proto3.
 //
@@ -85,7 +85,7 @@ message NamedPathItem {
   PathItem value = 2;
 }
 
-// `PathItem` carries the per-path operations. Rusternetes' v3 spec stores
+// `PathItem` carries the per-path operations. k3rs' v3 spec stores
 // operations as full OpenAPI Operation objects; in this minimal subset we
 // only need to round-trip the path keys + descriptions, so we lift the
 // operation summary/description out as plain strings rather than modelling

@@ -7,7 +7,7 @@
 //! `ScaleREST` (storage/storage.go) and the apps validators.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const RSS: &str = "/apis/apps/v1/namespaces/default/replicasets";

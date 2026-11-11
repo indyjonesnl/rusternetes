@@ -1,10 +1,10 @@
 //! `DefinitionsSchemaResolver` / `PopulateRefs`
 //! (`cel/openapi/resolver/{definitions,refs}.go`).
 
-use rusternetes_common::cel_openapi_resolver::{
+use k3rs_common::cel_openapi_resolver::{
     populate_refs, DefinitionsSchemaResolver, Gvk, ResolveError,
 };
-use rusternetes_common::resources::crd::{JSONSchemaProps, JSONSchemaPropsOrArray};
+use k3rs_common::resources::crd::{JSONSchemaProps, JSONSchemaPropsOrArray};
 use serde_json::{json, Map, Value};
 
 fn defs() -> Map<String, Value> {

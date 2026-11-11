@@ -8,14 +8,14 @@
 //! `authentication.k8s.io/v1.TokenRequest` (with status). Encoding under the
 //! bare kind selected the CSI schema and dropped `status`. The response encoder
 //! now resolves the group-qualified key first (see
-//! `rusternetes_middleware::response::encode_native_or_wrapped`); this test pins
+//! `k3rs_middleware::response::encode_native_or_wrapped`); this test pins
 //! that the auth schema itself round-trips the status losslessly.
-use rusternetes_protobuf::ProtoRegistry;
+use k3rs_protobuf::ProtoRegistry;
 use serde_json::json;
 
 /// The decode must read `spec.expirationSeconds` at protobuf tag **4** — the
 /// upstream `authentication/v1` field number that client-go writes. A symmetric
-/// rusternetes encode↔decode can't catch a wrong tag (it's consistent with
+/// k3rs encode↔decode can't catch a wrong tag (it's consistent with
 /// itself); this feeds a hand-built wire payload with expirationSeconds at tag 4
 /// (TokenRequest.spec = field 2 message; spec.expirationSeconds = field 4 varint
 /// 3600 = 0x90 0x1c) and asserts it decodes. Regression for the controller-

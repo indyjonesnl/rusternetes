@@ -16,10 +16,10 @@
 //! returned `url.URL` is reduced to the `(host, port)` the proxy needs, since
 //! the scheme is always `https`.
 
+use k3rs_common::resources::{EndpointSlice, IPFamily, Service, ServiceType};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use rusternetes_common::resources::{EndpointSlice, IPFamily, Service, ServiceType};
-use rusternetes_storage::{build_key, build_prefix, Storage};
 use std::sync::OnceLock;
 
 /// `label "kubernetes.io/service-name"` (`discoveryv1.LabelServiceName`).
@@ -96,7 +96,7 @@ pub fn service_resolver() -> ServiceResolver {
 fn find_service_port(
     svc: &Service,
     port: i32,
-) -> Result<&rusternetes_common::resources::ServicePort, String> {
+) -> Result<&k3rs_common::resources::ServicePort, String> {
     svc.spec
         .ports
         .iter()

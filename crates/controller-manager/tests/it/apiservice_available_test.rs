@@ -8,11 +8,11 @@
 //! Regression target: conformance e2e `apimachinery/aggregator.go:359`, which
 //! fails because the sample-apiserver APIService never reports Available=True.
 
-use rusternetes_common::resources::endpointslice::{
+use k3rs_common::resources::endpointslice::{
     Endpoint, EndpointConditions, EndpointPort as ESEndpointPort, EndpointSlice,
 };
-use rusternetes_controller_manager::controllers::apiservice::APIServiceAvailabilityController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_controller_manager::controllers::apiservice::APIServiceAvailabilityController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -461,7 +461,7 @@ async fn missing_service_reports_not_available() {
 // checks, `attempts` concurrent discovery requests; one success is overall
 // success, otherwise the last result is the FailedDiscoveryCheck message.
 
-use rusternetes_controller_manager::controllers::apiservice::DiscoveryProbe;
+use k3rs_controller_manager::controllers::apiservice::DiscoveryProbe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 async fn available_setup(

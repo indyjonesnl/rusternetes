@@ -9,7 +9,7 @@
 # Or pass --focus explicitly:
 #   AGENT_ID=1 bash scripts/conformance-agent-run.sh --focus '\[Conformance\]'
 #
-# Output: ${AGENT_WORKDIR}/.rusternetes/agents/${AGENT_ID}/results/{e2e.log,junit_01.xml,…}
+# Output: ${AGENT_WORKDIR}/.k3rs/agents/${AGENT_ID}/results/{e2e.log,junit_01.xml,…}
 # Exit code mirrors hydrophone's: 0 on pass, non-zero on any failure.
 
 set -euo pipefail
@@ -65,9 +65,9 @@ docker exec "$DIND_NAME" sh -c '
 # --- direct hydrophone invocation --------------------------------------------
 agent_banner "hydrophone --focus '$FOCUS'"
 docker exec -w /workspace \
-  -e KUBECONFIG="/workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal" \
+  -e KUBECONFIG="/workspace/.k3rs/agents/${AGENT_ID}/kubeconfig-internal" \
   "$DIND_NAME" \
   hydrophone \
     --conformance-image "$CONFORMANCE_IMAGE" \
     --focus "$FOCUS" \
-    --output-dir "/workspace/.rusternetes/agents/${AGENT_ID}/results"
+    --output-dir "/workspace/.k3rs/agents/${AGENT_ID}/results"

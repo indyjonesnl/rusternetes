@@ -13,7 +13,7 @@
 //! each of them, a body that omits the field upstream requires must come back
 //! as a `422` naming the field, never as a `400`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// `(label, path, body, expected substring)`.

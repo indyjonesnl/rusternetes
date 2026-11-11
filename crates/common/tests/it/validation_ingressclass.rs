@@ -1,10 +1,10 @@
 //! Tests for IngressClass validation (port of upstream `ValidateIngressClass`).
 
-use rusternetes_common::resources::ingressclass::{
+use k3rs_common::resources::ingressclass::{
     IngressClass, IngressClassParametersReference, IngressClassSpec,
 };
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::ingressclass::validate_ingress_class;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::ingressclass::validate_ingress_class;
 
 fn ic(controller: &str, parameters: Option<IngressClassParametersReference>) -> IngressClass {
     let mut x = IngressClass {

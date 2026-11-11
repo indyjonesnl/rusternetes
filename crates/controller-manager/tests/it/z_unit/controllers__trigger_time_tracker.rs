@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::{Pod, Service};
+    pub use k3rs_common::resources::{Pod, Service};
     pub use std::collections::HashMap;
     pub use std::sync::Mutex;
 }
@@ -12,9 +12,9 @@ mod tests {
     //! Ports of `trigger_time_tracker_test.go`.
     use super::__parent::*;
     use chrono::{Duration, TimeZone};
-    use rusternetes_common::resources::{PodCondition, PodSpec, PodStatus, ServiceSpec};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::trigger_time_tracker::*;
+    use k3rs_common::resources::{PodCondition, PodSpec, PodStatus, ServiceSpec};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::trigger_time_tracker::*;
 
     const NS: &str = "ttNamespace1";
     const SVC: &str = "my-service";

@@ -10,7 +10,7 @@
 //!   - test/e2e/apps/job.go
 //!   - test/e2e/apps/disruption.go
 //!
-//! Owner crate: rusternetes-controller-manager. Tests drive controllers
+//! Owner crate: k3rs-controller-manager. Tests drive controllers
 //! directly against `Arc<MemoryStorage>` — no HTTP harness, no Docker, no
 //! etcd. The REST surface for these resources is exercised by api-server's
 //! own tests; here we pin the *controller* contract.
@@ -18,17 +18,17 @@
 //! Tests marked `#[ignore]` correspond to the failing.txt bucket and document
 //! the gap without blocking CI.
 
-use rusternetes_common::resources::pod::PodCondition;
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::workloads::{
+use k3rs_common::resources::pod::PodCondition;
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::workloads::{
     DaemonSetUpdateStrategy, JobStatus, RollingUpdateDaemonSet,
 };
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::daemonset::DaemonSetController;
-use rusternetes_controller_manager::controllers::job::JobController;
-use rusternetes_controller_manager::controllers::pod_disruption_budget::PodDisruptionBudgetController;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::daemonset::DaemonSetController;
+use k3rs_controller_manager::controllers::job::JobController;
+use k3rs_controller_manager::controllers::pod_disruption_budget::PodDisruptionBudgetController;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -116,8 +116,8 @@ fn make_job(
     name: &str,
     namespace: &str,
     completions: i32,
-) -> rusternetes_common::resources::workloads::Job {
-    use rusternetes_common::resources::workloads::{Job, JobSpec};
+) -> k3rs_common::resources::workloads::Job {
+    use k3rs_common::resources::workloads::{Job, JobSpec};
     let labels = app_labels(name);
     Job {
         type_meta: TypeMeta {
@@ -469,7 +469,7 @@ async fn daemonset_rolling_update_replaces_pods_on_template_change() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
+            max_unavailable: Some(k3rs_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });
@@ -549,7 +549,7 @@ async fn daemonset_should_rollback_without_unnecessary_restarts() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
+            max_unavailable: Some(k3rs_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });
@@ -708,7 +708,7 @@ async fn job_should_apply_changes_to_status() {
 
     // Simulate a status PATCH: write a status with one active pod.
     let now = chrono::Utc::now();
-    let mut j: rusternetes_common::resources::workloads::Job = storage.get(&key).await.unwrap();
+    let mut j: k3rs_common::resources::workloads::Job = storage.get(&key).await.unwrap();
     j.status = Some(JobStatus {
         active: Some(1),
         succeeded: Some(0),
@@ -725,7 +725,7 @@ async fn job_should_apply_changes_to_status() {
     });
     storage.update(&key, &j).await.unwrap();
 
-    let fetched: rusternetes_common::resources::workloads::Job = storage.get(&key).await.unwrap();
+    let fetched: k3rs_common::resources::workloads::Job = storage.get(&key).await.unwrap();
     assert_eq!(
         fetched.status.as_ref().unwrap().active,
         Some(1),

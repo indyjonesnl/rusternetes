@@ -4,7 +4,7 @@
 # Produce the two git-ignored build inputs that Dockerfile.k0s-node bakes into a
 # swap image (v1..v4), so `run-variant.sh vN <sig>` works from a clean checkout:
 #
-#   .build/rusternetes-<component>   the Rusternetes replacement, built as a
+#   .build/k3rs-<component>   the k3rs replacement, built as a
 #                                    STATIC-MUSL binary (the k0s image is Alpine;
 #                                    a glibc binary won't run — see task-3-report).
 #   .build/<k0s-binary>.real         the GENUINE upstream Go binary k0s would
@@ -35,9 +35,9 @@ component="${1:-}"
   exit 1
 }
 
-# component -> rusternetes bin target (== crate suffix) and upstream k0s binary.
+# component -> k3rs bin target (== crate suffix) and upstream k0s binary.
 # For every workspace crate the [[bin]] name equals the component, and the
-# package is rusternetes-<component> (verified in crates/*/Cargo.toml).
+# package is k3rs-<component> (verified in crates/*/Cargo.toml).
 case "$component" in
   api-server)         k0s_bin="kube-apiserver" ;;
   kubelet)            k0s_bin="kubelet" ;;
@@ -46,12 +46,12 @@ case "$component" in
   kube-proxy)         k0s_bin="kube-proxy" ;;
   *) echo "unknown component '$component'" >&2; exit 1 ;;
 esac
-crate="rusternetes-${component}"
+crate="k3rs-${component}"
 bin="${component}"
 
 mkdir -p "$build_dir"
 
-# --- 1. static-musl Rusternetes binary --------------------------------------
+# --- 1. static-musl k3rs binary --------------------------------------
 if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
   log "adding rust target $target"
   rustup target add "$target"
@@ -64,8 +64,8 @@ log "building $crate (bin '$bin') as static-musl for $target"
 tdir="${CARGO_TARGET_DIR:-$repo_root/target}"
 artifact="$tdir/$target/release/$bin"
 [ -f "$artifact" ] || { echo "build did not produce $artifact" >&2; exit 1; }
-install -m0755 "$artifact" "$build_dir/rusternetes-${component}"
-log "staged $build_dir/rusternetes-${component} ($(stat -c %s "$build_dir/rusternetes-${component}") B)"
+install -m0755 "$artifact" "$build_dir/k3rs-${component}"
+log "staged $build_dir/k3rs-${component} ($(stat -c %s "$build_dir/k3rs-${component}") B)"
 
 # --- 2. genuine upstream Go binary from the pinned k0s image ----------------
 # kube-proxy is NOT a k0s-staged binary — upstream ships it inside the kube-proxy

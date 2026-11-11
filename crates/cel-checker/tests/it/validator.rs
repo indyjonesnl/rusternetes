@@ -5,7 +5,7 @@
 //! (`ext/formatting.go` `stringFormatValidator.Configure`). The comparison
 //! with cel-go is in `goldens.rs`.
 
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::{
     check, Container, EnvSet, EnvType, Features, MapProvider, SourceLocator, Version,
 };
 use std::sync::Arc;

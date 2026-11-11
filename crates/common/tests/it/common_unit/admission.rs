@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::pod::Pod;
+    pub use k3rs_common::resources::pod::Pod;
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::admission::*;
+    use k3rs_common::admission::*;
 
     #[test]
     fn test_admission_response() {

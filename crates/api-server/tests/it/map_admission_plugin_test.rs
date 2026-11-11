@@ -8,35 +8,33 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_api_server::admission::policy_dispatch::ParamScope;
-use rusternetes_api_server::admission::policy_dispatch::PolicyHook;
-use rusternetes_api_server::admission::policy_matching::{
-    EquivalentResourceMapper, NamespaceLister,
-};
-use rusternetes_api_server::admission::policy_mutating::{
+use k3rs_api_server::admission::policy_dispatch::ParamScope;
+use k3rs_api_server::admission::policy_dispatch::PolicyHook;
+use k3rs_api_server::admission::policy_matching::{EquivalentResourceMapper, NamespaceLister};
+use k3rs_api_server::admission::policy_mutating::{
     MutatingEvaluator, NamespaceObjects, ObjectDefaulter, PatchError, PatchRequest, Patcher,
     TypeConverters,
 };
-use rusternetes_api_server::admission::policy_plugin::{HookSource, MutatingPolicyPlugin};
-use rusternetes_api_server::endpoints::handlers::admission::Admission;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-use rusternetes_common::auth::{TokenManager, UserInfo};
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::resources::mutating_admission_policy::{
+use k3rs_api_server::admission::policy_plugin::{HookSource, MutatingPolicyPlugin};
+use k3rs_api_server::endpoints::handlers::admission::Admission;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+use k3rs_common::auth::{TokenManager, UserInfo};
+use k3rs_common::authz::AlwaysAllowAuthorizer;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::resources::mutating_admission_policy::{
     MutatingAdmissionPolicyBindingSpec, MutatingAdmissionPolicySpec, Mutation, PatchType,
     ReinvocationPolicyType,
 };
-use rusternetes_common::resources::validating_admission_policy::{
+use k3rs_common::resources::validating_admission_policy::{
     MatchPolicyType, NamedRuleWithOperations, OperationType, RuleWithOperations,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ConfigMap, LabelSelector, MatchResources, MutatingAdmissionPolicy,
     MutatingAdmissionPolicyBinding,
 };
-use rusternetes_storage::{MemoryStorage, StorageBackend};
+use k3rs_storage::{MemoryStorage, StorageBackend};
 use serde_json::{json, Value};
 use serial_test::serial;
 
@@ -69,16 +67,13 @@ impl HookSource for Source {
 struct Fakes;
 #[async_trait]
 impl NamespaceLister for Fakes {
-    async fn namespace_labels(
-        &self,
-        _: &str,
-    ) -> rusternetes_common::Result<HashMap<String, String>> {
+    async fn namespace_labels(&self, _: &str) -> k3rs_common::Result<HashMap<String, String>> {
         Ok(HashMap::new())
     }
 }
 #[async_trait]
 impl NamespaceObjects for Fakes {
-    async fn get_namespace(&self, name: &str) -> rusternetes_common::Result<Value> {
+    async fn get_namespace(&self, name: &str) -> k3rs_common::Result<Value> {
         Ok(json!({"kind": "Namespace", "metadata": {"name": name}}))
     }
 }
@@ -181,7 +176,7 @@ fn plugin_with(hooks: Vec<Hook>) -> Arc<MutatingPolicyPlugin> {
         namespace_objects: Arc::new(Fakes),
         type_converters: Arc::new(Fakes),
         defaulter: Arc::new(Fakes),
-        authorizer: Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer),
+        authorizer: Arc::new(k3rs_common::authz::AlwaysAllowAuthorizer),
     })
 }
 
@@ -345,8 +340,8 @@ async fn never_policy_is_not_reinvoked() {
 /// Mock mutating webhook: sets label `w=call-N` and counts its calls.
 async fn mock_webhook() -> (String, Arc<AtomicUsize>) {
     use base64::Engine;
-    use rusternetes_common::admission::AdmissionReview;
-    use rusternetes_test_support::mock_http::*;
+    use k3rs_common::admission::AdmissionReview;
+    use k3rs_test_support::mock_http::*;
     let calls = Arc::new(AtomicUsize::new(0));
     let c = calls.clone();
     let route = mock_post(move |review: AdmissionReview| {
@@ -367,15 +362,15 @@ async fn mock_webhook() -> (String, Arc<AtomicUsize>) {
 }
 
 async fn install_webhook(backend: &Arc<StorageBackend>, url: String) {
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         MutatingWebhook, MutatingWebhookConfiguration, OperationType as WhOp, ReinvocationPolicy,
         Rule, RuleWithOperations as WhRule, SideEffectClass, WebhookClientConfig,
     };
-    use rusternetes_storage::{build_key, Storage};
+    use k3rs_storage::{build_key, Storage};
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "MutatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("w-cfg"),
+        metadata: k3rs_common::types::ObjectMeta::new("w-cfg"),
         webhooks: Some(vec![MutatingWebhook {
             name: "w.example.com".into(),
             client_config: WebhookClientConfig {

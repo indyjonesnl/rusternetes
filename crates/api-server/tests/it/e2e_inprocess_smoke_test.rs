@@ -10,7 +10,7 @@
 //!   * `DeploymentController::reconcile_all()` (in-process tick)
 //!   * `ReplicaSetController::reconcile_all()` (in-process tick)
 //!   * scheduler step simulated by direct `MemoryStorage` write — wiring
-//!     `rusternetes-scheduler` in-process would require an extra dev-dep and
+//!     `k3rs-scheduler` in-process would require an extra dev-dep and
 //!     all we need to assert is "spec.nodeName is set after one scheduling
 //!     pass", which a single storage update reproduces exactly. The
 //!     production scheduler's `try_schedule_pod` does the same write.
@@ -24,12 +24,12 @@
 //!
 //! Test function name: `test_e2e_deployment_to_pods_and_foreground_cascade`.
 
-use rusternetes_common::resources::{Pod, ReplicaSet};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_storage::{build_prefix, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::resources::{Pod, ReplicaSet};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_storage::{build_prefix, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -225,10 +225,10 @@ async fn test_e2e_deployment_to_pods_and_foreground_cascade() {
     // and writes `spec.nodeName`. We reproduce the same observable end-state
     // (`spec.nodeName` set on every pod) with one storage update per pod;
     // wiring the real scheduler in-process would require pulling
-    // `rusternetes-scheduler` in as a dev-dep, plus seeding Nodes, and adds
+    // `k3rs-scheduler` in as a dev-dep, plus seeding Nodes, and adds
     // no signal to the cascade-delete assertions that follow.
     for pod in &pods {
-        let pod_key = rusternetes_storage::build_key("pods", Some(ns), &pod.metadata.name);
+        let pod_key = k3rs_storage::build_key("pods", Some(ns), &pod.metadata.name);
         let mut updated: Pod = mem.get(&pod_key).await.expect("re-read pod");
         if let Some(spec) = updated.spec.as_mut() {
             spec.node_name = Some("e2e-node-1".to_string());

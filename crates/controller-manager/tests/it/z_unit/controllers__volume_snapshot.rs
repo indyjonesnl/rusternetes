@@ -3,17 +3,17 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-    pub use rusternetes_common::resources::volume::VolumeSnapshotContentSource;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+    pub use k3rs_common::resources::volume::VolumeSnapshotContentSource;
+    pub use k3rs_common::resources::{
         DeletionPolicy, EventSource, EventType, PersistentVolume, PersistentVolumeClaim,
         VolumeSnapshot, VolumeSnapshotClass, VolumeSnapshotContent, VolumeSnapshotContentSpec,
         VolumeSnapshotContentStatus, VolumeSnapshotStatus,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{
         build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue,
     };
     pub use std::sync::Arc;
@@ -24,17 +24,17 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::volume::{VolumeSnapshotSource, VolumeSnapshotSpec};
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_controller_manager::controllers::volume_snapshot::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::volume::{VolumeSnapshotSource, VolumeSnapshotSpec};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::volume_snapshot::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[test]
     fn test_is_driver_supported() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = VolumeSnapshotController::new(storage);
 
-        assert!(controller.is_driver_supported("rusternetes.io/hostpath-snapshotter"));
+        assert!(controller.is_driver_supported("k3rs.io/hostpath-snapshotter"));
         assert!(controller.is_driver_supported("hostpath-snapshotter"));
         assert!(!controller.is_driver_supported("kubernetes.io/aws-ebs"));
     }
@@ -50,7 +50,7 @@ mod tests {
                 api_version: "snapshot.storage.k8s.io/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-class"),
-            driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+            driver: "k3rs.io/hostpath-snapshotter".to_string(),
             parameters: None,
             deletion_policy: DeletionPolicy::Delete,
         };
@@ -81,7 +81,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(content.metadata.name, "test-content");
-        assert_eq!(content.spec.driver, "rusternetes.io/hostpath-snapshotter");
+        assert_eq!(content.spec.driver, "k3rs.io/hostpath-snapshotter");
         assert_eq!(content.spec.deletion_policy, DeletionPolicy::Delete);
         assert_eq!(
             content.spec.volume_snapshot_ref.name,
@@ -110,7 +110,7 @@ mod tests {
                 api_version: "snapshot.storage.k8s.io/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-class"),
-            driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+            driver: "k3rs.io/hostpath-snapshotter".to_string(),
             parameters: None,
             deletion_policy: DeletionPolicy::Retain,
         };
@@ -154,7 +154,7 @@ mod tests {
                 api_version: "snapshot.storage.k8s.io/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-class"),
-            driver: "rusternetes.io/hostpath-snapshotter".to_string(),
+            driver: "k3rs.io/hostpath-snapshotter".to_string(),
             parameters: None,
             deletion_policy: DeletionPolicy::Delete,
         };

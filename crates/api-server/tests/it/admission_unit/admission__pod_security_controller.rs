@@ -2,16 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::pod_security_api::{
-        self as api, Level, LevelVersion,
-    };
-    pub use rusternetes_api_server::admission::pod_security_policy::aggregate_check_results;
-    pub use rusternetes_api_server::admission::{
+    pub use k3rs_api_server::admission::pod_security_api::{self as api, Level, LevelVersion};
+    pub use k3rs_api_server::admission::pod_security_policy::aggregate_check_results;
+    pub use k3rs_api_server::admission::{
         pod_security_registry, PodSecurityAdmission, PodSecurityOutcome,
     };
-    pub use rusternetes_common::resources::pod::PodSpec;
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_common::resources::pod::PodSpec;
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_storage::Storage;
     pub use serde_json::Value;
     pub use std::collections::{BTreeMap, HashMap};
     pub use std::sync::Arc;
@@ -19,24 +17,21 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_controller::*;
-    use rusternetes_api_server::admission::PodSecurityExemptions;
+    use k3rs_api_server::admission::pod_security_controller::*;
+    use k3rs_api_server::admission::PodSecurityExemptions;
     use serde_json::json;
 
-    async fn ns(storage: &Arc<rusternetes_storage::MemoryStorage>, name: &str, l: &[(&str, &str)]) {
+    async fn ns(storage: &Arc<k3rs_storage::MemoryStorage>, name: &str, l: &[(&str, &str)]) {
         let labels: BTreeMap<String, String> = l
             .iter()
             .map(|(k, v)| (format!("pod-security.kubernetes.io/{k}"), v.to_string()))
             .collect();
-        let n: rusternetes_common::resources::Namespace = serde_json::from_value(json!({
+        let n: k3rs_common::resources::Namespace = serde_json::from_value(json!({
             "apiVersion": "v1", "kind": "Namespace",
             "metadata": {"name": name, "labels": labels}}))
         .unwrap();
         storage
-            .create(
-                &rusternetes_storage::build_key("namespaces", None, name),
-                &n,
-            )
+            .create(&k3rs_storage::build_key("namespaces", None, name), &n)
             .await
             .unwrap();
     }
@@ -91,7 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn warn_and_audit_never_enforce() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         ns(
             &storage,
             "n",
@@ -121,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn privileged_namespace_is_silent() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         ns(&storage, "n", &[("enforce", "privileged")]).await;
         let out = PodSecurityAdmission::new()
             .validate_pod_controller(
@@ -139,7 +134,7 @@ mod tests {
 
     #[tokio::test]
     async fn compliant_template_subresource_and_missing_namespace() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         ns(&storage, "n", &[("warn", "baseline")]).await;
         let psa = PodSecurityAdmission::new();
         let ok = psa
@@ -189,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn exemptions_short_circuit() {
-        let storage = Arc::new(rusternetes_storage::MemoryStorage::new());
+        let storage = Arc::new(k3rs_storage::MemoryStorage::new());
         ns(&storage, "n", &[("warn", "baseline")]).await;
         let psa = PodSecurityAdmission::with_exemptions(PodSecurityExemptions {
             usernames: vec!["bob".into()],

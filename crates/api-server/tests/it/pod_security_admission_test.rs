@@ -18,7 +18,7 @@
 //!
 //! Every test is marked `#[ignore = "RED-state: PodSecurityAdmission is a
 //! stub (allow-all)"]`. The freshly-introduced
-//! `rusternetes_api_server::admission::PodSecurityAdmission` is an
+//! `k3rs_api_server::admission::PodSecurityAdmission` is an
 //! allow-all stub — the existing inline check in
 //! `handlers::pod::create_pod` covers privileged + host namespaces but
 //! misses the volume-types and runAsUser dimensions. The tests run with
@@ -28,8 +28,8 @@
 #![allow(non_snake_case)]
 
 use axum::http::{Method, StatusCode};
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

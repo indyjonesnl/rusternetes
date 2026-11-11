@@ -2,10 +2,10 @@
 //! (`Test_cellForJSONValue`, `Test_convertor_ConvertToTable`) for
 //! `src/registry/apiextensions/tableconvertor.rs`.
 
-use rusternetes_api_server::registry::apiextensions::tableconvertor::{
+use k3rs_api_server::registry::apiextensions::tableconvertor::{
     cell_for_json_value, columns_for_version, TableConvertor,
 };
-use rusternetes_common::resources::{CustomResourceColumnDefinition, CustomResourceDefinition};
+use k3rs_common::resources::{CustomResourceColumnDefinition, CustomResourceDefinition};
 use serde_json::{json, Value};
 
 fn col(name: &str, ty: &str, path: &str) -> CustomResourceColumnDefinition {

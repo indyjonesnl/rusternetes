@@ -68,7 +68,7 @@ export class WatchManager {
       params.set("fieldSelector", this.options.fieldSelector);
     }
 
-    const token = sessionStorage.getItem("rusternetes-token");
+    const token = sessionStorage.getItem("k3rs-token");
     const headers: Record<string, string> = {};
     if (token) {
       headers["Authorization"] = `Bearer ${token}`;

@@ -148,7 +148,7 @@ fn to_metav1_condition(c: &PodDisruptionBudgetCondition) -> Condition {
 /// Upstream takes `oldStatus` and `apiVersion` parameters. The `oldStatus` is
 /// unused in the upstream body (no transition checks), and the `apiVersion`
 /// guard only short-circuits the non-negative checks for the legacy
-/// `policy/v1beta1` group — which rusternetes does not serve (target is
+/// `policy/v1beta1` group — which k3rs does not serve (target is
 /// `policy/v1`, k8s v1.35), so the non-negative checks always run here.
 pub fn validate_pod_disruption_budget_status(
     status: &PodDisruptionBudgetStatus,

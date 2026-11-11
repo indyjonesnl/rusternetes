@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde_json::{json, Value};
     pub use std::collections::HashMap;
 }

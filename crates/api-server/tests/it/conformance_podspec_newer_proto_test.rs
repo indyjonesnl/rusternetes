@@ -34,8 +34,8 @@
 //! field-number registry against the upstream .proto; this file complements
 //! it with end-to-end decode-then-typed-deserialize assertions.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_common::resources::pod::{Container, PodSpec};
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_common::resources::pod::{Container, PodSpec};
 
 /// Encode a varint per protobuf wire format.
 fn write_varint(buf: &mut Vec<u8>, mut value: u64) {

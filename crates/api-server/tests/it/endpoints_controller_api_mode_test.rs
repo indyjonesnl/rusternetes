@@ -7,10 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusternetes_client::http::ApiClient;
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 #[tokio::test]

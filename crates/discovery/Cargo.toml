@@ -1,17 +1,17 @@
 [package]
-name = "rusternetes-discovery"
+name = "k3rs-discovery"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_discovery"
+name = "k3rs_discovery"
 path = "src/lib.rs"
 
 [dependencies]
-rusternetes-storage = { path = "../storage" }
-rusternetes-common = { path = "../common" }
+k3rs-storage = { path = "../storage" }
+k3rs-common = { path = "../common" }
 axum = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

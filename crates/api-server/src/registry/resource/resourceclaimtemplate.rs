@@ -6,15 +6,15 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::ResourceClaimTemplate;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::resources::ResourceClaimTemplate;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_common::validation::resourceclaim::{
+use k3rs_common::validation::resourceclaim::{
     validate_resource_claim_template, validate_resource_claim_template_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use super::admin::authorized_for_admin;
 use super::spec::drop_disabled_fields;

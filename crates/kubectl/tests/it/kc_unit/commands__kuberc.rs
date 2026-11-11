@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_kubectl::types::KubercCommands;
+    pub use k3rs_kubectl::types::KubercCommands;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::kuberc::*;
+    use k3rs_kubectl::commands::kuberc::*;
 
     #[test]
     fn test_kuberc_no_subcommand() {

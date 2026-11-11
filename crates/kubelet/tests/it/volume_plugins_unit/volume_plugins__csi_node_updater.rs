@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::CSIDriver;
-    pub use rusternetes_kubelet::pluginmanager::csi_handler::csi_driver_client_for;
-    pub use rusternetes_kubelet::volume_plugins::csi_client::CSI_TIMEOUT;
-    pub use rusternetes_kubelet::volume_plugins::csi_drivers_store::DriversStore;
-    pub use rusternetes_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent};
+    pub use k3rs_common::resources::CSIDriver;
+    pub use k3rs_kubelet::pluginmanager::csi_handler::csi_driver_client_for;
+    pub use k3rs_kubelet::volume_plugins::csi_client::CSI_TIMEOUT;
+    pub use k3rs_kubelet::volume_plugins::csi_drivers_store::DriversStore;
+    pub use k3rs_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
+    pub use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent};
     pub use std::collections::HashMap;
     pub use std::sync::atomic::{AtomicBool, Ordering};
     pub use std::sync::{Arc, Mutex};
@@ -21,11 +21,11 @@ mod tests {
     use crate::csi_fake;
     use async_trait::async_trait;
     use csi_fake::FakeDriver;
-    use rusternetes_common::resources::CSIDriverSpec;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::NodeGetInfoResponse;
-    use rusternetes_kubelet::volume_plugins::csi_drivers_store::Driver;
-    use rusternetes_kubelet::volume_plugins::csi_node_updater::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::CSIDriverSpec;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::NodeGetInfoResponse;
+    use k3rs_kubelet::volume_plugins::csi_drivers_store::Driver;
+    use k3rs_kubelet::volume_plugins::csi_node_updater::*;
+    use k3rs_storage::MemoryStorage;
 
     const TEST_DRIVER: &str = "test-driver";
 
@@ -71,7 +71,7 @@ mod tests {
     fn csi_driver(name: &str, period: Option<i64>) -> CSIDriver {
         let mut d = CSIDriver {
             type_meta: Default::default(),
-            metadata: rusternetes_common::types::ObjectMeta::new(name),
+            metadata: k3rs_common::types::ObjectMeta::new(name),
             spec: CSIDriverSpec::default(),
         };
         d.spec.node_allocatable_update_period_seconds = period;

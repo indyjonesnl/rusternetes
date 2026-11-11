@@ -14,11 +14,11 @@ use axum::{
     response::Response,
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     Result,
 };
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -155,15 +155,15 @@ pub async fn proxy_node(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
     // Get the node to find its address. Storage lookup uses the parsed
     // name; the raw `node_name` may carry a `:port` suffix the upstream
     // e2e framework appended.
-    let node_key = rusternetes_storage::build_key("nodes", None, actual_node_name);
-    let node: rusternetes_common::resources::Node = state.storage.get(&node_key).await?;
+    let node_key = k3rs_storage::build_key("nodes", None, actual_node_name);
+    let node: k3rs_common::resources::Node = state.storage.get(&node_key).await?;
 
     // Resolve kubelet connection parameters (address, port, scheme) via the
     // shared helper so that exec/attach/logs handlers (Tasks 6/7) can reuse
@@ -244,14 +244,13 @@ pub async fn proxy_service(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
     // Get the service to find its ClusterIP and port
-    let service_key =
-        rusternetes_storage::build_key("services", Some(&namespace), actual_service_name);
-    let service: rusternetes_common::resources::Service = state.storage.get(&service_key).await?;
+    let service_key = k3rs_storage::build_key("services", Some(&namespace), actual_service_name);
+    let service: k3rs_common::resources::Service = state.storage.get(&service_key).await?;
 
     // Resolve the service port:
     // 1. If port_id is a number, match by port number
@@ -291,8 +290,8 @@ pub async fn proxy_service(
     let target_port = matched_service_port
         .and_then(|sp| {
             sp.target_port.as_ref().map(|tp| match tp {
-                rusternetes_common::resources::IntOrString::Int(p) => *p as u16,
-                rusternetes_common::resources::IntOrString::String(s) => {
+                k3rs_common::resources::IntOrString::Int(p) => *p as u16,
+                k3rs_common::resources::IntOrString::String(s) => {
                     s.parse::<u16>().unwrap_or(service_port)
                 }
             })
@@ -308,8 +307,8 @@ pub async fn proxy_service(
     let mut resolved_port: u16 = target_port;
 
     // Strategy 1: EndpointSlices
-    let es_prefix = rusternetes_storage::build_prefix("endpointslices", Some(&namespace));
-    let endpoint_slices: Vec<rusternetes_common::resources::EndpointSlice> =
+    let es_prefix = k3rs_storage::build_prefix("endpointslices", Some(&namespace));
+    let endpoint_slices: Vec<k3rs_common::resources::EndpointSlice> =
         state.storage.list(&es_prefix).await.unwrap_or_default();
     for es in &endpoint_slices {
         let svc = es
@@ -359,11 +358,10 @@ pub async fn proxy_service(
     // Some tests create Endpoints directly, and the EndpointSlice mirroring controller
     // may not have run yet.
     if endpoint_ip.is_none() {
-        let ep_key =
-            rusternetes_storage::build_key("endpoints", Some(&namespace), actual_service_name);
+        let ep_key = k3rs_storage::build_key("endpoints", Some(&namespace), actual_service_name);
         if let Ok(endpoints) = state
             .storage
-            .get::<rusternetes_common::resources::Endpoints>(&ep_key)
+            .get::<k3rs_common::resources::Endpoints>(&ep_key)
             .await
         {
             for subset in &endpoints.subsets {
@@ -526,13 +524,13 @@ pub async fn proxy_pod(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
     // Get the pod to find its IP
-    let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), actual_pod_name);
-    let pod: rusternetes_common::resources::Pod = state.storage.get(&pod_key).await?;
+    let pod_key = k3rs_storage::build_key("pods", Some(&namespace), actual_pod_name);
+    let pod: k3rs_common::resources::Pod = state.storage.get(&pod_key).await?;
 
     // Get pod IP from status.podIPs (preferred) or status.podIP
     let pod_ip = pod
@@ -545,7 +543,7 @@ pub async fn proxy_pod(
                 .or_else(|| s.pod_ip.clone())
         })
         .ok_or_else(|| {
-            rusternetes_common::Error::NotFound(format!(
+            k3rs_common::Error::NotFound(format!(
                 "Pod {}/{} has no IP address yet",
                 namespace, actual_pod_name
             ))
@@ -718,9 +716,9 @@ pub async fn proxy_request_with_dialer(
     };
 
     // Convert axum body to bytes
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| {
-        rusternetes_common::Error::Internal(format!("Failed to read request body: {}", e))
-    })?;
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|e| k3rs_common::Error::Internal(format!("Failed to read request body: {}", e)))?;
 
     // Collect forwarded headers (filter out hop-by-hop headers)
     let mut forward_headers: Vec<(String, String)> = Vec::new();
@@ -829,7 +827,7 @@ pub async fn proxy_request_with_dialer(
 
                 // Build final response
                 return axum_response.body(final_body).map_err(|e| {
-                    rusternetes_common::Error::Internal(format!("Failed to build response: {}", e))
+                    k3rs_common::Error::Internal(format!("Failed to build response: {}", e))
                 });
             }
             Upstream::Failed {

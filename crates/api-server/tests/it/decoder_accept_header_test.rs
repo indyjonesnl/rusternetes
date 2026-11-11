@@ -7,7 +7,7 @@
 //! and falls back through the quality-value list before returning
 //! 406 Not Acceptable.
 //!
-//! Rusternetes' current negotiation surface:
+//! k3rs' current negotiation surface:
 //! - `crates/api-server/src/response.rs::negotiate_content_type` recognizes
 //!   `application/vnd.kubernetes.protobuf` and returns `ContentType::Protobuf`,
 //!   but the routes never use this helper directly — handlers always emit
@@ -15,7 +15,7 @@
 //! - `crates/api-server/src/middleware.rs` (the response wrapping branch at
 //!   line 353) has `wants_protobuf = false` hardcoded — the comment cites
 //!   `scripts/run-conformance.sh:78-80`: K8s protobuf requires native protobuf
-//!   bytes which Rusternetes cannot produce, so the server forces JSON even
+//!   bytes which k3rs cannot produce, so the server forces JSON even
 //!   when the client requests protobuf. Real client-go always sends
 //!   `Accept: application/vnd.kubernetes.protobuf, application/json` and
 //!   falls back to JSON when protobuf is unavailable.
@@ -24,7 +24,7 @@
 //!   and no Table conversion code path.
 //!
 //! These tests pin the ACTUAL behavior — they do NOT force upstream contract
-//! when Rusternetes diverges intentionally. Divergences are documented in
+//! when k3rs diverges intentionally. Divergences are documented in
 //! per-test docstrings. Gaps that block conformance get `#[ignore]` with a
 //! one-liner pointing at the missing feature.
 //!
@@ -33,8 +33,8 @@
 //! `decoder_content_type_test.rs` and the `conformance_apimachinery_*` files.
 
 use axum::http::StatusCode;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -156,7 +156,7 @@ async fn accept_application_json_returns_json() {
 }
 
 /// `Accept: */*` — RFC 7231 wildcard. Server picks its default representation.
-/// In Rusternetes the only available representation is JSON.
+/// In k3rs the only available representation is JSON.
 #[tokio::test]
 async fn accept_wildcard_falls_back_to_default_json() {
     let (mem, router) = spawn_router();
@@ -195,14 +195,14 @@ async fn no_accept_header_defaults_to_json() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. application/yaml — unsupported in Rusternetes
+// 4. application/yaml — unsupported in k3rs
 // ---------------------------------------------------------------------------
 
 /// `Accept: application/yaml`. Upstream apiserver registers a YAML serializer
-/// and emits a YAML document. Rusternetes' router has no YAML response
+/// and emits a YAML document. k3rs' router has no YAML response
 /// serializer — handlers always produce JSON via `axum::Json<T>`. Per RFC
 /// 7231 §5.3.2 a non-matching Accept should produce 406 Not Acceptable, but
-/// Rusternetes ignores the header and returns JSON regardless.
+/// k3rs ignores the header and returns JSON regardless.
 ///
 /// Pin the actual behavior: 200 + Content-Type: application/json, no 406.
 /// This is a divergence from upstream; flip the assertion if a YAML
@@ -219,17 +219,17 @@ async fn accept_application_yaml_falls_back_to_json() {
     )
     .await;
 
-    // Rusternetes does NOT honor application/yaml — it serves JSON anyway.
+    // k3rs does NOT honor application/yaml — it serves JSON anyway.
     assert_eq!(
         status,
         StatusCode::OK,
-        "rusternetes serves JSON for application/yaml (no 406); status={} body={:?}",
+        "k3rs serves JSON for application/yaml (no 406); status={} body={:?}",
         status,
         body
     );
     assert!(
         ct.starts_with("application/json"),
-        "Rusternetes does not implement YAML; falls back to JSON; got {}",
+        "k3rs does not implement YAML; falls back to JSON; got {}",
         ct
     );
     assert_pod_body("p-yaml", &body);
@@ -246,7 +246,7 @@ async fn accept_application_yaml_falls_back_to_json() {
 /// Native protobuf encoding ships for the Pod GET path — see
 /// `crates/api-server/src/response.rs::{NativeProtoOptIn,
 /// NativePodProtoEncoder}` and the opt-in in
-/// `crates/api-server/src/handlers/pod.rs::get`. Rusternetes responds with
+/// `crates/api-server/src/handlers/pod.rs::get`. k3rs responds with
 /// a `k8s\0`-framed `runtime.Unknown` envelope whose `raw` field carries
 /// native proto bytes (`ProtoRegistry::encode_message("Pod", …)`).
 ///
@@ -281,7 +281,7 @@ async fn accept_protobuf_returns_native_envelope() {
 // ---------------------------------------------------------------------------
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=0.9, application/json;q=1.0`.
-/// Rusternetes' protobuf-opt-in path matches on a substring `contains`
+/// k3rs' protobuf-opt-in path matches on a substring `contains`
 /// check and does not yet parse quality values — so any Accept that names
 /// protobuf produces a protobuf response, even when JSON has a higher q.
 /// This is a known divergence from upstream RFC 7231; pin the actual
@@ -313,7 +313,7 @@ async fn accept_q_values_protobuf_wins_despite_lower_q() {
 
 /// `Accept: application/vnd.kubernetes.protobuf;q=1.0, application/json;q=0.5`.
 /// Upstream RFC 7231 contract: protobuf has higher q AND is supported by
-/// rusternetes for Pod GET, so protobuf wins. Same outcome the upstream
+/// k3rs for Pod GET, so protobuf wins. Same outcome the upstream
 /// contract demands.
 #[tokio::test]
 async fn accept_q_values_protobuf_first_returns_protobuf() {
@@ -348,7 +348,7 @@ async fn accept_q_values_protobuf_first_returns_protobuf() {
 
 /// `Accept: application/json;as=Table;v=v1;g=meta.k8s.io`. Upstream
 /// converts the resource into a `meta.k8s.io/v1.Table` for kubectl's
-/// columnar output. Rusternetes' `normalize_content_type_middleware`
+/// columnar output. k3rs' `normalize_content_type_middleware`
 /// intercepts the response and rebuilds it as a Table when the Accept
 /// header carries `as=Table`.
 #[tokio::test]
@@ -483,7 +483,7 @@ async fn accept_as_table_returns_default_table_for_resource_without_printer() {
 }
 
 /// Same default-Table fallback must hold for `secrets` and `podtemplates` —
-/// neither has a custom printer in Rusternetes, both carry ObjectMeta, so both
+/// neither has a custom printer in k3rs, both carry ObjectMeta, so both
 /// must convert to a 200 NAME/AGE Table rather than 406.
 #[tokio::test]
 async fn accept_as_table_default_table_for_secrets_and_podtemplates() {
@@ -517,7 +517,7 @@ async fn accept_as_table_default_table_for_secrets_and_podtemplates() {
 
 /// `Accept: application/json;as=PartialObjectMetadata;v=v1;g=meta.k8s.io`.
 /// Upstream strips `spec` and `status`, returning just TypeMeta +
-/// ObjectMeta to keep watch traffic light. Rusternetes' middleware
+/// ObjectMeta to keep watch traffic light. k3rs' middleware
 /// performs the same projection.
 #[tokio::test]
 async fn accept_as_partial_object_metadata_strips_spec_status() {
@@ -559,7 +559,7 @@ async fn accept_as_partial_object_metadata_strips_spec_status() {
 
 /// `Accept-Encoding: gzip`. RFC 7231 §5.3.4 permits the server to send
 /// the response uncompressed (no Content-Encoding) or compressed (with
-/// `Content-Encoding: gzip`). Rusternetes wires no `tower_http::compression`
+/// `Content-Encoding: gzip`). k3rs wires no `tower_http::compression`
 /// layer into the router, so the server returns identity-encoded JSON
 /// (no Content-Encoding header). Pin that contract — gzip request must
 /// still produce a valid uncompressed JSON Pod.
@@ -583,11 +583,11 @@ async fn accept_encoding_gzip_returns_identity() {
         .to_string();
 
     assert_eq!(status, StatusCode::OK);
-    // Rusternetes does not compress; Content-Encoding header is either
+    // k3rs does not compress; Content-Encoding header is either
     // absent or set to "identity". RFC 7231 permits either.
     assert!(
         content_encoding.is_empty() || content_encoding.eq_ignore_ascii_case("identity"),
-        "rusternetes must not compress (no compression layer); got Content-Encoding={:?}",
+        "k3rs must not compress (no compression layer); got Content-Encoding={:?}",
         content_encoding
     );
     // Body must be plain (uncompressed) JSON. Gzip magic is 1f 8b.
@@ -630,7 +630,7 @@ async fn accept_encoding_brotli_returns_identity() {
 
 /// `Accept: application/garbage`. Per RFC 7231 §5.3.2 + §6.5.6 the server
 /// should return 406 Not Acceptable when none of the requested media types
-/// can be served. Rusternetes ignores Accept entirely and always returns
+/// can be served. k3rs ignores Accept entirely and always returns
 /// JSON, so a garbage Accept still yields a JSON response.
 ///
 /// Pin actual: 200 + Content-Type: application/json. Divergence from
@@ -647,17 +647,17 @@ async fn accept_garbage_falls_back_to_json() {
     )
     .await;
 
-    // Upstream contract would be 406 here; Rusternetes ignores Accept.
+    // Upstream contract would be 406 here; k3rs ignores Accept.
     assert_eq!(
         status,
         StatusCode::OK,
-        "rusternetes ignores Accept and serves JSON for any value; status={} body={:?}",
+        "k3rs ignores Accept and serves JSON for any value; status={} body={:?}",
         status,
         body
     );
     assert!(
         ct.starts_with("application/json"),
-        "rusternetes always returns JSON regardless of Accept; got {}",
+        "k3rs always returns JSON regardless of Accept; got {}",
         ct
     );
     assert_pod_body("p-garbage", &body);

@@ -8,16 +8,16 @@
 //! (:1321-1346), which prunes (:1432-1441) before admission runs.
 
 use axum::http::StatusCode;
-use rusternetes_common::{
+use k3rs_common::{
     admission::{AdmissionReview, AdmissionReviewResponse},
     resources::{
         FailurePolicy, MutatingWebhook, MutatingWebhookConfiguration, OperationType, Rule,
         RuleWithOperations, SideEffectClass, WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
+use k3rs_test_support::mock_http::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -82,7 +82,7 @@ async fn a_mutating_webhook_is_sent_the_pruned_and_defaulted_object() {
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "MutatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("mutate-widgets"),
+        metadata: k3rs_common::types::ObjectMeta::new("mutate-widgets"),
         webhooks: Some(vec![MutatingWebhook {
             name: "mutate.widgets.io".into(),
             client_config: WebhookClientConfig {

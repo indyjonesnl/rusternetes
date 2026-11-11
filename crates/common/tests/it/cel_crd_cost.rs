@@ -1,16 +1,16 @@
 //! The static cost estimate of CRD rules:
 //! `apiextensions-apiserver/pkg/apiserver/schema/cel/compilation_test.go`
 //! `TestCostEstimation` (release-1.35), through the shadow estimator
-//! ([`rusternetes_common::cel_checker_shadow::estimate_rule_cost`]) and the
-//! schema size estimator of [`rusternetes_common::cel_crd_cost`].
+//! ([`k3rs_common::cel_checker_shadow::estimate_rule_cost`]) and the
+//! schema size estimator of [`k3rs_common::cel_crd_cost`].
 
-use rusternetes_cel_checker::cost::{AstNode, CostEstimator, SizeEstimate};
-use rusternetes_cel_checker::decl::limits;
-use rusternetes_common::cel_checker_shadow::{estimate_rule_cost, SelfScope};
-use rusternetes_common::cel_crd_cost::{max_cardinality, SchemaSizeEstimator};
-use rusternetes_common::cel_schema_types::schema_decl_type;
-use rusternetes_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
-use rusternetes_common::resources::crd::JSONSchemaProps;
+use k3rs_cel_checker::cost::{AstNode, CostEstimator, SizeEstimate};
+use k3rs_cel_checker::decl::limits;
+use k3rs_common::cel_checker_shadow::{estimate_rule_cost, SelfScope};
+use k3rs_common::cel_crd_cost::{max_cardinality, SchemaSizeEstimator};
+use k3rs_common::cel_schema_types::schema_decl_type;
+use k3rs_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
+use k3rs_common::resources::crd::JSONSchemaProps;
 use serde_json::{json, Value};
 
 /// `costLimit` of compilation_test.go.
@@ -822,7 +822,7 @@ fn estimator_for(schema: Value) -> SchemaSizeEstimator {
 fn node(path: &[&str]) -> AstNode<'static> {
     AstNode {
         path: path.iter().map(|s| s.to_string()).collect(),
-        ty: rusternetes_cel_checker::DType::Dyn,
+        ty: k3rs_cel_checker::DType::Dyn,
         expr: None,
         computed_size: None,
     }

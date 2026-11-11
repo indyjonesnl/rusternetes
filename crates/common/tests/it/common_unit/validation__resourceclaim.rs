@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::cel_versions::{self, EnvSet, EnvType};
+    pub use k3rs_common::resources::{
         AllocatedDeviceStatus, AllocationConfigSource, AllocationResult,
         DeviceAllocationConfiguration, DeviceAllocationMode, DeviceClaim, DeviceClaimConfiguration,
         DeviceRequestAllocationResult, DeviceSelector, DeviceTaintEffect, DeviceToleration,
         ExactDeviceRequest, NetworkDeviceData, OpaqueDeviceConfiguration, ResourceClaim,
         ResourceClaimSpec, ResourceClaimStatus, TolerationOperator,
     };
-    pub use rusternetes_common::types::Condition;
-    pub use rusternetes_common::validation::csinode::validate_csi_driver_name;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::types::Condition;
+    pub use k3rs_common::validation::csinode::validate_csi_driver_name;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_valid_label_value, validate_conditions,
         validate_label_name,
     };
-    pub use rusternetes_common::validation::objectmeta::validate_immutable_field;
-    pub use rusternetes_common::validation::pod::validate_node_selector;
-    pub use rusternetes_common::validation::resourceslice::{
+    pub use k3rs_common::validation::objectmeta::validate_immutable_field;
+    pub use k3rs_common::validation::pod::validate_node_selector;
+    pub use k3rs_common::validation::resourceslice::{
         validate_device_binding_parameters, validate_device_name, validate_pool_name,
     };
     pub use std::collections::{HashMap, HashSet};
@@ -28,7 +28,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::resourceclaim::*;
+    use k3rs_common::validation::resourceclaim::*;
 
     fn claim(devices: serde_json::Value) -> ResourceClaim {
         serde_json::from_value(serde_json::json!({
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn template_validates_embedded_spec() {
-        use rusternetes_common::resources::ResourceClaimTemplate;
+        use k3rs_common::resources::ResourceClaimTemplate;
         let tmpl: ResourceClaimTemplate = serde_json::from_value(serde_json::json!({
             "metadata": {"name": "t"},
             "spec": {"spec": {"devices": {"requests": [
@@ -421,7 +421,7 @@ mod tests {
     fn too_many_origins(errs: ErrorList) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = errs
             .into_iter()
-            .filter(|e| e.error_type == rusternetes_common::validation::field::ErrorType::TooMany)
+            .filter(|e| e.error_type == k3rs_common::validation::field::ErrorType::TooMany)
             .map(|e| (e.field, e.origin))
             .collect();
         v.sort();

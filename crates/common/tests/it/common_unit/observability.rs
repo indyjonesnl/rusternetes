@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::observability::*;
+    use k3rs_common::observability::*;
 
     #[test]
     fn test_api_server_metrics() {

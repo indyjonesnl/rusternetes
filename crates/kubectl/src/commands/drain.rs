@@ -35,12 +35,12 @@
 //!   lookups, `--selector` lists with `--chunk-size` continuation.
 
 use anyhow::{anyhow, Result};
-use rusternetes_client::api_status::{
+use k3rs_client::api_status::{
     has_status_cause, is_bad_request, is_forbidden, is_not_found, is_resource_expired,
     is_too_many_requests, ApiStatusError,
 };
-use rusternetes_client::http::{ApiClient, GetError};
-use rusternetes_common::label_selector::LabelSelector;
+use k3rs_client::http::{ApiClient, GetError};
+use k3rs_common::label_selector::LabelSelector;
 use serde_json::{json, Value};
 use std::io::IsTerminal;
 use std::sync::Arc;

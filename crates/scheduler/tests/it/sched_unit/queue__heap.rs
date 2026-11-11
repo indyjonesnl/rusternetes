@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::heap::*;
+    use k3rs_scheduler::queue::heap::*;
 
     fn int_heap() -> Heap<(String, i64)> {
         Heap::new(

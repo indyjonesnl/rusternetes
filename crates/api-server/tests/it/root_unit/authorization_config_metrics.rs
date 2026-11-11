@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::authorization_config_metrics::*;
+    use k3rs_api_server::authorization_config_metrics::*;
 
     // metrics_test.go:28-29.
     const TEST_API_SERVER_ID: &str = "testAPIServerID";

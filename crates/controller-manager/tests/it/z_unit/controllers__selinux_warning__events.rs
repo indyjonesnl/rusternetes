@@ -5,10 +5,10 @@
 //! and no test of these predicates, so these pin the conditions read from
 //! the handlers.
 
-use rusternetes_common::types::Phase;
-use rusternetes_controller_manager::controllers::selinux_warning::*;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::{WatchEvent, WorkQueue};
+use k3rs_common::types::Phase;
+use k3rs_controller_manager::controllers::selinux_warning::*;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::{WatchEvent, WorkQueue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -150,11 +150,11 @@ async fn pvc_modification_without_volume_name_change_is_not_queued() {
     let q = WorkQueue::new();
     let s = Arc::new(MemoryStorage::new());
     let c2 = SELinuxWarningController::new(s.clone());
-    use rusternetes_storage::Storage;
-    let pod_json: rusternetes_common::resources::Pod =
+    use k3rs_storage::Storage;
+    let pod_json: k3rs_common::resources::Pod =
         serde_json::from_value(pod("p1", "Running", Some("claim"))).unwrap();
     s.create(
-        &rusternetes_storage::build_key("pods", Some("ns1"), "p1"),
+        &k3rs_storage::build_key("pods", Some("ns1"), "p1"),
         &pod_json,
     )
     .await
@@ -172,14 +172,14 @@ async fn pvc_modification_without_volume_name_change_is_not_queued() {
 
 #[tokio::test]
 async fn pv_modification_with_same_claim_uid_is_not_queued() {
-    use rusternetes_storage::Storage;
+    use k3rs_storage::Storage;
     let s = Arc::new(MemoryStorage::new());
     let c = SELinuxWarningController::new(s.clone());
     let q = WorkQueue::new();
-    let pod_json: rusternetes_common::resources::Pod =
+    let pod_json: k3rs_common::resources::Pod =
         serde_json::from_value(pod("p1", "Running", Some("claim"))).unwrap();
     s.create(
-        &rusternetes_storage::build_key("pods", Some("ns1"), "p1"),
+        &k3rs_storage::build_key("pods", Some("ns1"), "p1"),
         &pod_json,
     )
     .await

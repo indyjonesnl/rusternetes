@@ -1,6 +1,6 @@
-use rusternetes_common::resources::Node;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, etcd::EtcdStorage, Storage};
+use k3rs_common::resources::Node;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, etcd::EtcdStorage, Storage};
 use std::collections::HashMap;
 
 /// Create a test node in etcd
@@ -20,13 +20,13 @@ pub async fn create_test_node(storage: &EtcdStorage, name: &str) -> Node {
             });
             meta
         },
-        spec: rusternetes_common::resources::node::NodeSpec {
+        spec: k3rs_common::resources::node::NodeSpec {
             pod_cidr: Some("10.244.0.0/24".to_string()),
             taints: None,
             unschedulable: None,
         },
-        status: Some(rusternetes_common::resources::node::NodeStatus {
-            conditions: vec![rusternetes_common::resources::node::NodeCondition {
+        status: Some(k3rs_common::resources::node::NodeStatus {
+            conditions: vec![k3rs_common::resources::node::NodeCondition {
                 condition_type: "Ready".to_string(),
                 status: "True".to_string(),
                 last_heartbeat_time: Some(chrono::Utc::now().to_rfc3339()),

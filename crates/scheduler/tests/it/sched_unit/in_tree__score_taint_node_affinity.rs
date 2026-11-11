@@ -3,11 +3,11 @@
 //! (`tainttoleration/taint_toleration_test.go` TestTaintTolerationScore,
 //! `nodeaffinity/node_affinity_test.go` TestNodeAffinityPriority).
 use super::listers::EmptyListers;
-use rusternetes_common::resources::pod::NodeAffinity;
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{CycleState, PreScorePlugin};
-use rusternetes_scheduler::in_tree::NodeAffinityPlugin;
-use rusternetes_scheduler::profile::Profile;
+use k3rs_common::resources::pod::NodeAffinity;
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{CycleState, PreScorePlugin};
+use k3rs_scheduler::in_tree::NodeAffinityPlugin;
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
 fn pod(spec: Value) -> Pod {
@@ -26,7 +26,7 @@ fn prefer(key: &str) -> Value {
 }
 
 async fn scores(
-    fw: &rusternetes_scheduler::framework_runtime::Framework,
+    fw: &k3rs_scheduler::framework_runtime::Framework,
     p: &Pod,
     nodes: &[Node],
     name: &str,
@@ -118,7 +118,7 @@ async fn added_affinity_scores_even_without_pod_preferences() {
         )
         .await;
     assert!(s.is_success());
-    use rusternetes_scheduler::fwk::{NodeInfo, ScorePlugin};
+    use k3rs_scheduler::fwk::{NodeInfo, ScorePlugin};
     let pods: Vec<Pod> = vec![];
     let (score, st) = plugin.score(
         &state,

@@ -1,5 +1,5 @@
 //! Integration tests that exercise multi-resource lifecycle flows through the
-//! in-process Axum router — the rusternetes mirror of upstream Kubernetes
+//! in-process Axum router — the k3rs mirror of upstream Kubernetes
 //! `test/integration/` tests that drive the API server end-to-end with multiple
 //! resources, asserting cross-resource semantics (namespace isolation,
 //! ownerReference cascade, label-selector filtering, deletion finalizer
@@ -29,11 +29,11 @@
 //! in `crates/api-server/tests/e2e_inprocess_smoke_test.rs`.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_controller_manager::controllers::{
+use k3rs_controller_manager::controllers::{
     garbage_collector::GarbageCollector, namespace::NamespaceController,
 };
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -429,7 +429,7 @@ async fn test_lifecycle_namespace_delete_marks_terminating_and_keeps_children() 
 /// Mirror of upstream
 /// `test/integration/namespace/ns_conditions_test.go` cascade assertion:
 /// after the namespace controller observes a terminating namespace, every
-/// namespaced child resource is GC'd. The rusternetes namespace controller
+/// namespaced child resource is GC'd. The k3rs namespace controller
 /// does this in `crates/controller-manager/src/controllers/namespace.rs`.
 ///
 /// In-process wiring (mirrors the pattern in `e2e_inprocess_smoke_test.rs`):
@@ -674,7 +674,7 @@ async fn test_lifecycle_owner_background_deletion_removes_owner() {
 /// `foregroundDeletion` finalizer, it deletes dependents and then clears the
 /// finalizer, after which the owner is removed.
 ///
-/// Rusternetes implements this in
+/// k3rs implements this in
 /// `crates/controller-manager/src/controllers/garbage_collector.rs`. This
 /// test wires it in-process the same way `e2e_inprocess_smoke_test.rs` does:
 /// the GC drives `Arc<MemoryStorage>` directly via `Storage`, while the

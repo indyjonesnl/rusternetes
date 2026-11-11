@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::{
         HostPathType, HostPathVolumeSource, PersistentVolumePhase, PersistentVolumeReclaimPolicy,
     };
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         EventSource, EventType, PersistentVolume, PersistentVolumeClaim, PersistentVolumeStatus,
         StorageClass,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -22,19 +22,19 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::volume::{
+    use k3rs_common::resources::volume::{
         PersistentVolumeAccessMode, PersistentVolumeClaimPhase, PersistentVolumeClaimStatus,
         PersistentVolumeMode, ResourceRequirements,
     };
-    use rusternetes_controller_manager::controllers::dynamic_provisioner::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::dynamic_provisioner::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[test]
     fn test_is_provisioner_supported() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = DynamicProvisionerController::new(storage);
 
-        assert!(controller.is_provisioner_supported("rusternetes.io/hostpath"));
+        assert!(controller.is_provisioner_supported("k3rs.io/hostpath"));
         assert!(controller.is_provisioner_supported("kubernetes.io/hostpath"));
         assert!(controller.is_provisioner_supported("hostpath"));
         assert!(!controller.is_provisioner_supported("kubernetes.io/aws-ebs"));
@@ -59,7 +59,7 @@ mod tests {
                 meta.namespace = Some("default".to_string());
                 meta
             },
-            spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
+            spec: k3rs_common::resources::PersistentVolumeClaimSpec {
                 access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
                 resources: ResourceRequirements {
                     limits: None,
@@ -92,7 +92,7 @@ mod tests {
                 api_version: "storage.k8s.io/v1".to_string(),
             },
             metadata: ObjectMeta::new("fast"),
-            provisioner: "rusternetes.io/hostpath".to_string(),
+            provisioner: "k3rs.io/hostpath".to_string(),
             parameters: None,
             reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
             volume_binding_mode: None,
@@ -129,7 +129,7 @@ mod tests {
             .host_path
             .as_ref()
             .expect("Expected HostPath volume source");
-        assert_eq!(hp.path, "/tmp/rusternetes/dynamic-pvs/pvc-default-test-pvc");
+        assert_eq!(hp.path, "/tmp/k3rs/dynamic-pvs/pvc-default-test-pvc");
         assert_eq!(hp.r#type, Some(HostPathType::DirectoryOrCreate));
 
         // Verify labels
@@ -138,7 +138,7 @@ mod tests {
         assert_eq!(labels.get("pvc-namespace"), Some(&"default".to_string()));
         assert_eq!(
             labels.get("provisioner"),
-            Some(&"rusternetes.io/hostpath".to_string())
+            Some(&"k3rs.io/hostpath".to_string())
         );
         assert_eq!(labels.get("storage-class"), Some(&"fast".to_string()));
 
@@ -146,7 +146,7 @@ mod tests {
         let annotations = pv.metadata.annotations.as_ref().unwrap();
         assert_eq!(
             annotations.get("pv.kubernetes.io/provisioned-by"),
-            Some(&"rusternetes.io/hostpath".to_string())
+            Some(&"k3rs.io/hostpath".to_string())
         );
 
         // #1095: the PV is pre-bound — claimRef names the exact PVC it was

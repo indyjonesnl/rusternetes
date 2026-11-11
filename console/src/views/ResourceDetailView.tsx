@@ -457,7 +457,7 @@ function ResourceEvents({
     queryKey: ["k8s", "events", kind, name, namespace],
     queryFn: async () => {
       const headers: Record<string, string> = { Accept: "application/json" };
-      const token = sessionStorage.getItem("rusternetes-token");
+      const token = sessionStorage.getItem("k3rs-token");
       if (token) headers["Authorization"] = `Bearer ${token}`;
 
       const fieldSelector = `involvedObject.name=${name},involvedObject.kind=${kind}`;

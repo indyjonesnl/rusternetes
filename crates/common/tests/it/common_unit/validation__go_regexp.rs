@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::go_regexp::*;
+    use k3rs_common::validation::go_regexp::*;
 
     /// `regexp.Compile(pattern)` outcomes recorded under Go 1.25.9
     /// (`None` = accepted, else `err.Error()`).

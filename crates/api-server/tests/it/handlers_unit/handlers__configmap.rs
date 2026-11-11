@@ -9,15 +9,15 @@ mod __parent {
         response::{IntoResponse, Response},
         Extension,
     };
-    pub use rusternetes_api_server::endpoints::handlers::{self as endpoints, RequestScope};
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::endpoints::handlers::{self as endpoints, RequestScope};
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::{
         admission::{GroupVersionKind, GroupVersionResource},
         authz::{Decision, RequestAttributes},
         resources::ConfigMap,
         List, Result,
     };
-    pub use rusternetes_storage::build_prefix;
+    pub use k3rs_storage::build_prefix;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, info};
@@ -25,21 +25,21 @@ mod __parent {
 
 mod finalizer_drain_put_tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::configmap::*;
-    use rusternetes_api_server::state::ApiServerState;
-    use rusternetes_storage::{build_key, Storage};
+    use k3rs_api_server::handlers::configmap::*;
+    use k3rs_api_server::state::ApiServerState;
+    use k3rs_storage::{build_key, Storage};
     use serde_json::json;
 
     async fn test_state() -> Arc<ApiServerState> {
-        use rusternetes_common::auth::TokenManager;
-        use rusternetes_common::authz::AlwaysAllowAuthorizer;
-        use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::StorageBackend;
+        use k3rs_common::auth::TokenManager;
+        use k3rs_common::authz::AlwaysAllowAuthorizer;
+        use k3rs_common::observability::MetricsRegistry;
+        use k3rs_storage::StorageBackend;
 
         Arc::new(ApiServerState::new(
             Arc::new(StorageBackend::new_memory()),
             Arc::new(TokenManager::new(b"test-secret")),
-            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn rusternetes_common::authz::Authorizer>,
+            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn k3rs_common::authz::Authorizer>,
             Arc::new(MetricsRegistry::new()),
             true,
         ))
@@ -81,7 +81,7 @@ mod finalizer_drain_put_tests {
         let _resp = update(
             State(state.clone()),
             Extension(AuthContext {
-                user: rusternetes_common::auth::UserInfo::anonymous(),
+                user: k3rs_common::auth::UserInfo::anonymous(),
             }),
             Path(("default".to_string(), "cm-fin".to_string())),
             Query(HashMap::new()),
@@ -90,7 +90,7 @@ mod finalizer_drain_put_tests {
         .await
         .expect("update must succeed");
 
-        let after: rusternetes_common::Result<ConfigMap> = state.storage.get(&key).await;
+        let after: k3rs_common::Result<ConfigMap> = state.storage.get(&key).await;
         assert!(
             after.is_err(),
             "the object must be gone once the PUT drained its last finalizer"
@@ -127,7 +127,7 @@ mod finalizer_drain_put_tests {
         let _resp = update(
             State(state.clone()),
             Extension(AuthContext {
-                user: rusternetes_common::auth::UserInfo::anonymous(),
+                user: k3rs_common::auth::UserInfo::anonymous(),
             }),
             Path(("default".to_string(), "cm-keep".to_string())),
             Query(HashMap::new()),

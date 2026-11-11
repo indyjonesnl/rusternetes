@@ -52,7 +52,7 @@
 //!     `spec.nodeName` on the stored pod.
 //!   * `test_pod_strategy_binding_can_only_be_done_once` — a second binding
 //!     against an already-bound pod must be rejected (upstream Conflict /
-//!     Forbidden depending on path). Currently the rusternetes binding
+//!     Forbidden depending on path). Currently the k3rs binding
 //!     handler overwrites silently, so this test is `#[ignore]`d until
 //!     upstream parity ships.
 //!
@@ -62,8 +62,8 @@
 //! single-file mirror of one upstream test file.
 
 use axum::http::Method;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -634,7 +634,7 @@ async fn test_pod_strategy_status_subresource_does_not_mutate_spec() {
 /// status — the status subresource is the only path that may mutate it.
 ///
 /// Upstream `podStrategy.PrepareForUpdate` resets
-/// `newPod.Status = oldPod.Status` before persisting; rusternetes' main
+/// `newPod.Status = oldPod.Status` before persisting; k3rs' main
 /// pod update handler currently accepts whatever status the client sends.
 #[tokio::test]
 async fn test_pod_strategy_main_resource_does_not_mutate_status() {
@@ -765,7 +765,7 @@ async fn test_pod_strategy_binding_sets_node_name() {
 
 /// Mirror of upstream `TestPodStrategy_Binding_CanOnlyBeDoneOnce`: a second
 /// `POST /binding` against an already-bound pod must be rejected. The
-/// current rusternetes handler overwrites silently, so this test is
+/// current k3rs handler overwrites silently, so this test is
 /// `#[ignore]`d until binding-once parity ships.
 #[tokio::test]
 async fn test_pod_strategy_binding_can_only_be_done_once() {

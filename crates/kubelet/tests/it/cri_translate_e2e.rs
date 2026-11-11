@@ -1,32 +1,32 @@
 //! End-to-end proof that the Pod → CRI translation produces configs a real
-//! runtime accepts: build a rusternetes `Pod`, translate it, and run it through
-//! containerd via the `rusternetes-cri` client until the container is RUNNING.
+//! runtime accepts: build a k3rs `Pod`, translate it, and run it through
+//! containerd via the `k3rs-cri` client until the container is RUNNING.
 //!
 //! Socket-gated like the crates/cri slice — does nothing unless
-//! `RUSTERNETES_CRI_SOCKET` is set. Optionally set `RUSTERNETES_CRI_RUNTIME_HANDLER`
+//! `K3RS_CRI_SOCKET` is set. Optionally set `K3RS_CRI_RUNTIME_HANDLER`
 //! (e.g. `crun`).
 //!
 //! ```bash
-//! RUSTERNETES_CRI_SOCKET=/tmp/cri-verify/containerd.sock \
-//! RUSTERNETES_CRI_RUNTIME_HANDLER=crun \
-//!   cargo test -p rusternetes-kubelet --test cri_translate_e2e -- --nocapture
+//! K3RS_CRI_SOCKET=/tmp/cri-verify/containerd.sock \
+//! K3RS_CRI_RUNTIME_HANDLER=crun \
+//!   cargo test -p k3rs-kubelet --test cri_translate_e2e -- --nocapture
 //! ```
 
 use std::collections::HashMap;
 
-use rusternetes_common::resources::pod::{Container, Pod, PodSpec};
-use rusternetes_cri::CriClient;
-use rusternetes_kubelet::cri_runtime::{translate, CriContainerRuntime};
-use rusternetes_kubelet::volumes::VolumeManager;
+use k3rs_common::resources::pod::{Container, Pod, PodSpec};
+use k3rs_cri::CriClient;
+use k3rs_kubelet::cri_runtime::{translate, CriContainerRuntime};
+use k3rs_kubelet::volumes::VolumeManager;
 
 const IMAGE: &str = "docker.io/library/busybox:latest";
 
 /// An exec liveness probe running a single command (Probe has no Default).
-fn exec_probe(cmd: &str) -> rusternetes_common::resources::pod::Probe {
-    rusternetes_common::resources::pod::Probe {
+fn exec_probe(cmd: &str) -> k3rs_common::resources::pod::Probe {
+    k3rs_common::resources::pod::Probe {
         http_get: None,
         tcp_socket: None,
-        exec: Some(rusternetes_common::resources::pod::ExecAction {
+        exec: Some(k3rs_common::resources::pod::ExecAction {
             command: vec![cmd.to_string()],
         }),
         initial_delay_seconds: None,
@@ -49,7 +49,7 @@ fn resized_container() -> Container {
     Container {
         name: "sleeper".to_string(),
         image: IMAGE.to_string(),
-        resources: Some(rusternetes_common::types::ResourceRequirements {
+        resources: Some(k3rs_common::types::ResourceRequirements {
             requests: Some(std::collections::HashMap::from([(
                 "cpu".to_string(),
                 "50m".to_string(),
@@ -70,7 +70,7 @@ fn test_pod(name: &str) -> Pod {
         image: IMAGE.to_string(),
         command: Some(vec!["/bin/sh".to_string()]),
         args: Some(vec!["-c".to_string(), "sleep 3600".to_string()]),
-        env: Some(vec![rusternetes_common::resources::pod::EnvVar {
+        env: Some(vec![k3rs_common::resources::pod::EnvVar {
             name: "GREETING".to_string(),
             value: Some("from-translation".to_string()),
             value_from: None,
@@ -93,13 +93,13 @@ fn test_pod(name: &str) -> Pod {
 
 #[tokio::test]
 async fn translated_pod_runs_on_containerd() {
-    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping translation e2e");
+    let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+        eprintln!("K3RS_CRI_SOCKET unset; skipping translation e2e");
         return;
     };
-    let handler = std::env::var("RUSTERNETES_CRI_RUNTIME_HANDLER").unwrap_or_default();
+    let handler = std::env::var("K3RS_CRI_RUNTIME_HANDLER").unwrap_or_default();
 
-    let log_dir = std::env::temp_dir().join("rusternetes-cri-translate");
+    let log_dir = std::env::temp_dir().join("k3rs-cri-translate");
     std::fs::create_dir_all(&log_dir).expect("log dir");
     let log_dir = log_dir.to_string_lossy().to_string();
 
@@ -126,7 +126,7 @@ async fn translated_pod_runs_on_containerd() {
     // Remove any leftover sandbox for this pod from an interrupted prior run so
     // the runtime's sandbox-name reservation doesn't block RunPodSandbox.
     if let Ok(existing) = cri
-        .list_pod_sandbox(Some(rusternetes_cri::v1::PodSandboxFilter {
+        .list_pod_sandbox(Some(k3rs_cri::v1::PodSandboxFilter {
             label_selector: std::collections::HashMap::from([(
                 "io.kubernetes.pod.uid".to_string(),
                 "translate-e2e-uid".to_string(),
@@ -155,7 +155,7 @@ async fn translated_pod_runs_on_containerd() {
             .await
             .expect("StartContainer");
 
-        let running = rusternetes_cri::v1::ContainerState::ContainerRunning as i32;
+        let running = k3rs_cri::v1::ContainerState::ContainerRunning as i32;
         let mut state = -1;
         for _ in 0..50 {
             state = cri
@@ -199,12 +199,12 @@ async fn translated_pod_runs_on_containerd() {
 /// start_pod -> is_pod_running -> list_running_pods -> stop_and_remove_pod.
 #[tokio::test]
 async fn cri_container_runtime_lifecycle() {
-    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping runtime lifecycle e2e");
+    let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+        eprintln!("K3RS_CRI_SOCKET unset; skipping runtime lifecycle e2e");
         return;
     };
 
-    let log_root = std::env::temp_dir().join("rusternetes-cri-runtime");
+    let log_root = std::env::temp_dir().join("k3rs-cri-runtime");
     let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect runtime");
@@ -252,8 +252,8 @@ async fn cri_container_runtime_lifecycle() {
     assert!(
         matches!(
             st.state,
-            Some(rusternetes_common::resources::pod::ContainerState {
-                running: Some(rusternetes_common::resources::pod::ContainerStateRunning { .. }),
+            Some(k3rs_common::resources::pod::ContainerState {
+                running: Some(k3rs_common::resources::pod::ContainerStateRunning { .. }),
                 ..
             })
         ),
@@ -352,20 +352,20 @@ async fn cri_container_runtime_lifecycle() {
 /// container: writing then reading a file under the mount path works.
 #[tokio::test]
 async fn emptydir_volume_provisioned_and_mounted() {
-    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping volume e2e");
+    let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+        eprintln!("K3RS_CRI_SOCKET unset; skipping volume e2e");
         return;
     };
 
-    let vol_base = std::env::temp_dir().join("rusternetes-cri-volbase");
+    let vol_base = std::env::temp_dir().join("k3rs-cri-volbase");
     std::fs::create_dir_all(&vol_base).expect("vol base");
     let vm = VolumeManager::new(
         vol_base.to_string_lossy().to_string(),
         None, // emptyDir needs no storage
-        rusternetes_common::auth::TokenManager::new(b"test-secret"),
+        k3rs_common::auth::TokenManager::new(b"test-secret"),
     );
 
-    let log_root = std::env::temp_dir().join("rusternetes-cri-vol");
+    let log_root = std::env::temp_dir().join("k3rs-cri-vol");
     let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect")
@@ -424,7 +424,7 @@ async fn emptydir_volume_provisioned_and_mounted() {
     let _ = runtime.probe_container(&pod, container, &probe).await;
 
     let mut cri = CriClient::connect(&socket).await.expect("cri");
-    let filter = rusternetes_cri::v1::ContainerFilter {
+    let filter = k3rs_cri::v1::ContainerFilter {
         label_selector: std::collections::HashMap::from([(
             "io.kubernetes.pod.uid".to_string(),
             "vol-e2e-uid".to_string(),
@@ -470,19 +470,19 @@ async fn emptydir_volume_provisioned_and_mounted() {
 /// restart; a passing one does not.
 #[tokio::test]
 async fn liveness_probe_drives_check_liveness() {
-    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping liveness e2e");
+    let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+        eprintln!("K3RS_CRI_SOCKET unset; skipping liveness e2e");
         return;
     };
-    let log_root = std::env::temp_dir().join("rusternetes-cri-live");
+    let log_root = std::env::temp_dir().join("k3rs-cri-live");
     let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect");
 
-    let liveness = |cmd: &str| rusternetes_common::resources::pod::Probe {
+    let liveness = |cmd: &str| k3rs_common::resources::pod::Probe {
         http_get: None,
         tcp_socket: None,
-        exec: Some(rusternetes_common::resources::pod::ExecAction {
+        exec: Some(k3rs_common::resources::pod::ExecAction {
             command: vec![cmd.to_string()],
         }),
         initial_delay_seconds: None,
@@ -559,12 +559,12 @@ async fn liveness_probe_drives_check_liveness() {
 /// Init container runs to completion before the app container starts.
 #[tokio::test]
 async fn init_container_runs_before_app() {
-    let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-        eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping init-container e2e");
+    let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+        eprintln!("K3RS_CRI_SOCKET unset; skipping init-container e2e");
         return;
     };
 
-    let log_root = std::env::temp_dir().join("rusternetes-cri-init");
+    let log_root = std::env::temp_dir().join("k3rs-cri-init");
     let runtime = CriContainerRuntime::connect(&socket, log_root.to_string_lossy())
         .await
         .expect("connect runtime");
@@ -612,9 +612,9 @@ async fn init_container_runs_before_app() {
         .expect("pod has init containers");
     assert_eq!(init_statuses.len(), 1);
     match &init_statuses[0].state {
-        Some(rusternetes_common::resources::pod::ContainerState {
+        Some(k3rs_common::resources::pod::ContainerState {
             terminated:
-                Some(rusternetes_common::resources::pod::ContainerStateTerminated { exit_code, .. }),
+                Some(k3rs_common::resources::pod::ContainerStateTerminated { exit_code, .. }),
             ..
         }) => {
             assert_eq!(*exit_code, 0, "init container should exit 0");

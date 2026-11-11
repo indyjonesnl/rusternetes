@@ -2,21 +2,21 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::Secret;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::secret::{validate_secret, validate_secret_update};
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::resources::Secret;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::secret::{validate_secret, validate_secret_update};
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::secret::*;
+    use k3rs_api_server::registry::core::secret::*;
     use std::collections::HashMap;
 
     fn secret(type_: Option<&str>) -> Secret {

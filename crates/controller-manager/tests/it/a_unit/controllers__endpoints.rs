@@ -4,15 +4,15 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         EndpointAddress, EndpointPort, EndpointReference, EndpointSubset, Endpoints, Pod, Service,
     };
-    pub use rusternetes_controller_manager::controllers::endpoints_tracker::StaleEndpointsTracker;
-    pub use rusternetes_controller_manager::controllers::trigger_time_tracker::{
+    pub use k3rs_controller_manager::controllers::endpoints_tracker::StaleEndpointsTracker;
+    pub use k3rs_controller_manager::controllers::trigger_time_tracker::{
         format_rfc3339_nano, TriggerTimeTracker,
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, error};
@@ -20,8 +20,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::endpoints::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_controller_manager::controllers::endpoints::*;
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -34,11 +34,11 @@ mod tests {
         pod_labels.insert("tier".to_string(), "frontend".to_string());
 
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "test-pod".to_string(),
                 namespace: Some("default".to_string()),
                 uid: String::new(),
@@ -54,7 +54,7 @@ mod tests {
                 generation: None,
                 managed_fields: None,
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 init_containers: None,
                 containers: vec![],
                 volumes: None,
@@ -123,11 +123,11 @@ mod tests {
     fn test_is_pod_ready() {
         // Pod without status
         let pod_no_status = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "test-pod".to_string(),
                 namespace: None,
                 uid: String::new(),
@@ -143,7 +143,7 @@ mod tests {
                 generation: None,
                 managed_fields: None,
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 init_containers: None,
                 containers: vec![],
                 volumes: None,
@@ -188,12 +188,12 @@ mod tests {
             }),
             status: None,
         };
-        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_no_status));
+        assert!(!k3rs_common::podutil::is_pod_ready(&pod_no_status));
 
         // Pod in Pending phase
         let pod_pending = Pod {
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Pending),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Pending),
                 message: None,
                 reason: None,
                 host_ip: None,
@@ -214,12 +214,12 @@ mod tests {
             }),
             ..pod_no_status.clone()
         };
-        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_pending));
+        assert!(!k3rs_common::podutil::is_pod_ready(&pod_pending));
 
         // Pod with Ready condition = True
         let pod_ready = Pod {
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Running),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Running),
                 message: None,
                 reason: None,
                 host_ip: None,
@@ -229,7 +229,7 @@ mod tests {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     reason: None,
@@ -238,7 +238,7 @@ mod tests {
                     last_transition_time: None,
                     observed_generation: None,
                 }]),
-                container_statuses: Some(vec![rusternetes_common::resources::ContainerStatus {
+                container_statuses: Some(vec![k3rs_common::resources::ContainerStatus {
                     name: "nginx".to_string(),
                     ready: true,
                     restart_count: 0,
@@ -264,12 +264,12 @@ mod tests {
             }),
             ..pod_no_status.clone()
         };
-        assert!(rusternetes_common::podutil::is_pod_ready(&pod_ready));
+        assert!(k3rs_common::podutil::is_pod_ready(&pod_ready));
 
         // Pod with Ready condition = False (not ready)
         let pod_not_ready = Pod {
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Running),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Running),
                 message: None,
                 reason: None,
                 host_ip: None,
@@ -279,7 +279,7 @@ mod tests {
                 nominated_node_name: None,
                 qos_class: None,
                 start_time: None,
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "False".to_string(),
                     reason: None,
@@ -288,7 +288,7 @@ mod tests {
                     last_transition_time: None,
                     observed_generation: None,
                 }]),
-                container_statuses: Some(vec![rusternetes_common::resources::ContainerStatus {
+                container_statuses: Some(vec![k3rs_common::resources::ContainerStatus {
                     name: "nginx".to_string(),
                     ready: false,
                     restart_count: 0,
@@ -314,26 +314,25 @@ mod tests {
             }),
             ..pod_no_status
         };
-        assert!(!rusternetes_common::podutil::is_pod_ready(&pod_not_ready));
+        assert!(!k3rs_common::podutil::is_pod_ready(&pod_not_ready));
     }
 
     /// Test that reconcile_all skips writing endpoints when nothing has changed.
     /// This prevents unnecessary etcd writes that would cause log spam and I/O pressure.
     #[tokio::test]
     async fn test_endpoints_skip_write_when_unchanged() {
-        use rusternetes_common::resources::{Service, ServicePort, ServiceSpec};
+        use k3rs_common::resources::{Service, ServicePort, ServiceSpec};
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EndpointsController::new(storage.clone());
 
         // Create a service with a selector
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-svc")
-                .with_namespace("default"),
+            metadata: k3rs_common::types::ObjectMeta::new("test-svc").with_namespace("default"),
             spec: ServiceSpec {
                 selector: Some({
                     let mut m = HashMap::new();
@@ -343,14 +342,14 @@ mod tests {
                 ports: vec![ServicePort {
                     name: Some("http".to_string()),
                     port: 80,
-                    target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
+                    target_port: Some(k3rs_common::resources::IntOrString::Int(8080)),
                     protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
                 cluster_ip: Some("10.96.0.100".to_string()),
                 cluster_ips: None,
-                service_type: Some(rusternetes_common::resources::ServiceType::ClusterIP),
+                service_type: Some(k3rs_common::resources::ServiceType::ClusterIP),
                 external_ips: None,
                 session_affinity: None,
                 load_balancer_ip: None,
@@ -400,20 +399,19 @@ mod tests {
     /// Test that endpoints ARE updated when pod data actually changes.
     #[tokio::test]
     async fn test_endpoints_write_when_changed() {
-        use rusternetes_common::resources::{PodStatus, Service, ServicePort, ServiceSpec};
-        use rusternetes_common::types::Phase;
+        use k3rs_common::resources::{PodStatus, Service, ServicePort, ServiceSpec};
+        use k3rs_common::types::Phase;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EndpointsController::new(storage.clone());
 
         // Create a service
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-svc")
-                .with_namespace("default"),
+            metadata: k3rs_common::types::ObjectMeta::new("test-svc").with_namespace("default"),
             spec: ServiceSpec {
                 selector: Some({
                     let mut m = HashMap::new();
@@ -423,14 +421,14 @@ mod tests {
                 ports: vec![ServicePort {
                     name: Some("http".to_string()),
                     port: 80,
-                    target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
+                    target_port: Some(k3rs_common::resources::IntOrString::Int(8080)),
                     protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
                 cluster_ip: Some("10.96.0.100".to_string()),
                 cluster_ips: None,
-                service_type: Some(rusternetes_common::resources::ServiceType::ClusterIP),
+                service_type: Some(k3rs_common::resources::ServiceType::ClusterIP),
                 external_ips: None,
                 session_affinity: None,
                 load_balancer_ip: None,
@@ -461,11 +459,11 @@ mod tests {
 
         // Now add a matching pod with an IP and Running phase
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "web-pod".to_string(),
                 namespace: Some("default".to_string()),
                 uid: "pod-uid-1".to_string(),
@@ -476,14 +474,14 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 containers: vec![],
                 ..Default::default()
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.244.0.5".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     last_probe_time: None,
@@ -523,20 +521,19 @@ mod tests {
     /// Test that EndpointAddress.hostname is populated from pod spec when subdomain is set.
     #[tokio::test]
     async fn test_endpoint_address_hostname_from_pod_spec() {
-        use rusternetes_common::resources::{PodStatus, Service, ServicePort, ServiceSpec};
-        use rusternetes_common::types::Phase;
+        use k3rs_common::resources::{PodStatus, Service, ServicePort, ServiceSpec};
+        use k3rs_common::types::Phase;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EndpointsController::new(storage.clone());
 
         // Create a headless service (clusterIP: None) with selector
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("my-svc")
-                .with_namespace("default"),
+            metadata: k3rs_common::types::ObjectMeta::new("my-svc").with_namespace("default"),
             spec: ServiceSpec {
                 selector: Some({
                     let mut m = HashMap::new();
@@ -546,14 +543,14 @@ mod tests {
                 ports: vec![ServicePort {
                     name: Some("http".to_string()),
                     port: 80,
-                    target_port: Some(rusternetes_common::resources::IntOrString::Int(8080)),
+                    target_port: Some(k3rs_common::resources::IntOrString::Int(8080)),
                     protocol: "TCP".to_string(),
                     node_port: None,
                     app_protocol: None,
                 }],
                 cluster_ip: Some("None".to_string()),
                 cluster_ips: None,
-                service_type: Some(rusternetes_common::resources::ServiceType::ClusterIP),
+                service_type: Some(k3rs_common::resources::ServiceType::ClusterIP),
                 external_ips: None,
                 session_affinity: None,
                 load_balancer_ip: None,
@@ -579,11 +576,11 @@ mod tests {
 
         // Create a pod with hostname and subdomain set
         let pod_with_hostname = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "web-0".to_string(),
                 namespace: Some("default".to_string()),
                 uid: "pod-uid-hostname".to_string(),
@@ -594,7 +591,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 containers: vec![],
                 hostname: Some("my-host".to_string()),
                 subdomain: Some("my-svc".to_string()),
@@ -603,7 +600,7 @@ mod tests {
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.244.0.10".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     last_probe_time: None,
@@ -622,11 +619,11 @@ mod tests {
 
         // Create a pod WITHOUT subdomain — hostname should NOT be set in endpoint
         let pod_no_subdomain = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "web-1".to_string(),
                 namespace: Some("default".to_string()),
                 uid: "pod-uid-no-subdomain".to_string(),
@@ -637,7 +634,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 containers: vec![],
                 hostname: Some("my-other-host".to_string()),
                 subdomain: None,
@@ -646,7 +643,7 @@ mod tests {
             status: Some(PodStatus {
                 phase: Some(Phase::Running),
                 pod_ip: Some("10.244.0.11".to_string()),
-                conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "True".to_string(),
                     last_probe_time: None,
@@ -783,19 +780,19 @@ mod tests {
     /// the stored finalizers and system fields (#2719).
     #[tokio::test]
     async fn updating_existing_endpoints_keeps_stored_identity() {
-        use rusternetes_common::resources::{PodCondition, PodStatus, ServicePort, ServiceSpec};
-        use rusternetes_common::types::Phase;
-        use rusternetes_controller_manager::controllers::uid_precondition_double::UidPreconditionStorage;
+        use k3rs_common::resources::{PodCondition, PodStatus, ServicePort, ServiceSpec};
+        use k3rs_common::types::Phase;
+        use k3rs_controller_manager::controllers::uid_precondition_double::UidPreconditionStorage;
 
         let storage = Arc::new(UidPreconditionStorage::new());
         let controller = EndpointsController::new(storage.clone());
 
         let service = Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("svc").with_namespace("default"),
+            metadata: k3rs_common::types::ObjectMeta::new("svc").with_namespace("default"),
             spec: ServiceSpec {
                 selector: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                 ports: vec![ServicePort {
@@ -830,18 +827,18 @@ mod tests {
 
         // A ready pod appears: the existing Endpoints must be updated.
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "p1".to_string(),
                 namespace: Some("default".to_string()),
                 uid: "pod-uid-1".to_string(),
                 labels: Some(HashMap::from([("app".to_string(), "web".to_string())])),
                 ..Default::default()
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 containers: vec![],
                 ..Default::default()
             }),
@@ -986,13 +983,13 @@ mod tests {
     }
 
     fn svc_for_metadata_tests(cluster_ip: &str) -> Service {
-        use rusternetes_common::resources::ServiceSpec;
-        let mut md = rusternetes_common::types::ObjectMeta::new("svc").with_namespace("default");
+        use k3rs_common::resources::ServiceSpec;
+        let mut md = k3rs_common::types::ObjectMeta::new("svc").with_namespace("default");
         md.uid = "svc-uid".to_string();
         md.labels = Some(HashMap::from([("app".to_string(), "web".to_string())]));
         md.annotations = Some(HashMap::from([("svc-only".to_string(), "x".to_string())]));
         Service {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Service".to_string(),
                 api_version: "v1".to_string(),
             },

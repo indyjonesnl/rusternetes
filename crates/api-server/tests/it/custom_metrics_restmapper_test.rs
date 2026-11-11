@@ -16,7 +16,7 @@
 //! - The mapper is `restmapper.NewDiscoveryRESTMapper` over the served
 //!   discovery (`pkg/dynamicmapper/mapper.go:65-78`).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CM: &str = "/apis/custom.metrics.k8s.io/v1beta2";

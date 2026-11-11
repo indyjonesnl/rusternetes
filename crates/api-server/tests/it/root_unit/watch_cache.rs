@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_storage::StorageBackend;
-    pub use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+    pub use k3rs_storage::StorageBackend;
+    pub use k3rs_storage::{Storage, WatchEvent, WatchStream};
     pub use std::collections::{HashMap, VecDeque};
     pub use std::sync::Arc;
     pub use tokio::sync::{broadcast, RwLock};
@@ -14,8 +14,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use futures::StreamExt as _;
-    use rusternetes_api_server::watch_cache::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_api_server::watch_cache::*;
+    use k3rs_storage::StorageBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -31,7 +31,7 @@ mod tests {
 
     #[async_trait]
     impl WatchSource for FloorSource {
-        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+        async fn watch_from_now(&self, _prefix: &str) -> k3rs_common::Result<WatchStream> {
             panic!("with a non-zero head revision the loop must use watch_since, not from-now");
         }
 
@@ -39,10 +39,10 @@ mod tests {
             &self,
             _prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<WatchStream> {
+        ) -> k3rs_common::Result<WatchStream> {
             self.since_revs.lock().unwrap().push(revision);
             let s = futures::stream::iter(Vec::new()).chain(futures::stream::pending::<
-                Result<WatchEvent, rusternetes_common::Error>,
+                Result<WatchEvent, k3rs_common::Error>,
             >());
             Ok(Box::pin(s))
         }
@@ -129,7 +129,7 @@ mod tests {
 
     #[async_trait]
     impl WatchSource for ReplaySource {
-        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+        async fn watch_from_now(&self, _prefix: &str) -> k3rs_common::Result<WatchStream> {
             panic!("non-zero head: loop must use watch_since");
         }
 
@@ -137,7 +137,7 @@ mod tests {
             &self,
             _prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<WatchStream> {
+        ) -> k3rs_common::Result<WatchStream> {
             let replay: Vec<_> = self
                 .events
                 .iter()
@@ -150,7 +150,7 @@ mod tests {
                 .map(Ok)
                 .collect();
             Ok(Box::pin(futures::stream::iter(replay).chain(
-                futures::stream::pending::<Result<WatchEvent, rusternetes_common::Error>>(),
+                futures::stream::pending::<Result<WatchEvent, k3rs_common::Error>>(),
             )))
         }
 
@@ -205,7 +205,7 @@ mod tests {
     // dispatch timer fired (cacher/cache_watcher.go).
     #[tokio::test]
     async fn slow_watcher_is_terminated_and_its_stream_ends() {
-        let dispatcher = rusternetes_api_server::cache_watcher::Dispatcher::new();
+        let dispatcher = k3rs_api_server::cache_watcher::Dispatcher::new();
         let rx = dispatcher.add_watcher(LOWER_BOUND_CAPACITY);
         let chan = rx.chan_size();
         assert_eq!(chan, 10);
@@ -245,7 +245,7 @@ mod tests {
         assert!(n < 4 * chan, "events after termination are discarded: {n}");
     }
 
-    fn added(rev: i64) -> Result<WatchEvent, rusternetes_common::Error> {
+    fn added(rev: i64) -> Result<WatchEvent, k3rs_common::Error> {
         // The loop parses the RV out of the JSON via extract_rv, so the value
         // MUST carry a `resourceVersion` matching `rev`.
         let json =
@@ -271,11 +271,11 @@ mod tests {
 
     #[async_trait]
     impl WatchSource for CompactedResumeSource {
-        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+        async fn watch_from_now(&self, _prefix: &str) -> k3rs_common::Result<WatchStream> {
             self.from_now_calls.fetch_add(1, Ordering::SeqCst);
             // Re-based stream: a live event arrives and the stream stays open.
             let s = futures::stream::iter(vec![added(101)]).chain(futures::stream::pending::<
-                Result<WatchEvent, rusternetes_common::Error>,
+                Result<WatchEvent, k3rs_common::Error>,
             >());
             Ok(Box::pin(s))
         }
@@ -284,7 +284,7 @@ mod tests {
             &self,
             _prefix: &str,
             _revision: i64,
-        ) -> rusternetes_common::Result<WatchStream> {
+        ) -> k3rs_common::Result<WatchStream> {
             self.since_calls.fetch_add(1, Ordering::SeqCst);
             // Cancelled by the backend: ends at once, no events, no error.
             let s = futures::stream::iter(Vec::new());
@@ -346,7 +346,7 @@ mod tests {
 
     #[async_trait]
     impl WatchSource for DroppingSource {
-        async fn watch_from_now(&self, _prefix: &str) -> rusternetes_common::Result<WatchStream> {
+        async fn watch_from_now(&self, _prefix: &str) -> k3rs_common::Result<WatchStream> {
             let n = self.from_now_calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 // First connection: deliver rev 5, then the stream ends.
@@ -357,7 +357,7 @@ mod tests {
                 // during the gap is invisible here. Stay open so the loop
                 // doesn't spin.
                 let s = futures::stream::iter(Vec::new()).chain(futures::stream::pending::<
-                    Result<WatchEvent, rusternetes_common::Error>,
+                    Result<WatchEvent, k3rs_common::Error>,
                 >());
                 Ok(Box::pin(s))
             }
@@ -371,12 +371,12 @@ mod tests {
             &self,
             _prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<WatchStream> {
+        ) -> k3rs_common::Result<WatchStream> {
             self.since_revs.lock().unwrap().push(revision);
             // Replay the gap event committed while the stream was down, then
             // stay open.
             let s = futures::stream::iter(vec![added(6)]).chain(futures::stream::pending::<
-                Result<WatchEvent, rusternetes_common::Error>,
+                Result<WatchEvent, k3rs_common::Error>,
             >());
             Ok(Box::pin(s))
         }
@@ -468,7 +468,7 @@ mod tests {
             let mut watchers = cache.watchers.write().await;
             watchers.insert(
                 "/registry/nodes/".to_string(),
-                Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new()),
+                Arc::new(k3rs_api_server::cache_watcher::Dispatcher::new()),
             );
         }
         {
@@ -509,10 +509,10 @@ mod tests {
         let cache = WatchCache::new(storage);
 
         // Prefix "a": a watcher with a LIVE receiver — must not be shrunk.
-        let disp_a = Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new());
+        let disp_a = Arc::new(k3rs_api_server::cache_watcher::Dispatcher::new());
         let rx_a = disp_a.add_watcher(100);
         // Prefix "b": a watcher whose receiver was dropped — count 0, eligible.
-        let disp_b = Arc::new(rusternetes_api_server::cache_watcher::Dispatcher::new());
+        let disp_b = Arc::new(k3rs_api_server::cache_watcher::Dispatcher::new());
         drop(disp_b.add_watcher(100));
         {
             let mut watchers = cache.watchers.write().await;

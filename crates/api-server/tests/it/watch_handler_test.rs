@@ -3,12 +3,12 @@
 //! Tests watch streams, bookmarks, timeouts, and resource version handling
 
 use futures::StreamExt;
-use rusternetes_common::resources::namespace::{Namespace, NamespaceSpec, NamespaceStatus};
-use rusternetes_common::resources::{
+use k3rs_common::resources::namespace::{Namespace, NamespaceSpec, NamespaceStatus};
+use k3rs_common::resources::{
     ConfigMap, Container, Pod, PodSpec, PodStatus, Service, ServicePort, ServiceSpec,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,7 +167,7 @@ async fn test_watch_initial_state_events() {
     // Should receive watch event
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Added(k, _) => {
+            k3rs_storage::WatchEvent::Added(k, _) => {
                 assert!(k.contains("pod-new"));
             }
             _ => panic!("Expected Added event"),
@@ -215,7 +215,7 @@ async fn test_watch_added_event() {
     // Verify we get an ADDED event
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Added(k, v) => {
+            k3rs_storage::WatchEvent::Added(k, v) => {
                 assert!(k.contains("test-pod"));
                 let received_pod: Pod = serde_json::from_str(&v).unwrap();
                 assert_eq!(received_pod.metadata.name, "test-pod");
@@ -270,7 +270,7 @@ async fn test_watch_modified_event() {
     // Verify we get a MODIFIED event
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Modified(k, v) => {
+            k3rs_storage::WatchEvent::Modified(k, v) => {
                 assert!(k.contains("test-pod"));
                 let received_pod: Pod = serde_json::from_str(&v).unwrap();
                 assert_eq!(
@@ -326,7 +326,7 @@ async fn test_watch_deleted_event() {
     // Verify we get a DELETED event
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Deleted(k, v) => {
+            k3rs_storage::WatchEvent::Deleted(k, v) => {
                 assert!(k.contains("test-pod"));
                 let received_pod: Pod = serde_json::from_str(&v).unwrap();
                 assert_eq!(received_pod.metadata.name, "test-pod");
@@ -370,7 +370,7 @@ async fn test_watch_multiple_resources() {
     // Verify we get 5 ADDED events
     let mut count = 0;
     for _ in 0..5 {
-        if let Some(Ok(rusternetes_storage::WatchEvent::Added(_, _))) = watch_stream.next().await {
+        if let Some(Ok(k3rs_storage::WatchEvent::Added(_, _))) = watch_stream.next().await {
             count += 1;
         }
     }
@@ -417,7 +417,7 @@ async fn test_watch_cluster_scoped_resources() {
     // Verify we get an ADDED event
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Added(k, _) => {
+            k3rs_storage::WatchEvent::Added(k, _) => {
                 assert!(k.contains("test-namespace"));
             }
             _ => panic!("Expected Added event"),
@@ -489,7 +489,7 @@ async fn test_watch_resource_version_tracking() {
         // Verify event has updated resource version
         if let Some(Ok(event)) = watch_stream.next().await {
             match event {
-                rusternetes_storage::WatchEvent::Modified(_, v) => {
+                k3rs_storage::WatchEvent::Modified(_, v) => {
                     let received_cm: ConfigMap = serde_json::from_str(&v).unwrap();
                     assert_eq!(
                         received_cm.metadata.resource_version,
@@ -621,7 +621,7 @@ async fn test_watch_namespace_isolation() {
     // Should only get event for ns1
     if let Some(Ok(event)) = watch_stream.next().await {
         match event {
-            rusternetes_storage::WatchEvent::Added(k, _) => {
+            k3rs_storage::WatchEvent::Added(k, _) => {
                 assert!(k.contains(ns1));
                 assert!(!k.contains(ns2));
             }
@@ -798,17 +798,17 @@ async fn test_watch_event_ordering() {
     ];
 
     match events[0].as_ref().unwrap().as_ref().unwrap() {
-        rusternetes_storage::WatchEvent::Added(_, _) => {}
+        k3rs_storage::WatchEvent::Added(_, _) => {}
         _ => panic!("First event should be Added"),
     }
 
     match events[1].as_ref().unwrap().as_ref().unwrap() {
-        rusternetes_storage::WatchEvent::Modified(_, _) => {}
+        k3rs_storage::WatchEvent::Modified(_, _) => {}
         _ => panic!("Second event should be Modified"),
     }
 
     match events[2].as_ref().unwrap().as_ref().unwrap() {
-        rusternetes_storage::WatchEvent::Deleted(_, _) => {}
+        k3rs_storage::WatchEvent::Deleted(_, _) => {}
         _ => panic!("Third event should be Deleted"),
     }
 }

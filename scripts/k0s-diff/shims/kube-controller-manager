@@ -1,10 +1,10 @@
 #!/bin/sh
 # scripts/k0s-diff/shims/kube-controller-manager
 #
-# Task 5, v4 — the rusternetes-controller-manager flag-adapter. k0s launches
+# Task 5, v4 — the k3rs-controller-manager flag-adapter. k0s launches
 # this file (staged via shims/stage-swap.sh) believing it is the upstream Go
 # kube-controller-manager. It translates the k0s controller-manager argv into
-# the flags rusternetes-controller-manager (crates/controller-manager/src/main.rs)
+# the flags k3rs-controller-manager (crates/controller-manager/src/main.rs)
 # understands, logs every dropped k0s flag, and execs it in **API mode**
 # (--kubeconfig present => run_api_mode against k0s's own, still-Go,
 # api-server).
@@ -28,7 +28,7 @@
 #     --requestheader-client-ca-file=/var/lib/k0s/pki/front-proxy-ca.crt \
 #     --root-ca-file=/var/lib/k0s/pki/ca.crt
 #
-# rusternetes-controller-manager uses clap KEBAB-case flags (verified via
+# k3rs-controller-manager uses clap KEBAB-case flags (verified via
 # crates/controller-manager/src/main.rs `Args`):
 #   --kubeconfig=X       -> --kubeconfig=X                 (selects API mode)
 #   (derived)            -> --api-server-url=<server from the kubeconfig>
@@ -41,14 +41,14 @@
 # goes through the CertificateSigningRequestController, which does not take a
 # CA key/cert via flags), --service-account-private-key-file (no SA token
 # issuer flag), --node-cidr-mask-size / --allocate-node-cidrs / --cluster-cidr
-# (rusternetes' node-IPAM flags exist but are not part of this mapping per the
+# (k3rs' node-IPAM flags exist but are not part of this mapping per the
 # task-5 brief — API mode's node IPAM path is unexercised here),
 # --service-cluster-ip-range, --use-service-account-credentials, --controllers,
 # --client-ca-file, --requestheader-client-ca-file,
 # --terminated-pod-gc-threshold, --authentication-kubeconfig,
 # --authorization-kubeconfig, --bind-address, --profiling, --v, --feature-gates.
 #
-# EXPECTED OUTCOME (per task-5 brief): rusternetes' ApiClient has no
+# EXPECTED OUTCOME (per task-5 brief): k3rs' ApiClient has no
 # client-cert/mTLS auth (issue #1578), so the controller-manager's API-mode
 # calls against k0s's cert-auth api-server are expected to 401 — this shim's
 # job is correct WIRING, not convergence.
@@ -57,7 +57,7 @@ set -eu
 LOG=/tmp/kube-controller-manager-shim.log
 : > "$LOG" 2>/dev/null || true
 log() { echo "$@" >> "$LOG" 2>/dev/null || true; }
-log "=== $(date -u +%FT%TZ) rusternetes-controller-manager adapter shim (pid $$) ==="
+log "=== $(date -u +%FT%TZ) k3rs-controller-manager adapter shim (pid $$) ==="
 log "raw argv: $*"
 
 KUBECONFIG_PATH=""
@@ -79,10 +79,10 @@ while [ $# -gt 0 ]; do
 done
 
 log "mapped: kubeconfig='$KUBECONFIG_PATH' cluster_name='${CLUSTER_NAME:-<unset>}' leader_elect='${LEADER_ELECT:-<unset>}'"
-log "DROPPED k0s flags (unsupported by rusternetes-controller-manager):"
+log "DROPPED k0s flags (unsupported by k3rs-controller-manager):"
 for f in $DROPPED; do log "  $f"; done
 
-# rusternetes-controller-manager's --api-server-url defaults to a hostname
+# k3rs-controller-manager's --api-server-url defaults to a hostname
 # unreachable here; derive the real endpoint from the kubeconfig's `server:`
 # line so it dials k0s's actual api-server (same technique as the v2 kubelet
 # and v3 kube-scheduler shims).
@@ -101,6 +101,6 @@ set -- --kubeconfig="$KUBECONFIG_PATH"
 
 # Absolute path: the k0s supervisor launches components with a minimal PATH
 # that excludes /usr/local/bin (a bare name yields exit 127 "not found").
-RUSTERNETES=/usr/local/bin/rusternetes-controller-manager
-log "exec: $RUSTERNETES $*"
-exec "$RUSTERNETES" "$@"
+K3RS=/usr/local/bin/k3rs-controller-manager
+log "exec: $K3RS $*"
+exec "$K3RS" "$@"

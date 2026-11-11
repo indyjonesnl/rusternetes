@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for Events
 
-use rusternetes_common::resources::{Event, EventSource, EventType, ObjectReference};
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Event, EventSource, EventType, ObjectReference};
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -111,7 +111,7 @@ async fn test_event_delete() {
     storage.delete(&key).await.unwrap();
 
     // Verify it's deleted
-    let result: rusternetes_common::Result<Event> = storage.get(&key).await;
+    let result: k3rs_common::Result<Event> = storage.get(&key).await;
     assert!(result.is_err());
 }
 
@@ -549,7 +549,7 @@ async fn test_event_not_found() {
     let namespace = "test-event-not-found";
     let key = build_key("events", Some(namespace), "nonexistent");
 
-    let result: rusternetes_common::Result<Event> = storage.get(&key).await;
+    let result: k3rs_common::Result<Event> = storage.get(&key).await;
     assert!(result.is_err());
 }
 

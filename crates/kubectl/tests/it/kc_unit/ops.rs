@@ -3,15 +3,15 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_kubectl::discovery::ResourceMapping;
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_kubectl::discovery::ResourceMapping;
     pub use serde_json::Value;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::discovery::ResourceMapping;
-    use rusternetes_kubectl::ops::*;
+    use k3rs_kubectl::discovery::ResourceMapping;
+    use k3rs_kubectl::ops::*;
 
     #[test]
     fn label_selector_query_none_and_empty_are_blank() {

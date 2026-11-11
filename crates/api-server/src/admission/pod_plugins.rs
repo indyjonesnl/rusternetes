@@ -17,14 +17,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use rusternetes_common::qos::{get_pod_qos, QoSClass};
-use rusternetes_common::resources::pod::Toleration;
-use rusternetes_common::resources::{Namespace, Pod};
-use rusternetes_common::validation::field::Path;
-use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
-use rusternetes_common::validation::pod::validate_tolerations_with_options;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::qos::{get_pod_qos, QoSClass};
+use k3rs_common::resources::pod::Toleration;
+use k3rs_common::resources::{Namespace, Pod};
+use k3rs_common::validation::field::Path;
+use k3rs_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+use k3rs_common::validation::pod::validate_tolerations_with_options;
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 
 use super::builtin_plugins::new_forbidden;
 use super::plugins::enabled;
@@ -578,7 +578,7 @@ pub fn extended_resource_toleration_admit(pod: &mut Pod) {
     {
         if let Some(requests) = c.resources.as_ref().and_then(|r| r.requests.as_ref()) {
             for name in requests.keys() {
-                if rusternetes_common::quota::is_extended_resource_name(name) {
+                if k3rs_common::quota::is_extended_resource_name(name) {
                     resources.insert(name.clone());
                 }
             }

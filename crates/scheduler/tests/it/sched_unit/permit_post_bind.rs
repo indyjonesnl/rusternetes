@@ -7,17 +7,17 @@
 //! and the timeout reject the pod) and of `bindingCycle` /
 //! `schedulingCycle` (schedule_one.go:234-256, :302-315, :344).
 use async_trait::async_trait;
-use rusternetes_common::resources::Pod;
-use rusternetes_scheduler::framework_runtime::{Framework, MAX_PERMIT_TIMEOUT};
-use rusternetes_scheduler::fwk::{
+use k3rs_common::resources::Pod;
+use k3rs_scheduler::framework_runtime::{Framework, MAX_PERMIT_TIMEOUT};
+use k3rs_scheduler::fwk::{
     Code, CycleState, Handle, NoHandle, PermitPlugin, Plugin, PostBindPlugin, Status,
 };
-use rusternetes_scheduler::profile::{Map, Profile};
-use rusternetes_scheduler::queue::scheduling_queue::{
+use k3rs_scheduler::profile::{Map, Profile};
+use k3rs_scheduler::queue::scheduling_queue::{
     priority_sort_less, PriorityQueue, PriorityQueueOptions,
 };
-use rusternetes_scheduler::scheduler::{ScheduleOutcome, Scheduler};
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_scheduler::scheduler::{ScheduleOutcome, Scheduler};
+use k3rs_storage::{MemoryStorage, Storage};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -413,7 +413,7 @@ async fn post_bind_plugins_run_in_order() {
 // The binding cycle
 // ---------------------------------------------------------------------------
 
-fn node() -> rusternetes_common::resources::Node {
+fn node() -> k3rs_common::resources::Node {
     serde_json::from_value(serde_json::json!({
         "apiVersion": "v1", "kind": "Node",
         "metadata": {"name": "n1", "uid": "n1-uid"},
@@ -462,7 +462,7 @@ async fn node_of(storage: &MemoryStorage) -> Option<String> {
     p.spec.and_then(|s| s.node_name)
 }
 
-async fn wait_for_waiting_pod(c: &Cluster) -> Arc<rusternetes_scheduler::waiting_pods::WaitingPod> {
+async fn wait_for_waiting_pod(c: &Cluster) -> Arc<k3rs_scheduler::waiting_pods::WaitingPod> {
     let fw = c
         .scheduler
         .profile_for(&pod_named("p", "uid-p"))

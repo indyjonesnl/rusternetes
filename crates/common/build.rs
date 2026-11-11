@@ -1,7 +1,7 @@
 // Capture the git commit SHA and build time so every binary can log which
 // build it is — `.git` is excluded from the Docker build context
 // (.dockerignore), so container builds inject the SHA via the
-// `RUSTERNETES_GIT_SHA` env/ARG; local `cargo build` reads it from the checkout.
+// `K3RS_GIT_SHA` env/ARG; local `cargo build` reads it from the checkout.
 use std::process::Command;
 
 fn main() {
@@ -11,14 +11,14 @@ fn main() {
     // so watching git metadata meant each commit, fetch, or branch switch
     // dirtied this build script and rebuilt all 19 crates — a full-workspace
     // rebuild as the routine price of `git commit`.
-    println!("cargo:rerun-if-env-changed=RUSTERNETES_GIT_SHA");
-    println!("cargo:rerun-if-env-changed=RUSTERNETES_STAMP_GIT");
+    println!("cargo:rerun-if-env-changed=K3RS_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=K3RS_STAMP_GIT");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     // Container builds inject the SHA as a build-arg because `.git` is excluded
     // from the Docker context (.dockerignore), and every shipped artifact is a
     // container image, so the real SHA still reaches everything we publish.
-    let injected = std::env::var("RUSTERNETES_GIT_SHA")
+    let injected = std::env::var("K3RS_GIT_SHA")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.trim().to_string());
@@ -33,7 +33,7 @@ fn main() {
 
     let sha = match injected {
         Some(sha) => sha,
-        // Opt in with `RUSTERNETES_STAMP_GIT=1` when a local build genuinely
+        // Opt in with `K3RS_STAMP_GIT=1` when a local build genuinely
         // needs to identify its commit; you get the git watch, and the
         // per-commit rebuild, back along with it.
         None if stamp_from_git() => {
@@ -42,17 +42,14 @@ fn main() {
         }
         None => "dev".to_string(),
     };
-    println!("cargo:rustc-env=RUSTERNETES_BUILD_SHA={sha}");
+    println!("cargo:rustc-env=K3RS_BUILD_SHA={sha}");
 
-    println!(
-        "cargo:rustc-env=RUSTERNETES_BUILD_TIME={}",
-        build_time(stamped)
-    );
+    println!("cargo:rustc-env=K3RS_BUILD_TIME={}", build_time(stamped));
 }
 
 /// Whether a local build asked to be stamped with its real commit.
 fn stamp_from_git() -> bool {
-    std::env::var_os("RUSTERNETES_STAMP_GIT").is_some_and(|v| !v.is_empty())
+    std::env::var_os("K3RS_STAMP_GIT").is_some_and(|v| !v.is_empty())
 }
 
 /// Declare git's HEAD/refs as build inputs, so the stamped SHA follows the

@@ -3,20 +3,20 @@
 
 mod __parent {
     pub use futures::StreamExt;
-    pub use rusternetes_api_server::aggregated_discovery::{
+    pub use k3rs_api_server::aggregated_discovery::{
         is_aggregated_discovery_content_type, legacy_path, parse_discovery_list,
         parse_legacy_resource_list, serve_with_timeout, AggregatorHandler, HandlerRequest,
         ProxyDiscoveryHandler, ACCEPT_V2, ACCEPT_V2_BETA1, AGGREGATOR_GROUP, AGGREGATOR_USER,
     };
-    pub use rusternetes_api_server::aggregator_mux::{
+    pub use k3rs_api_server::aggregator_mux::{
         install_handler_manager, serve_api_group, ApiGroupResponse, ProxyHandler,
     };
-    pub use rusternetes_api_server::autoregister::{APIServiceClient, StorageAPIServiceClient};
-    pub use rusternetes_api_server::crdregistration::WorkQueue;
-    pub use rusternetes_api_server::post_start_hooks::{spawn_hook_with, PostStartHooks};
-    pub use rusternetes_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
-    pub use rusternetes_common::resources::APIService;
-    pub use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+    pub use k3rs_api_server::autoregister::{APIServiceClient, StorageAPIServiceClient};
+    pub use k3rs_api_server::crdregistration::WorkQueue;
+    pub use k3rs_api_server::post_start_hooks::{spawn_hook_with, PostStartHooks};
+    pub use k3rs_api_server::registry::apiextensions::customresourcedefinition::ControllerRateLimiter;
+    pub use k3rs_common::resources::APIService;
+    pub use k3rs_storage::{build_prefix, Storage, WatchEvent};
     pub use std::collections::{BTreeMap, BTreeSet, HashMap};
     pub use std::sync::{Arc, Mutex};
     pub use std::time::{Duration, Instant};
@@ -26,9 +26,9 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use async_trait::async_trait;
-    use rusternetes_api_server::aggregated_discovery::HandlerResponse;
-    use rusternetes_api_server::apiservice_registration::*;
-    use rusternetes_api_server::autoregister::ClientError;
+    use k3rs_api_server::aggregated_discovery::HandlerResponse;
+    use k3rs_api_server::apiservice_registration::*;
+    use k3rs_api_server::autoregister::ClientError;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn svc(name: &str, with_service: bool) -> APIService {
@@ -38,7 +38,7 @@ mod tests {
         s.spec.group = group;
         s.spec.version = version;
         if with_service {
-            s.spec.service = Some(rusternetes_common::resources::APIServiceReference {
+            s.spec.service = Some(k3rs_common::resources::APIServiceReference {
                 namespace: "ns".into(),
                 name: "backend".into(),
                 port: None,
@@ -125,7 +125,7 @@ mod tests {
     /// unmounts the version, and the group handler with its last version.
     #[tokio::test]
     async fn add_and_remove_mount_and_unmount_handlers() {
-        use rusternetes_api_server::aggregator_mux::{ApiGroupResponse, ProxyDecision};
+        use k3rs_api_server::aggregator_mux::{ApiGroupResponse, ProxyDecision};
         let (_, mgr, _, _) = controller_over(lister_with(&[]));
         assert!(mgr.proxy_handler("g.example.com", "v1").is_none());
         assert!(mgr.serve_api_group("g.example.com").is_none());
@@ -143,7 +143,7 @@ mod tests {
 
         // An update reaches the SAME handler (updateAPIService), not a new one.
         v1.status.conditions.push(
-            rusternetes_common::resources::apiregistration::APIServiceCondition {
+            k3rs_common::resources::apiregistration::APIServiceCondition {
                 type_: "Available".into(),
                 status: "True".into(),
                 ..Default::default()

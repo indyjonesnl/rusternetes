@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::builtin_plugins::new_forbidden;
-    pub use rusternetes_api_server::admission::plugins::enabled;
-    pub use rusternetes_common::qos::{get_pod_qos, QoSClass};
-    pub use rusternetes_common::resources::pod::Toleration;
-    pub use rusternetes_common::resources::{Namespace, Pod};
-    pub use rusternetes_common::validation::field::Path;
-    pub use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
-    pub use rusternetes_common::validation::pod::validate_tolerations_with_options;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_api_server::admission::builtin_plugins::new_forbidden;
+    pub use k3rs_api_server::admission::plugins::enabled;
+    pub use k3rs_common::qos::{get_pod_qos, QoSClass};
+    pub use k3rs_common::resources::pod::Toleration;
+    pub use k3rs_common::resources::{Namespace, Pod};
+    pub use k3rs_common::validation::field::Path;
+    pub use k3rs_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+    pub use k3rs_common::validation::pod::validate_tolerations_with_options;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use std::collections::{BTreeMap, HashMap};
     pub use std::sync::OnceLock;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_plugins::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::admission::pod_plugins::*;
+    use k3rs_storage::MemoryStorage;
 
     fn tol(key: &str, op: &str, value: &str, effect: &str, secs: Option<i64>) -> Toleration {
         let o = |s: &str| (!s.is_empty()).then(|| s.to_string());

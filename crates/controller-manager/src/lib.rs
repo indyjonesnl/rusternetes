@@ -43,9 +43,9 @@ use controllers::{
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
 };
-use rusternetes_client::http::ApiClient;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_storage::{Storage, StorageBackend};
+use k3rs_client::http::ApiClient;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -253,7 +253,7 @@ where
     S: Storage + Send + Sync + 'static,
     F: Fn(&'static str) -> Arc<S>,
 {
-    info!("Starting Rusternetes Controller Manager");
+    info!("Starting k3rs Controller Manager");
     let _handles = spawn_controllers(storage_for, config);
     info!("All controllers started successfully");
 
@@ -281,11 +281,7 @@ where
     // Spawn all controllers
     let s = storage_for("LoadBalancer");
     handles.push(tokio::spawn(async move {
-        let c = Arc::new(LoadBalancerController::new(
-            s,
-            "rusternetes".to_string(),
-            interval,
-        ));
+        let c = Arc::new(LoadBalancerController::new(s, "k3rs".to_string(), interval));
         if let Err(e) = c.run().await {
             error!("LoadBalancer controller error: {}", e);
         }
@@ -407,7 +403,7 @@ where
         let attacher = Arc::new(controllers::csi_attacher::CsiAttacher::new(
             s,
             driver,
-            rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+            k3rs_csi::controller_client::CsiControllerClient::with_endpoint(socket),
         ));
         handles.push(tokio::spawn(async move {
             if let Err(e) = attacher.run().await {
@@ -632,9 +628,8 @@ where
     // `newKubeAPIServerSignerClusterTrustBundledPublisherController`
     // (cmd/kube-controller-manager/app/certificates.go:289-353), gated on
     // the ClusterTrustBundle feature gate; skipped without a root CA.
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    ) {
+    if k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::ClusterTrustBundle)
+    {
         let s = storage_for("ClusterTrustBundlePublisher");
         match controllers::clustertrustbundle_publisher::ClusterTrustBundlePublisher::for_kube_apiserver_serving(
             s,
@@ -656,8 +651,8 @@ where
     // `newPodCertificateRequestCleanerController`
     // (cmd/kube-controller-manager/app/certificates.go:232-253), gated on the
     // `PodCertificateRequest` feature gate.
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    if k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
     ) {
         let s = storage_for("PodCertificateRequestCleaner");
         handles.push(tokio::spawn(async move {

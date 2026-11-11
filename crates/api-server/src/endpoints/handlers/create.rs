@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use rusternetes_common::admission::Operation;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::validation::metav1::{validate_create_options, CreateOptions};
-use rusternetes_common::{Error, Result};
+use k3rs_common::admission::Operation;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::validation::metav1::{validate_create_options, CreateOptions};
+use k3rs_common::{Error, Result};
 
 use super::admission::{Admission, CreateValidation};
 use super::rest::{

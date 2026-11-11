@@ -6,7 +6,7 @@
 //! `kubernetes-sigs/gateway-api`, and its *schema* is the contract the
 //! api-server enforces:
 //! `config/crd/standard/gateway.networking.k8s.io_referencegrants.yaml`
-//! (v1.4.0, version `v1beta1`). Rusternetes serves it natively, so nothing
+//! (v1.4.0, version `v1beta1`). k3rs serves it natively, so nothing
 //! else applies the schema. The schema keywords ported:
 //!
 //! * `spec.from` / `spec.to`: `required`, `minItems: 1`, `maxItems: 16`;

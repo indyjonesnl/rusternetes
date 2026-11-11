@@ -3,9 +3,9 @@
 //! Tests all CRUD operations for CSIStorageCapacity resources.
 //! CSIStorageCapacity stores the result of one CSI GetCapacity call.
 
-use rusternetes_common::resources::csi::CSIStorageCapacity;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::csi::CSIStorageCapacity;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -246,7 +246,7 @@ async fn test_csistoragecapacity_optional_fields_omitted() {
 
 #[tokio::test]
 async fn test_csistoragecapacity_with_node_topology() {
-    use rusternetes_common::resources::volume::LabelSelector;
+    use k3rs_common::resources::volume::LabelSelector;
 
     let mut match_labels = HashMap::new();
     match_labels.insert(

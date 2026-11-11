@@ -976,7 +976,7 @@ pub struct VolumeMount {
 }
 
 /// The deprecated in-tree volume sources of core/v1 `VolumeSource`
-/// (`staging/src/k8s.io/api/core/v1/types.go`, `VolumeSource`). Rusternetes
+/// (`staging/src/k8s.io/api/core/v1/types.go`, `VolumeSource`). k3rs
 /// does not implement these plugins, but the API must still round-trip them
 /// losslessly and PodSecurity `restrictedVolumes` names the type of the
 /// offending source (`check_restrictedVolumes.go:108-153`). Most sources are

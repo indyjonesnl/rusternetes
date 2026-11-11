@@ -16,7 +16,7 @@
 //! it (`fieldValidation=Strict`, `fieldManager=field_validation_mgr`), and the
 //! upstream substring assertion is checked on the response body.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";

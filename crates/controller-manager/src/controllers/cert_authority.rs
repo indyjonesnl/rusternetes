@@ -9,15 +9,15 @@
 //! authoritative upstream), and signs it with the cluster CA key, writing the
 //! PEM into `status.certificate`.
 //!
-//! [`CertificateSigningRequest`]: rusternetes_common::resources::CertificateSigningRequest
+//! [`CertificateSigningRequest`]: k3rs_common::resources::CertificateSigningRequest
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Datelike;
+use k3rs_common::resources::KeyUsage;
 use rcgen::{
     Certificate, CertificateParams, CertificateSigningRequestParams, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose,
 };
-use rusternetes_common::resources::KeyUsage;
 
 /// Default issued-certificate lifetime when a CSR does not request one, matching
 /// upstream's 1-year default (`pkg/controller/certificates/signer`).
@@ -112,13 +112,13 @@ impl CertificateAuthority {
     }
 }
 
-/// Load the cluster CA from the `RUSTERNETES_CA_CERT_FILE` +
-/// `RUSTERNETES_CA_KEY_FILE` environment variables, enabling the in-process CSR
+/// Load the cluster CA from the `K3RS_CA_CERT_FILE` +
+/// `K3RS_CA_KEY_FILE` environment variables, enabling the in-process CSR
 /// signer. Returns `None` (signer disabled, issuance left to an external signer)
 /// when either var is unset or the material cannot be loaded.
 pub fn load_cluster_ca_from_env() -> Option<std::sync::Arc<CertificateAuthority>> {
-    let cert_path = std::env::var("RUSTERNETES_CA_CERT_FILE").ok()?;
-    let key_path = std::env::var("RUSTERNETES_CA_KEY_FILE").ok()?;
+    let cert_path = std::env::var("K3RS_CA_CERT_FILE").ok()?;
+    let key_path = std::env::var("K3RS_CA_KEY_FILE").ok()?;
     match CertificateAuthority::from_files(&cert_path, &key_path) {
         Ok(ca) => {
             tracing::info!("CSR signer enabled (cluster CA loaded from {cert_path})");

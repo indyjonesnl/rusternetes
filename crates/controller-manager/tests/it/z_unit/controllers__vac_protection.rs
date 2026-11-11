@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::resources::csi::VolumeAttributesClass;
-    pub use rusternetes_common::resources::volume::VAC_PROTECTION_FINALIZER;
-    pub use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
-    pub use rusternetes_controller_manager::controllers::pvc_protection::{
+    pub use k3rs_common::resources::csi::VolumeAttributesClass;
+    pub use k3rs_common::resources::volume::VAC_PROTECTION_FINALIZER;
+    pub use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim};
+    pub use k3rs_controller_manager::controllers::pvc_protection::{
         is_deletion_candidate, need_to_add_finalizer, update_or_reap,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
+    pub use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tokio::time;
@@ -18,8 +18,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::vac_protection::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::vac_protection::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::{json, Value};
 
     const FIN: &str = "kubernetes.io/vac-protection";

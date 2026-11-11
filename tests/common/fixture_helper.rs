@@ -1,6 +1,6 @@
-use rusternetes_common::resources::*;
-use rusternetes_common::resources::volume::*;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::resources::*;
+use k3rs_common::resources::volume::*;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 use std::collections::HashMap;
 
 /// Create a test namespace
@@ -113,7 +113,7 @@ pub fn create_test_storage_class(name: &str, provisioner: &str) -> StorageClass 
         provisioner: provisioner.to_string(),
         parameters: Some({
             let mut params = HashMap::new();
-            params.insert("path".to_string(), "/tmp/rusternetes/dynamic-pvs".to_string());
+            params.insert("path".to_string(), "/tmp/k3rs/dynamic-pvs".to_string());
             params
         }),
         reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
@@ -185,7 +185,7 @@ pub fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Dep
         },
         spec: DeploymentSpec {
             replicas: Some(replicas),
-            selector: rusternetes_common::types::LabelSelector {
+            selector: k3rs_common::types::LabelSelector {
                 match_labels: Some(labels.clone()),
                 match_expressions: None
             },
@@ -195,8 +195,8 @@ pub fn create_test_deployment(name: &str, namespace: &str, replicas: i32) -> Dep
                     meta.labels = Some(labels);
                     meta
                 }),
-                spec: Some(rusternetes_common::resources::pod::PodSpec {
-                    containers: vec![rusternetes_common::resources::pod::Container {
+                spec: Some(k3rs_common::resources::pod::PodSpec {
+                    containers: vec![k3rs_common::resources::pod::Container {
                         name: "nginx".to_string(),
                         image: "nginx:1.25-alpine".to_string(),
                         image_pull_policy: Some("IfNotPresent".to_string()),

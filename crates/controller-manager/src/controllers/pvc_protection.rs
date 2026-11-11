@@ -16,10 +16,10 @@
 //! the claims the pod mounts (`enqueuePVCs`).
 
 use anyhow::Result;
-use rusternetes_common::resources::volume::PVC_PROTECTION_FINALIZER;
-use rusternetes_common::resources::{PersistentVolumeClaim, Pod};
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::volume::PVC_PROTECTION_FINALIZER;
+use k3rs_common::resources::{PersistentVolumeClaim, Pod};
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -60,7 +60,7 @@ where
     storage.update(key, obj).await?;
     if !finalizers_left && !meta["metadata"]["deletionTimestamp"].is_null() {
         match storage.delete(key).await {
-            Ok(()) | Err(rusternetes_common::Error::NotFound(_)) => {}
+            Ok(()) | Err(k3rs_common::Error::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -126,7 +126,7 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
         let key = build_key("persistentvolumeclaims", Some(namespace), name);
         let mut pvc: PersistentVolumeClaim = match self.storage.get(&key).await {
             Ok(p) => p,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         if is_deletion_candidate(&pvc.metadata, PVC_PROTECTION_FINALIZER) {
@@ -158,7 +158,7 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
     /// `askAPIServer`: a live list of the namespace's pods.
     async fn is_being_used(&self, pvc: &PersistentVolumeClaim) -> Result<bool> {
         let ns = pvc.metadata.namespace.as_deref().unwrap_or("");
-        let prefix = rusternetes_storage::build_prefix("pods", Some(ns));
+        let prefix = k3rs_storage::build_prefix("pods", Some(ns));
         let pods: Vec<Pod> = self.storage.list(&prefix).await?;
         Ok(pods.iter().any(|p| pod_uses_pvc(p, pvc)))
     }
@@ -166,7 +166,7 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
     /// Queue every claim that needs work (`pvcAddedUpdated`'s filter),
     /// optionally limited to one namespace.
     async fn enqueue(&self, queue: &WorkQueue, namespace: Option<&str>) {
-        let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", namespace);
+        let prefix = k3rs_storage::build_prefix("persistentvolumeclaims", namespace);
         match self.storage.list::<PersistentVolumeClaim>(&prefix).await {
             Ok(pvcs) => {
                 for c in pvcs {
@@ -213,14 +213,11 @@ impl<S: Storage + 'static> PvcProtectionController<S> {
             self.enqueue(&queue, None).await;
             let pvc_watch = self
                 .storage
-                .watch(&rusternetes_storage::build_prefix(
-                    "persistentvolumeclaims",
-                    None,
-                ))
+                .watch(&k3rs_storage::build_prefix("persistentvolumeclaims", None))
                 .await;
             let pod_watch = self
                 .storage
-                .watch(&rusternetes_storage::build_prefix("pods", None))
+                .watch(&k3rs_storage::build_prefix("pods", None))
                 .await;
             let (mut pvc_watch, mut pod_watch) = match (pvc_watch, pod_watch) {
                 (Ok(a), Ok(b)) => (a, b),

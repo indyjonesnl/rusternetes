@@ -1,8 +1,8 @@
 //! Ports of the cases of `TestIsResourceMigratable`
 //! (`pkg/controller/storageversionmigrator/resourceversion_test.go`) that
 //! exercise the verb check, and of `setStatusConditions` (`util.go`).
-use rusternetes_common::resources::storageversionmigration::*;
-use rusternetes_controller_manager::controllers::storage_version_migrator::*;
+use k3rs_common::resources::storageversionmigration::*;
+use k3rs_controller_manager::controllers::storage_version_migrator::*;
 
 fn verbs(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()

@@ -16,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::encryption::*;
+    use k3rs_common::encryption::*;
 
     #[test]
     fn test_aes_gcm_encrypt_decrypt() {

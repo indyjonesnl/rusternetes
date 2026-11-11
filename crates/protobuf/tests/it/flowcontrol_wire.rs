@@ -1,5 +1,5 @@
 //! Wire-level regression tests for flowcontrol.apiserver.k8s.io/v1 protobuf
-//! field numbers. A symmetric rusternetes encode↔decode cannot catch a wrong
+//! field numbers. A symmetric k3rs encode↔decode cannot catch a wrong
 //! tag (it is consistent with itself), so these feed hand-built payloads with
 //! the UPSTREAM field numbers (k8s.io/api/flowcontrol/v1/generated.proto) and
 //! assert they decode.
@@ -11,7 +11,7 @@
 //! .nonResourceURLs: Required value: nonResourceURLs must contain at least one
 //! value" — failing `[sig-api-machinery] API priority and fairness should
 //! support FlowSchema API operations`.
-use rusternetes_protobuf::ProtoRegistry;
+use k3rs_protobuf::ProtoRegistry;
 use serde_json::json;
 
 /// FlowSchema.spec(2) → rules(4) → nonResourceRules(3) →

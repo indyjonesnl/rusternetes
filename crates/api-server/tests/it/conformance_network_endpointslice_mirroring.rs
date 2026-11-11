@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
-use rusternetes_client::http::ApiClient;
-use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
-use rusternetes_storage::api_storage::ApiStorage;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_controller_manager::controllers::endpointslice::EndpointSliceController;
+use k3rs_storage::api_storage::ApiStorage;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

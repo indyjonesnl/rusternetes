@@ -2,14 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::builtin_plugins::{attr_name, new_forbidden};
-    pub use rusternetes_api_server::authorization_webhook::{
-        is_connection_reset, WebhookClientConfig,
-    };
-    pub use rusternetes_common::lru_expire_cache::LruExpireCache;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_common::wait::Backoff;
-    pub use rusternetes_common::Error;
+    pub use k3rs_api_server::admission::builtin_plugins::{attr_name, new_forbidden};
+    pub use k3rs_api_server::authorization_webhook::{is_connection_reset, WebhookClientConfig};
+    pub use k3rs_common::lru_expire_cache::LruExpireCache;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_common::wait::Backoff;
+    pub use k3rs_common::Error;
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::BTreeMap;
     pub use std::path::Path;
@@ -19,7 +17,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::image_policy::*;
+    use k3rs_api_server::admission::image_policy::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -215,15 +213,15 @@ mod tests {
     fn good_pod(image: &str) -> Pod {
         Pod::new(
             "",
-            rusternetes_common::resources::PodSpec {
+            k3rs_common::resources::PodSpec {
                 containers: vec![container(image)],
                 ..Default::default()
             },
         )
     }
 
-    fn container(image: &str) -> rusternetes_common::resources::Container {
-        rusternetes_common::resources::Container {
+    fn container(image: &str) -> k3rs_common::resources::Container {
+        k3rs_common::resources::Container {
             name: "c".into(),
             image: image.into(),
             ..Default::default()
@@ -269,7 +267,7 @@ mod tests {
 
     #[test]
     fn missing_config_and_missing_kubeconfig_fail() {
-        let _g = rusternetes_api_server::admission::plugins::EnabledForTest::new(&[PLUGIN_NAME]);
+        let _g = k3rs_api_server::admission::plugins::EnabledForTest::new(&[PLUGIN_NAME]);
         assert!(install_from_config(None)
             .unwrap_err()
             .to_string()
@@ -280,7 +278,7 @@ mod tests {
 
     #[test]
     fn disabled_plugin_needs_no_config() {
-        let _g = rusternetes_api_server::admission::plugins::EnabledForTest::new(&[]);
+        let _g = k3rs_api_server::admission::plugins::EnabledForTest::new(&[]);
         install_from_config(None).unwrap();
     }
 
@@ -359,7 +357,7 @@ mod tests {
         let mut pod = good_pod("a");
         let spec = pod.spec.as_mut().unwrap();
         spec.init_containers = Some(vec![container("i")]);
-        spec.ephemeral_containers = Some(vec![rusternetes_common::resources::EphemeralContainer {
+        spec.ephemeral_containers = Some(vec![k3rs_common::resources::EphemeralContainer {
             name: "e".into(),
             image: "eph".into(),
             ..Default::default()

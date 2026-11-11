@@ -36,9 +36,9 @@ use super::protobuf_schema_parity_upstream::{
     build_logical, collect_map_entries, compare_types, intentional_field_skip, map_value_type,
     LogicalType, MapEntryNames, UpstreamField, PROTO_FILES,
 };
+use k3rs_api_server::protobuf::{FieldType, ProtoRegistry};
+use k3rs_test_support::harness::TestApiServer;
 use prost_types::{DescriptorProto, FileDescriptorProto};
-use rusternetes_api_server::protobuf::{FieldType, ProtoRegistry};
-use rusternetes_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

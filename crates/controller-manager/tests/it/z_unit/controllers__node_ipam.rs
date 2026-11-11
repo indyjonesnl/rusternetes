@@ -5,10 +5,10 @@ mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
     pub use ipnet::IpNet;
-    pub use rusternetes_common::resources::{EventSource, EventType, Node, ObjectReference};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_controller_manager::controllers::cidrset_metrics;
-    pub use rusternetes_storage::{
+    pub use k3rs_common::resources::{EventSource, EventType, Node, ObjectReference};
+    pub use k3rs_common::Error;
+    pub use k3rs_controller_manager::controllers::cidrset_metrics;
+    pub use k3rs_storage::{
         build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
     };
     pub use std::collections::HashMap;
@@ -21,10 +21,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Event;
-    use rusternetes_controller_manager::controllers::node_ipam::*;
-    use rusternetes_storage::memory::MemoryStorage;
-    use rusternetes_storage::{build_key, build_prefix};
+    use k3rs_common::resources::Event;
+    use k3rs_controller_manager::controllers::node_ipam::*;
+    use k3rs_storage::memory::MemoryStorage;
+    use k3rs_storage::{build_key, build_prefix};
     use std::collections::HashSet;
 
     /// The patch body is upstream's `nodeForCIDRMergePatch`
@@ -354,7 +354,7 @@ mod tests {
     fn node_with_cidr(name: &str, cidr: Option<&str>) -> Node {
         let mut n = Node::new(name);
         if let Some(c) = cidr {
-            n.spec = Some(rusternetes_common::resources::NodeSpec {
+            n.spec = Some(k3rs_common::resources::NodeSpec {
                 pod_cidr: Some(c.to_string()),
                 pod_cidrs: Some(vec![c.to_string()]),
                 provider_id: None,
@@ -662,7 +662,7 @@ mod tests {
     fn node_with_cidrs(name: &str, cidrs: &[&str]) -> Node {
         let mut n = Node::new(name);
         if !cidrs.is_empty() {
-            n.spec = Some(rusternetes_common::resources::NodeSpec {
+            n.spec = Some(k3rs_common::resources::NodeSpec {
                 pod_cidr: Some(cidrs[0].to_string()),
                 pod_cidrs: Some(cidrs.iter().map(|c| c.to_string()).collect()),
                 provider_id: None,

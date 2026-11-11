@@ -9,7 +9,7 @@
 //! body issues its client calls. Names come from `generateName`, so each
 //! step uses the name the server returned.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const VACS: &str = "/apis/storage.k8s.io/v1/volumeattributesclasses";

@@ -1,4 +1,4 @@
-# Rūsternetes Documentation
+# k3rs Documentation
 
 A ground-up reimplementation of Kubernetes in Rust. This is the index of the
 current documentation set. The [HTML documentation site](guide/index.html) has

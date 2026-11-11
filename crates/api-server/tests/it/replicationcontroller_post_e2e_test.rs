@@ -20,7 +20,7 @@
 //!   [sig-api-machinery] Garbage collector should orphan pods created by rc
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TEST_NS: &str = "rc-e2e";

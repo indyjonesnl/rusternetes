@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::LabelSelector;
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::LabelSelector;
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::csi::*;
+    use k3rs_common::resources::csi::*;
 
     #[test]
     fn test_csi_driver_serialization() {

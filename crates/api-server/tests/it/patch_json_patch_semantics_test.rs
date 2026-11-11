@@ -31,8 +31,8 @@
 //! Pattern follows `decoder_content_type_test.rs` — helpers inline, no
 //! shared `tests/common` mod, all assertions ride on the public HTTP surface.
 
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -78,12 +78,12 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str) -> String {
 
 /// Apply `ops` the way the PATCH handler's patch step does, against the pod
 /// stored under `{name}`, and write the result back. These cases pin the patch
-/// ENGINE (`rusternetes_api_server::patch`), not what a Pod may become: a pod
+/// ENGINE (`k3rs_api_server::patch`), not what a Pod may become: a pod
 /// update fence refuses added containers and ports, as upstream's
 /// `ValidatePodUpdate` does, so sending them through `PATCH /pods` would test
 /// that fence instead.
 async fn apply_patch(router: TestApiServer, pod_name: &str, ops: &Value) -> (u16, Value) {
-    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    use k3rs_api_server::patch::{apply_patch, PatchType};
     let key = build_key("pods", Some(TEST_NS), pod_name);
     let current: Value = router.storage.get(&key).await.expect("pod must exist");
     match apply_patch(&current, ops, PatchType::JsonPatch) {

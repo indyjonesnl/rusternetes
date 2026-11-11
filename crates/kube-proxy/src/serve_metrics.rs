@@ -31,13 +31,13 @@ pub fn config_registry() -> Arc<ConfigRegistry> {
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(ConfigRegistry::default())))
 }
 
-static FLAGZ: OnceLock<rusternetes_common::flagz::NamedFlagSetsReader> = OnceLock::new();
+static FLAGZ: OnceLock<k3rs_common::flagz::NamedFlagSetsReader> = OnceLock::new();
 
 /// `o.flagz = flagz.NamedFlagSetsReader{...}` (cmd/kube-proxy/app/options.go:244-251):
 /// set once from the parsed command line, and only when `ComponentFlagz` is
 /// enabled. Unset leaves `/flagz` uninstalled (`flagzReader != nil`,
 /// server.go:483).
-pub fn set_flagz_reader(reader: rusternetes_common::flagz::NamedFlagSetsReader) {
+pub fn set_flagz_reader(reader: k3rs_common::flagz::NamedFlagSetsReader) {
     let _ = FLAGZ.set(reader);
 }
 
@@ -152,7 +152,7 @@ pub fn metrics_router_with_config(proxy_mode: &str, configs: Arc<ConfigRegistry>
 pub fn metrics_router_with_flagz(
     proxy_mode: &str,
     configs: Arc<ConfigRegistry>,
-    flagz_reader: Option<rusternetes_common::flagz::NamedFlagSetsReader>,
+    flagz_reader: Option<k3rs_common::flagz::NamedFlagSetsReader>,
 ) -> Router {
     exposition::initialize();
     let proxy_mode = proxy_mode.to_owned();
@@ -216,14 +216,14 @@ pub fn metrics_router_with_flagz(
     // Installed before statusz, so /flagz is in ListedPaths.
     let flagz_installed = flagz_reader.is_some();
     let router = match flagz_reader {
-        Some(reader) => rusternetes_common::flagz::install(router, KUBE_PROXY, Box::new(reader)),
+        Some(reader) => k3rs_common::flagz::install(router, KUBE_PROXY, Box::new(reader)),
         None => router,
     };
     // ListedPaths excludes neither healthz/ping nor metrics/slis and is sorted
     // (mux/pathrecorder.go:98-105). Read before statusz.Install (server.go:490).
-    rusternetes_common::statusz::install_if_enabled(router, KUBE_PROXY, || {
-        rusternetes_common::statusz::Registry::new(Some(
-            rusternetes_common::compatibility::default_build_effective_version(),
+    k3rs_common::statusz::install_if_enabled(router, KUBE_PROXY, || {
+        k3rs_common::statusz::Registry::new(Some(
+            k3rs_common::compatibility::default_build_effective_version(),
         ))
         .with_listed_paths({
             let mut paths: Vec<String> = [
@@ -238,7 +238,7 @@ pub fn metrics_router_with_flagz(
             .map(str::to_owned)
             .collect();
             if flagz_installed {
-                paths.push(rusternetes_common::flagz::DEFAULT_FLAGZ_PATH.to_owned());
+                paths.push(k3rs_common::flagz::DEFAULT_FLAGZ_PATH.to_owned());
             }
             paths.sort();
             paths
@@ -319,7 +319,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     use serial_test::serial;
     use tower::ServiceExt;
 
@@ -366,9 +366,9 @@ mod tests {
         );
     }
 
-    fn flagz_reader() -> rusternetes_common::flagz::NamedFlagSetsReader {
-        rusternetes_common::flagz::NamedFlagSetsReader {
-            flags: vec![rusternetes_common::flagz::Flag {
+    fn flagz_reader() -> k3rs_common::flagz::NamedFlagSetsReader {
+        k3rs_common::flagz::NamedFlagSetsReader {
+            flags: vec![k3rs_common::flagz::Flag {
                 name: "v".into(),
                 value: "2".into(),
                 classified: false,

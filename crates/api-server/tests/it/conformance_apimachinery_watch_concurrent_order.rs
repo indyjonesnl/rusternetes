@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use rusternetes_client::http::ApiClient;
-use rusternetes_client::watch::{watch_stream, WatchEvent};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_client::http::ApiClient;
+use k3rs_client::watch::{watch_stream, WatchEvent};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch as stop_signal};
 

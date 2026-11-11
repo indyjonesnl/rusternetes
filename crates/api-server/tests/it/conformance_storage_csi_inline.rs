@@ -8,7 +8,7 @@
 //! with `strict_namespaces()` (`framework.NewDefaultFramework`, :41); the
 //! CSIDriver `f.UniqueName` is that namespace's name.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(

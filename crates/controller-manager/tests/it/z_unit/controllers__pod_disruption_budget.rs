@@ -4,20 +4,20 @@
 mod __parent {
     pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
     pub use futures::StreamExt;
-    pub use rusternetes_common::pdbhelper::{
+    pub use k3rs_common::pdbhelper::{
         conditions_are_up_to_date, set_status_condition, update_disruption_allowed_condition,
         DISRUPTION_ALLOWED_CONDITION, SYNC_FAILED_REASON,
     };
-    pub use rusternetes_common::podutil::is_pod_ready;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::podutil::is_pod_ready;
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::{
         CustomResource, CustomResourceDefinition, EventSource, EventType, IntOrString, Pod,
         PodDisruptionBudget, PodDisruptionBudgetCondition, PodDisruptionBudgetStatus,
     };
-    pub use rusternetes_common::types::{LabelSelector, OwnerReference, Phase, Selector};
-    pub use rusternetes_common::validation::metav1::{is_qualified_name, is_valid_label_value};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{
+    pub use k3rs_common::types::{LabelSelector, OwnerReference, Phase, Selector};
+    pub use k3rs_common::validation::metav1::{is_qualified_name, is_valid_label_value};
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{
         build_key, build_prefix, extract_key, EventRecorder, Storage, WatchEvent, WorkQueue,
     };
     pub use std::collections::HashMap;
@@ -28,10 +28,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_controller_manager::controllers::pod_disruption_budget::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::{IntOrString, PodDisruptionBudgetSpec};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::pod_disruption_budget::*;
+    use k3rs_storage::MemoryStorage;
     /// A storage double that behaves like a real api-server: `update` (full-object
     /// PUT) DISCARDS `.status`; only the status subresource persists it. Upstream
     /// strips status on the main resource for any type with a status subresource,
@@ -55,14 +55,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for StatusStrippingStorage {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create(key, value).await
         }
 
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
@@ -71,7 +71,7 @@ mod tests {
 
         /// Full-object PUT: keep whatever status is already stored, ignore the
         /// caller's — exactly what an api-server with a status subresource does.
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -96,7 +96,7 @@ mod tests {
         /// Must be overridden — the trait's default `update_status` does a
         /// read-modify-write through `update`, which above strips status, so
         /// inheriting it would make even a correct controller look broken.
-        async fn update_status<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update_status<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -113,7 +113,7 @@ mod tests {
 
         /// The status subresource with the resourceVersion precondition an
         /// api-server applies; the compare is `MemoryStorage`'s own.
-        async fn update_status_cas<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update_status_cas<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -129,25 +129,22 @@ mod tests {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
 
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
 
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.list(prefix).await
         }
 
-        async fn watch(
-            &self,
-            prefix: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
 
@@ -155,15 +152,15 @@ mod tests {
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
 
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
 
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }

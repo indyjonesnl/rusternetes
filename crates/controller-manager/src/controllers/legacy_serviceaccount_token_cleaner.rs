@@ -26,8 +26,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
-use rusternetes_common::resources::{ConfigMap, Pod, Secret, ServiceAccount};
-use rusternetes_storage::{build_key, build_prefix, Preconditions, Storage};
+use k3rs_common::resources::{ConfigMap, Pod, Secret, ServiceAccount};
+use k3rs_storage::{build_key, build_prefix, Preconditions, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -285,8 +285,8 @@ impl<S: Storage + 'static> LegacySATokenCleaner<S> {
             .await
         {
             Ok(())
-            | Err(rusternetes_common::Error::NotFound(_))
-            | Err(rusternetes_common::Error::Conflict(_)) => {}
+            | Err(k3rs_common::Error::NotFound(_))
+            | Err(k3rs_common::Error::Conflict(_)) => {}
             Err(e) => error!(
                 "Deleting legacy service account token {}/{}: {e}",
                 namespace_of(secret),
@@ -334,7 +334,7 @@ impl<S: Storage + 'static> LegacySATokenCleaner<S> {
         let key = build_key("serviceaccounts", Some(namespace_of(secret)), sa_name);
         let sa: ServiceAccount = match self.storage.get(&key).await {
             Ok(sa) => sa,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(None),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         // Ensure UID matches if given

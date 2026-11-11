@@ -3,7 +3,7 @@
 #
 # Task 4, Deliverable 1 — the v2 kubelet flag-adapter. k0s launches this file
 # (staged via shims/stage-swap.sh) believing it is the upstream Go kubelet. It
-# translates the k0s kubelet argv into the flags rusternetes-kubelet
+# translates the k0s kubelet argv into the flags k3rs-kubelet
 # (crates/kubelet/src/main.rs) understands, logs every dropped k0s flag, points
 # the kubelet at the foundation's containerd-rs CRI socket, and execs it in
 # **API mode** (--kubeconfig present => StorageBackend::Api against k0s's own,
@@ -16,7 +16,7 @@
 #     --config=/run/k0s/kubelet/config.yaml --kubeconfig=/run/k0s/kubelet-direct.conf \
 #     --v=1 --cert-dir=/var/lib/k0s/kubelet/pki
 #
-# rusternetes-kubelet uses clap KEBAB-case flags (verified via --help, NOT the
+# k3rs-kubelet uses clap KEBAB-case flags (verified via --help, NOT the
 # snake_case the brief sketched):
 #   --hostname-override=X -> --hostname-override=X  (required; nodeName derives from it)
 #   --kubeconfig=X        -> --kubeconfig=X          (selects API mode)
@@ -26,32 +26,32 @@
 #
 # NOTE — --config is DROPPED, not passed through. k0s's generated
 # KubeletConfiguration expresses duration fields as K8s Duration STRINGS
-# (syncFrequency: "0s", ...), but rusternetes-kubelet's KubeletConfiguration
+# (syncFrequency: "0s", ...), but k3rs-kubelet's KubeletConfiguration
 # (crates/kubelet/src/config.rs) types syncFrequency as u64 and hard-fails the
 # whole file on the type mismatch ("invalid type: string \"0s\", expected u64").
-# rusternetes only reads a handful of fields from --config (rootDir, syncFreq,
+# k3rs only reads a handful of fields from --config (rootDir, syncFreq,
 # metricsBindPort, logLevel) — we pass --root-dir explicitly and extract
 # clusterDNS/clusterDomain below — so dropping --config loses nothing reachable
 # and lets the kubelet start. This K8s-Duration parse gap is recorded for a
 # GitHub issue (see task-4-report.md).
 #
-# CRI endpoint is NOT a flag: rusternetes-kubelet reads CONTAINER_RUNTIME_ENDPOINT
+# CRI endpoint is NOT a flag: k3rs-kubelet reads CONTAINER_RUNTIME_ENDPOINT
 # from the env (default unix:///run/containerd/containerd.sock). We export it to
 # the foundation's containerd-rs socket before exec.
 #
-# Everything else is DROPPED and logged — those are the rusternetes-kubelet
+# Everything else is DROPPED and logged — those are the k3rs-kubelet
 # capability gaps this harness exists to surface (--node-labels, --cert-dir
 # bootstrap/serving-cert machinery, --runtime-cgroups, --v).
 set -eu
 
 # Point the kubelet at the co-resident Rust CRI runtime (the tested runtime the
-# v0 baseline uses). rusternetes-kubelet's CRI client reads this env var.
+# v0 baseline uses). k3rs-kubelet's CRI client reads this env var.
 export CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd-rs.sock
 
 LOG=/tmp/kubelet-shim.log
 : > "$LOG" 2>/dev/null || true
 log() { echo "$@" >> "$LOG" 2>/dev/null || true; }
-log "=== $(date -u +%FT%TZ) rusternetes-kubelet adapter shim (pid $$) ==="
+log "=== $(date -u +%FT%TZ) k3rs-kubelet adapter shim (pid $$) ==="
 log "raw argv: $*"
 log "CONTAINER_RUNTIME_ENDPOINT=$CONTAINER_RUNTIME_ENDPOINT"
 
@@ -77,10 +77,10 @@ while [ $# -gt 0 ]; do
 done
 
 log "mapped: node_name='$NODE_NAME' kubeconfig='$KUBECONFIG_PATH' config='$CONFIG_PATH' root_dir='$ROOT_DIR'"
-log "DROPPED k0s flags (unsupported by rusternetes-kubelet):"
+log "DROPPED k0s flags (unsupported by k3rs-kubelet):"
 for f in $DROPPED; do log "  $f"; done
 
-# rusternetes-kubelet connects to --api-server-url (default https://api-server:6443,
+# k3rs-kubelet connects to --api-server-url (default https://api-server:6443,
 # unreachable here), NOT the kubeconfig's server field — the kubeconfig only
 # supplies the CA. Derive the real endpoint from the kubeconfig's `server:` line
 # so the kubelet dials k0s's actual api-server.
@@ -91,7 +91,7 @@ fi
 log "derived api-server-url from kubeconfig: '${API_URL:-<none>}'"
 
 # The config file (KubeletConfiguration) carries clusterDNS (a YAML list) and
-# clusterDomain, which rusternetes-kubelet does NOT read from --config anyway; it
+# clusterDomain, which k3rs-kubelet does NOT read from --config anyway; it
 # takes them from --cluster-dns / --cluster-domain flags (else it tries to
 # discover DNS via the api-server). Extract and pass them explicitly. --config
 # itself is NOT forwarded (K8s-Duration parse gap; see header note).
@@ -110,7 +110,7 @@ log "from config: cluster_dns='${CLUSTER_DNS:-<none>}' cluster_domain='${CLUSTER
 [ -n "$NODE_NAME" ] || { log "FATAL no --hostname-override in k0s argv"; echo "kubelet shim: no --hostname-override" >&2; exit 1; }
 
 # --config deliberately omitted (K8s-Duration parse gap — see header note).
-[ -n "$CONFIG_PATH" ] && log "NOTE dropping --config=$CONFIG_PATH (rusternetes-kubelet cannot parse k0s KubeletConfiguration Duration strings)"
+[ -n "$CONFIG_PATH" ] && log "NOTE dropping --config=$CONFIG_PATH (k3rs-kubelet cannot parse k0s KubeletConfiguration Duration strings)"
 
 set -- --hostname-override="$NODE_NAME"
 [ -n "$KUBECONFIG_PATH" ] && set -- "$@" --kubeconfig="$KUBECONFIG_PATH"
@@ -121,6 +121,6 @@ set -- --hostname-override="$NODE_NAME"
 
 # Absolute path: the k0s supervisor launches the kubelet with a minimal PATH
 # that excludes /usr/local/bin (a bare name yields exit 127 "not found").
-RUSTERNETES=/usr/local/bin/rusternetes-kubelet
-log "exec: $RUSTERNETES $*"
-exec "$RUSTERNETES" "$@"
+K3RS=/usr/local/bin/k3rs-kubelet
+log "exec: $K3RS $*"
+exec "$K3RS" "$@"

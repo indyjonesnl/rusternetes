@@ -8,11 +8,11 @@
 //! (`ProcessPodVolumes`, `getPVCFromCache`, `getPVSpecFromCache`,
 //! `IsMultiAttachAllowed`).
 
-use rusternetes_common::resources::csi::VolumeAttachment;
-use rusternetes_controller_manager::controllers::attach_detach::{
+use k3rs_common::resources::csi::VolumeAttachment;
+use k3rs_controller_manager::controllers::attach_detach::{
     attachment_name, AttachDetachController,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -24,12 +24,9 @@ async fn put(s: &MemoryStorage, resource: &str, ns: Option<&str>, name: &str, v:
 }
 
 async fn vas(s: &MemoryStorage) -> Vec<VolumeAttachment> {
-    s.list(&rusternetes_storage::build_prefix(
-        "volumeattachments",
-        None,
-    ))
-    .await
-    .unwrap()
+    s.list(&k3rs_storage::build_prefix("volumeattachments", None))
+        .await
+        .unwrap()
 }
 
 fn pod(name: &str, node: &str, claim: &str, phase: &str) -> Value {
@@ -305,8 +302,7 @@ async fn rwx_volume_attaches_to_every_node() {
 // from the report and updates the node BEFORE detaching.
 
 async fn node_attached(s: &MemoryStorage, name: &str) -> Vec<String> {
-    let n: rusternetes_common::resources::Node =
-        s.get(&build_key("nodes", None, name)).await.unwrap();
+    let n: k3rs_common::resources::Node = s.get(&build_key("nodes", None, name)).await.unwrap();
     n.status
         .and_then(|s| s.volumes_attached)
         .unwrap_or_default()
@@ -368,7 +364,7 @@ async fn volume_still_mounted_stays_reported_attached() {
     controller(&s).reconcile_all().await.unwrap();
     // Kubelet reports the volume mounted, then the pod goes away.
     let key = build_key("nodes", None, "node-1");
-    let mut n: rusternetes_common::resources::Node = s.get(&key).await.unwrap();
+    let mut n: k3rs_common::resources::Node = s.get(&key).await.unwrap();
     n.status.as_mut().unwrap().volumes_in_use = Some(vec![unique()]);
     s.update(&key, &n).await.unwrap();
     s.delete(&build_key("pods", Some("ns"), "p")).await.unwrap();
@@ -490,8 +486,8 @@ async fn out_of_service_taint_detaches_mounted_volume_immediately() {
 // reconciler_test.go:1279) ----
 
 async fn pod_events(s: &MemoryStorage, pod: &str) -> Vec<(String, String, String)> {
-    let events: Vec<rusternetes_common::resources::Event> = s
-        .list(&rusternetes_storage::build_prefix("events", Some("ns")))
+    let events: Vec<k3rs_common::resources::Event> = s
+        .list(&k3rs_storage::build_prefix("events", Some("ns")))
         .await
         .unwrap_or_default();
     events
@@ -593,7 +589,7 @@ fn gce_pv_json() -> Value {
 
 /// The volume handle the shared translator produces for the GCE PV.
 fn translated_gce_pv_handle() -> String {
-    use rusternetes_common::csi_translation::CsiTranslator;
+    use k3rs_common::csi_translation::CsiTranslator;
     let pv = serde_json::from_value(gce_pv_json()).unwrap();
     let csi = CsiTranslator::new()
         .translate_in_tree_pv_to_csi(&pv)

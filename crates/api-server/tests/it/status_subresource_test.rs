@@ -1,7 +1,7 @@
 // Integration tests for Status Subresource
 // Tests that status updates don't affect spec and vice versa
 
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::{json, Value};
 use std::sync::Arc;
 

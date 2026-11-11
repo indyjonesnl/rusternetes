@@ -25,7 +25,7 @@
 //! | removes definition when one version becomes not-served | PASS |
 //! | removes definition when CRD is deleted | PASS |
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------

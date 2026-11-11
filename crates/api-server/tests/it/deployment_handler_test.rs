@@ -2,11 +2,9 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for deployments
 
-use rusternetes_common::resources::{
-    Container, Deployment, DeploymentSpec, PodSpec, PodTemplateSpec,
-};
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Container, Deployment, DeploymentSpec, PodSpec, PodTemplateSpec};
+use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

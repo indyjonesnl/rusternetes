@@ -2,25 +2,25 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::cel_cost::{
+    pub use k3rs_common::cel_cost::{
         CostEvalError, CostOptions, MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES,
         RUNTIME_CEL_COST_BUDGET,
     };
-    pub use rusternetes_common::cel_versions::{compile_failure, EnvSet, EnvType};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::cel_versions::{compile_failure, EnvSet, EnvType};
+    pub use k3rs_common::resources::{
         CustomResource, CustomResourceDefinition, CustomResourceDefinitionSpec, JSONSchemaProps,
         JSONSchemaPropsOrArray, JSONSchemaPropsOrBool,
     };
-    pub use rusternetes_common::schema_validation::PathSeg;
-    pub use rusternetes_common::validation::field::{Error as FieldError, Path};
-    pub use rusternetes_common::{CELContext, CELEvaluator, Error, Result};
+    pub use k3rs_common::schema_validation::PathSeg;
+    pub use k3rs_common::validation::field::{Error as FieldError, Path};
+    pub use k3rs_common::{CELContext, CELEvaluator, Error, Result};
     pub use std::collections::HashSet;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::cel_validation::*;
-    use rusternetes_common::feature_gates::Version;
+    use k3rs_api_server::handlers::cel_validation::*;
+    use k3rs_common::feature_gates::Version;
     use serde_json::json;
 
     fn schema_with_rule(rule: &str, message: &str) -> JSONSchemaProps {

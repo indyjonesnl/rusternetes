@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::admission::pod_security_api::{Level, LevelVersion, Version};
-    pub use rusternetes_common::resources::pod::{
+    pub use k3rs_api_server::admission::pod_security_api::{Level, LevelVersion, Version};
+    pub use k3rs_common::resources::pod::{
         ContainerPort, EphemeralContainer, Lifecycle, LifecycleHandler, PodSpec, Probe,
         SecurityContext, Volume,
     };
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::types::ObjectMeta;
     pub use std::collections::{BTreeMap, BTreeSet, HashMap};
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_policy::*;
-    use rusternetes_common::resources::pod::Pod;
+    use k3rs_api_server::admission::pod_security_policy::*;
+    use k3rs_common::resources::pod::Pod;
 
     fn lv(level: Level, v: &str) -> LevelVersion {
-        let (version, err) = rusternetes_api_server::admission::pod_security_api::parse_version(v);
+        let (version, err) = k3rs_api_server::admission::pod_security_api::parse_version(v);
         assert!(err.is_ok(), "{v}");
         LevelVersion::new(level, version)
     }
@@ -32,8 +32,7 @@ mod tests {
             versions: versions
                 .iter()
                 .map(|v| {
-                    let ver =
-                        rusternetes_api_server::admission::pod_security_api::parse_version(v).0;
+                    let ver = k3rs_api_server::admission::pod_security_api::parse_version(v).0;
                     let reason = format!("{id}:{v}");
                     VersionedCheck {
                         minimum_version: ver,
@@ -1116,8 +1115,8 @@ mod cases {
     //! check_capabilities_baseline_test.go.
     //! Child module of `pod_security_policy` so it can reach the private checks.
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_policy::*;
-    use rusternetes_common::resources::pod::Pod;
+    use k3rs_api_server::admission::pod_security_policy::*;
+    use k3rs_common::resources::pod::Pod;
     use serde_json::{json, Value};
 
     fn mk(annotations: Value, spec: Value) -> Pod {
@@ -1937,9 +1936,9 @@ mod fixtures {
     //! Child module of `pod_security_policy` so it reaches the private registry
     //! internals.
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_api::{Level, LevelVersion, Version};
-    use rusternetes_api_server::admission::pod_security_policy::*;
-    use rusternetes_common::resources::pod::Pod;
+    use k3rs_api_server::admission::pod_security_api::{Level, LevelVersion, Version};
+    use k3rs_api_server::admission::pod_security_policy::*;
+    use k3rs_common::resources::pod::Pod;
     use std::path::{Path, PathBuf};
 
     /// run.go:40 `newestMinorVersionToTest`.
@@ -1963,7 +1962,7 @@ mod fixtures {
             // run.go creates the pod through the apiserver, which applies the
             // v1 defaults before admission runs (e.g. SetDefaults_Volume turns the
             // fixtures' source-less `volume0` into an emptyDir).
-            rusternetes_api_server::handlers::defaults::apply_pod_spec_defaults(
+            k3rs_api_server::handlers::defaults::apply_pod_spec_defaults(
                 pod.spec.as_mut().unwrap(),
             );
             let stem = p.file_stem().unwrap().to_string_lossy().to_string();
@@ -2102,11 +2101,11 @@ mod fixtures {
     /// are replayed against `validate_deployment` instead of PodSecurity.
     #[tokio::test]
     async fn pod_security_fixtures_controller_scenarios() {
-        use rusternetes_common::resources::Namespace;
-        use rusternetes_storage::{build_key, MemoryStorage, Storage};
+        use k3rs_common::resources::Namespace;
+        use k3rs_storage::{build_key, MemoryStorage, Storage};
         use std::sync::Arc;
 
-        let psa = rusternetes_api_server::admission::PodSecurityAdmission::new();
+        let psa = k3rs_api_server::admission::PodSecurityAdmission::new();
         let storage = Arc::new(MemoryStorage::new());
         let mut controllers = 0;
 
@@ -2188,9 +2187,9 @@ mod fixtures {
                         d["metadata"]["namespace"] = ns.clone().into();
                         d["spec"]["template"]["metadata"]["labels"] =
                             serde_json::json!({"test": "true"});
-                        let d: rusternetes_common::resources::Deployment =
+                        let d: k3rs_common::resources::Deployment =
                             serde_json::from_value(d).unwrap();
-                        let errs = rusternetes_common::validation::apps::validate_deployment(&d);
+                        let errs = k3rs_common::validation::apps::validate_deployment(&d);
                         assert!(
                             errs.iter()
                                 .any(|e| e.field.ends_with("securityContext.procMount")),
@@ -2238,8 +2237,8 @@ mod fixture_gen {
     //!
     //! Every `test/fixtures_*.go` generator is ported (#2904).
     use super::__parent::*;
-    use rusternetes_api_server::admission::pod_security_api::{Level, Version};
-    use rusternetes_api_server::admission::pod_security_policy::*;
+    use k3rs_api_server::admission::pod_security_api::{Level, Version};
+    use k3rs_api_server::admission::pod_security_policy::*;
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};

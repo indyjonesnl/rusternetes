@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
-use rusternetes_kubelet::healthz::{install_path_handler, HealthChecker};
+use k3rs_kubelet::healthz::{install_path_handler, HealthChecker};
 use tower::ServiceExt;
 
 async fn get(app: &Router, uri: &str) -> (StatusCode, String) {

@@ -33,7 +33,7 @@
 //!    with the omitted case.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TEST_NS: &str = "default";
@@ -365,7 +365,7 @@ async fn test_strict_integer_port_preserved_through_round_trip() {
 // ---------------------------------------------------------------------------
 
 /// Upstream `resource.Quantity` deserialisation accepts BOTH wire forms:
-/// `"100"` and `100`. Rusternetes mirrors this via `deserialize_quantity_map`
+/// `"100"` and `100`. k3rs mirrors this via `deserialize_quantity_map`
 /// in `crates/common/src/types.rs` (visit_map handles both `Value::String`
 /// and `Value::Number`).
 #[tokio::test]
@@ -448,7 +448,7 @@ async fn test_strict_quantity_accepts_bare_integer_form() {
 // ---------------------------------------------------------------------------
 
 /// Pod create with `spec: null` — upstream rejects this (PodSpec.containers is
-/// `Required value`). Rusternetes currently treats `spec: null` as `None`
+/// `Required value`). k3rs currently treats `spec: null` as `None`
 /// (PodSpec is `Option<PodSpec>` on `Pod`), which is the same parity gap
 /// pinned by `decoder_malformed_json_test::test_malformed_spec_null`. Re-pin
 /// here as part of the parity-gap matrix.

@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::authz::AuthzStorage;
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::event_bus::EventBus;
-    pub use rusternetes_storage::event_recorder::EventRecorder;
-    pub use rusternetes_storage::memory::MemoryStorage;
-    pub use rusternetes_storage::preconditions::Preconditions;
-    pub use rusternetes_storage::workqueue::{
+    pub use k3rs_common::authz::AuthzStorage;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::event_bus::EventBus;
+    pub use k3rs_storage::event_recorder::EventRecorder;
+    pub use k3rs_storage::memory::MemoryStorage;
+    pub use k3rs_storage::preconditions::Preconditions;
+    pub use k3rs_storage::workqueue::{
         extract_key, WorkQueue, WorkQueueConfig, RECONCILE_ALL_SENTINEL,
     };
     pub use serde::{de::DeserializeOwned, Serialize};
@@ -18,7 +18,7 @@ mod __parent {
 
 mod evict_tests {
     use super::__parent::*;
-    use rusternetes_storage::*;
+    use k3rs_storage::*;
     use serde_json::json;
 
     /// Storage-mode eviction must behaviour-preservingly persist the mutated pod
@@ -54,7 +54,7 @@ mod evict_tests {
 
 mod graceful_delete_tests {
     use super::__parent::*;
-    use rusternetes_storage::*;
+    use k3rs_storage::*;
     use serde_json::json;
 
     fn running_pod(name: &str, grace: i64) -> serde_json::Value {
@@ -128,7 +128,7 @@ mod graceful_delete_tests {
 
 mod continue_token_tests {
     use super::__parent::*;
-    use rusternetes_storage::*;
+    use k3rs_storage::*;
 
     /// A backend that has compacted every revision below `compacted_below`.
     ///
@@ -442,8 +442,8 @@ pub mod preconditions_suite {
     //! `etcd3/store_test.go` `TestPreconditions`. Each backend's test module calls
     //! `run_all` with a fresh-store constructor.
 
-    use rusternetes_common::Error;
-    use rusternetes_storage::{Preconditions, Storage};
+    use k3rs_common::Error;
+    use k3rs_storage::{Preconditions, Storage};
     use serde_json::{json, Value};
     use std::sync::Arc;
 
@@ -720,15 +720,15 @@ mod request_context_tests {
     //! `StorageBackend` observes the request context at its dispatch point.
 
     use super::__parent::*;
-    use rusternetes_common::cancellation::{
+    use k3rs_common::cancellation::{
         request_cancellation, request_cancellation_with_deadline, with_request_cancellation,
     };
-    use rusternetes_storage::*;
+    use k3rs_storage::*;
     use serde_json::json;
     use std::time::Duration;
 
-    fn is_timeout(e: &rusternetes_common::Error) -> bool {
-        matches!(e, rusternetes_common::Error::Status(s) if s.code == Some(504))
+    fn is_timeout(e: &k3rs_common::Error) -> bool {
+        matches!(e, k3rs_common::Error::Status(s) if s.code == Some(504))
     }
 
     // etcd3 store: a `ctx` that is done fails the call with `ctx.Err()` before it

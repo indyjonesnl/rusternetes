@@ -1,7 +1,7 @@
-//! Shadow run of the cel-go checker port (`rusternetes-cel-checker`) next to
+//! Shadow run of the cel-go checker port (`k3rs-cel-checker`) next to
 //! the existing compile-time probe, [`crate::cel_versions::compile_failure`].
 //!
-//! Controlled by `RUSTERNETES_CEL_CHECKER`:
+//! Controlled by `K3RS_CEL_CHECKER`:
 //!
 //! * unset / `off` (default): nothing runs.
 //! * `shadow`: every probe result is compared with the checker's verdict for
@@ -20,16 +20,16 @@
 
 use crate::cel_versions::{EnvSet, EnvType};
 use crate::feature_gates::{self, Feature};
-use rusternetes_cel_checker as checker;
-use rusternetes_cel_checker::decl::{DeclType, DeclTypeProvider};
-use rusternetes_cel_checker::DType;
+use k3rs_cel_checker as checker;
+use k3rs_cel_checker::decl::{DeclType, DeclTypeProvider};
+use k3rs_cel_checker::DType;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Environment variable selecting the mode.
-pub const FLAG: &str = "RUSTERNETES_CEL_CHECKER";
+pub const FLAG: &str = "K3RS_CEL_CHECKER";
 
-/// What `RUSTERNETES_CEL_CHECKER` selects.
+/// What `K3RS_CEL_CHECKER` selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Off,

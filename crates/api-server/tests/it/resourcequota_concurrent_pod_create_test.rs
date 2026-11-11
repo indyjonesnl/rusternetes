@@ -16,7 +16,7 @@
 //! checked. Evaluated in parallel, both creates saw one pod used and both were
 //! admitted — three pods, no failed create, no condition.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 const PODS: &str = "/api/v1/namespaces/default/pods";

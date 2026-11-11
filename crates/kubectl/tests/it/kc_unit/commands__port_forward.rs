@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_kubectl::websocket;
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_kubectl::websocket;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::port_forward::*;
+    use k3rs_kubectl::commands::port_forward::*;
 
     #[test]
     fn test_parse_port_mapping_local_remote() {

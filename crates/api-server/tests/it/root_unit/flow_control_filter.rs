@@ -8,19 +8,19 @@ mod __parent {
     pub use axum::middleware::Next;
     pub use axum::response::{IntoResponse, Response};
     pub use futures::{FutureExt, StreamExt};
-    pub use rusternetes_api_server::apiserver_request_metrics::{self, RequestMeta};
-    pub use rusternetes_api_server::audit::request_info;
-    pub use rusternetes_api_server::flow_control::{
+    pub use k3rs_api_server::apiserver_request_metrics::{self, RequestMeta};
+    pub use k3rs_api_server::audit::request_info;
+    pub use k3rs_api_server::flow_control::{
         Classification, FlowControlEngine, FlowControlPermit, RequestDigest,
     };
-    pub use rusternetes_api_server::flow_control_object_count::ObjectCountTracker;
-    pub use rusternetes_api_server::flow_control_watch_tracker::{
+    pub use k3rs_api_server::flow_control_object_count::ObjectCountTracker;
+    pub use k3rs_api_server::flow_control_watch_tracker::{
         scope_signal, ForgetWatch, InitializationSignal, WatchTracker,
     };
-    pub use rusternetes_api_server::flow_control_work_estimator::{
+    pub use k3rs_api_server::flow_control_work_estimator::{
         RequestInfo, WorkEstimator, WorkEstimatorConfig,
     };
-    pub use rusternetes_storage::{Storage, StorageBackend};
+    pub use k3rs_storage::{Storage, StorageBackend};
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, Mutex, OnceLock, RwLock};
     pub use std::time::{Duration, Instant};
@@ -33,10 +33,10 @@ mod tests {
     use axum::middleware::from_fn_with_state;
     use axum::routing::get;
     use axum::Router;
-    use rusternetes_api_server::flow_control_filter::*;
-    use rusternetes_api_server::flow_control_work_estimator::Stats;
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::flow_control_filter::*;
+    use k3rs_api_server::flow_control_work_estimator::Stats;
+    use k3rs_common::auth::UserInfo;
+    use k3rs_storage::memory::MemoryStorage;
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -192,7 +192,7 @@ mod tests {
         ));
         engine.initialize().await.unwrap();
         let filter = Arc::new(ApfFilter::new(engine, wait));
-        let ctx = rusternetes_middleware::AuthContext { user };
+        let ctx = k3rs_middleware::AuthContext { user };
         Router::new()
             .route(
                 "/api/v1/namespaces/default",
@@ -213,7 +213,7 @@ mod tests {
             .route("/api/v1/watch/namespaces", get(|| async { "w" }))
             // As in router.rs: InstrumentRouteFunc sits inside APF.
             .layer(axum::middleware::from_fn(
-                rusternetes_api_server::apiserver_request_metrics::instrument_request,
+                k3rs_api_server::apiserver_request_metrics::instrument_request,
             ))
             .layer(from_fn_with_state(
                 filter,
@@ -311,7 +311,7 @@ mod tests {
     async fn observes_work_estimated_seats() {
         // ObserveWorkEstimatedSeats (priority-and-fairness.go:134), recorded
         // once the estimate is made, for the matched level and flow schema.
-        use rusternetes_api_server::flow_control::metric_test_util::sample;
+        use k3rs_api_server::flow_control::metric_test_util::sample;
         let l = [
             ("priority_level", "catch-all"),
             ("flow_schema", "catch-all"),
@@ -401,7 +401,7 @@ mod tests {
     // the termination (TestApfRejectRequest checks both metrics exist).
     #[tokio::test]
     async fn rejected_request_records_dropped_and_termination_metrics() {
-        use rusternetes_api_server::flow_control::metric_test_util::sample;
+        use k3rs_api_server::flow_control::metric_test_util::sample;
         let l = [
             ("verb", "GET"),
             ("resource", "namespaces"),
@@ -440,7 +440,7 @@ mod tests {
     // just the 429s.
     #[tokio::test]
     async fn served_request_counts_apiserver_request_total_with_status_code() {
-        use rusternetes_api_server::flow_control::metric_test_util::sample;
+        use k3rs_api_server::flow_control::metric_test_util::sample;
         let l = [
             ("verb", "GET"),
             ("resource", "namespaces"),
@@ -470,13 +470,13 @@ mod tests {
     async fn queued_request_that_waits_too_long_is_a_429() {
         // TestApfCancelWaitRequest, against a level that queues. The filter is
         // built straight on an engine with a `Queue` level.
-        use rusternetes_common::resources::flowcontrol::{
+        use k3rs_common::resources::flowcontrol::{
             LimitResponse, LimitResponseType, LimitedPriorityLevelConfiguration,
             PriorityLevelConfiguration, QueuingConfiguration,
         };
-        use rusternetes_common::types::ObjectMeta;
-        use rusternetes_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
-        use rusternetes_storage::build_key;
+        use k3rs_common::types::ObjectMeta;
+        use k3rs_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
+        use k3rs_storage::build_key;
 
         let mut pl: PriorityLevelConfiguration =
             mandatory_priority_level_configuration("catch-all").unwrap();
@@ -550,13 +550,13 @@ mod tests {
     // default wait limit. Through the real timeout middleware via `?timeout=`.
     #[tokio::test]
     async fn queue_wait_is_a_quarter_of_the_request_deadline() {
-        use rusternetes_common::resources::flowcontrol::{
+        use k3rs_common::resources::flowcontrol::{
             LimitResponse, LimitResponseType, LimitedPriorityLevelConfiguration,
             PriorityLevelConfiguration, QueuingConfiguration,
         };
-        use rusternetes_common::types::ObjectMeta;
-        use rusternetes_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
-        use rusternetes_storage::build_key;
+        use k3rs_common::types::ObjectMeta;
+        use k3rs_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
+        use k3rs_storage::build_key;
 
         let mut pl: PriorityLevelConfiguration =
             mandatory_priority_level_configuration("catch-all").unwrap();
@@ -609,7 +609,7 @@ mod tests {
                 priority_and_fairness::<MemoryStorage>,
             ))
             .layer(axum::middleware::from_fn(
-                rusternetes_api_server::request_timeout::request_timeout_middleware,
+                k3rs_api_server::request_timeout::request_timeout_middleware,
             ));
         let a = router.clone();
         let held = tokio::spawn(async move {
@@ -636,15 +636,15 @@ mod tests {
     async fn finishing_the_last_request_reaps_a_quiescing_level() {
         // #2803: a removed level that is still busy quiesces; when its last
         // request finishes the filter reaps it (apf_filter.go:171-177).
-        use rusternetes_common::resources::flowcontrol::{
+        use k3rs_common::resources::flowcontrol::{
             LimitResponse, LimitResponseType, LimitedPriorityLevelConfiguration,
             PriorityLevelConfiguration, QueuingConfiguration,
         };
-        use rusternetes_common::types::ObjectMeta;
-        use rusternetes_common::validation::flowcontrol_bootstrap::{
+        use k3rs_common::types::ObjectMeta;
+        use k3rs_common::validation::flowcontrol_bootstrap::{
             mandatory_flow_schema, mandatory_priority_level_configuration,
         };
-        use rusternetes_storage::build_key;
+        use k3rs_storage::build_key;
 
         let mut pl: PriorityLevelConfiguration =
             mandatory_priority_level_configuration("catch-all").unwrap();
@@ -692,7 +692,7 @@ mod tests {
 
         let gate = Arc::new(Notify::new());
         let g = gate.clone();
-        let ctx = rusternetes_middleware::AuthContext { user: bob() };
+        let ctx = k3rs_middleware::AuthContext { user: bob() };
         let router = Router::new()
             .route(
                 "/api/v1/namespaces/default",
@@ -784,7 +784,7 @@ mod tests {
         ));
         engine.initialize().await.unwrap();
         let filter = Arc::new(ApfFilter::new(engine, Duration::from_millis(50)));
-        let ctx = rusternetes_middleware::AuthContext { user: bob() };
+        let ctx = k3rs_middleware::AuthContext { user: bob() };
         let router = Router::new()
             .route(
                 "/api/v1/watch/namespaces",
@@ -792,7 +792,7 @@ mod tests {
                     let gate = gate.clone();
                     async move {
                         if initialized {
-                            rusternetes_api_server::flow_control_watch_tracker::watch_initialized();
+                            k3rs_api_server::flow_control_watch_tracker::watch_initialized();
                         }
                         gate.notified().await;
                         "w"
@@ -933,22 +933,22 @@ mod tests {
         cond()
     }
 
-    fn extra_pl(name: &str) -> rusternetes_common::resources::PriorityLevelConfiguration {
-        use rusternetes_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
+    fn extra_pl(name: &str) -> k3rs_common::resources::PriorityLevelConfiguration {
+        use k3rs_common::validation::flowcontrol_bootstrap::mandatory_priority_level_configuration;
         let mut pl = mandatory_priority_level_configuration("catch-all").unwrap();
-        pl.metadata = rusternetes_common::types::ObjectMeta::new(name);
+        pl.metadata = k3rs_common::types::ObjectMeta::new(name);
         pl
     }
 
-    fn ev_mod(k: &str, v: serde_json::Value) -> rusternetes_storage::WatchEvent {
-        rusternetes_storage::WatchEvent::Modified(k.into(), v.to_string())
+    fn ev_mod(k: &str, v: serde_json::Value) -> k3rs_storage::WatchEvent {
+        k3rs_storage::WatchEvent::Modified(k.into(), v.to_string())
     }
 
     // Handlers apf_controller.go:308-368: PL update triggers on spec only.
     #[test]
     fn pl_update_triggers_only_on_spec_change() {
         let mut f = ConfigEventFilter::default();
-        let add = rusternetes_storage::WatchEvent::Added(
+        let add = k3rs_storage::WatchEvent::Added(
             "k".into(),
             serde_json::json!({"spec": {"a": 1}, "status": {}}).to_string(),
         );
@@ -964,7 +964,7 @@ mod tests {
         assert!(f.triggers(false, &ev_mod("k", serde_json::json!({"spec": {"a": 2}}))));
         // A resync-style identical update: no trigger.
         assert!(!f.triggers(false, &ev_mod("k", serde_json::json!({"spec": {"a": 2}}))));
-        let del = rusternetes_storage::WatchEvent::Deleted("k".into(), String::new());
+        let del = k3rs_storage::WatchEvent::Deleted("k".into(), String::new());
         assert!(f.triggers(false, &del));
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         assert_eq!(n.load(Ordering::SeqCst), 1, "idle: no polling");
         for i in 0..5 {
-            tx.send(Ok(rusternetes_storage::WatchEvent::Added(
+            tx.send(Ok(k3rs_storage::WatchEvent::Added(
                 format!("k{i}"),
                 "{}".into(),
             )))
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_change_applies_without_waiting_for_a_poll() {
-        use rusternetes_storage::build_key;
+        use k3rs_storage::build_key;
         let st = Arc::new(MemoryStorage::new());
         let engine = Arc::new(FlowControlEngine::with_limits(st.clone(), 100, 0));
         engine.initialize().await.unwrap();
@@ -1091,7 +1091,7 @@ mod tests {
     // always sets the tracker at config.go:472).
     #[tokio::test]
     async fn tracker_hook_registers_standalone_without_apf() {
-        let registry = rusternetes_api_server::post_start_hooks::PostStartHooks::new();
+        let registry = k3rs_api_server::post_start_hooks::PostStartHooks::new();
         let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         register_storage_object_count_tracker_hook(
             &registry,
@@ -1109,7 +1109,7 @@ mod tests {
     // so the hook is on `/readyz/poststarthook/...` for both and finishes.
     #[tokio::test]
     async fn tracker_hook_without_apf_helper_registers_and_finishes() {
-        let registry = rusternetes_api_server::post_start_hooks::PostStartHooks::new();
+        let registry = k3rs_api_server::post_start_hooks::PostStartHooks::new();
         register_object_count_tracker_hook_without_apf(&registry);
         for _ in 0..50 {
             if registry.check("storage-object-count-tracker-hook") == Some(Ok(())) {
@@ -1126,7 +1126,7 @@ mod tests {
     // after starting their goroutines).
     #[tokio::test]
     async fn apf_post_start_hooks_registered_and_finish() {
-        let registry = rusternetes_api_server::post_start_hooks::PostStartHooks::new();
+        let registry = k3rs_api_server::post_start_hooks::PostStartHooks::new();
         let engine = Arc::new(FlowControlEngine::with_limits(
             Arc::new(MemoryStorage::new()),
             400,

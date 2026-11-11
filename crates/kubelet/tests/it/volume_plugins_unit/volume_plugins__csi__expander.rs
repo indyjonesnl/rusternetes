@@ -4,27 +4,25 @@
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::csi::FSGroupPolicy;
-    pub use rusternetes_common::resources::volume::{CSIVolumeSource, PersistentVolumeMode};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::csi::FSGroupPolicy;
+    pub use k3rs_common::resources::volume::{CSIVolumeSource, PersistentVolumeMode};
+    pub use k3rs_common::resources::{
         CSIDriver, PersistentVolume, PersistentVolumeAccessMode, Pod, Secret, VolumeAttachment,
     };
-    pub use rusternetes_kubelet::volume_plugins::csi::*;
-    pub use rusternetes_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
-    pub use rusternetes_kubelet::volume_plugins::csi_client::{
+    pub use k3rs_kubelet::volume_plugins::csi::*;
+    pub use k3rs_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
+    pub use k3rs_kubelet::volume_plugins::csi_client::{
         CsiResizeOptions, NodeExpandError, FS_TYPE_BLOCK_NAME,
     };
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
+    pub use k3rs_kubelet::volume_plugins::plugin::{
         DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter,
     };
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
-        NodeExpandableVolumePlugin, NodeResizeOptions,
-    };
-    pub use rusternetes_kubelet::volume_plugins::util::types::VolumeOperationError;
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_kubelet::volume_plugins::plugin::{NodeExpandableVolumePlugin, NodeResizeOptions};
+    pub use k3rs_kubelet::volume_plugins::util::types::VolumeOperationError;
+    pub use k3rs_kubelet::volume_plugins::{
         Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
     };
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use sha2::{Digest, Sha256};
     pub use std::collections::HashMap;
     pub use std::path::{Path, PathBuf};
@@ -38,14 +36,14 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use crate::csi_fake::{serve, FakeDriver};
-    use rusternetes_common::quantity::Quantity;
-    use rusternetes_common::resources::{Secret, Volume};
-    use rusternetes_kubelet::volume_plugins::csi::expander::*;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::{
+    use k3rs_common::quantity::Quantity;
+    use k3rs_common::resources::{Secret, Volume};
+    use k3rs_kubelet::volume_plugins::csi::expander::*;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::{
         node_service_capability::rpc::Type as Cap, NodeExpandVolumeRequest,
     };
-    use rusternetes_storage::{MemoryStorage, StorageBackend};
+    use k3rs_storage::{MemoryStorage, StorageBackend};
     use serde_json::json;
 
     struct Fx {
@@ -73,10 +71,10 @@ mod tests {
                 .unwrap();
         }
         let host = Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 dir.path().to_string_lossy().to_string(),
                 Some(storage),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         );
@@ -201,7 +199,7 @@ mod tests {
     /// The access mode is the PV's first (`expander.go:112-114`).
     #[tokio::test]
     async fn access_mode_is_the_pvs_first() {
-        use rusternetes_kubelet::volume_plugins::csi_client::proto::volume_capability::access_mode::Mode;
+        use k3rs_kubelet::volume_plugins::csi_client::proto::volume_capability::access_mode::Mode;
         let f = fx(&[Cap::ExpandVolume], None).await;
         run(&f, &test_pv(false, false), "", true).await.unwrap();
         let mode = only_expand(&f)

@@ -27,11 +27,9 @@ use crate::controllers::taint_eviction_timed_workers::{TimedWorkerQueue, WorkArg
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::{
-    EventSource, EventType, Node, Pod, PodCondition, Taint, Toleration,
-};
-use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent, WorkQueue};
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::{EventSource, EventType, Node, Pod, PodCondition, Taint, Toleration};
+use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent, WorkQueue};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -438,7 +436,7 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
         let key = build_key("pods", Some(&update.pod_namespace), &update.pod_name);
         let pod = match self.storage.get::<Pod>(&key).await {
             Ok(pod) => pod,
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 // Delete
                 debug!(
                     "Noticed pod deletion {}/{}",
@@ -495,7 +493,7 @@ impl<S: Storage + 'static> TaintEvictionController<S> {
             .await
         {
             Ok(node) => node,
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 // Delete
                 debug!("Noticed node deletion {node_name}");
                 self.tainted_nodes.lock().unwrap().remove(node_name);

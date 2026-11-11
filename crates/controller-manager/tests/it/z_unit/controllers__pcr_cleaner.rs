@@ -4,8 +4,8 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    pub use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tracing::{error, info};
@@ -13,10 +13,10 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::podcertificaterequest::PodCertificateRequestStatus;
-    use rusternetes_common::types::{Condition, ObjectMeta};
-    use rusternetes_controller_manager::controllers::pcr_cleaner::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::podcertificaterequest::PodCertificateRequestStatus;
+    use k3rs_common::types::{Condition, ObjectMeta};
+    use k3rs_controller_manager::controllers::pcr_cleaner::*;
+    use k3rs_storage::MemoryStorage;
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

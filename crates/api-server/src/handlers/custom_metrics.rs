@@ -9,7 +9,7 @@ use axum::{
     Extension, Json,
 };
 use chrono::Utc;
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     label_selector::LabelSelector,
     resources::custom_metrics::{
@@ -17,13 +17,13 @@ use rusternetes_common::{
     },
     Result,
 };
-use rusternetes_discovery::deferred_restmapper::{
+use k3rs_discovery::deferred_restmapper::{
     DeferredRestMapper, DiscoveryClient, MemCacheClient, RESET_PERIOD,
 };
-use rusternetes_discovery::restmapper::{
+use k3rs_discovery::restmapper::{
     is_builtin_group, served_group_resources, ApiGroupResources, Gvr, MapperError,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
+use k3rs_storage::{build_key, build_prefix, Storage, StorageBackend};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -31,15 +31,15 @@ use tracing::{debug, info, warn};
 /// TypeMeta for the custom-metrics group. Flattened into the value/list structs
 /// since #1916, so a response still names its type while a body that omits
 /// apiVersion/kind still decodes.
-fn metric_value_type_meta(kind: &str) -> rusternetes_common::types::TypeMeta {
-    rusternetes_common::types::TypeMeta {
+fn metric_value_type_meta(kind: &str) -> k3rs_common::types::TypeMeta {
+    k3rs_common::types::TypeMeta {
         api_version: "custom.metrics.k8s.io/v1beta2".to_string(),
         kind: kind.to_string(),
     }
 }
 
 /// PromQL matchers for the metric label selector; an unrepresentable
-/// requirement is an error (Rusternetes-only mapping, see
+/// requirement is an error (k3rs-only mapping, see
 /// `prometheus_client::promql_matchers`).
 fn matchers_for(metric_selector: &LabelSelector) -> Result<Vec<String>> {
     crate::prometheus_client::promql_matchers(metric_selector)
@@ -93,7 +93,7 @@ impl std::fmt::Display for GroupResource {
 ///
 /// One mapper per process, kept in [`ApiServerState`], with the
 /// invalidate-and-retry-on-miss and the periodic `Reset` of the
-/// `DeferredDiscoveryRESTMapper` (see `rusternetes_discovery::
+/// `DeferredDiscoveryRESTMapper` (see `k3rs_discovery::
 /// deferred_restmapper`); upstream regenerates it on an interval likewise
 /// (`pkg/dynamicmapper/mapper.go:56-78`).
 pub type ServedRestMapper = DeferredRestMapper<MemCacheClient<StorageDiscovery>>;
@@ -442,7 +442,7 @@ async fn list_op(
         type_meta: metric_value_type_meta("MetricValueList"),
         // `metav1.ListMeta`. The bespoke predecessor carried only `selfLink`,
         // which upstream stopped populating on every object in 1.20 (#1916).
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items,
     })
 }
@@ -473,7 +473,7 @@ pub async fn get_custom_metric(
         .with_subresource(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     Ok(crate::audit::json_response(
@@ -511,7 +511,7 @@ pub async fn list_custom_metrics(
         .with_name(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     Ok(crate::audit::json_response(
@@ -548,7 +548,7 @@ pub async fn get_namespace_metric(
         .with_name(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     Ok(crate::audit::json_response(
@@ -583,7 +583,7 @@ pub async fn get_cluster_metric(
         .with_subresource(&metric_name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     Ok(crate::audit::json_response(
@@ -604,14 +604,14 @@ pub async fn get_cluster_metric(
 mod tests {
     use super::*;
     use crate::state::ApiServerState;
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
-    use rusternetes_common::storage::MemoryStorage;
+    use k3rs_common::auth::UserInfo;
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_common::storage::MemoryStorage;
 
     async fn create_test_state() -> Arc<ApiServerState> {
-        use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
-        use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::auth::{BootstrapTokenManager, TokenManager};
+        use k3rs_common::observability::MetricsRegistry;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let token_manager = Arc::new(TokenManager::new(b"test-key"));

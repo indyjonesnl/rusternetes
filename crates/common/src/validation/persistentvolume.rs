@@ -9,7 +9,7 @@
 //!
 //! reclaimPolicy / volumeMode / accessModes enum-membership (upstream
 //! `supportedReclaimPolicy` / `supportedVolumeModes` / `supportedAccessModes`)
-//! is enforced upstream-of-validation by Rusternetes' typed enums: an unknown
+//! is enforced upstream-of-validation by k3rs' typed enums: an unknown
 //! string fails to deserialize before this validator runs, so no explicit
 //! `NotSupported` check is reproduced here.
 

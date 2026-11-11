@@ -1,4 +1,4 @@
-//! Structural parity test: Rusternetes resource structs vs the upstream
+//! Structural parity test: k3rs resource structs vs the upstream
 //! `k8s-openapi` crate (the canonical Rust mirror of the Kubernetes OpenAPI
 //! spec).
 //!
@@ -9,7 +9,7 @@
 //!   1. `schemars::schema_for!(Upstream)` -> draft-07 JSON Schema.
 //!   2. Walk that schema and synthesize a *maximal* JSON instance in which
 //!      every property of every (sub)object is populated.
-//!   3. Deserialize that JSON into the corresponding Rusternetes struct, then
+//!   3. Deserialize that JSON into the corresponding k3rs struct, then
 //!      re-serialize it.
 //!   4. Any object key present in the upstream-maximal JSON but missing from
 //!      our round-tripped JSON is a field we drop on decode -> a parity gap.
@@ -278,7 +278,7 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     // ---- Intentional omissions ------------------------------------------
     // selfLink: deprecated k8s 1.16, removed from server responses.
     ("*", "metadata.selfLink"),
-    // Legacy / removed in-tree volume plugins. Rusternetes does not implement
+    // Legacy / removed in-tree volume plugins. k3rs does not implement
     // these provider-specific sources (most are removed upstream too). Bare
     // suffixes cover both the pod `volumes[]` form and the inline
     // PersistentVolume `spec.<plugin>` form.
@@ -434,8 +434,8 @@ macro_rules! parity {
     }};
 }
 
+use k3rs_common::resources as ours;
 use k8s_openapi::api;
-use rusternetes_common::resources as ours;
 
 #[test]
 fn core_v1_parity() {

@@ -2,26 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::apiextensions::controllers::{
+    pub use k3rs_api_server::registry::apiextensions::controllers::{
         aggregate, condition, find_crd_condition, set_crd_condition,
     };
-    pub use rusternetes_common::resources::{
-        CustomResourceDefinition, CustomResourceDefinitionCondition,
-    };
-    pub use rusternetes_common::validation::crd::{
+    pub use k3rs_common::resources::{CustomResourceDefinition, CustomResourceDefinitionCondition};
+    pub use k3rs_common::validation::crd::{
         api_approval_state, is_protected_community_group, ApiApprovalState,
         KUBE_API_APPROVED_ANNOTATION,
     };
-    pub use rusternetes_common::validation::field::{Error, Path};
-    pub use rusternetes_common::validation::structural::{new_structural, validate_structural};
+    pub use k3rs_common::validation::field::{Error, Path};
+    pub use k3rs_common::validation::structural::{new_structural, validate_structural};
     pub use std::collections::HashMap;
     pub use std::sync::Mutex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::condition_controllers::*;
-    use rusternetes_common::resources::CustomResourceDefinitionStatus;
+    use k3rs_api_server::registry::apiextensions::condition_controllers::*;
+    use k3rs_common::resources::CustomResourceDefinitionStatus;
 
     fn crd(group: &str, annotation: Option<&str>, preserve: bool) -> CustomResourceDefinition {
         let mut c: CustomResourceDefinition = serde_json::from_value(serde_json::json!({

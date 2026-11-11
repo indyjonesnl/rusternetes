@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::fsquota::common::*;
+    use k3rs_kubelet::fsquota::common::*;
 
     #[test]
     fn max_quota_matches_upstream_on_64_bit() {

@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use hmac::{Hmac, Mac};
-use rusternetes_common::auth::UserInfo;
+use k3rs_common::auth::UserInfo;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};

@@ -16,11 +16,11 @@
 // byte-level diff in the stored Pod JSON between scans.
 
 use async_trait::async_trait;
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_common::Result as RnResult;
-use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchStream};
+use k3rs_common::resources::pod::*;
+use k3rs_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
+use k3rs_common::Result as RnResult;
+use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WatchStream};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -18,7 +18,7 @@
 // HPA shape and the autoscaling/v2 (multi-metric + behavior) HPA shape, which
 // share the same Rust struct in this codebase but have very different JSON.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CronJob, HorizontalPodAutoscaler, IntOrString, Job, PodDisruptionBudget,
 };
 use serde::de::DeserializeOwned;

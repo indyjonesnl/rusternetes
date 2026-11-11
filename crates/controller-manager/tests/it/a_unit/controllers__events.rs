@@ -4,8 +4,8 @@
 mod __parent {
     pub use chrono::Utc;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::{Event, EventSource, EventType, ObjectReference, Pod};
-    pub use rusternetes_storage::{
+    pub use k3rs_common::resources::{Event, EventSource, EventType, ObjectReference, Pod};
+    pub use k3rs_storage::{
         build_prefix, EventRecorder, Storage, WorkQueue, RECONCILE_ALL_SENTINEL,
     };
     pub use std::sync::Arc;
@@ -14,12 +14,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{Container, PodSpec, PodStatus};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::events::*;
+    use k3rs_common::resources::{Container, PodSpec, PodStatus};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::events::*;
 
     fn create_test_pod(name: &str, namespace: &str, phase: &str, node_name: Option<String>) -> Pod {
-        use rusternetes_common::types::{Phase, TypeMeta};
+        use k3rs_common::types::{Phase, TypeMeta};
 
         Pod {
             type_meta: TypeMeta {
@@ -153,7 +153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recurring_event_bumps_count_and_series() {
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_storage::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EventsController::new(storage.clone(), 5);
@@ -226,9 +226,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_succeeded_pod_emits_completed_not_started() {
-        use rusternetes_common::resources::{ContainerState, ContainerStateTerminated};
-        use rusternetes_common::types::Phase;
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_common::resources::{ContainerState, ContainerStateTerminated};
+        use k3rs_common::types::Phase;
+        use k3rs_storage::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EventsController::new(storage.clone(), 5);
@@ -241,35 +241,34 @@ mod tests {
         );
         if let Some(ref mut status) = pod.status {
             status.phase = Some(Phase::Succeeded);
-            status.container_statuses =
-                Some(vec![rusternetes_common::resources::ContainerStatus {
-                    name: "main".to_string(),
-                    ready: false,
-                    restart_count: 0,
-                    state: Some(ContainerState {
-                        terminated: Some(ContainerStateTerminated {
-                            exit_code: 0,
-                            signal: None,
-                            reason: Some("Completed".to_string()),
-                            message: None,
-                            started_at: None,
-                            finished_at: None,
-                            container_id: None,
-                        }),
-                        ..Default::default()
+            status.container_statuses = Some(vec![k3rs_common::resources::ContainerStatus {
+                name: "main".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 0,
+                        signal: None,
+                        reason: Some("Completed".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
                     }),
-                    last_state: None,
-                    image: Some("busybox".to_string()),
-                    image_id: None,
-                    container_id: None,
-                    started: Some(false),
-                    allocated_resources: None,
-                    allocated_resources_status: None,
-                    resources: None,
-                    user: None,
-                    volume_mounts: None,
-                    stop_signal: None,
-                }]);
+                    ..Default::default()
+                }),
+                last_state: None,
+                image: Some("busybox".to_string()),
+                image_id: None,
+                container_id: None,
+                started: Some(false),
+                allocated_resources: None,
+                allocated_resources_status: None,
+                resources: None,
+                user: None,
+                volume_mounts: None,
+                stop_signal: None,
+            }]);
         }
         storage
             .create("/registry/pods/default/quick-pod", &pod)
@@ -295,9 +294,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_pod_emits_failed_not_started() {
-        use rusternetes_common::resources::{ContainerState, ContainerStateTerminated};
-        use rusternetes_common::types::Phase;
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_common::resources::{ContainerState, ContainerStateTerminated};
+        use k3rs_common::types::Phase;
+        use k3rs_storage::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = EventsController::new(storage.clone(), 5);
@@ -307,35 +306,34 @@ mod tests {
             status.phase = Some(Phase::Failed);
             status.reason = Some("Error".to_string());
             status.message = Some("Container exited with error".to_string());
-            status.container_statuses =
-                Some(vec![rusternetes_common::resources::ContainerStatus {
-                    name: "main".to_string(),
-                    ready: false,
-                    restart_count: 0,
-                    state: Some(ContainerState {
-                        terminated: Some(ContainerStateTerminated {
-                            exit_code: 1,
-                            signal: None,
-                            reason: Some("Error".to_string()),
-                            message: None,
-                            started_at: None,
-                            finished_at: None,
-                            container_id: None,
-                        }),
-                        ..Default::default()
+            status.container_statuses = Some(vec![k3rs_common::resources::ContainerStatus {
+                name: "main".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 1,
+                        signal: None,
+                        reason: Some("Error".to_string()),
+                        message: None,
+                        started_at: None,
+                        finished_at: None,
+                        container_id: None,
                     }),
-                    last_state: None,
-                    image: Some("busybox".to_string()),
-                    image_id: None,
-                    container_id: None,
-                    started: Some(false),
-                    allocated_resources: None,
-                    allocated_resources_status: None,
-                    resources: None,
-                    user: None,
-                    volume_mounts: None,
-                    stop_signal: None,
-                }]);
+                    ..Default::default()
+                }),
+                last_state: None,
+                image: Some("busybox".to_string()),
+                image_id: None,
+                container_id: None,
+                started: Some(false),
+                allocated_resources: None,
+                allocated_resources_status: None,
+                resources: None,
+                user: None,
+                volume_mounts: None,
+                stop_signal: None,
+            }]);
         }
         storage
             .create("/registry/pods/default/fail-pod", &pod)

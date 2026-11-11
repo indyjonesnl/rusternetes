@@ -3,17 +3,17 @@
 
 mod __parent {
     pub use base64::Engine;
-    pub use rusternetes_common::resources::certificates::{
+    pub use k3rs_common::resources::certificates::{
         CertificateSigningRequest, CertificateSigningRequestCondition, KeyUsage,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
     pub use x509_parser::prelude::FromDer;
 }
 
 mod status_certificate_tests {
     use base64::Engine;
-    use rusternetes_common::validation::certificatesigningrequest::status_certificate_error;
+    use k3rs_common::validation::certificatesigningrequest::status_certificate_error;
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
@@ -73,7 +73,7 @@ mod status_certificate_tests {
 
 mod request_signature_tests {
     use base64::Engine;
-    use rusternetes_common::validation::certificatesigningrequest::parse_csr_request_error;
+    use k3rs_common::validation::certificatesigningrequest::parse_csr_request_error;
 
     /// Generate a real PKCS#10 CSR PEM with a valid self-signature via rcgen.
     fn valid_csr_pem() -> String {
@@ -138,12 +138,12 @@ mod request_signature_tests {
 mod update_and_wiring_tests {
     use super::__parent::*;
     use base64::Engine;
-    use rusternetes_common::resources::certificates::{
+    use k3rs_common::resources::certificates::{
         CertificateSigningRequestCondition, CertificateSigningRequestSpec,
         CertificateSigningRequestStatus,
     };
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_common::validation::certificatesigningrequest::*;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_common::validation::certificatesigningrequest::*;
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s.as_bytes())

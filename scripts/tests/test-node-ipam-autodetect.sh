@@ -90,9 +90,9 @@ test_pod_subnet_detected_from_kube_proxy() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" \
-        STUB_CONTAINERS='rusternetes-kube-proxy rusternetes-kube-proxy2' \
-        STUB_CMD_rusternetes_kube_proxy='--node-name node-1 --configure-node-network --pod-cidr 10.244.0.0/16' \
-        STUB_CMD_rusternetes_kube_proxy2='--node-name node-2 --configure-node-network --pod-cidr 10.244.0.0/16' \
+        STUB_CONTAINERS='k3rs-kube-proxy k3rs-kube-proxy2' \
+        STUB_CMD_k3rs_kube_proxy='--node-name node-1 --configure-node-network --pod-cidr 10.244.0.0/16' \
+        STUB_CMD_k3rs_kube_proxy2='--node-name node-2 --configure-node-network --pod-cidr 10.244.0.0/16' \
         run_helper stack_pod_subnet)" || out="<helper-missing>"
     assert_eq "10.244.0.0/16" "$out" "detect --pod-cidr from kube-proxy"
     rm -rf "$tmp"
@@ -104,8 +104,8 @@ test_pod_subnet_detected_with_equals_form() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" \
-        STUB_CONTAINERS='rusternetes-kube-proxy' \
-        STUB_CMD_rusternetes_kube_proxy='--configure-node-network --pod-cidr=10.42.0.0/16' \
+        STUB_CONTAINERS='k3rs-kube-proxy' \
+        STUB_CMD_k3rs_kube_proxy='--configure-node-network --pod-cidr=10.42.0.0/16' \
         run_helper stack_pod_subnet)" || out="<helper-missing>"
     assert_eq "10.42.0.0/16" "$out" "detect --pod-cidr=<cidr>"
     rm -rf "$tmp"
@@ -119,8 +119,8 @@ test_auto_enables_when_stack_declares_pod_subnet() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" \
-        STUB_CONTAINERS='rusternetes-kube-proxy' \
-        STUB_CMD_rusternetes_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
+        STUB_CONTAINERS='k3rs-kube-proxy' \
+        STUB_CMD_k3rs_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
         run_helper node_ipam_cluster_cidr)" || out="<helper-missing>"
     assert_eq "10.244.0.0/16" "$out" "auto-enable node IPAM from the stack's pod subnet"
     rm -rf "$tmp"
@@ -133,8 +133,8 @@ test_auto_stays_off_without_pod_subnet() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" \
-        STUB_CONTAINERS='rusternetes-kube-proxy' \
-        STUB_CMD_rusternetes_kube_proxy='--node-name node-1 --api-server-url https://api-server:6443' \
+        STUB_CONTAINERS='k3rs-kube-proxy' \
+        STUB_CMD_k3rs_kube_proxy='--node-name node-1 --api-server-url https://api-server:6443' \
         run_helper node_ipam_cluster_cidr)" || out="<helper-missing>"
     assert_eq "" "$out" "no pod subnet declared -> node IPAM stays off"
     rm -rf "$tmp"
@@ -160,8 +160,8 @@ test_explicit_disable_wins_over_detection() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" ALLOCATE_NODE_CIDRS=0 \
-        STUB_CONTAINERS='rusternetes-kube-proxy' \
-        STUB_CMD_rusternetes_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
+        STUB_CONTAINERS='k3rs-kube-proxy' \
+        STUB_CMD_k3rs_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
         run_helper node_ipam_cluster_cidr)" || out="<helper-missing>"
     assert_eq "" "$out" "ALLOCATE_NODE_CIDRS=0 disables node IPAM"
     rm -rf "$tmp"
@@ -173,8 +173,8 @@ test_explicit_cluster_cidr_wins() {
     make_stub_rt "$tmp"
     local out
     out="$(CONTAINER_RT="$tmp/bin/stub-rt" CLUSTER_CIDR=192.168.0.0/16 \
-        STUB_CONTAINERS='rusternetes-kube-proxy' \
-        STUB_CMD_rusternetes_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
+        STUB_CONTAINERS='k3rs-kube-proxy' \
+        STUB_CMD_k3rs_kube_proxy='--configure-node-network --pod-cidr 10.244.0.0/16' \
         run_helper node_ipam_cluster_cidr)" || out="<helper-missing>"
     assert_eq "192.168.0.0/16" "$out" "explicit CLUSTER_CIDR wins over detection"
     rm -rf "$tmp"

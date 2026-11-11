@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::coordination::*;
+    use k3rs_common::resources::coordination::*;
 
     #[test]
     fn test_lease_creation() {

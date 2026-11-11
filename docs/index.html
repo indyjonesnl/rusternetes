@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Rūsternetes - Kubernetes Reimplemented in Rust</title>
+  <title>k3rs - Kubernetes Reimplemented in Rust</title>
   <meta name="description" content="A full Kubernetes reimplementation in Rust, focusing on memory safety, performance, and conformance. 216,000+ lines of Rust, 31 controllers, 3,100+ tests, 91% conformance pass rate.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="stylesheet" href="style.css">
@@ -12,7 +12,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="#" class="nav-logo">
-        <img src="favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="#console">Console</a>
@@ -222,7 +222,7 @@
           <div class="feature-icon">&#128640;</div>
           <h3>Single Binary, Single Process</h3>
           <p>All five Kubernetes components running as concurrent tokio tasks in one process with an embedded SQLite database. No containers. No external dependencies. Full Kubernetes API in a single binary.</p>
-          <pre style="font-size: 0.85em; margin-top: 0.5em; color: #b8a088;"><code>./rusternetes --data-dir ./cluster.db</code></pre>
+          <pre style="font-size: 0.85em; margin-top: 0.5em; color: #b8a088;"><code>./k3rs --data-dir ./cluster.db</code></pre>
         </div>
       </div>
       <div style="margin-top: 2em;">
@@ -361,7 +361,7 @@
           <p>CLI tool for cluster interaction. get, create, apply, delete, logs, exec, and more.</p>
         </div>
         <div class="crate-card">
-          <code>rusternetes</code>
+          <code>k3rs</code>
           <p>All-in-one binary. All components as tokio tasks in a single process with embedded SQLite.</p>
         </div>
       </div>
@@ -381,11 +381,11 @@
         </div>
         <pre><code><span class="comment"># Clone and build</span>
 git clone https://github.com/calfonso/rusternetes.git
-cd rusternetes
+cd k3rs
 cargo build --release
 
 <span class="comment"># Start the cluster</span>
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 podman compose -f compose.yml build   <span class="comment"># or: docker compose -f docker-compose.yml build</span>
 podman compose -f compose.yml up -d   <span class="comment"># or: docker compose -f docker-compose.yml up -d</span>
 
@@ -393,7 +393,7 @@ podman compose -f compose.yml up -d   <span class="comment"># or: docker compose
 bash scripts/bootstrap-cluster.sh
 
 <span class="comment"># Use the cluster</span>
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 kubectl get nodes
 kubectl get pods -A</code></pre>
       </div>
@@ -423,7 +423,7 @@ kubectl get pods -A</code></pre>
   <footer class="footer">
     <div class="footer-inner">
       <div class="footer-left">
-        <span class="nav-logo"><img src="favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes</span>
+        <span class="nav-logo"><img src="favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs</span>
         <p>A Kubernetes reimplementation in Rust.</p>
         <p class="footer-license">Apache-2.0 License</p>
       </div>

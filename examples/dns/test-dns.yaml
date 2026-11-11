@@ -1,4 +1,4 @@
-# Example: Testing DNS Resolution in Rusternetes
+# Example: Testing DNS Resolution in k3rs
 #
 # This example demonstrates:
 # 1. A ClusterIP service with DNS resolution

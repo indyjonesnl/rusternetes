@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_middleware::PeerCertificates;
+    pub use k3rs_middleware::PeerCertificates;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::serving_tls::*;
+    use k3rs_kubelet::serving_tls::*;
 
     // Regression for #1644: the kubelet API port must be servable over TLS.
     // Before the fix it bound plain HTTP (`axum::serve(TcpListener)`), so a
@@ -18,7 +18,7 @@ mod tests {
     // self-signed cert (cert-gen + rustls wiring intact).
     #[tokio::test]
     async fn builds_a_tls_serving_config() {
-        let cfg = kubelet_serving_tls("rusternetes-node");
+        let cfg = kubelet_serving_tls("k3rs-node");
         assert!(
             cfg.is_ok(),
             "kubelet serving TLS config must build, got {:?}",

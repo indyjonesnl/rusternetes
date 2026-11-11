@@ -1,9 +1,9 @@
 //! A `fwk::Handle` over an empty cluster: no Services, controllers or
 //! namespaces, as the listers return for a cluster with none.
 use async_trait::async_trait;
-use rusternetes_common::resources::{Namespace, Pod};
-use rusternetes_scheduler::fwk::Handle;
-use rusternetes_scheduler::pod_topology_spread_score::DefaultSelectorInputs;
+use k3rs_common::resources::{Namespace, Pod};
+use k3rs_scheduler::fwk::Handle;
+use k3rs_scheduler::pod_topology_spread_score::DefaultSelectorInputs;
 
 pub struct EmptyListers;
 

@@ -19,7 +19,7 @@
 //! (no empty/default values, which protobuf omits). The synthesizer below is
 //! careful to only emit such values.
 
-use rusternetes_api_server::protobuf::{FieldType, MessageSchema, ProtoRegistry};
+use k3rs_api_server::protobuf::{FieldType, MessageSchema, ProtoRegistry};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
@@ -280,7 +280,7 @@ fn json_value_survives_cbor_roundtrip() {
     // to CBOR and back must be byte-for-byte identical — number widening, string
     // mangling, or map reordering here would silently corrupt every CBOR
     // request. (The #954 CRD struct-form bug was this class, one layer up.)
-    use rusternetes_api_server::cbor::{decode_cbor_to_json, encode_json_to_cbor};
+    use k3rs_api_server::cbor::{decode_cbor_to_json, encode_json_to_cbor};
 
     let reg = ProtoRegistry::new();
     let schemas = all_schemas(&reg);
@@ -342,7 +342,7 @@ fn resource_survives_protobuf_envelope_request_path() {
     // We seed every metadata-bearing (i.e. top-level) resource with the
     // adversarial corpus, push it through the genuine middleware function, and
     // assert no synthesized field was corrupted or lost.
-    use rusternetes_api_server::middleware::decode_k8s_protobuf_request_body;
+    use k3rs_api_server::middleware::decode_k8s_protobuf_request_body;
 
     let reg = ProtoRegistry::new();
     let schemas = all_schemas(&reg);

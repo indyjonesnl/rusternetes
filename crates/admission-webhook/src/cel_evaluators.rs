@@ -14,7 +14,7 @@
 //!     — short-circuits matchConditions in order
 //!
 //! The heavy-lifting CEL primitives (`CELEvaluator`, `CELContext`, JSON→CEL
-//! value conversion) live in [`rusternetes_common::cel`]. This module exposes
+//! value conversion) live in [`k3rs_common::cel`]. This module exposes
 //! purpose-built APIs that take a typed [`AdmissionRequest`] and return one of
 //! a small set of outcomes per surface.
 //!
@@ -50,14 +50,14 @@
 //!
 //! [VAP spec]: https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
 
-use rusternetes_common::admission::AdmissionRequest;
-use rusternetes_common::cel::{CELContext, CELEvaluator};
-use rusternetes_common::cel_cost::{
+use k3rs_common::admission::AdmissionRequest;
+use k3rs_common::cel::{CELContext, CELEvaluator};
+use k3rs_common::cel_cost::{
     charge_budget, BudgetError, CostOptions, LazyVariables,
     MAX_EVALUATED_MESSAGE_EXPRESSION_SIZE_BYTES, RUNTIME_CEL_COST_BUDGET,
     RUNTIME_CEL_COST_BUDGET_MATCH_CONDITIONS,
 };
-use rusternetes_common::resources::MatchCondition;
+use k3rs_common::resources::MatchCondition;
 use serde_json::Value;
 
 /// Outcome of evaluating a policy's `matchConditions[]` against a request.
@@ -110,7 +110,7 @@ pub enum AuditAnnotationOutcome {
 
 /// Evaluator dedicated to webhook & VAP `matchConditions[*]`.
 ///
-/// Reuses the program cache exposed by [`rusternetes_common::cel::CELEvaluator`]
+/// Reuses the program cache exposed by [`k3rs_common::cel::CELEvaluator`]
 /// so repeated admission of objects against the same policy avoids re-compiling
 /// the CEL programs.
 pub struct MatchConditionEvaluator {
@@ -360,7 +360,7 @@ pub type VariableDefs = [(String, String)];
 
 /// `CreateActivation` + `compositionCtx.Variables(va)` (`activation.go:75-78`):
 /// the lazily composited `variables` of one activation over `context`'s
-/// variables. See [`rusternetes_common::cel_cost::LazyVariables`].
+/// variables. See [`k3rs_common::cel_cost::LazyVariables`].
 fn new_activation(variables: &VariableDefs, context: &CELContext) -> LazyVariables {
     let mut base = context.variables.clone();
     base.remove("variables");
@@ -562,8 +562,8 @@ pub fn audit_annotations_budgeted(
 /// and the request's user (`versionedAttr.GetUserInfo()`, activation.go:53-54).
 #[derive(Clone)]
 pub struct VapAuthorizer {
-    pub user: rusternetes_common::auth::UserInfo,
-    pub authorizer: std::sync::Arc<dyn rusternetes_common::authz::Authorizer>,
+    pub user: k3rs_common::auth::UserInfo,
+    pub authorizer: std::sync::Arc<dyn k3rs_common::authz::Authorizer>,
     /// `versionedAttr.GetSubresource()`.
     pub subresource: String,
 }
@@ -581,7 +581,7 @@ pub fn bind_authorizer(
     namespace: &str,
     name: &str,
 ) {
-    use rusternetes_common::cel_authz_library as lib;
+    use k3rs_common::cel_authz_library as lib;
     context.add_variable(
         lib::AUTHORIZER_VAR.to_string(),
         lib::new_authorizer_val(&authz.user, authz.authorizer.clone()),
@@ -650,8 +650,8 @@ pub fn build_context(
     Ok(context)
 }
 
-fn operation_as_str(op: &rusternetes_common::admission::Operation) -> &'static str {
-    use rusternetes_common::admission::Operation;
+fn operation_as_str(op: &k3rs_common::admission::Operation) -> &'static str {
+    use k3rs_common::admission::Operation;
     match op {
         Operation::Create => "CREATE",
         Operation::Update => "UPDATE",
@@ -686,7 +686,7 @@ fn resolve_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::admission::{Operation, UserInfo};
+    use k3rs_common::admission::{Operation, UserInfo};
 
     fn req(namespace: Option<&str>) -> AdmissionRequest {
         AdmissionRequest {

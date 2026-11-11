@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::networking::{
+    pub use k3rs_common::resources::networking::{
         IPBlock, NetworkPolicy, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
     };
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::ingress::parse_ip_sloppy;
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::ingress::parse_ip_sloppy;
+    pub use k3rs_common::validation::metav1::{
         validate_label_selector, LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
     pub use std::net::IpAddr;
@@ -19,7 +19,7 @@ mod __parent {
 
 mod ip_block_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::networkpolicy::*;
+    use k3rs_common::validation::networkpolicy::*;
 
     fn ipb_errs(json: serde_json::Value) -> Vec<String> {
         let ipb: IPBlock = serde_json::from_value(json).unwrap();

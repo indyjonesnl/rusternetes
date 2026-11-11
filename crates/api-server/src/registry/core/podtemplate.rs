@@ -4,13 +4,11 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::resources::PodTemplate;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::podtemplate::{
-    validate_pod_template, validate_pod_template_update,
-};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::resources::PodTemplate;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::podtemplate::{validate_pod_template, validate_pod_template_update};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{
@@ -38,10 +36,7 @@ impl RestCreateStrategy<PodTemplate> for Strategy {
     /// `DropDisabledTemplateFields` is strategy.go:51.
     fn prepare_for_create(&self, _ctx: &RequestContext, obj: &mut PodTemplate) {
         obj.metadata.generation = Some(1);
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
-            &mut obj.template,
-            None,
-        );
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(&mut obj.template, None);
     }
 
     fn validate(&self, _ctx: &RequestContext, obj: &PodTemplate) -> ErrorList {
@@ -60,7 +55,7 @@ impl RestUpdateStrategy<PodTemplate> for Strategy {
     /// `PrepareForUpdate` (strategy.go:77-89): a template change bumps the
     /// generation.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut PodTemplate, old: &PodTemplate) {
-        rusternetes_common::pod_drop_disabled::drop_disabled_template_fields(
+        k3rs_common::pod_drop_disabled::drop_disabled_template_fields(
             &mut obj.template,
             Some(&old.template),
         );

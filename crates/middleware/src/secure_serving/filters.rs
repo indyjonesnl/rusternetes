@@ -39,10 +39,10 @@ use axum::middleware::{from_fn, Next};
 use axum::response::Response;
 use axum::Router;
 use futures::FutureExt;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::error::Error;
-use rusternetes_common::types::Status;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_common::error::Error;
+use k3rs_common::types::Status;
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::resources::serde_helpers::empty_string_as_none;
-    pub use rusternetes_common::types::{Condition, ObjectMeta, TypeMeta};
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::resources::serde_helpers::empty_string_as_none;
+    pub use k3rs_common::types::{Condition, ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::service::*;
+    use k3rs_common::resources::service::*;
 
     #[test]
     fn test_service_port_with_int_target_port() {

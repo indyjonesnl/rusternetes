@@ -11,17 +11,17 @@
 //! * the metrics collector (`metrics/collectors/podcertificate_metrics.go`).
 
 use super::{IssuingManager, Manager, NoOpManager, PodManager, RealClock};
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::resources::Pod;
+use k3rs_storage::{EventRecorder, Storage};
 use prometheus::core::{Collector, Desc};
 use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::resources::Pod;
-use rusternetes_storage::{EventRecorder, Storage};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
 /// `kubelet.podManager`, as far as the pod certificate manager reads it.
-/// Rusternetes has no event-driven pod manager: the sync loop lists the
+/// k3rs has no event-driven pod manager: the sync loop lists the
 /// node's pods each pass, so [`PodCache::reconcile`] turns that list into the
 /// `HandlePodAdditions` / `HandlePodRemoves` calls upstream receives as
 /// config-source updates.
@@ -152,7 +152,7 @@ impl Collector for PodCertificateCollector {
 
 /// `kubelet.go:955-972`: an `IssuingManager` when a client exists and the
 /// `PodCertificateRequest` gate is on (the caller then spawns `run`), else a
-/// `NoOpManager`. Rusternetes' kubelet always has a storage client, so only
+/// `NoOpManager`. k3rs' kubelet always has a storage client, so only
 /// the gate decides.
 #[allow(clippy::type_complexity)]
 pub fn new_pod_certificate_manager<S: Storage + ?Sized + 'static>(

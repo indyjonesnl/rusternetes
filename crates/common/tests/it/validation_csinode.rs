@@ -1,10 +1,8 @@
 //! Tests for CSINode validation (port of upstream `ValidateCSINode`).
 
-use rusternetes_common::resources::csi::{
-    CSINode, CSINodeDriver, CSINodeSpec, VolumeNodeResources,
-};
-use rusternetes_common::validation::csinode::{self, CsiNodeValidationOptions};
-use rusternetes_common::validation::field::ErrorType;
+use k3rs_common::resources::csi::{CSINode, CSINodeDriver, CSINodeSpec, VolumeNodeResources};
+use k3rs_common::validation::csinode::{self, CsiNodeValidationOptions};
+use k3rs_common::validation::field::ErrorType;
 
 fn driver(name: &str, node_id: &str) -> CSINodeDriver {
     CSINodeDriver {
@@ -25,7 +23,7 @@ fn node(drivers: Vec<CSINodeDriver>) -> CSINode {
     n
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field_substr: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field_substr: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field_substr))
 }
 
@@ -63,7 +61,7 @@ fn missing_node_id_rejected() {
         .any(|e| e.field == "spec.drivers[0].nodeID" && e.error_type == ErrorType::Required));
 }
 
-fn validate_csi_node(n: &CSINode) -> rusternetes_common::validation::field::ErrorList {
+fn validate_csi_node(n: &CSINode) -> k3rs_common::validation::field::ErrorList {
     csinode::validate_csi_node(n, CsiNodeValidationOptions::default())
 }
 

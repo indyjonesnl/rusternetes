@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::runtimeclass::*;
+    use k3rs_common::resources::runtimeclass::*;
 
     #[test]
     fn test_runtime_class_creation() {
@@ -85,7 +85,7 @@ mod tests {
         let mut node_selector = HashMap::new();
         node_selector.insert("runtime".to_string(), "gvisor".to_string());
 
-        let tolerations = vec![rusternetes_common::resources::pod::Toleration {
+        let tolerations = vec![k3rs_common::resources::pod::Toleration {
             key: Some("runtime".to_string()),
             operator: Some("Equal".to_string()),
             value: Some("gvisor".to_string()),

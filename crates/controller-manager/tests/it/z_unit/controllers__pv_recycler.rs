@@ -5,15 +5,15 @@ mod __parent {
     pub use async_trait::async_trait;
     pub use futures::stream::BoxStream;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::{Event, PersistentVolume, Pod};
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_storage::{build_key, Storage, WatchEvent};
+    pub use k3rs_common::resources::{Event, PersistentVolume, Pod};
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_storage::{build_key, Storage, WatchEvent};
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::pv_recycler::*;
+    use k3rs_controller_manager::controllers::pv_recycler::*;
     use std::sync::Mutex;
 
     fn json(p: &Pod) -> serde_json::Value {
@@ -27,12 +27,10 @@ mod tests {
             "spec": {"capacity": {"storage": capacity}},
         }))
         .unwrap();
-        pv.spec.host_path = Some(
-            rusternetes_common::resources::volume::HostPathVolumeSource {
-                path: "/tmp/x".to_string(),
-                r#type: None,
-            },
-        );
+        pv.spec.host_path = Some(k3rs_common::resources::volume::HostPathVolumeSource {
+            path: "/tmp/x".to_string(),
+            r#type: None,
+        });
         pv
     }
 
@@ -110,7 +108,7 @@ mod tests {
     fn nfs_recycler_pod_matches_upstream_plugin() {
         let mut pv = pv_with_capacity("1Gi");
         pv.spec.host_path = None;
-        pv.spec.nfs = Some(rusternetes_common::resources::volume::NFSVolumeSource {
+        pv.spec.nfs = Some(k3rs_common::resources::volume::NFSVolumeSource {
             server: "srv".to_string(),
             path: "/exp".to_string(),
             read_only: None,
@@ -299,7 +297,7 @@ spec:
         let pod = host_path_recycler_pod(&pv, &r.host_path).unwrap();
         assert_eq!(pod.spec.unwrap().active_deadline_seconds, Some(90));
         pv.spec.host_path = None;
-        pv.spec.nfs = Some(rusternetes_common::resources::volume::NFSVolumeSource {
+        pv.spec.nfs = Some(k3rs_common::resources::volume::NFSVolumeSource {
             server: "s".to_string(),
             path: "/e".to_string(),
             read_only: None,
@@ -366,7 +364,7 @@ spec:
 
     fn pod_in(phase: Phase, message: &str) -> Pod {
         let mut pod = new_persistent_volume_recycler_pod_template();
-        pod.status = Some(rusternetes_common::resources::pod::PodStatus {
+        pod.status = Some(k3rs_common::resources::pod::PodStatus {
             phase: Some(phase),
             message: if message.is_empty() {
                 None
@@ -517,7 +515,7 @@ spec:
     /// (`recycler_client.go:62-63`).
     #[tokio::test]
     async fn storage_client_creates_pod_named_for_pv() {
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_storage::MemoryStorage;
         let storage = Arc::new(MemoryStorage::new());
         let client = StorageRecyclerClient::new(storage.clone(), Box::new(|_, _| {}));
         // Succeed straight away: a kubelet stand-in marks the pod Succeeded.
@@ -527,7 +525,7 @@ spec:
             loop {
                 if let Ok(mut p) = s2.get::<Pod>(&key).await {
                     assert!(p.metadata.generate_name.is_none());
-                    p.status = Some(rusternetes_common::resources::pod::PodStatus {
+                    p.status = Some(k3rs_common::resources::pod::PodStatus {
                         phase: Some(Phase::Succeeded),
                         ..Default::default()
                     });

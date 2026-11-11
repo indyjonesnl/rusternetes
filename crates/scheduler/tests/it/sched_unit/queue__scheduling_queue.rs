@@ -2,13 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_scheduler::profile::pod_scheduler_name;
-    pub use rusternetes_scheduler::queue::events::*;
-    pub use rusternetes_scheduler::queue::heap::Heap;
-    pub use rusternetes_scheduler::queue::nominator::{
-        NominatingInfo, Nominator, PodLister, PodRef,
-    };
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_scheduler::profile::pod_scheduler_name;
+    pub use k3rs_scheduler::queue::events::*;
+    pub use k3rs_scheduler::queue::heap::Heap;
+    pub use k3rs_scheduler::queue::nominator::{NominatingInfo, Nominator, PodLister, PodRef};
     pub use std::collections::{HashMap, HashSet, VecDeque};
     pub use std::sync::{Arc, Mutex};
     pub use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::scheduling_queue::*;
+    use k3rs_scheduler::queue::scheduling_queue::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn mk_pod(name: &str, ns: &str, uid: &str) -> Pod {
@@ -37,7 +35,7 @@ mod tests {
         .unwrap()
     }
 
-    fn mk_node() -> rusternetes_common::resources::Node {
+    fn mk_node() -> k3rs_common::resources::Node {
         serde_json::from_value(serde_json::json!({"metadata": {"name": "node"}})).unwrap()
     }
 
@@ -86,7 +84,7 @@ mod tests {
                 }));
         }
         HashMap::from([(
-            rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
+            k3rs_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
             m,
         )])
     }
@@ -524,13 +522,13 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn pre_enqueue(&self, pod: &Pod) -> rusternetes_scheduler::fwk::Status {
+        fn pre_enqueue(&self, pod: &Pod) -> k3rs_scheduler::fwk::Status {
             let labels = pod.metadata.labels.clone().unwrap_or_default();
             if self.allow.iter().any(|a| labels.contains_key(*a)) {
-                rusternetes_scheduler::fwk::Status::success()
+                k3rs_scheduler::fwk::Status::success()
             } else {
-                rusternetes_scheduler::fwk::Status::new(
-                    rusternetes_scheduler::fwk::Code::Unschedulable,
+                k3rs_scheduler::fwk::Status::new(
+                    k3rs_scheduler::fwk::Code::Unschedulable,
                     vec![format!("pod is gated by {}", self.name)],
                 )
             }
@@ -581,7 +579,7 @@ mod tests {
                 ),
             ]);
             let pre_enqueue: PreEnqueuePluginMap = HashMap::from([(
-                rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
+                k3rs_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
                 vec![Arc::new(AllowlistGate {
                     name: gate,
                     allow: &["allow"],
@@ -620,11 +618,11 @@ mod tests {
             EVENT_UNSCHEDULED_POD_UPDATE,
             vec![(
                 "gate",
-                rusternetes_scheduler::queue::hints::default_queueing_hint_fn(),
+                k3rs_scheduler::queue::hints::default_queueing_hint_fn(),
             )],
         )]);
         let pre_enqueue: PreEnqueuePluginMap = HashMap::from([(
-            rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
+            k3rs_scheduler::profile::DEFAULT_SCHEDULER_NAME.to_string(),
             vec![Arc::new(AllowlistGate {
                 name: "gate",
                 allow: &["allow"],

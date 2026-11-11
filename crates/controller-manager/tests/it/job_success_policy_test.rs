@@ -11,11 +11,11 @@
 //! short-circuit branch does NOT fire (success_policy_met=false), forcing the code to
 //! reach the `already_complete` guard.  Assert that the guard prevents the overwrite.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::workloads::*;
-use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::job::JobController;
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::workloads::*;
+use k3rs_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::job::JobController;
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

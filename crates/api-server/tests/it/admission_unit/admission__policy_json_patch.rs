@@ -3,31 +3,27 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::admission::policy_json_patch_ops::{
-        apply, ApplyError, Operation,
-    };
-    pub use rusternetes_api_server::admission::policy_mutating::{
-        PatchError, PatchRequest, Patcher,
-    };
-    pub use rusternetes_common::admission::GroupVersionKind;
-    pub use rusternetes_common::admission::Operation as AdmissionOperation;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::cel::{CELContext, CELEvaluator};
-    pub use rusternetes_common::cel_authz_library;
-    pub use rusternetes_common::cel_cost::{charge_budget, CostOptions};
-    pub use rusternetes_common::cel_struct::{self, TypeCheck};
+    pub use k3rs_api_server::admission::policy_json_patch_ops::{apply, ApplyError, Operation};
+    pub use k3rs_api_server::admission::policy_mutating::{PatchError, PatchRequest, Patcher};
+    pub use k3rs_common::admission::GroupVersionKind;
+    pub use k3rs_common::admission::Operation as AdmissionOperation;
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::cel::{CELContext, CELEvaluator};
+    pub use k3rs_common::cel_authz_library;
+    pub use k3rs_common::cel_cost::{charge_budget, CostOptions};
+    pub use k3rs_common::cel_struct::{self, TypeCheck};
     pub use serde_json::{json, Value};
     pub use std::sync::{Arc, Mutex};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_json_patch::*;
-    use rusternetes_api_server::admission::policy_matching::Attributes;
-    use rusternetes_api_server::admission::policy_mutating::VersionedAttributes;
-    use rusternetes_common::admission::Operation as AdmissionOperation;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-    use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+    use k3rs_api_server::admission::policy_json_patch::*;
+    use k3rs_api_server::admission::policy_matching::Attributes;
+    use k3rs_api_server::admission::policy_mutating::VersionedAttributes;
+    use k3rs_common::admission::Operation as AdmissionOperation;
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+    use k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
     use serde_json::json;
 
     fn attributes(object: &Value) -> Attributes {
@@ -402,7 +398,7 @@ mod tests {
     fn request_variable_carries_user_dry_run_and_options() {
         let object = json!({"metadata": {}});
         let mut attrs = attributes(&object);
-        attrs.user_info = Some(rusternetes_common::auth::UserInfo {
+        attrs.user_info = Some(k3rs_common::auth::UserInfo {
             username: "alice".into(),
             uid: "u1".into(),
             groups: vec!["g1".into()],
@@ -491,12 +487,12 @@ mod budget_tests {
     //! expression against it and fails with `ErrOutOfBudget` when it runs out.
 
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_apply_config::ApplyConfigPatcher;
-    use rusternetes_api_server::admission::policy_json_patch::*;
-    use rusternetes_api_server::admission::policy_matching::Attributes;
-    use rusternetes_api_server::admission::policy_mutating::VersionedAttributes;
-    use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-    use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+    use k3rs_api_server::admission::policy_apply_config::ApplyConfigPatcher;
+    use k3rs_api_server::admission::policy_json_patch::*;
+    use k3rs_api_server::admission::policy_matching::Attributes;
+    use k3rs_api_server::admission::policy_mutating::VersionedAttributes;
+    use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+    use k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
     use serde_json::json;
 
     const OUT_OF_BUDGET: &str =

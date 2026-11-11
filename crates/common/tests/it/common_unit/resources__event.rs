@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::ObjectReference;
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::resources::ObjectReference;
+    pub use k3rs_common::types::ObjectMeta;
     pub use serde::{Deserialize, Serialize};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::event::*;
+    use k3rs_common::resources::event::*;
 
     #[test]
     fn test_event_creation() {
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn test_event_field_selector_involved_object() {
-        use rusternetes_common::field_selector::FieldSelector;
+        use k3rs_common::field_selector::FieldSelector;
 
         let obj_ref = ObjectReference {
             kind: Some("Pod".to_string()),

@@ -50,14 +50,14 @@ globalDefault: false
 preemptionPolicy: PreemptLowerPriority
 description: "Used for system critical pods that must run in the cluster but can be moved to another node if necessary."
 ---
-# kube-dns Service (backed by rusternetes-dns)
+# kube-dns Service (backed by k3rs-dns)
 #
 # The Service is ALWAYS created so its ClusterIP (10.96.0.10) stays stable —
 # every Pod's /etc/resolv.conf references it via kubelet's --cluster-dns flag.
-# The backend — the rusternetes-dns kube-system Deployment from
+# The backend — the k3rs-dns kube-system Deployment from
 # bootstrap-dns.yaml, or the all-in-one container's in-process DNS task — is
 # wired in separately by bootstrap-cluster.sh (Step 5). CoreDNS has been
-# removed; rusternetes-dns is the only backend.
+# removed; k3rs-dns is the only backend.
 # Pin to 10.96.0.10 for stability (like real Kubernetes often does)
 # This ensures kubelet always discovers the same DNS IP
 apiVersion: v1
@@ -68,7 +68,7 @@ metadata:
   labels:
     k8s-app: kube-dns
     kubernetes.io/cluster-service: "true"
-    kubernetes.io/name: rusternetes-dns
+    kubernetes.io/name: k3rs-dns
 spec:
   selector:
     k8s-app: kube-dns
@@ -138,7 +138,7 @@ subjects:
 # cert to user `system:kube-controller-manager` via x509 authn. These objects
 # grant that user the verbs the controllers issue.
 #
-# Broad by necessity: rusternetes runs ALL ~40 controllers as concurrent tasks
+# Broad by necessity: k3rs runs ALL ~40 controllers as concurrent tasks
 # in ONE process under this single identity — it does NOT split per-controller
 # ServiceAccounts the way upstream does with --use-service-account-credentials
 # (plugin/pkg/auth/authorizer/rbac/bootstrappolicy/controller_policy.go). So the

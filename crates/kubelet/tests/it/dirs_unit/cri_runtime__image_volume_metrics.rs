@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_common::feature_gates::{enabled, Feature};
+    pub use k3rs_common::resources::pod::Container;
     pub use prometheus::{IntCounter, Opts};
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
-    pub use rusternetes_common::resources::pod::Container;
     pub use std::collections::HashMap;
     pub use std::sync::{LazyLock, Once};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::resources::pod::VolumeMount;
-    use rusternetes_kubelet::cri_runtime::image_volume_metrics::*;
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::resources::pod::VolumeMount;
+    use k3rs_kubelet::cri_runtime::image_volume_metrics::*;
     use std::sync::Arc;
 
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -8,8 +8,8 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::volume::{NFSVolumeSource, PersistentVolumeAccessMode};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::volume::{NFSVolumeSource, PersistentVolumeAccessMode};
+use k3rs_common::resources::Pod;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::Arc;

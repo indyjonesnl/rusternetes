@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use serde_json::Value;
 
 /// List events in a namespace, optionally filtered by resource.

@@ -7,17 +7,17 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
 use clap::Parser;
-use rusternetes_kube_proxy::{
+use k3rs_kube_proxy::{
     iptables::{DEFAULT_CLUSTER_CIDR, DEFAULT_NODEPORT_RANGE},
     KubeProxyConfig,
 };
-use rusternetes_storage::{StorageBackend, StorageConfig};
+use k3rs_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "rusternetes-kube-proxy")]
-#[command(about = "Rusternetes Kube-proxy - Network proxy for service load balancing")]
+#[command(name = "k3rs-kube-proxy")]
+#[command(about = "k3rs Kube-proxy - Network proxy for service load balancing")]
 struct Args {
     /// Comma-separated `Gate=bool` pairs, e.g. `StorageCapacityScoring=true`
     /// (upstream `--feature-gates`, component-base featuregate `Set`).
@@ -37,7 +37,7 @@ struct Args {
     storage_backend: String,
 
     /// SQLite database path (only used when --storage-backend=sqlite)
-    #[arg(long, default_value = "./data/rusternetes.db")]
+    #[arg(long, default_value = "./data/k3rs.db")]
     data_dir: String,
 
     /// Log level
@@ -88,7 +88,7 @@ struct Args {
 
     /// Path of the CNI conflist to write when `--configure-node-network` is set.
     /// Must be in the conf dir the container runtime watches.
-    #[arg(long, default_value = "/etc/cni/net.d/10-rusternetes.conflist")]
+    #[arg(long, default_value = "/etc/cni/net.d/10-k3rs.conflist")]
     cni_conf_path: String,
 
     /// Cluster-wide pod CIDR (the controller-manager's `--cluster-cidr`). Used as
@@ -114,7 +114,7 @@ struct Args {
 /// Apply `--feature-gates` process-wide. Port of `featureGate.Set`
 /// (staging/src/k8s.io/component-base/featuregate/feature_gate.go:340-359).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    rusternetes_common::feature_gates::set_from_str(&args.feature_gates)
+    k3rs_common::feature_gates::set_from_str(&args.feature_gates)
         .map_err(|e| anyhow::anyhow!("invalid --feature-gates: {e}"))?;
     Ok(())
 }
@@ -130,18 +130,16 @@ async fn main() -> Result<()> {
 
     // options.go:244-251: after the feature gates are applied, the flagz
     // reader exists only when ComponentFlagz is enabled.
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ComponentFlagz,
-    ) {
-        rusternetes_kube_proxy::serve_metrics::set_flagz_reader(
-            rusternetes_common::flagz::flags_from_clap(&cmd, &matches),
-        );
+    if k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::ComponentFlagz) {
+        k3rs_kube_proxy::serve_metrics::set_flagz_reader(k3rs_common::flagz::flags_from_clap(
+            &cmd, &matches,
+        ));
     }
 
-    rusternetes_common::tracing::init_basic_tracing("kube-proxy", &args.log_level)?;
+    k3rs_common::tracing::init_basic_tracing("kube-proxy", &args.log_level)?;
     info!(
-        "Starting Rusternetes kube-proxy {}",
-        rusternetes_common::build_info::version_line()
+        "Starting k3rs kube-proxy {}",
+        k3rs_common::build_info::version_line()
     );
 
     let config = KubeProxyConfig {
@@ -153,35 +151,32 @@ async fn main() -> Result<()> {
         nodeport_range: args.node_port_range.replace('-', ":"),
         // Cluster pod CIDR and Service CIDR both keep their source IPs; only
         // egress off-cluster is masqueraded (kindnetd masq.go:105).
-        node_net: args.configure_node_network.then(|| {
-            rusternetes_kube_proxy::node_net::NodeNetConfig {
+        node_net: args
+            .configure_node_network
+            .then(|| k3rs_kube_proxy::node_net::NodeNetConfig {
                 node_name: args.node_name.clone(),
                 cni_conf_path: args.cni_conf_path.clone(),
                 no_masq_cidrs: vec![args.pod_cidr.clone(), args.cluster_cidr.clone()],
-            }
-        }),
+            }),
         // `--metrics-bind-address`; empty gets the defaults.go:52-56 default.
-        metrics_bind_address: rusternetes_kube_proxy::serve_metrics::default_metrics_bind_address(
+        metrics_bind_address: k3rs_kube_proxy::serve_metrics::default_metrics_bind_address(
             &args.metrics_bind_address,
         ),
     };
 
-    let diagnostics = rusternetes_kube_proxy::serve_metrics::DiagnosticsOptions {
+    let diagnostics = k3rs_kube_proxy::serve_metrics::DiagnosticsOptions {
         healthz_bind_address: if args.healthz_bind_address.is_empty() {
             String::new()
         } else {
-            rusternetes_kube_proxy::serve_metrics::append_port_if_needed(
-                &args.healthz_bind_address,
-                10256,
-            )
+            k3rs_kube_proxy::serve_metrics::append_port_if_needed(&args.healthz_bind_address, 10256)
         },
         bind_address_hard_fail: args.bind_address_hard_fail,
     };
 
     // In-cluster path: read cluster state from the api-server (no storage handle).
     if let Some(kubeconfig) = args.kubeconfig.as_deref() {
-        use rusternetes_client::http::ApiClient;
-        use rusternetes_client::kubeconfig::KubeConfig;
+        use k3rs_client::http::ApiClient;
+        use k3rs_client::kubeconfig::KubeConfig;
 
         let cfg = KubeConfig::load_from_file(&std::path::PathBuf::from(kubeconfig))?;
         let ca_pem = cfg.get_ca_cert_pem().ok().flatten();
@@ -209,12 +204,9 @@ async fn main() -> Result<()> {
                 None,
             )?
             // `rest.SetKubernetesDefaults`: the component's default User-Agent.
-            .with_default_user_agent(
-                rusternetes_common::compatibility::default_kubernetes_user_agent(),
-            ),
+            .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent()),
         );
-        return rusternetes_kube_proxy::run_with_api_and_diagnostics(client, config, diagnostics)
-            .await;
+        return k3rs_kube_proxy::run_with_api_and_diagnostics(client, config, diagnostics).await;
     }
 
     let storage_config = match args.storage_backend.as_str() {
@@ -237,13 +229,13 @@ async fn main() -> Result<()> {
     };
     let storage = Arc::new(StorageBackend::new(storage_config).await?);
 
-    rusternetes_kube_proxy::run_with_diagnostics(storage, config, diagnostics).await
+    k3rs_kube_proxy::run_with_diagnostics(storage, config, diagnostics).await
 }
 
 #[cfg(test)]
 mod feature_gates_flag_tests {
     use super::*;
-    use rusternetes_common::feature_gates::{enabled, reset_to_defaults, Feature};
+    use k3rs_common::feature_gates::{enabled, reset_to_defaults, Feature};
     use serial_test::serial;
 
     fn parse(gates: &str) -> Args {

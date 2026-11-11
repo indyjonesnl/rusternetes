@@ -221,7 +221,7 @@ SELECTION=$(resolve_selection "$MANIFEST" "$TARGETS" "$SKIP_TARGETS" "$ORDER" "$
     || die "could not resolve the partition selection (see above)"
 mapfile -t PARTITIONS <<<"$SELECTION"
 
-[ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="$REPO_ROOT/.rusternetes/volumes/suite-$(date +%Y%m%d-%H%M%S)"
+[ -n "$OUTPUT_DIR" ] || OUTPUT_DIR="$REPO_ROOT/.k3rs/volumes/suite-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUTPUT_DIR"
 SUMMARY_TSV="$OUTPUT_DIR/summary.tsv"
 : > "$SUMMARY_TSV"

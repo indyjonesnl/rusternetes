@@ -1,7 +1,7 @@
 //! WebSocket streaming support for logs.
 //!
 //! exec and attach are now upgrade-proxied to the pod's kubelet
-//! via `rusternetes_streamproxy::proxy_upgrade` (Task 6).
+//! via `k3rs_streamproxy::proxy_upgrade` (Task 6).
 
 use axum::extract::ws::{Message, WebSocket};
 use base64::Engine;

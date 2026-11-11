@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde_json::Value;
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::discovery::*;
+    use k3rs_kubectl::discovery::*;
 
     fn fixture() -> Value {
         let raw = include_str!("../../fixtures/aggregated-discovery.json");

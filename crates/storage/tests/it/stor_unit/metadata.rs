@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::metadata::*;
+    use k3rs_storage::metadata::*;
 
     #[test]
     fn stamps_all_fields_when_missing() {

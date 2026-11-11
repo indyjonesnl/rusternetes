@@ -35,13 +35,13 @@
 //! (selfsubjectreviews.go:115 is a plain `ginkgo.It`), and the RBAC
 //! round-trips.
 
-use rusternetes_common::{
+use k3rs_common::{
     auth::{ServiceAccountClaims, TokenManager},
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject},
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{memory::MemoryStorage, Storage, WatchEvent};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{memory::MemoryStorage, Storage, WatchEvent};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,7 +97,7 @@ async fn get_json_as(state: TestApiServer, uri: &str, username: &str) -> (u16, V
 /// HTTP harness cannot hold a streaming response open across the intervening
 /// requests, so the mirror observes the same event types on the storage stream
 /// — the technique `conformance_apimachinery_watch_chunking_gc.rs` uses.
-async fn next_watch_type(stream: &mut rusternetes_storage::WatchStream) -> &'static str {
+async fn next_watch_type(stream: &mut k3rs_storage::WatchStream) -> &'static str {
     let ev = timeout(Duration::from_millis(500), stream.next())
         .await
         .expect("watch stream timed out")
@@ -848,8 +848,8 @@ async fn subject_access_review_agrees_with_the_impersonated_request() {
     // (crates/api-server/src/bootstrap.rs `bootstrap_default_rbac`).
     // A second StorageBackend handle over the same MemoryStorage — the data,
     // not the wrapper, is what the authorizer reads.
-    rusternetes_api_server::bootstrap::bootstrap_default_rbac(Arc::new(
-        rusternetes_storage::StorageBackend::Memory(api.storage.clone()),
+    k3rs_api_server::bootstrap::bootstrap_default_rbac(Arc::new(
+        k3rs_storage::StorageBackend::Memory(api.storage.clone()),
     ))
     .await
     .expect("bootstrap cluster-admin");

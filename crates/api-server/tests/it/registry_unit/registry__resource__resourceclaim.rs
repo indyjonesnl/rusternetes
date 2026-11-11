@@ -2,34 +2,34 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::resource::admin::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::resource::admin::{
         authorized_for_admin, authorized_for_admin_status,
     };
-    pub use rusternetes_api_server::registry::resource::spec::drop_disabled_fields as drop_disabled_spec_fields;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::resource::spec::drop_disabled_fields as drop_disabled_spec_fields;
+    pub use k3rs_api_server::registry::rest::{
         reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy, ValidateFuture,
     };
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::dra::ResourceClaimStatus;
-    pub use rusternetes_common::resources::ResourceClaim;
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::dra::ResourceClaimStatus;
+    pub use k3rs_common::resources::ResourceClaim;
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::resourceclaim::{
+    pub use k3rs_common::validation::resourceclaim::{
         validate_resource_claim, validate_resource_claim_status_update,
         validate_resource_claim_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::collections::HashSet;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::resource::resourceclaim::*;
+    use k3rs_api_server::registry::resource::resourceclaim::*;
 
     fn claim(results: &[&str], devices: &[&str]) -> ResourceClaim {
         let res: Vec<_> = results
@@ -78,7 +78,7 @@ mod tests {
 
     fn first_result(
         c: &ResourceClaim,
-    ) -> &rusternetes_common::resources::dra::DeviceRequestAllocationResult {
+    ) -> &k3rs_common::resources::dra::DeviceRequestAllocationResult {
         &c.status
             .as_ref()
             .unwrap()
@@ -121,8 +121,8 @@ mod tests {
         let r = first_result(&new);
         assert!(r.binding_conditions.is_empty() && r.binding_failure_conditions.is_empty());
 
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::DRADeviceBindingConditions,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::DRADeviceBindingConditions,
             true,
         );
         let mut new = gated_claim();

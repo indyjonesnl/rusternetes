@@ -3,47 +3,39 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::handlers::custom_resource::{
+    pub use k3rs_api_server::handlers::custom_resource::{
         apply_schema_defaults, has_cel_rules, validate_custom_resource_phase,
         validate_field_selector_paths, CrPhase,
     };
-    pub use rusternetes_api_server::registry::generic::store::{BeginUpdate, Finish};
-    pub use rusternetes_api_server::registry::generic::{
-        CreateOptions, Deleted, Store, UpdateOptions,
-    };
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::store::{BeginUpdate, Finish};
+    pub use k3rs_api_server::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
+    pub use k3rs_api_server::registry::rest::{
         with_group_kind, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo,
         ValidateObject, ValidateObjectUpdate,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-    pub use rusternetes_common::fieldmanager::schema::Type as FieldType;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::deletion::{DeleteOptions, Preconditions};
+    pub use k3rs_common::fieldmanager::schema::Type as FieldType;
+    pub use k3rs_common::resources::{
         prune_custom_resource, CustomResource, CustomResourceDefinition,
         CustomResourceSubresourceScale, ResourceScope, Scale, ScaleSpec, ScaleStatus,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_common::validation::field::{
-        Error as FieldError, ErrorList, ErrorType, Path,
-    };
-    pub use rusternetes_common::validation::metav1::is_qualified_name;
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_dns_subdomain, validate_object_meta,
-    };
-    pub use rusternetes_common::validation::structural::listtype::validate_list_sets_and_maps;
-    pub use rusternetes_common::validation::structural::objectmeta::{
-        coerce_with_options, CoerceOptions,
-    };
-    pub use rusternetes_common::validation::structural::{new_structural, Structural};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::validation::field::{Error as FieldError, ErrorList, ErrorType, Path};
+    pub use k3rs_common::validation::metav1::is_qualified_name;
+    pub use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+    pub use k3rs_common::validation::structural::listtype::validate_list_sets_and_maps;
+    pub use k3rs_common::validation::structural::objectmeta::{coerce_with_options, CoerceOptions};
+    pub use k3rs_common::validation::structural::{new_structural, Structural};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod prune_nulls_tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::customresource::*;
+    use k3rs_api_server::registry::apiextensions::customresource::*;
     use serde_json::json;
 
     fn strategy(preserve_unknown_fields: bool) -> Strategy {
@@ -119,7 +111,7 @@ mod prune_nulls_tests {
     /// (errors.go:284-312), not the bare `Invalid resource: ...` list.
     #[test]
     fn decode_strict_kind_mismatch_is_new_invalid() {
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_storage::MemoryStorage;
         let strat = strategy(false);
         let rest = CustomResourceRest::new(
             Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new()))),
@@ -140,7 +132,7 @@ mod prune_nulls_tests {
 
 mod embedded_and_blocking_tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::customresource::*;
+    use k3rs_api_server::registry::apiextensions::customresource::*;
     use serde_json::json;
 
     const BLOCKING: &str = "some validation rules were not checked because the object was invalid; correct the existing errors to complete validation";
@@ -332,7 +324,7 @@ mod embedded_and_blocking_tests {
 
 mod list_type_tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::customresource::*;
+    use k3rs_api_server::registry::apiextensions::customresource::*;
     use serde_json::json;
 
     fn strategy() -> Strategy {
@@ -393,7 +385,7 @@ mod list_type_tests {
 
 mod field_converter_tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apiextensions::customresource::*;
+    use k3rs_api_server::registry::apiextensions::customresource::*;
     use serde_json::json;
 
     fn strategy(versions: &[&str], conversion: Option<serde_json::Value>) -> Strategy {

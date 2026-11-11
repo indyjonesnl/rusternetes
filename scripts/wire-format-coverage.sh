@@ -33,10 +33,10 @@ if command -v cargo-nextest >/dev/null 2>&1 && [ "${WFC_USE_CARGO_TEST:-0}" != 1
     # --workspace + the CI feature set keeps the already-compiled nextest
     # artifacts valid (a `-p` selection would unify features differently and
     # force a rebuild). Passing tests hide output, the report goes to files.
-    cargo nextest run --workspace ${WFC_CARGO_ARGS:---features rusternetes-api-server/sqlite} \
+    cargo nextest run --workspace ${WFC_CARGO_ARGS:---features k3rs-api-server/sqlite} \
         --locked -E 'test(wire_format_coverage_report)' --no-tests=fail --status-level fail
 else
-    cargo test -p rusternetes-api-server --test it wire_format_coverage_report -- --nocapture
+    cargo test -p k3rs-api-server --test it wire_format_coverage_report -- --nocapture
 fi
 
 if [ ! -s "$WIRE_FORMAT_REPORT_DIR/summary.md" ]; then

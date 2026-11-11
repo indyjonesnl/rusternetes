@@ -6,7 +6,7 @@ mod __parent {
     pub use axum::Router;
     pub use axum_server::accept::Accept;
     pub use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
-    pub use rusternetes_middleware::secure_serving::authn::CaContent;
+    pub use k3rs_middleware::secure_serving::authn::CaContent;
     pub use rustls::crypto::aws_lc_rs::cipher_suite as cs;
     pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
     pub use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
@@ -26,7 +26,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::secure_serving::serve::*;
+    use k3rs_middleware::secure_serving::serve::*;
 
     // ciphersuites_flag.go:131-147
     #[test]

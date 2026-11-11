@@ -1,8 +1,8 @@
 //! Ports of `cacher/watch_cache_test.go::TestSuggestedWatchChannelSize`,
 //! `time_budget_test.go::TestTimeBudget` and the `cacheWatcher.add` /
 //! `Cacher.dispatchEvent` semantics of `cache_watcher_test.go` / `cacher.go`.
-use rusternetes_api_server::cache_watcher::*;
-use rusternetes_api_server::watch_cache::{
+use k3rs_api_server::cache_watcher::*;
+use k3rs_api_server::watch_cache::{
     CachedWatchEvent, WatchEventData, WatchScope, EVENT_FRESH_DURATION, LOWER_BOUND_CAPACITY,
 };
 use std::sync::Arc;
@@ -196,7 +196,7 @@ fn watch_scope_name_comes_from_an_exact_metadata_name_selector() {
 /// `cacheWatcher.add` closeFunc: `TerminatedWatchersCounter{group,resource}`.
 #[tokio::test]
 async fn terminating_a_watcher_counts_it_under_group_and_resource() {
-    use rusternetes_api_server::cache_metrics::terminated_watchers;
+    use k3rs_api_server::cache_metrics::terminated_watchers;
     let d = Dispatcher::new();
     let scope = WatchScope::new("apps", "deployments-terminated-test", None);
     let rx = d.add_scoped(LOWER_BOUND_CAPACITY, &scope);

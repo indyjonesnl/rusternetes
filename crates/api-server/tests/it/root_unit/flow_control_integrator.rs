@@ -2,15 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::flow_control_queueset::Clock;
+    pub use k3rs_api_server::flow_control_queueset::Clock;
     pub use std::sync::{Arc, Mutex};
     pub use std::time::Duration;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::flow_control_integrator::test_clock::ManualClock;
-    use rusternetes_api_server::flow_control_integrator::*;
+    use k3rs_api_server::flow_control_integrator::test_clock::ManualClock;
+    use k3rs_api_server::flow_control_integrator::*;
 
     /// `TestIntegrator` (fairqueuing/integrator_test.go:27).
     #[test]

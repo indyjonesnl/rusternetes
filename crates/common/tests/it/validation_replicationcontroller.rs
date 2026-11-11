@@ -4,9 +4,9 @@
 //! (`pkg/apis/core/validation/validation.go`, release-1.35). Runs after
 //! defaulting, so a valid fixture carries an explicit selector.
 
-use rusternetes_common::resources::workloads::ReplicationController;
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::replicationcontroller::validate_replication_controller;
+use k3rs_common::resources::workloads::ReplicationController;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::replicationcontroller::validate_replication_controller;
 use serde_json::json;
 
 fn rc(spec: serde_json::Value) -> ReplicationController {

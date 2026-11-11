@@ -1,5 +1,5 @@
 //! Regression tests for protobuf wire-format decoding of
-//! `runtime.RawExtension` and every field that the rusternetes
+//! `runtime.RawExtension` and every field that the k3rs
 //! [`ProtoRegistry`] models with [`FieldType::JsonRaw`].
 //!
 //! Upstream reference:
@@ -34,7 +34,7 @@
 //!   (the only RawExtension field registered today; the upstream
 //!   `AdmissionReview.request.object` carries the identical wire shape).
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::{json, Value};
 
 /// Encode a varint per the protobuf spec. Used for tag and length fields.

@@ -6,7 +6,7 @@ mod common;
 #[test]
 fn test_multi_document_yaml_file_creation() {
     // Create a test multi-document YAML file
-    let test_dir = std::env::temp_dir().join("rusternetes_test");
+    let test_dir = std::env::temp_dir().join("k3rs_test");
     fs::create_dir_all(&test_dir).unwrap();
 
     let yaml_content = r#"
@@ -68,7 +68,7 @@ provisioner: kubernetes.io/no-provisioner
 volumeBindingMode: WaitForFirstConsumer
 "#;
 
-    use rusternetes_common::resources::StorageClass;
+    use k3rs_common::resources::StorageClass;
     let sc: StorageClass = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(sc.metadata.name, "fast-storage");
@@ -89,7 +89,7 @@ spec:
     persistentVolumeClaimName: test-pvc
 "#;
 
-    use rusternetes_common::resources::VolumeSnapshot;
+    use k3rs_common::resources::VolumeSnapshot;
     let snapshot: VolumeSnapshot = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(snapshot.metadata.name, "test-snapshot");
@@ -116,7 +116,7 @@ subsets:
         protocol: TCP
 "#;
 
-    use rusternetes_common::resources::Endpoints;
+    use k3rs_common::resources::Endpoints;
     let endpoints: Endpoints = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(endpoints.metadata.name, "test-endpoints");
@@ -136,7 +136,7 @@ data:
   api_key: "test-key-123"
 "#;
 
-    use rusternetes_common::resources::ConfigMap;
+    use k3rs_common::resources::ConfigMap;
     let cm: ConfigMap = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(cm.metadata.name, "test-config");
@@ -161,7 +161,7 @@ data:
   password: cGFzc3dvcmQ=
 "#;
 
-    use rusternetes_common::resources::Secret;
+    use k3rs_common::resources::Secret;
     let secret: Secret = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(secret.metadata.name, "test-secret");
@@ -191,7 +191,7 @@ spec:
                   number: 80
 "#;
 
-    use rusternetes_common::resources::Ingress;
+    use k3rs_common::resources::Ingress;
     let ingress: Ingress = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(ingress.metadata.name, "test-ingress");
@@ -213,7 +213,7 @@ spec:
     requests.memory: "8Gi"
 "#;
 
-    use rusternetes_common::resources::ResourceQuota;
+    use k3rs_common::resources::ResourceQuota;
     let quota: ResourceQuota = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(quota.metadata.name, "test-quota");
@@ -232,7 +232,7 @@ globalDefault: false
 description: "High priority class"
 "#;
 
-    use rusternetes_common::resources::PriorityClass;
+    use k3rs_common::resources::PriorityClass;
     let pc: PriorityClass = serde_yaml::from_str(yaml).unwrap();
 
     assert_eq!(pc.metadata.name, "high-priority");

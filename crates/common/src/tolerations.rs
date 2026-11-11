@@ -9,7 +9,7 @@
 //! `tolerationSeconds: 300` (the `defaultNotReadyTolerationSeconds` /
 //! `defaultUnreachableTolerationSeconds` defaults at admission.go:44-45).
 //!
-//! Without this, rusternetes pods carry NO toleration for the NotReady taint
+//! Without this, k3rs pods carry NO toleration for the NotReady taint
 //! the node controller adds on a NotReady node, so a single transient node
 //! flap under CI load lets the kubelet's NoExecute sweep evict (and ultimately
 //! delete) every pod on the node instantly — including Succeeded pods whose

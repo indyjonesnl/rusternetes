@@ -4,20 +4,20 @@
 //!
 //! The mandatory-object spec equality checks of
 //! `pkg/apis/flowcontrol/validation` (`internalbootstrap.Mandatory*`) live in
-//! `rusternetes_common::validation::flowcontrol_bootstrap` and the validators.
+//! `k3rs_common::validation::flowcontrol_bootstrap` and the validators.
 //!
 //! Not modelled: `getRequestGroupVersion` (strategy.go:192) only selects the
 //! v1beta1/v1beta2 field name `assuredConcurrencyShares`; only v1 is served.
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{FlowSchema, FlowSchemaStatus};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::flowschema::{
+use k3rs_common::resources::{FlowSchema, FlowSchemaStatus};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::flowschema::{
     validate_flow_schema, validate_flow_schema_status_update,
 };
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

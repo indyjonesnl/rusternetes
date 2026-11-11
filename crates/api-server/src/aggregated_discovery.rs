@@ -16,7 +16,7 @@
 //! needs no conversion beyond accepting its content type.
 //!
 //! Deviation: upstream hands `fetchFreshDiscoveryForService` the APIService's
-//! `proxyHandler` (an `http.Handler`). Rusternetes has no per-APIService
+//! `proxyHandler` (an `http.Handler`). k3rs has no per-APIService
 //! handler (see `apiservice_registration` module docs), so the same role is the
 //! [`AggregatorHandler`] trait, whose production implementation
 //! ([`ProxyDiscoveryHandler`]) resolves the backend through the aggregator
@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use serde_json::{json, Map, Value};
 
 use crate::apiservice_registration::{DiscoveryFreshness, VersionDiscovery};

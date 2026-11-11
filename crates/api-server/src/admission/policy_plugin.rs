@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::admission::Operation;
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
-use rusternetes_common::Error;
+use k3rs_common::admission::Operation;
+use k3rs_common::authz::Authorizer;
+use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+use k3rs_common::Error;
 
 use super::policy_dispatch::{dispatch, PolicyHook};
 use super::policy_matching::{Attributes, EquivalentResourceMapper, Matcher, NamespaceLister};
@@ -27,7 +27,7 @@ use super::policy_mutating::{
 };
 use super::policy_source::Hooks;
 use crate::registry::rest::GroupResource;
-use rusternetes_common::feature_gates::Feature;
+use k3rs_common::feature_gates::Feature;
 
 pub type MutatingHook =
     PolicyHook<MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding, MutatingEvaluator>;
@@ -83,7 +83,7 @@ impl MutatingPolicyPlugin {
     /// Enabled(features.MutatingAdmissionPolicy))`, read per request here
     /// because the gate is process-wide and settable.
     pub fn enabled() -> bool {
-        rusternetes_common::feature_gates::enabled(Feature::MutatingAdmissionPolicy)
+        k3rs_common::feature_gates::enabled(Feature::MutatingAdmissionPolicy)
     }
 
     /// `shouldIgnoreResource` (generic/plugin.go:217-222).

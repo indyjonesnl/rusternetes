@@ -18,10 +18,10 @@
 
 use super::pvc_protection::{is_deletion_candidate, need_to_add_finalizer, update_or_reap};
 use anyhow::Result;
-use rusternetes_common::resources::csi::VolumeAttributesClass;
-use rusternetes_common::resources::volume::VAC_PROTECTION_FINALIZER;
-use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
+use k3rs_common::resources::csi::VolumeAttributesClass;
+use k3rs_common::resources::volume::VAC_PROTECTION_FINALIZER;
+use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim};
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -91,7 +91,7 @@ impl<S: Storage + 'static> VacProtectionController<S> {
         let key = build_key("volumeattributesclasses", None, name);
         let mut vac: VolumeAttributesClass = match self.storage.get(&key).await {
             Ok(v) => v,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         // A used class is kept: falls through, where NeedToAddFinalizer is

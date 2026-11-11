@@ -3,13 +3,13 @@
 //! Tests all CRUD operations, edge cases, and error handling for networkpolicies.
 //! NetworkPolicy describes what network traffic is allowed for a set of Pods.
 
-use rusternetes_common::resources::policy::IntOrString;
-use rusternetes_common::resources::{
+use k3rs_common::resources::policy::IntOrString;
+use k3rs_common::resources::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -396,7 +396,7 @@ async fn test_networkpolicy_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut np = create_test_networkpolicy("test-owner", "default");
-    np.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    np.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "v1".to_string(),
         kind: "Namespace".to_string(),
         name: "default".to_string(),

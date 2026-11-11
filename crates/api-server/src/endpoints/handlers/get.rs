@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::{Error, Result};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::{Error, Result};
 
 use super::rest::{respond_object, RequestScope};
 use crate::registry::generic::GetOptions;

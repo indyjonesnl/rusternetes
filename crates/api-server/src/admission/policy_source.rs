@@ -39,14 +39,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use rusternetes_common::admission::GroupVersionResource;
-use rusternetes_common::resources::validating_admission_policy::{
+use k3rs_common::admission::GroupVersionResource;
+use k3rs_common::resources::validating_admission_policy::{
     FailurePolicy, MatchResources, ParamKind, ParamRef,
 };
-use rusternetes_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
-use rusternetes_common::types::Selector;
-use rusternetes_common::Error;
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+use k3rs_common::types::Selector;
+use k3rs_common::Error;
+use k3rs_storage::{build_prefix, Storage, WatchEvent};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 

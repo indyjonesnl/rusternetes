@@ -1,6 +1,6 @@
 # MetalLB Configuration Examples
 
-This directory contains example MetalLB configurations for different deployment scenarios with Rusternetes.
+This directory contains example MetalLB configurations for different deployment scenarios with k3rs.
 
 ## Quick Start
 
@@ -59,7 +59,7 @@ addresses:
 
 ### Podman (`metallb-config-podman.yaml`)
 
-For Rusternetes running in Podman containers.
+For k3rs running in Podman containers.
 
 **Before applying:**
 1. Check your Podman network:
@@ -253,4 +253,4 @@ spec:
 
 - [Complete MetalLB Integration Guide](../../docs/METALLB_INTEGRATION.md)
 - [MetalLB Official Documentation](https://metallb.universe.tf/)
-- [Rusternetes LoadBalancer Overview](../../LOADBALANCER.md)
+- [k3rs LoadBalancer Overview](../../LOADBALANCER.md)

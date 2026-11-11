@@ -27,9 +27,9 @@
 
 use crate::protobuf_schema_parity_upstream::{parse_all_files, qualified_prefix_for};
 use base64::Engine;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use prost_types::field_descriptor_proto::{Label, Type as T};
 use prost_types::{DescriptorProto, FieldDescriptorProto};
-use rusternetes_api_server::protobuf::ProtoRegistry;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 

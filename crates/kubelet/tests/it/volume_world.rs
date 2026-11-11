@@ -4,12 +4,12 @@
 //! populate the desired state from the pods the kubelet knows, then run the
 //! reconciler (`unmountVolumes`, `unmountDetachDevices`).
 
-use rusternetes_common::resources::Pod;
-use rusternetes_kubelet::podcertificate::PodManager;
-use rusternetes_kubelet::volume_manager::populator::PodStateProvider;
-use rusternetes_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
-use rusternetes_kubelet::volumes::VolumeManager;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::Pod;
+use k3rs_kubelet::podcertificate::PodManager;
+use k3rs_kubelet::volume_manager::populator::PodStateProvider;
+use k3rs_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
+use k3rs_kubelet::volumes::VolumeManager;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,7 @@ pub async fn world(
     storage: Arc<StorageBackend>,
     pods: Vec<Pod>,
 ) -> World {
-    let node_obj: rusternetes_common::resources::Node = serde_json::from_value(json!({
+    let node_obj: k3rs_common::resources::Node = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Node", "metadata": {"name": node}
     }))
     .unwrap();

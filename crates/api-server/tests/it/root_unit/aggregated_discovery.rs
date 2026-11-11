@@ -3,13 +3,11 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::apiservice_registration::{
-        DiscoveryFreshness, VersionDiscovery,
-    };
-    pub use rusternetes_api_server::handlers::aggregator::{
+    pub use k3rs_api_server::apiservice_registration::{DiscoveryFreshness, VersionDiscovery};
+    pub use k3rs_api_server::handlers::aggregator::{
         build_aggregator_client, resolve_aggregator_target_with_storage,
     };
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_storage::Storage;
     pub use serde_json::{json, Map, Value};
     pub use std::collections::BTreeMap;
     pub use std::sync::Arc;
@@ -17,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::aggregated_discovery::*;
+    use k3rs_api_server::aggregated_discovery::*;
 
     #[test]
     fn content_type_gvk_matches_v2_and_v2beta1_only() {

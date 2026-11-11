@@ -5,12 +5,12 @@
 //!
 //! 1. Every table entry names a field the registry knows (guards typos and
 //!    upstream renames).
-//! 2. For the messages we model in `rusternetes-common`, the all-zero wire
+//! 2. For the messages we model in `k3rs-common`, the all-zero wire
 //!    message decodes to `{}` and then deserializes into the Rust type.
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{ObjectMeta, Status, StatusDetails};
-use rusternetes_protobuf::plain_zero_scalars::PLAIN_ZERO_SCALARS;
-use rusternetes_protobuf::PROTO_REGISTRY;
+use k3rs_common::resources::*;
+use k3rs_common::types::{ObjectMeta, Status, StatusDetails};
+use k3rs_protobuf::plain_zero_scalars::PLAIN_ZERO_SCALARS;
+use k3rs_protobuf::PROTO_REGISTRY;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 

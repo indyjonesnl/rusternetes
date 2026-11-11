@@ -1,8 +1,8 @@
 //! Tests for PriorityClass validation (port of upstream `ValidatePriorityClass`).
 
-use rusternetes_common::resources::PriorityClass;
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::priorityclass::validate_priority_class;
+use k3rs_common::resources::PriorityClass;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::priorityclass::validate_priority_class;
 
 fn pc(name: &str, value: i32) -> PriorityClass {
     let mut p = PriorityClass {
@@ -17,7 +17,7 @@ fn pc(name: &str, value: i32) -> PriorityClass {
     p
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field == field)
 }
 

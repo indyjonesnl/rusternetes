@@ -1,6 +1,6 @@
-# rusternetes-dns as an in-cluster kube-system Deployment (CoreDNS parity).
+# k3rs-dns as an in-cluster kube-system Deployment (CoreDNS parity).
 #
-# Applied by bootstrap-cluster.sh on the default USE_RUSTERNETES_DNS=1 path
+# Applied by bootstrap-cluster.sh on the default USE_K3RS_DNS=1 path
 # for multi-container stacks. The pod carries the `k8s-app: kube-dns` label,
 # so the endpoints controller populates the kube-dns Service (created in
 # bootstrap-cluster.yaml with a matching selector and ClusterIP 10.96.0.10)
@@ -13,18 +13,18 @@
 #
 # The image is built by the compose `dns` service (build-only, profile
 # "build"): `docker compose --profile build build dns` tags it
-# rusternetes-dns:latest. Kubelets share the host docker daemon, so the
+# k3rs-dns:latest. Kubelets share the host docker daemon, so the
 # locally-built tag is visible without a registry; imagePullPolicy
 # IfNotPresent keeps the kubelet from trying to pull it.
 #
 # The all-in-one stack does NOT use this manifest — there the DNS server is
-# an in-process task inside the `rusternetes` container, and
+# an in-process task inside the `k3rs` container, and
 # bootstrap-cluster.sh wires the kube-dns Service to that container's bridge
 # IP with a manual EndpointSlice.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rusternetes-dns
+  name: k3rs-dns
   namespace: kube-system
   labels:
     k8s-app: kube-dns
@@ -32,7 +32,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: system:rusternetes-dns
+  name: system:k3rs-dns
   labels:
     k8s-app: kube-dns
 rules:
@@ -46,22 +46,22 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: system:rusternetes-dns
+  name: system:k3rs-dns
   labels:
     k8s-app: kube-dns
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: system:rusternetes-dns
+  name: system:k3rs-dns
 subjects:
 - kind: ServiceAccount
-  name: rusternetes-dns
+  name: k3rs-dns
   namespace: kube-system
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rusternetes-dns
+  name: k3rs-dns
   namespace: kube-system
   labels:
     k8s-app: kube-dns
@@ -75,10 +75,10 @@ spec:
       labels:
         k8s-app: kube-dns
     spec:
-      serviceAccountName: rusternetes-dns
+      serviceAccountName: k3rs-dns
       containers:
       - name: dns
-        image: rusternetes-dns:latest
+        image: k3rs-dns:latest
         imagePullPolicy: IfNotPresent
         # Arg-free: in-cluster api-server config; defaults already serve
         # cluster.local on UDP+TCP 0.0.0.0:53.

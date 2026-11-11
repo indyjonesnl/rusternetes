@@ -3,7 +3,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod tests {
-    use rusternetes_storage::WorkQueue;
+    use k3rs_storage::WorkQueue;
     use std::time::Duration;
 
     /// One series from the default registry's text exposition, e.g.

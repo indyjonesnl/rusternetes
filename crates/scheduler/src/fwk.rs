@@ -18,7 +18,7 @@
 use crate::node_volume_limits::NodeVolumeLimitsSnapshot;
 use crate::volume_binding::VolumeSnapshot;
 use async_trait::async_trait;
-use rusternetes_common::resources::{Namespace, Node, Pod, ResourceClaim, ResourceSlice};
+use k3rs_common::resources::{Namespace, Node, Pod, ResourceClaim, ResourceSlice};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 

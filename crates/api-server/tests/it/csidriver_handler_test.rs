@@ -3,11 +3,11 @@
 //! Tests all CRUD operations, edge cases, and error handling for csidrivers.
 //! CSIDriver represents information about a CSI volume driver installed on a cluster.
 
-use rusternetes_common::resources::csi::{
+use k3rs_common::resources::csi::{
     CSIDriver, CSIDriverSpec, FSGroupPolicy, TokenRequest, VolumeLifecycleMode,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

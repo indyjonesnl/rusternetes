@@ -7,8 +7,8 @@
 //! CRI `ExecSync`, while http/tcp probes are dialed from the node against the
 //! pod IP. This module holds the pure helpers (port resolution).
 
-use rusternetes_common::resources::pod::Container;
-use rusternetes_common::resources::policy::IntOrString;
+use k3rs_common::resources::pod::Container;
+use k3rs_common::resources::policy::IntOrString;
 
 /// Resolve a probe port to a numeric container port. Integer ports pass through;
 /// named ports are looked up in the container's declared `ports`. Returns `None`

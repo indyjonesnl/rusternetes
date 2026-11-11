@@ -60,7 +60,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- control-plane image resolution ----------------------------------------
 # The kube-scheduler / kube-controller-manager static pods AND the
-# rusternetes-dns Deployment run INSIDE the containerd CRI service, which keeps
+# k3rs-dns Deployment run INSIDE the containerd CRI service, which keeps
 # its own image store (the `containerd-data` volume). That store is separate
 # from the docker/podman daemon `compose build`/`compose pull` write to, so the
 # images must be put there one of two ways:
@@ -78,15 +78,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 #     as before.
 #
 #   * Local build path — registry unset. Images were built into the local
-#     docker/podman daemon as rusternetes-<component>:latest, which the separate
+#     docker/podman daemon as k3rs-<component>:latest, which the separate
 #     containerd store cannot see, so we `save | ctr -n k8s.io images import`
 #     them over the CRI socket. Without this every static pod / dns pod fails
-#     with `pull access denied ... docker.io/library/rusternetes-*` (the kubelet
+#     with `pull access denied ... docker.io/library/k3rs-*` (the kubelet
 #     falls back to docker.io for the unqualified local tag).
 CONTROL_PLANE_IMAGE_REGISTRY="${CONTROL_PLANE_IMAGE_REGISTRY:-}"
-CONTROL_PLANE_IMAGE_TAG="${RUSTERNETES_IMAGE_TAG:-main}"
+CONTROL_PLANE_IMAGE_TAG="${K3RS_IMAGE_TAG:-main}"
 # Explicit single-runtime override (scripts/run-node-conformance.sh sets this to
-# rusternetes-nc-containerd). Empty means "discover the compose runtimes" — see
+# k3rs-nc-containerd). Empty means "discover the compose runtimes" — see
 # containerd_service_containers.
 CONTAINERD_SERVICE_CONTAINER="${CONTAINERD_SERVICE_CONTAINER:-}"
 
@@ -98,7 +98,7 @@ resolve_cluster_image() {
     if [ -n "$CONTROL_PLANE_IMAGE_REGISTRY" ]; then
         echo "${CONTROL_PLANE_IMAGE_REGISTRY}/${component}:${CONTROL_PLANE_IMAGE_TAG}"
     else
-        echo "rusternetes-${component}:latest"
+        echo "k3rs-${component}:latest"
     fi
 }
 
@@ -107,7 +107,7 @@ resolve_cluster_image() {
 # when there is no separate containerd service (all-in-one stack) or the source
 # image was never built locally. `docker save` emits a docker-archive tarball
 # that `ctr images import` auto-detects; ctr normalizes the RepoTag
-# rusternetes-X:latest to docker.io/library/rusternetes-X:latest, the exact ref
+# k3rs-X:latest to docker.io/library/k3rs-X:latest, the exact ref
 # the CRI ImageService resolves the unqualified pod-spec name to, so the lookup
 # matches.
 # Every node's runtime that is currently up. Each containerd keeps its OWN image
@@ -123,7 +123,7 @@ containerd_service_containers() {
         return 0
     fi
     ${CONTAINER_RT:-docker} ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E '^rusternetes-containerd[0-9]*$' \
+        | grep -E '^k3rs-containerd[0-9]*$' \
         | sort
 }
 
@@ -133,7 +133,7 @@ containerd_service_containers() {
 stack_pod_subnet() {
     local names name cmd cidr
     names="$(${CONTAINER_RT:-docker} ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E '^rusternetes-kube-proxy[0-9]*$' \
+        | grep -E '^k3rs-kube-proxy[0-9]*$' \
         | sort)"
     for name in $names; do
         cmd="$(${CONTAINER_RT:-docker} inspect -f '{{join .Config.Cmd " "}}' "$name" 2>/dev/null || true)"
@@ -193,7 +193,7 @@ node_ipam_cluster_cidr() {
 # DirectoryOrCreate hostPath, "as it is used for third-party plugins to
 # integrate with their storage backends via unix domain socket"
 # (cmd/kubeadm/app/phases/controlplane/volumes.go:73-79). The in-process CSI
-# attacher itself is Rusternetes-only (upstream's controller-manager has no
+# attacher itself is k3rs-only (upstream's controller-manager has no
 # CSI socket; the external-attacher sidecar does); the mount follows kubeadm.
 #
 # csi_socket_dirs prints the unique parent directories of the CSI_ATTACHERS
@@ -297,23 +297,23 @@ import_sandbox_image() {
 }
 
 # Discover the Docker bridge gateway (always [subnet].1) so we can
-# bootstrap rusternetes-dns and other resources without hardcoding an IP.
+# bootstrap k3rs-dns and other resources without hardcoding an IP.
 # Uses the discover-bridge-gateway helper; callers can override via
-# RUSTERNETES_BRIDGE_GATEWAY env var if discovery fails.
+# K3RS_BRIDGE_GATEWAY env var if discovery fails.
 #
 # Invoke as a subprocess (not `source`): the helper prints the gateway
 # on stdout and ends with `exit 0`, which — if sourced — would terminate
 # this bootstrap script before the actual bootstrap work runs. Capturing
 # stdout gives us the value without that side-effect.
-if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
+if [ -z "${K3RS_BRIDGE_GATEWAY:-}" ]; then
     if [ -f "$SCRIPT_DIR/discover-bridge-gateway.sh" ]; then
-        RUSTERNETES_BRIDGE_GATEWAY="$(bash "$SCRIPT_DIR/discover-bridge-gateway.sh" 2>/dev/null || true)"
-        export RUSTERNETES_BRIDGE_GATEWAY
+        K3RS_BRIDGE_GATEWAY="$(bash "$SCRIPT_DIR/discover-bridge-gateway.sh" 2>/dev/null || true)"
+        export K3RS_BRIDGE_GATEWAY
     fi
 fi
 
-if [ -n "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
-    echo "Docker bridge gateway: $RUSTERNETES_BRIDGE_GATEWAY"
+if [ -n "${K3RS_BRIDGE_GATEWAY:-}" ]; then
+    echo "Docker bridge gateway: $K3RS_BRIDGE_GATEWAY"
 fi
 
 echo "Using container runtime: $CONTAINER_RT"
@@ -360,7 +360,7 @@ if [ -z "$KUBECONFIG" ] || [ "$KUBECONFIG" = "/dev/null" ]; then
     KUBECTL_FLAGS="$KUBECTL_FLAGS --server https://localhost:6443"
 fi
 
-print_step "Bootstrapping Rusternetes cluster..."
+print_step "Bootstrapping k3rs cluster..."
 echo "Using kubectl: $KUBECTL"
 echo "Kubectl flags: $KUBECTL_FLAGS"
 echo ""
@@ -370,11 +370,11 @@ echo ""
 # The kube-scheduler and kube-controller-manager static pods
 # (manifests/control-plane/*.yaml) hostPath-mount the certs dir. Because the
 # kubelet runs inside a compose container, that hostPath must be the
-# HOST-absolute path of .rusternetes/certs (Docker resolves pod hostPaths on the
+# HOST-absolute path of .k3rs/certs (Docker resolves pod hostPaths on the
 # host AND the kubelet stat()s it inside its own container — so it has to exist
 # at the same path on both sides; compose mounts CERTS_PATH:CERTS_PATH on the
 # node-1 kubelet). We rewrite the committed @CERTS_PATH@ placeholder into the
-# templated copies under .rusternetes/manifests, which is what the node-1
+# templated copies under .k3rs/manifests, which is what the node-1
 # kubelet's --pod-manifest-path actually mounts. The loop below globs every
 # manifest, so new control-plane pods are picked up automatically.
 #
@@ -386,12 +386,12 @@ echo ""
 # (x509 authn, #1129). The controller-manager equivalent
 # (system:kube-controller-manager) is still TODO. See scripts/generate-certs.sh
 # for the full authn notes.
-CERTS_PATH="$PROJECT_ROOT/.rusternetes/certs"
+CERTS_PATH="$PROJECT_ROOT/.k3rs/certs"
 export CERTS_PATH
 if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     import_sandbox_image
     print_step "Templating control-plane static pod manifests (CERTS_PATH=$CERTS_PATH)..."
-    mkdir -p "$PROJECT_ROOT/.rusternetes/manifests"
+    mkdir -p "$PROJECT_ROOT/.k3rs/manifests"
     # Node IPAM follows the stack's declared pod subnet (see
     # node_ipam_cluster_cidr above, ported from kubeadm). When there is one,
     # expand the @NODE_IPAM_ARGS@ placeholder in the controller-manager manifest
@@ -409,7 +409,7 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     fi
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
-        dst="$PROJECT_ROOT/.rusternetes/manifests/$(basename "$src")"
+        dst="$PROJECT_ROOT/.k3rs/manifests/$(basename "$src")"
         # Derive the component (and thus the image) from the manifest name:
         # kube-scheduler.yaml -> scheduler, kube-controller-manager.yaml ->
         # controller-manager. resolve_cluster_image picks GHCR vs local :latest.
@@ -454,29 +454,29 @@ fi
 sleep 1
 
 # Step 2: Apply ServiceAccounts and Secrets
-if [ -f "$PROJECT_ROOT/.rusternetes/default-serviceaccounts.yaml" ]; then
+if [ -f "$PROJECT_ROOT/.k3rs/default-serviceaccounts.yaml" ]; then
     print_step "Applying ServiceAccounts and Secrets..."
-    $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/.rusternetes/default-serviceaccounts.yaml"
+    $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/.k3rs/default-serviceaccounts.yaml"
     print_success "ServiceAccounts and Secrets created"
 else
-    print_warning "ServiceAccount YAML not found at .rusternetes/default-serviceaccounts.yaml"
+    print_warning "ServiceAccount YAML not found at .k3rs/default-serviceaccounts.yaml"
     print_warning "Continuing with bootstrap, but pods may not have valid tokens"
 fi
 
 # Step 3: Remove any legacy CoreDNS leftovers. CoreDNS has been removed in
-# favour of rusternetes-dns, but a pod/container named `coredns` may survive
+# favour of k3rs-dns, but a pod/container named `coredns` may survive
 # from an older cluster on the shared host; drop it so the kube-dns Service
-# binds only to the rusternetes-dns backend.
+# binds only to the k3rs-dns backend.
 print_step "Cleaning up any legacy CoreDNS resources (if present)..."
 # Remove CoreDNS container
 $CONTAINER_RT rm -f $($CONTAINER_RT ps -a --filter "name=coredns" --format "{{.ID}}") 2>/dev/null && echo "  Deleted CoreDNS container" || echo "  No CoreDNS container to delete"
 # Remove CoreDNS pod from the api-server. kubectl works across every
 # storage backend (etcd / sqlite / redis) — the previous variant did
-# `docker exec rusternetes-etcd etcdctl del ...`, which silently no-ops
+# `docker exec k3rs-etcd etcdctl del ...`, which silently no-ops
 # on the all-in-one stack (no etcd container) and lets a stale pod with
 # a bound nodeName survive into the next apply, where it then 422s with
 # "spec.nodeName: Forbidden: field is immutable".
-# --ignore-not-found is the upstream-kubectl flag, but the rusternetes
+# --ignore-not-found is the upstream-kubectl flag, but the k3rs
 # kubectl built in this workspace rejects it (`unexpected argument`).
 # Rely on the `|| echo "No CoreDNS pod..."` fallback to swallow the
 # not-found case instead.
@@ -484,21 +484,21 @@ $KUBECTL $KUBECTL_FLAGS delete pod coredns -n kube-system --grace-period=0 --for
 
 # Step 4: Apply bootstrap cluster resources
 # bootstrap-cluster.yaml carries namespaces, the kubernetes + kube-dns
-# Services, and PriorityClasses. The rusternetes-dns backend behind the
+# Services, and PriorityClasses. The k3rs-dns backend behind the
 # kube-dns Service is applied separately in Step 5 (bootstrap-dns.yaml).
 #
-# The gateway is injected so rusternetes-dns can reach the api-server, and to
+# The gateway is injected so k3rs-dns can reach the api-server, and to
 # fail fast early if discovery broke (#787).
 print_step "Applying bootstrap resources (namespaces, services, priority classes)..."
 if [ -f "$PROJECT_ROOT/bootstrap-cluster.yaml" ]; then
-    # Fail fast if discovery didn't give us a gateway — rusternetes-dns won't
+    # Fail fast if discovery didn't give us a gateway — k3rs-dns won't
     # be able to reach the API server without it after #787.
-    if [ -z "${RUSTERNETES_BRIDGE_GATEWAY:-}" ]; then
-        print_error "Bridge gateway discovery failed. Set RUSTERNETES_BRIDGE_GATEWAY or fix discover-bridge-gateway.sh"
+    if [ -z "${K3RS_BRIDGE_GATEWAY:-}" ]; then
+        print_error "Bridge gateway discovery failed. Set K3RS_BRIDGE_GATEWAY or fix discover-bridge-gateway.sh"
         exit 1
     fi
     $KUBECTL $KUBECTL_FLAGS apply -f "$PROJECT_ROOT/bootstrap-cluster.yaml"
-    print_success "Bootstrap resources created (gateway: $RUSTERNETES_BRIDGE_GATEWAY)"
+    print_success "Bootstrap resources created (gateway: $K3RS_BRIDGE_GATEWAY)"
 else
     print_error "bootstrap-cluster.yaml not found"
     exit 1
@@ -510,31 +510,31 @@ fi
 #
 # Only applies to the all-in-one stack — the multi-container stack
 # (compose.yml) doesn't substitute DOCKER_GATEWAY anywhere and the
-# `rusternetes` container doesn't exist there, so attempting the restart
+# `k3rs` container doesn't exist there, so attempting the restart
 # would either no-op or, worse, race with a fresh `up -d` and bind-clash
-# on the 6443 host port. Gate the restart on the all-in-one `rusternetes`
+# on the 6443 host port. Gate the restart on the all-in-one `k3rs`
 # container actually being up.
 if grep -q '\${DOCKER_GATEWAY}' "$PROJECT_ROOT/compose.all-in-one.yml" 2>/dev/null \
-    && "$CONTAINER_RT" ps --filter "name=^rusternetes$" --format '{{.Names}}' 2>/dev/null \
-        | grep -qx 'rusternetes'; then
+    && "$CONTAINER_RT" ps --filter "name=^k3rs$" --format '{{.Names}}' 2>/dev/null \
+        | grep -qx 'k3rs'; then
     print_step "Restarting cluster with discovered gateway..."
-    echo "DOCKER_GATEWAY=${RUSTERNETES_BRIDGE_GATEWAY}" > "$PROJECT_ROOT/.env"
+    echo "DOCKER_GATEWAY=${K3RS_BRIDGE_GATEWAY}" > "$PROJECT_ROOT/.env"
     echo "KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}" >> "$PROJECT_ROOT/.env"
     "$CONTAINER_RT" compose -f "$PROJECT_ROOT/compose.all-in-one.yml" up -d
-    print_success "Cluster restarted with gateway $RUSTERNETES_BRIDGE_GATEWAY"
+    print_success "Cluster restarted with gateway $K3RS_BRIDGE_GATEWAY"
     echo "  .env file written: $PROJECT_ROOT/.env"
 fi
 
-# Step 5: Wire the kube-dns Service to the rusternetes-dns backend.
+# Step 5: Wire the kube-dns Service to the k3rs-dns backend.
 #
-# rusternetes-dns is the only cluster-DNS backend (CoreDNS has been removed).
+# k3rs-dns is the only cluster-DNS backend (CoreDNS has been removed).
 # The backend depends on the stack:
-#   - All-in-one stack (`rusternetes` container on the bridge): the DNS
+#   - All-in-one stack (`k3rs` container on the bridge): the DNS
 #     server is an in-process task inside that container, so the script
 #     creates a hand-written EndpointSlice pointing `kube-dns` at the
 #     container's bridge IP (kube-proxy then DNATs 10.96.0.10:53 to it).
 #   - Multi-container stacks: the script applies bootstrap-dns.yaml, which
-#     runs rusternetes-dns as a kube-system Deployment (k8s-app=kube-dns).
+#     runs k3rs-dns as a kube-system Deployment (k8s-app=kube-dns).
 #     The endpoints controller populates the kube-dns Service from the pod
 #     via the Service selector — no manual EndpointSlice.
 # Either way bootstrap-cluster.yaml only creates the kube-dns Service,
@@ -551,20 +551,20 @@ if [ "${SKIP_DNS_WIRING:-0}" = "1" ]; then
     print_step "Skipping DNS backend wiring (SKIP_DNS_WIRING=1)."
     echo "  This stack has no in-cluster DNS backend; node-scoped tests don't need cluster DNS."
 else
-    # rusternetes-dns is the only cluster-DNS backend (CoreDNS fully removed).
+    # k3rs-dns is the only cluster-DNS backend (CoreDNS fully removed).
     # The kube-dns Service stays (created in Step 4) so the ClusterIP is stable.
 
-    # All-in-one stack detection: the `rusternetes` container runs the DNS
+    # All-in-one stack detection: the `k3rs` container runs the DNS
     # server as an in-process task binding 0.0.0.0:53 — there is no dns pod
     # image on that stack, so kube-dns is wired manually to the container IP.
-    # The compose files pin the network name to `rusternetes-network`.
-    DNS_NETWORK="rusternetes-network"
+    # The compose files pin the network name to `k3rs-network`.
+    DNS_NETWORK="k3rs-network"
     # The all-in-one container joins the bundled containerd container's network
     # namespace (network_mode: service:containerd), so it has no network
     # settings of its own: its address is the containerd container's.
     AIO_DNS_IP=""
-    if $CONTAINER_RT inspect rusternetes >/dev/null 2>&1; then
-        for aio_net_container in rusternetes rusternetes-containerd; do
+    if $CONTAINER_RT inspect k3rs >/dev/null 2>&1; then
+        for aio_net_container in k3rs k3rs-containerd; do
             AIO_DNS_IP=$($CONTAINER_RT inspect "$aio_net_container" \
                 --format "{{(index .NetworkSettings.Networks \"$DNS_NETWORK\").IPAddress}}" \
                 2>/dev/null || true)
@@ -576,8 +576,8 @@ else
     fi
 
     if [ -n "$AIO_DNS_IP" ] && [ "$AIO_DNS_IP" != "<no value>" ]; then
-        print_step "Wiring kube-dns Service to the all-in-one rusternetes container..."
-        echo "  Found rusternetes at $AIO_DNS_IP"
+        print_step "Wiring kube-dns Service to the all-in-one k3rs container..."
+        echo "  Found k3rs at $AIO_DNS_IP"
 
         # Wire up the EndpointSlice that backs the kube-dns Service.
         # Without this kube-proxy has nothing to DNAT 10.96.0.10:53 to.
@@ -590,7 +590,7 @@ else
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
 metadata:
-  name: kube-dns-rusternetes
+  name: kube-dns-k3rs
   namespace: kube-system
   labels:
     kubernetes.io/service-name: kube-dns
@@ -611,13 +611,13 @@ endpoints:
       serving: true
       terminating: false
 EOF
-        print_success "rusternetes wired up at $AIO_DNS_IP for kube-dns Service"
+        print_success "k3rs wired up at $AIO_DNS_IP for kube-dns Service"
     else
-        # Multi-container stack: rusternetes-dns runs as a kube-system
+        # Multi-container stack: k3rs-dns runs as a kube-system
         # Deployment reading cluster state from the api-server. The
         # endpoints controller wires the kube-dns Service to the pod via
         # the k8s-app=kube-dns selector.
-        print_step "Applying rusternetes-dns Deployment (bootstrap-dns.yaml)..."
+        print_step "Applying k3rs-dns Deployment (bootstrap-dns.yaml)..."
         if [ ! -f "$PROJECT_ROOT/bootstrap-dns.yaml" ]; then
             print_error "bootstrap-dns.yaml not found"
             exit 1
@@ -626,35 +626,35 @@ EOF
         # A previous bootstrap may have wired kube-dns manually to a (now
         # stale) compose-container IP — drop that slice; the endpoints
         # controller owns the Service's endpoints from here on.
-        $KUBECTL $KUBECTL_FLAGS delete endpointslice kube-dns-rusternetes -n kube-system 2>/dev/null \
-            && echo "  Deleted stale kube-dns-rusternetes EndpointSlice" || true
+        $KUBECTL $KUBECTL_FLAGS delete endpointslice kube-dns-k3rs -n kube-system 2>/dev/null \
+            && echo "  Deleted stale kube-dns-k3rs EndpointSlice" || true
 
         # The dns pod runs inside containerd too (same store problem as the
         # static pods). Resolve its image: GHCR ref on the prebuilt path (swap
-        # the committed rusternetes-dns:latest literal), local :latest imported
+        # the committed k3rs-dns:latest literal), local :latest imported
         # into containerd otherwise.
         dns_image="$(resolve_cluster_image dns)"
-        echo "  rusternetes-dns image: $dns_image"
+        echo "  k3rs-dns image: $dns_image"
         import_image_into_containerd "$dns_image"
-        sed "s|image: rusternetes-dns:latest|image: ${dns_image}|" \
+        sed "s|image: k3rs-dns:latest|image: ${dns_image}|" \
             "$PROJECT_ROOT/bootstrap-dns.yaml" | $KUBECTL $KUBECTL_FLAGS apply -f -
 
-        print_step "Waiting for the rusternetes-dns Deployment to be ready..."
+        print_step "Waiting for the k3rs-dns Deployment to be ready..."
         MAX_WAIT=60
         for i in $(seq 1 $MAX_WAIT); do
-            DNS_READY=$($KUBECTL $KUBECTL_FLAGS get deployment rusternetes-dns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+            DNS_READY=$($KUBECTL $KUBECTL_FLAGS get deployment k3rs-dns -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
 
             if [ "$DNS_READY" == "1" ]; then
-                print_success "rusternetes-dns Deployment is ready!"
+                print_success "k3rs-dns Deployment is ready!"
                 break
             fi
 
             if [ $i -eq $MAX_WAIT ]; then
-                print_warning "rusternetes-dns not ready after ${MAX_WAIT} attempts (readyReplicas: ${DNS_READY:-none})"
+                print_warning "k3rs-dns not ready after ${MAX_WAIT} attempts (readyReplicas: ${DNS_READY:-none})"
                 print_warning "Check: $KUBECTL $KUBECTL_FLAGS get pods -n kube-system"
-                print_warning "Is the rusternetes-dns:latest image built? Try: docker compose --profile build build dns"
+                print_warning "Is the k3rs-dns:latest image built? Try: docker compose --profile build build dns"
             else
-                echo "  Waiting for rusternetes-dns... ($i/$MAX_WAIT)"
+                echo "  Waiting for k3rs-dns... ($i/$MAX_WAIT)"
                 sleep 2
             fi
         done

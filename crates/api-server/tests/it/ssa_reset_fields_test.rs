@@ -11,7 +11,7 @@
 //! main resource) and `:129-139` (`spec` on `/status`).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SC: &str = "/apis/networking.k8s.io/v1/servicecidrs";

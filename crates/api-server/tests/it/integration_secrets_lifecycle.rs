@@ -41,7 +41,7 @@
 //! `tests/conformance_apimachinery_admission_webhooks.rs` and
 //! `tests/patch_cas_retry_test.rs`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ use serde_json::{json, Value};
 /// `TestApiServer` factory (kept tuple-shaped: tests destructure
 /// `let (_mem, router) = spawn_router();`, where `_mem` is the backing store).
 fn spawn_router() -> (
-    std::sync::Arc<rusternetes_storage::memory::MemoryStorage>,
+    std::sync::Arc<k3rs_storage::memory::MemoryStorage>,
     TestApiServer,
 ) {
     let api = TestApiServer::new();

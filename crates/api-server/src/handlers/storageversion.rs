@@ -9,7 +9,7 @@
 //! is enabled (`pkg/registry/apiserverinternal/rest/storage.go`
 //! `v1alpha1Storage`), a group-version that is in
 //! `alphaAPIGroupVersionsDisabledByDefault`
-//! (`pkg/controlplane/instance.go:487-497`). Rusternetes has no
+//! (`pkg/controlplane/instance.go:487-497`). k3rs has no
 //! `--runtime-config`, so the `StorageVersionAPI` gate (alpha, off in v1.35,
 //! `pkg/features/kube_features.go:2084`) stands in for it, as
 //! `DRADeviceTaintRules` does for `resource.k8s.io/v1alpha3`; with it off every
@@ -25,14 +25,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     feature_gates::{enabled, Feature},
     resources::storageversion::StorageVersion,
     Error, List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 

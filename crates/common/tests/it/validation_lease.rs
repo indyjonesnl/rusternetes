@@ -1,8 +1,8 @@
 //! Tests for Lease validation (port of upstream coordination ValidateLeaseSpec).
 
-use rusternetes_common::resources::coordination::{Lease, LeaseSpec};
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::lease::validate_lease;
+use k3rs_common::resources::coordination::{Lease, LeaseSpec};
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::lease::validate_lease;
 
 fn spec() -> LeaseSpec {
     LeaseSpec {
@@ -26,7 +26,7 @@ fn lease(spec: Option<LeaseSpec>) -> Lease {
     l
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field))
 }
 

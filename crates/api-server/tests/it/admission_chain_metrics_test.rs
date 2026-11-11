@@ -6,15 +6,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rusternetes_api_server::endpoints::handlers::admission::Admission;
-use rusternetes_api_server::registry::rest::RequestContext;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-use rusternetes_common::auth::{TokenManager, UserInfo};
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::resources::ConfigMap;
-use rusternetes_storage::{MemoryStorage, Storage, StorageBackend};
+use k3rs_api_server::endpoints::handlers::admission::Admission;
+use k3rs_api_server::registry::rest::RequestContext;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+use k3rs_common::auth::{TokenManager, UserInfo};
+use k3rs_common::authz::AlwaysAllowAuthorizer;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::resources::ConfigMap;
+use k3rs_storage::{MemoryStorage, Storage, StorageBackend};
 use serde_json::json;
 
 fn state() -> ApiServerState {
@@ -373,9 +373,8 @@ async fn rejecting_plugin_is_observed_as_rejected() {
         resource: "pods".into(),
     };
     let admission = cm_admission(&state, &kind, &resource, &user);
-    rusternetes_test_support::harness::seed_default_service_account(&*state.storage, "default")
-        .await;
-    let pod: rusternetes_common::resources::Pod = serde_json::from_value(json!({
+    k3rs_test_support::harness::seed_default_service_account(&*state.storage, "default").await;
+    let pod: k3rs_common::resources::Pod = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": "p", "namespace": "default"},
         "spec": {"priorityClassName": "does-not-exist",
@@ -408,21 +407,17 @@ fn pod_chain_fits_a_small_stack() {
                 .unwrap()
                 .block_on(async {
                     let state = state();
-                    let ns: rusternetes_common::resources::Namespace =
-                        serde_json::from_value(json!({
-                            "apiVersion": "v1", "kind": "Namespace",
-                            "metadata": {"name": "default"},
-                        }))
-                        .unwrap();
+                    let ns: k3rs_common::resources::Namespace = serde_json::from_value(json!({
+                        "apiVersion": "v1", "kind": "Namespace",
+                        "metadata": {"name": "default"},
+                    }))
+                    .unwrap();
                     state
                         .storage
-                        .create(
-                            &rusternetes_storage::build_key("namespaces", None, "default"),
-                            &ns,
-                        )
+                        .create(&k3rs_storage::build_key("namespaces", None, "default"), &ns)
                         .await
                         .unwrap();
-                    rusternetes_test_support::harness::seed_default_service_account(
+                    k3rs_test_support::harness::seed_default_service_account(
                         &*state.storage,
                         "default",
                     )
@@ -453,7 +448,7 @@ fn pod_chain_fits_a_small_stack() {
                         dry_run: false,
                         forbid_create: false,
                     };
-                    let pod: rusternetes_common::resources::Pod = serde_json::from_value(json!({
+                    let pod: k3rs_common::resources::Pod = serde_json::from_value(json!({
                         "apiVersion": "v1", "kind": "Pod",
                         "metadata": {"name": "p", "namespace": "default"},
                         "spec": {"containers": [{"name": "c", "image": "busybox"}]},

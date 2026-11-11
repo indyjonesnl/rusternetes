@@ -16,7 +16,7 @@
 //! and `ObjectMeta.uid`'s `#[serde(default = "generate_uid")]` named a function
 //! whose whole body was `String::new()`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 const SAR: &str = "/apis/authorization.k8s.io/v1/subjectaccessreviews";

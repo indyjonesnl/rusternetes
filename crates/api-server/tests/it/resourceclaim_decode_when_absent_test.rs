@@ -15,7 +15,7 @@
 //! runs `validateSelectorSlice` (`:298`) and `validateDeviceToleration`
 //! (`:1411`) over each request.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// A claim whose single request is `request`.
@@ -134,8 +134,8 @@ async fn every_bad_resource_claim_answers_422_with_a_field_path() {
     // Tolerations are behind the alpha `DRADeviceTaints` gate, off by default
     // in 1.35: `dropDisabledFields` (resourceclaimspec/util.go) clears them
     // before validation. One case validates them, so turn the gate on.
-    let _taints = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::DRADeviceTaints,
+    let _taints = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::DRADeviceTaints,
         true,
     );
     let api = TestApiServer::new();
@@ -227,7 +227,7 @@ async fn a_well_formed_resource_claim_is_written() {
 /// decodes to an empty list rather than failing.
 #[tokio::test]
 async fn a_dra_list_without_items_decodes() {
-    use rusternetes_common::resources::dra::{
+    use k3rs_common::resources::dra::{
         DeviceClassList, ResourceClaimList, ResourceClaimTemplateList, ResourceSliceList,
     };
 

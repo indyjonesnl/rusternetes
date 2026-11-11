@@ -11,10 +11,10 @@
 //! - `tainttoleration/taint_toleration.go` `Score`/`NormalizeScore`
 //! - `imagelocality/image_locality.go`
 
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::scheduler::Scheduler;
-use rusternetes_scheduler::scheduler_config::profiles_from_config;
-use rusternetes_storage::{memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::scheduler::Scheduler;
+use k3rs_scheduler::scheduler_config::profiles_from_config;
+use k3rs_storage::{memory::MemoryStorage, Storage};
 use serde_json::json;
 use std::sync::Arc;
 

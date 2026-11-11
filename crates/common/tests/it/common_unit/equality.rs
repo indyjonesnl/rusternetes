@@ -6,7 +6,7 @@ mod __parent {
 }
 
 mod tests {
-    use rusternetes_common::equality::semantic_equal;
+    use k3rs_common::equality::semantic_equal;
     use std::collections::HashMap;
 
     #[test]

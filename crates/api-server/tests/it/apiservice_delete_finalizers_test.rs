@@ -17,7 +17,7 @@
 //! `delete_propagation_guard_test.rs` (#1911).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const COLLECTION: &str = "/apis/apiregistration.k8s.io/v1/apiservices";

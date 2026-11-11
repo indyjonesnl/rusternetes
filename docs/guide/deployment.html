@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Deployment Overview - Rūsternetes</title>
+  <title>Deployment Overview - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Deployment Overview</h1>
       <p class="lead">
-        Rūsternetes supports four deployment modes: a full compose cluster with etcd,
+        k3rs supports four deployment modes: a full compose cluster with etcd,
         lighter compose clusters with SQLite or Redis (via Rhino), and a single all-in-one binary
         that embeds every component in one process. Choose the mode that matches your needs.
       </p>
@@ -218,7 +218,7 @@
 <span class="comment"># Compose: Full Cluster with etcd</span>
 
   +-----------------------------------------------------+
-  |                rusternetes-net (bridge)              |
+  |                k3rs-net (bridge)              |
   |                                                     |
   |  +-----------+   +-----------+   +---------------+  |
   |  |   etcd    |   |api-server |   | controller-   |  |
@@ -258,7 +258,7 @@
 <span class="comment"># Compose: SQLite Cluster with Rhino</span>
 
   +-----------------------------------------------------+
-  |                rusternetes-net (bridge)              |
+  |                k3rs-net (bridge)              |
   |                                                     |
   |  +-----------+   +-----------+   +---------------+  |
   |  |  rhino    |   |api-server |   | controller-   |  |
@@ -297,7 +297,7 @@
 <span class="comment"># Compose: Redis Cluster with Rhino</span>
 
   +-----------------------------------------------------+
-  |                rusternetes-net (bridge)              |
+  |                k3rs-net (bridge)              |
   |                                                     |
   |  +-----------+   +-----------+   +---------------+  |
   |  |  redis    |   |  rhino    |   | controller-   |  |
@@ -339,7 +339,7 @@
 <span class="comment"># Single Process: All-in-One Binary</span>
 
   +---------------------------------------------------+
-  |              rusternetes (single binary)           |
+  |              k3rs (single binary)           |
   |                                                   |
   |  +-------------+  +-----------+  +--------------+ |
   |  | api-server  |  | scheduler |  | controller-  | |
@@ -466,7 +466,7 @@
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

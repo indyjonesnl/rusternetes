@@ -7,8 +7,8 @@ pub mod storage;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use k3rs_common::{Error, Result};
 use rand::Rng;
-use rusternetes_common::{Error, Result};
 
 /// `allocator.Interface` (interfaces.go:19-31): allocation of items out of a
 /// range. Async because the storage-backed allocator persists every change.

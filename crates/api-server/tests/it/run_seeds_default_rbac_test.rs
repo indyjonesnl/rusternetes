@@ -4,8 +4,8 @@
 //! `PostStartHook`). Otherwise an authz-enabled all-in-one cluster starts
 //! with an empty policy and nobody (not even `system:masters`) is allowed.
 
-use rusternetes_api_server::{run, ApiServerConfig};
-use rusternetes_storage::{memory::MemoryStorage, Storage, StorageBackend};
+use k3rs_api_server::{run, ApiServerConfig};
+use k3rs_storage::{memory::MemoryStorage, Storage, StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
 

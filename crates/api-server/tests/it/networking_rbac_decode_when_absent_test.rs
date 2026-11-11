@@ -7,7 +7,7 @@
 //! answer must be a 422 `Status` with a field path — not serde's 400
 //! BadRequest, which carries neither.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn assert_not_a_decode_failure(status: axum::http::StatusCode, body: &Value, whose: &str) {

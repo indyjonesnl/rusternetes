@@ -27,13 +27,13 @@
 
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_common::feature_gates::{enabled, Feature};
-use rusternetes_common::resources::storageversion::{
+use k3rs_common::feature_gates::{enabled, Feature};
+use k3rs_common::resources::storageversion::{
     set_common_encoding_version, ServerStorageVersion, StorageVersion,
 };
-use rusternetes_common::resources::Lease;
-use rusternetes_common::Error;
-use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
+use k3rs_common::resources::Lease;
+use k3rs_common::Error;
+use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};

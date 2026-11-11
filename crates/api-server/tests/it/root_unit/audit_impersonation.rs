@@ -4,10 +4,10 @@
 //! Metadata level up.
 
 use axum::{body::Body, routing::get, Router};
-use rusternetes_api_server::audit::{with_audit, AuditConfig, Policy};
-use rusternetes_common::audit::{AuditBackend, AuditEvent, AuditStage};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_middleware::{AuthContext, AuthImpersonator};
+use k3rs_api_server::audit::{with_audit, AuditConfig, Policy};
+use k3rs_common::audit::{AuditBackend, AuditEvent, AuditStage};
+use k3rs_common::auth::UserInfo;
+use k3rs_middleware::{AuthContext, AuthImpersonator};
 use std::sync::Arc;
 use tower::ServiceExt;
 

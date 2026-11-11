@@ -136,8 +136,8 @@ impl UpstreamCompatArgs {
     /// is not yet gated by it (see the tracking issue), so the flag is
     /// validated but does not enable or disable groups.
     pub fn apply_runtime_config(&self) -> Result<()> {
-        use rusternetes_common::resource_encoding::Scheme;
-        use rusternetes_discovery::resource_config as rc;
+        use k3rs_common::resource_encoding::Scheme;
+        use k3rs_discovery::resource_config as rc;
         if self.runtime_config.is_empty() {
             return Ok(());
         }
@@ -165,8 +165,8 @@ impl UpstreamCompatArgs {
         );
         let merged = rc::merge_api_resource_configs(default, &overrides, &registry)
             .map_err(|e| anyhow::anyhow!(e))?;
-        rusternetes_discovery::set_runtime_config(Some(merged));
-        rusternetes_discovery::check_runtime_config_against_emulation_version()
+        k3rs_discovery::set_runtime_config(Some(merged));
+        k3rs_discovery::check_runtime_config_against_emulation_version()
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
@@ -333,7 +333,7 @@ mod tests {
         assert!(err("api/all=false").contains("invalid key with only api/all=false"));
         assert!(err("apps/v1=maybe").contains("invalid value of apps/v1"));
         assert!(err("apps/v9=true").contains("has not been registered"));
-        rusternetes_discovery::set_runtime_config(None);
+        k3rs_discovery::set_runtime_config(None);
     }
 
     #[test]

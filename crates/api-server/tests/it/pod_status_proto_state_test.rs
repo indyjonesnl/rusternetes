@@ -2,7 +2,7 @@
 //! kubelet (client-go, protobuf) GETs the pod and diffs its status against
 //! the new one; a `state` lost on the wire makes the diff omit `waiting:null`.
 
-use rusternetes_api_server::protobuf::PROTO_REGISTRY;
+use k3rs_api_server::protobuf::PROTO_REGISTRY;
 use serde_json::{json, Value};
 
 fn roundtrip(pod: &Value) -> Value {
@@ -55,8 +55,8 @@ fn waiting_state_without_message_survives_protobuf() {
 // ---------------------------------------------------------------------------
 
 use axum::http::StatusCode;
-use rusternetes_common::protobuf::{Unknown, PROTOBUF_MAGIC};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::protobuf::{Unknown, PROTOBUF_MAGIC};
+use k3rs_test_support::harness::TestApiServer;
 
 const POD: &str = "/api/v1/namespaces/default/pods/p";
 

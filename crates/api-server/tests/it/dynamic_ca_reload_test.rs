@@ -11,17 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use k3rs_api_server::request_header_authentication::RequestHeaderTrust;
+use k3rs_api_server::router::build_router;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::auth::TokenManager;
+use k3rs_common::authz::AlwaysAllowAuthorizer;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::tls::TlsConfig;
+use k3rs_middleware::request_header::RequestHeaderConfig;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::StorageBackend;
 use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rusternetes_api_server::request_header_authentication::RequestHeaderTrust;
-use rusternetes_api_server::router::build_router;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::tls::TlsConfig;
-use rusternetes_middleware::request_header::RequestHeaderConfig;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::StorageBackend;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{json, Value};
 
@@ -94,8 +94,8 @@ struct Harness {
 
 async fn start(client_ca: &TestCa, proxy_ca: &TestCa) -> Harness {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let server_ca = TestCa::new("rusternetes-server-ca");
-    let server = server_ca.issue("rusternetes-apiserver", vec!["127.0.0.1".into()], false);
+    let server_ca = TestCa::new("k3rs-server-ca");
+    let server = server_ca.issue("k3rs-apiserver", vec!["127.0.0.1".into()], false);
     let client_ca_path = tmp_pem(client_ca);
     let proxy_ca_path = tmp_pem(proxy_ca);
 
@@ -124,7 +124,7 @@ async fn start(client_ca: &TestCa, proxy_ca: &TestCa) -> Harness {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let (acceptor, reload) = rusternetes_api_server::request_header_authentication::mtls_acceptor(
+    let (acceptor, reload) = k3rs_api_server::request_header_authentication::mtls_acceptor(
         tls_config,
         Some(client_ca_path.to_str().unwrap()),
         Some(&trust),

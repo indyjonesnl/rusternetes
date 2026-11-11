@@ -4,23 +4,21 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::node::Taint;
-    pub use rusternetes_common::resources::pod::Toleration;
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::node::Taint;
+    pub use k3rs_common::resources::pod::Toleration;
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::resources::workloads::DEPRECATED_TEMPLATE_GENERATION;
+    pub use k3rs_common::resources::{
         ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
     };
-    pub use rusternetes_common::types::{
-        label_selector_as_selector, OwnerReference, Phase, Selector,
-    };
-    pub use rusternetes_controller_manager::controllers::expectations::ControllerExpectations;
-    pub use rusternetes_controller_manager::controllers::pod_informer::{
+    pub use k3rs_common::types::{label_selector_as_selector, OwnerReference, Phase, Selector};
+    pub use k3rs_controller_manager::controllers::expectations::ControllerExpectations;
+    pub use k3rs_controller_manager::controllers::pod_informer::{
         ControllerRef, PodEventTarget, ResolvedController, SharedPodInformer,
     };
-    pub use rusternetes_controller_manager::controllers::replicationcontroller::slow_start_batches_capped;
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::replicationcontroller::slow_start_batches_capped;
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -30,9 +28,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::PodSpec;
-    use rusternetes_controller_manager::controllers::daemonset::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::PodSpec;
+    use k3rs_controller_manager::controllers::daemonset::*;
+    use k3rs_storage::memory::MemoryStorage;
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -45,11 +43,11 @@ mod tests {
         node_labels.insert("region".to_string(), "us-west".to_string());
 
         let node = Node {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Node".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "node-1".to_string(),
                 namespace: None,
                 labels: Some(node_labels),
@@ -65,7 +63,7 @@ mod tests {
                 generation: None,
                 managed_fields: None,
             },
-            spec: Some(rusternetes_common::resources::NodeSpec {
+            spec: Some(k3rs_common::resources::NodeSpec {
                 pod_cidr: None,
                 pod_cidrs: None,
                 provider_id: None,
@@ -77,11 +75,11 @@ mod tests {
 
         // Test: no selector = all nodes match
         let ds_no_selector = DaemonSet {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "DaemonSet".to_string(),
                 api_version: "apps/v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta {
+            metadata: k3rs_common::types::ObjectMeta {
                 name: "test-ds".to_string(),
                 namespace: Some("default".to_string()),
                 labels: None,
@@ -97,13 +95,13 @@ mod tests {
                 generation: None,
                 managed_fields: None,
             },
-            spec: rusternetes_common::resources::DaemonSetSpec {
-                selector: rusternetes_common::types::LabelSelector {
+            spec: k3rs_common::resources::DaemonSetSpec {
+                selector: k3rs_common::types::LabelSelector {
                     match_labels: None,
                     match_expressions: None,
                 },
-                template: rusternetes_common::resources::PodTemplateSpec {
-                    metadata: Some(rusternetes_common::types::ObjectMeta {
+                template: k3rs_common::resources::PodTemplateSpec {
+                    metadata: Some(k3rs_common::types::ObjectMeta {
                         name: "".to_string(),
                         namespace: None,
                         labels: None,
@@ -341,9 +339,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = DaemonSetController::new(storage.clone());
 
-        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        let mut sa = k3rs_common::resources::ServiceAccount::new("default", "default");
         sa.image_pull_secrets = Some(vec![
-            rusternetes_common::resources::service_account::LocalObjectReference {
+            k3rs_common::resources::service_account::LocalObjectReference {
                 name: "regcred".to_string(),
             },
         ]);
@@ -384,24 +382,24 @@ mod tests {
         match_labels.insert("app".to_string(), name.to_string());
 
         DaemonSet {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "DaemonSet".to_string(),
                 api_version: "apps/v1".to_string(),
             },
             metadata: {
-                let mut m = rusternetes_common::types::ObjectMeta::new(name.to_string())
+                let mut m = k3rs_common::types::ObjectMeta::new(name.to_string())
                     .with_namespace(namespace.to_string());
                 m.ensure_uid();
                 m.generation = Some(1);
                 m
             },
-            spec: rusternetes_common::resources::DaemonSetSpec {
-                selector: rusternetes_common::types::LabelSelector {
+            spec: k3rs_common::resources::DaemonSetSpec {
+                selector: k3rs_common::types::LabelSelector {
                     match_labels: Some(match_labels.clone()),
                     match_expressions: None,
                 },
-                template: rusternetes_common::resources::PodTemplateSpec {
-                    metadata: Some(rusternetes_common::types::ObjectMeta {
+                template: k3rs_common::resources::PodTemplateSpec {
+                    metadata: Some(k3rs_common::types::ObjectMeta {
                         name: "".to_string(),
                         namespace: None,
                         labels: Some(match_labels),
@@ -419,7 +417,7 @@ mod tests {
                     }),
                     spec: PodSpec {
                         init_containers: None,
-                        containers: vec![rusternetes_common::resources::pod::Container {
+                        containers: vec![k3rs_common::resources::pod::Container {
                             name: "test".to_string(),
                             image: "busybox:latest".to_string(),
                             command: None,
@@ -498,16 +496,16 @@ mod tests {
     /// Helper to create a minimal Node for testing
     fn make_test_node(name: &str) -> Node {
         Node {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Node".to_string(),
                 api_version: "v1".to_string(),
             },
             metadata: {
-                let mut m = rusternetes_common::types::ObjectMeta::new(name.to_string());
+                let mut m = k3rs_common::types::ObjectMeta::new(name.to_string());
                 m.ensure_uid();
                 m
             },
-            spec: Some(rusternetes_common::resources::NodeSpec {
+            spec: Some(k3rs_common::resources::NodeSpec {
                 pod_cidr: None,
                 pod_cidrs: None,
                 provider_id: None,
@@ -791,7 +789,7 @@ mod tests {
     // --- Ports of pkg/controller/daemon/util/daemonset_util_test.go ---
 
     fn pod_with_labels(labels: &[(&str, &str)]) -> Pod {
-        let mut pod = Pod::new("p", rusternetes_common::resources::PodSpec::default());
+        let mut pod = Pod::new("p", k3rs_common::resources::PodSpec::default());
         pod.metadata.labels = Some(
             labels
                 .iter()
@@ -1059,7 +1057,7 @@ mod tests {
         let queue = WorkQueue::new();
         controller
             .deliver_pod_event(
-                &rusternetes_storage::WatchEvent::Modified(pod_key.clone(), json.clone()),
+                &k3rs_storage::WatchEvent::Modified(pod_key.clone(), json.clone()),
                 &queue,
             )
             .await;
@@ -1070,10 +1068,7 @@ mod tests {
         );
         // ...and the DELETED event of the same pod is not counted again.
         controller
-            .deliver_pod_event(
-                &rusternetes_storage::WatchEvent::Deleted(pod_key, json),
-                &queue,
-            )
+            .deliver_pod_event(&k3rs_storage::WatchEvent::Deleted(pod_key, json), &queue)
             .await;
         assert_eq!(
             controller.expectations.get_expectations("default/ge"),
@@ -1178,7 +1173,7 @@ mod tests {
         for pod in &pods {
             let key = format!("/registry/pods/default/{}", pod.metadata.name);
             let json = serde_json::to_string(pod).unwrap();
-            let ev = rusternetes_storage::WatchEvent::Added(key, json);
+            let ev = k3rs_storage::WatchEvent::Added(key, json);
             controller.deliver_pod_event(&ev, &queue).await;
             // a replayed event must not count twice
             controller.deliver_pod_event(&ev, &queue).await;
@@ -1189,7 +1184,7 @@ mod tests {
         );
     }
 
-    /// Rusternetes settle step: a created pod the fresh listing shows counts
+    /// k3rs settle step: a created pod the fresh listing shows counts
     /// as observed, so direct `reconcile` calls do not wedge on a missing
     /// event.
     #[tokio::test]
@@ -1263,12 +1258,11 @@ mod tests {
             .await
             .unwrap();
         let mut ds = make_test_daemonset("fc", "default");
-        ds.spec.update_strategy = Some(
-            rusternetes_common::resources::workloads::DaemonSetUpdateStrategy {
+        ds.spec.update_strategy =
+            Some(k3rs_common::resources::workloads::DaemonSetUpdateStrategy {
                 strategy_type: Some("OnDelete".to_string()),
                 rolling_update: None,
-            },
-        );
+            });
         storage
             .create("/registry/daemonsets/default/fc", &ds)
             .await
@@ -1298,7 +1292,7 @@ mod tests {
     // TestUpdatePodChangeControllerRef, TestUpdatePodControllerRefRemoved,
     // TestDeletePod, TestDeletePodOrphan.
 
-    use rusternetes_storage::WatchEvent;
+    use k3rs_storage::WatchEvent;
 
     /// Drive one pod event through the informer's classification and this
     /// controller's handlers (what `SharedPodInformer::on_event` does, for a
@@ -1310,7 +1304,7 @@ mod tests {
     impl DeliverPodEvent for DaemonSetController<MemoryStorage> {
         async fn deliver_pod_event(&self, event: &WatchEvent, queue: &WorkQueue) {
             if let Some(observation) = self.pod_informer.cache().on_event(event) {
-                rusternetes_controller_manager::controllers::pod_informer::apply_pod_observation(
+                k3rs_controller_manager::controllers::pod_informer::apply_pod_observation(
                     self,
                     queue,
                     &observation,

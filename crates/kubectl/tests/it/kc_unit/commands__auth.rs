@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_kubectl::types::AuthCommands;
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_kubectl::types::AuthCommands;
     pub use serde::{Deserialize, Serialize};
     pub use serde_json::{json, Value};
     pub use std::fs;
@@ -12,7 +12,7 @@ mod __parent {
 
 mod auth_reconcile_tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::auth::*;
+    use k3rs_kubectl::commands::auth::*;
 
     #[test]
     fn test_reconcile_merge_rules() {

@@ -1,10 +1,10 @@
 //! `RunBindPlugins` (`runtime/framework.go:1514-1550`, `TestBindPlugins`) and
 //! `DefaultBinder.Bind` (`plugins/defaultbinder/default_binder.go`).
 use async_trait::async_trait;
-use rusternetes_common::resources::Pod;
-use rusternetes_scheduler::framework_runtime::Framework;
-use rusternetes_scheduler::fwk::{BindPlugin, Code, CycleState, Handle, NoHandle, Plugin, Status};
-use rusternetes_scheduler::in_tree::DefaultBinder;
+use k3rs_common::resources::Pod;
+use k3rs_scheduler::framework_runtime::Framework;
+use k3rs_scheduler::fwk::{BindPlugin, Code, CycleState, Handle, NoHandle, Plugin, Status};
+use k3rs_scheduler::in_tree::DefaultBinder;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -135,7 +135,7 @@ async fn default_binder_binds_through_the_handle() {
 
 #[test]
 fn default_profile_has_the_default_binder() {
-    use rusternetes_scheduler::profile::Profile;
+    use k3rs_scheduler::profile::Profile;
     // Bound through the framework the scheduler builds: the DefaultBinder
     // object is the only Bind plugin, so a handle without cluster access
     // fails the bind rather than skipping it.

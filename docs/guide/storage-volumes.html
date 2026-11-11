@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Storage &amp; Volumes - Rūsternetes</title>
+  <title>Storage &amp; Volumes - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Storage &amp; Volumes</h1>
       <p class="lead">
-        Rūsternetes supports 12 volume types for mounting data into pod containers. This page covers
+        k3rs supports 12 volume types for mounting data into pod containers. This page covers
         every volume type, the PersistentVolume / PersistentVolumeClaim lifecycle, StorageClasses,
         dynamic provisioning, volume snapshots, and online expansion.
       </p>
@@ -681,8 +681,8 @@ parameters:
       <div class="admonition tip">
         <div class="admonition-title">DEFAULT STORAGECLASS</div>
         <p>
-          Rūsternetes bootstraps a default <code>standard</code> StorageClass on startup with the
-          <code>rusternetes.io/hostpath</code> provisioner. PVCs that don't specify a StorageClass
+          k3rs bootstraps a default <code>standard</code> StorageClass on startup with the
+          <code>k3rs.io/hostpath</code> provisioner. PVCs that don't specify a StorageClass
           use this default automatically. You can manage StorageClasses and PVCs through the
           <a href="console.html">web console</a> Storage page.
         </p>
@@ -773,8 +773,8 @@ EOF</code>
 
       <h3>Built-in Provisioner</h3>
       <p>
-        Without a CSI driver, Rūsternetes includes a built-in hostpath provisioner
-        (<code>rusternetes.io/hostpath</code>) that creates PVs backed by directories on the
+        Without a CSI driver, k3rs includes a built-in hostpath provisioner
+        (<code>k3rs.io/hostpath</code>) that creates PVs backed by directories on the
         node&rsquo;s filesystem. This is suitable for development and single-node clusters.
         For production, use a proper CSI driver that provides replicated storage.
       </p>
@@ -892,7 +892,7 @@ kubectl describe pvc <span class="value">my-pvc</span>
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

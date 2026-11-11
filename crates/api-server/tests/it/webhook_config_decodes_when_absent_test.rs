@@ -9,13 +9,13 @@
 //! (`pkg/apis/admissionregistration/validation/validation.go:250-330`) answer
 //! `field.Required` / `field.NotSupported` with a path the client can act on.
 //!
-//! Rusternetes declared them as bare non-`Option` fields, so serde rejected the
+//! k3rs declared them as bare non-`Option` fields, so serde rejected the
 //! body first and the client got a 400 BadRequest with no `Status` details
 //! (#1939, the `admission_webhook.rs` slice). Every check the fields need
 //! already exists in `crates/common/src/validation/webhookconfiguration.rs`;
 //! they just could not be reached.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn assert_not_a_decode_failure(status: axum::http::StatusCode, body: &Value, whose: &str) {

@@ -10,7 +10,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use k3rs_storage::{build_prefix, Storage};
 use std::sync::Arc;
 
 /// Encode a u64 as a protobuf varint
@@ -88,8 +88,8 @@ async fn local_root_paths(
     }
     paths.insert("api/v1".into(), path_entry("api/v1"));
     // MutatingAdmissionPolicy gate (storage_apiserver.go:187-205).
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::MutatingAdmissionPolicy,
+    if k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::MutatingAdmissionPolicy,
     ) {
         paths.insert(
             "apis/admissionregistration.k8s.io/v1beta1".into(),
@@ -98,9 +98,8 @@ async fn local_root_paths(
     }
     // resource.k8s.io/v1alpha3 (DeviceTaintRule) is installed only under the
     // DRADeviceTaintRules gate (pkg/registry/resource/rest/storage_resource.go).
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::DRADeviceTaintRules,
-    ) {
+    if k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::DRADeviceTaintRules)
+    {
         paths.insert(
             "apis/resource.k8s.io/v1alpha3".into(),
             path_entry("apis/resource.k8s.io/v1alpha3"),
@@ -769,7 +768,7 @@ fn upstream_group_docs() -> &'static serde_json::Map<String, serde_json::Value> 
 /// `scripts/sync-upstream-openapi.sh`).
 pub(crate) fn upstream_v2_definitions() -> &'static serde_json::Map<String, serde_json::Value> {
     // One embedded copy, shared with the VAP type checker.
-    rusternetes_discovery::vap_typechecking::upstream_v2_definitions()
+    k3rs_discovery::vap_typechecking::upstream_v2_definitions()
 }
 
 /// Whether the `/openapi/v3` document at `path` (`apis/<group>[/<version>]`)
@@ -780,8 +779,8 @@ pub(crate) fn upstream_v2_definitions() -> &'static serde_json::Map<String, serd
 /// documents go with it (the same gate `discovery` applies).
 fn openapi_path_served(path: &str) -> bool {
     if path == "apis/storagemigration.k8s.io" || path.starts_with("apis/storagemigration.k8s.io/") {
-        return rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::StorageVersionMigrator,
+        return k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::StorageVersionMigrator,
         );
     }
     true
@@ -1136,7 +1135,7 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
     //
     // Upstream kube-apiserver publishes one definition per built-in GVK via
     // kube-openapi's `pkg/builder`, sourced from `types_swagger_doc_generated.go`
-    // that's codegen'd from the Go struct comments. Rusternetes does not have
+    // that's codegen'd from the Go struct comments. k3rs does not have
     // codegen for this; we publish hand-written stubs so that:
     //   * kubectl explain / discovery sees the GVK + standard metadata layout
     //   * conformance assertions that check for `io.k8s.api.core.v1.Pod`
@@ -1175,7 +1174,7 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
     serde_json::json!({
         "swagger": "2.0",
         "info": {
-            "title": "Rusternetes Kubernetes API",
+            "title": "k3rs Kubernetes API",
             "version": "v1.35.0"
         },
         "paths": paths,
@@ -1187,7 +1186,7 @@ pub fn build_swagger_spec_for_crds(crds: &[serde_json::Value]) -> serde_json::Va
 /// `io.k8s.api.core.v1` (and a few sibling) GVKs.
 ///
 /// Upstream Go publishes per-GVK schemas generated from struct comments via
-/// `kube-openapi/pkg/builder` + `types_swagger_doc_generated.go`. Rusternetes
+/// `kube-openapi/pkg/builder` + `types_swagger_doc_generated.go`. k3rs
 /// doesn't have that codegen pipeline yet; we instead inline minimal stubs
 /// here so discovery clients can resolve the canonical definition keys.
 ///

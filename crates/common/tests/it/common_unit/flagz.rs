@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::statusz::{
+    pub use k3rs_common::statusz::{
         is_pretty_print, negotiate_media_type_options, not_acceptable, plain_error, Response,
     };
     pub use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::flagz::*;
+    use k3rs_common::flagz::*;
 
     // flagz_test.go:wantTmpl
     fn want_tmpl(component: &str) -> String {
@@ -182,8 +182,8 @@ mod axum_tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::flagz::*;
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::flagz::*;
     use serial_test::serial;
     use tower::ServiceExt;
 
@@ -230,7 +230,7 @@ mod axum_tests {
 mod clap_tests {
     use super::__parent::*;
     use clap::{Arg, ArgAction, Command};
-    use rusternetes_common::flagz::*;
+    use k3rs_common::flagz::*;
 
     #[test]
     fn reads_defaults_and_parsed_values() {

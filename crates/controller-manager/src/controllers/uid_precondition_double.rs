@@ -17,7 +17,7 @@
 //! any test that asserts a controller's update carries the stored identity.
 //! Every PUT body is recorded in [`UidPreconditionStorage::puts`].
 
-use rusternetes_storage::{memory::MemoryStorage, Storage, WatchStream};
+use k3rs_storage::{memory::MemoryStorage, Storage, WatchStream};
 use std::sync::Mutex;
 
 pub struct UidPreconditionStorage {
@@ -44,7 +44,7 @@ impl Default for UidPreconditionStorage {
 #[async_trait::async_trait]
 impl Storage for UidPreconditionStorage {
     /// `BeforeCreate`: the server assigns the UID and creationTimestamp.
-    async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
@@ -68,7 +68,7 @@ impl Storage for UidPreconditionStorage {
         self.inner.create(key, &filled).await
     }
 
-    async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+    async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
     where
         T: serde::de::DeserializeOwned + Send + Sync,
     {
@@ -77,7 +77,7 @@ impl Storage for UidPreconditionStorage {
 
     /// `Preconditions()` + `BeforeUpdate`: a non-empty UID must match the
     /// stored one; an empty UID and a missing creationTimestamp are restored.
-    async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
@@ -87,7 +87,7 @@ impl Storage for UidPreconditionStorage {
         let sent_uid = sent["metadata"]["uid"].as_str().unwrap_or("");
         let stored_uid = stored["metadata"]["uid"].as_str().unwrap_or("");
         if !sent_uid.is_empty() && sent_uid != stored_uid {
-            return Err(rusternetes_common::Error::Conflict(format!(
+            return Err(k3rs_common::Error::Conflict(format!(
                 "Precondition failed: UID in precondition: {sent_uid}, UID in object meta: {stored_uid}"
             )));
         }
@@ -105,26 +105,22 @@ impl Storage for UidPreconditionStorage {
         self.inner.update(key, &kept).await
     }
 
-    async fn update_raw(
-        &self,
-        key: &str,
-        value: &serde_json::Value,
-    ) -> rusternetes_common::Result<()> {
+    async fn update_raw(&self, key: &str, value: &serde_json::Value) -> k3rs_common::Result<()> {
         self.inner.update_raw(key, value).await
     }
 
-    async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
         self.inner.delete(key).await
     }
 
-    async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+    async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         self.inner.list(prefix).await
     }
 
-    async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+    async fn watch(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
         self.inner.watch(prefix).await
     }
 
@@ -132,15 +128,15 @@ impl Storage for UidPreconditionStorage {
         &self,
         prefix: &str,
         revision: i64,
-    ) -> rusternetes_common::Result<WatchStream> {
+    ) -> k3rs_common::Result<WatchStream> {
         self.inner.watch_from_revision(prefix, revision).await
     }
 
-    async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+    async fn current_revision(&self) -> k3rs_common::Result<i64> {
         self.inner.current_revision().await
     }
 
-    async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+    async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
         self.inner.is_revision_compacted(revision).await
     }
 }

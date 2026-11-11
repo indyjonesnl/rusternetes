@@ -2,21 +2,21 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::LimitRange;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::limitrange::validate_limit_range;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::resources::LimitRange;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::limitrange::validate_limit_range;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::limitrange::*;
+    use k3rs_api_server::registry::core::limitrange::*;
 
     fn limit_range() -> LimitRange {
         let mut lr: LimitRange = serde_json::from_value(serde_json::json!({

@@ -30,11 +30,11 @@
 //!
 //! The end-to-end test wraps `EnvVarSource` inside a `Container` with
 //! `env[0].valueFrom = {configMapKeyRef: {...}}` and round-trips it through
-//! the typed `rusternetes_common::resources::Container` deserializer —
+//! the typed `k3rs_common::resources::Container` deserializer —
 //! mirroring exactly what `handlers::pod::create` does after the
 //! protobuf→JSON middleware.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 
 // --- low-level wire helpers ---------------------------------------------
 
@@ -268,12 +268,12 @@ fn test_env_var_source_secret_key_ref_branch_only() {
 /// carries a `configMapKeyRef`. The bytes are exactly what client-go would
 /// send for `kubectl set env --from=configmap/foo` over the protobuf
 /// content type. The decoded JSON must round-trip through the typed
-/// `rusternetes_common::resources::Container` deserializer used by the pod
+/// `k3rs_common::resources::Container` deserializer used by the pod
 /// handler — anything less would surface as the same `missing field 'name'`
 /// canary failure documented in the EnvFromSource sibling test.
 #[test]
 fn test_container_env_value_from_configmap_round_trips_through_pod_decoder() {
-    use rusternetes_common::resources::Container;
+    use k3rs_common::resources::Container;
 
     let registry = ProtoRegistry::new();
 

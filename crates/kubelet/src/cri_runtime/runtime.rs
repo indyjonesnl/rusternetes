@@ -21,13 +21,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
-use rusternetes_common::resources::pod::{
+use k3rs_common::resources::pod::{
     Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
     ContainerStateWaiting, ContainerStatus, Pod, Probe,
 };
-use rusternetes_common::resources::{ConfigMap, Secret, Service};
-use rusternetes_cri::{v1, CriClient, CriError};
-use rusternetes_storage::{build_prefix, Storage};
+use k3rs_common::resources::{ConfigMap, Secret, Service};
+use k3rs_cri::{v1, CriClient, CriError};
+use k3rs_storage::{build_prefix, Storage};
 use tracing::{debug, warn};
 
 use super::{image_volume_metrics, probe, status, translate};
@@ -307,13 +307,13 @@ fn is_https_to_http_error(err: &reqwest::Error) -> bool {
 /// Returns `None` if the log is absent or produces no output after CRI-framing
 /// is stripped.
 pub fn read_log_tail(log_path: &str) -> Option<String> {
-    let opts = rusternetes_cri::stream::LogReadOptions {
+    let opts = k3rs_cri::stream::LogReadOptions {
         tail_lines: Some(status::MAX_TERMINATION_MESSAGE_LOG_LINES),
         limit_bytes: Some(status::MAX_TERMINATION_MESSAGE_LOG_LENGTH as i64),
         timestamps: false,
         since_unix: None,
     };
-    let bytes = rusternetes_cri::stream::read_log_file(std::path::Path::new(log_path), &opts)
+    let bytes = k3rs_cri::stream::read_log_file(std::path::Path::new(log_path), &opts)
         .ok()
         .filter(|b| !b.is_empty())?;
     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -389,8 +389,7 @@ pub struct CriContainerRuntime {
     /// docker config credentials for image pulls. `Arc` so clones share the cache.
     pub node_keyring: Arc<crate::credentialprovider::NodeKeyring>,
     /// Records Kubernetes lifecycle events. `None` disables event emission.
-    pub event_recorder:
-        Option<rusternetes_storage::EventRecorder<rusternetes_storage::StorageBackend>>,
+    pub event_recorder: Option<k3rs_storage::EventRecorder<k3rs_storage::StorageBackend>>,
     /// ClusterIP + port of the default `kubernetes` Service, injected into every
     /// container as KUBERNETES_SERVICE_HOST/PORT so in-cluster clients (kube-rs,
     /// client-go) can reach the api-server.
@@ -573,7 +572,7 @@ impl CriContainerRuntime {
                         pod,
                         None,
                         ev.reason,
-                        rusternetes_common::resources::EventType::Warning,
+                        k3rs_common::resources::EventType::Warning,
                         &ev.message,
                     )
                     .await
@@ -592,7 +591,7 @@ impl CriContainerRuntime {
         let Some(recorder) = &self.event_recorder else {
             return;
         };
-        let involved = rusternetes_common::resources::ObjectReference {
+        let involved = k3rs_common::resources::ObjectReference {
             kind: Some("Node".to_string()),
             namespace: None,
             name: Some(self.node_name.clone()),
@@ -601,7 +600,7 @@ impl CriContainerRuntime {
             resource_version: None,
             field_path: None,
         };
-        let source = rusternetes_common::resources::EventSource {
+        let source = k3rs_common::resources::EventSource {
             component: crate::events::KUBELET_COMPONENT.to_string(),
             host: Some(self.node_name.clone()).filter(|n| !n.is_empty()),
         };
@@ -609,7 +608,7 @@ impl CriContainerRuntime {
             .event(
                 &involved,
                 &source,
-                rusternetes_common::resources::EventType::Warning,
+                k3rs_common::resources::EventType::Warning,
                 reason,
                 message,
             )
@@ -649,11 +648,8 @@ impl CriContainerRuntime {
 
     /// Emit Kubernetes lifecycle events through `storage`.
     #[must_use]
-    pub fn with_event_recorder(
-        mut self,
-        storage: Arc<rusternetes_storage::StorageBackend>,
-    ) -> Self {
-        self.event_recorder = Some(rusternetes_storage::EventRecorder::new(storage));
+    pub fn with_event_recorder(mut self, storage: Arc<k3rs_storage::StorageBackend>) -> Self {
+        self.event_recorder = Some(k3rs_storage::EventRecorder::new(storage));
         self
     }
 
@@ -663,7 +659,7 @@ impl CriContainerRuntime {
         pod: &Pod,
         container_name: Option<&str>,
         reason: &str,
-        event_type: rusternetes_common::resources::EventType,
+        event_type: k3rs_common::resources::EventType,
         message: &str,
     ) {
         let Some(recorder) = &self.event_recorder else {
@@ -749,7 +745,7 @@ impl CriContainerRuntime {
         sandbox_cfg: Option<&v1::PodSandboxConfig>,
     ) -> anyhow::Result<String> {
         use crate::image_manager::{self as im, ImageErrorKind, ImageManagerError};
-        use rusternetes_common::resources::EventType;
+        use k3rs_common::resources::EventType;
         let policy = pull_policy.unwrap_or("IfNotPresent");
         let mut cri = self.cri.clone();
         // `logIt` (`image_manager.go:131-137`): an event only when the caller
@@ -785,7 +781,7 @@ impl CriContainerRuntime {
         let annotations = event_ctx
             .and_then(|(p, _)| p.metadata.annotations.clone())
             .unwrap_or_default();
-        let spec = rusternetes_cri::to_runtime_api_image_spec(&tagged, &handler, &annotations);
+        let spec = k3rs_cri::to_runtime_api_image_spec(&tagged, &handler, &annotations);
 
         // `imagePullPrecheck` (`image_manager.go:108-129`).
         if policy != "Always" {
@@ -928,7 +924,7 @@ impl CriContainerRuntime {
             if name.is_empty() {
                 continue;
             };
-            let key = rusternetes_storage::build_key("secrets", Some(ns), name);
+            let key = k3rs_storage::build_key("secrets", Some(ns), name);
             match storage {
                 Some(st) => match st.get::<Secret>(&key).await {
                     Ok(s) => secrets.push(s),
@@ -942,7 +938,7 @@ impl CriContainerRuntime {
                 pod,
                 None,
                 "FailedToRetrieveImagePullSecret",
-                rusternetes_common::resources::EventType::Warning,
+                k3rs_common::resources::EventType::Warning,
                 &format!(
                     "Unable to retrieve some image pull secrets ({}); attempting to pull the image may not succeed.",
                     failed.join(", ")
@@ -1019,7 +1015,7 @@ impl CriContainerRuntime {
         pod: &Pod,
         sandbox_cfg: &v1::PodSandboxConfig,
     ) -> anyhow::Result<ImageVolumePulls> {
-        use rusternetes_common::feature_gates::{enabled, Feature};
+        use k3rs_common::feature_gates::{enabled, Feature};
         let mut res = ImageVolumePulls::new();
         if !enabled(Feature::ImageVolume) {
             return Ok(res);
@@ -1094,7 +1090,7 @@ impl CriContainerRuntime {
     /// `getPodRuntimeHandler` (`kuberuntime_container.go:177-190`): the runtime
     /// handler passed to image RPCs. Empty unless `RuntimeClassInImageCriApi`.
     pub async fn pod_runtime_handler(&self, pod: Option<&Pod>) -> anyhow::Result<String> {
-        use rusternetes_common::feature_gates::{enabled, Feature};
+        use k3rs_common::feature_gates::{enabled, Feature};
         if !enabled(Feature::RuntimeClassInImageCriApi) {
             return Ok(String::new());
         }
@@ -1220,7 +1216,7 @@ impl CriContainerRuntime {
         &self,
         cri: &mut CriClient,
         pod: &Pod,
-        container: &rusternetes_common::resources::pod::Container,
+        container: &k3rs_common::resources::pod::Container,
         sandbox_id: &str,
         sandbox_cfg: &v1::PodSandboxConfig,
         host_paths: &std::collections::HashMap<String, String>,
@@ -1239,7 +1235,7 @@ impl CriContainerRuntime {
                 pod,
                 Some(&container.name),
                 crate::events::FAILED_CONTAINER,
-                rusternetes_common::resources::EventType::Warning,
+                k3rs_common::resources::EventType::Warning,
                 &msg,
             )
             .await;
@@ -1279,7 +1275,7 @@ impl CriContainerRuntime {
         &self,
         cri: &mut CriClient,
         pod: &Pod,
-        container: &rusternetes_common::resources::pod::Container,
+        container: &k3rs_common::resources::pod::Container,
         sandbox_id: &str,
         sandbox_cfg: &v1::PodSandboxConfig,
         host_paths: &std::collections::HashMap<String, String>,
@@ -1317,9 +1313,7 @@ impl CriContainerRuntime {
             let st = eff_pod.status.get_or_insert_with(Default::default);
             if st.pod_ip.is_none() {
                 if let Some(ip) = pod_ip {
-                    st.pod_i_ps = Some(vec![rusternetes_common::resources::pod::PodIP {
-                        ip: ip.clone(),
-                    }]);
+                    st.pod_i_ps = Some(vec![k3rs_common::resources::pod::PodIP { ip: ip.clone() }]);
                     st.pod_ip = Some(ip);
                 }
             }
@@ -1333,7 +1327,7 @@ impl CriContainerRuntime {
                     st.host_i_ps = Some(
                         host_ips
                             .iter()
-                            .map(|ip| rusternetes_common::resources::pod::HostIP { ip: ip.clone() })
+                            .map(|ip| k3rs_common::resources::pod::HostIP { ip: ip.clone() })
                             .collect(),
                     );
                 }
@@ -1584,7 +1578,7 @@ impl CriContainerRuntime {
             pod,
             Some(&container.name),
             crate::events::CREATED_CONTAINER,
-            rusternetes_common::resources::EventType::Normal,
+            k3rs_common::resources::EventType::Normal,
             &format!("Created container {}", container.name),
         )
         .await;
@@ -1598,7 +1592,7 @@ impl CriContainerRuntime {
             pod,
             Some(&container.name),
             crate::events::STARTED_CONTAINER,
-            rusternetes_common::resources::EventType::Normal,
+            k3rs_common::resources::EventType::Normal,
             &format!("Started container {}", container.name),
         )
         .await;
@@ -1641,7 +1635,7 @@ impl CriContainerRuntime {
         &self,
         cri: &mut CriClient,
         pod: &Pod,
-        container: &rusternetes_common::resources::pod::Container,
+        container: &k3rs_common::resources::pod::Container,
         container_id: &str,
         err: anyhow::Error,
     ) -> anyhow::Error {
@@ -1650,7 +1644,7 @@ impl CriContainerRuntime {
             pod,
             Some(&container.name),
             crate::events::FAILED_POST_START_HOOK,
-            rusternetes_common::resources::EventType::Warning,
+            k3rs_common::resources::EventType::Warning,
             "PostStartHook failed",
         )
         .await;
@@ -1720,7 +1714,7 @@ impl CriContainerRuntime {
 
         for name in cm_names {
             if !config_maps.contains_key(name) {
-                let key = rusternetes_storage::build_key("configmaps", Some(ns), name);
+                let key = k3rs_storage::build_key("configmaps", Some(ns), name);
                 if let Ok(cm) = storage.get::<ConfigMap>(&key).await {
                     config_maps.insert(name.to_string(), cm);
                 }
@@ -1728,7 +1722,7 @@ impl CriContainerRuntime {
         }
         for name in secret_names {
             if !secrets.contains_key(name) {
-                let key = rusternetes_storage::build_key("secrets", Some(ns), name);
+                let key = k3rs_storage::build_key("secrets", Some(ns), name);
                 if let Ok(s) = storage.get::<Secret>(&key).await {
                     secrets.insert(name.to_string(), s);
                 }
@@ -2302,8 +2296,8 @@ impl CriContainerRuntime {
         &self,
         probe_type: ProbeType,
         pod: &Pod,
-        container: &rusternetes_common::resources::pod::Container,
-        probe: &rusternetes_common::resources::pod::Probe,
+        container: &k3rs_common::resources::pod::Container,
+        probe: &k3rs_common::resources::pod::Probe,
     ) -> Result<bool> {
         let start = std::time::Instant::now();
         let result = self.probe_container(pod, container, probe).await;
@@ -2340,8 +2334,8 @@ impl CriContainerRuntime {
     pub async fn probe_container(
         &self,
         pod: &Pod,
-        container: &rusternetes_common::resources::pod::Container,
-        probe: &rusternetes_common::resources::pod::Probe,
+        container: &k3rs_common::resources::pod::Container,
+        probe: &k3rs_common::resources::pod::Probe,
     ) -> Result<bool> {
         let timeout =
             std::time::Duration::from_secs(probe.timeout_seconds.unwrap_or(1).max(1) as u64);
@@ -2461,7 +2455,7 @@ impl CriContainerRuntime {
                             pod,
                             Some(&container.name),
                             crate::events::CONTAINER_PROBE_WARNING,
-                            rusternetes_common::resources::EventType::Warning,
+                            k3rs_common::resources::EventType::Warning,
                             &format!("Probe terminated redirects, Response body: {body}"),
                         )
                         .await;
@@ -2517,7 +2511,7 @@ impl CriContainerRuntime {
         pod: &Pod,
         container: &Container,
         container_id: &str,
-        handler: &rusternetes_common::resources::pod::LifecycleHandler,
+        handler: &k3rs_common::resources::pod::LifecycleHandler,
     ) -> anyhow::Result<()> {
         // Lifecycle handlers have no per-handler timeout in the API; upstream
         // bounds preStop by the grace period and lets postStart block readiness.
@@ -3430,9 +3424,9 @@ pub type ImageVolumePulls =
 
 /// The error text upstream sees from `remoteImageService.PullImage`/`ImageStatus`:
 /// the gRPC status message without the code (`cri-client/pkg/remote_image.go:208-211`).
-fn pull_err_message(e: rusternetes_cri::CriError) -> String {
+fn pull_err_message(e: k3rs_cri::CriError) -> String {
     match e {
-        rusternetes_cri::CriError::Rpc { source, .. } => source.message().to_string(),
+        k3rs_cri::CriError::Rpc { source, .. } => source.message().to_string(),
         other => other.to_string(),
     }
 }

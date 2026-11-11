@@ -8,7 +8,7 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod upstream_flags;
 // The bin shares the lib's modules (and so its process-global state) rather
 // than recompiling them as a second copy of the crate.
-use rusternetes_api_server::{
+use k3rs_api_server::{
     admission, audit, bootstrap, flow_control, flow_control_filter, flow_control_stats_poller,
     max_in_flight_filter, post_start_hooks, prometheus_client, registry, request_timeout, router,
     state, zpages,
@@ -17,25 +17,24 @@ use rusternetes_api_server::{
 use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
+use k3rs_common::auth::TokenManager;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_storage::{StorageBackend, StorageConfig};
 use prometheus_client::PrometheusClient;
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{StorageBackend, StorageConfig};
 use state::ApiServerState;
 use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
-#[command(name = "rusternetes-api-server")]
-#[command(about = "Rusternetes API Server - Kubernetes API reimplemented in Rust")]
+#[command(name = "k3rs-api-server")]
+#[command(about = "k3rs API Server - Kubernetes API reimplemented in Rust")]
 struct Args {
     /// A port range to reserve for services with NodePort visibility. This
     /// must not overlap with the ephemeral port range on nodes. Example:
     /// '30000-32767'. Inclusive at both ends of the range
     /// (cmd/kube-apiserver/app/options/options.go:124).
     #[arg(long, default_value = "30000-32767")]
-    service_node_port_range:
-        rusternetes_api_server::registry::core::service::portallocator::PortRange,
+    service_node_port_range: k3rs_api_server::registry::core::service::portallocator::PortRange,
 
     /// Comma-separated `[component:]Gate=bool` pairs, e.g.
     /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
@@ -85,15 +84,15 @@ struct Args {
     log_level: String,
 
     /// JWT secret for service account tokens
-    #[arg(long, default_value = "rusternetes-secret-change-in-production")]
+    #[arg(long, default_value = "k3rs-secret-change-in-production")]
     jwt_secret: String,
 
     #[command(flatten)]
-    service_account: rusternetes_api_server::ServiceAccountArgs,
+    service_account: k3rs_api_server::ServiceAccountArgs,
 
     /// `--authorization-mode` (#2854).
     #[command(flatten)]
-    authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
+    authorization: k3rs_api_server::authorizer::AuthorizationArgs,
 
     /// `--enable-admission-plugins` / `--disable-admission-plugins` /
     /// `--admission-control` (#3415).
@@ -101,12 +100,11 @@ struct Args {
     admission: admission::plugins::AdmissionArgs,
     /// `--requestheader-*` front-proxy authentication (#3414).
     #[command(flatten)]
-    request_header:
-        rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
+    request_header: k3rs_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
 
     /// `--egress-selector-config-file` (#3416).
     #[command(flatten)]
-    egress_selector: rusternetes_api_server::egress_selector::EgressSelectorArgs,
+    egress_selector: k3rs_api_server::egress_selector::EgressSelectorArgs,
 
     /// `--enable-aggregator-routing`: turns on aggregator routing requests to
     /// endpoints IP rather than cluster IP (options.go `EnableAggregatorRouting`).
@@ -154,7 +152,7 @@ struct Args {
     storage_backend: String,
 
     /// SQLite database path (only used when --storage-backend=sqlite)
-    #[arg(long, default_value = "./data/rusternetes.db")]
+    #[arg(long, default_value = "./data/k3rs.db")]
     data_dir: String,
 
     /// Prometheus server URL for custom metrics (optional)
@@ -210,7 +208,7 @@ struct Args {
         long,
         default_value = "1m0s",
         value_parser = |s: &str| -> Result<std::time::Duration, String> {
-            let ns = rusternetes_common::go_duration::parse_go_duration(s)?;
+            let ns = k3rs_common::go_duration::parse_go_duration(s)?;
             u64::try_from(ns)
                 .map(std::time::Duration::from_nanos)
                 .map_err(|_| format!("negative duration {s:?} is not allowed"))
@@ -281,7 +279,7 @@ struct Args {
     #[arg(
         long,
         default_value = "0s",
-        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+        value_parser = k3rs_api_server::authorization_webhook::parse_go_duration
     )]
     audit_log_batch_max_wait: std::time::Duration,
 
@@ -321,7 +319,7 @@ struct Args {
         long,
         alias = "audit-webhook-batch-initial-backoff",
         default_value = "10s",
-        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+        value_parser = k3rs_api_server::authorization_webhook::parse_go_duration
     )]
     audit_webhook_initial_backoff: std::time::Duration,
 
@@ -346,7 +344,7 @@ struct Args {
     #[arg(
         long,
         default_value = "30s",
-        value_parser = rusternetes_api_server::authorization_webhook::parse_go_duration
+        value_parser = k3rs_api_server::authorization_webhook::parse_go_duration
     )]
     audit_webhook_batch_max_wait: std::time::Duration,
 
@@ -377,8 +375,8 @@ struct Args {
 }
 
 /// The `AuditWebhookOptions` the `--audit-webhook-*` flags describe.
-fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::WebhookOptions {
-    use rusternetes_api_server::audit_webhook::{BatchConfig, BatchOptions, WebhookOptions};
+fn audit_webhook_options(args: &Args) -> k3rs_api_server::audit_webhook::WebhookOptions {
+    use k3rs_api_server::audit_webhook::{BatchConfig, BatchOptions, WebhookOptions};
     // `int` flags: a negative value is kept so `Validate` can reject it.
     let pos = |v: i64| v.max(0) as usize;
     WebhookOptions {
@@ -397,9 +395,9 @@ fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::
                 async_delegate: true,
             },
         },
-        truncate: rusternetes_api_server::audit_truncate::TruncateOptions {
+        truncate: k3rs_api_server::audit_truncate::TruncateOptions {
             enabled: args.audit_webhook_truncate_enabled,
-            config: rusternetes_api_server::audit_truncate::TruncateConfig {
+            config: k3rs_api_server::audit_truncate::TruncateConfig {
                 max_event_size: args.audit_webhook_truncate_max_event_size,
                 max_batch_size: args.audit_webhook_truncate_max_batch_size,
             },
@@ -409,8 +407,8 @@ fn audit_webhook_options(args: &Args) -> rusternetes_api_server::audit_webhook::
 
 /// The `AuditBatchOptions` the `--audit-log-mode`/`--audit-log-batch-*` flags
 /// describe.
-fn audit_log_batch_options(args: &Args) -> rusternetes_api_server::audit_webhook::BatchOptions {
-    use rusternetes_api_server::audit_webhook::{BatchConfig, BatchOptions};
+fn audit_log_batch_options(args: &Args) -> k3rs_api_server::audit_webhook::BatchOptions {
+    use k3rs_api_server::audit_webhook::{BatchConfig, BatchOptions};
     let pos = |v: i64| v.max(0) as usize;
     BatchOptions {
         mode: args.audit_log_mode.clone(),
@@ -429,10 +427,8 @@ fn audit_log_batch_options(args: &Args) -> rusternetes_api_server::audit_webhook
 }
 
 /// The `AuditTruncateOptions` the `--audit-log-truncate-*` flags describe.
-fn audit_log_truncate_options(
-    args: &Args,
-) -> rusternetes_api_server::audit_truncate::TruncateOptions {
-    use rusternetes_api_server::audit_truncate::{TruncateConfig, TruncateOptions};
+fn audit_log_truncate_options(args: &Args) -> k3rs_api_server::audit_truncate::TruncateOptions {
+    use k3rs_api_server::audit_truncate::{TruncateConfig, TruncateOptions};
     TruncateOptions {
         enabled: args.audit_log_truncate_enabled,
         config: TruncateConfig {
@@ -443,9 +439,7 @@ fn audit_log_truncate_options(
 }
 
 /// `AuditLogOptions.Validate` (options/audit.go:453) for the rotation flags.
-fn audit_rotation_options(
-    args: &Args,
-) -> Result<rusternetes_common::audit_rotate::RotationOptions> {
+fn audit_rotation_options(args: &Args) -> Result<k3rs_common::audit_rotate::RotationOptions> {
     let mut errs = Vec::new();
     for (flag, v) in [
         ("--audit-log-maxage", args.audit_log_maxage),
@@ -459,7 +453,7 @@ fn audit_rotation_options(
     if !errs.is_empty() {
         anyhow::bail!("{}", errs.join("; "));
     }
-    Ok(rusternetes_common::audit_rotate::RotationOptions {
+    Ok(k3rs_common::audit_rotate::RotationOptions {
         max_size_mb: args.audit_log_maxsize as u64,
         max_age_days: args.audit_log_maxage as u64,
         max_backups: args.audit_log_maxbackup as usize,
@@ -472,7 +466,7 @@ fn audit_rotation_options(
 /// auditing off.
 async fn install_audit_from_flags(
     args: &Args,
-) -> Result<Vec<std::sync::Arc<rusternetes_api_server::audit_webhook::BufferedBackend>>> {
+) -> Result<Vec<std::sync::Arc<k3rs_api_server::audit_webhook::BufferedBackend>>> {
     if args.audit_log_format != "json" {
         anyhow::bail!(
             "invalid audit log format {:?}: only \"json\" is supported",
@@ -512,21 +506,21 @@ async fn install_audit_from_flags(
         .with_context(|| format!("reading --audit-policy-file {policy_file}"))?;
     let policy = audit::Policy::from_yaml(&yaml)
         .map_err(|e| anyhow::anyhow!("{e}: from file {policy_file}"))?;
-    let mut sinks: Vec<std::sync::Arc<dyn rusternetes_common::audit::AuditBackend>> = Vec::new();
+    let mut sinks: Vec<std::sync::Arc<dyn k3rs_common::audit::AuditBackend>> = Vec::new();
     let mut buffered = Vec::new();
     if let Some(log_path) = &args.audit_log_path {
-        let log: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = if log_path == "-" {
+        let log: std::sync::Arc<dyn k3rs_common::audit::AuditBackend> = if log_path == "-" {
             std::sync::Arc::new(audit::StdoutAuditBackend)
         } else {
             // `AuditLogOptions.getWriter`: a lumberjack writer over the file.
             std::sync::Arc::new(
-                rusternetes_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
+                k3rs_common::audit_rotate::RotatingFileAuditBackend::new(log_path, rotation)
                     .with_context(|| format!("opening --audit-log-path {log_path}"))?,
             )
         };
         // `AuditLogOptions.newBackend`: log, then the batch wrap, then truncate.
         let (log, b) = audit_log_batch_options(args).wrap_backend(std::sync::Arc::new(
-            rusternetes_api_server::audit_webhook::LogDelegate(log),
+            k3rs_api_server::audit_webhook::LogDelegate(log),
         ));
         buffered.extend(b);
         sinks.push(audit_log_truncate_options(args).wrap_backend(log));
@@ -537,13 +531,13 @@ async fn install_audit_from_flags(
         buffered.extend(b);
     }
     // `c.AuditBackend = appendBackend(logBackend, dynamicBackend)`.
-    let sink: std::sync::Arc<dyn rusternetes_common::audit::AuditBackend> = match sinks.len() {
+    let sink: std::sync::Arc<dyn k3rs_common::audit::AuditBackend> = match sinks.len() {
         0 => {
             warn!("auditing needs --audit-log-path or --audit-webhook-config-file; it is off");
             return Ok(Vec::new());
         }
         1 => sinks.remove(0),
-        _ => std::sync::Arc::new(rusternetes_api_server::audit_webhook::UnionBackend(sinks)),
+        _ => std::sync::Arc::new(k3rs_api_server::audit_webhook::UnionBackend(sinks)),
     };
     audit::install_audit(audit::AuditConfig { policy, sink });
     Ok(buffered)
@@ -558,7 +552,7 @@ async fn install_audit_from_flags(
 /// server has no graceful-shutdown path, so SIGTERM/SIGINT flush the backends
 /// and then exit; a second signal exits at once.
 fn spawn_audit_shutdown(
-    buffered: Vec<std::sync::Arc<rusternetes_api_server::audit_webhook::BufferedBackend>>,
+    buffered: Vec<std::sync::Arc<k3rs_api_server::audit_webhook::BufferedBackend>>,
 ) {
     if buffered.is_empty() {
         return;
@@ -591,7 +585,7 @@ fn spawn_audit_shutdown(
 /// `--feature-gates`: `ComponentGlobalsRegistry.Set()` then `Validate()`
 /// (cmd/kube-apiserver/app/server.go:84-87; staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    let effective_version = rusternetes_common::compatibility::apply_flags(
+    let effective_version = k3rs_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
@@ -599,8 +593,8 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
     .map_err(|e| anyhow::anyhow!("invalid --feature-gates/--emulated-version: {e}"))?;
     // `ComponentGlobalsRegistry.AddMetrics()` (cmd/kube-apiserver/app/server.go:116;
     // component-base/compatibility/registry.go:123-131): record `version_info`.
-    rusternetes_common::compat_version_metrics::add_metrics(
-        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+    k3rs_common::compat_version_metrics::add_metrics(
+        k3rs_common::compatibility::DEFAULT_KUBE_COMPONENT,
         &effective_version,
     );
     Ok(())
@@ -613,7 +607,7 @@ async fn main() -> Result<()> {
     let matches = cmd.clone().get_matches();
     // `s.Flagz = flagz.NamedFlagSetsReader{FlagSets: namedFlagSets}`
     // (cmd/kube-apiserver/app/server.go:131-134).
-    zpages::set_flagz_reader(rusternetes_common::flagz::flags_from_clap(&cmd, &matches));
+    zpages::set_flagz_reader(k3rs_common::flagz::flags_from_clap(&cmd, &matches));
     let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
         .map_err(|e| e.exit())
         .unwrap();
@@ -646,10 +640,10 @@ async fn main() -> Result<()> {
         registry::core::service::ipranges::ServiceIpRanges::parse(&args.service_cluster_ip_range)
             .map_err(|e| anyhow::anyhow!(e))?;
 
-    rusternetes_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
+    k3rs_common::tracing::init_basic_tracing("api-server", &args.log_level)?;
     // The audit metrics register at init upstream (audit/metrics.go).
-    rusternetes_api_server::audit_metrics::register_metrics();
-    rusternetes_common::dump::install_panic_hook("api-server");
+    k3rs_api_server::audit_metrics::register_metrics();
+    k3rs_common::dump::install_panic_hook("api-server");
     for msg in args.upstream.ignored_flags() {
         warn!("{msg}");
     }
@@ -718,8 +712,8 @@ async fn main() -> Result<()> {
     spawn_audit_shutdown(audit_buffered);
 
     info!(
-        "Starting Rusternetes API Server {}",
-        rusternetes_common::build_info::version_line()
+        "Starting k3rs API Server {}",
+        k3rs_common::build_info::version_line()
     );
 
     // Initialize storage
@@ -752,20 +746,20 @@ async fn main() -> Result<()> {
     let token_manager = Arc::new(
         TokenManager::new_auto(args.jwt_secret.as_bytes())
             .with_service_account_options(&service_account)?
-            .with_external_address(rusternetes_api_server::bootstrap::external_address(
+            .with_external_address(k3rs_api_server::bootstrap::external_address(
                 args.external_hostname.as_deref(),
-                rusternetes_api_server::bootstrap::AdvertiseAddress::new(
+                k3rs_api_server::bootstrap::AdvertiseAddress::new(
                     args.advertise_address,
                     &args.bind_address,
                 ),
                 &args.bind_address,
             )?),
     );
-    rusternetes_api_server::log_openid_metadata_status(&token_manager);
+    k3rs_api_server::log_openid_metadata_status(&token_manager);
 
     // Egress selector and aggregator service resolver, installed as `run` does
     // and before the authorizer takes the selector's `Lookup`.
-    rusternetes_api_server::install_server_options(&rusternetes_api_server::ApiServerConfig {
+    k3rs_api_server::install_server_options(&k3rs_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         egress_selector_config_file: args.egress_selector.config_file.clone(),
         enable_aggregator_routing: args.enable_aggregator_routing,
@@ -778,7 +772,7 @@ async fn main() -> Result<()> {
         warn!("⚠️  Using AlwaysAllowAuthorizer - all requests will be permitted");
         warn!("⚠️  This should ONLY be used in development/testing environments");
     }
-    let authorizer = rusternetes_api_server::authorizer::build_authorizer_with_config(
+    let authorizer = k3rs_api_server::authorizer::build_authorizer_with_config(
         storage.clone(),
         args.skip_auth,
         &args.authorization.authorization_mode,
@@ -792,7 +786,7 @@ async fn main() -> Result<()> {
     info!("Initializing Metrics Registry");
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
 
-    let api_config = rusternetes_api_server::ApiServerConfig {
+    let api_config = k3rs_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         advertise_address: args.advertise_address,
         external_hostname: args.external_hostname.clone(),
@@ -814,7 +808,7 @@ async fn main() -> Result<()> {
         enable_aggregator_routing: args.enable_aggregator_routing,
         ..Default::default()
     };
-    let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
+    let prepared_tls = k3rs_api_server::prepare_tls_for_config(&api_config)?;
     let ca_cert_pem = prepared_tls
         .as_ref()
         .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
@@ -829,22 +823,22 @@ async fn main() -> Result<()> {
 
     // `NewDynamicServingContentFromFiles("aggregator-proxy-cert", ...)` +
     // `RunOnce` (kube-aggregator apiserver.go:297-307): a bad pair stops startup.
-    rusternetes_api_server::handlers::aggregator::install_proxy_client_certs(
+    k3rs_api_server::handlers::aggregator::install_proxy_client_certs(
         args.upstream.proxy_client_cert_file.as_deref(),
         args.upstream.proxy_client_key_file.as_deref(),
     )?;
 
     let crd_controllers = Default::default();
-    rusternetes_api_server::startup::register_post_start_hooks(
+    k3rs_api_server::startup::register_post_start_hooks(
         storage.clone(),
         api_port,
         service_ranges.api_server_service_ip(),
-        rusternetes_api_server::bootstrap::AdvertiseAddress::new(
+        k3rs_api_server::bootstrap::AdvertiseAddress::new(
             args.advertise_address,
             &args.bind_address,
         ),
         service_ranges.cidrs(),
-        rusternetes_api_server::startup::ClusterAuthnInputs {
+        k3rs_api_server::startup::ClusterAuthnInputs {
             ca_cert_pem: ca_cert_pem.as_deref(),
             client_ca_file: args.client_ca_file.as_deref(),
             request_header: request_header.as_ref(),
@@ -876,14 +870,14 @@ async fn main() -> Result<()> {
         None
     };
 
-    rusternetes_api_server::upgrade_aware::set_reject_forwarding_redirects(
+    k3rs_api_server::upgrade_aware::set_reject_forwarding_redirects(
         args.aggregator_reject_forwarding_redirect,
     );
     // API Priority and Fairness: installed before the router is built, which
     // layers it on the protected routes when present (#2704).
     post_start_hooks::register_generic_server_hooks(
         post_start_hooks::global(),
-        rusternetes_api_server::shared_informer_factory::global(),
+        k3rs_api_server::shared_informer_factory::global(),
         storage.clone(),
         args.enable_priority_and_fairness,
     );
@@ -987,7 +981,7 @@ async fn main() -> Result<()> {
         // connect) and serve via PeerCertAcceptor so the verified cert reaches
         // handlers for CN→user / O→groups mapping (#1129). Without it, plain
         // serving-only TLS as before.
-        let client_cas = rusternetes_api_server::request_header_authentication::client_ca_files(
+        let client_cas = k3rs_api_server::request_header_authentication::client_ca_files(
             args.client_ca_file.as_deref(),
             request_header.as_ref(),
         );
@@ -1001,7 +995,7 @@ async fn main() -> Result<()> {
             );
             (
                 Some(
-                    rusternetes_api_server::request_header_authentication::mtls_acceptor(
+                    k3rs_api_server::request_header_authentication::mtls_acceptor(
                         tls_config,
                         args.client_ca_file.as_deref(),
                         request_header.as_ref(),
@@ -1056,22 +1050,18 @@ async fn main() -> Result<()> {
         if let Some((acceptor, _ca_reload)) = mtls {
             let mut server = axum_server::bind(addr).acceptor(acceptor);
             apply_http2_tuning!(server);
-            server
-                .serve(rusternetes_api_server::serve_service(app))
-                .await?;
+            server.serve(k3rs_api_server::serve_service(app)).await?;
         } else {
             let mut server =
                 axum_server::bind_rustls(addr, plain_config.expect("set when no client CA"));
             apply_http2_tuning!(server);
-            server
-                .serve(rusternetes_api_server::serve_service(app))
-                .await?;
+            server.serve(k3rs_api_server::serve_service(app)).await?;
         }
     } else {
         info!("TLS disabled - starting HTTP server (not recommended for production)");
         info!("API Server listening on {}", args.bind_address);
         let listener = tokio::net::TcpListener::bind(&args.bind_address).await?;
-        axum::serve(listener, rusternetes_api_server::serve_service(app)).await?;
+        axum::serve(listener, k3rs_api_server::serve_service(app)).await?;
     }
 
     Ok(())
@@ -1080,7 +1070,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::feature_gates::{self, Feature};
+    use k3rs_common::feature_gates::{self, Feature};
 
     /// `--feature-gates` must parse and be applicable (upstream
     /// `featureGate.AddFlag`, component-base/featuregate/feature_gate.go:912).

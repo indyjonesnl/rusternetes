@@ -20,7 +20,7 @@
 //! Deployment defaults are `intstr.FromString("25%")` — a string.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";
@@ -161,8 +161,8 @@ async fn statefulset_integer_max_unavailable_stays_an_integer() {
     // `maxUnavailable` is gated by `MaxUnavailableStatefulSet`, off by
     // default in 1.35: the StatefulSet strategy drops it otherwise
     // (`dropStatefulSetDisabledFields`, pkg/registry/apps/statefulset/strategy.go:120-126).
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::MaxUnavailableStatefulSet,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::MaxUnavailableStatefulSet,
         true,
     );
     let state = TestApiServer::new();
@@ -190,8 +190,8 @@ async fn statefulset_percentage_max_unavailable_stays_a_string() {
     // `maxUnavailable` is gated by `MaxUnavailableStatefulSet`, off by
     // default in 1.35: the StatefulSet strategy drops it otherwise
     // (`dropStatefulSetDisabledFields`, pkg/registry/apps/statefulset/strategy.go:120-126).
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::MaxUnavailableStatefulSet,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::MaxUnavailableStatefulSet,
         true,
     );
     let state = TestApiServer::new();

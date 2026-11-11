@@ -588,7 +588,7 @@ impl axum::response::IntoResponse for Error {
 /// Upstream never builds these messages from a storage path — it is handed a
 /// `schema.GroupResource` and a name (`NewNotFound(qualifiedResource, name)`),
 /// so both the message and `Status.details` are derived from the same
-/// structured identity. Rusternetes' storage layer raises `NotFound(key)` /
+/// structured identity. k3rs' storage layer raises `NotFound(key)` /
 /// `AlreadyExists(key)` with the raw `/registry/...` key instead, so the
 /// boundary has to parse it back.
 ///

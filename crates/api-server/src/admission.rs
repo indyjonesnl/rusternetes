@@ -32,12 +32,12 @@ pub mod service_account;
 pub mod storage_object_in_use_protection;
 
 /// Pod admission controllers for ResourceQuota, LimitRange enforcement, and ServiceAccount injection
-use rusternetes_common::{
+use k3rs_common::{
     quantity::{parse_resource_value, Quantity},
     resources::{LimitRange, Pod},
     types::ResourceRequirements,
 };
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -261,7 +261,7 @@ fn exceeds(observed: &Quantity, enforced: &Quantity) -> std::cmp::Ordering {
 /// aggregate. Keys are walked sorted where Go's map order is random.
 pub fn persistent_volume_claim_validate_limit(
     limit_range: &LimitRange,
-    pvc: &rusternetes_common::resources::PersistentVolumeClaim,
+    pvc: &k3rs_common::resources::PersistentVolumeClaim,
 ) -> Vec<String> {
     let empty = HashMap::new();
     let requests = pvc.spec.resources.requests.as_ref().unwrap_or(&empty);
@@ -330,7 +330,7 @@ fn aggregate(errs: &[String]) -> String {
 pub async fn limit_ranger_validate_pvc<S: Storage>(
     storage: &Arc<S>,
     namespace: &str,
-    pvc: &rusternetes_common::resources::PersistentVolumeClaim,
+    pvc: &k3rs_common::resources::PersistentVolumeClaim,
 ) -> anyhow::Result<Option<String>> {
     let limit_prefix = format!("/registry/limitranges/{}/", namespace);
     let limit_ranges: Vec<LimitRange> = storage.list(&limit_prefix).await?;
@@ -490,7 +490,7 @@ fn validate_ratio(
 ///
 /// Upstream never does this: `ResourceQuota.spec.hard`, `LimitRange` bounds and
 /// container resources are all typed `resource.Quantity` in Go, parsed once at
-/// decode time and compared with `Quantity.Cmp`. Rusternetes carries them as
+/// decode time and compared with `Quantity.Cmp`. k3rs carries them as
 /// `String`, so every comparison re-parses — hence one shared implementation
 /// rather than a suffix chain per call site.
 ///
@@ -518,7 +518,7 @@ pub fn parse_memory_to_bytes(memory: &str) -> anyhow::Result<i64> {
 /// beta annotation) gets the default class, if there is one.
 pub async fn set_default_storage_class<S: Storage>(
     storage: &Arc<S>,
-    pvc: &mut rusternetes_common::resources::PersistentVolumeClaim,
+    pvc: &mut k3rs_common::resources::PersistentVolumeClaim,
 ) -> anyhow::Result<()> {
     let has_beta_annotation = pvc
         .metadata
@@ -528,7 +528,7 @@ pub async fn set_default_storage_class<S: Storage>(
     if pvc.spec.storage_class_name.is_some() || has_beta_annotation {
         return Ok(());
     }
-    let storage_classes: Vec<rusternetes_common::resources::StorageClass> =
+    let storage_classes: Vec<k3rs_common::resources::StorageClass> =
         storage.list("/registry/storageclasses/").await?;
     if let Some(default) = get_default_class(storage_classes) {
         info!(
@@ -546,10 +546,10 @@ pub async fn set_default_storage_class<S: Storage>(
 /// annotated default (`IsDefaultAnnotation`, :76-85), the newest, then the
 /// first by name.
 fn get_default_class(
-    classes: Vec<rusternetes_common::resources::StorageClass>,
-) -> Option<rusternetes_common::resources::StorageClass> {
+    classes: Vec<k3rs_common::resources::StorageClass>,
+) -> Option<k3rs_common::resources::StorageClass> {
     // Shared with the PV controller.
-    rusternetes_common::resources::volume::get_default_class(classes)
+    k3rs_common::resources::volume::get_default_class(classes)
 }
 
 /// `Plugin.Admit` of the ServiceAccount plugin on a pod CREATE
@@ -598,10 +598,10 @@ pub async fn inject_service_account_token<S: Storage>(
         // Shared with the controller-manager so controller-created pods
         // (ReplicaSet/StatefulSet/etc.), which write pods straight to storage
         // and bypass this HTTP admission path, get the same volume.
-        rusternetes_common::serviceaccount::add_kube_api_access_volume(spec);
+        k3rs_common::serviceaccount::add_kube_api_access_volume(spec);
     }
 
-    let copied = rusternetes_common::serviceaccount::propagate_image_pull_secrets(
+    let copied = k3rs_common::serviceaccount::propagate_image_pull_secrets(
         spec,
         service_account.image_pull_secrets.as_deref(),
     );
@@ -632,7 +632,7 @@ pub const IGNORED_POD_SUBRESOURCES: [&str; 8] = [
 /// container was added or its image changed. Relevant mutable pod fields
 /// are the image fields (`isSignificantContainerUpdate`, :669-671).
 pub fn is_significant_pod_update(pod: &Pod, old_pod: &Pod) -> bool {
-    use rusternetes_common::resources::pod::Container;
+    use k3rs_common::resources::pod::Container;
     let empty = Vec::new();
     let (spec, old_spec) = match (&pod.spec, &old_pod.spec) {
         (Some(s), Some(o)) => (s, o),
@@ -795,7 +795,7 @@ impl PodSecurityAdmission {
         namespace: &str,
         pod: &Pod,
         username: &str,
-    ) -> Result<(), rusternetes_common::Error> {
+    ) -> Result<(), k3rs_common::Error> {
         self.admit_outcome(storage, namespace, pod, username)
             .await
             .map(|_| ())
@@ -816,7 +816,7 @@ impl PodSecurityAdmission {
         namespace: &str,
         pod: &Pod,
         username: &str,
-    ) -> Result<PodSecurityOutcome, rusternetes_common::Error> {
+    ) -> Result<PodSecurityOutcome, k3rs_common::Error> {
         let exempt = |reason: &str| PodSecurityOutcome {
             warnings: Vec::new(),
             audit_annotations: BTreeMap::from([("exempt".to_string(), reason.to_string())]),
@@ -830,20 +830,20 @@ impl PodSecurityAdmission {
         if self.exemptions.exempt_user(username) {
             return Ok(exempt("user"));
         }
-        let ns_key = rusternetes_storage::build_key("namespaces", None, namespace);
+        let ns_key = k3rs_storage::build_key("namespaces", None, namespace);
         // admission.go:344-350: any namespace lookup failure, NotFound
         // included, answers `NewInternalError("failed to lookup namespace
         // %q")`, not an allow. Upstream never sees NotFound here because
         // NamespaceLifecycle answers it first; that plugin exists here too
         // (#2543), so there is no NotFound arm.
         let labels = match storage
-            .get::<rusternetes_common::resources::Namespace>(&ns_key)
+            .get::<k3rs_common::resources::Namespace>(&ns_key)
             .await
         {
             Ok(ns) => ns.metadata.labels,
             Err(e) => {
                 warn!("PodSecurity: failed to fetch pod namespace {namespace:?}: {e}");
-                return Err(rusternetes_common::Error::Internal(format!(
+                return Err(k3rs_common::Error::Internal(format!(
                     "Internal error occurred: failed to lookup namespace {namespace:?}"
                 )));
             }
@@ -891,7 +891,7 @@ impl PodSecurityAdmission {
 
         let pod_name = &pod.metadata.name;
         // EvaluatePod caches results by LevelVersion (admission.go:476-477).
-        let default_spec = rusternetes_common::resources::pod::PodSpec::default();
+        let default_spec = k3rs_common::resources::pod::PodSpec::default();
         let spec = pod.spec.as_ref().unwrap_or(&default_spec);
         let mut cache: HashMap<pod_security_api::LevelVersion, Option<String>> = HashMap::new();
         let mut eval = |lv: pod_security_api::LevelVersion| {
@@ -907,7 +907,7 @@ impl PodSecurityAdmission {
         };
 
         if let Some(detail) = eval(policy.enforce) {
-            return Err(rusternetes_common::Error::Forbidden(format!(
+            return Err(k3rs_common::Error::Forbidden(format!(
                 "pod {pod_name} violates PodSecurity \"{}\": {detail}",
                 policy.enforce
             )));
@@ -976,12 +976,12 @@ pub fn pod_security_registry() -> &'static pod_security_policy::CheckRegistry {
 /// `globalDefault`. If a race left more than one, the lowest value wins.
 pub async fn get_default_priority_class<S: Storage>(
     storage: &Arc<S>,
-) -> rusternetes_common::Result<Option<rusternetes_common::resources::PriorityClass>> {
-    let prefix = rusternetes_storage::build_prefix("priorityclasses", None);
+) -> k3rs_common::Result<Option<k3rs_common::resources::PriorityClass>> {
+    let prefix = k3rs_storage::build_prefix("priorityclasses", None);
     let list = storage
-        .list::<rusternetes_common::resources::PriorityClass>(&prefix)
+        .list::<k3rs_common::resources::PriorityClass>(&prefix)
         .await?;
-    let mut default: Option<rusternetes_common::resources::PriorityClass> = None;
+    let mut default: Option<k3rs_common::resources::PriorityClass> = None;
     for pc in list {
         if pc.global_default == Some(true) && default.as_ref().is_none_or(|d| d.value > pc.value) {
             default = Some(pc);

@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::quantity::Quantity;
-use rusternetes_cri::{v1, CriClient};
+use k3rs_common::quantity::Quantity;
+use k3rs_cri::{v1, CriClient};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info};
 

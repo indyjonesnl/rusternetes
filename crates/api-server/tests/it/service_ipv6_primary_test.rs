@@ -4,7 +4,7 @@
 //! storage.go:115-124), so a Service with no family preference lands on it.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const SVCS: &str = "/api/v1/namespaces/default/services";

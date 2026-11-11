@@ -29,8 +29,8 @@ use crate::volume_plugins::plugin::{
 use crate::volume_plugins::util::types::is_operation_finished_error;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{PersistentVolumeAccessMode, Pod, VolumeAttachment};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{PersistentVolumeAccessMode, Pod, VolumeAttachment};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -246,7 +246,7 @@ impl BlockVolumePlugin for CsiPlugin {
 
         let get = |k: &str| vol_data.get(k).cloned().unwrap_or_default();
         let spec_vol_id = get(vol_data_key::SPEC_VOL_ID);
-        let pv: rusternetes_common::resources::PersistentVolume =
+        let pv: k3rs_common::resources::PersistentVolume =
             serde_json::from_value(serde_json::json!({
                 "metadata": {"name": spec_vol_id},
                 "spec": {
@@ -416,7 +416,7 @@ impl CsiBlockMapper {
         &self,
         client: &CsiDriverClient,
         access_mode: &PersistentVolumeAccessMode,
-        csi_source: &rusternetes_common::resources::volume::CSIVolumeSource,
+        csi_source: &k3rs_common::resources::volume::CSIVolumeSource,
         attachment: Option<&VolumeAttachment>,
     ) -> Result<String> {
         debug!("kubernetes.io/csi: blockMapper.stageVolumeForBlock called");
@@ -485,7 +485,7 @@ impl CsiBlockMapper {
         &self,
         client: &CsiDriverClient,
         access_mode: &PersistentVolumeAccessMode,
-        csi_source: &rusternetes_common::resources::volume::CSIVolumeSource,
+        csi_source: &k3rs_common::resources::volume::CSIVolumeSource,
         attachment: Option<&VolumeAttachment>,
     ) -> Result<String> {
         debug!("kubernetes.io/csi: blockMapper.publishVolumeForBlock called");

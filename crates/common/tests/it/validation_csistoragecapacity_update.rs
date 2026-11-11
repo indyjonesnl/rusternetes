@@ -1,5 +1,5 @@
-use rusternetes_common::resources::CSIStorageCapacity;
-use rusternetes_common::validation::csistoragecapacity::validate_csi_storage_capacity_update;
+use k3rs_common::resources::CSIStorageCapacity;
+use k3rs_common::validation::csistoragecapacity::validate_csi_storage_capacity_update;
 use serde_json::json;
 
 fn csc(storage_class: &str, node_topology: serde_json::Value) -> CSIStorageCapacity {

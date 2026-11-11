@@ -8,9 +8,9 @@
 //! is forwarded to `podIP:containerPort`. Different hostPorts on the same
 //! node must each get their own rule and not clobber each other.
 
-use rusternetes_common::resources::{Container, ContainerPort, Pod, PodSpec, PodStatus};
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_kube_proxy::iptables::IptablesManager;
+use k3rs_common::resources::{Container, ContainerPort, Pod, PodSpec, PodStatus};
+use k3rs_common::types::ObjectMeta;
+use k3rs_kube_proxy::iptables::IptablesManager;
 
 /// Build a minimal Pod that exposes a single hostPort.
 fn pod_with_hostport(
@@ -23,7 +23,7 @@ fn pod_with_hostport(
     protocol: &str,
 ) -> Pod {
     let mut pod = Pod {
-        type_meta: rusternetes_common::types::TypeMeta {
+        type_meta: k3rs_common::types::TypeMeta {
             kind: "Pod".to_string(),
             api_version: "v1".to_string(),
         },
@@ -84,8 +84,8 @@ fn hostport_dnat_rule_is_generated() {
     // A single pod with a hostPort must produce a DNAT rule that maps
     // `nodeIP:hostPort -> podIP:containerPort` in the KUBE-HOSTPORTS chain.
     let mgr = IptablesManager::new(
-        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
-        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
     );
     let pods = vec![pod_with_hostport(
         "pod1",
@@ -131,8 +131,8 @@ fn distinct_hostports_coexist_on_same_node() {
     // their own DNAT rule. Neither should clobber the other.
     // This mirrors upstream e2e network/hostport.go:219.
     let mgr = IptablesManager::new(
-        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
-        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
     );
     let pods = vec![
         pod_with_hostport(
@@ -186,8 +186,8 @@ fn hostport_rules_skip_pods_on_other_nodes() {
     // for pods scheduled on its own node. Pods on other nodes are handled
     // by the kube-proxy running there.
     let mgr = IptablesManager::new(
-        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
-        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
     );
     let pods = vec![
         pod_with_hostport(
@@ -229,8 +229,8 @@ fn hostport_rules_skip_pods_without_pod_ip() {
     // A hostPort with no podIP yet (pod still pending) cannot have a DNAT
     // target — skip it. The next sync will pick it up once the pod is running.
     let mgr = IptablesManager::new(
-        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
-        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
     );
     let mut pod = pod_with_hostport("pending-pod", "default", "node-1", "", 8080, 30080, "TCP");
     // Clear the pod IP to simulate a pending pod.
@@ -263,8 +263,8 @@ fn hostport_rules_skip_host_network_pods() {
     // kube-scheduler / kube-controller-manager `--bind-address=127.0.0.1`) is
     // not listening. The probe gets ECONNREFUSED and the pod never goes Ready.
     let mgr = IptablesManager::new(
-        rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
-        rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string(),
+        k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE.to_string(),
     );
     // Mirrors kubeadm's kube-scheduler static pod on a v1.35 cluster: a
     // hostNetwork pod carrying a `probe-port` hostPort of 10259 whose podIP is

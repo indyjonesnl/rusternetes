@@ -7,11 +7,11 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::csi::FSGroupPolicy;
-use rusternetes_common::resources::{
+use k3rs_common::resources::csi::FSGroupPolicy;
+use k3rs_common::resources::{
     CSIDriver, PersistentVolume, PersistentVolumeAccessMode, Pod, Secret, VolumeAttachment,
 };
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -257,8 +257,8 @@ impl VolumePlugin for CsiPlugin {
     /// `CSIDriver.Spec.SELinuxMount`; a missing CSIDriver is `(false, nil)`,
     /// any other lookup failure is the error.
     fn supports_selinux_context_mount(&self, spec: &Spec<'_>) -> Result<bool> {
-        if !rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if !k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             return Ok(false);
         }
@@ -410,8 +410,8 @@ impl CsiPlugin {
             )
         })?;
         let get = |k: &str| data.get(k).cloned().unwrap_or_default();
-        let selinux_mount_context = if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let selinux_mount_context = if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             get(vol_data_key::SELINUX_MOUNT_CONTEXT)
         } else {
@@ -559,7 +559,7 @@ pub fn plugin_dir(volumes_base_path: &str) -> PathBuf {
 }
 
 enum Source {
-    Inline(Box<rusternetes_common::resources::csi::CSIVolumeSource>),
+    Inline(Box<k3rs_common::resources::csi::CSIVolumeSource>),
     Pv(Box<PersistentVolume>),
 }
 
@@ -669,7 +669,7 @@ impl CsiMounter {
     /// An unset `volumeLifecycleModes` is read as `[Persistent]`, the value the
     /// API server defaults it to; reading storage directly we may see it unset.
     fn supports_volume_lifecycle_mode(&self, driver: Option<&CSIDriver>) -> Result<()> {
-        use rusternetes_common::resources::csi::VolumeLifecycleMode as M;
+        use k3rs_common::resources::csi::VolumeLifecycleMode as M;
         let mode = self.mode;
         match driver {
             None if mode == LifecycleMode::Persistent => Ok(()),
@@ -749,7 +749,7 @@ async fn get_csi_driver(
         .await
     {
         Ok(d) => Ok(Some(d)),
-        Err(rusternetes_common::Error::NotFound(_)) => Ok(None),
+        Err(k3rs_common::Error::NotFound(_)) => Ok(None),
         Err(e) => Err(anyhow!("failed to get CSIDriver {driver_name}: {e}")),
     }
 }
@@ -852,7 +852,7 @@ impl DeviceMountableVolumePlugin for CsiPlugin {
 /// `getPVSourceFromSpec` (`csi_util.go:165-174`).
 pub fn pv_source_from_spec<'a>(
     spec: &'a Spec<'_>,
-) -> Result<&'a rusternetes_common::resources::volume::CSIVolumeSource> {
+) -> Result<&'a k3rs_common::resources::volume::CSIVolumeSource> {
     if spec.volume.csi.is_some() {
         return Err(anyhow!(
             "unexpected api.CSIVolumeSource found in volume.Spec"
@@ -965,8 +965,8 @@ impl DeviceMounter for CsiAttacher {
 
         let mut mount_options = pv.spec.mount_options.clone().unwrap_or_default();
         let mut selinux_supported = false;
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             // `c.plugin.SupportsSELinuxContextMount(spec)` (`csi_plugin.go:637`):
             // the CSIDriver fetched above; a missing one is `(false, nil)`.
@@ -1279,8 +1279,8 @@ impl Mounter for CsiMounter {
         // `SupportsSELinuxContextMount` reads `CSIDriver.Spec.SELinuxMount`; the
         // CSIDriver was already fetched above (a missing one is `(false, nil)`).
         let mut selinux_label_mount = false;
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             let support = csi_driver
                 .as_ref()
@@ -1459,7 +1459,7 @@ impl CsiMounter {
         // map keys, as BTreeMap does.
         let mut outputs: std::collections::BTreeMap<
             String,
-            rusternetes_common::resources::TokenRequestStatus,
+            k3rs_common::resources::TokenRequestStatus,
         > = Default::default();
         for request in requests {
             let audience = request.audience.clone();
@@ -1501,7 +1501,7 @@ impl CsiMounter {
         &self,
         audiences: &[String],
         expiration_seconds: i64,
-    ) -> Result<rusternetes_common::resources::TokenRequestStatus> {
+    ) -> Result<k3rs_common::resources::TokenRequestStatus> {
         let tr = self
             .token_manager
             .get_service_account_token(
@@ -1523,7 +1523,7 @@ impl CsiMounter {
                 },
             )
             .await?;
-        Ok(rusternetes_common::resources::TokenRequestStatus {
+        Ok(k3rs_common::resources::TokenRequestStatus {
             expiration_timestamp: tr
                 .status
                 .expiration_timestamp
@@ -1637,7 +1637,7 @@ impl CsiPlugin {
             .await
         {
             Ok(a) => Ok(a.status.is_some_and(|s| s.attached)),
-            Err(rusternetes_common::Error::NotFound(_)) => Ok(false),
+            Err(k3rs_common::Error::NotFound(_)) => Ok(false),
             Err(e) => Err(anyhow!(
                 "failed to get volume attachment {attachment_name}: {e}"
             )),

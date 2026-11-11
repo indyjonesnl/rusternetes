@@ -11,8 +11,8 @@
 // We also assert the call returns within roughly `timeoutSeconds + slack`
 // rather than waiting for the slow webhook to finish.
 
-use rusternetes_api_server::admission_webhook::AdmissionWebhookManager;
-use rusternetes_common::{
+use k3rs_api_server::admission_webhook::AdmissionWebhookManager;
+use k3rs_common::{
     admission::{
         AdmissionResponse, AdmissionReview, AdmissionReviewResponse, GroupVersionKind,
         GroupVersionResource, Operation, UserInfo,
@@ -23,8 +23,8 @@ use rusternetes_common::{
     },
     types::ObjectMeta,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::mock_http::*;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

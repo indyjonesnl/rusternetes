@@ -4,8 +4,8 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
-    pub use rusternetes_common::resources::{ConfigMap, Pod, Secret, ServiceAccount};
-    pub use rusternetes_storage::{build_key, build_prefix, Preconditions, Storage};
+    pub use k3rs_common::resources::{ConfigMap, Pod, Secret, ServiceAccount};
+    pub use k3rs_storage::{build_key, build_prefix, Preconditions, Storage};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -14,8 +14,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::legacy_serviceaccount_token_cleaner::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::json;
 
     const CM_NS: &str = "kube-system";

@@ -5,12 +5,12 @@
 //! and `authorization/cel/matcher.go:44-82` + `cel/metrics.go`.
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-use rusternetes_api_server::authorization_match_conditions::WebhookMatchCondition;
-use rusternetes_api_server::authorization_webhook::{
+use k3rs_api_server::authorization_match_conditions::WebhookMatchCondition;
+use k3rs_api_server::authorization_webhook::{
     Backoff, FailurePolicy, WebhookAuthorizer, WebhookClientConfig,
 };
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, RequestAttributes};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, RequestAttributes};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;

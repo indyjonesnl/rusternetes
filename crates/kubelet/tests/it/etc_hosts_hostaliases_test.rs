@@ -5,10 +5,10 @@
 //! standard localhost entries and any `spec.hostAliases` lines, and that
 //! `hostNetwork: true` pods do NOT get a managed file.
 
-use rusternetes_common::resources::pod::HostAlias;
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::kubelet::build_managed_hosts_content;
+use k3rs_common::resources::pod::HostAlias;
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::kubelet::build_managed_hosts_content;
 
 fn make_container(name: &str) -> Container {
     Container {

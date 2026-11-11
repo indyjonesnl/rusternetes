@@ -1,5 +1,5 @@
 //! Shadow type check of a ValidatingAdmissionPolicy against the types of the
-//! resources it matches (`RUSTERNETES_CEL_CHECKER=shadow`, default off).
+//! resources it matches (`K3RS_CEL_CHECKER=shadow`, default off).
 //!
 //! Ported from `plugin/policy/validating/typechecking.go` (release-1.35):
 //! `TypeChecker.CreateContext`, `typesToCheck` (with `extractGroups`,
@@ -16,14 +16,14 @@
 use crate::restmapper::{
     new_discovery_rest_mapper, served_group_resources, Gvr, PriorityRestMapper,
 };
-use rusternetes_common::cel_openapi_resolver::{DefinitionsSchemaResolver, Gvk, ResolveError};
-use rusternetes_common::cel_policy_types::{
+use k3rs_common::cel_openapi_resolver::{DefinitionsSchemaResolver, Gvk, ResolveError};
+use k3rs_common::cel_policy_types::{
     check_policy_expression_with, CheckOptions, DeclType, ParamsType, PolicyCheck,
     PolicyTypeContext,
 };
-use rusternetes_common::cel_schema_types::schema_decl_type;
-use rusternetes_common::cel_versions::{self, EnvSet, EnvType};
-use rusternetes_common::resources::{
+use k3rs_common::cel_schema_types::schema_decl_type;
+use k3rs_common::cel_versions::{self, EnvSet, EnvType};
+use k3rs_common::resources::{
     ExpressionWarning, ValidatingAdmissionPolicy, ValidatingAdmissionPolicySpec,
 };
 use std::collections::BTreeSet;

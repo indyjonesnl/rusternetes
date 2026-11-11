@@ -234,7 +234,7 @@ pub trait GroupVersionRegistry {
     fn prioritized_versions_for_group(&self, group: &str) -> Vec<Gv>;
 }
 
-impl GroupVersionRegistry for rusternetes_common::resource_encoding::Scheme {
+impl GroupVersionRegistry for k3rs_common::resource_encoding::Scheme {
     fn is_group_registered(&self, group: &str) -> bool {
         Self::is_group_registered(self, group)
     }
@@ -454,7 +454,7 @@ pub fn emulation_forward_compatible_resource_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resource_encoding::Scheme;
+    use k3rs_common::resource_encoding::Scheme;
 
     fn g(group: &str, version: &str) -> Gv {
         gv(group, version)

@@ -9,12 +9,12 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::csi::{FSGroupPolicy, VolumeLifecycleMode};
-use rusternetes_common::resources::CSIDriver;
-use rusternetes_common::validation::csidriver::{validate_csi_driver, validate_csi_driver_update};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::csi::{FSGroupPolicy, VolumeLifecycleMode};
+use k3rs_common::resources::CSIDriver;
+use k3rs_common::validation::csidriver::{validate_csi_driver, validate_csi_driver_update};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

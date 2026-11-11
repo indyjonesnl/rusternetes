@@ -1,4 +1,4 @@
-# Rusternetes cluster with Redis storage via rhino.
+# k3rs cluster with Redis storage via rhino.
 #
 # Rhino is an etcd-compatible gRPC server backed by Redis.
 # All components use their existing --etcd-servers flag pointed at rhino.
@@ -12,13 +12,13 @@ services:
   # Redis - backing store for rhino
   redis:
     image: docker.io/library/redis:7-alpine
-    container_name: rusternetes-redis
+    container_name: k3rs-redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
     networks:
-      - rusternetes-net
+      - k3rs-net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -31,14 +31,14 @@ services:
     build:
       context: .
       dockerfile: rhino.Dockerfile
-    container_name: rusternetes-rhino
+    container_name: k3rs-rhino
     ports:
       - "2379:2379"
     depends_on:
       redis:
         condition: service_healthy
     networks:
-      - rusternetes-net
+      - k3rs-net
     command:
       - "--listen-address"
       - "0.0.0.0:2379"
@@ -57,9 +57,9 @@ services:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: api-server
-    container_name: rusternetes-api-server
+    container_name: k3rs-api-server
     # NET_ADMIN lets the entrypoint install a route to the pod CIDR
     # (10.244.0.0/16) via the containerd container, so the pod/service proxy
     # subresources can reach pod IPs that live in containerd's CNI netns.
@@ -71,11 +71,11 @@ services:
       rhino:
         condition: service_healthy
     networks:
-      rusternetes-net:
+      k3rs-net:
         aliases:
           - api-server
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
       # CRI socket from the containerd service: the api-server reads container
       # stats (metrics) and runs exec/logs over CRI, not a Docker socket.
       - containerd-run:/run/containerd
@@ -123,21 +123,21 @@ services:
   # Scheduler — build-only. Runs as a static pod on node-1
   # (manifests/control-plane/kube-scheduler.yaml) via the node-1 kubelet, not as
   # its own compose service. Present only so `compose --profile build build`
-  # produces rusternetes-scheduler:latest. Never starts under `up`.
+  # produces k3rs-scheduler:latest. Never starts under `up`.
   scheduler:
     profiles: ["build"]
     build:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: scheduler
-    image: rusternetes-scheduler:latest
+    image: k3rs-scheduler:latest
 
   # Controller Manager — build-only. Runs in-cluster as a static pod on node-1
   # (manifests/control-plane/kube-controller-manager.yaml, API mode via
   # ApiStorage); `compose --profile build build` produces
-  # rusternetes-controller-manager:latest for the static pod. It never starts
+  # k3rs-controller-manager:latest for the static pod. It never starts
   # under `up` (gated by the `build` profile).
   controller-manager:
     profiles: ["build"]
@@ -145,9 +145,9 @@ services:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: controller-manager
-    image: rusternetes-controller-manager:latest
+    image: k3rs-controller-manager:latest
 
   # Shared CRI runtime: containerd (CRI plugin) + crun. The kubelets talk to
   # this over CRI v1 instead of a Docker/Podman socket; pods run as containers
@@ -155,15 +155,15 @@ services:
   # `containerd-run` volume, and KUBELET_VOLUMES_PATH is bind-mounted at the same
   # host path so the pod volumes the kubelet provisions resolve here too.
   containerd:
-    image: rusternetes-containerd:latest
+    image: k3rs-containerd:latest
     build:
       context: .
       dockerfile: containerd.Dockerfile
-    container_name: rusternetes-containerd
+    container_name: k3rs-containerd
     restart: unless-stopped
     privileged: true
     networks:
-      - rusternetes-net
+      - k3rs-net
     volumes:
       - containerd-run:/run/containerd
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
@@ -171,7 +171,7 @@ services:
       # mounts fail with "invalid argument". A named volume is host-fs-backed.
       - containerd-data:/var/lib/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
-      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+      - ${CERTS_PATH:-./.k3rs/certs}:${CERTS_PATH:-/etc/k3rs/certs}:ro
 
   # Kubelet - node agent that manages containers
   kubelet:
@@ -179,34 +179,34 @@ services:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: kubelet
-    container_name: rusternetes-kubelet
+    container_name: k3rs-kubelet
     privileged: true
     depends_on:
       - rhino
       - api-server
       - containerd
     networks:
-      - rusternetes-net
+      - k3rs-net
     volumes:
       # CRI socket shared from the containerd service.
       - containerd-run:/run/containerd
       # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
       # mount namespace and survive container restarts (#445).
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      - ./.k3rs/certs:/root/.k3rs/certs:ro
       # Templated control-plane static pod manifests (kube-scheduler) +
       # host-absolute certs mount for the scheduler static pod's hostPath. See
       # the matching block in compose.sqlite.yml for the full rationale.
-      - ./.rusternetes/manifests:/etc/rusternetes/manifests:ro
-      - ${CERTS_PATH:-./.rusternetes/certs}:${CERTS_PATH:-/etc/rusternetes/certs}:ro
+      - ./.k3rs/manifests:/etc/k3rs/manifests:ro
+      - ${CERTS_PATH:-./.k3rs/certs}:${CERTS_PATH:-/etc/k3rs/certs}:ro
     environment:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
       - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH}/node-1
-    command: ["--hostname-override", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/rusternetes/manifests"]
+    command: ["--hostname-override", "node-1", "--etcd-servers", "http://rhino:2379", "--cluster-dns", "10.96.0.10", "--metrics-port", "10250", "--sync-interval", "3", "--pod-manifest-path", "/etc/k3rs/manifests"]
 
   # Kubelet 2 - second node agent for multi-node conformance tests
   kubelet2:
@@ -214,23 +214,23 @@ services:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: kubelet
-    container_name: rusternetes-kubelet2
+    container_name: k3rs-kubelet2
     privileged: true
     depends_on:
       - rhino
       - api-server
       - containerd
     networks:
-      - rusternetes-net
+      - k3rs-net
     volumes:
       # CRI socket shared from the containerd service.
       - containerd-run:/run/containerd
       # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
       # mount namespace and survive container restarts (#445).
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      - ./.k3rs/certs:/root/.k3rs/certs:ro
     environment:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
@@ -242,15 +242,15 @@ services:
   # (network_mode: service:containerd) so its iptables Service rules live where
   # the pods are: pod IPs come from CNI (cni0, 10.244.0.0/16) inside containerd,
   # which the host netns cannot reach. It reaches rhino over the compose network
-  # (containerd is attached to rusternetes-net) at rhino:2379.
+  # (containerd is attached to k3rs-net) at rhino:2379.
   kube-proxy:
     build:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: kube-proxy
-    container_name: rusternetes-kube-proxy
+    container_name: k3rs-kube-proxy
     privileged: true
     network_mode: "service:containerd"
     user: "0:0"
@@ -282,26 +282,26 @@ services:
   # Build with: docker compose -f compose.redis.yml --profile build build dns
   dns:
     profiles: ["build"]
-    image: rusternetes-dns:latest
+    image: k3rs-dns:latest
     build:
       context: .
       dockerfile: services.Dockerfile
       args:
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
       target: dns
 
 networks:
-  rusternetes-net:
+  k3rs-net:
     driver: bridge
-    name: rusternetes-network
+    name: k3rs-network
 
 volumes:
   redis-data:
-    name: rusternetes-redis-data
+    name: k3rs-redis-data
   # CRI socket shared from the containerd service to the kubelets + api-server.
   containerd-run:
-    name: rusternetes-containerd-run
+    name: k3rs-containerd-run
   # containerd's snapshotter root on a real (host-fs-backed) volume so the
   # overlayfs snapshotter works inside the Docker-hosted containerd.
   containerd-data:
-    name: rusternetes-containerd-data
+    name: k3rs-containerd-data

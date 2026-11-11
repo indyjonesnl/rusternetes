@@ -2,22 +2,20 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::storageversion::{
+    pub use k3rs_common::resources::storageversion::{
         ServerStorageVersion, StorageVersion, StorageVersionCondition, StorageVersionStatus,
     };
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1035_label, is_dns1123_subdomain, is_qualified_name,
     };
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_dns_subdomain, validate_object_meta,
-    };
+    pub use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::storageversion::*;
+    use k3rs_common::validation::storageversion::*;
 
     fn agg(errs: &ErrorList) -> String {
         errs.iter()

@@ -180,7 +180,7 @@ function StorageCapabilities({ scs }: { scs: SC[] }) {
 
 function QuickCreateStorageClass({ onCreated }: { onCreated: (msg: string) => void }) {
   const [name, setName] = useState("");
-  const [provisioner, setProvisioner] = useState("rusternetes.io/hostpath");
+  const [provisioner, setProvisioner] = useState("k3rs.io/hostpath");
   const [reclaimPolicy, setReclaimPolicy] = useState("Delete");
   const [bindingMode, setBindingMode] = useState("WaitForFirstConsumer");
   const [creating, setCreating] = useState(false);
@@ -225,11 +225,11 @@ function QuickCreateStorageClass({ onCreated }: { onCreated: (msg: string) => vo
           <label className="mb-1 block text-[10px] text-[#a89880]">Provisioner</label>
           <select value={provisioner} onChange={(e) => setProvisioner(e.target.value)}
             className="w-full rounded-md border border-surface-3 bg-surface-2 px-3 py-1.5 text-sm text-[#e8ddd0] outline-none focus:border-accent">
-            <option value="rusternetes.io/hostpath">Host path (auto-provisions)</option>
+            <option value="k3rs.io/hostpath">Host path (auto-provisions)</option>
             <option value="kubernetes.io/no-provisioner">No provisioner (manual PV binding)</option>
           </select>
           <span className="mt-0.5 block text-[9px] text-[#a89880]">
-            {provisioner === "rusternetes.io/hostpath"
+            {provisioner === "k3rs.io/hostpath"
               ? "Automatically creates PVs as host directories"
               : "PVCs will stay Pending until a PV is manually created"}
           </span>
@@ -294,7 +294,7 @@ function QuickCreatePVC({ onCreated, storageClasses }: { onCreated: (msg: string
       "Content-Type": "application/json",
       Accept: "application/json",
     };
-    const token = sessionStorage.getItem("rusternetes-token");
+    const token = sessionStorage.getItem("k3rs-token");
     if (token) headers["Authorization"] = `Bearer ${token}`;
 
     fetch(`/api/v1/namespaces/${namespace}/persistentvolumeclaims`, {

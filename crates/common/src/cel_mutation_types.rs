@@ -1,6 +1,6 @@
 //! Shadow type check of the CEL expressions compiled by the admission
 //! compiler `plugin/cel/compile.go`, with the output type check of
-//! `CompileCELExpression` (`RUSTERNETES_CEL_CHECKER=shadow`, default off).
+//! `CompileCELExpression` (`K3RS_CEL_CHECKER=shadow`, default off).
 //! It covers a MutatingAdmissionPolicy (below), and the expressions of a
 //! ValidatingAdmissionPolicy (`validations` bool, `messageExpression` string,
 //! `auditAnnotations` string or null, `variables` any: `validating/
@@ -34,7 +34,7 @@ use crate::cel_policy_types::{
     PolicyTypeContext,
 };
 use crate::cel_versions::{EnvSet, EnvType};
-use rusternetes_cel_checker::DType;
+use k3rs_cel_checker::DType;
 
 /// One expression of a MutatingAdmissionPolicy and the environment it is
 /// compiled in.

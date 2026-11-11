@@ -16,7 +16,7 @@
 //! Served only while the `ClusterTrustBundle` gate is on, which stands in for
 //! `--runtime-config=certificates.k8s.io/v1alpha1`; see
 //! [`crate::handlers::clustertrustbundle::gate`] and
-//! `rusternetes_discovery::get_certificates_v1alpha1_resources`.
+//! `k3rs_discovery::get_certificates_v1alpha1_resources`.
 
 use crate::endpoints::handlers::{self as endpoints, RequestScope};
 use crate::handlers::clustertrustbundle::{gate, patch_content_type};
@@ -29,13 +29,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::ClusterTrustBundle,
     Error, List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 

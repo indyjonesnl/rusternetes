@@ -1,13 +1,13 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::Result;
 use chrono::Utc;
-use rusternetes_common::resources::autoscaling::ResourceMetricStatus;
-use rusternetes_common::resources::{
+use k3rs_common::resources::autoscaling::ResourceMetricStatus;
+use k3rs_common::resources::{
     Deployment, HorizontalPodAutoscaler, HorizontalPodAutoscalerCondition,
     HorizontalPodAutoscalerStatus, MetricSpec, MetricStatus, MetricValueStatus, ReplicaSet,
     StatefulSet,
 };
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -304,7 +304,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     pub async fn get_current_replicas(
         &self,
         namespace: &str,
-        target_ref: &rusternetes_common::resources::CrossVersionObjectReference,
+        target_ref: &k3rs_common::resources::CrossVersionObjectReference,
     ) -> Result<i32> {
         match target_ref.kind.as_str() {
             "Deployment" => {
@@ -333,7 +333,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     pub async fn scale_target(
         &self,
         namespace: &str,
-        target_ref: &rusternetes_common::resources::CrossVersionObjectReference,
+        target_ref: &k3rs_common::resources::CrossVersionObjectReference,
         desired_replicas: i32,
     ) -> Result<()> {
         match target_ref.kind.as_str() {
@@ -383,10 +383,10 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     async fn list_pods_for_selector(
         &self,
         namespace: &str,
-        selector: &rusternetes_common::types::LabelSelector,
-    ) -> Vec<rusternetes_common::resources::pod::Pod> {
+        selector: &k3rs_common::types::LabelSelector,
+    ) -> Vec<k3rs_common::resources::pod::Pod> {
         let prefix = build_prefix("pods", Some(namespace));
-        let pods: Vec<rusternetes_common::resources::pod::Pod> =
+        let pods: Vec<k3rs_common::resources::pod::Pod> =
             self.storage.list(&prefix).await.unwrap_or_default();
         let want = selector.match_labels.clone().unwrap_or_default();
         pods.into_iter()
@@ -405,7 +405,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     async fn filter_ready_cpu_pods(
         &self,
         namespace: &str,
-        selector: &rusternetes_common::types::LabelSelector,
+        selector: &k3rs_common::types::LabelSelector,
         info: PodMetricsInfo,
     ) -> PodMetricsInfo {
         use crate::controllers::hpa_pod_grouping as grp;
@@ -428,9 +428,9 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
     async fn target_selector(
         &self,
         namespace: &str,
-        target_ref: &rusternetes_common::resources::CrossVersionObjectReference,
-    ) -> rusternetes_common::types::LabelSelector {
-        use rusternetes_common::types::LabelSelector;
+        target_ref: &k3rs_common::resources::CrossVersionObjectReference,
+    ) -> k3rs_common::types::LabelSelector {
+        use k3rs_common::types::LabelSelector;
         match target_ref.kind.as_str() {
             "Deployment" => {
                 let key = build_key("deployments", Some(namespace), &target_ref.name);
@@ -609,7 +609,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     object: None,
                     external: None,
                     container_resource: Some(
-                        rusternetes_common::resources::ContainerResourceMetricStatus {
+                        k3rs_common::resources::ContainerResourceMetricStatus {
                             name: cr.name.clone(),
                             container: cr.container.clone(),
                             current: MetricValueStatus {
@@ -647,7 +647,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                 let status = MetricStatus {
                     metric_type: "Pods".into(),
                     resource: None,
-                    pods: Some(rusternetes_common::resources::PodsMetricStatus {
+                    pods: Some(k3rs_common::resources::PodsMetricStatus {
                         metric: p.metric.clone(),
                         current: MetricValueStatus {
                             value: None,
@@ -719,7 +719,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     metric_type: "Object".into(),
                     resource: None,
                     pods: None,
-                    object: Some(rusternetes_common::resources::ObjectMetricStatus {
+                    object: Some(k3rs_common::resources::ObjectMetricStatus {
                         metric: o.metric.clone(),
                         described_object: o.described_object.clone(),
                         current,
@@ -767,7 +767,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
                     resource: None,
                     pods: None,
                     object: None,
-                    external: Some(rusternetes_common::resources::ExternalMetricStatus {
+                    external: Some(k3rs_common::resources::ExternalMetricStatus {
                         metric: e.metric.clone(),
                         current: MetricValueStatus {
                             value: None,
@@ -984,7 +984,7 @@ impl<S: Storage + 'static> HorizontalPodAutoscalerController<S> {
 
 /// `fmt.Sprintf("%+v", *metav1.LabelSelector)`: the generated `String()`
 /// (apimachinery/pkg/apis/meta/v1/generated.pb.go:3157-3194).
-pub fn go_label_selector_string(sel: Option<&rusternetes_common::types::LabelSelector>) -> String {
+pub fn go_label_selector_string(sel: Option<&k3rs_common::types::LabelSelector>) -> String {
     let Some(sel) = sel else {
         return "nil".to_string();
     };
@@ -1009,14 +1009,14 @@ pub fn go_label_selector_string(sel: Option<&rusternetes_common::types::LabelSel
 }
 
 /// `Target.AverageValue.MilliValue()` (horizontal.go:468,476,727).
-fn parse_target_avg(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
+fn parse_target_avg(t: &k3rs_common::resources::MetricTarget) -> Result<i64> {
     t.average_value
         .as_ref()
         .and_then(|s| crate::controllers::hpa_metrics_client::parse_milli(s))
         .ok_or_else(|| anyhow::anyhow!("metric target missing/invalid averageValue"))
 }
 
-fn parse_target_value(t: &rusternetes_common::resources::MetricTarget) -> Result<i64> {
+fn parse_target_value(t: &k3rs_common::resources::MetricTarget) -> Result<i64> {
     t.value
         .as_ref()
         .or(t.average_value.as_ref())

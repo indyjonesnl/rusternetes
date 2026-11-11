@@ -1,11 +1,11 @@
 //! Ports of `pkg/kubelet/images/image_manager_test.go` (`TestApplyDefaultImageTag`,
 //! the `noFGPullerTestCases` flows of `TestParallelPuller`, `evalCRIPullErr`).
-use rusternetes_common::resources::{Event, Pod, PodSpec};
-use rusternetes_cri::fake::FakeCri;
-use rusternetes_kubelet::credentialprovider::NodeKeyring;
-use rusternetes_kubelet::image_manager::*;
-use rusternetes_kubelet::lifecycle::reason_from_anyhow;
-use rusternetes_storage::{Storage, StorageBackend};
+use k3rs_common::resources::{Event, Pod, PodSpec};
+use k3rs_cri::fake::FakeCri;
+use k3rs_kubelet::credentialprovider::NodeKeyring;
+use k3rs_kubelet::image_manager::*;
+use k3rs_kubelet::lifecycle::reason_from_anyhow;
+use k3rs_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,7 +66,7 @@ fn go_duration_formatting() {
 }
 
 struct Env {
-    rt: rusternetes_kubelet::cri_runtime::CriContainerRuntime,
+    rt: k3rs_kubelet::cri_runtime::CriContainerRuntime,
     fake: FakeCri,
     storage: Arc<StorageBackend>,
     pod: Pod,
@@ -79,7 +79,7 @@ async fn env() -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let sock = tmp.path().join("fake-cri.sock");
     fake.serve(&sock);
-    let rt = rusternetes_kubelet::cri_runtime::CriContainerRuntime::connect(
+    let rt = k3rs_kubelet::cri_runtime::CriContainerRuntime::connect(
         &sock,
         tmp.path().to_str().unwrap(),
     )

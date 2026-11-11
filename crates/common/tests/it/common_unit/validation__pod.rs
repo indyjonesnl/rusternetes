@@ -2,9 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::resources::pod::{
+    pub use k3rs_common::resources::pod::{
         AppArmorProfile, ConfigMapVolumeSource, Container, ContainerPort, ContainerResizePolicy,
         ContainerRestartRule, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvFromSource,
         EnvVar, EphemeralVolumeSource, ExecAction, FileKeySelector, GRPCAction, HTTPGetAction,
@@ -15,24 +13,26 @@ mod __parent {
         SecurityContext, SleepAction, TCPSocketAction, Toleration, TopologySpreadConstraint,
         Volume, VolumeDevice, VolumeMount, WeightedPodAffinityTerm, WorkloadReference,
     };
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_dns1123_subdomain_with_underscore,
         is_qualified_name, is_valid_label_value, validate_label_name, validate_label_selector,
         LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::pod_options::{
+    pub use k3rs_common::validation::pod_options::{
         get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
     };
-    pub use rusternetes_common::validation::pod_status::is_valid_id;
+    pub use k3rs_common::validation::pod_status::is_valid_id;
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::Sysctl;
-    use rusternetes_common::validation::pod::*;
+    use k3rs_common::resources::pod::Sysctl;
+    use k3rs_common::validation::pod::*;
 
     /// validation.go:1396 `sets.List(supportedHostPathTypes)` sorts, so the
     /// supported list in the NotSupported detail is lexicographic (#2499).
@@ -102,7 +102,7 @@ mod tests {
         let bad: Vec<&str> = errs
             .iter()
             .filter_map(|e| match &e.bad_value {
-                rusternetes_common::validation::field::BadValue::String(s) => Some(s.as_str()),
+                k3rs_common::validation::field::BadValue::String(s) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -518,12 +518,10 @@ mod tests {
         let cfg = PodDNSConfig {
             nameservers: None,
             searches: None,
-            options: Some(vec![
-                rusternetes_common::resources::pod::PodDNSConfigOption {
-                    name: String::new(),
-                    value: None,
-                },
-            ]),
+            options: Some(vec![k3rs_common::resources::pod::PodDNSConfigOption {
+                name: String::new(),
+                value: None,
+            }]),
         };
         let errs = validate_pod_dns_config(Some(&cfg), None, true, &p);
         assert!(
@@ -547,7 +545,7 @@ mod tests {
 
     // ----- gated-pod nodeSelector / nodeAffinity relaxation (KEP-3521) -----
 
-    use rusternetes_common::resources::pod::{
+    use k3rs_common::resources::pod::{
         NodeAffinity as NA, NodeSelector as NS, NodeSelectorRequirement as NSR,
         NodeSelectorTerm as NST,
     };
@@ -920,8 +918,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn strict_env_name_when_the_relaxed_gate_is_off() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
             false,
         );
         let errs = env_only(validate_pod_create(
@@ -941,8 +939,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn update_keeps_a_relaxed_env_name_the_old_pod_already_used() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::RelaxedEnvironmentVariableValidation,
             false,
         );
         let old = env_pod(serde_json::json!([{"name": "1bad", "value": "x"}]));
@@ -967,8 +965,8 @@ mod tests {
             on,
             vec!["spec.containers[0].env[0].valueFrom: Invalid value: \"\": must specify one of: `fieldRef`, `resourceFieldRef`, `configMapKeyRef`, `secretKeyRef` or `fileKeyRef`".to_string()]
         );
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::EnvFiles,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::EnvFiles,
             false,
         );
         let off = env_only(validate_pod_create(&pod, false));
@@ -1174,7 +1172,7 @@ mod tests {
         let e = sc_errs(serde_json::json!({"procMount": "Bogus"}), false);
         assert_eq!(
             e[0].error_type,
-            rusternetes_common::validation::field::ErrorType::NotSupported
+            k3rs_common::validation::field::ErrorType::NotSupported
         );
     }
 

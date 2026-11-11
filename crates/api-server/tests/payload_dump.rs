@@ -1,6 +1,6 @@
 //! Integration tests for the conformance payload-dump middleware.
 //!
-//! Each test sets `RUSTERNETES_DUMP_PAYLOADS=1` via a process-wide guard
+//! Each test sets `K3RS_DUMP_PAYLOADS=1` via a process-wide guard
 //! before the first call to `dumps_enabled()`. Tests run with
 //! `--test-threads=1` because the env gate is read once per process.
 //!
@@ -14,7 +14,7 @@
 //! `cargo test` does not.
 
 use axum::{body::Body, http::Request, routing::post, Router};
-use rusternetes_api_server::middleware::capture_payload;
+use k3rs_api_server::middleware::capture_payload;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -42,7 +42,7 @@ impl tracing::field::Visit for Visitor<'_> {
 }
 
 fn install_capture() -> (LogSink, tracing::subscriber::DefaultGuard) {
-    std::env::set_var("RUSTERNETES_DUMP_PAYLOADS", "1");
+    std::env::set_var("K3RS_DUMP_PAYLOADS", "1");
     let sink = LogSink::default();
     let sub = tracing_subscriber::registry().with(sink.clone());
     let guard = tracing::subscriber::set_default(sub);

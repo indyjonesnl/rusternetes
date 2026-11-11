@@ -3,12 +3,12 @@
 //! Tests all CRUD operations, edge cases, and error handling for poddisruptionbudgets.
 //! PodDisruptionBudget limits the number of pods that can be disrupted during voluntary disruptions.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     IntOrString, PodDisruptionBudget, PodDisruptionBudgetCondition, PodDisruptionBudgetSpec,
     PodDisruptionBudgetStatus,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -468,7 +468,7 @@ async fn test_pdb_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut pdb = create_test_pdb("test-owner", "default", 1);
-    pdb.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    pdb.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "apps/v1".to_string(),
         kind: "Deployment".to_string(),
         name: "web-deployment".to_string(),

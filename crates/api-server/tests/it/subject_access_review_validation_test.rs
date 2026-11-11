@@ -9,12 +9,12 @@
 //! }
 //! ```
 //!
-//! Rusternetes raised `Error::Internal` instead, so a body with neither
+//! k3rs raised `Error::Internal` instead, so a body with neither
 //! `resourceAttributes` nor `nonResourceAttributes` came back as a 500 with no
 //! field path. A 500 reads as "the server broke" and `client-go` retries it;
 //! the 422 is terminal and names the field (#1938).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn cause_fields(status: &Value) -> Vec<String> {

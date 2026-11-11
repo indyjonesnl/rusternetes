@@ -198,7 +198,7 @@ pub fn node_ip_config(node_ip: &str, cloud_provider: &str) -> Result<(Vec<IpAddr
 /// `lookup` is `net.LookupIP(node.Name)`; `resolve` is
 /// `resolveAddressFunc(nodeIP)` (default-route address of the family).
 pub fn set_node_address(
-    node: &mut rusternetes_common::resources::Node,
+    node: &mut k3rs_common::resources::Node,
     node_ips: &[IpAddr],
     validate: &dyn Fn(IpAddr) -> Result<(), String>,
     hostname: &str,
@@ -237,11 +237,11 @@ pub fn set_node_address(
     }
 
     let status = node.status.get_or_insert_with(Default::default);
-    let internal = |a: IpAddr| rusternetes_common::resources::NodeAddress {
+    let internal = |a: IpAddr| k3rs_common::resources::NodeAddress {
         address_type: "InternalIP".to_string(),
         address: a.to_string(),
     };
-    let host = rusternetes_common::resources::NodeAddress {
+    let host = k3rs_common::resources::NodeAddress {
         address_type: "Hostname".to_string(),
         address: hostname.to_string(),
     };
@@ -344,7 +344,7 @@ pub fn resolve_node_identity(
 
 /// `utilnode.GetNodeHostIPs` (pkg/util/node/node.go:65-98).
 pub fn get_node_host_ips(
-    addresses: &[rusternetes_common::resources::NodeAddress],
+    addresses: &[k3rs_common::resources::NodeAddress],
 ) -> Result<Vec<IpAddr>, String> {
     // Re-sort the addresses with InternalIPs first and then ExternalIPs.
     let mut all_ips: Vec<IpAddr> = Vec::with_capacity(addresses.len());
@@ -379,10 +379,10 @@ pub fn get_node_host_ips(
 /// `HostIPsIPFamilyMismatch` event message when upstream would record one.
 pub fn apply_host_ips(
     host_network: bool,
-    s: &mut rusternetes_common::resources::pod::PodStatus,
+    s: &mut k3rs_common::resources::pod::PodStatus,
     host_ips: &[IpAddr],
 ) -> Option<String> {
-    use rusternetes_common::resources::pod::{HostIP, PodIP};
+    use k3rs_common::resources::pod::{HostIP, PodIP};
     // utilnet.IPFamilyOfString: "4" / "6", or "" when unparseable.
     let family_of_str = |ip: &str| match parse_ip_sloppy(ip) {
         Some(ip) if ip.is_ipv4() => "4",
@@ -446,7 +446,7 @@ pub fn node_addresses(
     lookup: &dyn Fn(&str) -> Vec<IpAddr>,
     resolve: &dyn Fn(Option<IpAddr>) -> Result<IpAddr, String>,
 ) -> Result<Vec<(String, String)>, String> {
-    let mut node = rusternetes_common::resources::Node::new(hostname);
+    let mut node = k3rs_common::resources::Node::new(hostname);
     set_node_address(
         &mut node, node_ips, validate, hostname, false, lookup, resolve,
     )?;

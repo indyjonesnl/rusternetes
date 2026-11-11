@@ -1,5 +1,5 @@
 # Example Kubelet Configuration File
-# This file demonstrates production-grade configuration options for the Rusternetes Kubelet
+# This file demonstrates production-grade configuration options for the k3rs Kubelet
 #
 # Usage:
 #   kubelet --hostname-override=node-1 --config=/path/to/kubelet-config.yaml --etcd-servers=http://localhost:2379

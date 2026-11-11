@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::cri_runtime::runtime::{CriContainerRuntime, CriRuntimeError};
+    pub use k3rs_kubelet::cri_runtime::runtime::{CriContainerRuntime, CriRuntimeError};
 }
 
 mod fake_cri_tests {
     //! CRI-less tests: `CriContainerRuntime` against an in-process fake
-    //! `RuntimeService` (`rusternetes_cri::fake`), covering the stale-incarnation
+    //! `RuntimeService` (`k3rs_cri::fake`), covering the stale-incarnation
     //! paths of issue #1115 without containerd.
     //!
     //! Upstream parity: `computePodActions` (`pkg/kubelet/kuberuntime/
@@ -15,10 +15,10 @@ mod fake_cri_tests {
     //! statuses, which are fetched by pod UID. A same-name pod with a NEW uid must
     //! not see the old incarnation's containers.
 
-    use rusternetes_cri::fake::FakeCri;
-    use rusternetes_cri::v1::ContainerState;
-    use rusternetes_kubelet::cri_runtime::translate::labels;
-    use rusternetes_kubelet::cri_runtime::CriContainerRuntime;
+    use k3rs_cri::fake::FakeCri;
+    use k3rs_cri::v1::ContainerState;
+    use k3rs_kubelet::cri_runtime::translate::labels;
+    use k3rs_kubelet::cri_runtime::CriContainerRuntime;
 
     async fn runtime_on(fake: &FakeCri) -> (CriContainerRuntime, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -97,7 +97,7 @@ mod fake_cri_tests {
         );
         let (rt, _tmp) = runtime_on(&fake).await;
 
-        let mut pod_new = rusternetes_common::resources::Pod::new("web-0", Default::default());
+        let mut pod_new = k3rs_common::resources::Pod::new("web-0", Default::default());
         pod_new.metadata.uid = "uid-new".to_string();
         assert!(
             !rt.has_terminated_containers(&pod_new).await,
@@ -116,12 +116,12 @@ mod fake_cri_tests {
     // `StopPodSandbox` then `RemovePodSandbox` (`kuberuntime_manager.go`) with
     // containers stopped first (`killContainersWithSyncResult`).
 
-    use rusternetes_cri::v1;
-    use rusternetes_cri::CriClient;
-    use rusternetes_kubelet::cri_runtime::translate::sandbox_config;
+    use k3rs_cri::v1;
+    use k3rs_cri::CriClient;
+    use k3rs_kubelet::cri_runtime::translate::sandbox_config;
 
-    fn pod(ns: &str, name: &str, uid: &str) -> rusternetes_common::resources::Pod {
-        let mut p = rusternetes_common::resources::Pod::new(name, Default::default());
+    fn pod(ns: &str, name: &str, uid: &str) -> k3rs_common::resources::Pod {
+        let mut p = k3rs_common::resources::Pod::new(name, Default::default());
         p.metadata.namespace = Some(ns.to_string());
         p.metadata.uid = uid.to_string();
         p
@@ -137,7 +137,7 @@ mod fake_cri_tests {
         (cri, rt, tmp)
     }
 
-    async fn run_pod_with_container(cri: &mut CriClient, p: &rusternetes_common::resources::Pod) {
+    async fn run_pod_with_container(cri: &mut CriClient, p: &k3rs_common::resources::Pod) {
         let sb_cfg = sandbox_config(p, "/tmp/fake-logs");
         let sb = cri.run_pod_sandbox(sb_cfg.clone(), "").await.unwrap();
         let cfg = v1::ContainerConfig {
@@ -258,11 +258,11 @@ mod fake_cri_tests {
     // `FakeRuntimeService` + `FakeImageService`; the fake image service lets this
     // path (EnsureImageExists -> CreateContainer -> StartContainer) run here too.
 
-    fn app_container() -> rusternetes_common::resources::pod::Container {
+    fn app_container() -> k3rs_common::resources::pod::Container {
         serde_json::from_value(serde_json::json!({"name": "app", "image": "busybox"})).unwrap()
     }
 
-    async fn run_sandbox_only(cri: &mut CriClient, p: &rusternetes_common::resources::Pod) {
+    async fn run_sandbox_only(cri: &mut CriClient, p: &k3rs_common::resources::Pod) {
         cri.run_pod_sandbox(sandbox_config(p, "/tmp/fake-logs"), "")
             .await
             .unwrap();

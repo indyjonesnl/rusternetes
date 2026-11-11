@@ -12,7 +12,7 @@
 //!   ready" mode: the check only reports failure while the hook is running.
 
 use crate::shared_informer_factory::SharedInformerFactory;
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};

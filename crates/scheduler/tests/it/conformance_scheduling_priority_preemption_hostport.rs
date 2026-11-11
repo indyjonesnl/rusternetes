@@ -15,7 +15,7 @@
 //! test-by-test status table.
 //!
 //! Scope: scheduler unit. No HTTP harness; tests drive the published
-//! `rusternetes_scheduler::advanced` helpers (`check_preemption`,
+//! `k3rs_scheduler::advanced` helpers (`check_preemption`,
 //! `check_preemption_with_pdbs`, `check_host_port_conflicts`) and the
 //! `PriorityClass` resource model directly. `MemoryStorage` is not required
 //! because every helper is pure — it takes `&[Pod]` / `&[Node]` slices.
@@ -25,14 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::preempt_support::check_preemption;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus, PriorityClass, ReplicaSet,
     ReplicaSetSpec,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_scheduler::advanced::check_host_port_conflicts;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_scheduler::advanced::check_host_port_conflicts;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -93,7 +93,7 @@ fn container_with_host_port(
     c
 }
 
-use rusternetes_test_support::node_with_resources as make_node;
+use k3rs_test_support::node_with_resources as make_node;
 
 fn make_scheduled_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {
     let spec = PodSpec {
@@ -399,7 +399,7 @@ async fn preemption_execution_path_replicaset_available_replicas() {
                 match_labels: Some(selector_labels.clone()),
                 match_expressions: None,
             },
-            template: rusternetes_common::resources::PodTemplateSpec {
+            template: k3rs_common::resources::PodTemplateSpec {
                 metadata: Some(ObjectMeta::new("").with_labels(selector_labels.clone())),
                 spec: pod_template_spec.clone(),
             },

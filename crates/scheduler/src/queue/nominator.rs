@@ -8,7 +8,7 @@
 //! Locking: upstream's separate `nLock` (lowest in the lock order) is subsumed
 //! by the queue's single mutex, which owns this struct.
 
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;

@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::types::{ListMeta, TypeMeta};
+    pub use k3rs_common::types::{ListMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::BTreeMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::custom_metrics::*;
+    use k3rs_common::resources::custom_metrics::*;
 
     /// A whole-second timestamp. `Utc::now()` carries nanoseconds, which these
     /// fields no longer round-trip: they are `metav1.Time` upstream and now

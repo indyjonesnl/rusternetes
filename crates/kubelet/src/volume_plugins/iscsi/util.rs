@@ -11,7 +11,7 @@ use crate::volume_plugins::util::exec::ExecError;
 use crate::volume_plugins::util::mount_utils::path_exists;
 use crate::volume_plugins::VolumeHost;
 use anyhow::{anyhow, bail, Result};
-use rusternetes_common::resources::volume::PersistentVolumeMode;
+use k3rs_common::resources::volume::PersistentVolumeMode;
 use std::collections::BTreeMap;
 use std::io;
 use std::io::Write;

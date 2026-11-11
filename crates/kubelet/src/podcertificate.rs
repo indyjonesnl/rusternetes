@@ -42,14 +42,14 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rand::Rng;
-use rusternetes_common::resources::pod::PodCertificateProjection;
-use rusternetes_common::resources::podcertificaterequest::{
+use k3rs_common::resources::pod::PodCertificateProjection;
+use k3rs_common::resources::podcertificaterequest::{
     PodCertificateRequest, CONDITION_TYPE_DENIED, CONDITION_TYPE_FAILED, CONDITION_TYPE_ISSUED,
 };
-use rusternetes_common::resources::{EventType, Node, Pod, ServiceAccount};
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+use k3rs_common::resources::{EventType, Node, Pod, ServiceAccount};
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::{build_key, build_prefix, EventRecorder, Storage, WatchEvent};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -548,7 +548,7 @@ impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
                 // `:468-527`.
                 let pcr = match self.get_pcr(&key.namespace, &pcr_name).await {
                     Ok(p) => p,
-                    Err(rusternetes_common::Error::NotFound(_)) if now > pcr_abandon_at => {
+                    Err(k3rs_common::Error::NotFound(_)) if now > pcr_abandon_at => {
                         // "Not Found" could be informer lag or a real delete;
                         // after 10 minutes assume the latter and start over
                         // (`:474-484`).
@@ -631,7 +631,7 @@ impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
                 // `:608-687`.
                 let pcr = match self.get_pcr(&key.namespace, &refresh_pcr_name).await {
                     Ok(p) => p,
-                    Err(rusternetes_common::Error::NotFound(_)) if now > refresh_pcr_abandon_at => {
+                    Err(k3rs_common::Error::NotFound(_)) if now > refresh_pcr_abandon_at => {
                         // Return to credStateFresh so we create a new PCR (`:611-629`).
                         *guard = CredState::Fresh(issued);
                         return Err(anyhow!(
@@ -765,7 +765,7 @@ impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
         &self,
         namespace: &str,
         name: &str,
-    ) -> rusternetes_common::Result<PodCertificateRequest> {
+    ) -> k3rs_common::Result<PodCertificateRequest> {
         self.storage
             .get(&build_key(PCR_RESOURCE, Some(namespace), name))
             .await
@@ -833,7 +833,7 @@ impl<S: Storage + ?Sized + 'static> IssuingManager<S> {
                 name,
                 generate_name: Some("req-".to_string()),
                 namespace: Some(namespace.to_string()),
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "core/v1".to_string(),
                     kind: "Pod".to_string(),
                     name: pod_name.to_string(),

@@ -9,7 +9,7 @@
 //! `test-adapter/provider/provider.go:312-327` returns one value per matching
 //! series, each carrying that series' labels and no window.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 const BASE: &str = "/apis/external.metrics.k8s.io/v1beta1/namespaces/default/qps";
 

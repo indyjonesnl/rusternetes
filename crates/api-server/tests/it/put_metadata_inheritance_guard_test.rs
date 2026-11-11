@@ -7,7 +7,7 @@
 //! `deletionTimestamp` and `deletionGracePeriodSeconds`. No resource can opt
 //! out, because no resource wires it up individually.
 //!
-//! Rusternetes has one hand-written handler per resource, so the same
+//! k3rs has one hand-written handler per resource, so the same
 //! behaviour has to be called from ~60 places — and the failure mode is
 //! silent: a handler that simply never calls it stores the client's blanks. A
 //! blanked `uid` orphans every child, because `ownerReferences[].uid` then
@@ -278,7 +278,7 @@ fn every_put_handler_reinstates_server_owned_metadata() {
 // Behavioural counterpart
 // ---------------------------------------------------------------------------
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 /// The source-level guard above proves every handler *calls* the helper; this

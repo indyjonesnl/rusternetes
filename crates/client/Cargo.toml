@@ -1,5 +1,5 @@
 [package]
-name = "rusternetes-client"
+name = "k3rs-client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -28,7 +28,7 @@ tempfile = "3"
 # Live reflector e2e test (#1126): boot the real api-server router on a TCP
 # socket and drive the Reflector against it. test-support gives the router +
 # MemoryStorage; axum::serve binds it; tokio needs net + a multi-thread runtime.
-rusternetes-test-support = { path = "../test_support", features = [
+k3rs-test-support = { path = "../test_support", features = [
     "apiserver-harness",
 ] }
 axum = { workspace = true }

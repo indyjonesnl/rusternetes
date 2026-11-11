@@ -26,10 +26,10 @@
 //! for the informer's resync.
 
 use futures::StreamExt;
-use rusternetes_common::resources::{ClusterRole, PolicyRule};
-use rusternetes_common::types::label_selector_as_selector;
-use rusternetes_common::Result;
-use rusternetes_storage::{build_key, build_prefix, Storage, WorkQueue};
+use k3rs_common::resources::{ClusterRole, PolicyRule};
+use k3rs_common::types::label_selector_as_selector;
+use k3rs_common::Result;
+use k3rs_storage::{build_key, build_prefix, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -181,7 +181,7 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
         let key = build_key("clusterroles", None, name);
         let shared: ClusterRole = match self.storage.get(&key).await {
             Ok(r) => r,
-            Err(rusternetes_common::Error::NotFound(_)) => return Ok(()),
+            Err(k3rs_common::Error::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e),
         };
         let Some(aggregation_rule) = &shared.aggregation_rule else {
@@ -196,7 +196,7 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
         let mut new_rules: Vec<PolicyRule> = Vec::new();
         for selector in aggregation_rule.cluster_role_selectors.iter().flatten() {
             let selector = label_selector_as_selector(Some(selector))
-                .map_err(rusternetes_common::Error::InvalidResource)?;
+                .map_err(k3rs_common::Error::InvalidResource)?;
             let mut matching: Vec<&ClusterRole> = all
                 .iter()
                 .filter(|r| selector.matches(r.metadata.labels.as_ref()))
@@ -219,10 +219,7 @@ impl<S: Storage + 'static> ClusterRoleAggregationController<S> {
         }
 
         let mut result = self.apply_cluster_roles(&key, name, &new_rules).await;
-        if matches!(
-            result,
-            Err(rusternetes_common::Error::UnsupportedMediaType(_))
-        ) {
+        if matches!(result, Err(k3rs_common::Error::UnsupportedMediaType(_))) {
             // `errors.IsUnsupportedMediaType(err)` -> `updateClusterRoles` (:133-141).
             result = self.update_cluster_roles(&key, &shared, &new_rules).await;
         }
@@ -257,11 +254,9 @@ fn rule_equal(a: &PolicyRule, b: &PolicyRule) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusternetes_common::resources::rbac::AggregationRule;
-    use rusternetes_common::types::{
-        LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta,
-    };
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::resources::rbac::AggregationRule;
+    use k3rs_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+    use k3rs_storage::MemoryStorage;
     use std::collections::HashMap;
 
     fn rule(verbs: &[&str], resources: &[&str]) -> PolicyRule {

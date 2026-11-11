@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use chrono::Utc;
-    pub use rusternetes_api_server::ssa::merge::{
+    pub use k3rs_api_server::ssa::merge::{
         merge_string_map_group, LeafGroup, OwnedPaths, PathConflict, ResourceLeafSchema,
         CONFIGMAP_SCHEMA, SECRET_SCHEMA,
     };
-    pub use rusternetes_common::fieldmanager::ResetFields;
-    pub use rusternetes_common::resources::{ConfigMap, Secret};
-    pub use rusternetes_common::types::ManagedFieldsEntry;
+    pub use k3rs_common::fieldmanager::ResetFields;
+    pub use k3rs_common::resources::{ConfigMap, Secret};
+    pub use k3rs_common::types::ManagedFieldsEntry;
     pub use serde::de::DeserializeOwned;
     pub use serde::Serialize;
     pub use serde_json::{json, Map, Value};
@@ -19,7 +19,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::ssa::*;
+    use k3rs_api_server::ssa::*;
 
     #[test]
     fn decode_yaml_body() {
@@ -54,8 +54,8 @@ mod tests {
     /// applier's entry.
     mod legacy_apply_managed_fields {
         use super::*;
-        use rusternetes_api_server::fieldmanager::FieldManager;
-        use rusternetes_common::resources::Lease;
+        use k3rs_api_server::fieldmanager::FieldManager;
+        use k3rs_common::resources::Lease;
 
         fn lease(spec: Value) -> Value {
             json!({"apiVersion": "coordination.k8s.io/v1", "kind": "Lease",

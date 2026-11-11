@@ -7,7 +7,7 @@ mod __parent {
         objects::{Key, Map, OptionalValue},
         Value,
     };
-    pub use rusternetes_common::cel_struct::{self, CompiledExpression};
+    pub use k3rs_common::cel_struct::{self, CompiledExpression};
     pub use serde_json;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -15,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cel::*;
+    use k3rs_common::cel::*;
 
     #[test]
     fn test_cel_evaluator_simple() {

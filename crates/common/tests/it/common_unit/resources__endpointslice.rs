@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
 }
 
 mod null_field_tests {
     use super::__parent::*;
-    use rusternetes_common::resources::endpointslice::*;
+    use k3rs_common::resources::endpointslice::*;
 
     /// An api-server that holds an EndpointSlice with no endpoints serialises
     /// the field as an explicit `null`, not `[]`:

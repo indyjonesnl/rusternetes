@@ -1,16 +1,16 @@
-# Network Policies in Rusternetes
+# Network Policies in k3rs
 
 
 > **Tip:** You can manage related resources through the [web console](../CONSOLE_USER_GUIDE.md).
 ## Overview
 
-Rusternetes implements Kubernetes NetworkPolicy resources following the standard Kubernetes networking model. Network policies are enforced by **CNI (Container Network Interface) plugins** that support the NetworkPolicy API.
+k3rs implements Kubernetes NetworkPolicy resources following the standard Kubernetes networking model. Network policies are enforced by **CNI (Container Network Interface) plugins** that support the NetworkPolicy API.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Rusternetes Cluster                   │
+│                   k3rs Cluster                   │
 │                                                          │
 │  ┌──────────────────────────────────────────────────┐  │
 │  │          NetworkPolicy Controller                 │  │
@@ -34,7 +34,7 @@ Rusternetes implements Kubernetes NetworkPolicy resources following the standard
 
 ## How It Works
 
-### 1. NetworkPolicy Controller (Rusternetes)
+### 1. NetworkPolicy Controller (k3rs)
 
 The NetworkPolicy controller in `crates/controller-manager/src/controllers/network_policy.rs`:
 
@@ -63,7 +63,7 @@ CNI plugins like Calico, Cilium, or Weave:
 
 ## Supported CNI Plugins
 
-Rusternetes is compatible with any NetworkPolicy-capable CNI plugin:
+k3rs is compatible with any NetworkPolicy-capable CNI plugin:
 
 ### Recommended Plugins
 
@@ -114,7 +114,7 @@ kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/we
 
 ## NetworkPolicy Validation
 
-Rusternetes validates NetworkPolicy resources before storage:
+k3rs validates NetworkPolicy resources before storage:
 
 ### Policy Types
 - **Ingress**: Controls incoming traffic to pods
@@ -273,7 +273,7 @@ spec:
 
 ## Validation Examples
 
-Rusternetes validates NetworkPolicy resources and provides clear error messages:
+k3rs validates NetworkPolicy resources and provides clear error messages:
 
 ### Valid Policy
 
@@ -355,7 +355,7 @@ kubectl describe networkpolicy <name> -n <namespace>
 
 **4. Check Controller Logs**
 ```bash
-# Rusternetes controller-manager logs
+# k3rs controller-manager logs
 kubectl logs -n kube-system deployment/controller-manager | grep NetworkPolicy
 
 # Or with docker-compose
@@ -483,7 +483,7 @@ spec:
         - 203.0.113.5/32  # Block specific IP
 ```
 
-## Integration with Rusternetes
+## Integration with k3rs
 
 ### Controller Status
 
@@ -504,7 +504,7 @@ INFO NetworkPolicy default/allow-app-to-db reconciled (enforcement delegated to 
 
 ### matchExpressions Support
 
-Rusternetes fully supports matchExpressions in NetworkPolicy selectors:
+k3rs fully supports matchExpressions in NetworkPolicy selectors:
 
 ```yaml
 spec:

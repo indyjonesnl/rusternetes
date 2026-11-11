@@ -1,4 +1,4 @@
-# containerd configuration for the rusternetes CRI runtime service.
+# containerd configuration for the k3rs CRI runtime service.
 #
 # This is the shared container runtime the kubelets talk to over CRI v1
 # (replacing the Docker/Podman socket the bollard kubelet used). It enables the

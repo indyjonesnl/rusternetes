@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use ipnet::IpNet;
-    pub use rusternetes_common::resources::IPFamily;
+    pub use k3rs_common::resources::IPFamily;
     pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::service_ip_ranges::*;
+    use k3rs_common::service_ip_ranges::*;
 
     #[test]
     fn empty_is_the_default_single_stack_range() {

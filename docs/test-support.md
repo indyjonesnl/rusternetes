@@ -1,4 +1,4 @@
-# Shared test fixtures: `rusternetes-test-support`
+# Shared test fixtures: `k3rs-test-support`
 
 `crates/test_support` consolidates fixtures that test files across the workspace
 were duplicating, and is the substrate for porting upstream Kubernetes Go unit
@@ -7,13 +7,13 @@ tests into idiomatic Rust. It is wired into other crates **only** under
 
 ## What it provides
 
-- **Builders** (`rusternetes_test_support::builders`, default feature) —
+- **Builders** (`k3rs_test_support::builders`, default feature) —
   JSON-backed `pod()`, `service()`, `node()`, `endpoint_slice()` with fluent
   setters (`namespace`, `label`, `container`, `restart_policy`, `merge`, …) and
   `build::<T>()`. JSON-backed because the resource structs deserialize but don't
   all derive `Default`, and JSON gives precise control over the (often
   deliberately invalid) inputs validation tests need.
-- **Harness** (`rusternetes_test_support::harness`, feature
+- **Harness** (`k3rs_test_support::harness`, feature
   `apiserver-harness`) — `TestApiServer` boots the real `build_router` on
   `MemoryStorage` with `--skip-auth` and drives it via `tower::oneshot`. It is the
   canonical in-process api-server harness: every MemoryStorage-backed test file
@@ -24,7 +24,7 @@ tests into idiomatic Rust. It is wired into other crates **only** under
 ## Using the harness
 
 ```rust
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 #[tokio::test]
 async fn my_router_test() {
@@ -83,7 +83,7 @@ Add it to a crate that needs the harness:
 
 ```toml
 [dev-dependencies]
-rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }
+k3rs-test-support = { path = "../test_support", features = ["apiserver-harness"] }
 ```
 
 This forms a dev-dependency cycle (`test_support` → `api-server` as a normal dep,

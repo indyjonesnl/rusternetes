@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_common::resources::pod::WindowsSecurityContextOptions;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
     pub use regex::Regex;
-    pub use rusternetes_common::resources::pod::WindowsSecurityContextOptions;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
     pub use std::sync::LazyLock;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::windows_options::*;
+    use k3rs_common::validation::windows_options::*;
 
     fn opts(
         name: Option<&str>,
@@ -174,7 +174,7 @@ mod tests {
     /// validator (upstream `validation.go:5564` and `:8407`).
     #[test]
     fn wired_into_pod_and_container_security_context() {
-        use rusternetes_common::resources::pod::{Pod, SecurityContext};
+        use k3rs_common::resources::pod::{Pod, SecurityContext};
         let bad = opts(None, Some(""), None);
 
         let mut pod: Pod = serde_json::from_value(serde_json::json!({
@@ -186,7 +186,7 @@ mod tests {
             windows_options: Some(bad.clone()),
             ..Default::default()
         });
-        let errs = rusternetes_common::validation::pod::validate_pod_create(&pod, false);
+        let errs = k3rs_common::validation::pod::validate_pod_create(&pod, false);
         assert!(
             errs.iter().any(|e| e
                 .to_string()
@@ -206,7 +206,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .windows_options = Some(bad);
-        let errs = rusternetes_common::validation::pod::validate_pod_create(&pod2, false);
+        let errs = k3rs_common::validation::pod::validate_pod_create(&pod2, false);
         assert!(
             errs.iter().any(|e| e
                 .to_string()

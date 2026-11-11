@@ -13,7 +13,7 @@
 # sketch is collapsed to one baked image here (see SPIKE-FINDINGS.md, Crux 1).
 #
 # Later variants (v1..v6) swap ONE upstream Go component (api-server, kubelet,
-# scheduler, controller-manager, kube-proxy, dns) for its Rusternetes build.
+# scheduler, controller-manager, kube-proxy, dns) for its k3rs build.
 # Those swaps are baked into the image / injected pre-k0s-start (Crux 1), never
 # bind-mounted over /var/lib/k0s/bin.
 services:
@@ -33,7 +33,7 @@ services:
     privileged: true
     cgroup: host
     # Which staged shim the entrypoint installs for a component swap:
-    #   adapter (default) = map k0s argv -> the Rusternetes binary
+    #   adapter (default) = map k0s argv -> the k3rs binary
     #   probe             = confirmatory shim (log argv, exec the real Go binary)
     # Harmless on v0 (no stager present). Set on the host before `up`.
     environment:
@@ -41,7 +41,7 @@ services:
       # Extra HTTP-plain registries containerd-rs may pull from (comma-separated
       # host:port). Empty on v0..v4. The v5/v6 workload swaps set this to the
       # k0s-diff-net gateway registry (run-variant.sh) so containerd-rs — which
-      # has NO local-image load path — can pull the rusternetes-{dns,kube-proxy}
+      # has NO local-image load path — can pull the k3rs-{dns,kube-proxy}
       # images over HTTP. Consumed by containerd-rs (crates/images/src/pull.rs).
       CONTAINERD_RS_INSECURE_REGISTRIES: "${CONTAINERD_RS_INSECURE_REGISTRIES:-}"
     # Skip the k0s image's kind-style resolv.conf rewrite (breaks in-container
@@ -62,7 +62,7 @@ services:
         containerd-rs --config /etc/containerd-rs.toml >/var/log/containerd-rs.log 2>&1 &
         for i in $(seq 1 60); do [ -S /run/containerd-rs.sock ] && break; sleep 1; done
         [ -S /run/containerd-rs.sock ] || { echo "containerd-rs socket never appeared"; tail -n 40 /var/log/containerd-rs.log; exit 1; }
-        # Component-swap interposition (v1..v4): pre-stage the Rusternetes shim
+        # Component-swap interposition (v1..v4): pre-stage the k3rs shim
         # into /var/lib/k0s/bin BEFORE k0s starts, so k0s treats it as
         # up-to-date (mtime+size match) and execs it instead of re-extracting
         # the Go binary. No-op on v0 (stager absent). See SPIKE-FINDINGS.md.

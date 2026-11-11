@@ -6,7 +6,7 @@
 
 use axum::http::StatusCode;
 use futures::StreamExt;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -852,11 +852,11 @@ async fn networking_json_null_uses_go_zero_values_before_validation() {
 /// equating nil/empty slices (ingress/strategy.go:89; apimachinery/pkg/api/equality).
 #[test]
 fn ingress_generation_preserves_http_pointer_presence() {
-    use rusternetes_api_server::registry::{
+    use k3rs_api_server::registry::{
         networking::ingress::Strategy,
         rest::{RequestContext, RestUpdateStrategy},
     };
-    use rusternetes_common::resources::Ingress;
+    use k3rs_common::resources::Ingress;
     let mut body = ingress("http-pointer");
     body["metadata"]["generation"] = json!(1);
     body["spec"]["rules"] = json!([{"host":"*.example.com", "http":{"paths":[]}}]);

@@ -2,23 +2,21 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::event_correlator::{
+    pub use k3rs_common::event_correlator::{
         CorrelatorEvent, CorrelatorEventSource, CorrelatorEventType, CorrelatorObjectReference,
         EventCorrelator, RealClock,
     };
-    pub use rusternetes_common::resources::{
-        Event, EventSeries, EventSource, EventType, ObjectReference,
-    };
-    pub use rusternetes_common::Result;
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_common::resources::{Event, EventSeries, EventSource, EventType, ObjectReference};
+    pub use k3rs_common::Result;
+    pub use k3rs_storage::Storage;
     pub use std::sync::atomic::{AtomicU64, Ordering};
     pub use std::sync::{Arc, Mutex};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::event_recorder::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_storage::event_recorder::*;
+    use k3rs_storage::MemoryStorage;
 
     fn obj_ref(name: &str, namespace: &str) -> ObjectReference {
         ObjectReference {

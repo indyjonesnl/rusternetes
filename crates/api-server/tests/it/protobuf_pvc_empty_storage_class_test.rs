@@ -5,7 +5,7 @@
 //! non-nil empty `*string` as `0x2a 0x00`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";

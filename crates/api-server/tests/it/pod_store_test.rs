@@ -3,8 +3,8 @@
 //! pod handlers used to run inline.
 
 use axum::http::StatusCode;
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PODS: &str = "/api/v1/namespaces/default/pods";
@@ -485,7 +485,7 @@ async fn priority_comes_from_the_priority_class() {
 /// lowest value wins - not the first listed.
 #[tokio::test]
 async fn the_lowest_valued_global_default_wins() {
-    use rusternetes_common::resources::PriorityClass;
+    use k3rs_common::resources::PriorityClass;
 
     let api = TestApiServer::new();
     // "a-high" lists first but has the higher value.

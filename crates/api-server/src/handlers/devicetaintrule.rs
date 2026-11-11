@@ -8,7 +8,7 @@
 //! Upstream installs the storage whenever `resource.k8s.io/v1alpha3` is
 //! enabled (`pkg/registry/resource/rest/storage_resource.go:117-130`), a
 //! group-version that is in `alphaAPIGroupVersionsDisabledByDefault`
-//! (`pkg/controlplane/instance.go:493`). Rusternetes has no `--runtime-config`,
+//! (`pkg/controlplane/instance.go:493`). k3rs has no `--runtime-config`,
 //! so the `DRADeviceTaintRules` gate (alpha, off in v1.35,
 //! `pkg/features/kube_features.go:1240`) stands in for it, as
 //! `DRADeviceTaintRules` does for `resource.k8s.io/v1alpha3`; with it
@@ -24,14 +24,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     feature_gates::{enabled, Feature},
     resources::devicetaintrule::DeviceTaintRule,
     Error, List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 

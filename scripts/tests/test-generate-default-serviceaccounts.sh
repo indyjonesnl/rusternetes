@@ -13,7 +13,7 @@ mkdir -p "$TMP/scripts"
 cp "$REPO/scripts/generate-default-serviceaccounts.sh" "$TMP/scripts/"
 bash "$TMP/scripts/generate-default-serviceaccounts.sh" >/dev/null
 
-OUT="$TMP/.rusternetes/default-serviceaccounts.yaml"
+OUT="$TMP/.k3rs/default-serviceaccounts.yaml"
 fail=0
 for ns in default kube-system; do
   grep -q "^kind: ServiceAccount" "$OUT" || { echo "FAIL: no ServiceAccount emitted"; fail=1; }

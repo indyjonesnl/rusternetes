@@ -9,7 +9,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cancellation::*;
+    use k3rs_common::cancellation::*;
     use std::time::Duration;
 
     #[tokio::test]
@@ -76,9 +76,9 @@ mod tests {
 
     #[test]
     fn context_error_is_a_504_timeout_status() {
-        let e: rusternetes_common::Error = ContextError::DeadlineExceeded.into();
+        let e: k3rs_common::Error = ContextError::DeadlineExceeded.into();
         match e {
-            rusternetes_common::Error::Status(s) => {
+            k3rs_common::Error::Status(s) => {
                 assert_eq!(s.code, Some(504));
                 assert_eq!(s.reason.as_deref(), Some("Timeout"));
             }

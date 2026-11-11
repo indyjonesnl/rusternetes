@@ -15,16 +15,16 @@
 //! Tests in the "failing" bucket that need a live network (connectivity probes)
 //! are stubs marked `#[ignore = "GAP: needs live network"]`.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerPort, EndpointAddress, EndpointPort as EPPort, EndpointSubset, Endpoints,
     IntOrString, Pod, PodCondition, PodSpec, PodStatus, Service, ServicePort, ServiceSpec,
     ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
-use rusternetes_controller_manager::controllers::service::ServiceController;
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_controller_manager::controllers::endpointslice::EndpointSliceController;
+use k3rs_controller_manager::controllers::service::ServiceController;
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -705,7 +705,7 @@ async fn endpointslicemirroring_create_update_delete() {
     ctrl.reconcile_all().await.unwrap();
 
     let slices_prefix = build_prefix("endpointslices", Some("ns-mir1"));
-    let slices: Vec<rusternetes_common::resources::EndpointSlice> =
+    let slices: Vec<k3rs_common::resources::EndpointSlice> =
         storage.list(&slices_prefix).await.unwrap();
     let mirror: Vec<_> = slices
         .iter()
@@ -747,7 +747,7 @@ async fn endpointslicemirroring_create_update_delete() {
         .unwrap();
     ctrl.reconcile_all().await.unwrap();
 
-    let slices2: Vec<rusternetes_common::resources::EndpointSlice> =
+    let slices2: Vec<k3rs_common::resources::EndpointSlice> =
         storage.list(&slices_prefix).await.unwrap();
     let ips2: Vec<String> = slices2
         .iter()
@@ -777,7 +777,7 @@ async fn endpointslicemirroring_create_update_delete() {
     storage.delete(&ep_key).await.unwrap();
     ctrl.reconcile_all().await.unwrap();
 
-    let slices3: Vec<rusternetes_common::resources::EndpointSlice> =
+    let slices3: Vec<k3rs_common::resources::EndpointSlice> =
         storage.list(&slices_prefix).await.unwrap();
     let remaining: Vec<_> = slices3
         .iter()

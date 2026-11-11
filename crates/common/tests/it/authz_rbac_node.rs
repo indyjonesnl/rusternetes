@@ -7,18 +7,18 @@
 //! Each authorizer is tested through the public `Authorizer::authorize` API.
 //! Subjects are exercised via Role/RoleBinding and ClusterRole/ClusterRoleBinding
 //! objects seeded into a purpose-built `MockAuthzStorage` that holds RBAC objects
-//! in memory, mirroring what `rusternetes_storage::MemoryStorage` would do in
+//! in memory, mirroring what `k3rs_storage::MemoryStorage` would do in
 //! integration tests.
 
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::node_graph::{GraphPopulator, NodeGraph};
-use rusternetes_common::authz::{
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::node_graph::{GraphPopulator, NodeGraph};
+use k3rs_common::authz::{
     AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, AuthzStorage, Decision,
     NodeAuthorizer, Opinion, RBACAuthorizer, RequestAttributes,
 };
-use rusternetes_common::error::Result;
-use rusternetes_common::resources::rbac::{
+use k3rs_common::error::Result;
+use k3rs_common::resources::rbac::{
     ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
 };
 use serde::de::DeserializeOwned;
@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
-// Minimal in-test AuthzStorage so we don't need rusternetes-storage as a dep
+// Minimal in-test AuthzStorage so we don't need k3rs-storage as a dep
 // ---------------------------------------------------------------------------
 
 /// Simple in-memory storage for RBAC objects, keyed by the same path patterns
@@ -109,10 +109,10 @@ impl AuthzStorage for MockAuthzStorage {
         };
 
         let json = self.store.get(&full_key).ok_or_else(|| {
-            rusternetes_common::error::Error::NotFound(format!("key not found: {}", full_key))
+            k3rs_common::error::Error::NotFound(format!("key not found: {}", full_key))
         })?;
 
-        serde_json::from_str(json).map_err(rusternetes_common::error::Error::Serialization)
+        serde_json::from_str(json).map_err(k3rs_common::error::Error::Serialization)
     }
 
     /// List all objects of a given type in a namespace (or cluster-scope).
@@ -145,8 +145,8 @@ impl AuthzStorage for MockAuthzStorage {
         let mut out = Vec::new();
         for (k, v) in &self.store {
             if k.starts_with(&prefix) {
-                let item: T = serde_json::from_str(v)
-                    .map_err(rusternetes_common::error::Error::Serialization)?;
+                let item: T =
+                    serde_json::from_str(v).map_err(k3rs_common::error::Error::Serialization)?;
                 out.push(item);
             }
         }
@@ -963,7 +963,7 @@ fn node_identity(node_name: &str) -> UserInfo {
 
 fn graph_with_pod(node: &str) -> Arc<NodeGraph> {
     let graph = Arc::new(NodeGraph::new());
-    let pod: rusternetes_common::resources::Pod = serde_json::from_value(serde_json::json!({
+    let pod: k3rs_common::resources::Pod = serde_json::from_value(serde_json::json!({
         "metadata": {"name": "p", "namespace": "ns", "uid": "u"},
         "spec": {
             "nodeName": node,

@@ -4,7 +4,7 @@
 //! Upstream cannot have a per-resource gap here: `Store.Delete` calls
 //! `deletionFinalizersForGarbageCollection`
 //! (staging/src/k8s.io/apiserver/pkg/registry/generic/registry/store.go:976)
-//! for every resource, with no kind check. Rusternetes has one delete handler
+//! for every resource, with no kind check. k3rs has one delete handler
 //! per resource, and only 8 of ~50 passed a policy before this guard existed.
 //!
 //! The scope rule matters as much as the check. This guard originally examined
@@ -148,7 +148,7 @@ fn every_delete_handler_passes_the_request_delete_options() {
          `orphanDependents` are silently ignored for those resources. Upstream \
          applies them to every resource in \
          registry/generic/registry/store.go:976 with no kind check. Take \
-         `Extension(delete_opts): Extension<rusternetes_middleware::DeleteOptionsCtx>` \
+         `Extension(delete_opts): Extension<k3rs_middleware::DeleteOptionsCtx>` \
          and pass `&delete_opts`.\n\nOffenders:\n  {}",
         offenders.len(),
         offenders.join("\n  ")

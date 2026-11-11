@@ -4,14 +4,14 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::authz::Authorizer;
-use rusternetes_common::resources::Role;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::authz::Authorizer;
+use k3rs_common::resources::Role;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{
     name_is_path_segment, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_common::validation::rbac::validate_role;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::rbac::validate_role;
+use k3rs_storage::StorageBackend;
 
 use super::policybased::{PolicyBased, RolePolicyBased};
 use super::rule::DefaultRuleResolver;

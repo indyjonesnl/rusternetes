@@ -4,13 +4,13 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::CSINode;
-use rusternetes_common::validation::csinode::{
+use k3rs_common::resources::CSINode;
+use k3rs_common::validation::csinode::{
     validate_csi_node, validate_csi_node_update, CsiNodeValidationOptions,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_storage::StorageBackend;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

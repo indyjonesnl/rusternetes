@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{PodSpec, Toleration};
+    pub use k3rs_common::resources::{PodSpec, Toleration};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Container;
-    use rusternetes_common::tolerations::*;
+    use k3rs_common::resources::Container;
+    use k3rs_common::tolerations::*;
 
     fn spec_with_container() -> PodSpec {
         PodSpec {

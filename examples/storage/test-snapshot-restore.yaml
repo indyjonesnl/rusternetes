@@ -2,7 +2,7 @@
 #
 # This example demonstrates how to restore data from a snapshot to a new PVC.
 # Prerequisites:
-# 1. Create a StorageClass with a supported provisioner (e.g., rusternetes.io/hostpath)
+# 1. Create a StorageClass with a supported provisioner (e.g., k3rs.io/hostpath)
 # 2. Create a PVC and populate it with data
 # 3. Create a VolumeSnapshotClass
 # 4. Create a VolumeSnapshot of the original PVC
@@ -17,9 +17,9 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: fast-storage
-provisioner: rusternetes.io/hostpath
+provisioner: k3rs.io/hostpath
 parameters:
-  path: /tmp/rusternetes/dynamic-pvs
+  path: /tmp/k3rs/dynamic-pvs
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 
@@ -44,7 +44,7 @@ apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: hostpath-snapclass
-driver: rusternetes.io/hostpath-snapshotter
+driver: k3rs.io/hostpath-snapshotter
 deletionPolicy: Delete
 
 ---

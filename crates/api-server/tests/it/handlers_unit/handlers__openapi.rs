@@ -8,17 +8,17 @@ mod __parent {
         http::{header, HeaderMap, StatusCode},
         response::Response,
     };
-    pub use rusternetes_api_server::gnostic;
-    pub use rusternetes_api_server::openapi::generate_openapi_spec;
-    pub use rusternetes_api_server::state::ApiServerState;
-    pub use rusternetes_storage::{build_prefix, Storage};
+    pub use k3rs_api_server::gnostic;
+    pub use k3rs_api_server::openapi::generate_openapi_spec;
+    pub use k3rs_api_server::state::ApiServerState;
+    pub use k3rs_storage::{build_prefix, Storage};
     pub use std::sync::Arc;
     pub use tracing::info;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::handlers::openapi::*;
+    use k3rs_api_server::handlers::openapi::*;
 
     /// Refs #3057: admissionregistration.k8s.io/v1 kinds must be published in
     /// /openapi/v2 under their `io.k8s.api.admissionregistration.v1.<Kind>` key
@@ -225,7 +225,7 @@ mod tests {
         let spec = serde_json::json!({
             "swagger": "2.0",
             "info": {
-                "title": "Rusternetes Kubernetes API",
+                "title": "k3rs Kubernetes API",
                 "version": "v1.35.0"
             },
             "paths": {},

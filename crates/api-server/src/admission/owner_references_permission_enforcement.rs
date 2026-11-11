@@ -22,10 +22,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Opinion, RequestAttributes};
-use rusternetes_common::types::{ObjectMeta, OwnerReference};
-use rusternetes_discovery::restmapper::{Gk, MapperError, RestMapping, Scope};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Opinion, RequestAttributes};
+use k3rs_common::types::{ObjectMeta, OwnerReference};
+use k3rs_discovery::restmapper::{Gk, MapperError, RestMapping, Scope};
 
 use crate::handlers::custom_metrics::ServedRestMapper;
 

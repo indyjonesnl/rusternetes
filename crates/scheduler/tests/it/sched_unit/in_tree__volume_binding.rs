@@ -2,16 +2,16 @@
 //! (`volumebinding/volume_binding.go:360-390`, `:424-453`); the binder's
 //! matching logic is covered in `volume_binding.rs`.
 use async_trait::async_trait;
-use rusternetes_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
-use rusternetes_scheduler::fwk::{
+use k3rs_common::resources::{Node, PersistentVolume, PersistentVolumeClaim, Pod};
+use k3rs_scheduler::fwk::{
     Code, CycleState, FilterPlugin, Handle, NoHandle, NodeInfo, PreFilterPlugin, PreScorePlugin,
     ScorePlugin,
 };
-use rusternetes_scheduler::in_tree::{
+use k3rs_scheduler::in_tree::{
     clear_pod_volumes_by_node, pod_volumes_by_node, VolumeBinding, VolumeBindingScore,
 };
-use rusternetes_scheduler::profile::Profile;
-use rusternetes_scheduler::volume_binding::{default_shape, VolumeSnapshot};
+use k3rs_scheduler::profile::Profile;
+use k3rs_scheduler::volume_binding::{default_shape, VolumeSnapshot};
 use serde_json::json;
 
 struct Listers(VolumeSnapshot);
@@ -153,8 +153,8 @@ async fn filter_without_pre_filter_state_is_an_error() {
 #[tokio::test]
 #[serial_test::serial]
 async fn pre_score_skips_without_storage_capacity_scoring() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::StorageCapacityScoring,
         false,
     );
     let s = VolumeBindingScore::new(default_shape())
@@ -175,8 +175,8 @@ async fn pre_score_skips_without_storage_capacity_scoring() {
 #[tokio::test]
 #[serial_test::serial]
 async fn score_is_zero_for_a_node_without_recorded_volumes() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::StorageCapacityScoring,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::StorageCapacityScoring,
         true,
     );
     let plugin = VolumeBindingScore::new(default_shape());
@@ -216,7 +216,7 @@ impl Handle for Binder {
 
     fn volume_reserve(
         &self,
-        state: &mut rusternetes_scheduler::volume_bind::VolumeBindingState,
+        state: &mut k3rs_scheduler::volume_bind::VolumeBindingState,
         _pod: &Pod,
         _node_name: &str,
     ) -> Result<(), String> {
@@ -226,7 +226,7 @@ impl Handle for Binder {
 
     async fn volume_pre_bind(
         &self,
-        _state: &mut rusternetes_scheduler::volume_bind::VolumeBindingState,
+        _state: &mut k3rs_scheduler::volume_bind::VolumeBindingState,
         _pod: &Pod,
         _node_name: &str,
     ) -> Result<(), String> {
@@ -237,7 +237,7 @@ impl Handle for Binder {
 
     fn volume_unreserve(
         &self,
-        _state: &rusternetes_scheduler::volume_bind::VolumeBindingState,
+        _state: &k3rs_scheduler::volume_bind::VolumeBindingState,
         _pod: &Pod,
         _node_name: &str,
     ) {

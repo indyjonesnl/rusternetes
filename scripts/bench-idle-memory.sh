@@ -6,11 +6,11 @@
 # before/after number.
 #
 # Usage:
-#   scripts/bench-idle-memory.sh                 # boot target/release/rusternetes, sample 30s
+#   scripts/bench-idle-memory.sh                 # boot target/release/k3rs, sample 30s
 #   scripts/bench-idle-memory.sh --pid 12345     # sample an already-running process
 #   scripts/bench-idle-memory.sh --seconds 60    # override sample window
 #   scripts/bench-idle-memory.sh --settle 10     # boot settle time before sampling
-#   scripts/bench-idle-memory.sh --bin PATH      # boot a specific binary (default: ${CARGO_TARGET_DIR:-target}/release/rusternetes)
+#   scripts/bench-idle-memory.sh --bin PATH      # boot a specific binary (default: ${CARGO_TARGET_DIR:-target}/release/k3rs)
 #   scripts/bench-idle-memory.sh --max-mib 400   # exit 1 if max VmRSS exceeds the bound (CI smoke)
 #   scripts/bench-idle-memory.sh -- --log-level warn   # extra args for the booted binary
 #
@@ -45,9 +45,9 @@ cleanup() { :; }
 BOOTED=""
 
 if [[ -z "$PID" ]]; then
-  BIN="${BIN:-${CARGO_TARGET_DIR:-target}/release/rusternetes}"
+  BIN="${BIN:-${CARGO_TARGET_DIR:-target}/release/k3rs}"
   if [[ ! -x "$BIN" ]]; then
-    echo "error: $BIN not found. Build it: cargo build --release -p rusternetes" >&2
+    echo "error: $BIN not found. Build it: cargo build --release -p k3rs" >&2
     echo "       or sample a running process with --pid <N>." >&2
     exit 1
   fi
@@ -56,7 +56,7 @@ if [[ -z "$PID" ]]; then
   LOG="$WORK/bench-idle-memory.log"
   (cd "$WORK" && exec "$(realpath "$BIN")" --skip-auth --disable-proxy \
     --dns-bind 127.0.0.1:5353 --bind-address 127.0.0.1:16443 \
-    --data-dir "$WORK/rusternetes.db" --volume-dir "$WORK/volumes" \
+    --data-dir "$WORK/k3rs.db" --volume-dir "$WORK/volumes" \
     "${EXTRA[@]}") >"$LOG" 2>&1 &
   PID=$!
   BOOTED=1

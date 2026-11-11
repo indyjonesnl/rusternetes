@@ -1,5 +1,5 @@
 [package]
-name = "rusternetes-kubelet"
+name = "k3rs-kubelet"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,7 +10,7 @@ name = "kubelet"
 path = "src/main.rs"
 
 [lib]
-name = "rusternetes_kubelet"
+name = "k3rs_kubelet"
 path = "src/lib.rs"
 # Unit tests live in tests/it: a second compilation of the lib as a test
 # target costs as much as the lib itself.
@@ -19,22 +19,22 @@ test = false
 [features]
 mimalloc = ["dep:mimalloc"]
 default = []
-sqlite = ["rusternetes-storage/sqlite"]
-redis = ["rusternetes-storage/redis"]
+sqlite = ["k3rs-storage/sqlite"]
+redis = ["k3rs-storage/redis"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
+k3rs-common = { path = "../common", features = ["axum-support", "clap-support"] }
 pem.workspace = true
 prometheus.workspace = true
 # api-client: StorageBackend::Api lets the in-cluster kubelet read/write via
 # the api-server while keeping its Arc<StorageBackend> handle unchanged.
-rusternetes-storage = { path = "../storage", features = ["api-client"] }
-rusternetes-client = { path = "../client" }
-rusternetes-middleware = { path = "../middleware" } # user_from_client_cert_der / PeerCertificates (x509 authn)
-rusternetes-cri = { path = "../cri" }
-rusternetes-csi = { path = "../csi" }
-rusternetes-streamproxy = { path = "../streamproxy" }
+k3rs-storage = { path = "../storage", features = ["api-client"] }
+k3rs-client = { path = "../client" }
+k3rs-middleware = { path = "../middleware" } # user_from_client_cert_der / PeerCertificates (x509 authn)
+k3rs-cri = { path = "../cri" }
+k3rs-csi = { path = "../csi" }
+k3rs-streamproxy = { path = "../streamproxy" }
 thiserror.workspace = true
 uuid.workspace = true
 tokio.workspace = true
@@ -70,7 +70,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 async-trait = { workspace = true }
 # CSI Node-service client dials the driver's unix socket (same connector shape
-# as rusternetes-cri): tonic 0.12 rides hyper 1.x, so a tokio UnixStream is
+# as k3rs-cri): tonic 0.12 rides hyper 1.x, so a tokio UnixStream is
 # wrapped in hyper_util's TokioIo.
 hyper-util = { version = "0.1", features = ["client", "tokio"] }
 tower = { workspace = true }
@@ -95,7 +95,7 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 # Fake CRI RuntimeService server for CRI-less concurrency/stale-incarnation tests (#1115).
-rusternetes-cri = { path = "../cri", features = ["fake-server"] }
+k3rs-cri = { path = "../cri", features = ["fake-server"] }
 tempfile = "3"
 serial_test = { workspace = true }
 http-body-util = "0.1"

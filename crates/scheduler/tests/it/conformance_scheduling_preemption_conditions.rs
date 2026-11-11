@@ -32,7 +32,7 @@
 //!     attempting to bind a (port, protocol) already owned by a 0.0.0.0 pod).
 //!
 //! NO HTTP harness — scheduler logic is exercised by direct calls into
-//! `rusternetes_scheduler::advanced`. Fixtures are plain `Node`/`Pod` values.
+//! `k3rs_scheduler::advanced`. Fixtures are plain `Node`/`Pod` values.
 //!
 //! See the test-by-test status table in docs/CONFORMANCE.md for the current
 //! pass/fail mapping.
@@ -40,11 +40,9 @@
 use std::collections::HashMap;
 
 use crate::preempt_support::check_preemption;
-use rusternetes_common::resources::{
-    Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus,
-};
-use rusternetes_common::types::{Phase, ResourceRequirements};
-use rusternetes_scheduler::advanced::check_host_port_conflicts;
+use k3rs_common::resources::{Container, ContainerPort, Pod, PodCondition, PodSpec, PodStatus};
+use k3rs_common::types::{Phase, ResourceRequirements};
+use k3rs_scheduler::advanced::check_host_port_conflicts;
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -108,7 +106,7 @@ fn container_with_host_port(
     c
 }
 
-use rusternetes_test_support::node_with_resources as make_node;
+use k3rs_test_support::node_with_resources as make_node;
 
 /// Scheduled, running pod on `node_name` with the given priority.
 fn make_running_pod(name: &str, priority: i32, cpu: &str, memory: &str, node_name: &str) -> Pod {

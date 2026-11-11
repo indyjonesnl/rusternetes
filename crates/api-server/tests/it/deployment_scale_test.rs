@@ -2,7 +2,7 @@
 //! (#1995): pkg/registry/apps/deployment/storage/storage.go:283-480.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const DEPLOYS: &str = "/apis/apps/v1/namespaces/default/deployments";

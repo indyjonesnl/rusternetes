@@ -10,7 +10,7 @@
 //! deletion in that request" holds for PUT and PATCH alike, for every resource,
 //! by construction.
 //!
-//! Rusternetes had it per-handler, and #1833 wired it into all 55 **update**
+//! k3rs had it per-handler, and #1833 wired it into all 55 **update**
 //! handlers only. PATCH is the mechanism that actually matters: upstream's
 //! garbage collector removes a finalizer with a JSON **merge patch** —
 //! `removeFinalizer` builds `objectForFinalizersPatch` and sends it as
@@ -24,7 +24,7 @@
 //! by dependency circle` against a vanilla kube-controller-manager left pod1
 //! and pod2 terminating forever and pod3 never deleted at all.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// Create an object that already carries a finalizer, DELETE it so the server

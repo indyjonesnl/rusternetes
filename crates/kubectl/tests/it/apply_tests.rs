@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use rusternetes_common::resources::*;
+    use k3rs_common::resources::*;
     use serde::Deserialize;
 
     #[test]

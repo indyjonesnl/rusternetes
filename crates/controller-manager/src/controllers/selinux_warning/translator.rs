@@ -1,7 +1,7 @@
 //! Port of `pkg/controller/volume/selinuxwarning/translator/selinux_translator.go`
 //! and `.../internal/parse/selinux_label.go` (release-1.35).
 
-use rusternetes_common::resources::pod::SELinuxOptions;
+use k3rs_common::resources::pod::SELinuxOptions;
 
 /// `parse.ParseSELinuxLabel` (`internal/parse/selinux_label.go`): split a
 /// label into `[user, role, type, level]` with `strings.SplitN(label, ":", 4)`.

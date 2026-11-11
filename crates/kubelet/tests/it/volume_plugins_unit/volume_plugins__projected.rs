@@ -4,12 +4,10 @@
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
-    pub use rusternetes_kubelet::atomic_writer::FileProjection;
-    pub use rusternetes_kubelet::volume_plugins::{
-        Attributes, Mounter, Spec, VolumeHost, VolumePlugin,
-    };
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_common::resources::{ConfigMap, KeyToPath, Pod, Secret, Volume};
+    pub use k3rs_kubelet::atomic_writer::FileProjection;
+    pub use k3rs_kubelet::volume_plugins::{Attributes, Mounter, Spec, VolumeHost, VolumePlugin};
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use std::collections::{BTreeMap, HashMap};
     pub use std::sync::Arc;
     pub use tracing::{info, warn};
@@ -17,26 +15,26 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::projected::*;
+    use k3rs_kubelet::volume_plugins::projected::*;
 
     /// The args the operation generator builds from the pod
     /// (`operation_generator.go:582-589`).
-    fn args_for(pod: &Pod) -> rusternetes_kubelet::volume_plugins::MounterArgs {
-        rusternetes_kubelet::volume_plugins::MounterArgs {
-            fs_user: rusternetes_kubelet::volume_plugins::util::fs_user_from(pod),
-            fs_group: rusternetes_kubelet::volume_plugins::util::fs_group_from(pod),
+    fn args_for(pod: &Pod) -> k3rs_kubelet::volume_plugins::MounterArgs {
+        k3rs_kubelet::volume_plugins::MounterArgs {
+            fs_user: k3rs_kubelet::volume_plugins::util::fs_user_from(pod),
+            fs_group: k3rs_kubelet::volume_plugins::util::fs_group_from(pod),
             ..Default::default()
         }
     }
 
-    use rusternetes_common::resources::Volume;
+    use k3rs_common::resources::Volume;
 
     fn plugin() -> ProjectedPlugin {
         ProjectedPlugin::new(std::sync::Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             ),
         ))
@@ -82,16 +80,13 @@ mod tests {
 
     #[test]
     fn plugin_name_is_the_upstream_name() {
-        assert_eq!(
-            plugin().name(),
-            rusternetes_kubelet::pod_dirs::plugin::PROJECTED
-        );
+        assert_eq!(plugin().name(), k3rs_kubelet::pod_dirs::plugin::PROJECTED);
     }
 
     // ---- behavioural tests through the mounter (projected.go SetUpAt /
     //      collectData) ----
 
-    use rusternetes_common::resources::ConfigMap;
+    use k3rs_common::resources::ConfigMap;
     use std::collections::HashMap;
 
     fn pod() -> Pod {
@@ -116,10 +111,10 @@ mod tests {
         v: &Volume,
     ) -> Box<dyn Mounter> {
         let p = ProjectedPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string_lossy().to_string(),
                 Some(storage.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         ));
@@ -216,10 +211,10 @@ mod tests {
         pod: &Pod,
     ) -> Box<dyn Mounter> {
         let p = ProjectedPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string_lossy().to_string(),
                 Some(storage.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         ));
@@ -401,10 +396,10 @@ mod tests {
         pod: &Pod,
     ) -> Box<dyn Mounter> {
         let p = ProjectedPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string_lossy().to_string(),
                 Some(storage.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         ));
@@ -491,14 +486,14 @@ mod tests {
     /// from the token manager once the wrapped emptyDir is torn down.
     #[tokio::test]
     async fn tear_down_evicts_the_pods_cached_service_account_token() {
-        use rusternetes_kubelet::volume_plugins::{VolumeHost, VolumePlugin};
+        use k3rs_kubelet::volume_plugins::{VolumeHost, VolumePlugin};
         let dir = tempfile::tempdir().unwrap();
         let st = Arc::new(StorageBackend::new_memory());
         let host = Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 dir.path().to_string_lossy().to_string(),
                 Some(st.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         );
@@ -589,10 +584,10 @@ mod tests {
     ) -> Result<BTreeMap<String, FileProjection>> {
         let root = tempfile::tempdir().unwrap();
         let plugin = ProjectedPlugin::new(Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.path().to_string_lossy().to_string(),
                 Some(st.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             ),
         ));
@@ -747,7 +742,7 @@ mod tests {
     struct FakePodCertificateManager;
 
     #[async_trait]
-    impl rusternetes_kubelet::podcertificate::Manager for FakePodCertificateManager {
+    impl k3rs_kubelet::podcertificate::Manager for FakePodCertificateManager {
         fn track_pod(&self, _pod: &Pod) {}
         fn forget_pod(&self, _pod: &Pod) {}
         async fn get_pod_certificate_credential_bundle(
@@ -760,7 +755,7 @@ mod tests {
         ) -> Result<(Vec<u8>, Vec<u8>)> {
             Ok((b"key\n".to_vec(), b"cert\n".to_vec()))
         }
-        fn metric_report(&self) -> rusternetes_kubelet::podcertificate::MetricReport {
+        fn metric_report(&self) -> k3rs_kubelet::podcertificate::MetricReport {
             Default::default()
         }
     }
@@ -771,10 +766,10 @@ mod tests {
         with_manager: bool,
     ) -> Result<BTreeMap<String, FileProjection>> {
         let root = tempfile::tempdir().unwrap();
-        let mut host = rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+        let mut host = k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
             root.path().to_string_lossy().to_string(),
             Some(Arc::new(StorageBackend::new_memory())),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         );
         if with_manager {
@@ -855,7 +850,7 @@ mod tests {
         use std::sync::Mutex;
         struct Recorder(Mutex<Vec<usize>>);
         #[async_trait]
-        impl rusternetes_kubelet::podcertificate::Manager for Recorder {
+        impl k3rs_kubelet::podcertificate::Manager for Recorder {
             fn track_pod(&self, _pod: &Pod) {}
             fn forget_pod(&self, _pod: &Pod) {}
             async fn get_pod_certificate_credential_bundle(
@@ -869,16 +864,16 @@ mod tests {
                 self.0.lock().unwrap().push(source_index);
                 Ok((b"k".to_vec(), b"c".to_vec()))
             }
-            fn metric_report(&self) -> rusternetes_kubelet::podcertificate::MetricReport {
+            fn metric_report(&self) -> k3rs_kubelet::podcertificate::MetricReport {
                 Default::default()
             }
         }
         let rec = Arc::new(Recorder(Mutex::new(vec![])));
         let root = tempfile::tempdir().unwrap();
-        let host = rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+        let host = k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
             root.path().to_string_lossy().to_string(),
             Some(Arc::new(StorageBackend::new_memory())),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             HashMap::new(),
         )
         .with_pod_certificate_manager(rec.clone());

@@ -96,10 +96,8 @@ pub struct FsQuota {
 
 /// `enabledQuotasForMonitoring` (`quota.go:53-55`).
 fn gate_enabled() -> bool {
-    rusternetes_common::feature_gates::gate_enabled(
-        "LocalStorageCapacityIsolationFSQuotaMonitoring",
-    )
-    .unwrap_or(false)
+    k3rs_common::feature_gates::gate_enabled("LocalStorageCapacityIsolationFSQuotaMonitoring")
+        .unwrap_or(false)
 }
 
 /// The process-wide instance (the Go package's globals).

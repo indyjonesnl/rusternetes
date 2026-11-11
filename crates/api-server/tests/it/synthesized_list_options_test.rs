@@ -9,7 +9,7 @@
 //! for every list, rejecting `resourceVersionMatch` without `resourceVersion`
 //! with 422 Invalid. No resourceVersion floor: these are not store reads.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 
 /// #2180 item 2: `ListResource` decodes `labelSelector` with
 /// `metainternalversion.ParameterCodec` (`Convert_string_To_labels_Selector`

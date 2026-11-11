@@ -1,5 +1,5 @@
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 
 fn make_container(name: &str) -> Container {
     Container {
@@ -304,10 +304,7 @@ fn test_pod_without_subdomain_deserializes_correctly() {
 #[test]
 fn test_hosts_file_mounted_at_etc_hosts() {
     // Verify the expected container mount path
-    let hosts_bind = format!(
-        "{}:/etc/hosts:ro",
-        "/var/lib/rusternetes/volumes/my-pod/hosts"
-    );
+    let hosts_bind = format!("{}:/etc/hosts:ro", "/var/lib/k3rs/volumes/my-pod/hosts");
     assert!(hosts_bind.ends_with(":/etc/hosts:ro"));
     assert!(hosts_bind.contains("/hosts:"));
 }
@@ -316,14 +313,14 @@ fn test_hosts_file_mounted_at_etc_hosts() {
 fn test_resolv_conf_mounted_at_etc_resolv_conf() {
     let resolv_bind = format!(
         "{}:/etc/resolv.conf:ro",
-        "/var/lib/rusternetes/volumes/my-pod/resolv.conf"
+        "/var/lib/k3rs/volumes/my-pod/resolv.conf"
     );
     assert!(resolv_bind.ends_with(":/etc/resolv.conf:ro"));
 }
 
 #[test]
 fn test_hosts_and_resolv_in_same_pod_dir() {
-    let base = "/var/lib/rusternetes/volumes";
+    let base = "/var/lib/k3rs/volumes";
     let pod_name = "my-pod";
 
     let hosts_path = format!("{}/{}/hosts", base, pod_name);

@@ -3,11 +3,11 @@
 //!
 //! Two data sources share one debounce/rebuild loop ([`DnsSource`]):
 //!
-//! - **Storage** — direct reads from the rusternetes storage backend
+//! - **Storage** — direct reads from the k3rs storage backend
 //!   (etcd/sqlite/redis). Used by the all-in-one binary and the legacy
 //!   compose container.
 //! - **Api** — list + watch against the api-server REST endpoints via
-//!   `rusternetes-client`. Used by the in-cluster Deployment.
+//!   `k3rs-client`. Used by the in-cluster Deployment.
 //!
 //! Pattern lifted from `crates/kube-proxy/src/lib.rs`: open one watch
 //! stream per resource type, multiplex them with `tokio::select!`, and
@@ -24,10 +24,10 @@ use crate::server::SharedZone;
 use crate::zone::Zone;
 use anyhow::Result;
 use futures::StreamExt;
-use rusternetes_client::http::ApiClient;
-use rusternetes_client::watch::watch_stream;
-use rusternetes_common::resources::{EndpointSlice, Pod, Service};
-use rusternetes_storage::{Storage, StorageBackend};
+use k3rs_client::http::ApiClient;
+use k3rs_client::watch::watch_stream;
+use k3rs_common::resources::{EndpointSlice, Pod, Service};
+use k3rs_storage::{Storage, StorageBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;

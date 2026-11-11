@@ -1,7 +1,7 @@
 name: vanilla-swap-module (reusable)
 
 # Reusable single-module vanilla-swap engine. Stands up an UNMODIFIED upstream
-# Kubernetes cluster (kind) and swaps in exactly ONE rusternetes component, then
+# Kubernetes cluster (kind) and swaps in exactly ONE k3rs component, then
 # runs the test subset scoped to that component. Because every other participant
 # is known-good upstream software, any failure is attributable to that module.
 #
@@ -21,7 +21,7 @@ on:
         required: true
         type: string
       image-tag:
-        description: "GHCR rusternetes image tag to swap in"
+        description: "GHCR k3rs image tag to swap in"
         required: false
         type: string
         default: main
@@ -48,7 +48,7 @@ on:
         type: choice
         options: ["kubelet", "api-server", "scheduler", "controller-manager", "kube-proxy"]
       image-tag:
-        description: "GHCR rusternetes image tag to swap in"
+        description: "GHCR k3rs image tag to swap in"
         required: false
         type: string
         default: main
@@ -122,7 +122,7 @@ jobs:
         env:
           MODULE: ${{ inputs.module }}
           K8S_VERSION: ${{ inputs.k8s-version }}
-          RUSTERNETES_IMAGE_TAG: ${{ inputs.image-tag }}
+          K3RS_IMAGE_TAG: ${{ inputs.image-tag }}
           # Single-test proof (#1648); empty keeps the registry focus. Read by
           # scripts/vanilla-swap-run.sh (VS_FOCUS_OVERRIDE).
           VS_FOCUS_OVERRIDE: ${{ inputs.focus }}
@@ -210,5 +210,5 @@ jobs:
           MODULE: ${{ inputs.module }}
         run: |
           kind delete cluster --name "vanilla-swap-$MODULE" >/dev/null 2>&1 || true
-          docker ps -aq --filter "label=rusternetes-swap-cluster=vanilla-swap-$MODULE" \
+          docker ps -aq --filter "label=k3rs-swap-cluster=vanilla-swap-$MODULE" \
             | xargs -r docker rm -f >/dev/null 2>&1 || true

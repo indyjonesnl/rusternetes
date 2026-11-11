@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
-use rusternetes_api_server::registry::apiextensions::customresourcedefinition::new_rest;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::registry::apiextensions::customresourcedefinition::new_rest;
+use k3rs_storage::{build_key, Storage, StorageBackend};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
@@ -84,7 +84,7 @@ async fn resync_finalizes_a_crd_left_terminating() {
     drop(rest);
     let leftover: Vec<Value> = api
         .storage
-        .list(&rusternetes_storage::build_prefix(
+        .list(&k3rs_storage::build_prefix(
             "example_com_widgets",
             Some("default"),
         ))

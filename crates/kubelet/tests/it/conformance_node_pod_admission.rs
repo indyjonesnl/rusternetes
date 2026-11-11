@@ -5,7 +5,7 @@
 //!   - `staging/src/k8s.io/pod-security-admission/api` — restricted /
 //!     baseline / privileged level field expectations.
 //!
-//! Rusternetes' Pod Security Admission is a stub (see
+//! k3rs' Pod Security Admission is a stub (see
 //! `crates/api-server/src/admission.rs::PodSecurityAdmission::admit` and
 //! the RED-state suite at
 //! `crates/api-server/tests/pod_security_admission_test.rs`). These tests
@@ -14,9 +14,9 @@
 //! the OS / nodeSelector field that today's kubelet uses to refuse pods
 //! it cannot run. Behavioural admit/deny coverage stays in api-server.
 
-use rusternetes_common::resources::pod::{PodOS, PodSecurityContext};
-use rusternetes_common::resources::{Container, Pod, PodSpec, SecurityContext, Toleration};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::resources::pod::{PodOS, PodSecurityContext};
+use k3rs_common::resources::{Container, Pod, PodSpec, SecurityContext, Toleration};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 
 fn base_container() -> Container {
     Container {

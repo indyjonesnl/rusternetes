@@ -6,7 +6,7 @@
 //! pass request to the delegate, which is supposed to lead to a 404."
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const GROUP: &str = "stable.example.com";

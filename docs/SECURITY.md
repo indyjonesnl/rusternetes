@@ -1,4 +1,4 @@
-# Security Features in Rūsternetes
+# Security Features in k3rs
 
 **Last Updated:** March 10, 2026
 
@@ -38,7 +38,7 @@ Storage (etcd)
 
 ### Built-in Admission Controllers
 
-Rusternetes includes several built-in admission controllers that are automatically enabled:
+k3rs includes several built-in admission controllers that are automatically enabled:
 
 #### 1. NamespaceLifecycle
 
@@ -81,7 +81,7 @@ Rusternetes includes several built-in admission controllers that are automatical
 You can implement custom admission controllers by implementing the `AdmissionController` trait:
 
 ```rust
-use rusternetes_common::admission::*;
+use k3rs_common::admission::*;
 use async_trait::async_trait;
 
 struct MyAdmissionController;
@@ -122,7 +122,7 @@ impl AdmissionController for MyAdmissionController {
 Multiple admission controllers run in sequence via an `AdmissionChain`:
 
 ```rust
-use rusternetes_common::admission::*;
+use k3rs_common::admission::*;
 
 let chain = AdmissionChain::new()
     .with_built_in_controllers()  // Adds all built-in controllers
@@ -366,7 +366,7 @@ To rotate encryption keys:
 ### Using Encryption in Code
 
 ```rust
-use rusternetes_common::encryption::*;
+use k3rs_common::encryption::*;
 
 // Load encryption config
 let config_yaml = std::fs::read_to_string("encryption-config.yaml")?;
@@ -471,7 +471,7 @@ Audit events follow Kubernetes audit.k8s.io/v1 format:
 Create an audit policy:
 
 ```rust
-use rusternetes_common::audit::*;
+use k3rs_common::audit::*;
 
 let policy = AuditPolicy {
     level: AuditLevel::Metadata,
@@ -543,7 +543,7 @@ cat /var/log/kubernetes/audit.log | jq 'select(.user.username == "alice")'
 Add security flags to the API server:
 
 ```bash
-./rusternetes-api-server \
+./k3rs-api-server \
   --bind-address 0.0.0.0:6443 \
   --etcd-servers http://localhost:2379 \
   --tls \
@@ -711,7 +711,7 @@ Before going to production:
 **Problem**: Pods are being rejected with unclear errors
 
 **Solution**:
-- Check admission controller logs: `podman logs rusternetes-api-server | grep admission`
+- Check admission controller logs: `podman logs k3rs-api-server | grep admission`
 - Verify namespace labels for Pod Security Standards
 - Test pod manifest against security level manually
 

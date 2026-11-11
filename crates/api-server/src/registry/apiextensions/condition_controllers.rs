@@ -17,18 +17,18 @@
 //!
 //! `NewStructural` and `ValidateStructural` (`apiserver/schema`) over each
 //! version's `openAPIV3Schema` are in
-//! `rusternetes_common::validation::structural`.
+//! `k3rs_common::validation::structural`.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rusternetes_common::resources::{CustomResourceDefinition, CustomResourceDefinitionCondition};
-use rusternetes_common::validation::crd::{
+use k3rs_common::resources::{CustomResourceDefinition, CustomResourceDefinitionCondition};
+use k3rs_common::validation::crd::{
     api_approval_state, is_protected_community_group, ApiApprovalState,
     KUBE_API_APPROVED_ANNOTATION,
 };
-use rusternetes_common::validation::field::{Error, Path};
-use rusternetes_common::validation::structural::{new_structural, validate_structural};
+use k3rs_common::validation::field::{Error, Path};
+use k3rs_common::validation::structural::{new_structural, validate_structural};
 
 use super::controllers::{aggregate, condition, find_crd_condition, set_crd_condition};
 

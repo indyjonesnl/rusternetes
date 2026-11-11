@@ -28,15 +28,15 @@
 //!      null`, no `terminationGracePeriodSeconds: 0`).
 //!
 //! Then we round-trip a `Toleration` through the typed
-//! `rusternetes_common::resources::Toleration` deserializer (mirroring
+//! `k3rs_common::resources::Toleration` deserializer (mirroring
 //! `crates/common/tests/roundtrip_core_v1.rs::assert_roundtrip`) to
 //! confirm the most surprising case: `tolerationSeconds: 0` survives as
 //! `Some(0)`, while an absent field surfaces as `None` — the two are
 //! distinguishable end-to-end. Upstream Go relies on this distinction
 //! via `*int64`; Rust mirrors it with `Option<i64>`.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_common::resources::Toleration;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_common::resources::Toleration;
 use serde_json::Value;
 
 /// Encode a u64 as a protobuf varint and append it to `out`.
@@ -350,7 +350,7 @@ fn test_toleration_seconds_negative_round_trips_through_decoder() {
 
 /// End-to-end: take proto bytes with `tolerationSeconds = 0`, decode →
 /// JSON, then feed the JSON through the typed
-/// `rusternetes_common::resources::Toleration` deserializer. The result
+/// `k3rs_common::resources::Toleration` deserializer. The result
 /// must be `Some(0)`. This is the "if proto decoder drops the zero,
 /// we'd see None here" check.
 #[test]

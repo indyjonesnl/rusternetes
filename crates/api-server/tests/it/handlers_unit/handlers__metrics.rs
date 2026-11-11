@@ -6,13 +6,13 @@ mod __parent {
         extract::{Path, Query, State},
         Extension, Json,
     };
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::{
         authz::{Decision, RequestAttributes},
         resources::{NodeMetrics, PodMetrics},
         List, Result,
     };
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::debug;
@@ -21,9 +21,9 @@ mod __parent {
 mod overlay_tests {
     use super::__parent::*;
     use chrono::Utc;
-    use rusternetes_api_server::handlers::metrics::*;
-    use rusternetes_common::resources::Node;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_api_server::handlers::metrics::*;
+    use k3rs_common::resources::Node;
+    use k3rs_storage::memory::MemoryStorage;
     use std::collections::BTreeMap;
 
     /// metrics-server `pkg/storage/node.go:57-62` builds each NodeMetrics with
@@ -40,11 +40,11 @@ mod overlay_tests {
 
         // Kubelet-published sample without labels.
         let stored = NodeMetrics {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 api_version: "metrics.k8s.io/v1beta1".to_string(),
                 kind: "NodeMetrics".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("n1"),
+            metadata: k3rs_common::types::ObjectMeta::new("n1"),
             timestamp: Utc::now(),
             window: "30s".to_string(),
             usage: BTreeMap::new(),

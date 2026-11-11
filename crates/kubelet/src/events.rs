@@ -2,7 +2,7 @@
 //!
 //! Upstream, the kubelet is the source of truth for per-container lifecycle
 //! events — `Pulling`, `Pulled`, `Failed` (image), `Created`, `Started`,
-//! `Killing`, `BackOff`, `Unhealthy` (probe). Before this module the rusternetes
+//! `Killing`, `BackOff`, `Unhealthy` (probe). Before this module the k3rs
 //! kubelet emitted none of these; the controller-manager's `EventsController`
 //! *inferred* a subset of them by polling `pod.status`. With a unified
 //! [`EventRecorder`] available, the kubelet now records the real events at the
@@ -11,8 +11,8 @@
 //! The reason strings here mirror `pkg/kubelet/events/event.go` exactly so the
 //! events match what conformance and tooling (Lens, `kubectl describe`) expect.
 
-use rusternetes_common::resources::{EventType, ObjectReference, Pod};
-use rusternetes_storage::{EventRecorder, Storage};
+use k3rs_common::resources::{EventType, ObjectReference, Pod};
+use k3rs_storage::{EventRecorder, Storage};
 
 // --- Reason strings, verbatim from pkg/kubelet/events/event.go ---
 
@@ -98,12 +98,12 @@ pub async fn emit_lifecycle_event<S: Storage + ?Sized>(
     reason: &str,
     event_type: EventType,
     message: &str,
-) -> rusternetes_common::Result<()> {
+) -> k3rs_common::Result<()> {
     let involved = match container_name {
         Some(name) => container_object_reference(pod, name),
         None => pod_object_reference(pod),
     };
-    let source = rusternetes_common::resources::EventSource {
+    let source = k3rs_common::resources::EventSource {
         component: KUBELET_COMPONENT.to_string(),
         host: pod
             .spec

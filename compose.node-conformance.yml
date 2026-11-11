@@ -27,7 +27,7 @@ services:
     build:
       context: .
       dockerfile: rhino.Dockerfile
-    container_name: rusternetes-nc-rhino
+    container_name: k3rs-nc-rhino
     ports:
       - "2379:2379"
     volumes:
@@ -53,7 +53,7 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: api-server
-    container_name: rusternetes-nc-api-server
+    container_name: k3rs-nc-api-server
     privileged: true
     ports:
       - "6443:6443"
@@ -73,14 +73,14 @@ services:
         aliases:
           - api-server
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
       # CRI socket from the containerd service: exec/logs/stats run over CRI v1,
       # not a Docker/Podman socket (the kubelet was cut over to CRI).
       - containerd-run:/run/containerd
       # Pod container logs live under ${KUBELET_VOLUMES_PATH}/pod-logs/...; the
       # api-server serves GET pods/<p>/log by reading them off the filesystem at
       # the same absolute path the CRI ContainerStatus.log_path reports.
-      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:ro
+      - ${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:ro
     environment:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
@@ -121,7 +121,7 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: kubelet
-    container_name: rusternetes-nc-kubelet
+    container_name: k3rs-nc-kubelet
     privileged: true
     depends_on:
       - rhino
@@ -153,13 +153,13 @@ services:
       # NodeConformance specs fail with `mount type != tmpfs`. Mirrors
       # compose.sqlite.yml / compose.yml; was missing here since the harness
       # scaffold (#1066).
-      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw,rshared
-      - ./.rusternetes/certs:/root/.rusternetes/certs:ro
+      - ${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:rw,rshared
+      - ./.k3rs/certs:/root/.k3rs/certs:ro
     environment:
       - RUST_LOG=info
       - CONTAINER_RUNTIME_ENDPOINT=unix:///run/containerd/containerd.sock
       - KUBERNETES_SERVICE_HOST_OVERRIDE=api-server
-      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}
+      - KUBELET_VOLUMES_PATH=${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}
     # Pod networking is handled by CNI inside the containerd runtime (cni0,
     # 10.244.0.0/16), so the old bollard-only `--network` flag (which attached
     # pause containers to a Docker bridge) no longer applies — omit it to match
@@ -175,7 +175,7 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: scheduler
-    container_name: rusternetes-nc-scheduler
+    container_name: k3rs-nc-scheduler
     depends_on:
       - rhino
       - api-server
@@ -198,14 +198,14 @@ services:
       context: .
       dockerfile: services.Dockerfile
       target: controller-manager
-    container_name: rusternetes-nc-controller-manager
+    container_name: k3rs-nc-controller-manager
     depends_on:
       - rhino
       - api-server
     networks:
       - nc-net
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
     environment:
       - RUST_LOG=info
     command: ["--etcd-servers", "http://rhino:2379", "--sync-interval", "2"]
@@ -219,11 +219,11 @@ services:
   # bind-mounted at the same host path so pod volumes the kubelet provisions
   # resolve here too. Mirrors compose.sqlite.yml.
   containerd:
-    image: rusternetes-containerd:latest
+    image: k3rs-containerd:latest
     build:
       context: .
       dockerfile: containerd.Dockerfile
-    container_name: rusternetes-nc-containerd
+    container_name: k3rs-nc-containerd
     privileged: true
     networks:
       - nc-net
@@ -233,21 +233,21 @@ services:
       # filesystem, not the container's own overlay rootfs — a named volume is
       # host-fs-backed.
       - containerd-data:/var/lib/containerd
-      - ${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:${KUBELET_VOLUMES_PATH:-./.rusternetes/volumes}:rw,rshared
-      - ./.rusternetes/certs:/etc/rusternetes/certs:ro
+      - ${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:${KUBELET_VOLUMES_PATH:-./.k3rs/volumes}:rw,rshared
+      - ./.k3rs/certs:/etc/k3rs/certs:ro
 
 networks:
   nc-net:
-    name: rusternetes-nc-net
+    name: k3rs-nc-net
     driver: bridge
 
 volumes:
   rhino-data:
-    name: rusternetes-nc-rhino-data
+    name: k3rs-nc-rhino-data
   # CRI socket shared from the containerd service to the kubelet + api-server.
   containerd-run:
-    name: rusternetes-nc-containerd-run
+    name: k3rs-nc-containerd-run
   # containerd's snapshotter root on a real (host-fs-backed) volume so the
   # overlayfs snapshotter works inside the Docker-hosted containerd.
   containerd-data:
-    name: rusternetes-nc-containerd-data
+    name: k3rs-nc-containerd-data

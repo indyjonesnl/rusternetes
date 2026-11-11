@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::volume::{
         ReferenceGrant, ReferenceGrantFrom, ReferenceGrantSpec,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::volume::ReferenceGrantTo;
-    use rusternetes_common::validation::referencegrant::*;
+    use k3rs_common::resources::volume::ReferenceGrantTo;
+    use k3rs_common::validation::referencegrant::*;
 
     fn valid() -> ReferenceGrant {
         ReferenceGrant {

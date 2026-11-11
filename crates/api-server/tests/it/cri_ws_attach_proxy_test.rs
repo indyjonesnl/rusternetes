@@ -10,25 +10,25 @@
 //! # containerd from deploy/containerd/config.toml (stream 0.0.0.0:10010),
 //! # CRI socket exposed to host, a `cat` container with stdin:true running:
 //! #   crictl create config: {"command":["cat"],"stdin":true, ...}
-//! RUSTERNETES_CRI_TEST_ENDPOINT=unix:///tmp/wsrun/containerd.sock \
-//! RUSTERNETES_CRI_TEST_ATTACH_CONTAINER=<container-id> \
+//! K3RS_CRI_TEST_ENDPOINT=unix:///tmp/wsrun/containerd.sock \
+//! K3RS_CRI_TEST_ATTACH_CONTAINER=<container-id> \
 //! CONTAINERD_STREAM_HOST=127.0.0.1 CONTAINERD_STREAM_PORT=10010 \
-//!   cargo test -p rusternetes-api-server --test cri_ws_attach_proxy_test -- --nocapture
+//!   cargo test -p k3rs-api-server --test cri_ws_attach_proxy_test -- --nocapture
 //! ```
 
 use futures::{SinkExt, StreamExt};
-use rusternetes_cri::stream as cri_exec;
-use rusternetes_cri::CriClient;
+use k3rs_cri::stream as cri_exec;
+use k3rs_cri::CriClient;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
 async fn open_attach_stream_echoes_stdin_on_stdout_from_live_containerd() {
     let (Ok(endpoint), Ok(container)) = (
-        std::env::var("RUSTERNETES_CRI_TEST_ENDPOINT"),
-        std::env::var("RUSTERNETES_CRI_TEST_ATTACH_CONTAINER"),
+        std::env::var("K3RS_CRI_TEST_ENDPOINT"),
+        std::env::var("K3RS_CRI_TEST_ATTACH_CONTAINER"),
     ) else {
         eprintln!(
-            "skipping: set RUSTERNETES_CRI_TEST_ENDPOINT + RUSTERNETES_CRI_TEST_ATTACH_CONTAINER \
+            "skipping: set K3RS_CRI_TEST_ENDPOINT + K3RS_CRI_TEST_ATTACH_CONTAINER \
              (a `cat`-with-stdin container) + CONTAINERD_STREAM_HOST/PORT to run this live check"
         );
         return;

@@ -4,18 +4,16 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::resources::{PodDisruptionBudget, PodDisruptionBudgetStatus};
-use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::metav1::{
-    validate_label_selector, LabelSelectorValidationOptions,
-};
-use rusternetes_common::validation::pdb::{
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::resources::{PodDisruptionBudget, PodDisruptionBudgetStatus};
+use k3rs_common::types::{LabelSelector, LabelSelectorRequirement};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::metav1::{validate_label_selector, LabelSelectorValidationOptions};
+use k3rs_common::validation::pdb::{
     validate_pod_disruption_budget, validate_pod_disruption_budget_status_update,
     PodDisruptionBudgetValidationOptions,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

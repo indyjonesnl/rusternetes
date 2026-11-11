@@ -2,17 +2,15 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
-        ContainerState, ContainerStateTerminated, Lifecycle, Pod,
-    };
-    pub use rusternetes_common::types::Phase;
+    pub use k3rs_common::resources::{ContainerState, ContainerStateTerminated, Lifecycle, Pod};
+    pub use k3rs_common::types::Phase;
     pub use std::collections::HashMap;
     pub use std::time::Duration;
 }
 
 mod conflict_predicate_tests {
-    use rusternetes_common::Error;
-    use rusternetes_kubelet::lifecycle::is_status_write_conflict;
+    use k3rs_common::Error;
+    use k3rs_kubelet::lifecycle::is_status_write_conflict;
 
     #[test]
     fn typed_conflict_is_matched() {
@@ -37,10 +35,10 @@ mod conflict_predicate_tests {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::lifecycle::*;
+    use k3rs_kubelet::lifecycle::*;
 
-    fn vol(source: anyhow::Error) -> rusternetes_kubelet::cri_runtime::CriRuntimeError {
-        rusternetes_kubelet::cri_runtime::CriRuntimeError::Volumes {
+    fn vol(source: anyhow::Error) -> k3rs_kubelet::cri_runtime::CriRuntimeError {
+        k3rs_kubelet::cri_runtime::CriRuntimeError::Volumes {
             pod: "p".into(),
             source,
         }
@@ -60,7 +58,7 @@ mod tests {
         assert!(is_volume_wait_cri(&vol(e.unwrap_err())));
         // The upstream ErrNoPluginMatched error stays a wait.
         assert!(is_volume_wait_cri(&vol(
-            rusternetes_kubelet::volumes::NoPluginForVolume("v".into()).into()
+            k3rs_kubelet::volumes::NoPluginForVolume("v".into()).into()
         )));
         // Real start failures whose TEXT merely mentions the tokens are not.
         for msg in [
@@ -75,7 +73,7 @@ mod tests {
         }
         // Non-volume runtime errors never wait.
         assert!(!is_volume_wait_cri(
-            &rusternetes_kubelet::cri_runtime::CriRuntimeError::InitContainerFailed {
+            &k3rs_kubelet::cri_runtime::CriRuntimeError::InitContainerFailed {
                 name: "i".into(),
                 exit_code: 1
             }

@@ -5,7 +5,7 @@
 //! The `cel` parser already is a port of cel-go's: every `IdedExpr` node has a
 //! unique id, macros are expanded, and the operator names are cel-go's, so the
 //! checker's `typeMap` / `referenceMap` can key on node ids. This crate
-//! therefore depends only on `cel`, never on `rusternetes-common`, so editing
+//! therefore depends only on `cel`, never on `k3rs-common`, so editing
 //! the checker does not rebuild `common` and its dependants.
 //!
 //! Layout (one module per cel-go concern):

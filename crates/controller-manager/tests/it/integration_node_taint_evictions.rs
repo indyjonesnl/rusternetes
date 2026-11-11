@@ -22,14 +22,14 @@
 //! pattern used by `crates/controller-manager/tests/node_controller_test.rs`.
 
 use chrono::{Duration, Utc};
-use rusternetes_common::resources::pod::Toleration;
-use rusternetes_common::resources::{
+use k3rs_common::resources::pod::Toleration;
+use k3rs_common::resources::{
     Container, Node, NodeCondition, NodeSpec, NodeStatus, Pod, PodSpec, PodStatus, Taint,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::node::NodeController;
-use rusternetes_controller_manager::controllers::taint_eviction::TaintEvictionController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::node::NodeController;
+use k3rs_controller_manager::controllers::taint_eviction::TaintEvictionController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 /// Build a minimal Ready node living in "zone1/region1" with no taints.

@@ -1,11 +1,11 @@
 //! Cases of `TestEnoughRequests` (`plugins/noderesources/fit_test.go`) and of
 //! `RunFilterPluginsWithNominatedPods` (`runtime/framework.go:1145-1190`).
-use rusternetes_common::resources::{Node, Pod};
-use rusternetes_scheduler::fwk::{
+use k3rs_common::resources::{Node, Pod};
+use k3rs_scheduler::fwk::{
     Code, CycleState, FilterPlugin, NoHandle, NodeInfo, PreFilterPlugin, Status,
 };
-use rusternetes_scheduler::in_tree::{FitIgnoredResources, NodeResourcesFit};
-use rusternetes_scheduler::profile::Profile;
+use k3rs_scheduler::in_tree::{FitIgnoredResources, NodeResourcesFit};
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
 fn pod(name: &str, node: &str, requests: Value) -> Pod {

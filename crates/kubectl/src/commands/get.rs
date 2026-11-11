@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_client::http::{ApiClient, GetError};
-use rusternetes_common::resources::{
+use k3rs_client::http::{ApiClient, GetError};
+use k3rs_common::resources::{
     CronJob, DaemonSet, Deployment, Job, Namespace, Node, PersistentVolume, PersistentVolumeClaim,
     Pod, Service, StatefulSet,
 };

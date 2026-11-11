@@ -2,11 +2,11 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::rest::Object;
-    pub use rusternetes_common::fieldmanager::{
+    pub use k3rs_api_server::registry::rest::Object;
+    pub use k3rs_common::fieldmanager::{
         apply, fieldset, is_reset_managed_fields, remove_managed_fields, Managed, ResetFields,
     };
-    pub use rusternetes_common::validation::metav1::FIELD_MANAGER_MAX_LENGTH;
+    pub use k3rs_common::validation::metav1::FIELD_MANAGER_MAX_LENGTH;
     pub use serde_json::Value;
     pub use std::ops::Deref;
 }
@@ -15,12 +15,12 @@ mod tests {
     //! Unit tests of the Update path; the HTTP behaviour is covered by
     //! `tests/it/managedfields_update_test.rs`.
 
-    use rusternetes_common::resources::ConfigMap;
+    use k3rs_common::resources::ConfigMap;
     use serde_json::{json, Value};
 
     use super::__parent::*;
-    use rusternetes_api_server::fieldmanager::fieldset::{Fields, Set};
-    use rusternetes_api_server::fieldmanager::*;
+    use k3rs_api_server::fieldmanager::fieldset::{Fields, Set};
+    use k3rs_api_server::fieldmanager::*;
 
     fn cm(data: Value) -> ConfigMap {
         serde_json::from_value(json!({
@@ -113,8 +113,7 @@ mod tests {
     }
 
     fn pod_fields(obj: &Value) -> Value {
-        let t = rusternetes_api_server::fieldmanager::schemas::builtin("v1", "Pod")
-            .expect("Pod schema");
+        let t = k3rs_api_server::fieldmanager::schemas::builtin("v1", "Pod").expect("Pod schema");
         Fields::of_typed(obj, &t).set.to_fields_v1()
     }
 
@@ -150,7 +149,7 @@ mod tests {
     /// `spec.selector` (a `LabelSelector`, atomic) is a leaf.
     #[test]
     fn deployment_selector_is_atomic() {
-        let t = rusternetes_api_server::fieldmanager::schemas::builtin("apps/v1", "Deployment")
+        let t = k3rs_api_server::fieldmanager::schemas::builtin("apps/v1", "Deployment")
             .expect("Deployment schema");
         let obj = json!({"spec": {"selector": {"matchLabels": {"a": "b"}}, "replicas": 1}});
         assert_eq!(
@@ -164,9 +163,9 @@ mod tests {
     /// could not express.
     #[test]
     fn a_custom_resource_schema_drives_the_field_sets() {
-        use rusternetes_common::fieldmanager::schema::Type;
-        use rusternetes_common::resources::crd::JSONSchemaProps;
-        use rusternetes_common::validation::structural::new_structural;
+        use k3rs_common::fieldmanager::schema::Type;
+        use k3rs_common::resources::crd::JSONSchemaProps;
+        use k3rs_common::validation::structural::new_structural;
         let props: JSONSchemaProps = serde_json::from_value(json!({
             "type": "object", "properties": {"spec": {"type": "object", "properties": {
                 "tags": {"type": "array", "items": {"type": "string"}, "x-kubernetes-list-type": "set"},
@@ -199,7 +198,7 @@ mod tests {
     /// `[containerPort, protocol]` item, not the whole list.
     #[test]
     fn update_with_a_schema_changes_one_keyed_item() {
-        let schema = rusternetes_api_server::fieldmanager::schemas::builtin("v1", "Pod");
+        let schema = k3rs_api_server::fieldmanager::schemas::builtin("v1", "Pod");
         let fm = FieldManager::new("v1", None, ResetFields::new()).with_schema(schema);
         let live = json!({"spec": {"containers": [{"name": "c", "ports": [
             {"containerPort": 80, "protocol": "TCP"}, {"containerPort": 80, "protocol": "UDP"}]}]}});

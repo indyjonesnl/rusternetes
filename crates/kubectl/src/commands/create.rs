@@ -2,7 +2,7 @@ use crate::discovery::RestMapper;
 use crate::types::{CreateCommands, SecretCommands, ServiceCommands};
 use anyhow::{Context, Result};
 use base64::Engine;
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;

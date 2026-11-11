@@ -1,5 +1,5 @@
 [package]
-name = "rusternetes-controller-core"
+name = "k3rs-controller-core"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,8 +7,8 @@ license.workspace = true
 description = "Controllers that run in-process inside the kube-apiserver as well as in the controller-manager"
 
 [dependencies]
-rusternetes-common = { path = "../common" }
-rusternetes-storage = { path = "../storage" }
+k3rs-common = { path = "../common" }
+k3rs-storage = { path = "../storage" }
 tokio.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

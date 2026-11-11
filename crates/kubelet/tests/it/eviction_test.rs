@@ -6,9 +6,9 @@
 //! - Evicts pods based on QoS class priority
 //! - Evicts pods based on resource usage within QoS class
 
-use rusternetes_common::resources::{Container, Node, NodeCondition, NodeStatus, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-use rusternetes_kubelet::eviction::{
+use k3rs_common::resources::{Container, Node, NodeCondition, NodeStatus, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+use k3rs_kubelet::eviction::{
     get_qos_class, EvictionManager, EvictionSignal, EvictionThreshold, EvictionValue, NodeStats,
     PodStats, QoSClass,
 };

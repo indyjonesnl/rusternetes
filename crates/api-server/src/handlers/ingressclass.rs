@@ -9,13 +9,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::IngressClass,
     List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
 fn scope(state: &ApiServerState, subresource: Option<&'static str>) -> RequestScope<IngressClass> {
@@ -182,7 +182,7 @@ pub async fn list_ingressclasses(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 

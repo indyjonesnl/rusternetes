@@ -14,7 +14,7 @@
 //! all completed init containers.
 
 use async_trait::async_trait;
-use rusternetes_common::{
+use k3rs_common::{
     resources::{
         Container, ContainerState, ContainerStateTerminated, ContainerStateWaiting,
         ContainerStatus, Pod, PodSpec, PodStatus,
@@ -22,7 +22,7 @@ use rusternetes_common::{
     types::{ObjectMeta, Phase, TypeMeta},
     Error,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchStream};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WatchStream};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -51,21 +51,21 @@ impl ConflictOnceStorage {
 
 #[async_trait]
 impl Storage for ConflictOnceStorage {
-    async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         self.inner.create(key, value).await
     }
 
-    async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+    async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
     where
         T: DeserializeOwned + Send + Sync,
     {
         self.inner.get(key).await
     }
 
-    async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
@@ -80,26 +80,22 @@ impl Storage for ConflictOnceStorage {
         self.inner.update(key, value).await
     }
 
-    async fn update_raw(
-        &self,
-        key: &str,
-        value: &serde_json::Value,
-    ) -> rusternetes_common::Result<()> {
+    async fn update_raw(&self, key: &str, value: &serde_json::Value) -> k3rs_common::Result<()> {
         self.inner.update_raw(key, value).await
     }
 
-    async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+    async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
         self.inner.delete(key).await
     }
 
-    async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+    async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
         self.inner.list(prefix).await
     }
 
-    async fn watch(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+    async fn watch(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
         self.inner.watch(prefix).await
     }
 
@@ -107,15 +103,15 @@ impl Storage for ConflictOnceStorage {
         &self,
         prefix: &str,
         revision: i64,
-    ) -> rusternetes_common::Result<WatchStream> {
+    ) -> k3rs_common::Result<WatchStream> {
         self.inner.watch_from_revision(prefix, revision).await
     }
 
-    async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+    async fn current_revision(&self) -> k3rs_common::Result<i64> {
         self.inner.current_revision().await
     }
 
-    async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+    async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
         self.inner.is_revision_compacted(revision).await
     }
 }
@@ -456,7 +452,7 @@ async fn test_9ff9e3a_init_container_statuses_refreshed_on_cas_retry() {
     let err = storage.update(&key, &new_pod).await.unwrap_err();
     println!("conflict on running status update: {}", err);
     assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
+        matches!(err, k3rs_common::Error::Conflict(_)),
         "expected Conflict, got: {}",
         err
     );

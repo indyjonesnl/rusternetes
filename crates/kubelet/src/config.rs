@@ -47,7 +47,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub sync_frequency: Option<std::time::Duration>,
 
@@ -55,7 +55,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub file_check_frequency: Option<std::time::Duration>,
 
@@ -81,7 +81,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub http_check_frequency: Option<std::time::Duration>,
 
@@ -89,7 +89,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub streaming_connection_idle_timeout: Option<std::time::Duration>,
 
@@ -97,7 +97,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub node_status_update_frequency: Option<std::time::Duration>,
 
@@ -105,7 +105,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub node_status_report_frequency: Option<std::time::Duration>,
 
@@ -117,7 +117,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "imageMinimumGCAge")]
     pub image_minimum_gc_age: Option<std::time::Duration>,
@@ -128,7 +128,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "imageMaximumGCAge")]
     pub image_maximum_gc_age: Option<std::time::Duration>,
@@ -155,7 +155,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub volume_stats_agg_period: Option<std::time::Duration>,
 
@@ -163,7 +163,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub cpu_manager_reconcile_period: Option<std::time::Duration>,
 
@@ -171,7 +171,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub runtime_request_timeout: Option<std::time::Duration>,
 
@@ -179,7 +179,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub eviction_pressure_transition_period: Option<std::time::Duration>,
 
@@ -187,7 +187,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub container_log_monitor_interval: Option<std::time::Duration>,
 
@@ -208,7 +208,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub shutdown_grace_period: Option<std::time::Duration>,
 
@@ -216,7 +216,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub shutdown_grace_period_critical_pods: Option<std::time::Duration>,
 
@@ -230,7 +230,7 @@ pub struct KubeletConfiguration {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "cpuCFSQuotaPeriod")]
     pub cpu_cfs_quota_period: Option<std::time::Duration>,
@@ -299,7 +299,7 @@ pub struct KubeletConfiguration {
 
 /// `utilfeature.DefaultFeatureGate.Enabled(features.NodeLogQuery)`.
 pub fn node_log_query_gate_enabled() -> bool {
-    rusternetes_common::feature_gates::gate_enabled("NodeLogQuery").unwrap_or(false)
+    k3rs_common::feature_gates::gate_enabled("NodeLogQuery").unwrap_or(false)
 }
 
 impl KubeletConfiguration {
@@ -385,7 +385,7 @@ pub struct KubeletWebhookAuthentication {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "cacheTTL")]
     pub cache_ttl: Option<std::time::Duration>,
@@ -410,14 +410,14 @@ pub struct KubeletWebhookAuthorization {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "cacheAuthorizedTTL")]
     pub cache_authorized_ttl: Option<std::time::Duration>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     #[serde(rename = "cacheUnauthorizedTTL")]
     pub cache_unauthorized_ttl: Option<std::time::Duration>,
@@ -432,7 +432,7 @@ pub struct CrashLoopBackOffConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "rusternetes_common::go_duration::option_serde"
+        with = "k3rs_common::go_duration::option_serde"
     )]
     pub max_container_restart_period: Option<std::time::Duration>,
 }
@@ -658,8 +658,8 @@ impl KubeletConfiguration {
     pub fn default_max_container_restart_period(
         configured: Option<std::time::Duration>,
     ) -> Option<std::time::Duration> {
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
         ) {
             Some(configured.unwrap_or(MAX_CONTAINER_BACKOFF))
         } else {
@@ -791,8 +791,8 @@ impl KubeletConfiguration {
             .crash_loop_backoff
             .as_ref()
             .and_then(|c| c.max_container_restart_period);
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::KubeletCrashLoopBackOffMax,
         ) {
             if let Some(d) = period {
                 let ms = d.as_millis();
@@ -849,8 +849,8 @@ impl KubeletConfiguration {
         if !max_age.is_zero() && max_age <= self.effective_image_minimum_gc_age() {
             anyhow::bail!(
                 "invalid configuration: imageMaximumGCAge {} must be greater than imageMinimumGCAge {}",
-                rusternetes_common::go_duration::format_go_duration(max_age.as_nanos() as i64),
-                rusternetes_common::go_duration::format_go_duration(
+                k3rs_common::go_duration::format_go_duration(max_age.as_nanos() as i64),
+                k3rs_common::go_duration::format_go_duration(
                     self.effective_image_minimum_gc_age().as_nanos() as i64
                 )
             );

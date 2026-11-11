@@ -13,7 +13,7 @@ endif
 COMPOSE := $(COMPOSE_CMD) -f $(COMPOSE_FILE)
 
 # Container image configuration
-IMAGE_PREFIX ?= rusternetes
+IMAGE_PREFIX ?= k3rs
 IMAGE_TAG ?= latest
 
 # Colors for output
@@ -23,7 +23,7 @@ YELLOW := \033[1;33m
 NC := \033[0m # No Color
 
 help: ## Show this help message
-	@echo "$(BOLD)Rusternetes Development Makefile$(NC)"
+	@echo "$(BOLD)k3rs Development Makefile$(NC)"
 	@echo ""
 	@echo "$(BOLD)Available targets:$(NC)"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-20s$(NC) %s\n", $$1, $$2}'
@@ -85,11 +85,11 @@ dev-up: ## Start the development cluster
 		echo "You must set this to an absolute path before starting the cluster."; \
 		echo ""; \
 		echo "Example:"; \
-		echo "  export KUBELET_VOLUMES_PATH=\$$(pwd)/.rusternetes/volumes"; \
+		echo "  export KUBELET_VOLUMES_PATH=\$$(pwd)/.k3rs/volumes"; \
 		echo "  make dev-up"; \
 		echo ""; \
 		echo "Or in one command:"; \
-		echo "  KUBELET_VOLUMES_PATH=\$$(pwd)/.rusternetes/volumes make dev-up"; \
+		echo "  KUBELET_VOLUMES_PATH=\$$(pwd)/.k3rs/volumes make dev-up"; \
 		exit 1; \
 	fi
 	@echo "$(GREEN)Starting development cluster...$(NC)"
@@ -206,7 +206,7 @@ dev-full: ## Build images and start development cluster
 		echo "You must set this to an absolute path before starting the cluster."; \
 		echo ""; \
 		echo "Example:"; \
-		echo "  export KUBELET_VOLUMES_PATH=\$$(pwd)/.rusternetes/volumes"; \
+		echo "  export KUBELET_VOLUMES_PATH=\$$(pwd)/.k3rs/volumes"; \
 		echo "  make dev-full"; \
 		exit 1; \
 	fi

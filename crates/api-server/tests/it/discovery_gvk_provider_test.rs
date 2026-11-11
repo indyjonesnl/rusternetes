@@ -6,7 +6,7 @@
 //! autoscaling/v1 `Scale` for every served version; `EvictionREST`
 //! (pkg/registry/core/pod/storage/eviction.go:83) is policy/v1 `Eviction`.
 
-use rusternetes_discovery::{registered_kinds, RegisteredKind};
+use k3rs_discovery::{registered_kinds, RegisteredKind};
 
 fn kind_of(group: &str, version: &str, resource: &str, sub: &str) -> RegisteredKind {
     registered_kinds()
@@ -67,7 +67,7 @@ fn other_subresources_keep_the_group_version_they_are_served_under() {
 
 #[tokio::test]
 async fn typed_resource_lists_carry_the_provider_group_version() {
-    let (_, list) = rusternetes_discovery::get_apps_v1_resources().await;
+    let (_, list) = k3rs_discovery::get_apps_v1_resources().await;
     let scale = list
         .0
         .resources
@@ -87,7 +87,7 @@ async fn typed_resource_lists_carry_the_provider_group_version() {
         (None, None)
     );
 
-    let (_, core) = rusternetes_discovery::get_core_resources().await;
+    let (_, core) = k3rs_discovery::get_core_resources().await;
     let ev = core
         .0
         .resources

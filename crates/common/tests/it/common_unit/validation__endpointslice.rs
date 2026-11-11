@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::endpointslice::{EndpointPort, EndpointSlice};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
+    pub use k3rs_common::resources::endpointslice::{EndpointPort, EndpointSlice};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{is_dns1123_label, is_dns1123_subdomain};
     pub use std::net::IpAddr;
     pub use std::str::FromStr;
 }
 
 mod size_cap_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::endpointslice::*;
+    use k3rs_common::validation::endpointslice::*;
 
     fn slice_with(endpoints: usize, addrs_per: usize, ports: usize) -> EndpointSlice {
         let eps: Vec<_> = (0..endpoints)
@@ -73,8 +73,8 @@ mod size_cap_tests {
 
 mod port_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::endpointslice::*;
-    use rusternetes_common::validation::field::ErrorType;
+    use k3rs_common::validation::endpointslice::*;
+    use k3rs_common::validation::field::ErrorType;
 
     fn es(ports: serde_json::Value) -> EndpointSlice {
         serde_json::from_value(serde_json::json!({

@@ -36,7 +36,7 @@
 //! Mirrors `conformance_configmap_envfrom_prefixes_test.rs` for the envFrom
 //! side; together they cover both halves of the `LocalObjectReference` story.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 
 /// Encode a varint into `buf`.
 fn write_varint(buf: &mut Vec<u8>, mut v: u64) {
@@ -233,7 +233,7 @@ fn test_iscsi_volume_source_secret_ref_proto_is_nested() {
 /// that mounts a configmap.
 #[test]
 fn test_configmap_volume_source_round_trips_through_typed_deserializer() {
-    use rusternetes_common::resources::ConfigMapVolumeSource;
+    use k3rs_common::resources::ConfigMapVolumeSource;
 
     let registry = ProtoRegistry::new();
     // ConfigMapVolumeSource { localObjectReference { name: "my-cm" }, items: [], defaultMode: 420 }
@@ -270,7 +270,7 @@ fn test_configmap_volume_source_round_trips_through_typed_deserializer() {
 /// typed struct's `secret_name` field correctly.
 #[test]
 fn test_secret_volume_source_round_trips_through_typed_deserializer() {
-    use rusternetes_common::resources::SecretVolumeSource;
+    use k3rs_common::resources::SecretVolumeSource;
 
     let registry = ProtoRegistry::new();
     let mut bytes = Vec::new();
@@ -304,7 +304,7 @@ fn test_secret_volume_source_round_trips_through_typed_deserializer() {
 /// the inlined `LocalObjectReference.name` proto field.
 #[test]
 fn test_configmap_projection_round_trips_through_typed_deserializer() {
-    use rusternetes_common::resources::ConfigMapProjection;
+    use k3rs_common::resources::ConfigMapProjection;
 
     let registry = ProtoRegistry::new();
     let inner = local_object_reference("projected-cm");
@@ -329,7 +329,7 @@ fn test_configmap_projection_round_trips_through_typed_deserializer() {
 /// Same e2e round-trip for `SecretProjection`.
 #[test]
 fn test_secret_projection_round_trips_through_typed_deserializer() {
-    use rusternetes_common::resources::SecretProjection;
+    use k3rs_common::resources::SecretProjection;
 
     let registry = ProtoRegistry::new();
     let inner = local_object_reference("projected-secret");

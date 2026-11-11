@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::apiservice_registration::AggregatorHandlerManager;
-    pub use rusternetes_common::resources::apiregistration::AVAILABLE;
-    pub use rusternetes_common::resources::APIService;
-    pub use rusternetes_discovery::kube_version::compare_kube_aware_version_strings;
+    pub use k3rs_api_server::apiservice_registration::AggregatorHandlerManager;
+    pub use k3rs_common::resources::apiregistration::AVAILABLE;
+    pub use k3rs_common::resources::APIService;
+    pub use k3rs_discovery::kube_version::compare_kube_aware_version_strings;
     pub use serde_json::{json, Value};
     pub use std::cmp::Ordering;
     pub use std::sync::{Arc, Mutex, RwLock};
@@ -13,9 +13,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::aggregator_mux::*;
-    use rusternetes_common::resources::apiregistration::APIServiceCondition;
-    use rusternetes_common::resources::APIServiceReference;
+    use k3rs_api_server::aggregator_mux::*;
+    use k3rs_common::resources::apiregistration::APIServiceCondition;
+    use k3rs_common::resources::APIServiceReference;
 
     fn svc(name: &str, group_prio: i32, version_prio: i32, available: bool) -> APIService {
         let (version, group) = name.split_once('.').unwrap();
@@ -229,7 +229,7 @@ mod tests {
     /// hold: added ones appear (updated in place), removed ones vanish.
     #[test]
     fn manager_api_services_follow_add_update_remove() {
-        use rusternetes_api_server::apiservice_registration::APIHandlerManager;
+        use k3rs_api_server::apiservice_registration::APIHandlerManager;
         let m = AggregatorHandlerManager::new(None);
         assert!(m.api_services().is_empty());
         m.add_api_service(&svc("v1.foo", 1, 0, false)).unwrap();

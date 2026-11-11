@@ -20,8 +20,8 @@
 //! - `google/cadvisor/fs/fs.go::GetFsInfoForPath` — filesystem stats via `statfs`.
 
 use anyhow::{anyhow, Result};
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::{Node, NodeCondition, Pod};
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::{Node, NodeCondition, Pod};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -109,10 +109,10 @@ pub enum EvictionValue {
 
 /// QoS class for pod eviction priority.
 ///
-/// Re-exported from [`rusternetes_common::qos`], the single port of upstream
+/// Re-exported from [`k3rs_common::qos`], the single port of upstream
 /// `ComputePodQOS` — eviction ordering must use the same class the api-server
 /// published and the kubelet posts back in `status.qosClass`.
-pub use rusternetes_common::qos::QoSClass;
+pub use k3rs_common::qos::QoSClass;
 
 /// Resource statistics for a node
 #[derive(Debug, Clone)]
@@ -968,13 +968,13 @@ pub fn build_thresholds(
 
 /// Determine QoS class for a pod.
 ///
-/// Thin delegation to [`rusternetes_common::qos::compute_pod_qos`], the single
+/// Thin delegation to [`k3rs_common::qos::compute_pod_qos`], the single
 /// port of upstream `ComputePodQOS`
 /// (`pkg/apis/core/v1/helper/qos/qos.go:92-172`). Kept as a named function
 /// because eviction reads it per candidate pod, and the name matches what the
 /// eviction ordering code (and upstream's `qosComparator`) talks about.
 pub fn get_qos_class(pod: &Pod) -> QoSClass {
-    rusternetes_common::qos::compute_pod_qos(pod)
+    k3rs_common::qos::compute_pod_qos(pod)
 }
 
 /// Get filesystem stats for the path that hosts the kubelet's root dir.
@@ -1154,7 +1154,7 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
 
     let socket = std::env::var("CONTAINER_RUNTIME_ENDPOINT")
         .unwrap_or_else(|_| "unix:///run/containerd/containerd.sock".to_string());
-    let mut cri = match rusternetes_cri::CriClient::connect(&socket).await {
+    let mut cri = match k3rs_cri::CriClient::connect(&socket).await {
         Ok(c) => c,
         Err(e) => {
             warn!("Failed to connect to CRI runtime for pod stats: {}", e);
@@ -1170,7 +1170,7 @@ async fn get_pod_stats_async(pods: &[Pod]) -> HashMap<String, PodStats> {
 
         // Sum CRI per-container stats for this pod (matched by the pod-uid
         // label): working-set memory + writable-layer disk usage.
-        let filter = rusternetes_cri::v1::ContainerStatsFilter {
+        let filter = k3rs_cri::v1::ContainerStatsFilter {
             label_selector: HashMap::from([(
                 crate::labels::POD_UID_LABEL.to_string(),
                 pod.metadata.uid.clone(),

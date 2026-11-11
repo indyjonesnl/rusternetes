@@ -3,9 +3,9 @@
 //! Mirrors upstream `ValidatePersistentVolumeClaimSpec`
 //! (`pkg/apis/core/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::volume::PersistentVolumeClaim;
-use rusternetes_common::validation::field::{Error, ErrorType};
-use rusternetes_common::validation::pvc::validate_persistent_volume_claim;
+use k3rs_common::resources::volume::PersistentVolumeClaim;
+use k3rs_common::validation::field::{Error, ErrorType};
+use k3rs_common::validation::pvc::validate_persistent_volume_claim;
 use serde_json::json;
 
 fn pvc(spec: serde_json::Value) -> PersistentVolumeClaim {

@@ -5,16 +5,16 @@ mod __parent {
     pub use anyhow::Result;
     pub use async_trait::async_trait;
     pub use chrono::{DateTime, Utc};
+    pub use k3rs_common::quantity::parse_resource_value;
+    pub use k3rs_common::resources::CrossVersionObjectReference;
+    pub use k3rs_common::types::LabelSelector;
     pub use reqwest::Client;
-    pub use rusternetes_common::quantity::parse_resource_value;
-    pub use rusternetes_common::resources::CrossVersionObjectReference;
-    pub use rusternetes_common::types::LabelSelector;
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::hpa_metrics_client::*;
+    use k3rs_controller_manager::controllers::hpa_metrics_client::*;
 
     #[tokio::test]
     async fn fake_returns_seeded_pods_metric() {

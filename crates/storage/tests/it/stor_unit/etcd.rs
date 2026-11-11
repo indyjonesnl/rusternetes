@@ -7,8 +7,8 @@ mod __parent {
         Client, Compare, CompareOp, GetOptions, PutOptions, TxnOp, WatchOptions,
     };
     pub use futures::StreamExt;
-    pub use rusternetes_common::{authz::AuthzStorage, Error, Result};
-    pub use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+    pub use k3rs_common::{authz::AuthzStorage, Error, Result};
+    pub use k3rs_storage::{Storage, WatchEvent, WatchStream};
     pub use serde::{de::DeserializeOwned, Serialize};
     pub use std::sync::atomic::{AtomicI64, Ordering};
     pub use std::sync::Arc;
@@ -60,7 +60,7 @@ pub mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_storage::etcd::*;
+    use k3rs_storage::etcd::*;
     use serde::{Deserialize, Serialize};
 
     #[test]

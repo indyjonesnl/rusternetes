@@ -12,7 +12,7 @@
 # (crates/kubelet/src/runtime.rs::create_volume -> check_host_path_type). The
 # path must therefore exist identically on the host AND inside the kubelet
 # container. `@CERTS_PATH@` is a placeholder that bootstrap-cluster.sh rewrites
-# (sed) to the host-absolute path of `.rusternetes/certs`; compose mounts that
+# (sed) to the host-absolute path of `.k3rs/certs`; compose mounts that
 # same host path at the same path inside the kubelet (see compose.*.yml's
 # node-1 kubelet `@CERTS_PATH@:@CERTS_PATH@:ro` mount). The committed manifest
 # keeps the placeholder so it is not machine-specific.
@@ -44,7 +44,7 @@ spec:
   containers:
   - name: kube-scheduler
     # @CONTROL_PLANE_IMAGE@ is templated by bootstrap-cluster.sh: the local
-    # build path leaves rusternetes-scheduler:latest (imported into containerd
+    # build path leaves k3rs-scheduler:latest (imported into containerd
     # from the docker/podman daemon), the CI prebuilt path swaps in the GHCR
     # ref so the containerd CRI service pulls it directly. See
     # bootstrap-cluster.sh "control-plane image resolution".
@@ -52,7 +52,7 @@ spec:
     imagePullPolicy: IfNotPresent
     # The api-server runs with --skip-auth, so the kubeconfig only needs the CA
     # to validate the server's TLS cert (see scripts/generate-certs.sh). The
-    # static pod joins rusternetes-network, where `api-server` resolves to the
+    # static pod joins k3rs-network, where `api-server` resolves to the
     # api-server container (cert SANs include `api-server`).
     args:
     - "--api-server-url"

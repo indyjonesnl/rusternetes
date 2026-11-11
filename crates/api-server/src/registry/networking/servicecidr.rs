@@ -5,12 +5,12 @@ use crate::registry::rest::{
     RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
 };
 use crate::ssa::ResetFields;
-use rusternetes_common::resources::ServiceCIDR;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::servicecidr::{
+use k3rs_common::resources::ServiceCIDR;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::servicecidr::{
     validate_service_cidr, validate_service_cidr_status_update, validate_service_cidr_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 
 pub struct Strategy;

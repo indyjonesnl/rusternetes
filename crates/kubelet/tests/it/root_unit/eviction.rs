@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_common::qos::QoSClass;
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::{Node, NodeCondition, Pod};
+    pub use k3rs_common::qos::QoSClass;
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::{Node, NodeCondition, Pod};
     pub use std::collections::{HashMap, HashSet};
     pub use std::path::{Path, PathBuf};
     pub use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::eviction::*;
+    use k3rs_kubelet::eviction::*;
 
     /// Coverage inherited from the deleted `parse_memory_value`: every input
     /// the local suffix chain handled correctly still parses identically.
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn transition_period_reaches_consumer_from_config_and_flag_wins() {
-        use rusternetes_kubelet::config::KubeletConfiguration;
+        use k3rs_kubelet::config::KubeletConfiguration;
         let cfg = KubeletConfiguration {
             eviction_pressure_transition_period: Some(Duration::from_secs(45)),
             ..Default::default()
@@ -396,13 +396,13 @@ mod tests {
     #[test]
     fn test_qos_class_best_effort() {
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Pod".to_string(),
                 api_version: "v1".to_string(),
             },
-            metadata: rusternetes_common::types::ObjectMeta::new("test-pod"),
-            spec: Some(rusternetes_common::resources::PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+            metadata: k3rs_common::types::ObjectMeta::new("test-pod"),
+            spec: Some(k3rs_common::resources::PodSpec {
+                containers: vec![k3rs_common::resources::Container {
                     name: "test".to_string(),
                     image: "nginx".to_string(),
                     resources: None,
@@ -535,7 +535,7 @@ mod tests {
     ) -> (Pod, PodStats) {
         let mut pod = Pod::new(
             name,
-            rusternetes_common::resources::PodSpec {
+            k3rs_common::resources::PodSpec {
                 priority,
                 ..Default::default()
             },

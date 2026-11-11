@@ -9,7 +9,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::pagination::*;
+    use k3rs_common::pagination::*;
 
     #[test]
     fn test_no_pagination() {

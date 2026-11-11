@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Footprint benchmark harness (#1038).
 #
-# Measures the rusternetes all-in-one footprint so the "k3s without melting your
+# Measures the k3rs all-in-one footprint so the "k3s without melting your
 # laptop" claim rests on real numbers instead of vibes. Dimensions:
 #
-#   1. binary size      — release `rusternetes`, raw + stripped (musl variant noted)
+#   1. binary size      — release `k3rs`, raw + stripped (musl variant noted)
 #   2. time-to-cluster  — `compose up` → first node Ready
 #   3. idle RSS         — all-in-one container RSS, sampled while idle
 #   4. idle CPU %       — same window
@@ -17,16 +17,16 @@
 #   scripts/footprint-benchmark.sh                 # full run (builds release, boots stack)
 #   scripts/footprint-benchmark.sh --size-only     # binary size only (no Docker)
 #   scripts/footprint-benchmark.sh --seconds 60    # idle sample window (default 30)
-#   scripts/footprint-benchmark.sh --no-build      # use an existing target/release/rusternetes
+#   scripts/footprint-benchmark.sh --no-build      # use an existing target/release/k3rs
 set -euo pipefail
 
 SECONDS_TO_SAMPLE=30
 SIZE_ONLY=0
 BUILD=1
 # Honour CARGO_TARGET_DIR (dev boxes often share one target dir across worktrees).
-BIN="${CARGO_TARGET_DIR:-target}/release/rusternetes"
+BIN="${CARGO_TARGET_DIR:-target}/release/k3rs"
 COMPOSE_FILE="compose.all-in-one.yml"
-CONTAINER="rusternetes"
+CONTAINER="k3rs"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,8 +48,8 @@ human() { # bytes -> MiB with 1 decimal
 # ---------------------------------------------------------------------------
 need cargo
 if [[ "$BUILD" == "1" ]]; then
-  echo "==> building release all-in-one (cargo build --release -p rusternetes) ..." >&2
-  cargo build --release -p rusternetes
+  echo "==> building release all-in-one (cargo build --release -p k3rs) ..." >&2
+  cargo build --release -p k3rs
 fi
 if [[ ! -x "$BIN" ]]; then
   echo "error: $BIN not found — build it (omit --no-build) or run from the repo root." >&2
@@ -68,7 +68,7 @@ echo "## Binary size (release, host target)"
 echo "  raw:      $(human "$raw_bytes")  ($raw_bytes bytes)"
 echo "  stripped: $(human "$stripped_bytes")  ($stripped_bytes bytes)"
 echo "  musl+strip: build with"
-echo "    cargo build --release -p rusternetes --target x86_64-unknown-linux-musl && strip ..."
+echo "    cargo build --release -p k3rs --target x86_64-unknown-linux-musl && strip ..."
 
 if [[ "$SIZE_ONLY" == "1" ]]; then
   exit 0
@@ -79,7 +79,7 @@ fi
 # ---------------------------------------------------------------------------
 need docker
 DC="docker compose -f $COMPOSE_FILE"
-export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
+export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
 
 cleanup() { $DC down -v >/dev/null 2>&1 || true; }
 trap cleanup EXIT

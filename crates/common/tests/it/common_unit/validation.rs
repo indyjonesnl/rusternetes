@@ -12,12 +12,12 @@ mod job_status_strategy_tests {
     //! gate is not consulted by `getStatusValidationOptions`).
 
     use chrono::{DateTime, TimeZone, Utc};
-    use rusternetes_common::resources::workloads::{
+    use k3rs_common::resources::workloads::{
         Job, JobCondition, JobSpec, JobStatus, SuccessPolicy, SuccessPolicyRule,
         UncountedTerminatedPods,
     };
-    use rusternetes_common::validation::field::ErrorType::{self, Invalid, Required};
-    use rusternetes_common::validation::job::{
+    use k3rs_common::validation::field::ErrorType::{self, Invalid, Required};
+    use k3rs_common::validation::job::{
         get_status_validation_options, get_status_validation_options_with_gates,
         validate_job_update_status, JobStatusValidationGates,
     };

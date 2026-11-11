@@ -7,8 +7,8 @@ use axum::{
     routing::{any, get, post, put},
     Extension, Router,
 };
-use rusternetes_common::resources::CustomResourceDefinition;
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::resources::CustomResourceDefinition;
+use k3rs_storage::{build_key, Storage};
 use std::path::Path;
 use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 /// `apidiscovery.k8s.io/v2` inline-resources format) inline each
 /// aggregated/extension API group's resources.
 ///
-/// The `rusternetes-discovery` crate is storage-only and cannot HTTP-proxy to
+/// The `k3rs-discovery` crate is storage-only and cannot HTTP-proxy to
 /// an extension apiserver, so it emits `resources: []` for APIService-backed
 /// groups. Here in the router we have the full [`ApiServerState`] (aggregator
 /// proxy machinery), so we fill those in via
@@ -91,22 +91,23 @@ async fn api_groups_with_aggregated_resources(
                 // Stale with no resources (backend not Available yet), falls
                 // back to the per-request fetch below -- a deviation kept
                 // until the manager's resync covers that window.
-                if let Some(entry) = rusternetes_api_server::apiservice_registration::merged_discovery()
+                if let Some(entry) = k3rs_api_server::apiservice_registration::merged_discovery()
                     .groups()
                     .get(&group)
                     .and_then(|vs| vs.get(&version))
                     .filter(|e| {
-                        e.freshness == rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Current
+                        e.freshness
+                            == k3rs_api_server::apiservice_registration::DiscoveryFreshness::Current
                             || !e.resources.is_empty()
                     })
                 {
                     ver["resources"] = serde_json::Value::Array(entry.resources.clone());
                     ver["freshness"] = serde_json::Value::String(
                         match entry.freshness {
-                            rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Current => {
+                            k3rs_api_server::apiservice_registration::DiscoveryFreshness::Current => {
                                 "Current"
                             }
-                            rusternetes_api_server::apiservice_registration::DiscoveryFreshness::Stale => "Stale",
+                            k3rs_api_server::apiservice_registration::DiscoveryFreshness::Stale => "Stale",
                         }
                         .to_string(),
                     );
@@ -314,15 +315,16 @@ async fn custom_resource_fallback(
     if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
         let group_name = parts[0];
         let version_name = parts[1];
-        let prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+        let prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
         let crds: Vec<CustomResourceDefinition> =
             state.storage.list(&prefix).await.unwrap_or_default();
         let mut resources = Vec::new();
         // customresource_discovery_controller.go:105: only Established CRDs
         // are in discovery.
-        for crd in crds.iter().filter(|c| {
-            rusternetes_common::validation::crd::is_crd_condition_true(c, "Established")
-        }) {
+        for crd in crds
+            .iter()
+            .filter(|c| k3rs_common::validation::crd::is_crd_condition_true(c, "Established"))
+        {
             if crd.spec.group != group_name {
                 continue;
             }
@@ -334,8 +336,7 @@ async fn custom_resource_fallback(
             if !has_version {
                 continue;
             }
-            let namespaced =
-                crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced;
+            let namespaced = crd.spec.scope == k3rs_common::resources::ResourceScope::Namespaced;
             let verbs = vec![
                 "create",
                 "delete",
@@ -349,14 +350,9 @@ async fn custom_resource_fallback(
             // customresource_discovery_controller.go:133-135: the hash of the
             // storage:true version (the last one, as upstream's loop
             // overwrites), with the CRD's Spec.Names.Kind.
-            let storage_version_hash = crd
-                .spec
-                .versions
-                .iter()
-                .rev()
-                .find(|v| v.storage)
-                .map(|v| {
-                    rusternetes_common::resource_encoding::storage_version_hash::storage_version_hash(
+            let storage_version_hash =
+                crd.spec.versions.iter().rev().find(|v| v.storage).map(|v| {
+                    k3rs_common::resource_encoding::storage_version_hash::storage_version_hash(
                         &crd.spec.group,
                         &v.name,
                         &crd.spec.names.kind,
@@ -495,7 +491,7 @@ async fn custom_resource_fallback(
     //
     // possiblyAcrossAllNamespacesVerbs = list, watch (customresource_handler.go:226),
     // i.e. a GET on a collection; a GET with a name is `get`.
-    let namespaced_crd = crd.spec.scope == rusternetes_common::resources::ResourceScope::Namespaced;
+    let namespaced_crd = crd.spec.scope == k3rs_common::resources::ResourceScope::Namespaced;
     let namespaced_req = namespace.is_some_and(|ns| !ns.is_empty());
     let possibly_across_all_namespaces = method == Method::GET && name.is_none();
     if (!namespaced_crd && namespaced_req)
@@ -611,10 +607,10 @@ async fn custom_resource_fallback(
                     watch: Some(true),
                     allow_watch_bookmarks: query_params
                         .get("allowWatchBookmarks")
-                        .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                        .map(|v| k3rs_common::query::k8s_query_bool(v)),
                     send_initial_events: query_params
                         .get("sendInitialEvents")
-                        .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                        .map(|v| k3rs_common::query::k8s_query_bool(v)),
                 };
                 match handlers::custom_resource::watch_custom_resources(
                     state.clone(),
@@ -3051,9 +3047,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
                 apf,
-                crate::flow_control_filter::priority_and_fairness::<
-                    rusternetes_storage::StorageBackend,
-                >,
+                crate::flow_control_filter::priority_and_fairness::<k3rs_storage::StorageBackend>,
             ));
         }
         // `c.FlowControl == nil`: WithMaxInFlightLimit stands in for APF
@@ -3138,9 +3132,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         if let Some(apf) = crate::flow_control_filter::installed() {
             protected_routes = protected_routes.layer(axum_middleware::from_fn_with_state(
                 apf,
-                crate::flow_control_filter::priority_and_fairness::<
-                    rusternetes_storage::StorageBackend,
-                >,
+                crate::flow_control_filter::priority_and_fairness::<k3rs_storage::StorageBackend>,
             ));
         }
         // `c.FlowControl == nil`: WithMaxInFlightLimit stands in for APF

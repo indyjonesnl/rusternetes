@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::dra::ResourceClaimSpec;
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::dra::ResourceClaimSpec;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::resource::spec::*;
+    use k3rs_api_server::registry::resource::spec::*;
 
     fn spec() -> ResourceClaimSpec {
         serde_json::from_value(serde_json::json!({"devices": {

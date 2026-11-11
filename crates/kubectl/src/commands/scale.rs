@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use serde_json::{json, Value};
 
 /// Scale a resource (Deployment, ReplicaSet, StatefulSet, etc.)

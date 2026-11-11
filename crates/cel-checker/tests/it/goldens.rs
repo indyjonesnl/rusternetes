@@ -9,8 +9,8 @@
 //!
 //! Regenerate with `tools/cel-oracle/gen-goldens.sh`.
 
-use rusternetes_cel_checker::library_cost::kubernetes_cost;
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::library_cost::kubernetes_cost;
+use k3rs_cel_checker::{
     check, Container, DType, EnvSet, EnvType, Features, MapProvider, PatchTypeProvider, Provider,
     SourceLocator, VariableDecl, Version,
 };
@@ -118,7 +118,7 @@ fn ours(req: &Value) -> Ours {
     };
     let mut env = set.env(env_type, Container::default(), provider);
     if patch_types {
-        env.add_library(rusternetes_cel_checker::table::jsonpatch);
+        env.add_library(k3rs_cel_checker::table::jsonpatch);
     }
     if let Some(vars) = req.get("vars").and_then(Value::as_object) {
         for (n, t) in vars {
@@ -136,7 +136,7 @@ fn ours(req: &Value) -> Ours {
         .flatten()
     {
         match lib.as_str() {
-            Some("jsonpatch") => env.add_library(rusternetes_cel_checker::table::jsonpatch),
+            Some("jsonpatch") => env.add_library(k3rs_cel_checker::table::jsonpatch),
             other => panic!("unknown library {other:?}"),
         }
     }

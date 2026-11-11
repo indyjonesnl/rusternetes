@@ -5,7 +5,7 @@
 use crate::server_metrics::collect_volume_stat_cal_duration;
 use crate::volume_plugins::plugin::{Metrics, MetricsProvider};
 use anyhow::Result;
-use rusternetes_common::quantity::{Format, Quantity};
+use k3rs_common::quantity::{Format, Quantity};
 use std::time::Instant;
 
 /// `MetricsError` codes (`metrics_errors.go:23-31`).

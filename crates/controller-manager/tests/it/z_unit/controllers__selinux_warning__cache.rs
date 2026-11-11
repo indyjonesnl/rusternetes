@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_controller_manager::controllers::selinux_warning::translator::{
+    pub use k3rs_controller_manager::controllers::selinux_warning::translator::{
         parse_selinux_label, ControllerSELinuxTranslator,
     };
     pub use std::collections::{BTreeSet, HashMap, HashSet};
@@ -18,7 +18,7 @@ mod tests {
     //! `TestVolumeCache_DeletePodConflicts`,
     //! `TestVolumeCache_GetPodsForCSIDriver`.
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::selinux_warning::cache::*;
+    use k3rs_controller_manager::controllers::selinux_warning::cache::*;
 
     const MOUNT: &str = SELINUX_CHANGE_POLICY_MOUNT_OPTION;
     const RECURSIVE: &str = SELINUX_CHANGE_POLICY_RECURSIVE;

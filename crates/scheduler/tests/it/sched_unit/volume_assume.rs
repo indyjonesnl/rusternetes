@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
-    pub use rusternetes_scheduler::volume_binding::{
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim, Pod, Volume};
+    pub use k3rs_scheduler::volume_binding::{
         ephemeral_volume_is_for_pod, is_pvc_fully_bound, is_volume_bound_to_claim, pod_volumes,
         volume_pvc_name, BindingInfo, DynamicProvision, PodVolumes, VolumeSnapshot,
         ANN_SELECTED_NODE,
@@ -14,7 +14,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::volume_assume::*;
+    use k3rs_scheduler::volume_assume::*;
     use serde_json::{json, Value};
 
     // The resource structs do not implement PartialEq; compare wire form.

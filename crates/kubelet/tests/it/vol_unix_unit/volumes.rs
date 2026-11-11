@@ -3,12 +3,12 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         ConfigMap, KeyToPath, PersistentVolume, PersistentVolumeClaim, Pod,
     };
-    pub use rusternetes_kubelet::atomic_writer::FileProjection;
-    pub use rusternetes_kubelet::volume_plugins::VolumePlugin;
-    pub use rusternetes_storage::{build_key, Storage};
+    pub use k3rs_kubelet::atomic_writer::FileProjection;
+    pub use k3rs_kubelet::volume_plugins::VolumePlugin;
+    pub use k3rs_storage::{build_key, Storage};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, info, warn};
@@ -17,9 +17,9 @@ mod __parent {
 #[cfg(unix)]
 mod projected_mode_tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Secret;
-    use rusternetes_kubelet::volumes::*;
-    use rusternetes_storage::{build_key, Storage, StorageBackend};
+    use k3rs_common::resources::Secret;
+    use k3rs_kubelet::volumes::*;
+    use k3rs_storage::{build_key, Storage, StorageBackend};
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
@@ -34,7 +34,7 @@ mod projected_mode_tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let storage = Arc::new(StorageBackend::new_memory());
-        let cm: rusternetes_common::resources::ConfigMap = serde_json::from_value(json!({
+        let cm: k3rs_common::resources::ConfigMap = serde_json::from_value(json!({
             "metadata": {"name": "cfg", "namespace": "default"},
             "data": {"app.conf": "hello"}
         }))
@@ -66,14 +66,14 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         vm.create_pod_volumes(&pod).await.unwrap();
 
-        let file = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let file = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-p",
-            rusternetes_kubelet::pod_dirs::plugin::PROJECTED,
+            k3rs_kubelet::pod_dirs::plugin::PROJECTED,
             "proj",
         )
         .join("app.conf");
@@ -96,7 +96,7 @@ mod projected_mode_tests {
         use sha2::Digest;
         let dir = root
             .join("plugins")
-            .join(rusternetes_kubelet::pod_dirs::plugin::CSI)
+            .join(k3rs_kubelet::pod_dirs::plugin::CSI)
             // `makeDeviceMountPath`: `<csi plugin dir>/<driver>/<sha256(handle)>/globalmount`.
             .join("gone.example.com")
             .join(format!("{:x}", sha2::Sha256::digest(handle.as_bytes())));
@@ -114,7 +114,7 @@ mod projected_mode_tests {
         crate::volume_world::world(
             vm,
             "node-7",
-            Arc::new(rusternetes_storage::StorageBackend::new_memory()),
+            Arc::new(k3rs_storage::StorageBackend::new_memory()),
             pods,
         )
         .await
@@ -131,7 +131,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name("node-7");
         world_of(&vm, vec![]).await.restart().await;
@@ -148,7 +148,7 @@ mod projected_mode_tests {
     /// forgets it.
     #[tokio::test]
     async fn device_unmount_keeps_uncertain_state_across_reconciles() {
-        use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+        use k3rs_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
 
         let tmp = std::env::temp_dir().join(format!("rn-asw-sweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -156,7 +156,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         assert!(vm.asw.get_attached_volumes().is_empty());
 
@@ -172,7 +172,7 @@ mod projected_mode_tests {
 
         // `CompleteFunc` (`operation_generator.go:910`): the failed unstage is
         // observed under the driver-qualified plugin name.
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(
             body.contains("storage_operation_duration_seconds_count{migrated=\"false\",operation_name=\"unmount_device\",status=\"fail-unknown\",volume_plugin=\"kubernetes.io/csi:gone.example.com\"}"),
             "{body}"
@@ -196,14 +196,14 @@ mod projected_mode_tests {
     /// nothing wants is marked detached, i.e. leaves the world.
     #[tokio::test]
     async fn unmount_detach_devices_detaches_unmounted_unwanted_volumes() {
-        use rusternetes_kubelet::volume_plugins::plugin::OwnedSpec;
+        use k3rs_kubelet::volume_plugins::plugin::OwnedSpec;
 
         let tmp = std::env::temp_dir().join(format!("rn-asw-detach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pv = serde_json::from_value(json!({
             "metadata": {"name": "pv-x"},
@@ -218,9 +218,9 @@ mod projected_mode_tests {
             migrated: false,
             inline_volume_spec_for_csi_migration: false,
         });
-        let name = rusternetes_kubelet::volume_plugins::util::get_unique_volume_name_from_spec(
+        let name = k3rs_kubelet::volume_plugins::util::get_unique_volume_name_from_spec(
             vm.plugin_mgr
-                .find_plugin_by_name(rusternetes_kubelet::pod_dirs::plugin::CSI)
+                .find_plugin_by_name(k3rs_kubelet::pod_dirs::plugin::CSI)
                 .unwrap(),
             &spec.as_spec(),
         )
@@ -279,15 +279,15 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
 
         // Initial projection (AtomicWriter layout: config.conf -> ..data/config.conf).
         vm.create_pod_volumes(&pod).await.unwrap();
-        let visible = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let visible = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-kp",
-            rusternetes_kubelet::pod_dirs::plugin::CONFIG_MAP,
+            k3rs_kubelet::pod_dirs::plugin::CONFIG_MAP,
             "kube-proxy",
         )
         .join("config.conf");
@@ -301,10 +301,10 @@ mod projected_mode_tests {
         let real = std::fs::canonicalize(&visible).unwrap();
         let ctime_before = std::fs::metadata(&real).unwrap().ctime();
         let data_link_before = std::fs::read_link(
-            rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+            k3rs_kubelet::pod_dirs::get_pod_volume_dir(
                 &tmp.to_string_lossy(),
                 "uid-kp",
-                rusternetes_kubelet::pod_dirs::plugin::CONFIG_MAP,
+                k3rs_kubelet::pod_dirs::plugin::CONFIG_MAP,
                 "kube-proxy",
             )
             .join("..data"),
@@ -332,10 +332,10 @@ mod projected_mode_tests {
             "unchanged re-projection must not rewrite the config file in place (would crash kube-proxy)"
         );
         let data_link_after = std::fs::read_link(
-            rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+            k3rs_kubelet::pod_dirs::get_pod_volume_dir(
                 &tmp.to_string_lossy(),
                 "uid-kp",
-                rusternetes_kubelet::pod_dirs::plugin::CONFIG_MAP,
+                k3rs_kubelet::pod_dirs::plugin::CONFIG_MAP,
                 "kube-proxy",
             )
             .join("..data"),
@@ -382,10 +382,10 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         vm.create_pod_volumes(&pod).await.unwrap();
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             &pod.metadata.uid,
             plugin_dir,
@@ -441,7 +441,7 @@ mod projected_mode_tests {
             "sec-noop",
             pod,
             Some(secret),
-            rusternetes_kubelet::pod_dirs::plugin::SECRET,
+            k3rs_kubelet::pod_dirs::plugin::SECRET,
             "creds",
             "password",
             "hunter2",
@@ -499,13 +499,13 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         vm.create_pod_volumes(&pod).await.unwrap();
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-proj",
-            rusternetes_kubelet::pod_dirs::plugin::PROJECTED,
+            k3rs_kubelet::pod_dirs::plugin::PROJECTED,
             "proj",
         );
         let files = ["a", "b", "pw", "podname", "token"];
@@ -601,13 +601,13 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         vm.create_pod_volumes(&pod).await.unwrap();
-        let token = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let token = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-sat",
-            rusternetes_kubelet::pod_dirs::plugin::SECRET,
+            k3rs_kubelet::pod_dirs::plugin::SECRET,
             "kube-api-access-x",
         )
         .join("token");
@@ -636,7 +636,7 @@ mod projected_mode_tests {
             "da-noop",
             pod,
             None,
-            rusternetes_kubelet::pod_dirs::plugin::DOWNWARD_API,
+            k3rs_kubelet::pod_dirs::plugin::DOWNWARD_API,
             "podinfo",
             "name",
             "dapi-pod",
@@ -654,7 +654,7 @@ mod projected_mode_tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         let storage = Arc::new(StorageBackend::new_memory());
-        let secret: rusternetes_common::resources::Secret = serde_json::from_value(json!({
+        let secret: k3rs_common::resources::Secret = serde_json::from_value(json!({
             "metadata": {"name": "sec", "namespace": "default"},
             "data": {"data-1": "dmFsdWUtMQ=="}
         }))
@@ -682,10 +682,10 @@ mod projected_mode_tests {
         }))
         .unwrap();
 
-        let volume_dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let volume_dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-p",
-            rusternetes_kubelet::pod_dirs::plugin::PROJECTED,
+            k3rs_kubelet::pod_dirs::plugin::PROJECTED,
             "proj",
         );
         std::fs::create_dir_all(&volume_dir).unwrap();
@@ -694,7 +694,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         vm.create_pod_volumes(&pod).await.unwrap();
 
@@ -719,7 +719,7 @@ mod projected_mode_tests {
     /// lacks the annotation contributes nothing.
     #[tokio::test]
     async fn volume_gids_reads_pv_gid_annotation_for_pvc() {
-        use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
+        use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim};
 
         let storage = Arc::new(StorageBackend::new_memory());
 
@@ -774,7 +774,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             std::env::temp_dir().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         assert_eq!(vm.volume_gids(&pod).await, vec![7777]);
     }
@@ -802,7 +802,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
@@ -835,7 +835,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
 
         let pod: Pod = serde_json::from_value(json!({
@@ -843,7 +843,7 @@ mod projected_mode_tests {
             "spec": {"containers": []}
         }))
         .unwrap();
-        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+        let volume: k3rs_common::resources::Volume = serde_json::from_value(json!({
             "name": "sec",
             "secret": {"secretName": "mysecret", "defaultMode": 0o400}
         }))
@@ -899,7 +899,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
 
         let pod: Pod = serde_json::from_value(json!({
@@ -910,7 +910,7 @@ mod projected_mode_tests {
             }]}
         }))
         .unwrap();
-        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+        let volume: k3rs_common::resources::Volume = serde_json::from_value(json!({
             "name": "podinfo",
             "downwardAPI": {
                 "defaultMode": 416,
@@ -1019,7 +1019,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
 
         let pod: Pod = serde_json::from_value(json!({
@@ -1027,7 +1027,7 @@ mod projected_mode_tests {
             "spec": {"containers": []}
         }))
         .unwrap();
-        let volume: rusternetes_common::resources::Volume = serde_json::from_value(json!({
+        let volume: k3rs_common::resources::Volume = serde_json::from_value(json!({
             "name": "proj",
             "projected": {
                 "defaultMode": 416,
@@ -1150,7 +1150,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-1"},
@@ -1182,7 +1182,7 @@ mod projected_mode_tests {
     /// file becomes 0640 (#2540).
     #[tokio::test]
     async fn create_pod_volumes_fs_group_is_ro_mask_for_cm_secret_downward_api() {
-        use rusternetes_common::resources::ConfigMap;
+        use k3rs_common::resources::ConfigMap;
         use std::os::unix::fs::MetadataExt;
         let storage = Arc::new(StorageBackend::new_memory());
         let secret = Secret::new("sec", "default")
@@ -1213,7 +1213,7 @@ mod projected_mode_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         let pod: Pod = serde_json::from_value(json!({
             "metadata": {"name": "p", "namespace": "default", "uid": "uid-1",
@@ -1255,8 +1255,8 @@ mod projected_mode_tests {
 #[cfg(unix)]
 mod blocking_fs_offload_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volumes::*;
-    use rusternetes_storage::{build_key, Storage, StorageBackend};
+    use k3rs_kubelet::volumes::*;
+    use k3rs_storage::{build_key, Storage, StorageBackend};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1266,7 +1266,7 @@ mod blocking_fs_offload_tests {
         let tmp = std::env::temp_dir().join(format!("rn-offload-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&tmp);
         let storage = Arc::new(StorageBackend::new_memory());
-        let secret: rusternetes_common::resources::Secret = serde_json::from_value(json!({
+        let secret: k3rs_common::resources::Secret = serde_json::from_value(json!({
             "metadata": {"name": "s", "namespace": "default"},
             "data": {"k": "dg=="}
         }))
@@ -1283,10 +1283,10 @@ mod blocking_fs_offload_tests {
             "spec": {"containers": [], "volumes": [{"name": "sv", "secret": {"secretName": "s"}}]}
         }))
         .unwrap();
-        let dir = rusternetes_kubelet::pod_dirs::get_pod_volume_dir(
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(
             &tmp.to_string_lossy(),
             "uid-p",
-            rusternetes_kubelet::pod_dirs::plugin::SECRET,
+            k3rs_kubelet::pod_dirs::plugin::SECRET,
             "sv",
         );
         std::fs::create_dir_all(&dir).unwrap();
@@ -1299,7 +1299,7 @@ mod blocking_fs_offload_tests {
         let vm = VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         );
         (vm, pod, storage, fifo)
     }
@@ -1363,8 +1363,8 @@ mod blocking_fs_offload_tests {
 #[cfg(unix)]
 mod pod_certificate_resync_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volumes::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_kubelet::volumes::*;
+    use k3rs_storage::StorageBackend;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1372,7 +1372,7 @@ mod pod_certificate_resync_tests {
     struct RotatingManager(Mutex<(Vec<u8>, Vec<u8>)>);
 
     #[async_trait::async_trait]
-    impl rusternetes_kubelet::podcertificate::Manager for RotatingManager {
+    impl k3rs_kubelet::podcertificate::Manager for RotatingManager {
         fn track_pod(&self, _pod: &Pod) {}
         fn forget_pod(&self, _pod: &Pod) {}
         async fn get_pod_certificate_credential_bundle(
@@ -1385,7 +1385,7 @@ mod pod_certificate_resync_tests {
         ) -> Result<(Vec<u8>, Vec<u8>)> {
             Ok(self.0.lock().unwrap().clone())
         }
-        fn metric_report(&self) -> rusternetes_kubelet::podcertificate::MetricReport {
+        fn metric_report(&self) -> k3rs_kubelet::podcertificate::MetricReport {
             Default::default()
         }
     }
@@ -1401,7 +1401,7 @@ mod pod_certificate_resync_tests {
         let vm = VolumeManager::new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
             tmp.path().to_string_lossy().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             Some(mgr.clone()),
         );
         let pod: Pod = serde_json::from_value(json!({
@@ -1455,7 +1455,7 @@ mod pod_certificate_resync_tests {
     async fn resync_keeps_files_when_manager_errors() {
         struct Failing;
         #[async_trait::async_trait]
-        impl rusternetes_kubelet::podcertificate::Manager for Failing {
+        impl k3rs_kubelet::podcertificate::Manager for Failing {
             fn track_pod(&self, _pod: &Pod) {}
             fn forget_pod(&self, _pod: &Pod) {}
             async fn get_pod_certificate_credential_bundle(
@@ -1468,7 +1468,7 @@ mod pod_certificate_resync_tests {
             ) -> Result<(Vec<u8>, Vec<u8>)> {
                 Err(anyhow::anyhow!("no credential bundle yet"))
             }
-            fn metric_report(&self) -> rusternetes_kubelet::podcertificate::MetricReport {
+            fn metric_report(&self) -> k3rs_kubelet::podcertificate::MetricReport {
                 Default::default()
             }
         }
@@ -1494,11 +1494,11 @@ mod pod_certificate_resync_tests {
             b"k\n".to_vec(),
             b"c\n".to_vec(),
         ))));
-        let mk = |m: Arc<dyn rusternetes_kubelet::podcertificate::Manager>| {
+        let mk = |m: Arc<dyn k3rs_kubelet::podcertificate::Manager>| {
             VolumeManager::new_with_pod_certificate_manager_and_recording_empty_dir_mounts(
                 tmp.path().to_string_lossy().to_string(),
                 Some(storage.clone()),
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 Some(m),
             )
         };
@@ -1515,9 +1515,9 @@ mod pod_certificate_resync_tests {
 /// `podVolumesExist` consults first (`HasPossiblyMountedVolumesForPod`).
 #[cfg(unix)]
 mod actual_state_tests {
-    use rusternetes_common::resources::Pod;
-    use rusternetes_kubelet::volumes::VolumeManager;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_common::resources::Pod;
+    use k3rs_kubelet::volumes::VolumeManager;
+    use k3rs_storage::StorageBackend;
     use serde_json::json;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1539,7 +1539,7 @@ mod actual_state_tests {
         VolumeManager::new_with_recording_empty_dir_mounts(
             tmp.to_string_lossy().to_string(),
             Some(Arc::new(StorageBackend::new_memory())),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name("node-asw")
     }
@@ -1576,8 +1576,7 @@ mod actual_state_tests {
         let vm = manager(tmp.path());
         let pod = empty_dir_pod();
         vm.create_pod_volumes(&pod).await.unwrap();
-        let pod_dir =
-            rusternetes_kubelet::pod_dirs::get_pod_dir(&tmp.path().to_string_lossy(), "uid-asw");
+        let pod_dir = k3rs_kubelet::pod_dirs::get_pod_dir(&tmp.path().to_string_lossy(), "uid-asw");
         assert!(pod_dir.exists());
 
         vm.cleanup_orphaned_pod_dirs(&HashSet::new());
@@ -1627,7 +1626,7 @@ mod actual_state_tests {
     /// in flight (`IsOperationPending`, `reconciler_common.go:275-277`).
     #[tokio::test]
     async fn a_mount_in_flight_protects_its_volume_from_detach() {
-        use rusternetes_kubelet::volume_plugins::util::nested_pending_operations::EMPTY;
+        use k3rs_kubelet::volume_plugins::util::nested_pending_operations::EMPTY;
         let tmp = tempfile::tempdir().unwrap();
         let vm = manager(tmp.path());
         vm.create_pod_volumes(&empty_dir_pod()).await.unwrap();
@@ -1636,7 +1635,7 @@ mod actual_state_tests {
         // The pod's mount is recorded unmounted, as when a re-mount begins.
         vm.asw
             .mark_volume_as_unmounted(
-                &rusternetes_kubelet::volume_plugins::util::types::UniquePodName("uid-asw".into()),
+                &k3rs_kubelet::volume_plugins::util::types::UniquePodName("uid-asw".into()),
                 &name,
             )
             .unwrap();

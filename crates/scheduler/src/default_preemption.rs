@@ -23,8 +23,8 @@
 
 use std::collections::HashSet;
 
-use rusternetes_common::resources::{Node, Pod, PodDisruptionBudget};
-use rusternetes_common::types::label_selector_as_selector;
+use k3rs_common::resources::{Node, Pod, PodDisruptionBudget};
+use k3rs_common::types::label_selector_as_selector;
 
 use crate::advanced::pod_key;
 use crate::framework_runtime::Framework;

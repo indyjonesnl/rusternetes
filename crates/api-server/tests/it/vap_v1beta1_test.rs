@@ -9,8 +9,8 @@
 //! one version reads at the other with that version's apiVersion.
 
 use axum::http::StatusCode;
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const B: &str = "/apis/admissionregistration.k8s.io/v1beta1";

@@ -3,12 +3,12 @@
 //! `readyToUnmount` (`reconstruct.go`): a volume no pod wants is unmounted,
 //! but only once the desired state is fully populated.
 
-use rusternetes_common::resources::{ConfigMap, Pod};
-use rusternetes_kubelet::podcertificate::PodManager;
-use rusternetes_kubelet::volume_manager::populator::PodStateProvider;
-use rusternetes_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
-use rusternetes_kubelet::volumes::VolumeManager;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{ConfigMap, Pod};
+use k3rs_kubelet::podcertificate::PodManager;
+use k3rs_kubelet::volume_manager::populator::PodStateProvider;
+use k3rs_kubelet::volume_manager::VolumeManager as VolumeManagerShell;
+use k3rs_kubelet::volumes::VolumeManager;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,7 @@ async fn kubelet(dir: &Path, pods: Vec<Pod>) -> (Arc<VolumeManager>, VolumeManag
         &config_map(),
     )
     .await;
-    let node: rusternetes_common::resources::Node = serde_json::from_value(json!({
+    let node: k3rs_common::resources::Node = serde_json::from_value(json!({
         "apiVersion": "v1", "kind": "Node",
         "metadata": {"name": "node-rr"},
         "status": {"volumesAttached": [{"name": "kubernetes.io/csi/other", "devicePath": "/dev/x"}]}
@@ -88,7 +88,7 @@ async fn kubelet(dir: &Path, pods: Vec<Pod>) -> (Arc<VolumeManager>, VolumeManag
         VolumeManager::new_with_recording_empty_dir_mounts(
             dir.display().to_string(),
             Some(storage.clone()),
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
         .with_node_name("node-rr"),
     );

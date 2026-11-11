@@ -3,9 +3,9 @@
 //! Mirrors the core of upstream `ValidateEndpointSlice`
 //! (`pkg/apis/discovery/validation/validation.go`, release-1.35).
 
-use rusternetes_common::resources::endpointslice::EndpointSlice;
-use rusternetes_common::validation::endpointslice::validate_endpoint_slice;
-use rusternetes_common::validation::field::{Error, ErrorType};
+use k3rs_common::resources::endpointslice::EndpointSlice;
+use k3rs_common::validation::endpointslice::validate_endpoint_slice;
+use k3rs_common::validation::field::{Error, ErrorType};
 use serde_json::json;
 
 fn es(v: serde_json::Value) -> EndpointSlice {

@@ -17,7 +17,7 @@
 //! per-test namespace (`f.Namespace`) is created up front with
 //! `strict_namespaces()`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(

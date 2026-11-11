@@ -27,7 +27,7 @@
 //! too: 422/Invalid is for an object that decoded and then failed validation;
 //! an undecodable body is 400/BadRequest (#1915).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn post_raw(uri: &str, body: &str) -> (u16, String) {
@@ -193,7 +193,7 @@ async fn a_decodable_body_is_unaffected_and_validation_still_returns_invalid() {
 /// Every creatable resource must answer an undecodable body the same way.
 ///
 /// The response shape cannot be a property of which handler you happen to hit.
-/// Rusternetes has three decode mechanisms — the `DumpingJson` extractor, a
+/// k3rs has three decode mechanisms — the `DumpingJson` extractor, a
 /// hand-rolled `serde_json::from_slice` on a `Bytes` body, and the generic
 /// patch path — and they disagreed: the extractor returned axum's plain-text
 /// 422, most hand-rolled sites returned `Error::InvalidResource` (422/Invalid),

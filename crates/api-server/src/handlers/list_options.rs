@@ -27,9 +27,9 @@
 
 use std::collections::HashMap;
 
-use rusternetes_common::validation::field::{Error as FieldError, Path};
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::validation::field::{Error as FieldError, Path};
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 
 /// `ValidateListOptions` (apimachinery
 /// `pkg/apis/meta/internalversion/validation/validation.go:28-76`) over the
@@ -242,7 +242,7 @@ where
 /// revision [`list_items`] read at when one was recorded for this request,
 /// otherwise [`crate::handlers::list_collection_resource_version`].
 pub async fn list_resource_version<T: serde::Serialize>(
-    storage: &rusternetes_storage::StorageBackend,
+    storage: &k3rs_storage::StorageBackend,
     params: &HashMap<String, String>,
     items: &[T],
 ) -> String {

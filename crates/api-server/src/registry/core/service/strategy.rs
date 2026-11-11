@@ -1,11 +1,11 @@
 //! Service strategies — port of `pkg/registry/core/service/strategy.go` and
 //! `GetWarningsForService` (`pkg/api/service/warnings.go`).
 
-use rusternetes_common::resources::{LoadBalancerStatus, Service, ServiceStatus, ServiceType};
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::ipaddress::get_warnings_for_cidr;
-use rusternetes_common::validation::metav1::get_warnings_for_ip;
-use rusternetes_common::validation::service::{
+use k3rs_common::resources::{LoadBalancerStatus, Service, ServiceStatus, ServiceType};
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::ipaddress::get_warnings_for_cidr;
+use k3rs_common::validation::metav1::get_warnings_for_ip;
+use k3rs_common::validation::service::{
     externally_accessible, validate_service_create, validate_service_status_update,
     validate_service_update,
 };
@@ -50,7 +50,7 @@ fn needs_hc_node_port(svc: &Service) -> bool {
     is_type(svc, ServiceType::LoadBalancer)
         && matches!(
             svc.spec.external_traffic_policy,
-            Some(rusternetes_common::resources::ServiceExternalTrafficPolicy::Local)
+            Some(k3rs_common::resources::ServiceExternalTrafficPolicy::Local)
         )
 }
 

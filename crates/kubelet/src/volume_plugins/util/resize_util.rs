@@ -25,11 +25,11 @@
 
 use anyhow::{anyhow, Result};
 use chrono::SecondsFormat;
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::volume::{
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::volume::{
     PersistentVolumeClaim, PersistentVolumeClaimCondition, PersistentVolumeClaimStatus,
 };
-use rusternetes_storage::{build_key, Storage};
+use k3rs_storage::{build_key, Storage};
 
 /// `v1.ResourceStorage`.
 pub const RESOURCE_STORAGE: &str = "storage";

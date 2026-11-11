@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::types::{Status, StatusDetails};
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::types::{Status, StatusDetails};
+    pub use k3rs_common::Error;
     pub use std::fmt::Display;
     pub use std::future::Future;
     pub use std::time::Duration;
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_storage::busy::*;
+    use k3rs_storage::busy::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const FAST: RetryPolicy = RetryPolicy {

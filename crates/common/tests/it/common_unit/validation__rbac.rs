@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::rbac::{
+    pub use k3rs_common::resources::rbac::{
         ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_subdomain, validate_label_selector, LabelSelectorValidationOptions,
     };
 }
 
 mod update_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::rbac::*;
+    use k3rs_common::validation::rbac::*;
 
     fn rb(role_ref_name: &str) -> RoleBinding {
         serde_json::from_value(serde_json::json!({

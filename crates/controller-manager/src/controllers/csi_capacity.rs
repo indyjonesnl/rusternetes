@@ -14,16 +14,16 @@
 
 use super::csi_capacity_metrics::CapacityStats;
 use super::csi_capacity_refresh::{ItemKey, QueueKey, State};
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::csi::{CSINode, CSIStorageCapacity};
-use rusternetes_common::resources::volume::LabelSelector;
-use rusternetes_common::resources::volume::{NodeSelectorTerm, StorageClass, VolumeBindingMode};
-use rusternetes_common::resources::Node;
-use rusternetes_common::types::{ObjectMeta, OwnerReference, TypeMeta};
-use rusternetes_common::{Error, Result};
-use rusternetes_csi::controller_client::CsiControllerClient;
-use rusternetes_csi::proto::{GetCapacityRequest, GetCapacityResponse, Topology};
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::csi::{CSINode, CSIStorageCapacity};
+use k3rs_common::resources::volume::LabelSelector;
+use k3rs_common::resources::volume::{NodeSelectorTerm, StorageClass, VolumeBindingMode};
+use k3rs_common::resources::Node;
+use k3rs_common::types::{ObjectMeta, OwnerReference, TypeMeta};
+use k3rs_common::{Error, Result};
+use k3rs_csi::controller_client::CsiControllerClient;
+use k3rs_csi::proto::{GetCapacityRequest, GetCapacityResponse, Topology};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -243,7 +243,7 @@ pub async fn lookup_owner<S: Storage>(
     api_version: &str,
     kind: &str,
     levels: i32,
-    limiter: &rusternetes_client::ratelimit::RateLimiter,
+    limiter: &k3rs_client::ratelimit::RateLimiter,
 ) -> Result<OwnerReference> {
     let (mut api_version, mut kind, mut name, mut levels) = (
         api_version.to_string(),
@@ -411,7 +411,7 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
     /// (`--kube-api-capacity-qps/-burst`, csi-provisioner.go:456-458): every
     /// non-watch request of that clientset (CSIStorageCapacity create, update,
     /// delete and the informer's list) takes a token, see [`capacity_limiter`].
-    pub limiter: std::sync::Arc<rusternetes_client::ratelimit::RateLimiter>,
+    pub limiter: std::sync::Arc<k3rs_client::ratelimit::RateLimiter>,
 }
 
 /// The rate limiter `kubernetes.NewForConfig` builds for `config.QPS` /
@@ -420,8 +420,8 @@ pub struct CapacityController<'a, S: Storage, C: CapacityClient> {
 pub fn capacity_limiter(
     qps: f64,
     burst: i32,
-) -> std::sync::Arc<rusternetes_client::ratelimit::RateLimiter> {
-    use rusternetes_client::ratelimit::{RateLimiter, DEFAULT_BURST, DEFAULT_QPS};
+) -> std::sync::Arc<k3rs_client::ratelimit::RateLimiter> {
+    use k3rs_client::ratelimit::{RateLimiter, DEFAULT_BURST, DEFAULT_QPS};
     let qps = if qps == 0.0 { DEFAULT_QPS } else { qps };
     let burst = if burst == 0 {
         DEFAULT_BURST
@@ -1132,7 +1132,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     async fn run_informer<T>(
         &self,
         prefix: String,
-        mut first: Option<rusternetes_storage::WatchStream>,
+        mut first: Option<k3rs_storage::WatchStream>,
         throttled: bool,
         relist: impl Fn(Vec<T>),
         upsert: impl Fn(&T),
@@ -1141,7 +1141,7 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
     {
         use futures::StreamExt;
-        use rusternetes_storage::WatchEvent;
+        use k3rs_storage::WatchEvent;
         loop {
             let mut stream = match first.take() {
                 Some(s) => s,
@@ -1198,8 +1198,8 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     async fn run_topology(
         &self,
         topology: &TopologySource,
-        nodes: Option<rusternetes_storage::WatchStream>,
-        csinodes: Option<rusternetes_storage::WatchStream>,
+        nodes: Option<k3rs_storage::WatchStream>,
+        csinodes: Option<k3rs_storage::WatchStream>,
     ) {
         if matches!(topology, TopologySource::Fixed(_)) {
             return std::future::pending().await;
@@ -1223,12 +1223,12 @@ impl<S: Storage, C: CapacityClient> CapacityController<'_, S, C> {
     /// (nodes.go:63-150): they only `queue.Add("")`.
     async fn watch_topology(
         &self,
-        mut nodes: Option<rusternetes_storage::WatchStream>,
-        mut csinodes: Option<rusternetes_storage::WatchStream>,
+        mut nodes: Option<k3rs_storage::WatchStream>,
+        mut csinodes: Option<k3rs_storage::WatchStream>,
         queue: &TopologyQueue,
     ) {
         use futures::StreamExt;
-        use rusternetes_storage::WatchEvent;
+        use k3rs_storage::WatchEvent;
         let node_prefix = build_prefix("nodes", None);
         let csinode_prefix = build_prefix("csinodes", None);
         // What the handlers' `oldObj` provides in Go: node labels and the

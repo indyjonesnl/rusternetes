@@ -12,16 +12,16 @@
 //! (`staging/src/k8s.io/api/core/v1/types.go:7314-7322`).
 
 use axum::http::StatusCode;
-use rusternetes_common::{
+use k3rs_common::{
     admission::{AdmissionReview, AdmissionReviewResponse},
     resources::{
         FailurePolicy, OperationType, Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook,
         ValidatingWebhookConfiguration, WebhookClientConfig,
     },
 };
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
-use rusternetes_test_support::mock_http::*;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
+use k3rs_test_support::mock_http::*;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -54,7 +54,7 @@ async fn install_connect_webhook(api: &TestApiServer, url: String, resource: &st
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "ValidatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("deny-connect"),
+        metadata: k3rs_common::types::ObjectMeta::new("deny-connect"),
         webhooks: Some(vec![ValidatingWebhook {
             name: "deny.connect.io".into(),
             client_config: WebhookClientConfig {

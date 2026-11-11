@@ -2,22 +2,22 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::NodeAffinity;
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_scheduler::framework_runtime::{
+    pub use k3rs_common::resources::pod::NodeAffinity;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_scheduler::framework_runtime::{
         default_plugins, merge_plugins, new_framework, ExtensionPoint, Framework, Plugins,
         ProfileSpec, Registry,
     };
-    pub use rusternetes_scheduler::scheduler_config::VolumeBindingArgs;
-    pub use rusternetes_scheduler::volume_binding::{self, FunctionShapePoint};
+    pub use k3rs_scheduler::scheduler_config::VolumeBindingArgs;
+    pub use k3rs_scheduler::volume_binding::{self, FunctionShapePoint};
     pub use std::collections::HashMap;
     pub use std::time::Duration;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::PodSpec;
-    use rusternetes_scheduler::profile::*;
+    use k3rs_common::resources::PodSpec;
+    use k3rs_scheduler::profile::*;
     use serde_json::json;
 
     /// profile_test.go `fakeRegistry`: queue sort plugins `QueueSort` /
@@ -36,7 +36,7 @@ mod tests {
     }
 
     fn p(name: &str, qs: &str, args: Option<serde_json::Value>) -> Profile {
-        use rusternetes_scheduler::framework_runtime::{Plugin, PluginSet};
+        use k3rs_scheduler::framework_runtime::{Plugin, PluginSet};
         let one = |n: &str| PluginSet {
             enabled: vec![Plugin::new(n)],
             disabled: Vec::new(),
@@ -128,7 +128,7 @@ mod tests {
     // profile_test.go TestNewMap "invalid framework configuration".
     #[test]
     fn new_map_invalid_framework_configuration() {
-        use rusternetes_scheduler::framework_runtime::{Plugin, PluginSet};
+        use k3rs_scheduler::framework_runtime::{Plugin, PluginSet};
         let mut prof = p("invalid-profile", "QueueSort", None);
         prof.plugins = Some(Plugins {
             queue_sort: PluginSet {
@@ -147,7 +147,7 @@ mod tests {
     // Each profile keeps its own resolved plugin set and score weights.
     #[test]
     fn each_profile_keeps_its_own_framework() {
-        use rusternetes_scheduler::framework_runtime::{Plugin, PluginSet};
+        use k3rs_scheduler::framework_runtime::{Plugin, PluginSet};
         let mut b = Profile::named("b");
         let mut plugins = b.plugins.take().unwrap();
         plugins.filter.disabled = vec![Plugin::new("TaintToleration")];

@@ -11,15 +11,15 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     IPFamily, IPFamilyPolicy, Service, ServiceExternalTrafficPolicy, ServiceType,
 };
-use rusternetes_common::validation::field;
-use rusternetes_common::validation::service::{
+use k3rs_common::validation::field;
+use k3rs_common::validation::service::{
     parse_ip_sloppy, validate_service_cluster_ips_related_fields,
 };
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 use std::net::IpAddr;
 
 use super::ipallocator::cidr::MetaAllocator;

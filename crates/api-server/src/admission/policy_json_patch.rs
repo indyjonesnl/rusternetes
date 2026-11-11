@@ -8,13 +8,13 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_common::admission::GroupVersionKind;
-use rusternetes_common::admission::Operation as AdmissionOperation;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::cel::{CELContext, CELEvaluator};
-use rusternetes_common::cel_authz_library;
-use rusternetes_common::cel_cost::{charge_budget, CostOptions};
-use rusternetes_common::cel_struct::{self, TypeCheck};
+use k3rs_common::admission::GroupVersionKind;
+use k3rs_common::admission::Operation as AdmissionOperation;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::cel::{CELContext, CELEvaluator};
+use k3rs_common::cel_authz_library;
+use k3rs_common::cel_cost::{charge_budget, CostOptions};
+use k3rs_common::cel_struct::{self, TypeCheck};
 use serde_json::{json, Value};
 
 use super::policy_json_patch_ops::{apply, ApplyError, Operation};
@@ -404,7 +404,7 @@ fn create_admission_request(r: &PatchRequest<'_>) -> Value {
 /// branch, json_patch.go:102-103, which has nothing to decode strictly).
 fn unknown_fields_of(kind: &GroupVersionKind, object: &Value) -> Option<Vec<String>> {
     use crate::handlers::validation::find_unknown_fields_via_schema as f;
-    use rusternetes_common::resources as r;
+    use k3rs_common::resources as r;
     Some(match (kind.group.as_str(), kind.kind.as_str()) {
         ("", "Pod") => f::<r::Pod>(object),
         ("", "ReplicationController") => f::<r::ReplicationController>(object),
@@ -447,9 +447,10 @@ fn strict_decode_check(
     if introduced.is_empty() {
         return Ok(());
     }
-    Err(PatchError::Status(rusternetes_common::Error::Internal(
-        format!("strict decoding error: {}", introduced.join(", ")),
-    )))
+    Err(PatchError::Status(k3rs_common::Error::Internal(format!(
+        "strict decoding error: {}",
+        introduced.join(", ")
+    ))))
 }
 
 #[async_trait]

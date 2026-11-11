@@ -9,7 +9,7 @@
 //!   - `application/cbor`               — full object encoding (POST / PUT / GET / LIST)
 //!   - `application/apply-patch+cbor`   — server-side apply patches
 //!
-//! Rusternetes routes these media types through
+//! k3rs routes these media types through
 //! `crates/api-server/src/middleware.rs`. The request branch decodes the CBOR
 //! body into a JSON value before any handler sees it; the response branch
 //! re-encodes the JSON value as CBOR when the client negotiated CBOR via the
@@ -39,9 +39,9 @@
 //!     a panic and not silent data corruption.
 
 use axum::http::{Method, StatusCode};
-use rusternetes_api_server::cbor;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::cbor;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

@@ -113,7 +113,7 @@ spec:
     image: nginx:latest
 "#;
 
-            use rusternetes_common::resources::Pod;
+            use k3rs_common::resources::Pod;
             let pod: Pod = serde_yaml::from_str(yaml).unwrap();
 
             assert_eq!(pod.metadata.namespace, Some("custom-ns".to_string()));
@@ -133,7 +133,7 @@ spec:
     image: nginx:latest
 "#;
 
-            use rusternetes_common::resources::Pod;
+            use k3rs_common::resources::Pod;
             let pod: Pod = serde_yaml::from_str(yaml).unwrap();
 
             let namespace = pod
@@ -199,7 +199,7 @@ metadata:
 mod create_test {
     #[cfg(test)]
     mod tests {
-        use rusternetes_kubectl::commands::create::*;
+        use k3rs_kubectl::commands::create::*;
         use serde_json::Value;
 
         #[test]
@@ -829,7 +829,7 @@ metadata:
 mod get_test {
     #[cfg(test)]
     mod tests {
-        use rusternetes_kubectl::commands::get::*;
+        use k3rs_kubectl::commands::get::*;
 
         #[test]
         fn test_output_format_json() {

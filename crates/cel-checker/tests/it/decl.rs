@@ -2,8 +2,8 @@
 //! behavior of `types.go`, through the checker.
 
 use cel::parser::Parser;
-use rusternetes_cel_checker::decl::{escape, DeclField, DeclType, DeclTypeProvider};
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::decl::{escape, DeclField, DeclType, DeclTypeProvider};
+use k3rs_cel_checker::{
     check, Container, DType, EnvSet, EnvType, Features, MapProvider, NoLocations, VariableDecl,
     Version,
 };

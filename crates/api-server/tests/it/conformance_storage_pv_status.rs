@@ -7,7 +7,7 @@
 //! creates an unbound PV then a PVC; no controller runs in-process, so the
 //! phases read back are Available/Pending, both accepted by the case.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(

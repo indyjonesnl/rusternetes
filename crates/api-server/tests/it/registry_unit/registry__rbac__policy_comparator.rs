@@ -2,12 +2,12 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::PolicyRule;
+    pub use k3rs_common::resources::PolicyRule;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::rbac::policy_comparator::*;
+    use k3rs_api_server::registry::rbac::policy_comparator::*;
 
     fn rule(verbs: &[&str], groups: &[&str], resources: &[&str], names: &[&str]) -> PolicyRule {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();

@@ -11,16 +11,16 @@
 //! endpoint ordering is deterministic. If a reconcile keeps rewriting the
 //! same slice we would see resource-version churn → watch storm → hot-loop.
 
-use rusternetes_common::resources::endpointslice::{
+use k3rs_common::resources::endpointslice::{
     Endpoint, EndpointConditions, EndpointPort, EndpointReference,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerPort, EndpointSlice, IntOrString, Pod, PodCondition, PodSpec, PodStatus,
     Service, ServicePort, ServiceSpec,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpointslice::EndpointSliceController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -9,12 +9,12 @@ use axum::{
 };
 use futures::future::BoxFuture;
 use futures::StreamExt;
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     types::{ObjectMeta, Status},
     Error, Result,
 };
-use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+use k3rs_storage::{build_prefix, Storage, WatchEvent};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +47,7 @@ pub struct WatchParams {
     /// Resource version to watch from
     #[serde(
         rename = "resourceVersion",
-        deserialize_with = "rusternetes_common::serde_helpers::empty_as_none",
+        deserialize_with = "k3rs_common::serde_helpers::empty_as_none",
         default
     )]
     pub resource_version: Option<String>,
@@ -202,10 +202,10 @@ pub fn watch_params_from_query(params: &std::collections::HashMap<String, String
         watch: Some(true),
         allow_watch_bookmarks: params
             .get("allowWatchBookmarks")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+            .map(|v| k3rs_common::query::k8s_query_bool(v)),
         send_initial_events: params
             .get("sendInitialEvents")
-            .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+            .map(|v| k3rs_common::query::k8s_query_bool(v)),
     }
 }
 
@@ -286,7 +286,7 @@ async fn open_watch_stream(
     prefix: &str,
     requested_rv: Option<&str>,
     scope: &crate::watch_cache::WatchScope,
-) -> Result<std::result::Result<rusternetes_storage::WatchStream, Response>> {
+) -> Result<std::result::Result<k3rs_storage::WatchStream, Response>> {
     // `cacher.Watch` (storage/cacher/cacher.go:513-516) and `etcd3.store.Watch`
     // (storage/etcd3/store.go:967-970) return `ParseResourceVersion`'s
     // `InvalidError` untouched, and `Store.WatchPredicate` passes it on
@@ -476,9 +476,9 @@ pub async fn watch_snapshot(
 /// carries the delete's revision (storage stamps it, as etcd3's
 /// `parseEvent` does with `e.rev`), so it is ordered correctly here.
 pub fn skip_events_covered_by_snapshot(
-    stream: rusternetes_storage::WatchStream,
+    stream: k3rs_storage::WatchStream,
     cutoff: Option<u64>,
-) -> rusternetes_storage::WatchStream {
+) -> k3rs_storage::WatchStream {
     let Some(cutoff) = cutoff else {
         return stream;
     };
@@ -813,7 +813,7 @@ where
 
         // Box-pin the watch stream so it can be replaced on reconnect
         let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
+            Box<dyn futures::Stream<Item = k3rs_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
         // Watch loop with timeout support
@@ -1390,7 +1390,7 @@ where
 
         // Box-pin the watch stream so it can be replaced on reconnect
         let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
+            Box<dyn futures::Stream<Item = k3rs_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
         // Watch loop with timeout support
@@ -1770,7 +1770,7 @@ fn matches_field_selector<T: Serialize>(object: &T, selector: &Option<String>) -
         Some(s) if !s.is_empty() => s,
         _ => return true,
     };
-    let parsed = match rusternetes_common::field_selector::FieldSelector::parse(selector) {
+    let parsed = match k3rs_common::field_selector::FieldSelector::parse(selector) {
         Ok(p) => p,
         Err(_) => return true, // unparseable selector: don't drop events
     };
@@ -2250,10 +2250,8 @@ pub async fn watch_pods(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<impl IntoResponse> {
-    watch_namespaced::<rusternetes_common::resources::Pod>(
-        state, auth_ctx, namespace, "pods", "", params,
-    )
-    .await
+    watch_namespaced::<k3rs_common::resources::Pod>(state, auth_ctx, namespace, "pods", "", params)
+        .await
 }
 
 /// Watch services in a namespace
@@ -2266,7 +2264,7 @@ pub async fn watch_services(
     let converter = crate::handlers::service::default_on_read_watch_converter(
         state.cluster_ip_allocators.primary_family(),
     );
-    watch_namespaced_converted::<rusternetes_common::resources::Service>(
+    watch_namespaced_converted::<k3rs_common::resources::Service>(
         state, auth_ctx, namespace, "services", "", params, converter, None,
     )
     .await
@@ -2283,7 +2281,7 @@ pub async fn watch_all_services(
     let converter = crate::handlers::service::default_on_read_watch_converter(
         state.cluster_ip_allocators.primary_family(),
     );
-    watch_cluster_scoped_converted::<rusternetes_common::resources::Service>(
+    watch_cluster_scoped_converted::<k3rs_common::resources::Service>(
         state, auth_ctx, "services", "", params, converter, None,
     )
     .await
@@ -2296,7 +2294,7 @@ pub async fn watch_deployments(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<impl IntoResponse> {
-    watch_namespaced::<rusternetes_common::resources::Deployment>(
+    watch_namespaced::<k3rs_common::resources::Deployment>(
         state,
         auth_ctx,
         namespace,
@@ -2314,7 +2312,7 @@ pub async fn watch_configmaps(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<impl IntoResponse> {
-    watch_namespaced::<rusternetes_common::resources::ConfigMap>(
+    watch_namespaced::<k3rs_common::resources::ConfigMap>(
         state,
         auth_ctx,
         namespace,
@@ -2332,7 +2330,7 @@ pub async fn watch_secrets(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<impl IntoResponse> {
-    watch_namespaced::<rusternetes_common::resources::Secret>(
+    watch_namespaced::<k3rs_common::resources::Secret>(
         state, auth_ctx, namespace, "secrets", "", params,
     )
     .await
@@ -2344,10 +2342,7 @@ pub async fn watch_nodes(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<impl IntoResponse> {
-    watch_cluster_scoped::<rusternetes_common::resources::Node>(
-        state, auth_ctx, "nodes", "", params,
-    )
-    .await
+    watch_cluster_scoped::<k3rs_common::resources::Node>(state, auth_ctx, "nodes", "", params).await
 }
 
 /// Watch namespaces (cluster-scoped)
@@ -2356,7 +2351,7 @@ pub async fn watch_namespaces(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::Namespace>(
+    watch_cluster_scoped::<k3rs_common::resources::Namespace>(
         state,
         auth_ctx,
         "namespaces",
@@ -2373,7 +2368,7 @@ pub async fn watch_endpoints(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Endpoints>(
+    watch_namespaced::<k3rs_common::resources::Endpoints>(
         state,
         auth_ctx,
         namespace,
@@ -2391,7 +2386,7 @@ pub async fn watch_endpointslices(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::EndpointSlice>(
+    watch_namespaced::<k3rs_common::resources::EndpointSlice>(
         state,
         auth_ctx,
         namespace,
@@ -2409,7 +2404,7 @@ pub async fn watch_statefulsets(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::StatefulSet>(
+    watch_namespaced::<k3rs_common::resources::StatefulSet>(
         state,
         auth_ctx,
         namespace,
@@ -2427,7 +2422,7 @@ pub async fn watch_replicasets(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::ReplicaSet>(
+    watch_namespaced::<k3rs_common::resources::ReplicaSet>(
         state,
         auth_ctx,
         namespace,
@@ -2445,7 +2440,7 @@ pub async fn watch_daemonsets(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::DaemonSet>(
+    watch_namespaced::<k3rs_common::resources::DaemonSet>(
         state,
         auth_ctx,
         namespace,
@@ -2463,7 +2458,7 @@ pub async fn watch_jobs(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Job>(
+    watch_namespaced::<k3rs_common::resources::Job>(
         state, auth_ctx, namespace, "jobs", "batch", params,
     )
     .await
@@ -2476,7 +2471,7 @@ pub async fn watch_cronjobs(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::CronJob>(
+    watch_namespaced::<k3rs_common::resources::CronJob>(
         state, auth_ctx, namespace, "cronjobs", "batch", params,
     )
     .await
@@ -2489,7 +2484,7 @@ pub async fn watch_events(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Event>(
+    watch_namespaced::<k3rs_common::resources::Event>(
         state, auth_ctx, namespace, "events", "", params,
     )
     .await
@@ -2502,7 +2497,7 @@ pub async fn watch_serviceaccounts(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::ServiceAccount>(
+    watch_namespaced::<k3rs_common::resources::ServiceAccount>(
         state,
         auth_ctx,
         namespace,
@@ -2519,7 +2514,7 @@ pub async fn watch_persistentvolumes(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::PersistentVolume>(
+    watch_cluster_scoped::<k3rs_common::resources::PersistentVolume>(
         state,
         auth_ctx,
         "persistentvolumes",
@@ -2536,7 +2531,7 @@ pub async fn watch_persistentvolumeclaims(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::PersistentVolumeClaim>(
+    watch_namespaced::<k3rs_common::resources::PersistentVolumeClaim>(
         state,
         auth_ctx,
         namespace,
@@ -2553,7 +2548,7 @@ pub async fn watch_runtimeclasses(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::RuntimeClass>(
+    watch_cluster_scoped::<k3rs_common::resources::RuntimeClass>(
         state,
         auth_ctx,
         "runtimeclasses",
@@ -2570,7 +2565,7 @@ pub async fn watch_resourcequotas(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::ResourceQuota>(
+    watch_namespaced::<k3rs_common::resources::ResourceQuota>(
         state,
         auth_ctx,
         namespace,
@@ -2587,7 +2582,7 @@ pub async fn watch_resourcequotas_all(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ResourceQuota>(
+    watch_cluster_scoped::<k3rs_common::resources::ResourceQuota>(
         state,
         auth_ctx,
         "resourcequotas",
@@ -2603,7 +2598,7 @@ pub async fn watch_servicecidrs(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ServiceCIDR>(
+    watch_cluster_scoped::<k3rs_common::resources::ServiceCIDR>(
         state,
         auth_ctx,
         "servicecidrs",
@@ -2619,7 +2614,7 @@ pub async fn watch_ipaddresses(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::IPAddress>(
+    watch_cluster_scoped::<k3rs_common::resources::IPAddress>(
         state,
         auth_ctx,
         "ipaddresses",
@@ -2635,7 +2630,7 @@ pub async fn watch_crds(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::CustomResourceDefinition>(
+    watch_cluster_scoped::<k3rs_common::resources::CustomResourceDefinition>(
         state,
         auth_ctx,
         "customresourcedefinitions",
@@ -2651,7 +2646,7 @@ pub async fn watch_validatingwebhookconfigurations(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ValidatingWebhookConfiguration>(
+    watch_cluster_scoped::<k3rs_common::resources::ValidatingWebhookConfiguration>(
         state,
         auth_ctx,
         "validatingwebhookconfigurations",
@@ -2667,7 +2662,7 @@ pub async fn watch_mutatingwebhookconfigurations(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::MutatingWebhookConfiguration>(
+    watch_cluster_scoped::<k3rs_common::resources::MutatingWebhookConfiguration>(
         state,
         auth_ctx,
         "mutatingwebhookconfigurations",
@@ -2683,7 +2678,7 @@ pub async fn watch_validatingadmissionpolicies(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ValidatingAdmissionPolicy>(
+    watch_cluster_scoped::<k3rs_common::resources::ValidatingAdmissionPolicy>(
         state,
         auth_ctx,
         "validatingadmissionpolicies",
@@ -2699,7 +2694,7 @@ pub async fn watch_validatingadmissionpolicybindings(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ValidatingAdmissionPolicyBinding>(
+    watch_cluster_scoped::<k3rs_common::resources::ValidatingAdmissionPolicyBinding>(
         state,
         auth_ctx,
         "validatingadmissionpolicybindings",
@@ -2716,7 +2711,7 @@ pub async fn watch_poddisruptionbudgets(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::PodDisruptionBudget>(
+    watch_namespaced::<k3rs_common::resources::PodDisruptionBudget>(
         state,
         auth_ctx,
         namespace,
@@ -2733,7 +2728,7 @@ pub async fn watch_poddisruptionbudgets_all(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::PodDisruptionBudget>(
+    watch_cluster_scoped::<k3rs_common::resources::PodDisruptionBudget>(
         state,
         auth_ctx,
         "poddisruptionbudgets",
@@ -2750,7 +2745,7 @@ pub async fn watch_limitranges(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::LimitRange>(
+    watch_namespaced::<k3rs_common::resources::LimitRange>(
         state,
         auth_ctx,
         namespace,
@@ -2768,7 +2763,7 @@ pub async fn watch_replicationcontrollers(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::ReplicationController>(
+    watch_namespaced::<k3rs_common::resources::ReplicationController>(
         state,
         auth_ctx,
         namespace,
@@ -2785,7 +2780,7 @@ pub async fn watch_priorityclasses(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::PriorityClass>(
+    watch_cluster_scoped::<k3rs_common::resources::PriorityClass>(
         state,
         auth_ctx,
         "priorityclasses",
@@ -2801,7 +2796,7 @@ pub async fn watch_storageclasses(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::StorageClass>(
+    watch_cluster_scoped::<k3rs_common::resources::StorageClass>(
         state,
         auth_ctx,
         "storageclasses",
@@ -2817,7 +2812,7 @@ pub async fn watch_clusterroles(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ClusterRole>(
+    watch_cluster_scoped::<k3rs_common::resources::ClusterRole>(
         state,
         auth_ctx,
         "clusterroles",
@@ -2833,7 +2828,7 @@ pub async fn watch_clusterrolebindings(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::ClusterRoleBinding>(
+    watch_cluster_scoped::<k3rs_common::resources::ClusterRoleBinding>(
         state,
         auth_ctx,
         "clusterrolebindings",
@@ -2850,7 +2845,7 @@ pub async fn watch_roles(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Role>(
+    watch_namespaced::<k3rs_common::resources::Role>(
         state,
         auth_ctx,
         namespace,
@@ -2868,7 +2863,7 @@ pub async fn watch_rolebindings(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::RoleBinding>(
+    watch_namespaced::<k3rs_common::resources::RoleBinding>(
         state,
         auth_ctx,
         namespace,
@@ -2886,7 +2881,7 @@ pub async fn watch_leases(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Lease>(
+    watch_namespaced::<k3rs_common::resources::Lease>(
         state,
         auth_ctx,
         namespace,
@@ -2904,7 +2899,7 @@ pub async fn watch_ingresses(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::Ingress>(
+    watch_namespaced::<k3rs_common::resources::Ingress>(
         state,
         auth_ctx,
         namespace,
@@ -2922,7 +2917,7 @@ pub async fn watch_networkpolicies(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::NetworkPolicy>(
+    watch_namespaced::<k3rs_common::resources::NetworkPolicy>(
         state,
         auth_ctx,
         namespace,
@@ -2939,7 +2934,7 @@ pub async fn watch_certificatesigningrequests(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::CertificateSigningRequest>(
+    watch_cluster_scoped::<k3rs_common::resources::CertificateSigningRequest>(
         state,
         auth_ctx,
         "certificatesigningrequests",
@@ -2957,7 +2952,7 @@ pub async fn watch_mutatingadmissionpolicies(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     crate::handlers::mutating_admission_policy::gate()?;
-    watch_cluster_scoped::<rusternetes_common::resources::MutatingAdmissionPolicy>(
+    watch_cluster_scoped::<k3rs_common::resources::MutatingAdmissionPolicy>(
         state,
         auth_ctx,
         "mutatingadmissionpolicies",
@@ -2975,7 +2970,7 @@ pub async fn watch_mutatingadmissionpolicybindings(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     crate::handlers::mutating_admission_policy::gate()?;
-    watch_cluster_scoped::<rusternetes_common::resources::MutatingAdmissionPolicyBinding>(
+    watch_cluster_scoped::<k3rs_common::resources::MutatingAdmissionPolicyBinding>(
         state,
         auth_ctx,
         "mutatingadmissionpolicybindings",
@@ -2995,7 +2990,7 @@ pub async fn watch_storageversionmigrations(
 ) -> Result<Response> {
     crate::handlers::storageversionmigration::gate()?;
     watch_cluster_scoped::<
-        rusternetes_common::resources::storageversionmigration::StorageVersionMigration,
+        k3rs_common::resources::storageversionmigration::StorageVersionMigration,
     >(
         state,
         auth_ctx,
@@ -3013,7 +3008,7 @@ pub async fn watch_clustertrustbundles(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     crate::handlers::clustertrustbundle::gate()?;
-    watch_cluster_scoped::<rusternetes_common::resources::ClusterTrustBundle>(
+    watch_cluster_scoped::<k3rs_common::resources::ClusterTrustBundle>(
         state,
         auth_ctx,
         "clustertrustbundles",
@@ -3033,7 +3028,7 @@ pub async fn watch_podcertificaterequests(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     crate::handlers::podcertificaterequest::gate()?;
-    watch_namespaced::<rusternetes_common::resources::podcertificaterequest::PodCertificateRequest>(
+    watch_namespaced::<k3rs_common::resources::podcertificaterequest::PodCertificateRequest>(
         state,
         auth_ctx,
         namespace,
@@ -3052,9 +3047,7 @@ pub async fn watch_all_podcertificaterequests(
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
     crate::handlers::podcertificaterequest::gate()?;
-    watch_cluster_scoped::<
-        rusternetes_common::resources::podcertificaterequest::PodCertificateRequest,
-    >(
+    watch_cluster_scoped::<k3rs_common::resources::podcertificaterequest::PodCertificateRequest>(
         state,
         auth_ctx,
         "podcertificaterequests",
@@ -3070,7 +3063,7 @@ pub async fn watch_flowschemas(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::FlowSchema>(
+    watch_cluster_scoped::<k3rs_common::resources::FlowSchema>(
         state,
         auth_ctx,
         "flowschemas",
@@ -3086,7 +3079,7 @@ pub async fn watch_prioritylevelconfigurations(
     Extension(auth_ctx): Extension<AuthContext>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_cluster_scoped::<rusternetes_common::resources::PriorityLevelConfiguration>(
+    watch_cluster_scoped::<k3rs_common::resources::PriorityLevelConfiguration>(
         state,
         auth_ctx,
         "prioritylevelconfigurations",
@@ -3103,7 +3096,7 @@ pub async fn watch_podtemplates(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::PodTemplate>(
+    watch_namespaced::<k3rs_common::resources::PodTemplate>(
         state,
         auth_ctx,
         namespace,
@@ -3121,7 +3114,7 @@ pub async fn watch_controllerrevisions(
     Path(namespace): Path<String>,
     Query(params): Query<WatchParams>,
 ) -> Result<Response> {
-    watch_namespaced::<rusternetes_common::resources::ControllerRevision>(
+    watch_namespaced::<k3rs_common::resources::ControllerRevision>(
         state,
         auth_ctx,
         namespace,
@@ -3279,7 +3272,7 @@ pub async fn watch_cluster_scoped_json(
         };
 
         let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
+            Box<dyn futures::Stream<Item = k3rs_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
         let watch_future = async {
@@ -3524,7 +3517,7 @@ pub async fn watch_namespaced_json(
         };
 
         let mut watch_stream: std::pin::Pin<
-            Box<dyn futures::Stream<Item = rusternetes_common::Result<WatchEvent>> + Send>,
+            Box<dyn futures::Stream<Item = k3rs_common::Result<WatchEvent>> + Send>,
         > = Box::pin(watch_stream);
 
         let watch_future = async {

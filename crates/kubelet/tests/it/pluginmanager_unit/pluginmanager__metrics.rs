@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
+    pub use k3rs_kubelet::pluginmanager::cache::{ActualStateOfWorld, DesiredStateOfWorld};
     pub use prometheus::core::{Collector, Desc};
     pub use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
-    pub use rusternetes_kubelet::pluginmanager::cache::{ActualStateOfWorld, DesiredStateOfWorld};
     pub use std::collections::BTreeMap;
     pub use std::sync::{Arc, Once};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pluginmanager::cache::PluginInfo;
-    use rusternetes_kubelet::pluginmanager::metrics::*;
+    use k3rs_kubelet::pluginmanager::cache::PluginInfo;
+    use k3rs_kubelet::pluginmanager::metrics::*;
     use std::time::SystemTime;
 
     fn fake_plugin() -> PluginInfo {

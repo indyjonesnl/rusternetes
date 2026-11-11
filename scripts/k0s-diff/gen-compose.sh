@@ -7,7 +7,7 @@
 #   v0            baseline, no swap — resolves to the plain all-Go k0s node.
 #   v1..v4        baked custom image: the build arg SWAP_COMPONENT=<component>
 #                 tells Dockerfile.k0s-node which upstream Go binary to replace
-#                 with its Rusternetes build (shim baked in a later task).
+#                 with its k3rs build (shim baked in a later task).
 #   v5 (kube-proxy), v6 (dns)
 #                 workload swap: same base image; run-variant.sh swaps the
 #                 DaemonSet/Deployment via kubectl. The com.k0s-diff.swap label

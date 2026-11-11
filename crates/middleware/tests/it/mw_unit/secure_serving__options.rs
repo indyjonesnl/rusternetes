@@ -3,18 +3,18 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::authz::{Authorizer, PrivilegedGroupAuthorizer};
-    pub use rusternetes_middleware::secure_serving::authn::{
+    pub use k3rs_common::authz::{Authorizer, PrivilegedGroupAuthorizer};
+    pub use k3rs_middleware::secure_serving::authn::{
         AnonymousAuthConfig, CaContent, DelegatingAuthenticatorConfig, RequestAuthenticator,
         RequestHeaderConfig, RequestHeaderSettings,
     };
-    pub use rusternetes_middleware::secure_serving::authz::{
+    pub use k3rs_middleware::secure_serving::authz::{
         new_path_authorizer, DelegatingAuthorizerConfig,
     };
-    pub use rusternetes_middleware::secure_serving::serve::{
+    pub use k3rs_middleware::secure_serving::serve::{
         tls_cipher_suites, tls_version, SecureServingInfo, ServingCert,
     };
-    pub use rusternetes_middleware::secure_serving::webhook::{
+    pub use k3rs_middleware::secure_serving::webhook::{
         ApiClientReviewClient, Backoff, ReviewClient, ReviewError,
     };
     pub use std::net::IpAddr;
@@ -25,7 +25,7 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use clap::Parser;
-    use rusternetes_middleware::secure_serving::options::*;
+    use k3rs_middleware::secure_serving::options::*;
 
     #[derive(Parser, Debug)]
     struct Cli {
@@ -489,8 +489,8 @@ mod tests {
     // authorizers; everything else is not allowed.
     #[tokio::test]
     async fn to_authorizer_without_a_client_has_only_masters_and_paths() {
-        use rusternetes_common::auth::UserInfo;
-        use rusternetes_common::authz::{Decision, RequestAttributes};
+        use k3rs_common::auth::UserInfo;
+        use k3rs_common::authz::{Decision, RequestAttributes};
         let o = DelegatingAuthorizationOptions::new();
         let a = o.to_authorizer(None).unwrap();
         let u = |name: &str, groups: &[&str]| UserInfo {
@@ -576,13 +576,11 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert("authorization", "Bearer token".parse().unwrap());
         let r = a
-            .authenticate_request(
-                &mut rusternetes_middleware::secure_serving::authn::AuthRequest {
-                    headers: &mut h,
-                    path: "/",
-                    peer_certs: &[],
-                },
-            )
+            .authenticate_request(&mut k3rs_middleware::secure_serving::authn::AuthRequest {
+                headers: &mut h,
+                path: "/",
+                peer_certs: &[],
+            })
             .await
             .unwrap()
             .unwrap();
@@ -634,13 +632,11 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert("authorization", "Bearer token".parse().unwrap());
         let r = a
-            .authenticate_request(
-                &mut rusternetes_middleware::secure_serving::authn::AuthRequest {
-                    headers: &mut h,
-                    path: "/",
-                    peer_certs: &[],
-                },
-            )
+            .authenticate_request(&mut k3rs_middleware::secure_serving::authn::AuthRequest {
+                headers: &mut h,
+                path: "/",
+                peer_certs: &[],
+            })
             .await;
         assert!(
             r.is_err(),
@@ -648,13 +644,11 @@ mod tests {
         );
         // no credentials: anonymous
         let r = a
-            .authenticate_request(
-                &mut rusternetes_middleware::secure_serving::authn::AuthRequest {
-                    headers: &mut axum::http::HeaderMap::new(),
-                    path: "/",
-                    peer_certs: &[],
-                },
-            )
+            .authenticate_request(&mut k3rs_middleware::secure_serving::authn::AuthRequest {
+                headers: &mut axum::http::HeaderMap::new(),
+                path: "/",
+                peer_certs: &[],
+            })
             .await
             .unwrap()
             .unwrap();

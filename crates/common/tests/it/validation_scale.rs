@@ -2,9 +2,9 @@
 //! validation.go:40-49), the wire shape, and the selector string a scale
 //! status carries (`LabelSelectorAsSelector(..).String()`).
 
-use rusternetes_common::resources::{Scale, ScaleSpec};
-use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta};
-use rusternetes_common::validation::hpa::validate_scale;
+use k3rs_common::resources::{Scale, ScaleSpec};
+use k3rs_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta};
+use k3rs_common::validation::hpa::validate_scale;
 use std::collections::HashMap;
 
 fn scale(replicas: i32) -> Scale {

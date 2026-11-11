@@ -1,5 +1,5 @@
 [package]
-name = "rusternetes"
+name = "k3rs"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,28 +7,28 @@ license.workspace = true
 description = "All-in-one Kubernetes in a single binary"
 
 [[bin]]
-name = "rusternetes"
+name = "k3rs"
 path = "src/main.rs"
 
 [features]
 default = ["sqlite"]
 sqlite = [
-    "rusternetes-storage/sqlite",
-    "rusternetes-api-server/sqlite",
-    "rusternetes-scheduler/sqlite",
-    "rusternetes-controller-manager/sqlite",
-    "rusternetes-kubelet/sqlite",
-    "rusternetes-kube-proxy/sqlite",
-    "rusternetes-dns/sqlite",
+    "k3rs-storage/sqlite",
+    "k3rs-api-server/sqlite",
+    "k3rs-scheduler/sqlite",
+    "k3rs-controller-manager/sqlite",
+    "k3rs-kubelet/sqlite",
+    "k3rs-kube-proxy/sqlite",
+    "k3rs-dns/sqlite",
 ]
 redis = [
-    "rusternetes-storage/redis",
-    "rusternetes-api-server/redis",
-    "rusternetes-scheduler/redis",
-    "rusternetes-controller-manager/redis",
-    "rusternetes-kubelet/redis",
-    "rusternetes-kube-proxy/redis",
-    "rusternetes-dns/redis",
+    "k3rs-storage/redis",
+    "k3rs-api-server/redis",
+    "k3rs-scheduler/redis",
+    "k3rs-controller-manager/redis",
+    "k3rs-kubelet/redis",
+    "k3rs-kube-proxy/redis",
+    "k3rs-dns/redis",
 ]
 # Heap profiling via dhat (off by default). Build with
 # `--features dhat-heap` to swap in dhat's allocator; on a clean shutdown
@@ -44,15 +44,15 @@ dhat-heap = ["dep:dhat"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-rusternetes-api-server = { path = "../api-server" }
-rusternetes-scheduler = { path = "../scheduler" }
-rusternetes-controller-manager = { path = "../controller-manager" }
-rusternetes-kubelet = { path = "../kubelet" }
-rusternetes-kube-proxy = { path = "../kube-proxy" }
-rusternetes-dns = { path = "../dns" }
-rusternetes-client = { path = "../client" }
-rusternetes-storage = { path = "../storage" }
-rusternetes-common = { path = "../common" }
+k3rs-api-server = { path = "../api-server" }
+k3rs-scheduler = { path = "../scheduler" }
+k3rs-controller-manager = { path = "../controller-manager" }
+k3rs-kubelet = { path = "../kubelet" }
+k3rs-kube-proxy = { path = "../kube-proxy" }
+k3rs-dns = { path = "../dns" }
+k3rs-client = { path = "../client" }
+k3rs-storage = { path = "../storage" }
+k3rs-common = { path = "../common" }
 tokio.workspace = true
 axum.workspace = true
 clap.workspace = true

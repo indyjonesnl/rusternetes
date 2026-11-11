@@ -2283,6 +2283,604 @@ dependencies = [
 ]
 
 [[package]]
+name = "k3rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "dhat",
+ "k3rs-api-server",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-controller-manager",
+ "k3rs-dns",
+ "k3rs-kube-proxy",
+ "k3rs-kubelet",
+ "k3rs-scheduler",
+ "k3rs-storage",
+ "mimalloc",
+ "serial_test",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-admission-webhook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "cel",
+ "chrono",
+ "futures",
+ "k3rs-common",
+ "k3rs-storage",
+ "prometheus",
+ "rand 0.9.4",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "k3rs-api-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64",
+ "bytes",
+ "cel",
+ "chrono",
+ "ciborium",
+ "clap",
+ "futures",
+ "get_if_addrs",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap 2.14.0",
+ "inotify",
+ "ipnet",
+ "jsonwebtoken",
+ "k3rs-admission-webhook",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-controller-core",
+ "k3rs-controller-manager",
+ "k3rs-cri",
+ "k3rs-discovery",
+ "k3rs-middleware",
+ "k3rs-protobuf",
+ "k3rs-storage",
+ "k3rs-streamproxy",
+ "k3rs-test-support",
+ "mimalloc",
+ "openapiv3",
+ "pem",
+ "prometheus",
+ "prometheus-http-query",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "protox-parse",
+ "rand 0.9.4",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-tungstenite",
+ "tower 0.4.13",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "k3rs-cel-checker"
+version = "0.1.0"
+dependencies = [
+ "cel",
+ "serde_json",
+]
+
+[[package]]
+name = "k3rs-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "futures",
+ "k3rs-test-support",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-common"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "cel",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "criterion",
+ "cron",
+ "ed25519-dalek",
+ "etcd-client",
+ "flate2",
+ "futures",
+ "ipnet",
+ "jsonwebtoken",
+ "k3rs-cel-checker",
+ "k8s-openapi",
+ "once_cell",
+ "p224",
+ "p256",
+ "p384",
+ "p521",
+ "pem",
+ "prometheus",
+ "proptest",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rsa",
+ "rustls",
+ "rustls-pemfile",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "sha2",
+ "tempfile",
+ "testcontainers",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "k3rs-controller-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures",
+ "k3rs-common",
+ "k3rs-storage",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-controller-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "cron",
+ "fnv",
+ "futures",
+ "hmac",
+ "ipnet",
+ "jsonwebtoken",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-controller-core",
+ "k3rs-csi",
+ "k3rs-discovery",
+ "k3rs-middleware",
+ "k3rs-storage",
+ "mimalloc",
+ "pem",
+ "prometheus",
+ "rand 0.9.4",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "k3rs-cri"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hyper-util",
+ "k3rs-common",
+ "prost",
+ "prost-types",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "k3rs-csi"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
+]
+
+[[package]]
+name = "k3rs-discovery"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "k3rs-common",
+ "k3rs-storage",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "k3rs-dns"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "futures",
+ "hickory-proto",
+ "hickory-server",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-storage",
+ "mimalloc",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-kube-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "crc",
+ "futures",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-controller-manager",
+ "k3rs-storage",
+ "mimalloc",
+ "miniz_oxide 0.8.9",
+ "prometheus",
+ "protobuf",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "k3rs-kubectl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "k3rs-client",
+ "k3rs-common",
+ "mimalloc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tabled",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+ "walkdir",
+]
+
+[[package]]
+name = "k3rs-kubelet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "flate2",
+ "futures",
+ "futures-util",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper-util",
+ "inotify",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-cri",
+ "k3rs-csi",
+ "k3rs-middleware",
+ "k3rs-storage",
+ "k3rs-streamproxy",
+ "libc",
+ "mimalloc",
+ "p256",
+ "p384",
+ "p521",
+ "pem",
+ "prometheus",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "rand_core 0.6.4",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rsa",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "sha1",
+ "sha2",
+ "sysinfo",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tonic-health",
+ "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "k3rs-middleware"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64",
+ "bytes",
+ "chrono",
+ "ciborium",
+ "clap",
+ "futures",
+ "hmac",
+ "http-body",
+ "http-body-util",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-protobuf",
+ "k3rs-storage",
+ "prometheus",
+ "prost",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+ "url",
+ "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "k3rs-protobuf"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "k3rs-common",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-scheduler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "k3rs-client",
+ "k3rs-common",
+ "k3rs-controller-manager",
+ "k3rs-middleware",
+ "k3rs-storage",
+ "k3rs-test-support",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "serial_test",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "k3rs-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "criterion",
+ "etcd-client",
+ "futures",
+ "k3rs-client",
+ "k3rs-common",
+ "prometheus",
+ "rhino",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "k3rs-streamproxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "k3rs-test-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures",
+ "k3rs-api-server",
+ "k3rs-common",
+ "k3rs-storage",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.4.13",
+]
+
+[[package]]
 name = "k8s-openapi"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3629,604 +4227,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
-]
-
-[[package]]
-name = "rusternetes"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "dhat",
- "mimalloc",
- "rusternetes-api-server",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-controller-manager",
- "rusternetes-dns",
- "rusternetes-kube-proxy",
- "rusternetes-kubelet",
- "rusternetes-scheduler",
- "rusternetes-storage",
- "serial_test",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-admission-webhook"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "cel",
- "chrono",
- "futures",
- "prometheus",
- "rand 0.9.4",
- "reqwest",
- "rusternetes-common",
- "rusternetes-storage",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rusternetes-api-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "axum-server",
- "base64",
- "bytes",
- "cel",
- "chrono",
- "ciborium",
- "clap",
- "futures",
- "get_if_addrs",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "indexmap 2.14.0",
- "inotify",
- "ipnet",
- "jsonwebtoken",
- "mimalloc",
- "openapiv3",
- "pem",
- "prometheus",
- "prometheus-http-query",
- "prost",
- "prost-build",
- "prost-types",
- "protox-parse",
- "rand 0.9.4",
- "rcgen",
- "reqwest",
- "rusternetes-admission-webhook",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-controller-core",
- "rusternetes-controller-manager",
- "rusternetes-cri",
- "rusternetes-discovery",
- "rusternetes-middleware",
- "rusternetes-protobuf",
- "rusternetes-storage",
- "rusternetes-streamproxy",
- "rusternetes-test-support",
- "rustls",
- "rustls-native-certs 0.8.3",
- "rustls-pemfile",
- "serde",
- "serde_ignored",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tokio-test",
- "tokio-tungstenite",
- "tower 0.4.13",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "x509-parser",
-]
-
-[[package]]
-name = "rusternetes-cel-checker"
-version = "0.1.0"
-dependencies = [
- "cel",
- "serde_json",
-]
-
-[[package]]
-name = "rusternetes-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "futures",
- "rcgen",
- "reqwest",
- "rusternetes-test-support",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-common"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "cel",
- "chrono",
- "chrono-tz",
- "clap",
- "criterion",
- "cron",
- "ed25519-dalek",
- "etcd-client",
- "flate2",
- "futures",
- "ipnet",
- "jsonwebtoken",
- "k8s-openapi",
- "once_cell",
- "p224",
- "p256",
- "p384",
- "p521",
- "pem",
- "prometheus",
- "proptest",
- "prost",
- "prost-types",
- "rand 0.9.4",
- "rcgen",
- "regex",
- "reqwest",
- "rsa",
- "rusternetes-cel-checker",
- "rustls",
- "rustls-pemfile",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "sha2",
- "tempfile",
- "testcontainers",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tower 0.4.13",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "x509-parser",
-]
-
-[[package]]
-name = "rusternetes-controller-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "futures",
- "rusternetes-common",
- "rusternetes-storage",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-controller-manager"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "chrono-tz",
- "clap",
- "cron",
- "fnv",
- "futures",
- "hmac",
- "ipnet",
- "jsonwebtoken",
- "mimalloc",
- "pem",
- "prometheus",
- "rand 0.9.4",
- "rcgen",
- "reqwest",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-controller-core",
- "rusternetes-csi",
- "rusternetes-discovery",
- "rusternetes-middleware",
- "rusternetes-storage",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
- "uuid",
- "x509-parser",
-]
-
-[[package]]
-name = "rusternetes-cri"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hyper-util",
- "prost",
- "prost-types",
- "rusternetes-common",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
- "tonic",
- "tonic-build",
- "tower 0.4.13",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "rusternetes-csi"
-version = "0.1.0"
-dependencies = [
- "hyper-util",
- "prost",
- "prost-types",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tower 0.4.13",
-]
-
-[[package]]
-name = "rusternetes-discovery"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "rusternetes-common",
- "rusternetes-storage",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "rusternetes-dns"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "futures",
- "hickory-proto",
- "hickory-server",
- "mimalloc",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-storage",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-kube-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "clap",
- "crc",
- "futures",
- "mimalloc",
- "miniz_oxide 0.8.9",
- "prometheus",
- "protobuf",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-controller-manager",
- "rusternetes-storage",
- "serde",
- "serde_json",
- "serial_test",
- "tokio",
- "tower 0.4.13",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "rusternetes-kubectl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "futures",
- "http-body-util",
- "hyper",
- "hyper-util",
- "mimalloc",
- "reqwest",
- "rusternetes-client",
- "rusternetes-common",
- "serde",
- "serde_json",
- "serde_yaml",
- "tabled",
- "tar",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "url",
- "walkdir",
-]
-
-[[package]]
-name = "rusternetes-kubelet"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "axum-server",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "ed25519-dalek",
- "flate2",
- "futures",
- "futures-util",
- "hmac",
- "http",
- "http-body-util",
- "hyper-util",
- "inotify",
- "libc",
- "mimalloc",
- "p256",
- "p384",
- "p521",
- "pem",
- "prometheus",
- "prost",
- "prost-types",
- "rand 0.9.4",
- "rand_core 0.6.4",
- "rcgen",
- "regex",
- "reqwest",
- "rsa",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-cri",
- "rusternetes-csi",
- "rusternetes-middleware",
- "rusternetes-storage",
- "rusternetes-streamproxy",
- "rustix",
- "rustls",
- "serde",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "sha1",
- "sha2",
- "sysinfo",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tonic-health",
- "tower 0.4.13",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "rusternetes-middleware"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "axum-server",
- "base64",
- "bytes",
- "chrono",
- "ciborium",
- "clap",
- "futures",
- "hmac",
- "http-body",
- "http-body-util",
- "prometheus",
- "prost",
- "rcgen",
- "reqwest",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-protobuf",
- "rusternetes-storage",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tower 0.4.13",
- "tracing",
- "url",
- "uuid",
- "x509-parser",
-]
-
-[[package]]
-name = "rusternetes-protobuf"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "rusternetes-common",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-scheduler"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "futures",
- "mimalloc",
- "rusternetes-client",
- "rusternetes-common",
- "rusternetes-controller-manager",
- "rusternetes-middleware",
- "rusternetes-storage",
- "rusternetes-test-support",
- "serde",
- "serde_json",
- "serde_yaml",
- "serial_test",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rusternetes-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "chrono",
- "criterion",
- "etcd-client",
- "futures",
- "prometheus",
- "rhino",
- "rusternetes-client",
- "rusternetes-common",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "testcontainers",
- "tokio",
- "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rusternetes-streamproxy"
-version = "0.1.0"
-dependencies = [
- "axum",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "rustls",
- "rustls-pemfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rusternetes-test-support"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "futures",
- "rusternetes-api-server",
- "rusternetes-common",
- "rusternetes-storage",
- "serde",
- "serde_json",
- "tokio",
- "tower 0.4.13",
 ]
 
 [[package]]

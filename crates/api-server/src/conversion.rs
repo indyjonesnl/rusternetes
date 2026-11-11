@@ -3,11 +3,9 @@
 //! This module implements Kubernetes-compatible conversion webhooks that allow
 //! automatic conversion between different versions of custom resources.
 
-use rusternetes_common::resources::{
-    CustomResource, CustomResourceDefinition, WebhookClientConfig,
-};
-use rusternetes_common::Result;
-use rusternetes_storage::Storage;
+use k3rs_common::resources::{CustomResource, CustomResourceDefinition, WebhookClientConfig};
+use k3rs_common::Result;
+use k3rs_storage::Storage;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,10 +41,7 @@ pub struct ConversionRequest {
     /// Tolerate an explicit `null` on deserialize: webhook responses echo the
     /// request with `objects: null`, and we only read the `response` field, so a
     /// null here must not fail the whole parse.
-    #[serde(
-        default,
-        deserialize_with = "rusternetes_common::serde_helpers::null_default"
-    )]
+    #[serde(default, deserialize_with = "k3rs_common::serde_helpers::null_default")]
     pub objects: Vec<serde_json::Value>,
 }
 
@@ -114,14 +109,12 @@ impl ConversionWebhookClient {
     ) -> Result<Vec<CustomResource>> {
         // Check if conversion is enabled
         let conversion = crd.spec.conversion.as_ref().ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(
-                "Conversion not configured for CRD".to_string(),
-            )
+            k3rs_common::Error::InvalidResource("Conversion not configured for CRD".to_string())
         })?;
 
         // Get webhook configuration
         let webhook = conversion.webhook.as_ref().ok_or_else(|| {
-            rusternetes_common::Error::InvalidResource(
+            k3rs_common::Error::InvalidResource(
                 "Webhook conversion strategy requires webhook configuration".to_string(),
             )
         })?;
@@ -132,10 +125,9 @@ impl ConversionWebhookClient {
         // `ServiceResolver.ResolveEndpoint` returns, through the egress
         // selector's `Cluster` lookup; a URL through `ControlPlane`.
         let target = self.build_webhook_target(&webhook.client_config)?;
-        let target = rusternetes_admission_webhook::AdmissionWebhookClient::resolve_webhook_target(
-            target, storage,
-        )
-        .await;
+        let target =
+            k3rs_admission_webhook::AdmissionWebhookClient::resolve_webhook_target(target, storage)
+                .await;
         let url = target.url.clone();
 
         info!(
@@ -175,27 +167,25 @@ impl ConversionWebhookClient {
         // NOT silently pass through the stored objects unconverted, which would
         // serve the wrong apiVersion than the client requested.
         let body = serde_json::to_vec(&review).map_err(|e| {
-            rusternetes_common::Error::Internal(format!("failed to encode conversion request: {e}"))
+            k3rs_common::Error::Internal(format!("failed to encode conversion request: {e}"))
         })?;
-        let response = rusternetes_admission_webhook::transport::transport()
-            .post_json(
-                rusternetes_admission_webhook::transport::WebhookHttpRequest {
-                    target: &target,
-                    body,
-                    timeout: Duration::from_secs(30),
-                    ca_bundle: ca_data.as_deref(),
-                },
-            )
+        let response = k3rs_admission_webhook::transport::transport()
+            .post_json(k3rs_admission_webhook::transport::WebhookHttpRequest {
+                target: &target,
+                body,
+                timeout: Duration::from_secs(30),
+                ca_bundle: ca_data.as_deref(),
+            })
             .await
             .map_err(|e| {
-                rusternetes_common::Error::Network(format!(
+                k3rs_common::Error::Network(format!(
                     "Conversion webhook {url} unreachable: {}",
                     e.message
                 ))
             })?;
 
         if !(200..300).contains(&response.status) {
-            return Err(rusternetes_common::Error::Network(format!(
+            return Err(k3rs_common::Error::Network(format!(
                 "Conversion webhook {url} returned status {}",
                 response.status
             )));
@@ -207,21 +197,19 @@ impl ConversionWebhookClient {
         // is a YAML subset), so it covers both content types.
         let body = String::from_utf8_lossy(&response.body).into_owned();
         let review_response: ConversionReview = serde_yaml::from_str(&body).map_err(|e| {
-            rusternetes_common::Error::Network(format!("Failed to parse webhook response: {e}"))
+            k3rs_common::Error::Network(format!("Failed to parse webhook response: {e}"))
         })?;
 
         debug!("Received conversion response: {:?}", review_response);
 
         // Extract response
         let conv_response = review_response.response.ok_or_else(|| {
-            rusternetes_common::Error::Network(
-                "Webhook response missing response field".to_string(),
-            )
+            k3rs_common::Error::Network("Webhook response missing response field".to_string())
         })?;
 
         // Check result
         if conv_response.result.status != "Success" {
-            return Err(rusternetes_common::Error::Network(format!(
+            return Err(k3rs_common::Error::Network(format!(
                 "Conversion failed: {}",
                 conv_response
                     .result
@@ -237,7 +225,7 @@ impl ConversionWebhookClient {
             .map(serde_json::from_value)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
-                rusternetes_common::Error::Network(format!(
+                k3rs_common::Error::Network(format!(
                     "Failed to deserialize converted objects: {}",
                     e
                 ))
@@ -253,12 +241,12 @@ impl ConversionWebhookClient {
     }
 
     /// `hookClientConfig` (util/webhook/client.go): see
-    /// [`rusternetes_admission_webhook::AdmissionWebhookClient::build_webhook_target`].
+    /// [`k3rs_admission_webhook::AdmissionWebhookClient::build_webhook_target`].
     pub fn build_webhook_target(
         &self,
         config: &WebhookClientConfig,
-    ) -> Result<rusternetes_admission_webhook::transport::WebhookTarget> {
-        rusternetes_admission_webhook::AdmissionWebhookClient::new().build_webhook_target(config)
+    ) -> Result<k3rs_admission_webhook::transport::WebhookTarget> {
+        k3rs_admission_webhook::AdmissionWebhookClient::new().build_webhook_target(config)
     }
 }
 
@@ -308,11 +296,11 @@ pub async fn convert_custom_resources<S: Storage>(
         .conversion
         .as_ref()
         .and_then(|c| c.strategy.clone())
-        .unwrap_or(rusternetes_common::resources::ConversionStrategyType::None);
+        .unwrap_or(k3rs_common::resources::ConversionStrategyType::None);
 
     match strategy {
-        rusternetes_common::resources::ConversionStrategyType::None
-        | rusternetes_common::resources::ConversionStrategyType::Unknown(_) => {
+        k3rs_common::resources::ConversionStrategyType::None
+        | k3rs_common::resources::ConversionStrategyType::Unknown(_) => {
             // An unknown strategy is refused at admission (validateEnumStrings,
             // validation.go:617); treat any stored one like None.
             // No conversion - just update the API version on objects that need it.
@@ -327,7 +315,7 @@ pub async fn convert_custom_resources<S: Storage>(
                 })
                 .collect())
         }
-        rusternetes_common::resources::ConversionStrategyType::Webhook => {
+        k3rs_common::resources::ConversionStrategyType::Webhook => {
             // Webhook strategy: only objects whose stored version differs from
             // the target need to round-trip through the webhook. Preserve
             // input order when stitching converted objects back into the result.

@@ -1,12 +1,12 @@
 //! Strategic-merge-patch semantic corpus.
 //!
 //! Ports ~30 representative cases from upstream Kubernetes'
-//! `apimachinery/pkg/util/strategicpatch/patch_test.go` against rusternetes'
+//! `apimachinery/pkg/util/strategicpatch/patch_test.go` against k3rs'
 //! in-process Axum router. Each test seeds a Pod, sends a real HTTP PATCH
 //! with `Content-Type: application/strategic-merge-patch+json`, then asserts
 //! both the HTTP response body and the resulting storage-state.
 //!
-//! Reference (rusternetes): `crates/api-server/src/patch.rs` —
+//! Reference (k3rs): `crates/api-server/src/patch.rs` —
 //! `apply_strategic_merge_patch` / `strategic_merge_arrays`. Test harness
 //! pattern follows `decoder_content_type_test.rs`.
 //!
@@ -29,8 +29,8 @@
 //! strategic-merge implementation. See the inline annotation for the
 //! specific divergence; production code is NOT modified by this corpus.
 
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -56,12 +56,12 @@ async fn seed_pod(mem: &Arc<MemoryStorage>, name: &str, body: Value) -> String {
 
 /// Apply `ops` the way the PATCH handler's patch step does, against the pod
 /// stored under `{name}`, and write the result back. These cases pin the patch
-/// ENGINE (`rusternetes_api_server::patch`), not what a Pod may become: a pod
+/// ENGINE (`k3rs_api_server::patch`), not what a Pod may become: a pod
 /// update fence refuses added containers and ports, as upstream's
 /// `ValidatePodUpdate` does, so sending them through `PATCH /pods` would test
 /// that fence instead.
 async fn apply_patch(router: TestApiServer, name: &str, ops: &Value) -> (u16, Value) {
-    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    use k3rs_api_server::patch::{apply_patch, PatchType};
     let key = build_key("pods", Some(TEST_NS), name);
     let current: Value = router.storage.get(&key).await.expect("pod must exist");
     match apply_patch(&current, ops, PatchType::StrategicMergePatch) {
@@ -208,7 +208,7 @@ async fn smp_containers_untouched_preserved() {
 /// SMP-1d: removing a container by name via `$patch: delete` directive.
 ///
 /// Upstream supports `$patch: delete` on a list entry to drop the entry
-/// matched by the merge key. Rusternetes' `strategic_merge_arrays` does
+/// matched by the merge key. k3rs' `strategic_merge_arrays` does
 /// not honor this on list entries — it merges the `$patch` key into the
 /// kept entry instead. Ignored as a documented parity gap.
 #[tokio::test]
@@ -279,7 +279,7 @@ async fn smp_containers_combined_update_add_delete() {
 // (containerPort, protocol) tuple — see `staging/src/k8s.io/api/core/v1/types.go`
 // and the `patchMergeKey` tags on ContainerPort.
 //
-// NOTE: rusternetes' current SMP implementation in `patch.rs` only knows the
+// NOTE: k3rs' current SMP implementation in `patch.rs` only knows the
 // `name` merge key. The ports field uses no `name` (well, it can be optional),
 // so the patch decoder falls back to "replace entire array". Tests in this
 // section therefore document the gap; the green ones cover what *does* work
@@ -290,7 +290,7 @@ async fn smp_containers_combined_update_add_delete() {
 /// SMP-2a: adding a port with a new (containerPort, protocol) tuple should
 /// append it to the ports list.
 ///
-/// rusternetes today: array items lack `name`, so the patch decoder falls
+/// k3rs today: array items lack `name`, so the patch decoder falls
 /// back to "not a named array → replace entirely". Result is that the
 /// existing port is lost. Ignored pending composite-merge-key support.
 #[tokio::test]
@@ -363,7 +363,7 @@ async fn smp_ports_composite_key_merges_existing() {
     assert_eq!(ports[0]["name"], "http", "untouched fields preserved");
 }
 
-/// SMP-2c: when the port DOES have a `name`, rusternetes' name-based merge
+/// SMP-2c: when the port DOES have a `name`, k3rs' name-based merge
 /// covers the upstream behavior for that tuple — pinning that this works.
 #[tokio::test]
 async fn smp_ports_name_merge_works_when_name_present() {
@@ -399,7 +399,7 @@ async fn smp_ports_name_merge_works_when_name_present() {
 
 /// SMP-2d: when ALL ports in the patch have `name`, but the original
 /// array has unnamed ports, the merge still operates by name. Documents
-/// the rusternetes-specific behavior.
+/// the k3rs-specific behavior.
 #[tokio::test]
 async fn smp_ports_named_patch_with_unnamed_original() {
     let (mem, router) = spawn_router();
@@ -424,7 +424,7 @@ async fn smp_ports_named_patch_with_unnamed_original() {
     let (status, body) = apply_patch(router, "smp-2d", &patch).await;
     assert_2xx(status, &body, "named-patch-unnamed-original");
 
-    // No assertion on exact length — rusternetes may preserve the original
+    // No assertion on exact length — k3rs may preserve the original
     // unnamed entry alongside the new named one. We pin the *minimum* that
     // must hold: the named patch entry is present in the output.
     let stored = read_stored(&mem, "smp-2d").await;
@@ -492,9 +492,9 @@ async fn smp_dollar_patch_replace_on_containers_list() {
     );
     seed_pod(&mem, "smp-3a", pod).await;
 
-    // NOTE: directive placement varies between upstream/rusternetes;
+    // NOTE: directive placement varies between upstream/k3rs;
     // the canonical SMP form expresses `$patch: replace` on the PARENT of
-    // the array (the container struct), but rusternetes only honors it on
+    // the array (the container struct), but k3rs only honors it on
     // the object level. We exercise the parent-level form which IS handled
     // by `apply_strategic_merge_patch`.
     let patch = json!({
@@ -714,7 +714,7 @@ async fn smp_delete_directive_on_annotations_map() {
     );
 }
 
-/// SMP-4b: `$patch: delete` on a list entry — rusternetes' current
+/// SMP-4b: `$patch: delete` on a list entry — k3rs' current
 /// implementation merges `$patch` into the entry as a sibling field
 /// rather than dropping the entry. Ignored.
 #[tokio::test]
@@ -826,7 +826,7 @@ async fn smp_delete_then_re_add_in_same_patch() {
 //
 // Upstream: combined with `$patch: replace` (or alone in a merge context),
 // `$retainKeys` says "after replace, restore these keys from the original".
-// Rusternetes' implementation only acts when paired with `replace`; in a
+// k3rs' implementation only acts when paired with `replace`; in a
 // merge context the directive is ignored.
 // ---------------------------------------------------------------------------
 
@@ -985,7 +985,7 @@ async fn smp_retain_keys_directive_stripped_from_output() {
 }
 
 /// SMP-5e: `$retainKeys` without `$patch: replace` is parsed but ignored
-/// in a normal merge — upstream uses it during merge too, but rusternetes
+/// in a normal merge — upstream uses it during merge too, but k3rs
 /// only acts on it under replace. Documented as a parity gap; ignored.
 #[tokio::test]
 async fn smp_retain_keys_in_merge_context() {

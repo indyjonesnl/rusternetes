@@ -4,7 +4,7 @@
 // real checker, cost estimator and interpreter say.
 //
 // It is built only from the vendored Kubernetes sources (see build.sh), never
-// shipped, and not part of any Rusternetes binary or the Cargo workspace.
+// shipped, and not part of any k3rs binary or the Cargo workspace.
 //
 // Protocol: one JSON object per line on stdin, one per line on stdout.
 //

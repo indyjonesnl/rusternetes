@@ -8,8 +8,8 @@
 //! codec's defaulting that `ValidateStatefulSetUpdate` depends on.
 
 use axum::http::StatusCode;
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const STS: &str = "/apis/apps/v1/namespaces/default/statefulsets";
@@ -166,8 +166,8 @@ async fn an_undefaulted_stored_object_accepts_a_metadata_update() {
 #[tokio::test]
 #[serial_test::serial]
 async fn max_unavailable_is_dropped_while_its_gate_is_off() {
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::MaxUnavailableStatefulSet,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::MaxUnavailableStatefulSet,
         false,
     );
     let api = TestApiServer::new();

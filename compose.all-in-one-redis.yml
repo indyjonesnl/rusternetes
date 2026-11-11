@@ -1,6 +1,6 @@
-# All-in-one rusternetes with Redis storage.
+# All-in-one k3rs with Redis storage.
 #
-# Three containers: the rusternetes binary (API server, scheduler,
+# Three containers: the k3rs binary (API server, scheduler,
 # controller manager, kubelet), Redis, and a bundled containerd CRI runtime.
 # Rhino's RedisBackend is embedded in the binary — no separate rhino server
 # needed.
@@ -12,13 +12,13 @@
 services:
   redis:
     image: docker.io/library/redis:7-alpine
-    container_name: rusternetes-redis
+    container_name: k3rs-redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
     networks:
-      - rusternetes-net
+      - k3rs-net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -26,14 +26,14 @@ services:
       retries: 5
       start_period: 5s
 
-  rusternetes:
+  k3rs:
     build:
       context: ..
-      dockerfile: rusternetes/all-in-one.Dockerfile
+      dockerfile: k3rs/all-in-one.Dockerfile
       args:
         CARGO_FEATURES: redis
-        RUSTERNETES_GIT_SHA: "${RUSTERNETES_GIT_SHA-}"
-    container_name: rusternetes
+        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
+    container_name: k3rs
     privileged: true
     depends_on:
       redis:
@@ -44,7 +44,7 @@ services:
     # the network attachment and aliases live on that service.
     network_mode: "service:containerd"
     volumes:
-      - ./.rusternetes/certs:/etc/kubernetes/pki:ro
+      - ./.k3rs/certs:/etc/kubernetes/pki:ro
       - containerd-run:/run/containerd
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
       # CSI attach/detach socket dir (#3746), off by default; uncomment together
@@ -105,17 +105,17 @@ services:
   # v1 to it over the shared `containerd-run` volume instead of a host
   # Podman/Docker socket, so this stack runs unchanged on Docker or Podman.
   # containerd owns the pod network namespace (cni0 bridge, iptables), so the
-  # `rusternetes` service joins THIS service's netns (network_mode below):
+  # `k3rs` service joins THIS service's netns (network_mode below):
   # the in-process kube-proxy then programs Service DNAT rules where the pod
   # IPs live, and the node IP the kubelet advertises is reachable by pods.
   # Single node: CNI_CONF_FROM_NODE_IPAM stays unset, so the cluster-wide
   # conflist baked into the image applies (main.rs keeps node_net: None).
   containerd:
-    image: rusternetes-containerd:latest
+    image: k3rs-containerd:latest
     build:
       context: .
       dockerfile: containerd.Dockerfile
-    container_name: rusternetes-containerd
+    container_name: k3rs-containerd
     restart: unless-stopped
     privileged: true
     ports:
@@ -123,7 +123,7 @@ services:
       - "10250:10250"
       - "10257:10257"
     networks:
-      rusternetes-net:
+      k3rs-net:
         ipv4_address: 10.89.0.10
         aliases:
           - api-server
@@ -138,18 +138,18 @@ services:
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
 
 networks:
-  rusternetes-net:
+  k3rs-net:
     driver: bridge
-    name: rusternetes-network
+    name: k3rs-network
     ipam:
       config:
         - subnet: 10.89.0.0/24
 
 volumes:
   redis-data:
-    name: rusternetes-redis-data
-  # CRI socket shared from the containerd service to the rusternetes binary.
+    name: k3rs-redis-data
+  # CRI socket shared from the containerd service to the k3rs binary.
   containerd-run:
-    name: rusternetes-containerd-run
+    name: k3rs-containerd-run
   containerd-data:
-    name: rusternetes-containerd-data
+    name: k3rs-containerd-data

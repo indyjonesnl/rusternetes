@@ -19,10 +19,10 @@
 //!   * `tower::ServiceExt::oneshot` per request.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
-// Harness: `TestApiServer` (rusternetes-test-support) boots the real
+// Harness: `TestApiServer` (k3rs-test-support) boots the real
 // `build_router` on `MemoryStorage` (whose `current_revision()` is a unix
 // timestamp, always > 0) with `--skip-auth`, driven via `tower::oneshot`.
 // `send_raw` returns the raw bytes so the wire-level resourceVersion check

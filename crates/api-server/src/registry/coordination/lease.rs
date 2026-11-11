@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::Lease;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::lease::validate_lease;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Lease;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::lease::validate_lease;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

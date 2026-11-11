@@ -5,18 +5,18 @@
 //! container half. Go has no required JSON fields, so an omitted `os.name`,
 //! scheduling-gate `name`, readiness-gate `conditionType`, resource-claim
 //! `name` or `workloadRef` field decodes to the zero value and validation
-//! answers. Rusternetes modelled all of them as bare non-`Option`, so the
+//! answers. k3rs modelled all of them as bare non-`Option`, so the
 //! answer was serde's 400 BadRequest — no `reason`, no `details.causes`, no
 //! field path (#1939).
 //!
 //! Making them reachable exposed five validators upstream runs from
-//! `validatePodSpec` and Rusternetes had no equivalent of at all —
+//! `validatePodSpec` and k3rs had no equivalent of at all —
 //! `validateOS`, `validatePodResourceClaims`, `validateReadinessGates`,
 //! `validateSchedulingGates` and `validateWorkloadReference` — each ported in
 //! `crates/common/src/validation/pod.rs` with its citation. Without them these
 //! bodies would have been silently *accepted*.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 fn containers() -> Value {
@@ -108,8 +108,8 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
 #[serial_test::serial]
 async fn every_absent_pod_level_field_answers_422_with_a_field_path() {
     // Upstream DropDisabledPodFields (pkg/api/pod/util.go dropDisabledWorkloadRef) drops spec.workloadRef while GenericWorkload (off in 1.35) is off, so validation only sees it with the gate on.
-    let _gate = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::GenericWorkload,
+    let _gate = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::GenericWorkload,
         true,
     );
     let api = TestApiServer::new();

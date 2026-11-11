@@ -7,8 +7,8 @@ mod __parent {
         http::{HeaderMap, HeaderValue, Method, StatusCode},
         response::Response,
     };
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_storage::{build_prefix, Storage};
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_storage::{build_prefix, Storage};
     pub use serde_json::Value;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -16,7 +16,7 @@ mod __parent {
 }
 
 mod proxy_header_tests {
-    use rusternetes_api_server::handlers::aggregator::header_key_escape;
+    use k3rs_api_server::handlers::aggregator::header_key_escape;
 
     // Regression: SA identities carry extra keys with `/`, which is illegal in
     // an HTTP header name. Without escaping, the aggregator proxy fails to build
@@ -48,7 +48,7 @@ mod proxy_header_tests {
 }
 
 mod proxy_client_identity_tests {
-    use rusternetes_api_server::handlers::aggregator::load_proxy_client_identity_from;
+    use k3rs_api_server::handlers::aggregator::load_proxy_client_identity_from;
 
     // Regression: the aggregation proxy MUST be able to load the kubeadm
     // front-proxy client credential (upstream --proxy-client-cert-file).
@@ -74,7 +74,7 @@ mod proxy_client_identity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Absent files (rusternetes' own cluster) → None, proxy stays client-auth-less.
+    // Absent files (k3rs' own cluster) → None, proxy stays client-auth-less.
     #[test]
     fn absent_files_yield_none() {
         assert!(load_proxy_client_identity_from(

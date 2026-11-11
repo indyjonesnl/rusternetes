@@ -4,18 +4,18 @@
 mod __parent {
     pub use anyhow::{anyhow, Context, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::csi::FSGroupPolicy;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::csi::FSGroupPolicy;
+    pub use k3rs_common::resources::{
         CSIDriver, PersistentVolume, PersistentVolumeAccessMode, Pod, Secret, VolumeAttachment,
     };
-    pub use rusternetes_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
-    pub use rusternetes_kubelet::volume_plugins::plugin::{
+    pub use k3rs_kubelet::volume_plugins::csi_client::{CsiDriverClient, CsiError};
+    pub use k3rs_kubelet::volume_plugins::plugin::{
         DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter,
     };
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_kubelet::volume_plugins::{
         Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
     };
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use sha2::{Digest, Sha256};
     pub use std::collections::HashMap;
     pub use std::path::{Path, PathBuf};
@@ -36,14 +36,14 @@ mod tests {
 
     use super::__parent::*;
     use crate::csi_fake::{serve, FakeDriver};
-    use rusternetes_common::resources::{Pod, Secret, Volume};
-    use rusternetes_kubelet::volume_plugins::csi::*;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::node_service_capability::rpc::Type as Cap;
-    use rusternetes_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
-    use rusternetes_kubelet::volume_plugins::csi_client::CsiError;
-    use rusternetes_kubelet::volume_plugins::csi_drivers_store::{csi_drivers, Driver};
-    use rusternetes_kubelet::volume_plugins::plugin::DeviceMounterArgs;
-    use rusternetes_storage::{build_key, MemoryStorage, Storage, StorageBackend};
+    use k3rs_common::resources::{Pod, Secret, Volume};
+    use k3rs_kubelet::volume_plugins::csi::*;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::node_service_capability::rpc::Type as Cap;
+    use k3rs_kubelet::volume_plugins::csi_client::proto::volume_capability::AccessType;
+    use k3rs_kubelet::volume_plugins::csi_client::CsiError;
+    use k3rs_kubelet::volume_plugins::csi_drivers_store::{csi_drivers, Driver};
+    use k3rs_kubelet::volume_plugins::plugin::DeviceMounterArgs;
+    use k3rs_storage::{build_key, MemoryStorage, Storage, StorageBackend};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -51,12 +51,12 @@ mod tests {
     fn host(
         base: &str,
         storage: Option<Arc<StorageBackend>>,
-    ) -> Arc<rusternetes_kubelet::volume_plugins::KubeletVolumeHost> {
+    ) -> Arc<k3rs_kubelet::volume_plugins::KubeletVolumeHost> {
         Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 base.to_string(),
                 storage,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_node_name("node-1"),
@@ -64,7 +64,7 @@ mod tests {
     }
 
     fn plugin() -> CsiPlugin {
-        CsiPlugin::new(host("/var/lib/rusternetes", None))
+        CsiPlugin::new(host("/var/lib/k3rs", None))
     }
 
     fn pod() -> Pod {
@@ -80,10 +80,7 @@ mod tests {
             .unwrap()
     }
 
-    fn pv(
-        driver: &str,
-        extra_csi: serde_json::Value,
-    ) -> rusternetes_common::resources::PersistentVolume {
+    fn pv(driver: &str, extra_csi: serde_json::Value) -> k3rs_common::resources::PersistentVolume {
         let mut csi = json!({"driver": driver, "volumeHandle": "vol-1"});
         for (k, v) in extra_csi.as_object().unwrap() {
             csi[k] = v.clone();
@@ -159,14 +156,12 @@ mod tests {
     /// Run the `MountVolume` operation (`GenerateMountVolumeFunc`): `MountDevice`
     /// then `SetUp`, through a registry holding the CSI plugin.
     async fn mount_volume(f: &Fx, spec: &Spec<'_>, pod: &Pod) -> String {
-        let mgr = rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+        let mgr = k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
             CsiPlugin::new(host(&f.root, Some(f.storage.clone()))),
         )]);
-        rusternetes_kubelet::volume_plugins::util::operation_generator::mount_volume(
-            &mgr, spec, pod, "",
-        )
-        .await
-        .unwrap()
+        k3rs_kubelet::volume_plugins::util::operation_generator::mount_volume(&mgr, spec, pod, "")
+            .await
+            .unwrap()
     }
 
     // ---- DeviceMounter (#2529) ------------------------------------------------
@@ -222,7 +217,7 @@ mod tests {
     /// (`getReadOnlyFromSpec`, `csi_plugin.go:499`), i.e. the claim's `readOnly`.
     #[tokio::test]
     async fn mounter_attributes_follow_spec_read_only() {
-        use rusternetes_kubelet::volume_plugins::plugin::Attributes;
+        use k3rs_kubelet::volume_plugins::plugin::Attributes;
         let f = fx("attrs", &[], Some(json!({"attachRequired": false}))).await;
         let p = pv(&f.driver, json!({}));
         let v = claim_volume();
@@ -320,10 +315,10 @@ mod tests {
             migrated: false,
             inline_volume_spec_for_csi_migration: false,
         };
-        let mgr = rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+        let mgr = k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
             CsiPlugin::new(host(&f.root, Some(f.storage.clone()))),
         )]);
-        let err = rusternetes_kubelet::volume_plugins::util::operation_generator::mount_volume(
+        let err = k3rs_kubelet::volume_plugins::util::operation_generator::mount_volume(
             &mgr,
             &spec,
             &pod(),
@@ -338,22 +333,19 @@ mod tests {
     /// `GenerateMountVolumeFunc` with its `actualStateOfWorld`: `MountVolume`
     /// reports the device and the pod mount to it.
     struct World {
-        mgr: rusternetes_kubelet::volume_plugins::VolumePluginMgr,
-        asw: rusternetes_kubelet::volume_manager::cache::ActualStateOfWorld,
+        mgr: k3rs_kubelet::volume_plugins::VolumePluginMgr,
+        asw: k3rs_kubelet::volume_manager::cache::ActualStateOfWorld,
     }
 
     fn world(f: &Fx) -> World {
-        let mgr = rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
+        let mgr = k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
             CsiPlugin::new(host(&f.root, Some(f.storage.clone()))),
         )]);
-        let asw = rusternetes_kubelet::volume_manager::cache::ActualStateOfWorld::new(
+        let asw = k3rs_kubelet::volume_manager::cache::ActualStateOfWorld::new(
             "node-1",
-            Arc::new(rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(
-                vec![Box::new(CsiPlugin::new(host(
-                    &f.root,
-                    Some(f.storage.clone()),
-                )))],
-            )),
+            Arc::new(k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![
+                Box::new(CsiPlugin::new(host(&f.root, Some(f.storage.clone())))),
+            ])),
         );
         World { mgr, asw }
     }
@@ -362,15 +354,15 @@ mod tests {
     /// (`MarkVolumeAsAttached`), as the caller of the mount operation does.
     async fn mount_in_world(
         w: &World,
-        spec: &rusternetes_kubelet::volume_plugins::OwnedSpec,
+        spec: &k3rs_kubelet::volume_plugins::OwnedSpec,
         pod: &Pod,
     ) -> anyhow::Result<String> {
-        use rusternetes_kubelet::volume_manager::cache::desired_state_of_world::get_unique_volume_name_for_pod;
-        let pod_name = rusternetes_kubelet::volume_plugins::util::get_unique_pod_name(pod);
+        use k3rs_kubelet::volume_manager::cache::desired_state_of_world::get_unique_volume_name_for_pod;
+        let pod_name = k3rs_kubelet::volume_plugins::util::get_unique_pod_name(pod);
         let plugin = w.mgr.find_plugin_by_spec(&spec.as_spec()).unwrap();
         let (volume_name, attachable, device_mountable) =
             get_unique_volume_name_for_pod(&w.mgr, &pod_name, plugin, &spec.as_spec()).unwrap();
-        let vtm = rusternetes_kubelet::volume_plugins::util::operation_executor::VolumeToMount {
+        let vtm = k3rs_kubelet::volume_plugins::util::operation_executor::VolumeToMount {
             volume_name: volume_name.clone(),
             pod_name,
             volume_spec: Arc::new(spec.clone()),
@@ -391,11 +383,11 @@ mod tests {
                 .mark_volume_as_attached(Some(&volume_name), vtm.volume_spec.clone(), "node-1", "")
                 .unwrap();
         }
-        let state = rusternetes_kubelet::volume_plugins::util::operation_generator::MountState {
+        let state = k3rs_kubelet::volume_plugins::util::operation_generator::MountState {
             volume_to_mount: &vtm,
             actual_state_of_world: &w.asw,
         };
-        rusternetes_kubelet::volume_plugins::util::operation_generator::mount_volume_with_attributes(
+        k3rs_kubelet::volume_plugins::util::operation_generator::mount_volume_with_attributes(
             &w.mgr,
             &spec.as_spec(),
             pod,
@@ -407,8 +399,8 @@ mod tests {
         .map(|(path, _)| path)
     }
 
-    fn owned_pv_spec(f: &Fx) -> rusternetes_kubelet::volume_plugins::OwnedSpec {
-        rusternetes_kubelet::volume_plugins::OwnedSpec {
+    fn owned_pv_spec(f: &Fx) -> k3rs_kubelet::volume_plugins::OwnedSpec {
+        k3rs_kubelet::volume_plugins::OwnedSpec {
             volume: claim_volume(),
             persistent_volume: Some(pv(&f.driver, json!({}))),
             read_only: false,
@@ -422,7 +414,7 @@ mod tests {
     /// `:545-566`): a second pod sharing the volume only publishes.
     #[tokio::test]
     async fn mount_volume_marks_the_device_mounted_and_skips_a_second_stage() {
-        use rusternetes_kubelet::volume_plugins::util::operation_executor::{
+        use k3rs_kubelet::volume_plugins::util::operation_executor::{
             DeviceMountState, VolumeMountState,
         };
         let f = fx(
@@ -445,7 +437,7 @@ mod tests {
         assert_eq!(
             w.asw.get_volume_mount_state(
                 &name,
-                &rusternetes_kubelet::volume_plugins::util::types::UniquePodName("uid-1".into())
+                &k3rs_kubelet::volume_plugins::util::types::UniquePodName("uid-1".into())
             ),
             VolumeMountState::VolumeMounted
         );
@@ -466,7 +458,7 @@ mod tests {
     /// a final one leaves it `DeviceNotMounted`.
     #[tokio::test]
     async fn a_failed_stage_marks_the_device_uncertain_only_for_a_non_final_error() {
-        use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+        use k3rs_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
         let f = fx(
             "worlduncertain",
             &[Cap::StageUnstageVolume],
@@ -703,7 +695,7 @@ mod tests {
     #[test]
     fn rejects_a_persistent_volume_without_a_csi_source() {
         let v = claim_volume();
-        let p: rusternetes_common::resources::PersistentVolume = serde_json::from_value(json!({
+        let p: k3rs_common::resources::PersistentVolume = serde_json::from_value(json!({
             "metadata": {"name": "pv1"},
             "spec": {"hostPath": {"path": "/mnt/data"}}
         }))
@@ -720,7 +712,7 @@ mod tests {
 
     #[test]
     fn plugin_name_is_the_upstream_name() {
-        assert_eq!(plugin().name(), rusternetes_kubelet::pod_dirs::plugin::CSI);
+        assert_eq!(plugin().name(), k3rs_kubelet::pod_dirs::plugin::CSI);
     }
 
     /// `GetVolumeName` for a PV spec: `<driver>^<volumeHandle>`.
@@ -761,7 +753,7 @@ mod tests {
         let m = plugin().new_mounter(&spec, &pod()).await.unwrap();
         assert_eq!(
             m.get_path(),
-            "/var/lib/rusternetes/pods/uid-1/volumes/kubernetes.io~csi/pv1/mount"
+            "/var/lib/k3rs/pods/uid-1/volumes/kubernetes.io~csi/pv1/mount"
         );
     }
 
@@ -1002,7 +994,7 @@ mod tests {
         assert!(tokens["gcp"]["expirationTimestamp"].as_str().is_some());
         assert!(tokens[""]["token"].as_str().is_some());
         // The token is for the pod's service account, bound to the requested audience.
-        let claims = rusternetes_common::auth::TokenManager::new_auto(b"test-secret")
+        let claims = k3rs_common::auth::TokenManager::new_auto(b"test-secret")
             .validate_token_with_audiences(gcp, &["gcp".to_string()])
             .unwrap();
         assert_eq!(claims.sub, "system:serviceaccount:ns1:sa-1");
@@ -1415,11 +1407,11 @@ mod tests {
 
     // ---- ConstructVolumeSpec / UnmountDevice (#2423, #2424) ------------------
 
-    fn volume_manager(root: &str) -> rusternetes_kubelet::volumes::VolumeManager {
-        rusternetes_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
+    fn volume_manager(root: &str) -> k3rs_kubelet::volumes::VolumeManager {
+        k3rs_kubelet::volumes::VolumeManager::new_with_recording_empty_dir_mounts(
             root.to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
         )
     }
 
@@ -1441,7 +1433,7 @@ mod tests {
     /// `volume_world`), with claim `c` bound to `pv1` in its API.
     async fn csi_world(
         f: &Fx,
-        vm: &rusternetes_kubelet::volumes::VolumeManager,
+        vm: &k3rs_kubelet::volumes::VolumeManager,
         pods: Vec<Pod>,
     ) -> crate::volume_world::World {
         let w = crate::volume_world::world(
@@ -1768,23 +1760,21 @@ mod tests {
         };
 
         let host = Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 f.root.clone(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_mounter(
-                rusternetes_kubelet::volume_plugins::util::mount_ops::Mounter::new(
-                    "", false, false,
-                )
-                .with_mountinfo_path(mountinfo.to_str().unwrap()),
+                k3rs_kubelet::volume_plugins::util::mount_ops::Mounter::new("", false, false)
+                    .with_mountinfo_path(mountinfo.to_str().unwrap()),
             ),
         );
         let mut vm = volume_manager(&f.root);
-        vm.plugin_mgr = Arc::new(rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(
-            vec![Box::new(CsiPlugin::new(host))],
-        ));
+        vm.plugin_mgr = Arc::new(k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![
+            Box::new(CsiPlugin::new(host)),
+        ]));
         let w = csi_world(&f, &vm, vec![]).await;
         w.restart().await;
 
@@ -1842,7 +1832,7 @@ mod tests {
 
     mod fs_group {
         use super::*;
-        use rusternetes_common::resources::PersistentVolumeAccessMode as Am;
+        use k3rs_common::resources::PersistentVolumeAccessMode as Am;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         fn fs_group_pod(gid: i64, policy: Option<&str>) -> Pod {
@@ -1897,8 +1887,8 @@ mod tests {
             // The pod's fsGroup reaches the mounter only as `MounterArgs`
             // (`operation_generator.go:582-589`).
             let fsg = fs_group_pod(own_gid(f), policy);
-            m.set_up_with(&rusternetes_kubelet::volume_plugins::MounterArgs {
-                fs_group: rusternetes_kubelet::volume_plugins::util::fs_group_from(&fsg),
+            m.set_up_with(&k3rs_kubelet::volume_plugins::MounterArgs {
+                fs_group: k3rs_kubelet::volume_plugins::util::fs_group_from(&fsg),
                 fs_group_change_policy: policy.map(str::to_string),
                 ..Default::default()
             })
@@ -2067,10 +2057,10 @@ mod tests {
 
     mod exhausted {
         use super::*;
-        use rusternetes_common::resources::{CSIDriver, VolumeAttachment};
-        use rusternetes_kubelet::volume_plugins::csi_client::proto::NodeGetInfoResponse;
-        use rusternetes_kubelet::volume_plugins::csi_drivers_store::DriversStore;
-        use rusternetes_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
+        use k3rs_common::resources::{CSIDriver, VolumeAttachment};
+        use k3rs_kubelet::volume_plugins::csi_client::proto::NodeGetInfoResponse;
+        use k3rs_kubelet::volume_plugins::csi_drivers_store::DriversStore;
+        use k3rs_kubelet::volume_plugins::nodeinfomanager::NodeInfoInstaller;
         use std::sync::Mutex;
 
         const EXHAUSTED: i32 = 8;
@@ -2193,14 +2183,14 @@ mod tests {
                     .unwrap();
             }
             Fx {
-                plugin: CsiPlugin::new(host("/var/lib/rusternetes", Some(st))),
+                plugin: CsiPlugin::new(host("/var/lib/k3rs", Some(st))),
                 drivers,
                 rec: Rec::default(),
                 _dir: dir,
             }
         }
 
-        async fn verify(f: &Fx, spec_pv: &rusternetes_common::resources::PersistentVolume) -> bool {
+        async fn verify(f: &Fx, spec_pv: &k3rs_common::resources::PersistentVolume) -> bool {
             let vol = claim_volume();
             let spec = Spec {
                 volume: &vol,
@@ -2277,8 +2267,8 @@ mod tests {
     fn lister_host(
         drivers: &[serde_json::Value],
         synced: bool,
-    ) -> Arc<rusternetes_kubelet::volume_plugins::KubeletVolumeHost> {
-        let lister = rusternetes_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+    ) -> Arc<k3rs_kubelet::volume_plugins::KubeletVolumeHost> {
+        let lister = k3rs_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
         for d in drivers {
             lister.insert(serde_json::from_value(d.clone()).unwrap());
         }
@@ -2286,10 +2276,10 @@ mod tests {
             lister.mark_synced();
         }
         Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_csi_driver_lister(lister),
@@ -2346,8 +2336,8 @@ mod tests {
 
     #[test]
     fn supports_selinux_context_mount_follows_csidriver() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             true,
         );
         let h = lister_host(
@@ -2377,8 +2367,8 @@ mod tests {
 
     #[test]
     fn supports_selinux_context_mount_errors_when_lister_missing() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             true,
         );
         let v = claim_volume();
@@ -2405,7 +2395,7 @@ mod tests {
     fn can_attach_of(
         p: &CsiPlugin,
         vol: &Volume,
-        pv: Option<&rusternetes_common::resources::PersistentVolume>,
+        pv: Option<&k3rs_common::resources::PersistentVolume>,
     ) -> Result<bool> {
         p.can_attach(&Spec {
             volume: vol,
@@ -2478,9 +2468,8 @@ mod tests {
             )],
             true,
         );
-        let mgr = rusternetes_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(
-            CsiPlugin::new(h),
-        )]);
+        let mgr =
+            k3rs_kubelet::volume_plugins::VolumePluginMgr::new(vec![Box::new(CsiPlugin::new(h))]);
         let v = claim_volume();
         let yes = pv("other.csi.example.com", json!({}));
         let no = pv("noattach.csi.example.com", json!({}));
@@ -2502,7 +2491,7 @@ mod tests {
 
     #[test]
     fn get_device_mount_refs_delegates_to_the_host_mounters_get_mount_refs() {
-        use rusternetes_kubelet::volume_plugins::plugin::DeviceMountableVolumePlugin;
+        use k3rs_kubelet::volume_plugins::plugin::DeviceMountableVolumePlugin;
         let p = plugin();
         // A path that does not exist has no refs (`GetMountRefs`: `!pathExists`).
         assert!(p
@@ -2518,7 +2507,7 @@ mod tests {
             "/etc/hosts",
             "/etc/resolv.conf",
         ] {
-            let want = rusternetes_kubelet::volume_plugins::util::mount_utils::get_mount_refs(path)
+            let want = k3rs_kubelet::volume_plugins::util::mount_utils::get_mount_refs(path)
                 .map_err(|e| e.to_string());
             let got = p.get_device_mount_refs(path).map_err(|e| e.to_string());
             assert_eq!(got, want, "{path}");
@@ -2534,7 +2523,7 @@ mod tests {
 
     #[test]
     fn get_csi_driver_waits_for_cache_sync_instead_of_erroring() {
-        let lister = rusternetes_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+        let lister = k3rs_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
         lister.insert(
             serde_json::from_value(csi_driver_obj(
                 "late.csi.example.com",
@@ -2543,10 +2532,10 @@ mod tests {
             .unwrap(),
         );
         let host = Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_csi_driver_lister(lister.clone()),
@@ -2569,7 +2558,7 @@ mod tests {
     #[test]
     fn can_attach_waits_for_cache_sync() {
         // skipAttach -> getCSIDriver blocks until synced, then reads attachRequired.
-        let lister = rusternetes_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
+        let lister = k3rs_kubelet::volume_plugins::csi_driver_lister::CsiDriverLister::new();
         lister.insert(
             serde_json::from_value(csi_driver_obj(
                 "noattach.csi.example.com",
@@ -2578,10 +2567,10 @@ mod tests {
             .unwrap(),
         );
         let host = Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
-                "/var/lib/rusternetes".to_string(),
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+                "/var/lib/k3rs".to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 HashMap::new(),
             )
             .with_csi_driver_lister(lister.clone()),
@@ -2608,8 +2597,8 @@ mod tests {
         gate: bool,
         label: &str,
     ) -> (Vec<String>, Option<String>) {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             gate,
         );
         let f = fx(name, &[], csi_driver).await;
@@ -2623,7 +2612,7 @@ mod tests {
             inline_volume_spec_for_csi_migration: false,
         };
         let m = f.plugin.new_mounter(&spec, &pod()).await.unwrap();
-        let args = rusternetes_kubelet::volume_plugins::MounterArgs {
+        let args = k3rs_kubelet::volume_plugins::MounterArgs {
             selinux_label: label.to_string(),
             ..Default::default()
         };
@@ -2733,8 +2722,8 @@ mod tests {
     #[serial_test::serial]
     async fn construct_volume_spec_returns_the_selinux_context_only_with_the_gate() {
         for (gate, expected) in [(true, SELINUX_CTX), (false, "")] {
-            let _g = rusternetes_common::feature_gates::with_feature(
-                rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+            let _g = k3rs_common::feature_gates::with_feature(
+                k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
                 gate,
             );
             let f = fx("construct-selinux", &[], None).await;
@@ -2800,8 +2789,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mount_device_stages_with_the_selinux_context_option() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             true,
         );
         // Driver supports `-o context=` and the pod has a label.
@@ -2841,8 +2830,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn mount_device_ignores_the_selinux_label_with_the_gate_off() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
             false,
         );
         let (flags, ctx) = selinux_mount_device(

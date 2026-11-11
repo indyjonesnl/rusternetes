@@ -4,13 +4,13 @@
 mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::workloads::{CronJob, Job};
-    pub use rusternetes_common::resources::{EventSource, EventType};
-    pub use rusternetes_common::types::OwnerReference;
-    pub use rusternetes_controller_manager::controllers::replicationcontroller::is_namespace_terminating_rejection;
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::workloads::{CronJob, Job};
+    pub use k3rs_common::resources::{EventSource, EventType};
+    pub use k3rs_common::types::OwnerReference;
+    pub use k3rs_controller_manager::controllers::replicationcontroller::is_namespace_terminating_rejection;
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tokio::time;
@@ -47,14 +47,13 @@ mod tests {
     #[tokio::test]
     async fn should_run_now_honours_time_zone() {
         use std::sync::Arc;
-        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
-        let ctrl =
-            rusternetes_controller_manager::controllers::cronjob::CronJobController::new(storage);
+        let storage = Arc::new(k3rs_storage::memory::MemoryStorage::new());
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(storage);
 
         let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let mk = |tz: serde_json::Value| -> rusternetes_common::resources::CronJob {
+        let mk = |tz: serde_json::Value| -> k3rs_common::resources::CronJob {
             serde_json::from_value(serde_json::json!({
                 "apiVersion": "batch/v1", "kind": "CronJob",
                 "metadata": {"name": "tz", "namespace": "default"},
@@ -99,25 +98,23 @@ mod tests {
     #[tokio::test]
     async fn should_run_now_honours_inline_tz_prefix() {
         use std::sync::Arc;
-        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
-        let ctrl =
-            rusternetes_controller_manager::controllers::cronjob::CronJobController::new(storage);
+        let storage = Arc::new(k3rs_storage::memory::MemoryStorage::new());
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(storage);
         let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let cj: rusternetes_common::resources::CronJob =
-            serde_json::from_value(serde_json::json!({
-                "apiVersion": "batch/v1", "kind": "CronJob",
-                "metadata": {"name": "tz", "namespace": "default"},
-                "spec": {
-                    "schedule": "x",
-                    "jobTemplate": {"spec": {"template": {"spec": {
-                        "containers": [{"name": "c", "image": "busybox"}]
-                    }}}},
-                },
-                "status": {"lastScheduleTime": "2025-01-15T02:00:00Z"},
-            }))
-            .unwrap();
+        let cj: k3rs_common::resources::CronJob = serde_json::from_value(serde_json::json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": "tz", "namespace": "default"},
+            "spec": {
+                "schedule": "x",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "busybox"}]
+                }}}},
+            },
+            "status": {"lastScheduleTime": "2025-01-15T02:00:00Z"},
+        }))
+        .unwrap();
         assert!(ctrl
             .should_run_now("CRON_TZ=America/New_York 0 0 * * *", now, &cj)
             .await
@@ -142,29 +139,28 @@ mod tests {
     /// message text are upstream's.
     #[tokio::test]
     async fn schedule_problems_record_upstream_events() {
-        use rusternetes_common::resources::Event;
+        use k3rs_common::resources::Event;
         use std::sync::Arc;
-        type Mem = rusternetes_storage::memory::MemoryStorage;
+        type Mem = k3rs_storage::memory::MemoryStorage;
         let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let mk =
-            |schedule: &str, tz: serde_json::Value| -> rusternetes_common::resources::CronJob {
-                serde_json::from_value(serde_json::json!({
-                    "apiVersion": "batch/v1", "kind": "CronJob",
-                    "metadata": {"name": "cj", "namespace": "default", "uid": "u1"},
-                    "spec": {
-                        "schedule": schedule,
-                        "timeZone": tz,
-                        "jobTemplate": {"spec": {"template": {"spec": {
-                            "containers": [{"name": "c", "image": "busybox"}]
-                        }}}},
-                    },
-                }))
-                .unwrap()
-            };
+        let mk = |schedule: &str, tz: serde_json::Value| -> k3rs_common::resources::CronJob {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "batch/v1", "kind": "CronJob",
+                "metadata": {"name": "cj", "namespace": "default", "uid": "u1"},
+                "spec": {
+                    "schedule": schedule,
+                    "timeZone": tz,
+                    "jobTemplate": {"spec": {"template": {"spec": {
+                        "containers": [{"name": "c", "image": "busybox"}]
+                    }}}},
+                },
+            }))
+            .unwrap()
+        };
         async fn events(storage: &Arc<Mem>) -> Vec<Event> {
-            use rusternetes_storage::Storage;
+            use k3rs_storage::Storage;
             storage
                 .list::<Event>("/registry/events/default/")
                 .await
@@ -173,7 +169,7 @@ mod tests {
 
         // Unparseable schedule -> UnparseableSchedule, `unparseable schedule: %q : %s`.
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = mk("not a cron", serde_json::Value::Null);
@@ -193,7 +189,7 @@ mod tests {
 
         // TZ in schedule -> UnsupportedSchedule (and it still schedules).
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let s = "CRON_TZ=UTC 0 0 * * *";
@@ -209,7 +205,7 @@ mod tests {
 
         // Invalid spec.timeZone -> UnknownTimeZone, `invalid timeZone: %q: %s`.
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = mk("0 0 * * *", serde_json::json!("Mars/Phobos"));
@@ -224,7 +220,7 @@ mod tests {
 
         // A valid schedule records nothing.
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = mk("0 0 * * *", serde_json::Value::Null);
@@ -232,7 +228,7 @@ mod tests {
         assert!(events(&storage).await.is_empty());
     }
 
-    fn cj_fixture(extra: serde_json::Value) -> rusternetes_common::resources::CronJob {
+    fn cj_fixture(extra: serde_json::Value) -> k3rs_common::resources::CronJob {
         let mut v = serde_json::json!({
             "apiVersion": "batch/v1", "kind": "CronJob",
             "metadata": {"name": "cj", "namespace": "default", "uid": "u1",
@@ -254,13 +250,13 @@ mod tests {
     // Ported from syncCronJob (cronjob_controllerv2.go:426-496) and
     // inActiveList / inActiveListByName (utils.go:58-77).
 
-    type Mem = rusternetes_storage::memory::MemoryStorage;
+    type Mem = k3rs_storage::memory::MemoryStorage;
 
     fn cj_json(
         schedule: &str,
         policy: &str,
         status: serde_json::Value,
-    ) -> rusternetes_common::resources::CronJob {
+    ) -> k3rs_common::resources::CronJob {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "batch/v1", "kind": "CronJob",
             "metadata": {"name": "cj", "namespace": "default", "uid": "cj-uid",
@@ -278,7 +274,7 @@ mod tests {
         uid: &str,
         owned: bool,
         finished: Option<&str>,
-    ) -> rusternetes_common::resources::Job {
+    ) -> k3rs_common::resources::Job {
         let mut v = serde_json::json!({
             "apiVersion": "batch/v1", "kind": "Job",
             "metadata": {"name": name, "namespace": "default", "uid": uid,
@@ -305,9 +301,8 @@ mod tests {
     #[tokio::test]
     async fn first_run_starts_from_creation_timestamp() {
         use std::sync::Arc;
-        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
-        let ctrl =
-            rusternetes_controller_manager::controllers::cronjob::CronJobController::new(storage);
+        let storage = Arc::new(k3rs_storage::memory::MemoryStorage::new());
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(storage);
         let now = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:02:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -337,11 +332,11 @@ mod tests {
     /// formatted RFC3339 (`Z` for a zero offset).
     #[tokio::test]
     async fn job_gets_scheduled_timestamp_annotation() {
-        use rusternetes_common::resources::Job;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Job;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
-        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let storage = Arc::new(k3rs_storage::memory::MemoryStorage::new());
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let t = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
@@ -350,7 +345,7 @@ mod tests {
         let key = |cj: &str| {
             format!(
                 "/registry/jobs/default/{}",
-                rusternetes_controller_manager::controllers::cronjob::job_name_for(cj, t)
+                k3rs_controller_manager::controllers::cronjob::job_name_for(cj, t)
             )
         };
         const ANN: &str = "batch.kubernetes.io/cronjob-scheduled-timestamp";
@@ -378,11 +373,11 @@ mod tests {
     /// status; we must NOT update the status (`return nil, updateStatus, nil`).
     #[tokio::test]
     async fn already_exists_uncontrolled_job_skips_status_update() {
-        use rusternetes_common::resources::Job;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Job;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
-        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let storage = Arc::new(k3rs_storage::memory::MemoryStorage::new());
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let t = chrono::DateTime::parse_from_rfc3339("2025-01-15T06:00:00Z")
@@ -392,7 +387,7 @@ mod tests {
         // Foreign Job with the deterministic name, no ownerReference.
         let foreign: Job = serde_json::from_value(serde_json::json!({
             "apiVersion": "batch/v1", "kind": "Job",
-            "metadata": {"name": rusternetes_controller_manager::controllers::cronjob::job_name_for("cj", t), "namespace": "default", "uid": "foreign"},
+            "metadata": {"name": k3rs_controller_manager::controllers::cronjob::job_name_for("cj", t), "namespace": "default", "uid": "foreign"},
             "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "busybox"}]}}},
         }))
         .unwrap();
@@ -422,10 +417,10 @@ mod tests {
 
     async fn seed(
         storage: &std::sync::Arc<Mem>,
-        cj: &rusternetes_common::resources::CronJob,
-        jobs: &[rusternetes_common::resources::Job],
-    ) -> rusternetes_common::resources::CronJob {
-        use rusternetes_storage::Storage;
+        cj: &k3rs_common::resources::CronJob,
+        jobs: &[k3rs_common::resources::Job],
+    ) -> k3rs_common::resources::CronJob {
+        use k3rs_storage::Storage;
         storage
             .create("/registry/cronjobs/default/cj", cj)
             .await
@@ -440,8 +435,8 @@ mod tests {
     }
 
     async fn reasons(storage: &std::sync::Arc<Mem>) -> Vec<String> {
-        use rusternetes_common::resources::Event;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Event;
+        use k3rs_storage::Storage;
         let mut r: Vec<String> = storage
             .list::<Event>("/registry/events/default/")
             .await
@@ -458,10 +453,10 @@ mod tests {
     /// not due (yearly schedule), so nothing else touches status.
     #[tokio::test]
     async fn finished_job_leaves_active_and_sets_last_successful_time() {
-        use rusternetes_storage::Storage;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = cj_json(
@@ -476,7 +471,7 @@ mod tests {
         )
         .await;
         ctrl.reconcile(&mut cj).await.unwrap();
-        let got: rusternetes_common::resources::CronJob =
+        let got: k3rs_common::resources::CronJob =
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         let st = got.status.unwrap();
         assert!(st.active.is_empty(), "{:?}", st.active);
@@ -491,10 +486,10 @@ mod tests {
     /// (:477-496), even when no run is due.
     #[tokio::test]
     async fn missing_job_is_removed_from_active() {
-        use rusternetes_storage::Storage;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = cj_json(
@@ -504,7 +499,7 @@ mod tests {
         );
         let mut cj = seed(&storage, &cj, &[]).await;
         ctrl.reconcile(&mut cj).await.unwrap();
-        let got: rusternetes_common::resources::CronJob =
+        let got: k3rs_common::resources::CronJob =
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         assert!(got.status.unwrap().active.is_empty());
         assert_eq!(reasons(&storage).await, vec!["MissingJob"]);
@@ -515,11 +510,11 @@ mod tests {
     /// not block the run (:565-578 uses len(Status.Active)).
     #[tokio::test]
     async fn forbid_uses_status_active_not_label_scan() {
-        use rusternetes_common::resources::Job;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Job;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = cj_json("* * * * *", "Forbid", serde_json::json!({}));
@@ -527,7 +522,7 @@ mod tests {
         ctrl.reconcile(&mut cj).await.unwrap();
         let jobs: Vec<Job> = storage.list("/registry/jobs/default/").await.unwrap();
         assert_eq!(jobs.len(), 2, "run must not be blocked by a foreign Job");
-        let got: rusternetes_common::resources::CronJob =
+        let got: k3rs_common::resources::CronJob =
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         let active = got.status.unwrap().active;
         assert_eq!(active.len(), 1, "only the Job we created is active");
@@ -538,16 +533,16 @@ mod tests {
     /// into it; UnexpectedJob warning only (:437-449).
     #[tokio::test]
     async fn unexpected_job_is_warned_not_adopted() {
-        use rusternetes_storage::Storage;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = cj_json("0 0 1 1 *", "Allow", serde_json::json!({}));
         let mut cj = seed(&storage, &cj, &[job_json("orphan", "ju3", true, None)]).await;
         ctrl.reconcile(&mut cj).await.unwrap();
-        let got: rusternetes_common::resources::CronJob =
+        let got: k3rs_common::resources::CronJob =
             storage.get("/registry/cronjobs/default/cj").await.unwrap();
         assert!(got.status.map(|s| s.active.is_empty()).unwrap_or(true));
         assert_eq!(reasons(&storage).await, vec!["UnexpectedJob"]);
@@ -560,10 +555,10 @@ mod tests {
     /// its CronJob (:240-256, Kind + name + UID) and that CronJob is enqueued.
     #[tokio::test]
     async fn job_events_enqueue_the_owning_cronjob() {
-        use rusternetes_storage::WatchEvent;
+        use k3rs_storage::WatchEvent;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let job = job_json("j1", "j1-uid", true, None);
@@ -593,10 +588,10 @@ mod tests {
     /// CronJob and a UID mismatch all enqueue nothing.
     #[tokio::test]
     async fn job_events_ignore_unresolvable_controller_refs() {
-        use rusternetes_storage::WatchEvent;
+        use k3rs_storage::WatchEvent;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         seed(
@@ -605,7 +600,7 @@ mod tests {
             &[],
         )
         .await;
-        let ev = |j: &rusternetes_common::resources::Job| {
+        let ev = |j: &k3rs_common::resources::Job| {
             WatchEvent::Added(
                 "/registry/jobs/default/j".into(),
                 serde_json::to_string(j).unwrap(),
@@ -652,8 +647,8 @@ mod tests {
     // (cronjob_controllerv2_test.go:1447-1671; the `@every` cases wait on
     // #2624) and updateJob (cronjob_controllerv2.go:303-331).
 
-    fn cj_event(kind: &str, schedule: &str, tz: Option<&str>) -> rusternetes_storage::WatchEvent {
-        use rusternetes_storage::WatchEvent;
+    fn cj_event(kind: &str, schedule: &str, tz: Option<&str>) -> k3rs_storage::WatchEvent {
+        use k3rs_storage::WatchEvent;
         let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
         cj.spec.time_zone = tz.map(str::to_string);
         // justBeforeTheHour (cronjob_controllerv2_test.go:150).
@@ -681,10 +676,10 @@ mod tests {
 
     #[tokio::test]
     async fn update_cronjob_schedule_change_enqueues_after_next_slot() {
-        use rusternetes_controller_manager::controllers::cronjob::CronJobEnqueue::*;
+        use k3rs_controller_manager::controllers::cronjob::CronJobEnqueue::*;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let now = just_a_second_before_the_hour();
@@ -695,7 +690,7 @@ mod tests {
             &str,
             Spec,
             Spec,
-            rusternetes_controller_manager::controllers::cronjob::CronJobEnqueue,
+            k3rs_controller_manager::controllers::cronjob::CronJobEnqueue,
         )> = vec![
             // "spec.schedule changed": 1s to the next minute + nextScheduleDelta.
             (
@@ -726,8 +721,7 @@ mod tests {
             ),
         ];
         for (name, old, new, want) in cases {
-            let mut cache =
-                rusternetes_controller_manager::controllers::cronjob::CronJobSpecCache::new();
+            let mut cache = k3rs_controller_manager::controllers::cronjob::CronJobSpecCache::new();
             // The first event only primes the cache.
             let o = cj_event("add", old.0, old.1);
             ctrl.cronjob_event_enqueue(&mut cache, &o, now).await;
@@ -745,16 +739,15 @@ mod tests {
     /// re-aims the requeue (:397).
     #[tokio::test]
     async fn cronjob_add_delete_enqueue_now_and_timezone_change_requeues_after() {
-        use rusternetes_controller_manager::controllers::cronjob::CronJobEnqueue::*;
+        use k3rs_controller_manager::controllers::cronjob::CronJobEnqueue::*;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let now = just_a_second_before_the_hour();
         let key = "cronjobs/default/cj".to_string();
-        let mut cache =
-            rusternetes_controller_manager::controllers::cronjob::CronJobSpecCache::new();
+        let mut cache = k3rs_controller_manager::controllers::cronjob::CronJobSpecCache::new();
         let add = cj_event("add", "0 12 * * *", None);
         assert_eq!(
             ctrl.cronjob_event_enqueue(&mut cache, &add, now).await,
@@ -785,10 +778,10 @@ mod tests {
     /// controller. The old ref comes from the cache a Modified event lacks.
     #[tokio::test]
     async fn job_controller_ref_change_wakes_old_and_new_controller() {
-        use rusternetes_storage::{Storage, WatchEvent};
+        use k3rs_storage::{Storage, WatchEvent};
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         seed(
@@ -810,10 +803,10 @@ mod tests {
         let mut moved = owned.clone();
         moved.metadata.owner_references.as_mut().unwrap()[0].name = "other".into();
         moved.metadata.owner_references.as_mut().unwrap()[0].uid = "other-uid".into();
-        let ev = |j: &rusternetes_common::resources::Job| {
+        let ev = |j: &k3rs_common::resources::Job| {
             WatchEvent::Modified(k.clone(), serde_json::to_string(j).unwrap())
         };
-        let mut cache = rusternetes_controller_manager::controllers::cronjob::JobRefCache::new();
+        let mut cache = k3rs_controller_manager::controllers::cronjob::JobRefCache::new();
         // Seen as an add (or the initial list): owned by cj.
         let added = WatchEvent::Added(k.clone(), serde_json::to_string(&owned).unwrap());
         assert_eq!(
@@ -851,13 +844,13 @@ mod tests {
     /// event can clear status.active.
     #[tokio::test]
     async fn run_syncs_cronjob_when_its_job_finishes() {
-        use rusternetes_storage::Storage;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
         let ctrl = Arc::new(
-            rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
-                Arc::clone(&storage),
-            ),
+            k3rs_controller_manager::controllers::cronjob::CronJobController::new(Arc::clone(
+                &storage,
+            )),
         );
         let cj = cj_json(
             "0 0 1 1 *",
@@ -876,7 +869,7 @@ mod tests {
         let mut cleared = false;
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let got: rusternetes_common::resources::CronJob =
+            let got: k3rs_common::resources::CronJob =
                 storage.get("/registry/cronjobs/default/cj").await.unwrap();
             if got.status.is_some_and(|s| s.active.is_empty()) {
                 cleared = true;
@@ -894,8 +887,8 @@ mod tests {
     // Ported from TestNextScheduleTimeDuration
     // (pkg/controller/cronjob/utils_test.go:614-702).
 
-    fn std_schedule(s: &str) -> rusternetes_controller_manager::controllers::cronjob::Schedule {
-        rusternetes_controller_manager::controllers::cronjob::parse_standard_schedule(s).unwrap()
+    fn std_schedule(s: &str) -> k3rs_controller_manager::controllers::cronjob::Schedule {
+        k3rs_controller_manager::controllers::cronjob::parse_standard_schedule(s).unwrap()
     }
 
     fn at(offset: chrono::Duration) -> chrono::DateTime<chrono::Utc> {
@@ -905,10 +898,7 @@ mod tests {
             + offset
     }
 
-    fn cj_at(
-        schedule: &str,
-        last: Option<chrono::Duration>,
-    ) -> rusternetes_common::resources::CronJob {
+    fn cj_at(schedule: &str, last: Option<chrono::Duration>) -> k3rs_common::resources::CronJob {
         let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
         cj.metadata.creation_timestamp = Some(at(chrono::Duration::zero()));
         if let Some(l) = last {
@@ -954,7 +944,7 @@ mod tests {
         ];
         for (name, schedule, last, now, want) in cases {
             let cj = cj_at(schedule, last);
-            let got = rusternetes_controller_manager::controllers::cronjob::next_schedule_duration(
+            let got = k3rs_controller_manager::controllers::cronjob::next_schedule_duration(
                 &std_schedule(schedule),
                 chrono_tz::UTC,
                 &cj,
@@ -972,7 +962,7 @@ mod tests {
     async fn sync_requeues_at_next_schedule_slot() {
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         // Yearly schedule, created 10 minutes ago: nothing due.
@@ -984,7 +974,7 @@ mod tests {
 
         // Suspended: upstream returns nil -> no requeue (:514-517).
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let mut sus = cj_json("* * * * *", "Allow", serde_json::json!({}));
@@ -999,7 +989,7 @@ mod tests {
     async fn sync_requeues_after_starting_a_job() {
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
@@ -1017,7 +1007,7 @@ mod tests {
         created: chrono::Duration,
         last: Option<chrono::Duration>,
         sds: Option<i64>,
-    ) -> rusternetes_common::resources::CronJob {
+    ) -> k3rs_common::resources::CronJob {
         let mut cj = cj_fixture(serde_json::json!({"schedule": schedule}));
         cj.metadata.creation_timestamp = Some(at(created));
         cj.spec.starting_deadline_seconds = sds;
@@ -1031,7 +1021,7 @@ mod tests {
     #[test]
     fn most_recent_schedule_time_matches_upstream_table() {
         use chrono::Duration as D;
-        use rusternetes_controller_manager::controllers::cronjob::MissedSchedules::{
+        use k3rs_controller_manager::controllers::cronjob::MissedSchedules::{
             Few, Many, None as NoneMissed,
         };
         let z = D::zero();
@@ -1049,7 +1039,7 @@ mod tests {
             D,
             D,
             Option<D>,
-            rusternetes_controller_manager::controllers::cronjob::MissedSchedules,
+            k3rs_controller_manager::controllers::cronjob::MissedSchedules,
         )> = vec![
             (
                 "now before next schedule",
@@ -1215,7 +1205,7 @@ mod tests {
         for (name, sched, created, last, sds, include, now, earliest, recent, missed) in cases {
             let cj = cj_sds(sched, created, last, sds);
             let (e, r, mm) =
-                rusternetes_controller_manager::controllers::cronjob::most_recent_schedule_time(
+                k3rs_controller_manager::controllers::cronjob::most_recent_schedule_time(
                     &cj,
                     at(now),
                     &std_schedule(sched),
@@ -1229,15 +1219,14 @@ mod tests {
         }
         // > 100 missed schedules and no deadline: manyMissed (utils.go:147-148).
         let cj = cj_sds("0 * * * *", z, None, None);
-        let (_, r, mm) =
-            rusternetes_controller_manager::controllers::cronjob::most_recent_schedule_time(
-                &cj,
-                at(D::days(7)),
-                &std_schedule("0 * * * *"),
-                chrono_tz::UTC,
-                true,
-            )
-            .unwrap();
+        let (_, r, mm) = k3rs_controller_manager::controllers::cronjob::most_recent_schedule_time(
+            &cj,
+            at(D::days(7)),
+            &std_schedule("0 * * * *"),
+            chrono_tz::UTC,
+            true,
+        )
+        .unwrap();
         assert_eq!(r, Some(at(D::days(7))));
         assert_eq!(mm, Many);
     }
@@ -1247,7 +1236,7 @@ mod tests {
     #[test]
     fn rogue_schedule_errors() {
         let cj = cj_sds("59 23 31 2 *", chrono::Duration::seconds(10), None, None);
-        let err = rusternetes_controller_manager::controllers::cronjob::most_recent_schedule_time(
+        let err = k3rs_controller_manager::controllers::cronjob::most_recent_schedule_time(
             &cj,
             at(chrono::Duration::hours(1)),
             &std_schedule("59 23 31 2 *"),
@@ -1266,8 +1255,8 @@ mod tests {
         use chrono::Duration as D;
         let s = "0 * * * *";
         let sch = std_schedule(s);
-        let next = |cj: &rusternetes_common::resources::CronJob, now: D| {
-            rusternetes_controller_manager::controllers::cronjob::next_schedule_time(
+        let next = |cj: &k3rs_common::resources::CronJob, now: D| {
+            k3rs_controller_manager::controllers::cronjob::next_schedule_time(
                 cj,
                 at(now),
                 &sch,
@@ -1303,7 +1292,7 @@ mod tests {
         let cj = cj_sds("59 23 31 2 *", D::seconds(10), None, None);
         let rogue = std_schedule("59 23 31 2 *");
         assert!(
-            rusternetes_controller_manager::controllers::cronjob::next_schedule_time(
+            k3rs_controller_manager::controllers::cronjob::next_schedule_time(
                 &cj,
                 at(D::hours(1)),
                 &rogue,
@@ -1317,11 +1306,11 @@ mod tests {
     /// than 100 starts were missed and there is no deadline.
     #[tokio::test]
     async fn too_many_missed_times_records_warning() {
-        use rusternetes_common::resources::Event;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Event;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let mut cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
@@ -1345,11 +1334,11 @@ mod tests {
     /// With a deadline the same backlog is not "many" and records nothing.
     #[tokio::test]
     async fn deadline_suppresses_too_many_missed_times() {
-        use rusternetes_common::resources::Event;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Event;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let mut cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
@@ -1371,11 +1360,11 @@ mod tests {
     /// `invalid schedule: %s : %s`, and nothing is requeued.
     #[tokio::test]
     async fn invalid_schedule_records_event_and_does_not_requeue() {
-        use rusternetes_common::resources::Event;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Event;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let mut cj = cj_json("59 23 31 2 *", "Allow", serde_json::json!({}));
@@ -1415,16 +1404,15 @@ mod tests {
             next("@every 1500ms", t),
             chrono::Utc.timestamp_opt(1_001, 0).unwrap()
         );
-        let e = rusternetes_controller_manager::controllers::cronjob::parse_standard_schedule(
-            "@every nope",
-        )
-        .unwrap_err();
+        let e =
+            k3rs_controller_manager::controllers::cronjob::parse_standard_schedule("@every nope")
+                .unwrap_err();
         assert_eq!(
             e,
             "failed to parse duration @every nope: time: invalid duration \"nope\""
         );
         assert!(
-            rusternetes_controller_manager::controllers::cronjob::parse_standard_schedule("@every")
+            k3rs_controller_manager::controllers::cronjob::parse_standard_schedule("@every")
                 .is_err()
         );
     }
@@ -1435,8 +1423,7 @@ mod tests {
     #[test]
     fn day_of_week_bounds_match_robfig() {
         let err = |s: &str| {
-            rusternetes_controller_manager::controllers::cronjob::parse_standard_schedule(s)
-                .unwrap_err()
+            k3rs_controller_manager::controllers::cronjob::parse_standard_schedule(s).unwrap_err()
         };
         assert_eq!(err("0 0 * * 7"), "end of range (7) above maximum (6): 7");
         assert_eq!(
@@ -1464,8 +1451,7 @@ mod tests {
             "0 0 * * SUN-SAT",
         ] {
             assert!(
-                rusternetes_controller_manager::controllers::cronjob::parse_standard_schedule(ok)
-                    .is_ok(),
+                k3rs_controller_manager::controllers::cronjob::parse_standard_schedule(ok).is_ok(),
                 "{ok}"
             );
         }
@@ -1480,25 +1466,23 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rusternetes_storage::Storage for RejectJobCreate {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+    impl k3rs_storage::Storage for RejectJobCreate {
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             if key.starts_with("/registry/jobs/") {
-                return Err(rusternetes_common::Error::Forbidden(
-                    self.message.to_string(),
-                ));
+                return Err(k3rs_common::Error::Forbidden(self.message.to_string()));
             }
             self.inner.create(key, value).await
         }
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.get(key).await
         }
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -1508,58 +1492,45 @@ mod tests {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
         // Events are written with a TTL (#2303); the default impl refuses ttl != 0.
-        async fn create_with_ttl<T>(
-            &self,
-            key: &str,
-            value: &T,
-            ttl: u64,
-        ) -> rusternetes_common::Result<T>
+        async fn create_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create_with_ttl(key, value, ttl).await
         }
-        async fn update_with_ttl<T>(
-            &self,
-            key: &str,
-            value: &T,
-            ttl: u64,
-        ) -> rusternetes_common::Result<T>
+        async fn update_with_ttl<T>(&self, key: &str, value: &T, ttl: u64) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.update_with_ttl(key, value, ttl).await
         }
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.list(prefix).await
         }
-        async fn watch(
-            &self,
-            prefix: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
         async fn watch_from_revision(
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }
@@ -1584,7 +1555,7 @@ mod tests {
                 inner: Arc::clone(&inner),
                 message,
             });
-            let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+            let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
                 Arc::clone(&storage),
             );
             let cj = cj_json("* * * * *", "Allow", serde_json::json!({}));
@@ -1602,11 +1573,11 @@ mod tests {
     /// pkg/apis/batch/v1/defaults.go:83-88), not the controller's.
     #[tokio::test]
     async fn cleanup_does_nothing_when_both_limits_nil() {
-        use rusternetes_common::resources::Job;
-        use rusternetes_storage::Storage;
+        use k3rs_common::resources::Job;
+        use k3rs_storage::Storage;
         use std::sync::Arc;
         let storage = Arc::new(Mem::new());
-        let ctrl = rusternetes_controller_manager::controllers::cronjob::CronJobController::new(
+        let ctrl = k3rs_controller_manager::controllers::cronjob::CronJobController::new(
             Arc::clone(&storage),
         );
         let jobs: Vec<_> = (0..5)

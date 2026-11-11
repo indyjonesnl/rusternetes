@@ -5,11 +5,11 @@
 //! and the `system:masters` bypass).
 
 use axum::{body::Body, routing::any, Router};
-use rusternetes_api_server::max_in_flight_filter::{
+use k3rs_api_server::max_in_flight_filter::{
     validate_limits, with_max_in_flight_limit, MaxInFlight,
 };
-use rusternetes_common::auth::UserInfo;
-use rusternetes_middleware::AuthContext;
+use k3rs_common::auth::UserInfo;
+use k3rs_middleware::AuthContext;
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tower::ServiceExt;

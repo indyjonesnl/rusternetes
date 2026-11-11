@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Quick Start - Rūsternetes</title>
+  <title>Quick Start - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Quick Start</h1>
       <p class="lead">
-        Get a fully functional Rūsternetes cluster running in 5 minutes using Podman or Docker Compose.
+        Get a fully functional k3rs cluster running in 5 minutes using Podman or Docker Compose.
         No Rust toolchain required.
       </p>
 
@@ -130,7 +130,7 @@
 
       <p>
         You also need <code>kubectl</code> installed on your host machine. Any recent version works &mdash;
-        Rūsternetes is compatible with the standard Kubernetes CLI.
+        k3rs is compatible with the standard Kubernetes CLI.
       </p>
 
       <div class="admonition tip">
@@ -153,7 +153,7 @@
           <span class="code-title">terminal</span>
         </div>
         <code>git clone https://github.com/calfonso/rusternetes.git
-cd rusternetes</code>
+cd k3rs</code>
       </pre>
 
       <h3>2. Set the volumes path</h3>
@@ -169,7 +169,7 @@ cd rusternetes</code>
           <span class="code-dot green"></span>
           <span class="code-title">terminal</span>
         </div>
-        <code>export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+        <code>export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 mkdir -p $KUBELET_VOLUMES_PATH</code>
       </pre>
 
@@ -178,13 +178,13 @@ mkdir -p $KUBELET_VOLUMES_PATH</code>
         <p>
           If using Podman Machine on macOS, <code>/tmp</code> is not shared between host and VM.
           Use a path under your home directory (which is automatically mounted).
-          The <code>$(pwd)/.rusternetes/volumes</code> path works correctly.
+          The <code>$(pwd)/.k3rs/volumes</code> path works correctly.
         </p>
       </div>
 
       <h3>3. Build the container images</h3>
       <p>
-        This compiles each Rūsternetes component inside a container build stage. The first build takes
+        This compiles each k3rs component inside a container build stage. The first build takes
         10&ndash;15 minutes; subsequent builds use the layer cache and are much faster.
       </p>
 
@@ -241,7 +241,7 @@ mkdir -p $KUBELET_VOLUMES_PATH</code>
           <span class="code-dot green"></span>
           <span class="code-title">terminal</span>
         </div>
-        <code>export KUBECONFIG=~/.kube/rusternetes-config</code>
+        <code>export KUBECONFIG=~/.kube/k3rs-config</code>
       </pre>
 
       <p>
@@ -271,8 +271,8 @@ mkdir -p $KUBELET_VOLUMES_PATH</code>
           <span class="code-title">output</span>
         </div>
         <code>NAME     STATUS   ROLES    AGE   VERSION
-node-1   Ready    &lt;none&gt;   30s   v1.35.0-rusternetes
-node-2   Ready    &lt;none&gt;   30s   v1.35.0-rusternetes</code>
+node-1   Ready    &lt;none&gt;   30s   v1.35.0-k3rs
+node-2   Ready    &lt;none&gt;   30s   v1.35.0-k3rs</code>
       </pre>
 
       <p>Try deploying a workload:</p>
@@ -304,37 +304,37 @@ kubectl get pods -w</code>
         <tbody>
           <tr>
             <td><code>etcd</code></td>
-            <td><code>rusternetes-etcd</code></td>
+            <td><code>k3rs-etcd</code></td>
             <td>Distributed key-value store for all cluster state</td>
           </tr>
           <tr>
             <td><code>api-server</code></td>
-            <td><code>rusternetes-api-server</code></td>
+            <td><code>k3rs-api-server</code></td>
             <td>HTTPS REST API on port 6443 (TLS)</td>
           </tr>
           <tr>
             <td><code>scheduler</code></td>
-            <td><code>rusternetes-scheduler</code></td>
+            <td><code>k3rs-scheduler</code></td>
             <td>Assigns pods to nodes using filter/score plugins</td>
           </tr>
           <tr>
             <td><code>controller-manager</code></td>
-            <td><code>rusternetes-controller-manager</code></td>
+            <td><code>k3rs-controller-manager</code></td>
             <td>Runs 31 reconciliation controllers</td>
           </tr>
           <tr>
             <td><code>kubelet</code></td>
-            <td><code>rusternetes-kubelet</code></td>
+            <td><code>k3rs-kubelet</code></td>
             <td>Node agent on node-1, manages containers via Docker</td>
           </tr>
           <tr>
             <td><code>kubelet2</code></td>
-            <td><code>rusternetes-kubelet2</code></td>
+            <td><code>k3rs-kubelet2</code></td>
             <td>Node agent on node-2, same as above</td>
           </tr>
           <tr>
             <td><code>kube-proxy</code></td>
-            <td><code>rusternetes-kube-proxy</code></td>
+            <td><code>k3rs-kube-proxy</code></td>
             <td>iptables-based service routing (host network mode)</td>
           </tr>
         </tbody>
@@ -414,7 +414,7 @@ podman compose -f compose.yml down -v</code>
         </div>
         <code><span class="comment"># Remove containers, volumes, and orphan pod containers</span>
 podman compose -f compose.yml down -v
-podman rm -f $(podman ps -aq --filter "label=rusternetes") 2>/dev/null || true
+podman rm -f $(podman ps -aq --filter "label=k3rs") 2>/dev/null || true
 
 <span class="comment"># Start fresh</span>
 podman compose -f compose.yml up -d
@@ -450,7 +450,7 @@ ports:
           <span class="code-dot green"></span>
           <span class="code-title">terminal</span>
         </div>
-        <code>kubectl config set-cluster rusternetes --server=https://localhost:7443</code>
+        <code>kubectl config set-cluster k3rs --server=https://localhost:7443</code>
       </pre>
 
       <h3>Cannot connect to API server</h3>
@@ -462,7 +462,7 @@ ports:
         <li>Check the API server logs: <code>podman compose -f compose.yml logs api-server</code></li>
         <li>Verify etcd is healthy: <code>podman compose -f compose.yml logs etcd</code></li>
         <li>Make sure <code>KUBECONFIG</code> is set: <code>echo $KUBECONFIG</code></li>
-        <li>Confirm the kubeconfig file exists: <code>cat ~/.kube/rusternetes-config</code></li>
+        <li>Confirm the kubeconfig file exists: <code>cat ~/.kube/k3rs-config</code></li>
       </ul>
 
       <h3>First build is slow</h3>
@@ -520,7 +520,7 @@ ports:
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

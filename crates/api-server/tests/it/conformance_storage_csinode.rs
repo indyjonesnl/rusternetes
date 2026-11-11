@@ -8,7 +8,7 @@
 //! drives the api-server's router step by step in the order the upstream
 //! body issues its client calls. `utilrand.String(5)` name suffixes are fixed.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CSINODES: &str = "/apis/storage.k8s.io/v1/csinodes";

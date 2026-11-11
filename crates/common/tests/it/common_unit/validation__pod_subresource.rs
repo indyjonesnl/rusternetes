@@ -2,30 +2,28 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::equality::semantic_equal;
-    pub use rusternetes_common::feature_gates::{enabled, Feature};
-    pub use rusternetes_common::qos::{compute_pod_qos, get_pod_qos};
-    pub use rusternetes_common::resources::pod::{EphemeralContainer, PodSpec};
-    pub use rusternetes_common::resources::{Container, Pod};
-    pub use rusternetes_common::types::ResourceRequirements;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::equality::semantic_equal;
+    pub use k3rs_common::feature_gates::{enabled, Feature};
+    pub use k3rs_common::qos::{compute_pod_qos, get_pod_qos};
+    pub use k3rs_common::resources::pod::{EphemeralContainer, PodSpec};
+    pub use k3rs_common::resources::{Container, Pod};
+    pub use k3rs_common::types::ResourceRequirements;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::pod::{
-        validate_container, validate_pod_create_with_options,
-    };
-    pub use rusternetes_common::validation::pod_options::{
+    pub use k3rs_common::validation::pod::{validate_container, validate_pod_create_with_options};
+    pub use k3rs_common::validation::pod_options::{
         get_validation_options_from_pod_spec_and_meta, PodValidationOptions,
     };
-    pub use rusternetes_common::validation::pod_status::validate_pod_metadata_annotations_with_opts;
+    pub use k3rs_common::validation::pod_status::validate_pod_metadata_annotations_with_opts;
     pub use std::collections::{HashMap, HashSet};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::PodStatus;
-    use rusternetes_common::validation::pod_subresource::*;
+    use k3rs_common::resources::PodStatus;
+    use k3rs_common::validation::pod_subresource::*;
     use serde_json::json;
 
     fn pod(value: serde_json::Value) -> Pod {
@@ -429,7 +427,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pod_level_resize_with_the_gate_on() {
-        let _g = rusternetes_common::feature_gates::with_feature(
+        let _g = k3rs_common::feature_gates::with_feature(
             Feature::InPlacePodLevelResourcesVerticalScaling,
             true,
         );

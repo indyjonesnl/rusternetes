@@ -17,8 +17,8 @@ use crate::volume_plugins::csi_client::CSI_TIMEOUT;
 use crate::volume_plugins::csi_drivers_store::DriversStore;
 use crate::volume_plugins::nodeinfomanager::NodeInfoInstaller;
 use futures::StreamExt;
-use rusternetes_common::resources::CSIDriver;
-use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent};
+use k3rs_common::resources::CSIDriver;
+use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -215,7 +215,7 @@ impl<S: Storage + 'static> CsiNodeUpdater<S> {
             .await
         {
             Ok(d) => d,
-            Err(rusternetes_common::Error::NotFound(_)) => {
+            Err(k3rs_common::Error::NotFound(_)) => {
                 tracing::info!(
                     "CSIDriver object not found; stopping csiNodeUpdater driver={driver_name}"
                 );

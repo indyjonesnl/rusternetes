@@ -1,5 +1,5 @@
-use rusternetes_common::resources::csi::VolumeAttributesClass;
-use rusternetes_common::validation::volumeattributesclass::validate_volume_attributes_class_update;
+use k3rs_common::resources::csi::VolumeAttributesClass;
+use k3rs_common::validation::volumeattributesclass::validate_volume_attributes_class_update;
 use serde_json::json;
 
 fn vac(driver: &str, params: serde_json::Value) -> VolumeAttributesClass {

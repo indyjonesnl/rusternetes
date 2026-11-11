@@ -9,9 +9,9 @@
 //! Pattern: pure-function. This file is a kubelet *unit* test — no Docker,
 //! no api-server, no axum router. We exercise the two helpers that pin the
 //! production volume-setup invariants:
-//!   * `rusternetes_kubelet::runtime::setup_emptydir_dir` — the EmptyDir
+//!   * `k3rs_kubelet::runtime::setup_emptydir_dir` — the EmptyDir
 //!     mode-0777 chmod path (pkg/volume/emptydir/empty_dir.go::setupDir).
-//!   * `rusternetes_kubelet::runtime::check_host_path_type` — the HostPath
+//!   * `k3rs_kubelet::runtime::check_host_path_type` — the HostPath
 //!     `type` validation + "OrCreate" creation path
 //!     (pkg/volume/host_path/host_path.go::checkType).
 //!
@@ -32,7 +32,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use rusternetes_kubelet::runtime::{check_host_path_type, setup_emptydir_dir, HostPathCheck};
+use k3rs_kubelet::runtime::{check_host_path_type, setup_emptydir_dir, HostPathCheck};
 
 // ---------------------------------------------------------------------------
 // Test helpers — keep duplicated logic minimal; mirror what runtime.rs does
@@ -49,7 +49,7 @@ fn unique_tmp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("rusternetes-conformance-storage-{tag}-{ts}"))
+    std::env::temp_dir().join(format!("k3rs-conformance-storage-{tag}-{ts}"))
 }
 
 #[cfg(unix)]
@@ -323,7 +323,7 @@ fn emptydir_pod_should_support_shared_volumes_between_containers() {
 /// round-trip through serde without loss.
 #[test]
 fn emptydir_pod_should_support_memory_backed_volume_of_specified_size() {
-    use rusternetes_common::resources::pod::EmptyDirVolumeSource;
+    use k3rs_common::resources::pod::EmptyDirVolumeSource;
 
     let src = EmptyDirVolumeSource {
         medium: Some("Memory".to_string()),

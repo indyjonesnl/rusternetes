@@ -18,16 +18,16 @@
 //! The per-controller counts are the upstream `Concurrent*Syncs` defaults,
 //! cited at each constant.
 
-// `spawn_workers` lives in `rusternetes-controller-core` so the api-server can
+// `spawn_workers` lives in `k3rs-controller-core` so the api-server can
 // use it without depending on this crate.
-pub use rusternetes_controller_core::worker_pool::spawn_workers;
+pub use k3rs_controller_core::worker_pool::spawn_workers;
 
 pub mod test_support {
     //! Storage wrapper that makes overlap between workers observable, so a
     //! test can drive a controller's real `run()` and assert the pool is wider
     //! than one (see namespace.rs `run_processes_namespaces_with_a_worker_pool`
     //! for why `reconcile_all` is the wrong thing to test).
-    use rusternetes_storage::{memory::MemoryStorage, Storage};
+    use k3rs_storage::{memory::MemoryStorage, Storage};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -107,13 +107,13 @@ pub mod test_support {
 
     #[async_trait::async_trait]
     impl Storage for StallStorage {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create(key, value).await
         }
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
@@ -122,7 +122,7 @@ pub mod test_support {
             }
             self.inner.get(key).await
         }
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -132,35 +132,32 @@ pub mod test_support {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.list(prefix).await
         }
-        async fn watch(
-            &self,
-            prefix: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
         async fn watch_from_revision(
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }

@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::autoscaling::*;
+    use k3rs_common::resources::autoscaling::*;
 
     #[test]
     fn test_hpa_creation() {

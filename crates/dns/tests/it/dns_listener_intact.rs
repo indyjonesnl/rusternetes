@@ -1,13 +1,13 @@
 //! Regression guard for the netstack removal (spec 001-remove-netlink, US2).
 //!
 //! The in-process DNS server serves over standard OS UDP+TCP sockets. It never
-//! depended on the (now-deleted) `rusternetes-netstack` smoltcp short-circuit;
+//! depended on the (now-deleted) `k3rs-netstack` smoltcp short-circuit;
 //! removing netstack must leave the DNS listener path and wire-response logic
 //! fully intact.
 
-use rusternetes_common::resources::{Service, ServiceSpec, ServiceType};
-use rusternetes_dns::server::respond_bytes;
-use rusternetes_dns::zone::{Zone, CLUSTER_ZONE};
+use k3rs_common::resources::{Service, ServiceSpec, ServiceType};
+use k3rs_dns::server::respond_bytes;
+use k3rs_dns::zone::{Zone, CLUSTER_ZONE};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{DNSClass, Name, RecordType};

@@ -1,12 +1,12 @@
 //! Tests for FlowSchema validation (upstream APF ValidateFlowSchemaSpec).
 
-use rusternetes_common::resources::flowcontrol::{
+use k3rs_common::resources::flowcontrol::{
     FlowSchema, FlowSchemaSpec, FlowSchemaSubject, NonResourcePolicyRule, PolicyRulesWithSubjects,
     PriorityLevelConfigurationReference, ResourcePolicyRule, ServiceAccountSubject, SubjectKind,
     UserSubject,
 };
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::flowschema::validate_flow_schema;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::flowschema::validate_flow_schema;
 
 fn user_subject(name: &str) -> FlowSchemaSubject {
     FlowSchemaSubject {
@@ -56,7 +56,7 @@ fn one_rule() -> PolicyRulesWithSubjects {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field))
 }
 
@@ -188,7 +188,7 @@ fn user_subject_with_group_forbidden() {
         user: Some(UserSubject {
             name: "a".to_string(),
         }),
-        group: Some(rusternetes_common::resources::flowcontrol::GroupSubject {
+        group: Some(k3rs_common::resources::flowcontrol::GroupSubject {
             name: "g".to_string(),
         }),
         service_account: None,
@@ -206,7 +206,7 @@ fn user_subject_with_group_forbidden() {
 
 // ---- mandatory-object spec equality (validation.go:86-94) ----
 
-use rusternetes_common::validation::flowcontrol_bootstrap::{
+use k3rs_common::validation::flowcontrol_bootstrap::{
     mandatory_flow_schema, MANDATORY_FLOW_SCHEMA_NAMES,
 };
 

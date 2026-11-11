@@ -1,16 +1,16 @@
 [package]
-name = "rusternetes-protobuf"
+name = "k3rs-protobuf"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_protobuf"
+name = "k3rs_protobuf"
 path = "src/lib.rs"
 
 [dependencies]
-rusternetes-common = { path = "../common" }
+k3rs-common = { path = "../common" }
 serde_json.workspace = true
 tracing.workspace = true
 base64 = "0.22"

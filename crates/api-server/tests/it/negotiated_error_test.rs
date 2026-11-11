@@ -10,12 +10,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::any;
 use axum::Router;
-use rusternetes_api_server::authorization_filter::with_authorization;
-use rusternetes_api_server::request_scope::request_info_middleware;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::Result;
-use rusternetes_middleware::AuthContext;
+use k3rs_api_server::authorization_filter::with_authorization;
+use k3rs_api_server::request_scope::request_info_middleware;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::Result;
+use k3rs_middleware::AuthContext;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -33,8 +33,8 @@ impl Authorizer for Deny {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 

@@ -12,7 +12,7 @@
 //! Today's encoder ladder:
 //!
 //! - [`NativePodProtoEncoder`] (Pod / PodList) walks the schema in
-//!   `rusternetes_protobuf::PROTO_REGISTRY` and emits real proto bytes into
+//!   `k3rs_protobuf::PROTO_REGISTRY` and emits real proto bytes into
 //!   `Unknown.raw`, matching what upstream `pb.go` would produce.
 //! - [`WrappedJsonProtoEncoder`] is the default fallback for kinds without
 //!   a native encoder yet: it stuffs the JSON bytes into `Unknown.raw` and
@@ -67,9 +67,9 @@ where
     fn into_response(self) -> Response {
         // For now, default to JSON
         // In full implementation, check Accept header and return protobuf if requested
-        match rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(
-            || serde_json::to_vec(&self.data),
-        ) {
+        match k3rs_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+            serde_json::to_vec(&self.data)
+        }) {
             Ok(body) => Response::builder()
                 .status(self.status)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -120,7 +120,7 @@ where
 {
     // For now, always use JSON since protobuf encoding needs type metadata
     // In full implementation, this would check content_type and encode appropriately
-    match rusternetes_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
+    match k3rs_common::latency_trackers::track_serialize_response_object_latency_sync(|| {
         serde_json::to_vec(&data)
     }) {
         Ok(body) => Response::builder()
@@ -202,7 +202,7 @@ impl NativeProtoOptIn {
 /// ([`WrappedJsonProtoEncoder`]) stuffs the JSON bytes into
 /// `Unknown.raw` and sets `Unknown.contentType` to `application/json`,
 /// which is the same envelope that
-/// `rusternetes_common::protobuf::encode_protobuf` produces and that
+/// `k3rs_common::protobuf::encode_protobuf` produces and that
 /// `decode_protobuf` round-trips. A future per-resource implementation
 /// would replace the body with native protobuf bytes produced from the
 /// resource type (matching what upstream's generated `pb.go` does).
@@ -221,7 +221,7 @@ pub trait ProtoEncoder: Send + Sync {
 /// Default [`ProtoEncoder`] that wraps the JSON in `runtime.Unknown.raw`
 /// and sets `contentType = "application/json"`.
 ///
-/// Delegates to [`rusternetes_common::protobuf::encode_protobuf`] so the
+/// Delegates to [`k3rs_common::protobuf::encode_protobuf`] so the
 /// envelope shape (prost-derived `Unknown` field layout) round-trips
 /// through `decode_protobuf` without any wire-format drift. A future
 /// per-resource native encoder can wrap `encode_protobuf` (or replace it)
@@ -236,14 +236,14 @@ impl ProtoEncoder for WrappedJsonProtoEncoder {
 
 /// Build a K8s `runtime.Unknown` protobuf envelope around `json`.
 ///
-/// Delegates to [`rusternetes_common::protobuf::encode_protobuf`] for the
+/// Delegates to [`k3rs_common::protobuf::encode_protobuf`] for the
 /// envelope shape so encode / decode share one prost-derived `Unknown`
 /// definition. If encoding fails we fall back to the raw JSON bytes — the
 /// response middleware will still emit them as `application/json` if the
 /// caller chooses not to override the Content-Type, but the standard
 /// usage path always treats the result as the protobuf envelope.
 pub fn wrap_json_in_protobuf_envelope(json: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
-    use rusternetes_common::protobuf::{Unknown, UnknownTypeMeta};
+    use k3rs_common::protobuf::{Unknown, UnknownTypeMeta};
 
     let unknown = Unknown {
         type_meta: Some(UnknownTypeMeta {
@@ -275,7 +275,7 @@ pub fn default_proto_encoder() -> &'static dyn ProtoEncoder {
 /// Native protobuf encoder for Pod / PodList responses.
 ///
 /// Parses the JSON body into a `serde_json::Value`, runs it through
-/// `rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, value)` to produce
+/// `k3rs_protobuf::PROTO_REGISTRY.encode_message(kind, value)` to produce
 /// native protobuf bytes, then wraps those bytes in a `k8s\0`-framed
 /// `runtime.Unknown` envelope whose `contentType` advertises
 /// `application/vnd.kubernetes.protobuf`. The output is wire-compatible
@@ -327,9 +327,9 @@ pub fn encode_native(json: &[u8], api_version: &str, kind: &str) -> Option<Vec<u
     // token request", #1667). Kinds registered only under the bare name (Pod, …)
     // fall through to the second lookup unchanged.
     let qualified = format!("{api_version}.{kind}");
-    let raw = rusternetes_protobuf::PROTO_REGISTRY
+    let raw = k3rs_protobuf::PROTO_REGISTRY
         .encode_message(&qualified, &value)
-        .or_else(|| rusternetes_protobuf::PROTO_REGISTRY.encode_message(kind, &value))?;
+        .or_else(|| k3rs_protobuf::PROTO_REGISTRY.encode_message(kind, &value))?;
     Some(wrap_native_proto_in_envelope(&raw, api_version, kind))
 }
 
@@ -338,7 +338,7 @@ pub fn encode_native(json: &[u8], api_version: &str, kind: &str) -> Option<Vec<u
 /// `Unknown.contentType = application/vnd.kubernetes.protobuf` so
 /// Unknown-aware decoders know the body is native proto, not JSON.
 pub fn wrap_native_proto_in_envelope(raw: &[u8], api_version: &str, kind: &str) -> Vec<u8> {
-    use rusternetes_common::protobuf::{Unknown, UnknownTypeMeta};
+    use k3rs_common::protobuf::{Unknown, UnknownTypeMeta};
 
     let unknown = Unknown {
         type_meta: Some(UnknownTypeMeta {
@@ -370,7 +370,7 @@ pub fn encoder_for(_opt_in: &NativeProtoOptIn) -> &'static dyn ProtoEncoder {
     // protobuf only when the registered schema round-trips losslessly, and
     // transparently falls back to the JSON-in-`Unknown.raw` envelope otherwise
     // (no schema, or an incomplete one). This mirrors official k8s ("native
-    // for marshalable types") while staying safe against rusternetes's
+    // for marshalable types") while staying safe against k3rs's
     // hand-written schemas — no per-kind allowlist to maintain.
     &NativePodProtoEncoder
 }

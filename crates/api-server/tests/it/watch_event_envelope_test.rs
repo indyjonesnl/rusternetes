@@ -33,7 +33,7 @@
 //! - `ERROR`: upstream emits a streamed `{type:"ERROR", object:Status}`
 //!   envelope when the watch backend reports an unrecoverable failure —
 //!   the canonical case being a `resourceVersion` that is below the
-//!   cacher's earliest available revision (compaction). Rusternetes
+//!   cacher's earliest available revision (compaction). k3rs
 //!   mirrors this: a compacted RV on `?watch=true` returns HTTP 200 with
 //!   a single streamed `{type:"ERROR", object:Status{code:410,
 //!   reason:"Expired"}}` envelope, then EOF. See
@@ -45,8 +45,8 @@
 
 use axum::http::{Method, StatusCode};
 use futures::StreamExt;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -309,7 +309,7 @@ async fn watch_envelope_modified_carries_updated_resource() {
 ///
 /// Per upstream `watch.Event` semantics the object in a DELETED envelope is
 /// the resource as it existed *at deletion time* (i.e. the prev-value the
-/// storage layer captured). The rusternetes handler implements this by
+/// storage layer captured). The k3rs handler implements this by
 /// deserializing `WatchEvent::Deleted(_, prev_value)`; see
 /// `handlers/watch.rs::472-509`.
 #[tokio::test]
@@ -453,7 +453,7 @@ async fn watch_envelope_bookmark_carries_resource_version() {
 /// Object: NewResourceExpired(...).Status()}` frame followed by stream
 /// close.
 ///
-/// Rusternetes mirrors this contract: a stale (compacted) `resourceVersion`
+/// k3rs mirrors this contract: a stale (compacted) `resourceVersion`
 /// on a `?watch=true` request returns HTTP 200 with a single streamed
 /// `{type:"ERROR", object:Status{code:410, reason:"Expired", …}}` envelope,
 /// then EOF. See `handlers/watch.rs::resource_expired_status` /

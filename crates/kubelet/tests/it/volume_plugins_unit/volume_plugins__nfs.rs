@@ -4,18 +4,16 @@
 mod __parent {
     pub use anyhow::{anyhow, Result};
     pub use async_trait::async_trait;
-    pub use rusternetes_common::resources::volume::{NFSVolumeSource, PersistentVolumeAccessMode};
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::volume_plugins::metrics_statfs::MetricsStatFs;
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
-    pub use rusternetes_kubelet::volume_plugins::util::mount_ops::{
+    pub use k3rs_common::resources::volume::{NFSVolumeSource, PersistentVolumeAccessMode};
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::volume_plugins::metrics_statfs::MetricsStatFs;
+    pub use k3rs_kubelet::volume_plugins::plugin::{Metrics, MetricsProvider};
+    pub use k3rs_kubelet::volume_plugins::util::mount_ops::{
         cleanup_mount_with_force, Mounter as MountUtil,
     };
-    pub use rusternetes_kubelet::volume_plugins::util::mount_utils::is_not_mount_point;
-    pub use rusternetes_kubelet::volume_plugins::util::{
-        join_mount_options, mount_option_from_spec,
-    };
-    pub use rusternetes_kubelet::volume_plugins::{
+    pub use k3rs_kubelet::volume_plugins::util::mount_utils::is_not_mount_point;
+    pub use k3rs_kubelet::volume_plugins::util::{join_mount_options, mount_option_from_spec};
+    pub use k3rs_kubelet::volume_plugins::{
         Attributes, Mounter, ReconstructedVolume, Spec, Unmounter, VolumeHost, VolumePlugin,
     };
     pub use std::io;
@@ -35,16 +33,16 @@ mod tests {
     //! faked here: the source string it receives is asserted from the
     //! mounter's inputs, and the cleanup path is exercised on a real directory.
     use super::__parent::*;
-    use rusternetes_common::resources::{PersistentVolume, Volume};
-    use rusternetes_kubelet::volume_plugins::nfs::*;
-    use rusternetes_kubelet::volume_plugins::{KubeletVolumeHost, VolumePluginMgr};
+    use k3rs_common::resources::{PersistentVolume, Volume};
+    use k3rs_kubelet::volume_plugins::nfs::*;
+    use k3rs_kubelet::volume_plugins::{KubeletVolumeHost, VolumePluginMgr};
     use serde_json::json;
 
     fn host(tmp: &std::path::Path) -> Arc<dyn VolumeHost> {
         Arc::new(KubeletVolumeHost::new_for_tests(
             tmp.to_string_lossy().to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             std::collections::HashMap::new(),
         ))
     }

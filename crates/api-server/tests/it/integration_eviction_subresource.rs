@@ -28,12 +28,12 @@
 //! assertion and delete the red one — never weaken the upstream assertion.
 
 use axum::http::StatusCode;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -183,7 +183,7 @@ async fn test_concurrent_eviction_requests() {
     // PDB status the disruption controller maintains (eviction.go:425-458),
     // so it is seeded, as upstream's tests do.
     let mut pdb = pdb_with_selector("pdb-concurrent", ns, 0, labels.clone());
-    pdb.status = Some(rusternetes_common::resources::PodDisruptionBudgetStatus {
+    pdb.status = Some(k3rs_common::resources::PodDisruptionBudgetStatus {
         current_healthy: N as i32,
         desired_healthy: 0,
         disruptions_allowed: N as i32,

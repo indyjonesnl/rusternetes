@@ -19,7 +19,7 @@
 //   - ValidatingWebhookConfiguration, MutatingWebhookConfiguration (admissionregistration.k8s.io/v1)
 //   - CustomResourceDefinition (apiextensions.k8s.io/v1)
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CSIDriver, ClusterRole, ClusterRoleBinding, CustomResourceDefinition, FlowSchema,
     MutatingWebhookConfiguration, PriorityClass, PriorityLevelConfiguration, Role, RoleBinding,
     RuntimeClass, StorageClass, ValidatingWebhookConfiguration, VolumeAttachment,

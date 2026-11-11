@@ -1,6 +1,6 @@
 //! Overload resolution and unification tests (moved from `common`).
 
-use rusternetes_cel_checker::*;
+use k3rs_cel_checker::*;
 
 fn call(name: &str, member: bool, args: &[DType]) -> Option<DType> {
     match resolve(lookup(name)?, member, args) {

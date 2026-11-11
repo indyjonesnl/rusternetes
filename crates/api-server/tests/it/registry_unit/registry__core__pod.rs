@@ -3,37 +3,33 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::registry::generic::{Store, UpdateOptions};
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::{Store, UpdateOptions};
+    pub use k3rs_api_server::registry::rest::{
         reset_object_meta_for_status, DefaultUpdatedObjectInfo, GroupResource,
         NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
         RestGracefulDeleteStrategy, RestUpdateStrategy, TransformFunc, UpdatedObjectInfo,
     };
-    pub use rusternetes_api_server::ssa::ResetFields;
-    pub use rusternetes_common::equality::semantic_equal;
-    pub use rusternetes_common::podutil::update_pod_condition;
-    pub use rusternetes_common::resources::pod::PodSpec;
-    pub use rusternetes_common::resources::pod::{
-        AppArmorProfile, PodAffinityTerm, SecurityContext,
-    };
-    pub use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
-    pub use rusternetes_common::types::Phase;
-    pub use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement};
-    pub use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
-    pub use rusternetes_common::validation::objectmeta::{
-        name_is_dns_subdomain, validate_object_meta,
-    };
-    pub use rusternetes_common::Status;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_api_server::ssa::ResetFields;
+    pub use k3rs_common::equality::semantic_equal;
+    pub use k3rs_common::podutil::update_pod_condition;
+    pub use k3rs_common::resources::pod::PodSpec;
+    pub use k3rs_common::resources::pod::{AppArmorProfile, PodAffinityTerm, SecurityContext};
+    pub use k3rs_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
+    pub use k3rs_common::types::Phase;
+    pub use k3rs_common::types::{LabelSelector, LabelSelectorRequirement};
+    pub use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
+    pub use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+    pub use k3rs_common::Status;
+    pub use k3rs_storage::StorageBackend;
     pub use std::collections::{HashMap, VecDeque};
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::pod::*;
-    use rusternetes_common::deletion::DeleteOptions;
+    use k3rs_api_server::registry::core::pod::*;
+    use k3rs_common::deletion::DeleteOptions;
 
     fn pod(extra: serde_json::Value) -> Pod {
         let mut body = serde_json::json!({
@@ -82,8 +78,8 @@ mod tests {
         let mut n = new.clone();
         drop_non_resize_updates(&mut n, &old);
         assert_eq!(cpu(&n), "1");
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
             true,
         );
         let mut n = new.clone();
@@ -221,10 +217,10 @@ mod tests {
         let old = pod(serde_json::json!({}));
         let mut new = old.clone();
         new.status = Some(PodStatus {
-            pod_i_ps: Some(vec![rusternetes_common::resources::pod::PodIP {
+            pod_i_ps: Some(vec![k3rs_common::resources::pod::PodIP {
                 ip: "010.0.0.1".into(),
             }]),
-            host_i_ps: Some(vec![rusternetes_common::resources::pod::HostIP {
+            host_i_ps: Some(vec![k3rs_common::resources::pod::HostIP {
                 ip: "10.0.0.1".into(),
             }]),
             ..Default::default()
@@ -276,7 +272,7 @@ mod tests {
     }
 
     fn exprs(
-        sel: &Option<rusternetes_common::types::LabelSelector>,
+        sel: &Option<k3rs_common::types::LabelSelector>,
     ) -> Vec<(String, String, Vec<String>)> {
         sel.as_ref()
             .unwrap()
@@ -295,7 +291,7 @@ mod tests {
         )
     }
 
-    fn tsc(p: Pod) -> rusternetes_common::resources::pod::TopologySpreadConstraint {
+    fn tsc(p: Pod) -> k3rs_common::resources::pod::TopologySpreadConstraint {
         p.spec
             .unwrap()
             .topology_spread_constraints
@@ -358,7 +354,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn topology_spread_keys_not_merged_without_selector_merge_gate() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let _g = with_feature(
             Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge,
             false,
@@ -435,7 +431,7 @@ mod tests {
         with_meta(spec, serde_json::json!(null), ann)
     }
 
-    fn aa_type(c: &rusternetes_common::resources::Container) -> Option<(String, Option<String>)> {
+    fn aa_type(c: &k3rs_common::resources::Container) -> Option<(String, Option<String>)> {
         c.security_context
             .as_ref()?
             .app_armor_profile

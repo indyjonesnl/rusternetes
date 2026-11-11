@@ -5,15 +5,15 @@
 # verify it converged. Called by run-variant.sh with KUBECONFIG already exported
 # (pointing at the variant's k0s admin kubeconfig).
 #
-#   dns        -> patch the kube-system coredns Deployment to rusternetes-dns
-#                 (coredns-rusternetes-dns.yaml); verify the pod goes Ready and
+#   dns        -> patch the kube-system coredns Deployment to k3rs-dns
+#                 (coredns-k3rs-dns.yaml); verify the pod goes Ready and
 #                 cluster DNS resolves via the kube-dns Service (10.96.0.10).
 #   kube-proxy -> patch the kube-system kube-proxy DaemonSet to
-#                 rusternetes-kube-proxy (kube-proxy-rusternetes.yaml); verify
+#                 k3rs-kube-proxy (kube-proxy-k3rs.yaml); verify
 #                 the pod runs and (attempt) service routing.
 #
 # The committed manifests carry an image placeholder; we sed-substitute it with
-# the local-registry ref (<registry_hostport>/rusternetes-<component>:<tag>) that
+# the local-registry ref (<registry_hostport>/k3rs-<component>:<tag>) that
 # run-variant.sh pushed and that containerd-rs is configured to pull over HTTP.
 #
 # Exit 0 iff the swapped component converged; non-zero (with diagnostics dumped
@@ -30,7 +30,7 @@ reg="${3:?registry_hostport}"
 : "${KUBECONFIG:?KUBECONFIG must be exported}"
 
 tag="${K8S_VERSION#v}"
-img="${reg}/rusternetes-${component}:${tag}"
+img="${reg}/k3rs-${component}:${tag}"
 diag="$here/results/${v}/${component}-diag.txt"
 mkdir -p "$(dirname "$diag")"
 
@@ -51,14 +51,14 @@ dump_diag() {
 
 case "$component" in
   dns)
-    log "applying coredns -> rusternetes-dns swap (image=$img)"
+    log "applying coredns -> k3rs-dns swap (image=$img)"
     # Delete + recreate rather than `apply`/patch: the k0s coredns Deployment is
     # server-created (no last-applied annotation) and a strategic merge would
     # UNION our tcpSocket probes with CoreDNS's httpGet probes ("may not specify
     # more than 1 handler type"). A clean recreate installs exactly our spec. The
     # kube-dns Service (10.96.0.10) is a separate object and is left untouched.
     kubectl -n kube-system delete deploy coredns --ignore-not-found --wait=true
-    sed "s#__RUSTERNETES_DNS_IMAGE__#${img}#g" "$here/coredns-rusternetes-dns.yaml" \
+    sed "s#__K3RS_DNS_IMAGE__#${img}#g" "$here/coredns-k3rs-dns.yaml" \
       | kubectl apply -f -
     if ! kubectl -n kube-system rollout status deploy/coredns --timeout=150s; then
       log "coredns rollout did not complete"; dump_diag "k8s-app=kube-dns"; exit 1
@@ -84,25 +84,25 @@ case "$component" in
     done
     kubectl -n default delete pod dnstest --ignore-not-found >/dev/null 2>&1 || true
     if [ "$ok" != 1 ]; then
-      log "cluster DNS did NOT resolve kubernetes.default via rusternetes-dns"
+      log "cluster DNS did NOT resolve kubernetes.default via k3rs-dns"
       dump_diag "k8s-app=kube-dns"; exit 1
     fi
-    log "CONVERGED: rusternetes-dns resolves kubernetes.default -> 10.96.0.1"
+    log "CONVERGED: k3rs-dns resolves kubernetes.default -> 10.96.0.1"
     ;;
 
   kube-proxy)
-    log "applying kube-proxy -> rusternetes-kube-proxy swap (image=$img)"
+    log "applying kube-proxy -> k3rs-kube-proxy swap (image=$img)"
     # Delete + recreate (see the dns branch): the k0s kube-proxy DaemonSet is
     # server-created and a strategic merge would union our args/command with
     # k0s's. A clean recreate installs exactly our spec.
     kubectl -n kube-system delete ds kube-proxy --ignore-not-found --wait=true
-    sed "s#__RUSTERNETES_KUBE_PROXY_IMAGE__#${img}#g" "$here/kube-proxy-rusternetes.yaml" \
+    sed "s#__K3RS_KUBE_PROXY_IMAGE__#${img}#g" "$here/kube-proxy-k3rs.yaml" \
       | kubectl apply -f -
     if ! kubectl -n kube-system rollout status ds/kube-proxy --timeout=150s; then
       log "kube-proxy DaemonSet rollout did not complete"; dump_diag "k8s-app=kube-proxy"; exit 1
     fi
     # Functional check: a fresh ClusterIP Service must be reachable through the
-    # iptables rules rusternetes-kube-proxy programs.
+    # iptables rules k3rs-kube-proxy programs.
     log "verifying service routing via a probe ClusterIP"
     kubectl -n default delete deploy kp-probe --ignore-not-found >/dev/null 2>&1 || true
     kubectl -n default delete svc kp-probe --ignore-not-found >/dev/null 2>&1 || true
@@ -125,10 +125,10 @@ case "$component" in
     fi
     kubectl -n default delete pod kp-curl deploy/kp-probe svc/kp-probe --ignore-not-found >/dev/null 2>&1 || true
     if [ "$ok" != 1 ]; then
-      log "service routing via rusternetes-kube-proxy did NOT converge"
+      log "service routing via k3rs-kube-proxy did NOT converge"
       dump_diag "k8s-app=kube-proxy"; exit 1
     fi
-    log "CONVERGED: ClusterIP reachable via rusternetes-kube-proxy"
+    log "CONVERGED: ClusterIP reachable via k3rs-kube-proxy"
     ;;
 
   *) echo "unknown workload-swap component '$component'" >&2; exit 1 ;;

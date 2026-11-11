@@ -12,11 +12,11 @@
 
 use axum::routing::get;
 use axum::Router;
-use rusternetes_middleware::secure_serving::filters::build_handler_chain;
-use rusternetes_middleware::secure_serving::options::{
+use k3rs_middleware::secure_serving::filters::build_handler_chain;
+use k3rs_middleware::secure_serving::options::{
     DelegatingAuthenticationOptions, DelegatingAuthorizationOptions, SecureServingOptions,
 };
-use rusternetes_middleware::secure_serving::serve::serve;
+use k3rs_middleware::secure_serving::serve::serve;
 
 struct Pki {
     ca: rcgen::Certificate,

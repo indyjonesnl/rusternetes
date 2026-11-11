@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::PersistentVolumeClaim;
-    pub use rusternetes_common::resources::{EventSource, EventType, Pod, Volume};
-    pub use rusternetes_common::types::{ObjectMeta, OwnerReference, TypeMeta};
-    pub use rusternetes_common::Error;
-    pub use rusternetes_controller_manager::controllers::ephemeral_volume_metrics;
-    pub use rusternetes_storage::{
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::PersistentVolumeClaim;
+    pub use k3rs_common::resources::{EventSource, EventType, Pod, Volume};
+    pub use k3rs_common::types::{ObjectMeta, OwnerReference, TypeMeta};
+    pub use k3rs_common::Error;
+    pub use k3rs_controller_manager::controllers::ephemeral_volume_metrics;
+    pub use k3rs_storage::{
         build_key, build_prefix, extract_key, EventRecorder, Storage, WorkQueue,
     };
     pub use std::sync::Arc;
@@ -22,8 +22,8 @@ mod tests {
     //! Mirrors `pkg/controller/volume/ephemeral/controller_test.go`
     //! `TestSyncHandler`.
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::ephemeral_volume::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::ephemeral_volume::*;
+    use k3rs_storage::memory::MemoryStorage;
     use serde_json::json;
 
     fn pod(name: &str, ns: &str, uid: &str, deleting: bool, with_vol: bool) -> Pod {

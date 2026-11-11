@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::field::ErrorList;
     pub use thiserror::Error;
 }
 
@@ -121,26 +121,26 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_common::error::*;
-    use rusternetes_common::validation::field::{ErrorType, Path};
+    use k3rs_common::error::*;
+    use k3rs_common::validation::field::{ErrorType, Path};
 
     /// `TestNewInvalid` (apimachinery pkg/api/errors/errors_test.go:124-220).
     #[test]
     fn new_invalid_matches_upstream_test_new_invalid() {
         let path = Path::new("field[0].name");
-        let cases: Vec<(rusternetes_common::validation::field::Error, &str, &str)> = vec![
+        let cases: Vec<(k3rs_common::validation::field::Error, &str, &str)> = vec![
             (
-                rusternetes_common::validation::field::Error::duplicate(&path, "bar"),
+                k3rs_common::validation::field::Error::duplicate(&path, "bar"),
                 "FieldValueDuplicate",
                 r#"Kind "name" is invalid: field[0].name: Duplicate value: "bar""#,
             ),
             (
-                rusternetes_common::validation::field::Error::invalid(&path, "bar", "detail"),
+                k3rs_common::validation::field::Error::invalid(&path, "bar", "detail"),
                 "FieldValueInvalid",
                 r#"Kind "name" is invalid: field[0].name: Invalid value: "bar": detail"#,
             ),
             (
-                rusternetes_common::validation::field::Error::required(&path, ""),
+                k3rs_common::validation::field::Error::required(&path, ""),
                 "FieldValueRequired",
                 r#"Kind "name" is invalid: field[0].name: Required value"#,
             ),
@@ -171,7 +171,7 @@ mod tests {
     /// `FieldValueInvalid`.
     #[test]
     fn new_invalid_matches_upstream_remaining_cases() {
-        use rusternetes_common::validation::field::{Error as FE, ErrorType};
+        use k3rs_common::validation::field::{Error as FE, ErrorType};
         let p = Path::new("field[0].name");
         let cases: Vec<(FE, &str, &str)> = vec![
             (
@@ -216,7 +216,7 @@ mod tests {
     /// empty name or kind must not serialize (delete.go:81 passes name "").
     #[test]
     fn new_invalid_omits_empty_name_and_kind() {
-        let e = rusternetes_common::validation::field::Error::invalid(&Path::new("f"), "x", "d");
+        let e = k3rs_common::validation::field::Error::invalid(&Path::new("f"), "x", "d");
         let Error::Status(st) = Error::new_invalid("", "", "", vec![e]) else {
             panic!("expected Status");
         };
@@ -232,8 +232,8 @@ mod tests {
         };
         assert_eq!(st.message.as_deref(), Some(r#"Kind "name" is invalid"#));
         let p = Path::new("a");
-        let e1 = rusternetes_common::validation::field::Error::required(&p, "");
-        let e2 = rusternetes_common::validation::field::Error::required(&Path::new("b"), "");
+        let e1 = k3rs_common::validation::field::Error::required(&p, "");
+        let e2 = k3rs_common::validation::field::Error::required(&Path::new("b"), "");
         // Duplicate messages are dropped by `ToAggregate`; several render in
         // brackets, `, `-joined (util/errors/errors.go:70-94).
         let Error::Status(st) =
@@ -298,8 +298,8 @@ mod tests {
     fn build_details_from_error_list_one_cause_per_error() {
         let p = Path::new("spec");
         let errs = vec![
-            rusternetes_common::validation::field::Error::required(&p.child("containers"), ""),
-            rusternetes_common::validation::field::Error::not_supported(
+            k3rs_common::validation::field::Error::required(&p.child("containers"), ""),
+            k3rs_common::validation::field::Error::not_supported(
                 &p.child("restartPolicy"),
                 "InvalidPolicy",
                 &["Always", "OnFailure", "Never"],
@@ -344,9 +344,7 @@ mod tests {
             let got = e.into_response().status().as_u16();
             assert_eq!(want, got);
         }
-        let unset = Error::Status(Box::new(rusternetes_common::types::Status::failure(
-            "m", "r", 0,
-        )));
+        let unset = Error::Status(Box::new(k3rs_common::types::Status::failure("m", "r", 0)));
         assert_eq!(unset.status_code(), 500);
     }
 }

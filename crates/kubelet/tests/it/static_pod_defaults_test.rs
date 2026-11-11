@@ -12,7 +12,7 @@
 //! class and different cgroup shares than the identical manifest posted to the
 //! API.
 
-use rusternetes_kubelet::static_pods::{parse_manifest, pod_config_hash};
+use k3rs_kubelet::static_pods::{parse_manifest, pod_config_hash};
 
 const MANIFEST: &str = r#"
 apiVersion: v1
@@ -162,8 +162,8 @@ spec:
 #[test]
 #[serial_test::serial]
 fn pod_level_requests_default_at_decode() {
-    let _g = rusternetes_common::feature_gates::with_feature(
-        rusternetes_common::feature_gates::Feature::PodLevelResources,
+    let _g = k3rs_common::feature_gates::with_feature(
+        k3rs_common::feature_gates::Feature::PodLevelResources,
         true,
     );
     const POD_LEVEL: &str = r#"

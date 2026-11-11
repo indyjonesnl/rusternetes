@@ -20,7 +20,7 @@ export async function discoverResourceTypes(): Promise<
   }
 
   const registry = new Map<string, ResourceType>();
-  const token = sessionStorage.getItem("rusternetes-token");
+  const token = sessionStorage.getItem("k3rs-token");
   const headers: Record<string, string> = { Accept: "application/json" };
   if (token) headers["Authorization"] = `Bearer ${token}`;
 

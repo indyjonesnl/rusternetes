@@ -24,12 +24,12 @@ use crate::queue::{
     ActionType, ClusterEvent, EventObject, EventResource, PriorityQueue, QueueingHintMapPerProfile,
 };
 use futures::StreamExt;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CSIDriver, CSINode, CSIStorageCapacity, DeviceClass, PersistentVolume, PersistentVolumeClaim,
     ResourceClaim, ResourceSlice, StorageClass, VolumeAttachment,
 };
-use rusternetes_common::types::ObjectMeta;
-use rusternetes_storage::{Storage, WatchEvent};
+use k3rs_common::types::ObjectMeta;
+use k3rs_storage::{Storage, WatchEvent};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -221,7 +221,7 @@ fn spawn_api_feed<T: Watched>(
     path: &'static str,
     mut handler: ResourceEventHandler<T>,
 ) {
-    use rusternetes_client::reflector::{ApiListWatch, Reflector, StoreEvent};
+    use k3rs_client::reflector::{ApiListWatch, Reflector, StoreEvent};
     let lw = Arc::new(ApiListWatch::new(Arc::clone(&api.client), path));
     let key_fn: fn(&T) -> String = |o| object_key(o.meta());
     let reflector = Arc::new(Reflector::new(lw, key_fn));
@@ -265,7 +265,7 @@ fn start_feed<T: Watched, S: Storage + Send + Sync + 'static>(
         DataPlane::Storage(s) => {
             tokio::spawn(run_storage_feed::<T, S>(
                 Arc::clone(s),
-                rusternetes_storage::build_prefix(prefix, None),
+                k3rs_storage::build_prefix(prefix, None),
                 handler,
                 retry,
             ));

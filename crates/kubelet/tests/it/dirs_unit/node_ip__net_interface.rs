@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_kubelet::node_ip::parse_ip_sloppy;
+    pub use k3rs_kubelet::node_ip::parse_ip_sloppy;
     pub use std::fmt;
     pub use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::node_ip::net_interface::*;
+    use k3rs_kubelet::node_ip::net_interface::*;
     use std::io::Write;
 
     fn ip(s: &str) -> IpAddr {

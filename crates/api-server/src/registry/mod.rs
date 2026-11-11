@@ -15,7 +15,7 @@
 //! strategy (`pkg/registry/<group>/<resource>/strategy.go`). A resource opts
 //! into behaviour — clearing status on create, bumping generation, allowing
 //! create-on-update — by what its strategy returns, never by carrying its own
-//! copy of the pipeline. Rusternetes grew one hand-rolled pipeline per handler
+//! copy of the pipeline. k3rs grew one hand-rolled pipeline per handler
 //! instead, and they drifted (#1990). Resources move onto this Store one at a
 //! time; each migration deletes its bespoke handler code.
 

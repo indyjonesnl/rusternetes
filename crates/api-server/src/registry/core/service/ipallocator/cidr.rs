@@ -3,7 +3,7 @@
 //!
 //! Upstream keeps the allocator set in sync from a ServiceCIDR informer
 //! (`syncAllocators` on every add/update, `deleteServiceCIDR` on delete).
-//! Rusternetes has no informer in the api-server, so `sync_allocators` runs
+//! k3rs has no informer in the api-server, so `sync_allocators` runs
 //! against a fresh ServiceCIDR list before each operation. The same rules
 //! decide which prefixes exist and which are ready.
 
@@ -13,8 +13,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ipnet::IpNet;
-use rusternetes_common::resources::{Service, ServiceCIDR};
-use rusternetes_storage::Storage;
+use k3rs_common::resources::{Service, ServiceCIDR};
+use k3rs_storage::Storage;
 use tokio::sync::Mutex;
 
 use super::{
@@ -69,7 +69,7 @@ impl<S: Storage> MetaAllocator<S> {
     /// `syncAllocators` (cidrallocator.go:240-297) plus the removal half of
     /// `deleteServiceCIDR` (:147-178): one allocator per prefix of this
     /// family, kept while any ServiceCIDR still names it.
-    async fn sync_allocators(&self) -> rusternetes_common::Result<()> {
+    async fn sync_allocators(&self) -> k3rs_common::Result<()> {
         let service_cidrs: Vec<ServiceCIDR> = self.storage.list("/registry/servicecidrs/").await?;
         let mut allocators = self.allocators.lock().await;
 

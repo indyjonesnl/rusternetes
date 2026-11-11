@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::go_selinux::*;
+    use k3rs_kubelet::go_selinux::*;
 
     #[test]
     fn mountinfo_selinuxfs_mount_point_is_fifth_field() {

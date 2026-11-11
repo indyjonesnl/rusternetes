@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::expectations::*;
+    use k3rs_controller_manager::controllers::expectations::*;
 
     const KEY: &str = "default/simpletest-rc";
 

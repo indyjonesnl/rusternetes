@@ -1,4 +1,4 @@
-// Copyright The Rusternetes Authors
+// Copyright The k3rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Conformance: `RuntimeClass` resource shape + `Pod.spec.runtimeClassName`.
@@ -7,7 +7,7 @@
 //!   - `test/e2e/common/node/runtimeclass.go`
 //!   - `staging/src/k8s.io/api/node/v1/types.go`
 //!
-//! Rusternetes' kubelet uses a single hardcoded Docker runtime — runtime
+//! k3rs' kubelet uses a single hardcoded Docker runtime — runtime
 //! *selection* is not implemented. These tests pin the resource API
 //! surface only: the kubelet must still accept and round-trip
 //! `RuntimeClass` objects and Pod manifests that reference
@@ -15,8 +15,8 @@
 //! doesn't break. Behaviour (actually running the named runtime) is
 //! deliberately out of scope.
 
-use rusternetes_common::resources::runtimeclass::{Overhead, RuntimeClass};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::runtimeclass::{Overhead, RuntimeClass};
+use k3rs_common::resources::Pod;
 use std::collections::HashMap;
 
 #[test]

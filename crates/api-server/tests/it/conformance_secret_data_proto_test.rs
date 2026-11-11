@@ -36,7 +36,7 @@
 //! `ConfigMapEnvSource` / `SecretEnvSource` inline-flattening fix.
 
 use base64::Engine;
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 
 /// Proto wire constants. Mirror the values used in the existing
 /// `conformance_configmap_envfrom_prefixes_test.rs` so they stay consistent
@@ -201,14 +201,14 @@ fn test_secret_data_proto_decode_multiple_entries_accumulate() {
 }
 
 /// End-to-end: the decoded JSON must round-trip through the typed
-/// `rusternetes_common::resources::Secret` deserializer. That's the path
+/// `k3rs_common::resources::Secret` deserializer. That's the path
 /// taken by the proto→JSON middleware in `handlers::secret::create`, so a
 /// failure here would surface as a `missing field` / `invalid type` panic
 /// in the real api-server, exactly like the conformance bug that
 /// `conformance_configmap_envfrom_prefixes_test.rs` was written to pin.
 #[test]
 fn test_secret_data_proto_decode_round_trips_through_typed_decoder() {
-    use rusternetes_common::resources::Secret;
+    use k3rs_common::resources::Secret;
 
     let registry = ProtoRegistry::new();
     let payload: [u8; 3] = [0x00, 0xFF, 0x42];

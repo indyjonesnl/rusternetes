@@ -2,10 +2,10 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for jobs
 
-use rusternetes_common::resources::pod::{Container, PodSpec};
-use rusternetes_common::resources::{Job, JobSpec, JobStatus, PodTemplateSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::{Container, PodSpec};
+use k3rs_common::resources::{Job, JobSpec, JobStatus, PodTemplateSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

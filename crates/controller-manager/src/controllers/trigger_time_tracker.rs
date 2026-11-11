@@ -11,7 +11,7 @@
 //! A "zero" `time.Time` is modelled as `None`.
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::resources::{Pod, Service};
+use k3rs_common::resources::{Pod, Service};
 use std::collections::HashMap;
 use std::sync::Mutex;
 

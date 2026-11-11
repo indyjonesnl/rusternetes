@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::ClusterTrustBundle;
-    pub use rusternetes_common::validation::clustertrustbundle::{
+    pub use k3rs_common::resources::ClusterTrustBundle;
+    pub use k3rs_common::validation::clustertrustbundle::{
         validate_cluster_trust_bundle, validate_cluster_trust_bundle_update,
         ValidateClusterTrustBundleOptions,
     };
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::certificates::clustertrustbundle::*;
+    use k3rs_api_server::registry::certificates::clustertrustbundle::*;
 
     /// strategy_test.go:26-48.
     #[test]

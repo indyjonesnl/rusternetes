@@ -3,7 +3,7 @@ use crate::volume_plugins::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::{EmptyDirVolumeSource, Pod};
+use k3rs_common::resources::{EmptyDirVolumeSource, Pod};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -663,10 +663,8 @@ fn teardown_default(dir: &str) -> Result<()> {
     // The unmounter's `emptyDir` carries only the pod UID (`NewUnmounter`),
     // so `HostUsers` is nil and `userNamespacesEnabled` is false.
     #[cfg(target_os = "linux")]
-    if rusternetes_common::feature_gates::gate_enabled(
-        "LocalStorageCapacityIsolationFSQuotaMonitoring",
-    )
-    .unwrap_or(false)
+    if k3rs_common::feature_gates::gate_enabled("LocalStorageCapacityIsolationFSQuotaMonitoring")
+        .unwrap_or(false)
     {
         // Remove any quota.
         if let Err(e) = crate::fsquota::clear_quota(dir, false) {
@@ -691,9 +689,8 @@ fn remove_all(dir: &str) -> Result<()> {
 /// (`empty_dir.go:297-300`): `HostUsers` is true by default, so a pod is by
 /// default not confined by a user namespace.
 fn user_namespaces_enabled(pod: &Pod) -> bool {
-    rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::UserNamespacesSupport,
-    ) && pod.spec.as_ref().and_then(|s| s.host_users) == Some(false)
+    k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::UserNamespacesSupport)
+        && pod.spec.as_ref().and_then(|s| s.host_users) == Some(false)
 }
 
 /// `assignQuota` (`empty_dir.go:292-316`): checks if the underlying medium

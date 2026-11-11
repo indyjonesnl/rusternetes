@@ -20,8 +20,8 @@
 //! * `masq.go:105` — one `-d <cidr> -j RETURN` per no-masquerade CIDR, then a
 //!   final `-j MASQUERADE` ("must be last in chain").
 
-use rusternetes_common::resources::Node;
-use rusternetes_kube_proxy::node_net::{cni_conflist, desired_routes, no_masq_rules, Route};
+use k3rs_common::resources::Node;
+use k3rs_kube_proxy::node_net::{cni_conflist, desired_routes, no_masq_rules, Route};
 
 /// Build a Node from its API JSON — the same shape kube-proxy decodes off the
 /// wire, so the test exercises the real `podCIDR` / `addresses` field names.
@@ -195,23 +195,23 @@ fn no_masq_rules_return_cluster_traffic_before_masquerading() {
 #[test]
 fn conflist_write_is_a_noop_when_unchanged() {
     let dir = std::env::temp_dir().join(format!("rn-conflist-{}", std::process::id()));
-    let path = dir.join("10-rusternetes.conflist");
+    let path = dir.join("10-k3rs.conflist");
     let path_str = path.to_string_lossy().to_string();
     let conf = cni_conflist("10.244.2.0/24");
 
     // First write creates it (including the parent dir).
     assert!(
-        rusternetes_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
+        k3rs_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
         "first write must happen"
     );
     // Identical content -> no write.
     assert!(
-        !rusternetes_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
+        !k3rs_kube_proxy::node_net::write_conflist_if_changed(&path_str, &conf).unwrap(),
         "identical conflist must not be rewritten"
     );
     // A reassigned pod CIDR -> write.
     assert!(
-        rusternetes_kube_proxy::node_net::write_conflist_if_changed(
+        k3rs_kube_proxy::node_net::write_conflist_if_changed(
             &path_str,
             &cni_conflist("10.244.3.0/24")
         )
@@ -248,14 +248,14 @@ fn cni_conflist_leaves_masquerade_to_the_agent() {
 /// `-m addrtype ! --dst-type LOCAL -j KIND-MASQ-AGENT`.
 #[test]
 fn masq_chain_is_hooked_for_non_local_destinations_only() {
-    let args = rusternetes_kube_proxy::node_net::postrouting_hook_args();
+    let args = k3rs_kube_proxy::node_net::postrouting_hook_args();
     let joined = args.join(" ");
     assert!(
         joined.contains("addrtype") && joined.contains("! --dst-type LOCAL"),
         "hook must exclude LOCAL destinations: {joined}"
     );
     assert!(
-        joined.contains(rusternetes_kube_proxy::node_net::MASQ_CHAIN),
+        joined.contains(k3rs_kube_proxy::node_net::MASQ_CHAIN),
         "hook must jump to the masq chain: {joined}"
     );
 }

@@ -32,9 +32,9 @@
 //!    `.k8s.io.apimachinery.pkg.util.intstr.IntOrString`. We split on `.`
 //!    and use the last segment for lookup.
 
+use k3rs_api_server::protobuf::{FieldType, ProtoRegistry};
 use prost_types::field_descriptor_proto::{Label, Type as ProtoType};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto};
-use rusternetes_api_server::protobuf::{FieldType, ProtoRegistry};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -67,13 +67,13 @@ pub(crate) const PROTO_FILES: &[&str] = &[
 ];
 
 /// Map a bundled proto file's directory path to the registry's qualified
-/// key prefix (i.e. the same `apiVersion` form rusternetes uses for
+/// key prefix (i.e. the same `apiVersion` form k3rs uses for
 /// group-qualified schema lookups). Returned tuple is `(prefix, file_path)`.
 ///
 /// `prefix` is `""` for core/v1 (registry uses bare simple names for core
 /// types — they win the unqualified `iter_schemas` slot). For every other
 /// group/version the qualified prefix is the apiVersion that the K8s
-/// client and rusternetes' router both speak (e.g. `events.k8s.io/v1`).
+/// client and k3rs' router both speak (e.g. `events.k8s.io/v1`).
 ///
 /// Without this mapping the parity test silently misses any schema whose
 /// registry key is `<group>/<version>.<MessageName>` — `events.k8s.io/v1.Event`
@@ -813,7 +813,7 @@ fn registry_covers_every_upstream_field() {
 ///   - adding the missing entry to a `register_*` helper in `src/protobuf.rs`
 ///     (the by-far-most-common case — even no-op shapes like List wrappers
 ///     belong in the registry), or
-///   - if a message has no rusternetes counterpart (a deprecated upstream
+///   - if a message has no k3rs counterpart (a deprecated upstream
 ///     type, internal-only payload), wire it into a name-skip set here and
 ///     leave a comment explaining why.
 #[test]

@@ -7,7 +7,7 @@
 //! (apimachinery/pkg/util/strategicpatch/patch.go:812) onto the CURRENT object,
 //! so a condition another writer added after the caller's read survives.
 
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_storage::{MemoryStorage, Storage};
 use serde_json::json;
 
 #[tokio::test]
@@ -82,7 +82,7 @@ async fn direct_backend_status_patch_applies_metadata_but_not_spec() {
 /// `apiVersion`/`kind` to infer it from.
 #[tokio::test]
 async fn direct_backend_status_patch_uses_callers_kind_not_stored_json() {
-    use rusternetes_common::resources::Node;
+    use k3rs_common::resources::Node;
     let s = MemoryStorage::new();
     let key = "/registry/minions/n3";
     // No apiVersion/kind in the stored object.

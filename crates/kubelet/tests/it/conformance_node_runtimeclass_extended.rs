@@ -32,10 +32,10 @@
 //! Style: pure-function `#[test]` where possible; `#[ignore]` for the
 //! live-runtime assertions that need a running cluster.
 
-use rusternetes_common::resources::pod::Toleration;
-use rusternetes_common::resources::runtimeclass::{Overhead, RuntimeClass, Scheduling};
-use rusternetes_common::resources::{Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::resources::pod::Toleration;
+use k3rs_common::resources::runtimeclass::{Overhead, RuntimeClass, Scheduling};
+use k3rs_common::resources::{Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------

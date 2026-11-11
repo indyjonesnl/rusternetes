@@ -20,14 +20,14 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     dump::decode_request_body,
     resources::{Binding, Node, Pod},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_storage::{build_key, build_prefix, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -392,7 +392,7 @@ pub async fn create_binding(
     body: Bytes,
 ) -> Result<Response> {
     use crate::endpoints::handlers::admission::{Admission, CreateValidation};
-    use rusternetes_common::admission::Operation;
+    use k3rs_common::admission::Operation;
 
     info!("Creating binding for pod {}/{}", namespace, name);
     let scope = scope(&state, Some("binding"));
@@ -462,7 +462,7 @@ pub async fn create_binding(
         .await?;
     Ok(endpoints::respond(
         axum::http::StatusCode::CREATED,
-        &rusternetes_common::Status::success(),
+        &k3rs_common::Status::success(),
         &ctx,
     ))
 }
@@ -477,9 +477,9 @@ pub async fn create_eviction(
     body: Bytes,
 ) -> Result<Response> {
     use crate::endpoints::handlers::admission::{Admission, CreateValidation};
-    use rusternetes_common::admission::Operation;
-    use rusternetes_common::resources::Eviction;
-    use rusternetes_common::Error;
+    use k3rs_common::admission::Operation;
+    use k3rs_common::resources::Eviction;
+    use k3rs_common::Error;
 
     info!("Creating eviction for pod {}/{}", namespace, name);
     let scope = scope(&state, Some("eviction"));
@@ -590,7 +590,7 @@ async fn admit_binding_topology_labels(
     state: &ApiServerState,
     binding: &mut Binding,
 ) -> Result<()> {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     if !crate::admission::plugins::enabled("PodTopologyLabels")
         || !enabled(Feature::PodTopologyLabelsAdmission)
     {
@@ -628,7 +628,7 @@ pub(crate) async fn topology_labels_for_node_name<S: Storage + ?Sized>(
     let node_key = build_key("nodes", None::<&str>, node_name);
     let node: Node = match storage.get(&node_key).await {
         Ok(node) => node,
-        Err(rusternetes_common::Error::NotFound(_)) => return Ok(HashMap::new()),
+        Err(k3rs_common::Error::NotFound(_)) => return Ok(HashMap::new()),
         Err(e) => return Err(e),
     };
     let node_labels = node.metadata.labels.unwrap_or_default();
@@ -665,11 +665,11 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<Pod>(
             state,
@@ -692,7 +692,7 @@ pub async fn list(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -720,7 +720,7 @@ pub async fn list(
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
     let continue_token = params.get("continue").cloned();
 
-    let pagination_params = rusternetes_common::PaginationParams {
+    let pagination_params = k3rs_common::PaginationParams {
         limit,
         continue_token,
     };
@@ -735,13 +735,13 @@ pub async fn list(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &pods).await;
 
     // Apply pagination
-    let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {
+    let paginated = match k3rs_common::paginate(pods, pagination_params, &resource_version) {
         Ok(p) => p,
         Err(e) => {
             if e.message.contains("410 Gone") {
-                let mut status = rusternetes_common::Status::failure(&e.message, "Expired", 410);
+                let mut status = k3rs_common::Status::failure(&e.message, "Expired", 410);
                 if let Some(token) = e.fresh_continue_token {
-                    status.metadata = Some(rusternetes_common::ListMeta {
+                    status.metadata = Some(k3rs_common::ListMeta {
                         resource_version: Some(resource_version),
                         continue_token: Some(token),
                         remaining_item_count: None,
@@ -753,7 +753,7 @@ pub async fn list(
                 )
                     .into_response());
             }
-            return Err(rusternetes_common::Error::InvalidResource(e.message));
+            return Err(k3rs_common::Error::InvalidResource(e.message));
         }
     };
 
@@ -808,11 +808,11 @@ pub async fn list_all_pods(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
 
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<Pod>(
             state,
@@ -832,7 +832,7 @@ pub async fn list_all_pods(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -861,7 +861,7 @@ pub async fn list_all_pods(
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
     let continue_token = params.get("continue").cloned();
 
-    let pagination_params = rusternetes_common::PaginationParams {
+    let pagination_params = k3rs_common::PaginationParams {
         limit,
         continue_token,
     };
@@ -873,13 +873,13 @@ pub async fn list_all_pods(
         crate::handlers::list_options::list_resource_version(&state.storage, &params, &pods).await;
 
     // Apply pagination
-    let paginated = match rusternetes_common::paginate(pods, pagination_params, &resource_version) {
+    let paginated = match k3rs_common::paginate(pods, pagination_params, &resource_version) {
         Ok(p) => p,
         Err(e) => {
             if e.message.contains("410 Gone") {
-                let mut status = rusternetes_common::Status::failure(&e.message, "Expired", 410);
+                let mut status = k3rs_common::Status::failure(&e.message, "Expired", 410);
                 if let Some(token) = e.fresh_continue_token {
-                    status.metadata = Some(rusternetes_common::ListMeta {
+                    status.metadata = Some(k3rs_common::ListMeta {
                         resource_version: Some(resource_version),
                         continue_token: Some(token),
                         remaining_item_count: None,
@@ -891,7 +891,7 @@ pub async fn list_all_pods(
                 )
                     .into_response());
             }
-            return Err(rusternetes_common::Error::InvalidResource(e.message));
+            return Err(k3rs_common::Error::InvalidResource(e.message));
         }
     };
 

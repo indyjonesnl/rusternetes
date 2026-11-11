@@ -11,8 +11,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::storage_readiness_hook::*;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_api_server::storage_readiness_hook::*;
+    use k3rs_common::feature_gates::{with_feature, Feature};
 
     fn gvr(i: usize) -> String {
         format!("group/version/resource-{i}")
@@ -102,12 +102,12 @@ mod tests {
     async fn registered_only_when_the_gate_is_on() {
         let hook = Arc::new(StorageReadinessHook::new(Duration::from_secs(1)));
         assert!(!spawn_storage_readiness_hook(hook.clone()));
-        assert!(rusternetes_api_server::post_start_hooks::global()
+        assert!(k3rs_api_server::post_start_hooks::global()
             .check(STORAGE_READINESS_HOOK)
             .is_none());
         let _g = with_feature(Feature::WatchCacheInitializationPostStartHook, true);
         assert!(spawn_storage_readiness_hook(hook));
-        assert!(rusternetes_api_server::post_start_hooks::global()
+        assert!(k3rs_api_server::post_start_hooks::global()
             .check(STORAGE_READINESS_HOOK)
             .is_some());
     }

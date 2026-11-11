@@ -11,10 +11,10 @@
 //! endpoint — the actual axum route is a thin wrapper.
 
 use chrono::{TimeZone, Utc};
-use rusternetes_common::resources::{Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::server::pods_for_node;
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::server::pods_for_node;
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::sync::Arc;
 
 fn pod_on_node(name: &str, node: &str) -> Pod {

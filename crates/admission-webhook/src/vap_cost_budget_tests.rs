@@ -13,8 +13,8 @@ use crate::cel_evaluators::{
     audit_annotations_budgeted, validate_budgeted, validate_with_budget, AuditAnnotationOutcome,
     ValidationItem, ValidationOutcome,
 };
-use rusternetes_common::cel::{CELContext, CELEvaluator};
-use rusternetes_common::cel_cost::{CostOptions, LazyVariables};
+use k3rs_common::cel::{CELContext, CELEvaluator};
+use k3rs_common::cel_cost::{CostOptions, LazyVariables};
 use serde_json::json;
 
 /// Costs ~0.95M of the 10M budget and succeeds (under the 1M per-call limit).
@@ -183,7 +183,7 @@ fn composited(
     )
 }
 
-const BUDGET: i64 = rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+const BUDGET: i64 = k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
 
 // composition_test.go "simple"
 #[test]

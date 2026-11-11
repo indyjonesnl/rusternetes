@@ -43,7 +43,7 @@ on:
     branches: [main]
     paths:
       - "crates/storage/**"
-      # The storage crate's error mapping comes from rusternetes-common, and
+      # The storage crate's error mapping comes from k3rs-common, and
       # the contract assertions match on those variants.
       - "crates/common/**"
       - "Cargo.toml"
@@ -129,14 +129,14 @@ jobs:
         # `--test-threads=1` is mandatory, not tuning: the fixtures give every
         # test its own container, and the default thread-per-core parallelism
         # would start a dozen etcd/kine containers at once on a 12 GiB pod.
-        run: cargo test -p rusternetes-storage --test storage_contract --locked -- --test-threads=1
+        run: cargo test -p k3rs-storage --test storage_contract --locked -- --test-threads=1
 
       - name: cargo test --test etcd_rpc_subset
         # Runs even if the contract suite failed, so one red backend doesn't
         # hide an unrelated RPC-subset regression. `!cancelled()` rather than
         # `always()`: a cancelled job should stop, not start more containers.
         if: ${{ !cancelled() }}
-        run: cargo test -p rusternetes-storage --test etcd_rpc_subset --locked -- --test-threads=1
+        run: cargo test -p k3rs-storage --test etcd_rpc_subset --locked -- --test-threads=1
 
       - name: sccache stats
         # Compilation-cache hit rate, for visibility. sccache is configured

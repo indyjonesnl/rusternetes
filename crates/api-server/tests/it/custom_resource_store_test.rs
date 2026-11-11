@@ -7,7 +7,7 @@
 //! wired in by `pkg/apiserver/customresource_handler.go`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const GROUP: &str = "stable.example.com";
@@ -571,7 +571,7 @@ async fn strict_field_validation_refuses_unknown_fields() {
 /// the generation of "very old CRs" on decode (customresource_handler.go:1465).
 #[tokio::test]
 async fn objects_stored_by_the_old_handler_still_update() {
-    use rusternetes_storage::Storage;
+    use k3rs_storage::Storage;
     let api = TestApiServer::new();
     install(
         &api,

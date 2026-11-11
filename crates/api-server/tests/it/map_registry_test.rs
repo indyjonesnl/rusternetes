@@ -7,10 +7,10 @@
 //! `system:masters`, which `rbacregistry.EscalationAllowed` always lets through.
 
 use axum::http::StatusCode;
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_common::resources::{ClusterRole, ClusterRoleBinding};
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_common::resources::{ClusterRole, ClusterRoleBinding};
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const VAP: &str = "/apis/admissionregistration.k8s.io/v1beta1/mutatingadmissionpolicies";

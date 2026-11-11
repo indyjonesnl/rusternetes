@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# Rusternetes Fedora Production Installer
+# k3rs Fedora Production Installer
 #
-# This script automates the complete installation of Rusternetes on Fedora Linux
+# This script automates the complete installation of k3rs on Fedora Linux
 # in production-ready configuration with rootful Podman.
 #
 # Usage:
@@ -34,8 +34,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-INSTALL_DIR="/opt/rusternetes"
-USER="rusternetes"
+INSTALL_DIR="/opt/k3rs"
+USER="k3rs"
 USE_DOCKER=false
 INSTALL_HA=false
 SKIP_FIREWALL=false
@@ -138,7 +138,7 @@ check_prerequisites() {
 display_config() {
     echo
     echo "=========================================="
-    echo "  Rusternetes Installation Configuration"
+    echo "  k3rs Installation Configuration"
     echo "=========================================="
     echo "Installation Directory: $INSTALL_DIR"
     echo "Container Runtime: $([ "$USE_DOCKER" == "true" ] && echo "Docker" || echo "Podman (rootful)")"
@@ -194,7 +194,7 @@ install_rust() {
         log_info "Rust already installed"
     fi
 
-    # Also install for rusternetes user (if exists)
+    # Also install for k3rs user (if exists)
     if id "$USER" &>/dev/null; then
         if ! sudo -u "$USER" bash -c 'command -v cargo' &> /dev/null; then
             sudo -u "$USER" bash -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
@@ -298,7 +298,7 @@ configure_selinux() {
 
 # Create user
 create_user() {
-    log_step "Creating rusternetes user..."
+    log_step "Creating k3rs user..."
 
     if id "$USER" &>/dev/null; then
         log_info "User $USER already exists"
@@ -316,7 +316,7 @@ create_user() {
 
 # Clone repository
 clone_repository() {
-    log_step "Cloning Rusternetes repository..."
+    log_step "Cloning k3rs repository..."
 
     if [[ -d "$INSTALL_DIR" ]]; then
         log_warn "Installation directory already exists, updating..."
@@ -324,7 +324,7 @@ clone_repository() {
         sudo -u "$USER" git pull || true
     else
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        git clone https://github.com/yourusername/rusternetes.git "$INSTALL_DIR"
+        git clone https://github.com/yourusername/k3rs.git "$INSTALL_DIR"
         chown -R "$USER:$USER" "$INSTALL_DIR"
         log_info "Repository cloned successfully"
     fi
@@ -332,11 +332,11 @@ clone_repository() {
 
 # Build binaries
 build_binaries() {
-    log_step "Building Rusternetes binaries..."
+    log_step "Building k3rs binaries..."
 
     cd "$INSTALL_DIR"
 
-    # Build as rusternetes user
+    # Build as k3rs user
     sudo -u "$USER" bash -c 'source $HOME/.cargo/env && cargo build --release'
 
     log_info "Binaries built successfully"
@@ -349,9 +349,9 @@ build_images() {
     cd "$INSTALL_DIR"
 
     # Set environment variable
-    export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.rusternetes/volumes"
+    export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.k3rs/volumes"
     mkdir -p "$KUBELET_VOLUMES_PATH"
-    chown -R "$USER:$USER" "$INSTALL_DIR/.rusternetes"
+    chown -R "$USER:$USER" "$INSTALL_DIR/.k3rs"
 
     # Choose compose file
     local COMPOSE_FILE="docker-compose.yml"
@@ -383,9 +383,9 @@ create_service() {
         COMPOSE_CMD="docker-compose"
     fi
 
-    cat > /etc/systemd/system/rusternetes.service <<EOF
+    cat > /etc/systemd/system/k3rs.service <<EOF
 [Unit]
-Description=Rusternetes Kubernetes Cluster
+Description=k3rs Kubernetes Cluster
 After=network-online.target
 Wants=network-online.target
 
@@ -393,7 +393,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$INSTALL_DIR
-Environment="KUBELET_VOLUMES_PATH=$INSTALL_DIR/.rusternetes/volumes"
+Environment="KUBELET_VOLUMES_PATH=$INSTALL_DIR/.k3rs/volumes"
 ExecStart=/usr/bin/$COMPOSE_CMD -f $COMPOSE_FILE up -d
 ExecStop=/usr/bin/$COMPOSE_CMD -f $COMPOSE_FILE down
 User=root
@@ -409,10 +409,10 @@ EOF
 
 # Start cluster
 start_cluster() {
-    log_step "Starting Rusternetes cluster..."
+    log_step "Starting k3rs cluster..."
 
-    systemctl start rusternetes
-    systemctl enable rusternetes
+    systemctl start k3rs
+    systemctl enable k3rs
 
     # Wait for services to be ready
     log_info "Waiting for services to start..."
@@ -423,29 +423,29 @@ start_cluster() {
 
 # Bootstrap cluster
 bootstrap_cluster() {
-    log_step "Bootstrapping cluster (rusternetes-dns)..."
+    log_step "Bootstrapping cluster (k3rs-dns)..."
 
     cd "$INSTALL_DIR"
 
-    export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.rusternetes/volumes"
+    export KUBELET_VOLUMES_PATH="$INSTALL_DIR/.k3rs/volumes"
 
     # Apply the core resources (namespaces, kube-dns Service, priority classes).
     envsubst < bootstrap-cluster.yaml > /tmp/bootstrap-expanded.yaml
     KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f /tmp/bootstrap-expanded.yaml
 
-    # CoreDNS has been removed. The all-in-one rusternetes container serves DNS
+    # CoreDNS has been removed. The all-in-one k3rs container serves DNS
     # in-process, so wire the kube-dns Service to it via a hand-written
     # EndpointSlice (kube-proxy then DNATs 10.96.0.10:53 to the container).
     # Mirrors the all-in-one path in scripts/bootstrap-cluster.sh Step 5.
     local aio_dns_ip
-    aio_dns_ip=$(docker inspect rusternetes \
+    aio_dns_ip=$(docker inspect k3rs \
         --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || true)
     if [[ -n "$aio_dns_ip" ]]; then
         cat <<EOF | KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify apply -f -
 apiVersion: discovery.k8s.io/v1
 kind: EndpointSlice
 metadata:
-  name: kube-dns-rusternetes
+  name: kube-dns-k3rs
   namespace: kube-system
   labels:
     kubernetes.io/service-name: kube-dns
@@ -459,7 +459,7 @@ endpoints:
     conditions: {ready: true, serving: true, terminating: false}
 EOF
     else
-        log_warn "Could not find the rusternetes container to wire kube-dns; DNS may be unavailable"
+        log_warn "Could not find the k3rs container to wire kube-dns; DNS may be unavailable"
     fi
 
     log_info "Bootstrap completed successfully"
@@ -479,7 +479,7 @@ verify_installation() {
     fi
 
     # Wait for cluster DNS
-    log_info "Waiting for cluster DNS (rusternetes-dns) to be ready..."
+    log_info "Waiting for cluster DNS (k3rs-dns) to be ready..."
     sleep 10
 
     # Check pods
@@ -497,15 +497,15 @@ verify_installation() {
 display_completion() {
     echo
     echo "=========================================="
-    echo "  Rusternetes Installation Complete!"
+    echo "  k3rs Installation Complete!"
     echo "=========================================="
     echo
     echo -e "${GREEN}Installation successful!${NC}"
     echo
     echo "Installation details:"
     echo "  Location: $INSTALL_DIR"
-    echo "  Service: systemctl status rusternetes"
-    echo "  Logs: journalctl -u rusternetes -f"
+    echo "  Service: systemctl status k3rs"
+    echo "  Logs: journalctl -u k3rs -f"
     echo
     echo "Quick commands:"
     echo "  # Check cluster status"
@@ -513,10 +513,10 @@ display_completion() {
     echo "  KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify get pods -A"
     echo
     echo "  # Stop cluster"
-    echo "  sudo systemctl stop rusternetes"
+    echo "  sudo systemctl stop k3rs"
     echo
     echo "  # Start cluster"
-    echo "  sudo systemctl start rusternetes"
+    echo "  sudo systemctl start k3rs"
     echo
     echo "  # View logs"
     if [[ "$USE_DOCKER" == "true" ]]; then
@@ -532,7 +532,7 @@ display_completion() {
 
 # Main installation flow
 main() {
-    log_info "Starting Rusternetes installation on Fedora..."
+    log_info "Starting k3rs installation on Fedora..."
 
     check_root
     check_prerequisites

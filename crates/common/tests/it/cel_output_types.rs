@@ -8,12 +8,12 @@
 //! CRD rules: `apiextensions-apiserver/pkg/apiserver/schema/cel/compilation.go`
 //! `compileRule` `:217-219` and `:260-262`.
 
-use rusternetes_cel_checker::DType;
-use rusternetes_common::cel_checker_shadow::{check_rule_output, SelfScope};
-use rusternetes_common::cel_env::ExpectedOutput;
-use rusternetes_common::cel_mutation_types::{check_mutation_expression, PolicyExpression};
-use rusternetes_common::cel_policy_types::DeclType;
-use rusternetes_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
+use k3rs_cel_checker::DType;
+use k3rs_common::cel_checker_shadow::{check_rule_output, SelfScope};
+use k3rs_common::cel_env::ExpectedOutput;
+use k3rs_common::cel_mutation_types::{check_mutation_expression, PolicyExpression};
+use k3rs_common::cel_policy_types::DeclType;
+use k3rs_common::cel_versions::{default_compatibility_version, EnvSet, EnvType};
 
 fn set() -> EnvSet {
     EnvSet::must_base_env_set(default_compatibility_version())

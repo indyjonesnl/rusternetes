@@ -2,12 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
-        CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod,
-    };
-    pub use rusternetes_scheduler::data_plane::DataPlane;
-    pub use rusternetes_scheduler::volume_assume::VolumeBinder;
-    pub use rusternetes_scheduler::volume_binding::{
+    pub use k3rs_common::resources::{CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod};
+    pub use k3rs_scheduler::data_plane::DataPlane;
+    pub use k3rs_scheduler::volume_assume::VolumeBinder;
+    pub use k3rs_scheduler::volume_binding::{
         check_pv_node_affinity, is_pvc_fully_bound, pvc_key, try_translate_pv_to_csi, BindingInfo,
         DynamicProvision, PodVolumes, ANN_SELECTED_NODE,
     };
@@ -17,8 +15,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::volume_bind::*;
-    use rusternetes_scheduler::volume_binding::DynamicProvision;
+    use k3rs_scheduler::volume_bind::*;
+    use k3rs_scheduler::volume_binding::DynamicProvision;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
 

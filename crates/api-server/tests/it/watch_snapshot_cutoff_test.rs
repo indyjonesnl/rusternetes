@@ -13,10 +13,10 @@
 //! stream that already contains the "interleaved" write.
 
 use futures::StreamExt;
-use rusternetes_api_server::handlers::watch::{
+use k3rs_api_server::handlers::watch::{
     skip_events_covered_by_snapshot, snapshot_resource_version,
 };
-use rusternetes_storage::{WatchEvent, WatchStream};
+use k3rs_storage::{WatchEvent, WatchStream};
 use serde_json::{json, Value};
 
 fn obj(name: &str, rv: u64) -> Value {
@@ -112,12 +112,12 @@ async fn live_modified_and_deleted_already_in_the_snapshot_are_dropped() {
 /// reordered; the first event after the snapshot is delivered.
 #[tokio::test]
 async fn gap_events_between_subscribe_and_list_are_not_duplicated() {
-    use rusternetes_api_server::handlers::watch::watch_snapshot;
-    use rusternetes_api_server::state::ApiServerState;
-    use rusternetes_common::{
+    use k3rs_api_server::handlers::watch::watch_snapshot;
+    use k3rs_api_server::state::ApiServerState;
+    use k3rs_common::{
         auth::TokenManager, authz::AlwaysAllowAuthorizer, observability::MetricsRegistry,
     };
-    use rusternetes_storage::{Storage, StorageBackend};
+    use k3rs_storage::{Storage, StorageBackend};
     use std::sync::Arc;
 
     let backend = Arc::new(StorageBackend::new_memory());
@@ -167,7 +167,7 @@ async fn gap_events_between_subscribe_and_list_are_not_duplicated() {
 /// an item it returned, or that object replays as ADDED.
 #[test]
 fn snapshot_cutoff_is_never_below_a_listed_item() {
-    use rusternetes_api_server::handlers::watch::snapshot_cutoff;
+    use k3rs_api_server::handlers::watch::snapshot_cutoff;
     let item = |rv: &str| json!({"metadata": {"resourceVersion": rv}});
     assert_eq!(
         snapshot_cutoff(10, &[item("12"), item("7")]),

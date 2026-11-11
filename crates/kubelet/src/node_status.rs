@@ -11,7 +11,7 @@
 //! changed or `nodeStatusReportFrequency` elapsed.
 
 use crate::image_gc::Image;
-use rusternetes_common::resources::{ContainerImage, Node, NodeCondition, NodeStatus};
+use k3rs_common::resources::{ContainerImage, Node, NodeCondition, NodeStatus};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -388,7 +388,7 @@ pub fn prepare_patch_for_node_status(old: &Node, new: &Node) -> Result<Value, St
         .as_ref()
         .and_then(|s| s.addresses.clone())
         .unwrap_or_default();
-    let to_v = |a: &Vec<rusternetes_common::resources::NodeAddress>| {
+    let to_v = |a: &Vec<k3rs_common::resources::NodeAddress>| {
         serde_json::to_value(a).map_err(|e| e.to_string())
     };
     let manually_patch_addresses = !old_addrs.is_empty() && to_v(&old_addrs)? != to_v(&new_addrs)?;

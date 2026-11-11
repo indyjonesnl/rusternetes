@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusternetes_common::resources::{NetworkPolicy, Pod};
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use k3rs_common::resources::{NetworkPolicy, Pod};
+use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -42,7 +42,7 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("networkpolicies", None);
+            let prefix = k3rs_storage::build_prefix("networkpolicies", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -243,7 +243,7 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     /// Validate ingress rule
     pub fn validate_ingress_rule(
         &self,
-        rule: &rusternetes_common::resources::NetworkPolicyIngressRule,
+        rule: &k3rs_common::resources::NetworkPolicyIngressRule,
         idx: usize,
     ) -> Result<()> {
         // Validate ports if specified
@@ -266,7 +266,7 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     /// Validate egress rule
     fn validate_egress_rule(
         &self,
-        rule: &rusternetes_common::resources::NetworkPolicyEgressRule,
+        rule: &k3rs_common::resources::NetworkPolicyEgressRule,
         idx: usize,
     ) -> Result<()> {
         // Validate ports if specified
@@ -289,7 +289,7 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     /// Validate NetworkPolicyPort
     pub fn validate_network_policy_port(
         &self,
-        port: &rusternetes_common::resources::NetworkPolicyPort,
+        port: &k3rs_common::resources::NetworkPolicyPort,
         rule_idx: usize,
         port_idx: usize,
     ) -> Result<()> {
@@ -322,7 +322,7 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     /// Validate NetworkPolicyPeer
     fn validate_network_policy_peer(
         &self,
-        peer: &rusternetes_common::resources::NetworkPolicyPeer,
+        peer: &k3rs_common::resources::NetworkPolicyPeer,
         rule_idx: usize,
         peer_idx: usize,
     ) -> Result<()> {
@@ -399,9 +399,9 @@ impl<S: Storage + 'static> NetworkPolicyController<S> {
     pub fn pod_matches_selector(
         &self,
         pod: &Pod,
-        selector: &rusternetes_common::types::LabelSelector,
+        selector: &k3rs_common::types::LabelSelector,
     ) -> bool {
-        rusternetes_common::types::label_selector_as_selector(Some(selector))
+        k3rs_common::types::label_selector_as_selector(Some(selector))
             .map(|selector| selector.matches(pod.metadata.labels.as_ref()))
             .unwrap_or(false)
     }

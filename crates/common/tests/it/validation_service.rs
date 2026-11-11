@@ -14,9 +14,9 @@
 //! the Rust types cannot hold (a port above 65535) are left out too; the
 //! unknown-enum cases are in `unknown_enum_values_report_unsupported_value`.
 
-use rusternetes_common::resources::service::Service;
-use rusternetes_common::validation::field::Path;
-use rusternetes_common::validation::service::{
+use k3rs_common::resources::service::Service;
+use k3rs_common::validation::field::Path;
+use k3rs_common::validation::service::{
     validate_load_balancer_status, validate_service_create, validate_service_update,
 };
 use serde_json::{json, Value};

@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-controller-manager"
+name = "k3rs-controller-manager"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_controller_manager"
+name = "k3rs_controller_manager"
 path = "src/lib.rs"
 # Unit tests live in tests/it: a second compilation of the lib as a test
 # target costs as much as the lib itself.
@@ -18,16 +18,16 @@ path = "src/main.rs"
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
+k3rs-common = { path = "../common", features = ["axum-support", "clap-support"] }
 # api-client: StorageBackend::Api + the ApiStorage adapter used by run_with_api.
-rusternetes-storage = { path = "../storage", features = ["api-client"] }
-rusternetes-client = { path = "../client" }
+k3rs-storage = { path = "../storage", features = ["api-client"] }
+k3rs-client = { path = "../client" }
 # secure serving + delegated authn/authz for /metrics, /statusz, /flagz (#3437)
-rusternetes-middleware = { path = "../middleware" }
-rusternetes-csi = { path = "../csi" }
-rusternetes-controller-core = { path = "../controller-core" }
+k3rs-middleware = { path = "../middleware" }
+k3rs-csi = { path = "../csi" }
+k3rs-controller-core = { path = "../controller-core" }
 # VAP type checker (`validatingadmissionpolicy-status`); RESTMapper + served-resource discovery (storage version migrator).
-rusternetes-discovery = { path = "../discovery" }
+k3rs-discovery = { path = "../discovery" }
 # gRPC status codes for the CSI provisioner (`isInfeasibleError`).
 tonic.workspace = true
 tokio.workspace = true
@@ -73,5 +73,5 @@ chrono = { workspace = true }
 [features]
 mimalloc = ["dep:mimalloc"]
 default = []
-sqlite = ["rusternetes-storage/sqlite"]
-redis = ["rusternetes-storage/redis"]
+sqlite = ["k3rs-storage/sqlite"]
+redis = ["k3rs-storage/redis"]

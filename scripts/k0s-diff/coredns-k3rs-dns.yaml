@@ -1,4 +1,4 @@
-# v6 workload swap: point the kube-system CoreDNS Deployment at rusternetes-dns.
+# v6 workload swap: point the kube-system CoreDNS Deployment at k3rs-dns.
 #
 # Applied by run-variant.sh (v6) AFTER the all-Go stack passes the smoke gate.
 # `kubectl apply` updates the existing k0s "coredns" Deployment in place — the
@@ -7,14 +7,14 @@
 # routing to these pods unchanged.
 #
 # What changes vs stock CoreDNS:
-#   image      -> rusternetes-dns (placeholder __RUSTERNETES_DNS_IMAGE__, sed-
+#   image      -> k3rs-dns (placeholder __K3RS_DNS_IMAGE__, sed-
 #                 substituted at apply time with the local-registry ref).
-#   args       -> dropped ("-conf /etc/coredns/Corefile"); rusternetes-dns is
+#   args       -> dropped ("-conf /etc/coredns/Corefile"); k3rs-dns is
 #                 arg-free — with NO storage/api-server flag it auto-uses the
 #                 in-cluster ServiceAccount token + KUBERNETES_SERVICE_HOST and
 #                 reads cluster state via the api-server (crates/dns/src/main.rs
 #                 resolve_api_config). --api-server-url is deliberately UNSET.
-#   probes     -> tcpSocket :53 (rusternetes-dns serves DNS only; it does NOT
+#   probes     -> tcpSocket :53 (k3rs-dns serves DNS only; it does NOT
 #                 expose CoreDNS's /health:8080 or /ready:8181 HTTP endpoints,
 #                 so the stock httpGet probes would never pass).
 #   security   -> runAsNonRoot/readOnlyRootFilesystem relaxed: the minimal
@@ -22,7 +22,7 @@
 #
 # The coredns ServiceAccount (kept) carries the RBAC the DNS server needs
 # (list/watch services, endpoints/endpointslices, pods, namespaces), so its
-# projected token authorizes rusternetes-dns's api-server reads.
+# projected token authorizes k3rs-dns's api-server reads.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -54,7 +54,7 @@ spec:
         operator: Exists
       containers:
       - name: coredns
-        image: __RUSTERNETES_DNS_IMAGE__
+        image: __K3RS_DNS_IMAGE__
         imagePullPolicy: Always
         args:
         - --cluster-zone=cluster.local

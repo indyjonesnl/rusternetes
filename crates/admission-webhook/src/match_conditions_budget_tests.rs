@@ -10,17 +10,17 @@
 
 use crate::cel_evaluators::{MatchConditionEvaluator, MatchOutcome};
 use crate::AdmissionWebhookManager;
-use rusternetes_common::admission::{
+use k3rs_common::admission::{
     AdmissionReview, AdmissionReviewResponse, GroupVersionKind, GroupVersionResource, Operation,
     UserInfo,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     FailurePolicy, MatchCondition, MutatingWebhook, MutatingWebhookConfiguration, OperationType,
     Rule, RuleWithOperations, SideEffectClass, ValidatingWebhook, ValidatingWebhookConfiguration,
     WebhookClientConfig,
 };
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::Storage;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::Storage;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -108,12 +108,12 @@ async fn validating(
     url: &str,
     policy: FailurePolicy,
     conds: Vec<MatchCondition>,
-) -> rusternetes_common::Result<rusternetes_common::admission::AdmissionResponse> {
+) -> k3rs_common::Result<k3rs_common::admission::AdmissionResponse> {
     let storage = Arc::new(MemoryStorage::new());
     let cfg = ValidatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "ValidatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("v"),
+        metadata: k3rs_common::types::ObjectMeta::new("v"),
         webhooks: Some(vec![ValidatingWebhook {
             name: "v.example.com".into(),
             client_config: WebhookClientConfig {
@@ -154,12 +154,12 @@ async fn mutating(
     url: &str,
     policy: FailurePolicy,
     conds: Vec<MatchCondition>,
-) -> rusternetes_common::Result<rusternetes_common::admission::AdmissionResponse> {
+) -> k3rs_common::Result<k3rs_common::admission::AdmissionResponse> {
     let storage = Arc::new(MemoryStorage::new());
     let cfg = MutatingWebhookConfiguration {
         api_version: "admissionregistration.k8s.io/v1".into(),
         kind: "MutatingWebhookConfiguration".into(),
-        metadata: rusternetes_common::types::ObjectMeta::new("m"),
+        metadata: k3rs_common::types::ObjectMeta::new("m"),
         webhooks: Some(vec![MutatingWebhook {
             name: "m.example.com".into(),
             client_config: WebhookClientConfig {
@@ -202,7 +202,7 @@ fn heavy3() -> Vec<MatchCondition> {
     vec![cond("a", HEAVY), cond("b", HEAVY), cond("c", HEAVY)]
 }
 
-fn request() -> rusternetes_common::admission::AdmissionRequest {
+fn request() -> k3rs_common::admission::AdmissionRequest {
     crate::build_admission_request_for_match(
         &Operation::Create,
         &gvk(),
@@ -235,10 +235,7 @@ async fn validating_budget_exhausted_ignore_skips_the_webhook() {
     let url = deny_server().await;
     let r = validating(&url, FailurePolicy::Ignore, heavy3()).await;
     assert!(
-        matches!(
-            r,
-            Ok(rusternetes_common::admission::AdmissionResponse::Allow)
-        ),
+        matches!(r, Ok(k3rs_common::admission::AdmissionResponse::Allow)),
         "{r:?}"
     );
 }

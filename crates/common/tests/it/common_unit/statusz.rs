@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use chrono::{DateTime, TimeZone, Utc};
-    pub use rusternetes_common::compatibility::{EffectiveVersion, DEFAULT_KUBE_BINARY_VERSION};
-    pub use rusternetes_common::feature_gates::Version;
+    pub use k3rs_common::compatibility::{EffectiveVersion, DEFAULT_KUBE_BINARY_VERSION};
+    pub use k3rs_common::feature_gates::Version;
     pub use serde::ser::SerializeStruct;
     pub use serde::{Serialize, Serializer};
     pub use std::collections::HashMap;
@@ -13,8 +13,8 @@ mod __parent {
 mod tests {
     use super::__parent::*;
     use chrono::{Local, SubsecRound};
-    use rusternetes_common::compatibility::EffectiveVersion;
-    use rusternetes_common::statusz::*;
+    use k3rs_common::compatibility::EffectiveVersion;
+    use k3rs_common::statusz::*;
 
     // statusz_test.go:wantTmpl / wantTmplWithoutEmulation.
     const HEADER: &str = "\n{c} statusz\nWarning: This endpoint is not meant to be machine parseable, has no formatting compatibility guarantees and is for debugging purposes only.\n";
@@ -365,7 +365,7 @@ mod tests {
         let reg = Registry::new(None);
         assert_eq!(
             reg.binary_version(),
-            rusternetes_common::compatibility::DEFAULT_KUBE_BINARY_VERSION
+            k3rs_common::compatibility::DEFAULT_KUBE_BINARY_VERSION
         );
     }
 
@@ -401,8 +401,8 @@ mod axum_tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::statusz::*;
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::statusz::*;
     use serial_test::serial;
     use tower::ServiceExt;
 
@@ -438,7 +438,7 @@ mod axum_tests {
         let _g = with_feature(Feature::ComponentStatusz, true);
         let app = install_if_enabled(axum::Router::new(), "kube-scheduler", || {
             Registry::new(Some(
-                rusternetes_common::compatibility::default_build_effective_version(),
+                k3rs_common::compatibility::default_build_effective_version(),
             ))
             .with_listed_paths(vec!["/metrics".into()])
         });

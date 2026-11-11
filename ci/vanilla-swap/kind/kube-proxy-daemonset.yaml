@@ -1,42 +1,42 @@
-# DaemonSet swap recipe: kube-proxy -> rusternetes kube-proxy (API mode).
+# DaemonSet swap recipe: kube-proxy -> k3rs kube-proxy (API mode).
 #
 # Consumed by vs_swap_daemonset() in scripts/vanilla-swap-common.sh, which:
 #   1. deletes the vanilla `kube-system/kube-proxy` DaemonSet;
 #   2. copies the control-plane admin kubeconfig into a Secret
-#      (`rusternetes-kube-proxy-kubeconfig`) so the rusternetes kube-proxy can
+#      (`k3rs-kube-proxy-kubeconfig`) so the k3rs kube-proxy can
 #      authenticate to the vanilla api-server with client-cert auth — kind's
-#      kube-proxy uses a projected `tokenFile`, which the rusternetes kubeconfig
+#      kube-proxy uses a projected `tokenFile`, which the k3rs kubeconfig
 #      loader does not support (only inline token / client-cert);
 #   3. renders the manifest below with vs_render_recipe_template (VS_IMAGE /
 #      VS_APISERVER_URL / VS_CLUSTER_CIDR / VS_NODEPORT_RANGE) and applies it.
 #
-# The rusternetes kube-proxy reads Services/Endpoints/EndpointSlices from the
+# The k3rs kube-proxy reads Services/Endpoints/EndpointSlices from the
 # vanilla api-server via ApiStorage and programs iptables — standard API only.
 # Verified live against a v1.35.0 kind cluster: "sync: N services, M endpoint
 # entries; built NAT rules".
 #
 # manifest-kind: daemonset-template
 namespace: kube-system
-name: rusternetes-kube-proxy
+name: k3rs-kube-proxy
 container: kube-proxy
 vanillaDaemonSet: kube-proxy
-kubeconfigSecret: rusternetes-kube-proxy-kubeconfig
+kubeconfigSecret: k3rs-kube-proxy-kubeconfig
 template: |
   apiVersion: apps/v1
   kind: DaemonSet
   metadata:
-    name: rusternetes-kube-proxy
+    name: k3rs-kube-proxy
     namespace: kube-system
     labels:
-      k8s-app: rusternetes-kube-proxy
+      k8s-app: k3rs-kube-proxy
   spec:
     selector:
       matchLabels:
-        k8s-app: rusternetes-kube-proxy
+        k8s-app: k3rs-kube-proxy
     template:
       metadata:
         labels:
-          k8s-app: rusternetes-kube-proxy
+          k8s-app: k3rs-kube-proxy
       spec:
         hostNetwork: true
         tolerations:
@@ -73,4 +73,4 @@ template: |
         volumes:
           - name: kubeconfig
             secret:
-              secretName: rusternetes-kube-proxy-kubeconfig
+              secretName: k3rs-kube-proxy-kubeconfig

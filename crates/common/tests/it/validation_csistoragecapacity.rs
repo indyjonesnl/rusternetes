@@ -1,12 +1,12 @@
 //! Tests for CSIStorageCapacity validation (upstream ValidateCSIStorageCapacity).
 
-use rusternetes_common::resources::csi::CSIStorageCapacity;
-use rusternetes_common::resources::volume::{LabelSelector, LabelSelectorRequirement};
-use rusternetes_common::validation::csistoragecapacity::{self, CsiStorageCapacityValidateOptions};
+use k3rs_common::resources::csi::CSIStorageCapacity;
+use k3rs_common::resources::volume::{LabelSelector, LabelSelectorRequirement};
+use k3rs_common::validation::csistoragecapacity::{self, CsiStorageCapacityValidateOptions};
 
 fn validate_csi_storage_capacity(
     c: &CSIStorageCapacity,
-) -> rusternetes_common::validation::field::ErrorList {
+) -> k3rs_common::validation::field::ErrorList {
     csistoragecapacity::validate_csi_storage_capacity(
         c,
         CsiStorageCapacityValidateOptions::default(),
@@ -26,7 +26,7 @@ fn csc(sc_name: &str, capacity: Option<&str>) -> CSIStorageCapacity {
     c
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field))
 }
 

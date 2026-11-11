@@ -4,9 +4,9 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: fast
-provisioner: rusternetes.io/hostpath
+provisioner: k3rs.io/hostpath
 parameters:
-  path: /tmp/rusternetes/dynamic-pvs
+  path: /tmp/k3rs/dynamic-pvs
 reclaimPolicy: Delete
 volumeBindingMode: Immediate
 

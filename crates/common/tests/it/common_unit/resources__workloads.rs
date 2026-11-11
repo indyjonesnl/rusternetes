@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::pod::PodSpec;
-    pub use rusternetes_common::resources::policy::IntOrString;
-    pub use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+    pub use k3rs_common::resources::pod::PodSpec;
+    pub use k3rs_common::resources::policy::IntOrString;
+    pub use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::workloads::*;
+    use k3rs_common::resources::workloads::*;
 
     #[test]
     fn test_replication_controller_creation() {

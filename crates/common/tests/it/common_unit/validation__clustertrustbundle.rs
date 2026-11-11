@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::ClusterTrustBundle;
-    pub use rusternetes_common::validation::certificatesigningrequest::validate_signer_name;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::ClusterTrustBundle;
+    pub use k3rs_common::validation::certificatesigningrequest::validate_signer_name;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_immutable_field,
         validate_object_meta_accessor_with_opts_common, validate_object_meta_update,
     };
@@ -13,8 +13,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
+    use k3rs_common::validation::clustertrustbundle::*;
     use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
-    use rusternetes_common::validation::clustertrustbundle::*;
 
     /// A DER certificate; `ca` sets the basic-constraints CA bit
     /// (validation_test.go `mustMakeCertificate`).

@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::validation::field::{Error, Path};
-    pub use rusternetes_common::validation::structural::Structural;
+    pub use k3rs_common::validation::field::{Error, Path};
+    pub use k3rs_common::validation::structural::Structural;
     pub use serde_json::{Map, Value};
     pub use std::collections::HashMap;
 }
@@ -17,10 +17,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::__parent::*;
-    use rusternetes_common::resources::crd::JSONSchemaProps;
-    use rusternetes_common::validation::field::ErrorType;
-    use rusternetes_common::validation::structural::listtype::*;
-    use rusternetes_common::validation::structural::new_structural;
+    use k3rs_common::resources::crd::JSONSchemaProps;
+    use k3rs_common::validation::field::ErrorType;
+    use k3rs_common::validation::structural::listtype::*;
+    use k3rs_common::validation::structural::new_structural;
 
     fn structural(v: Value) -> Structural {
         let props: JSONSchemaProps = serde_json::from_value(v).unwrap();
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(errs[0].field, "root.array[2]");
         assert_eq!(
             errs[0].bad_value,
-            rusternetes_common::validation::field::BadValue::Json(json!({"k": "a"}))
+            k3rs_common::validation::field::BadValue::Json(json!({"k": "a"}))
         );
     }
 

@@ -3,34 +3,33 @@
 
 mod __parent {
     pub use axum::{routing::get, Router};
-    pub use rusternetes_api_server::{handlers::custom_resource, state::ApiServerState};
-    pub use rusternetes_common::resources::{CustomResourceDefinition, ResourceScope};
+    pub use k3rs_api_server::{handlers::custom_resource, state::ApiServerState};
+    pub use k3rs_common::resources::{CustomResourceDefinition, ResourceScope};
     pub use std::sync::Arc;
     pub use tracing::{debug, info};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::dynamic_routes::*;
-    use rusternetes_common::resources::{
+    use k3rs_api_server::dynamic_routes::*;
+    use k3rs_common::resources::{
         CustomResourceDefinitionNames, CustomResourceDefinitionSpec,
         CustomResourceDefinitionVersion, CustomResourceSubresourceScale,
         CustomResourceSubresourceStatus, CustomResourceSubresources,
     };
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_common::types::ObjectMeta;
 
     // Build an ApiServerState backed by the in-memory storage backend, so these
     // tests can exercise route-building logic without any external etcd cluster.
     async fn create_test_state() -> Arc<ApiServerState> {
-        use rusternetes_common::auth::TokenManager;
-        use rusternetes_common::authz::AlwaysAllowAuthorizer;
-        use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::StorageBackend;
+        use k3rs_common::auth::TokenManager;
+        use k3rs_common::authz::AlwaysAllowAuthorizer;
+        use k3rs_common::observability::MetricsRegistry;
+        use k3rs_storage::StorageBackend;
 
         let storage = Arc::new(StorageBackend::new_memory());
         let token_manager = Arc::new(TokenManager::new(b"test-secret"));
-        let authorizer =
-            Arc::new(AlwaysAllowAuthorizer) as Arc<dyn rusternetes_common::authz::Authorizer>;
+        let authorizer = Arc::new(AlwaysAllowAuthorizer) as Arc<dyn k3rs_common::authz::Authorizer>;
         let metrics = Arc::new(MetricsRegistry::new());
 
         Arc::new(ApiServerState::new(

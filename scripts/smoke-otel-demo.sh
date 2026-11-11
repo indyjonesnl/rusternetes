@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Rusternetes smoke test: bring up an all-in-one SQLite cluster, install
+# k3rs smoke test: bring up an all-in-one SQLite cluster, install
 # ingress-nginx via Helm, deploy the opentelemetry-demo chart with all
 # observability backends, curl the demo frontend through the Ingress, and
 # tear everything down.
@@ -11,7 +11,7 @@
 #            curl, marker grep). Teardown still runs.
 #
 # Caveats:
-#  * Rusternetes' kube-proxy runs in the host network namespace and
+#  * k3rs' kube-proxy runs in the host network namespace and
 #    rewrites the host's iptables. While the cluster is up, the host
 #    loses local DNS (127.0.0.53:53). Browser / docker pull / apt all
 #    break until teardown completes. See memory note
@@ -19,7 +19,7 @@
 #  * The OpenTelemetry demo brings up ~22 pods including OpenSearch,
 #    Jaeger, Prometheus and Grafana. Expect ~6 GB RAM and ~20 minutes
 #    for everything to reach Ready.
-#  * Rusternetes' Ingress resource is API-only — actual HTTP traffic is
+#  * k3rs' Ingress resource is API-only — actual HTTP traffic is
 #    served by the nginx-ingress controller we install here. If kube-proxy
 #    fails to programme the right iptables for the controller's Service
 #    Endpoints, the final curl will time out.
@@ -51,8 +51,8 @@ DEMO_RELEASE="otel-demo"
 DEMO_HOST="otel.local"
 NODE_PORT_HTTP="30080"
 API_SERVER="https://localhost:6443"
-KUBECONFIG_FILE="${HOME}/.kube/rusternetes-config"
-KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.rusternetes/volumes}"
+KUBECONFIG_FILE="${HOME}/.kube/k3rs-config"
+KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-${PROJECT_ROOT}/.k3rs/volumes}"
 COMPOSE_FILE="compose.all-in-one.yml"
 
 # --------------------------------------------------------------- preflight
@@ -88,7 +88,7 @@ phase_preflight() {
 
 # ----------------------------------------------------------- cluster up --
 phase_cluster_up() {
-  step "Phase 1 — bring up rusternetes (all-in-one, sqlite)"
+  step "Phase 1 — bring up k3rs (all-in-one, sqlite)"
 
   export KUBELET_VOLUMES_PATH
   mkdir -p "$KUBELET_VOLUMES_PATH"
@@ -123,7 +123,7 @@ phase_bootstrap() {
   export KUBECONFIG="$KUBECONFIG_FILE"
   [ -f "$KUBECONFIG" ] || die "kubeconfig missing at $KUBECONFIG after bootstrap"
 
-  # Backend-agnostic readiness: the default path runs rusternetes-dns (no
+  # Backend-agnostic readiness: the default path runs k3rs-dns (no
   # CoreDNS Pod), the A/B path runs a CoreDNS Pod. Both back the kube-dns
   # Service, so wait for a ready kube-dns endpoint rather than a Pod phase.
   echo -n "  waiting for kube-dns endpoints Ready "

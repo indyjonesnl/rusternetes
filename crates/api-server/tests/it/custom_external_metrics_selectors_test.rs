@@ -13,7 +13,7 @@
 //!   `metricSelector.Matches(series labels)`, NotFound objects skipped in a
 //!   selector list, `NewMetricNotFoundForSelectorError` for a named miss).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const BASE: &str = "/apis/custom.metrics.k8s.io/v1beta2/namespaces/default/pods/qps";

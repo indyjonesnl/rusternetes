@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use prometheus::core::{Collector, Desc};
-    pub use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
-    pub use rusternetes_common::feature_gates::{self, Feature};
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_kubelet::podcertificate::{
+    pub use k3rs_common::feature_gates::{self, Feature};
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_kubelet::podcertificate::{
         IssuingManager, Manager, NoOpManager, PodManager, RealClock,
     };
-    pub use rusternetes_storage::{EventRecorder, Storage};
+    pub use k3rs_storage::{EventRecorder, Storage};
+    pub use prometheus::core::{Collector, Desc};
+    pub use prometheus::proto::{Gauge, LabelPair, Metric, MetricFamily, MetricType};
     pub use std::collections::{HashMap, HashSet};
     pub use std::sync::{Arc, RwLock};
     pub use tracing::info;
@@ -24,15 +24,15 @@ mod tests {
 
     use super::__parent::*;
     use async_trait::async_trait;
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+    use k3rs_common::resources::{Node, PodSpec, ServiceAccount, Volume};
+    use k3rs_common::types::{ObjectMeta, TypeMeta};
+    use k3rs_kubelet::podcertificate::tokio_util_cancel::Token;
+    use k3rs_kubelet::podcertificate::wiring::*;
+    use k3rs_kubelet::podcertificate::{MetricReport, SignerAndState};
+    use k3rs_storage::{build_key, build_prefix, Storage, StorageBackend};
     use prometheus::core::Collector;
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-    use rusternetes_common::resources::{Node, PodSpec, ServiceAccount, Volume};
-    use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    use rusternetes_kubelet::podcertificate::tokio_util_cancel::Token;
-    use rusternetes_kubelet::podcertificate::wiring::*;
-    use rusternetes_kubelet::podcertificate::{MetricReport, SignerAndState};
-    use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend};
     use std::sync::Mutex;
 
     fn pod(uid: &str, name: &str) -> Pod {

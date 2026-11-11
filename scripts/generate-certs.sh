@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CERT_DIR="${PROJECT_ROOT}/.rusternetes/certs"
+CERT_DIR="${PROJECT_ROOT}/.k3rs/certs"
 CERT_FILE="${CERT_DIR}/api-server.crt"
 KEY_FILE="${CERT_DIR}/api-server.key"
 # Cluster CA — a real CA (CA:TRUE) that signs the api-server's leaf serving cert
@@ -149,9 +149,9 @@ generate_scheduler_kubeconfig() {
         cat > "$sched_conf" <<KUBECONFIG
 apiVersion: v1
 kind: Config
-current-context: kube-scheduler@rusternetes
+current-context: kube-scheduler@k3rs
 clusters:
-- name: rusternetes
+- name: k3rs
   cluster:
     server: https://api-server:6443
     certificate-authority-data: ${ca_b64}
@@ -161,9 +161,9 @@ users:
     client-certificate-data: ${cert_b64}
     client-key-data: ${key_b64}
 contexts:
-- name: kube-scheduler@rusternetes
+- name: kube-scheduler@k3rs
   context:
-    cluster: rusternetes
+    cluster: k3rs
     user: system:kube-scheduler
     namespace: kube-system
 KUBECONFIG
@@ -205,9 +205,9 @@ generate_controller_manager_kubeconfig() {
         cat > "$cm_conf" <<KUBECONFIG
 apiVersion: v1
 kind: Config
-current-context: kube-controller-manager@rusternetes
+current-context: kube-controller-manager@k3rs
 clusters:
-- name: rusternetes
+- name: k3rs
   cluster:
     server: https://api-server:6443
     certificate-authority-data: ${ca_b64}
@@ -217,9 +217,9 @@ users:
     client-certificate-data: ${cert_b64}
     client-key-data: ${key_b64}
 contexts:
-- name: kube-controller-manager@rusternetes
+- name: kube-controller-manager@k3rs
   context:
-    cluster: rusternetes
+    cluster: k3rs
     user: system:kube-controller-manager
     namespace: kube-system
 KUBECONFIG
@@ -247,7 +247,7 @@ generate_kubelet_kubeconfig() {
         echo "Generating kubelet client cert + kubeconfig..."
         openssl ecparam -name prime256v1 -genkey -noout -out "$kl_key"
         openssl req -new -key "$kl_key" -out "${CERT_DIR}/kubelet.csr" \
-            -subj "/CN=system:node:rusternetes/O=system:nodes"
+            -subj "/CN=system:node:k3rs/O=system:nodes"
         openssl x509 -req -in "${CERT_DIR}/kubelet.csr" \
             -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
             -out "$kl_crt" -days 3650 \
@@ -262,9 +262,9 @@ generate_kubelet_kubeconfig() {
         cat > "$kl_conf" <<KUBECONFIG
 apiVersion: v1
 kind: Config
-current-context: kubelet@rusternetes
+current-context: kubelet@k3rs
 clusters:
-- name: rusternetes
+- name: k3rs
   cluster:
     server: https://api-server:6443
     certificate-authority-data: ${ca_b64}
@@ -274,13 +274,13 @@ users:
     client-certificate-data: ${cert_b64}
     client-key-data: ${key_b64}
 contexts:
-- name: kubelet@rusternetes
+- name: kubelet@k3rs
   context:
-    cluster: rusternetes
+    cluster: k3rs
     user: kubelet
     namespace: default
 KUBECONFIG
-        echo "  Kubelet cert:       $kl_crt (CN=system:node:rusternetes)"
+        echo "  Kubelet cert:       $kl_crt (CN=system:node:k3rs)"
         echo "  Kubelet kubeconfig: $kl_conf"
     fi
 }
@@ -320,9 +320,9 @@ generate_kube_proxy_kubeconfig() {
         cat > "$kp_conf" <<KUBECONFIG
 apiVersion: v1
 kind: Config
-current-context: kube-proxy@rusternetes
+current-context: kube-proxy@k3rs
 clusters:
-- name: rusternetes
+- name: k3rs
   cluster:
     server: https://localhost:6443
     certificate-authority-data: ${ca_b64}
@@ -332,9 +332,9 @@ users:
     client-certificate-data: ${cert_b64}
     client-key-data: ${key_b64}
 contexts:
-- name: kube-proxy@rusternetes
+- name: kube-proxy@k3rs
   context:
-    cluster: rusternetes
+    cluster: k3rs
     user: system:kube-proxy
     namespace: kube-system
 KUBECONFIG
@@ -380,7 +380,7 @@ if [ ! -f "$CA_KEY" ] || [ ! -f "$CA_CERT" ]; then
         -key "$CA_KEY" \
         -out "$CA_CERT" \
         -days 3650 \
-        -subj "/CN=rusternetes-ca/O=Rusternetes/C=US" \
+        -subj "/CN=k3rs-ca/O=k3rs/C=US" \
         -addext "basicConstraints = critical, CA:TRUE" \
         -addext "keyUsage = critical, digitalSignature, keyCertSign, cRLSign" \
         -set_serial 01
@@ -395,14 +395,14 @@ CONTAINER_RT=""
 NETWORK_SUBNET=""
 NETWORK_GATEWAY=""
 
-if command -v podman &>/dev/null && podman network inspect rusternetes-network &>/dev/null 2>&1; then
+if command -v podman &>/dev/null && podman network inspect k3rs-network &>/dev/null 2>&1; then
     CONTAINER_RT="podman"
-    NETWORK_SUBNET=$(podman network inspect rusternetes-network 2>/dev/null | jq -r '.[0].subnets[0].subnet // empty')
-    NETWORK_GATEWAY=$(podman network inspect rusternetes-network 2>/dev/null | jq -r '.[0].subnets[0].gateway // empty')
-elif command -v docker &>/dev/null && docker network inspect rusternetes-network &>/dev/null 2>&1; then
+    NETWORK_SUBNET=$(podman network inspect k3rs-network 2>/dev/null | jq -r '.[0].subnets[0].subnet // empty')
+    NETWORK_GATEWAY=$(podman network inspect k3rs-network 2>/dev/null | jq -r '.[0].subnets[0].gateway // empty')
+elif command -v docker &>/dev/null && docker network inspect k3rs-network &>/dev/null 2>&1; then
     CONTAINER_RT="docker"
-    NETWORK_SUBNET=$(docker network inspect rusternetes-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Subnet // empty')
-    NETWORK_GATEWAY=$(docker network inspect rusternetes-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Gateway // empty')
+    NETWORK_SUBNET=$(docker network inspect k3rs-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Subnet // empty')
+    NETWORK_GATEWAY=$(docker network inspect k3rs-network 2>/dev/null | jq -r '.[0].IPAM.Config[0].Gateway // empty')
 fi
 
 # Extract base IP from gateway (e.g., 10.89.0.1 -> 10.89.0)
@@ -419,8 +419,8 @@ req_extensions = v3_req
 prompt = no
 
 [req_distinguished_name]
-CN = rusternetes-api
-O = Rusternetes
+CN = k3rs-api
+O = k3rs
 C = US
 
 [v3_req]
@@ -432,7 +432,7 @@ subjectAltName = @alt_names
 [alt_names]
 DNS.1 = localhost
 DNS.2 = api-server
-DNS.3 = rusternetes-api-server
+DNS.3 = k3rs-api-server
 DNS.4 = kubernetes
 DNS.5 = kubernetes.default
 DNS.6 = kubernetes.default.svc

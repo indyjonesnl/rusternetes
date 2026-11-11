@@ -11,16 +11,16 @@
 //! * `cmd/kube-apiserver/app/server.go:131-134`: `s.Flagz =
 //!   flagz.NamedFlagSetsReader{FlagSets: namedFlagSets}`.
 //!
-//! The handlers themselves are `rusternetes_common::{statusz,flagz}`
+//! The handlers themselves are `k3rs_common::{statusz,flagz}`
 //! (`component-base/zpages/{statusz,flagz}`), shared with the other
 //! components. The routes are registered on the router that sits behind the
 //! handler chain's authorization filter: upstream `/statusz` and `/flagz` are
 //! non-resource URLs authorized against `system:monitoring`
 //! (`bootstrappolicy/policy.go:301-307`), not exempt from authorization.
 
-use rusternetes_common::feature_gates::{enabled, Feature};
-use rusternetes_common::flagz::{self, NamedFlagSetsReader};
-use rusternetes_common::statusz;
+use k3rs_common::feature_gates::{enabled, Feature};
+use k3rs_common::flagz::{self, NamedFlagSetsReader};
+use k3rs_common::statusz;
 use std::sync::OnceLock;
 
 /// `Config.Flagz`: set once at startup from the parsed command line; unset
@@ -85,9 +85,7 @@ where
         reader.map(|r| Box::new(r) as Box<dyn flagz::FlagReader>),
     );
     statusz::install_if_enabled(router, "apiserver", || {
-        statusz::Registry::new(Some(
-            rusternetes_common::compatibility::current_effective_version(),
-        ))
-        .with_listed_paths(listed_paths(flagz_installed))
+        statusz::Registry::new(Some(k3rs_common::compatibility::current_effective_version()))
+            .with_listed_paths(listed_paths(flagz_installed))
     })
 }

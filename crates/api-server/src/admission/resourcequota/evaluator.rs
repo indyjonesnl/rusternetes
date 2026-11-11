@@ -6,7 +6,7 @@
 //! registry of `pkg/quota/v1/evaluator/core/registry.go`.
 //!
 //! and `pkg/quota/v1/evaluator/core/persistent_volume_claims.go`
-//! (`pvcEvaluator`; its `Usage` is `rusternetes_common::quota::pvc_usage`,
+//! (`pvcEvaluator`; its `Usage` is `k3rs_common::quota::pvc_usage`,
 //! shared with the quota controller's `UsageStats`), including the
 //! VolumeAttributesClass scope and `Handles` for the `status` subresource
 //! (`RequiresQuotaReplenish`).
@@ -14,16 +14,16 @@
 //! and `pkg/quota/v1/evaluator/core/pods.go` (`podEvaluator`: `Handles`,
 //! `Matches` through `podMatchesScopeFunc`, `MatchingResources`,
 //! `MatchingScopes`, `Constraints`, `Usage`; the scope functions and `Usage`
-//! are `rusternetes_common::quota`, shared with the quota controller).
+//! are `k3rs_common::quota`, shared with the quota controller).
 
-use rusternetes_common::admission::Operation;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::quota::{self, ResourceList};
-use rusternetes_common::quota::{
+use k3rs_common::admission::Operation;
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::quota::{self, ResourceList};
+use k3rs_common::quota::{
     pvc_matches_resource_name, pvc_matches_scope, pvc_matching_scopes,
     pvc_requires_quota_replenish, pvc_usage, scope_selectors_from_quota,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     PersistentVolumeClaim, Pod, ResourceQuota, ScopedResourceSelectorRequirement, Service,
     ServiceType,
 };

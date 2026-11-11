@@ -30,7 +30,7 @@ use super::authz::{new_path_authorizer, DelegatingAuthorizerConfig};
 use super::serve::{tls_cipher_suites, tls_version, SecureServingInfo, ServingCert};
 use super::webhook::{ApiClientReviewClient, Backoff, ReviewClient, ReviewError};
 use async_trait::async_trait;
-use rusternetes_common::authz::{Authorizer, PrivilegedGroupAuthorizer, UnionAuthorizer};
+use k3rs_common::authz::{Authorizer, PrivilegedGroupAuthorizer, UnionAuthorizer};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -228,7 +228,7 @@ impl SecureServingOptions {
                 .join(format!("{}.key", self.server_cert.pair_name))
                 .to_string_lossy()
                 .into_owned();
-            can_read_cert_and_key = rusternetes_common::self_signed::can_read_cert_and_key(
+            can_read_cert_and_key = k3rs_common::self_signed::can_read_cert_and_key(
                 &self.server_cert.cert_key.cert_file,
                 &self.server_cert.cert_key.key_file,
             )?;
@@ -245,7 +245,7 @@ impl SecureServingOptions {
             }
 
             let (cert, key) =
-                rusternetes_common::self_signed::generate_self_signed_cert_key_with_fixtures(
+                k3rs_common::self_signed::generate_self_signed_cert_key_with_fixtures(
                     public_address,
                     &alternate_ips,
                     &alternate_dns,
@@ -714,14 +714,14 @@ fn request_header_settings_from_configmap(
 }
 
 async fn get_authentication_configmap(
-    client: &rusternetes_client::http::ApiClient,
+    client: &k3rs_client::http::ApiClient,
 ) -> Result<Option<serde_json::Value>, String> {
     let path = format!(
         "/api/v1/namespaces/{AUTHENTICATION_CONFIGMAP_NAMESPACE}/configmaps/{AUTHENTICATION_CONFIGMAP_NAME}"
     );
     match client.get::<serde_json::Value>(&path).await {
         Ok(v) => Ok(Some(v)),
-        Err(rusternetes_client::http::GetError::NotFound(_)) => Ok(None),
+        Err(k3rs_client::http::GetError::NotFound(_)) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -740,7 +740,7 @@ fn load_ca_bundle(ca: &CaContent, cm: Option<&serde_json::Value>, key: &str) -> 
 /// `RequestHeaderAuthRequestController.Run`: re-read the configmap on an
 /// interval (upstream also reacts to watch events). The task ends with the CA.
 fn spawn_configmap_refresh(
-    client: Arc<rusternetes_client::http::ApiClient>,
+    client: Arc<k3rs_client::http::ApiClient>,
     ca: &Arc<CaContent>,
     key: &'static str,
     settings: Option<Arc<RwLock<RequestHeaderSettings>>>,
@@ -788,7 +788,7 @@ fn spawn_configmap_refresh(
 /// worked. `ConfigMapCAController.RunOnce` ignores its error; the header
 /// controller's `RunOnce` ignores NotFound and fails on anything else.
 async fn create_request_header_config(
-    client: Arc<rusternetes_client::http::ApiClient>,
+    client: Arc<k3rs_client::http::ApiClient>,
 ) -> Result<RequestHeaderConfig, String> {
     let ca = CaContent::new("client-ca");
     let settings = Arc::new(RwLock::new(RequestHeaderSettings::default()));
@@ -917,7 +917,7 @@ impl AuthenticationFlags {
 
 /// A Go `time.Duration` flag value (`24h`, `10s`, `1m30s`).
 pub fn parse_go_duration_arg(s: &str) -> Result<Duration, String> {
-    let nanos = rusternetes_common::go_duration::parse_go_duration(s)?;
+    let nanos = k3rs_common::go_duration::parse_go_duration(s)?;
     u64::try_from(nanos)
         .map(Duration::from_nanos)
         .map_err(|_| format!("negative duration {s:?}"))
@@ -1119,13 +1119,13 @@ pub fn get_client(
     kubeconfig_file: &str,
     optional: bool,
     what: &str,
-) -> Result<Option<Arc<rusternetes_client::http::ApiClient>>, String> {
-    use rusternetes_client::http::ApiClient;
+) -> Result<Option<Arc<k3rs_client::http::ApiClient>>, String> {
+    use k3rs_client::http::ApiClient;
     let wrap = |e: String| format!("failed to get delegated {what} kubeconfig: {e}");
     let client = if !kubeconfig_file.is_empty() {
-        let cfg = rusternetes_client::kubeconfig::KubeConfig::load_from_file(
-            &std::path::PathBuf::from(kubeconfig_file),
-        )
+        let cfg = k3rs_client::kubeconfig::KubeConfig::load_from_file(&std::path::PathBuf::from(
+            kubeconfig_file,
+        ))
         .map_err(|e| wrap(format!("{e:#}")))?;
         let server = cfg.get_server().map_err(|e| wrap(format!("{e:#}")))?;
         ApiClient::with_tls(
@@ -1146,7 +1146,7 @@ pub fn get_client(
     } else {
         // without the remote kubeconfig file, try to use the in-cluster config.
         // If it is optional, ignore errors.
-        let cc = match rusternetes_client::config::ClientConfig::in_cluster() {
+        let cc = match k3rs_client::config::ClientConfig::in_cluster() {
             Ok(cc) => cc,
             Err(e) => {
                 if optional {

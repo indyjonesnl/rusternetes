@@ -18,8 +18,8 @@
 //!     codes surface as `reason="Error"`, 137 as `reason="OOMKilled"`
 //!     (unless the runtime supplied a specific `error` string).
 
-use rusternetes_common::resources::{ContainerState, ContainerStateTerminated, Lifecycle, Pod};
-use rusternetes_common::types::Phase;
+use k3rs_common::resources::{ContainerState, ContainerStateTerminated, Lifecycle, Pod};
+use k3rs_common::types::Phase;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -42,15 +42,15 @@ pub fn phase_is_terminal(phase: Option<&Phase>) -> bool {
 /// message. Every storage backend maps a resourceVersion CAS failure to
 /// `Error::Conflict` (memory.rs, etcd.rs, rhino.rs, api_storage.rs
 /// `map_write_err`).
-pub fn is_status_write_conflict(e: &rusternetes_common::Error) -> bool {
-    matches!(e, rusternetes_common::Error::Conflict(_))
+pub fn is_status_write_conflict(e: &k3rs_common::Error) -> bool {
+    matches!(e, k3rs_common::Error::Conflict(_))
 }
 
 /// Decide whether a kubelet status write that would set the pod phase to
 /// `incoming` must be SKIPPED because the pod already reached a terminal
 /// phase in storage (`current`).
 ///
-/// This is the rusternetes analogue of the terminal-phase stickiness guard
+/// This is the k3rs analogue of the terminal-phase stickiness guard
 /// in upstream `pkg/kubelet/kubelet_pods.go:1934-1942 generateAPIPodStatus`
 /// ("pods are not allowed to transition out of terminal phases"): when the
 /// API server already shows `Failed`/`Succeeded` and the freshly computed

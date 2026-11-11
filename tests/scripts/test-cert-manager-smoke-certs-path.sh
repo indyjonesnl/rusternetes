@@ -6,9 +6,9 @@
 # (compose.sqlite.yml) and bootstrap-cluster.sh later templates that SAME
 # host-absolute path into the control-plane static-pod hostPath volumes. If
 # CERTS_PATH is not exported BEFORE the first `compose up`, the kubelet falls
-# back to /etc/rusternetes/certs, the static pods' `type: Directory` hostPath
+# back to /etc/k3rs/certs, the static pods' `type: Directory` hostPath
 # check fails, they stay Pending, the controller-manager never runs, and every
-# Deployment (rusternetes-dns, cert-manager) is stuck with zero pods — the
+# Deployment (k3rs-dns, cert-manager) is stuck with zero pods — the
 # rollout wait then times out. This kept the cert-manager Smoke workflow red.
 #
 # This is a static check: no cluster needed. It fails if the CERTS_PATH export

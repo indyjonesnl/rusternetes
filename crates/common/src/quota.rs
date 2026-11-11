@@ -15,7 +15,7 @@
 //!
 //! Upstream carries `spec.hard`, `status.used`, LimitRange bounds and container
 //! resources as typed `resource.Quantity`: parsed once at decode time, then
-//! added and compared as quantities from there on. Rusternetes carries them as
+//! added and compared as quantities from there on. k3rs carries them as
 //! `String` and re-parses at each use, and the natural shortcut — reduce to an
 //! `i64` of millicores or bytes, do the arithmetic there — silently changes what
 //! a quantity means:
@@ -70,7 +70,7 @@ pub const KUBERNETES_IO_PREFIX: &str = "kubernetes.io/";
 /// Unparseable entries are dropped rather than failing the whole map. Upstream
 /// never needs this: the API types are already `resource.Quantity`, so a bad
 /// quantity is rejected at decode time and this layer only ever sees valid
-/// ones. Rusternetes stores strings, so a value that predates a validator (or
+/// ones. k3rs stores strings, so a value that predates a validator (or
 /// arrives on a path that has none) must not take a whole quota offline —
 /// dropping the key means that dimension goes unaccounted, which is what
 /// upstream's decode failure would also amount to.

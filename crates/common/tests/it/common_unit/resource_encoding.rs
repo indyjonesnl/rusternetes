@@ -2,8 +2,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::compatibility::{current_effective_version, EffectiveVersion};
-    pub use rusternetes_common::feature_gates::Version;
+    pub use k3rs_common::compatibility::{current_effective_version, EffectiveVersion};
+    pub use k3rs_common::feature_gates::Version;
     pub use std::collections::BTreeMap;
 }
 
@@ -13,9 +13,9 @@ mod tests {
     //! scheme table.
 
     use super::__parent::*;
-    use rusternetes_common::compatibility::EffectiveVersion;
-    use rusternetes_common::feature_gates::Version;
-    use rusternetes_common::resource_encoding::*;
+    use k3rs_common::compatibility::EffectiveVersion;
+    use k3rs_common::feature_gates::Version;
+    use k3rs_common::resource_encoding::*;
 
     fn ev(version: &str) -> EffectiveVersion {
         EffectiveVersion::from_string(version, "", "").unwrap()
@@ -191,7 +191,7 @@ mod tests {
     // ---- release-1.35 scheme ----
 
     fn parse_mm(s: &str) -> Version {
-        rusternetes_common::compatibility::parse_version(s)
+        k3rs_common::compatibility::parse_version(s)
             .unwrap()
             .major_minor()
     }

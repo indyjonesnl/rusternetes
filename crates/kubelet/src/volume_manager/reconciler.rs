@@ -305,7 +305,7 @@ async fn wait_for_volume_attach(mounter: Arc<VolumeMounter>, v: VolumeToMount) {
 async fn expand_volume(
     mounter: Arc<VolumeMounter>,
     v: VolumeToMount,
-    current_size: Option<rusternetes_common::quantity::Quantity>,
+    current_size: Option<k3rs_common::quantity::Quantity>,
 ) {
     debug!(
         "Starting operationExecutor.ExpandInUseVolume for volume {} pod {}",
@@ -313,10 +313,7 @@ async fn expand_volume(
     );
     // `None` is upstream's zero `resource.Quantity`; the operation rejects it.
     let current_size = current_size.unwrap_or_else(|| {
-        rusternetes_common::quantity::Quantity::from_value(
-            0,
-            rusternetes_common::quantity::Format::BinarySI,
-        )
+        k3rs_common::quantity::Quantity::from_value(0, k3rs_common::quantity::Format::BinarySI)
     });
     if let Err(e) = mounter.expand_in_use_volume(&v, current_size).await {
         error!(

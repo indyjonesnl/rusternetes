@@ -199,7 +199,7 @@ test_kubelets_stream_to_their_own_runtime() {
 # Locally-built images must be imported into EVERY node's runtime. Each
 # containerd has its own image store, so importing into one leaves the other
 # node unable to start that pod: `failed to resolve image ... pull access denied`
-# for rusternetes-dns:latest, which then blocks the conformance suite's
+# for k3rs-dns:latest, which then blocks the conformance suite's
 # BeforeSuite ("Error waiting for all pods to be running and ready").
 test_bootstrap_imports_into_every_runtime() {
     local script="$REPO_ROOT/scripts/bootstrap-cluster.sh"
@@ -213,7 +213,7 @@ test_bootstrap_imports_into_every_runtime() {
     local tmp; tmp="$(mktemp -d)"
     cat > "$tmp/stub-rt" <<'STUB'
 #!/usr/bin/env bash
-[ "$1" = ps ] && printf '%s\n' rusternetes-containerd rusternetes-kubelet rusternetes-containerd2
+[ "$1" = ps ] && printf '%s\n' k3rs-containerd k3rs-kubelet k3rs-containerd2
 exit 0
 STUB
     chmod +x "$tmp/stub-rt"
@@ -227,22 +227,22 @@ STUB
     rm -rf "$tmp"
 
     # An explicit single-runtime override must still win — run-node-conformance.sh
-    # passes CONTAINERD_SERVICE_CONTAINER=rusternetes-nc-containerd, and that
-    # runtime is not named rusternetes-containerd*.
+    # passes CONTAINERD_SERVICE_CONTAINER=k3rs-nc-containerd, and that
+    # runtime is not named k3rs-containerd*.
     local overridden
-    overridden="$(CONTAINER_RT=docker CONTAINERD_SERVICE_CONTAINER=rusternetes-nc-containerd bash -c "
+    overridden="$(CONTAINER_RT=docker CONTAINERD_SERVICE_CONTAINER=k3rs-nc-containerd bash -c "
         set -euo pipefail
         source <(sed -n '/^containerd_service_containers()/,/^}/p' \"$script\")
         containerd_service_containers
     " 2>/dev/null | tr -d '\n')"
-    assert_eq "rusternetes-nc-containerd" "$overridden" \
+    assert_eq "k3rs-nc-containerd" "$overridden" \
         "explicit CONTAINERD_SERVICE_CONTAINER must be honoured"
     case "$listed" in
-        *rusternetes-containerd*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+        *k3rs-containerd*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         *) fail "enumeration must include node-1's runtime, got: '$listed'" ;;
     esac
     case "$listed" in
-        *rusternetes-containerd2*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+        *k3rs-containerd2*) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         *) fail "enumeration must include node-2's runtime, got: '$listed'" ;;
     esac
 }

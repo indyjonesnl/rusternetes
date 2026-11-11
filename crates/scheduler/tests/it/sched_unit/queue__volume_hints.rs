@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::volume::{
+    pub use k3rs_common::resources::volume::{
         PersistentVolume, PersistentVolumeClaim, StorageClass, VolumeBindingMode,
     };
-    pub use rusternetes_common::resources::{Pod, Volume};
-    pub use rusternetes_scheduler::queue::events::{as_typed, EventObject, QueueingHint};
+    pub use k3rs_common::resources::{Pod, Volume};
+    pub use k3rs_scheduler::queue::events::{as_typed, EventObject, QueueingHint};
     pub use std::collections::BTreeSet;
     pub use tracing::debug;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_scheduler::queue::volume_hints::*;
+    use k3rs_scheduler::queue::volume_hints::*;
     use serde_json::json;
 
     fn obj<T: Send + Sync + 'static>(t: T) -> Box<EventObject> {

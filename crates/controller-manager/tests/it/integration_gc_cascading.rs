@@ -39,10 +39,10 @@
 //! Part of the /batch landing upstream integration-test mirrors as
 //! RED-state TDD pins.
 
-use rusternetes_common::resources::pod::{Container, Pod, PodSpec, PodStatus};
-use rusternetes_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::{Container, Pod, PodSpec, PodStatus};
+use k3rs_common::types::{ObjectMeta, OwnerReference, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -568,7 +568,7 @@ async fn test_gc_orphan_policy_fans_out_to_all_dependents() {
             name,
         );
         let key = build_key("pods", Some(ns), &name);
-        let kept: rusternetes_common::resources::pod::Pod = storage.get(&key).await.unwrap();
+        let kept: k3rs_common::resources::pod::Pod = storage.get(&key).await.unwrap();
         let refs = kept.metadata.owner_references.unwrap_or_default();
         assert!(
             refs.iter().all(|r| r.uid != owner.metadata.uid),

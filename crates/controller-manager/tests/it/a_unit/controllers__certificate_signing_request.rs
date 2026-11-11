@@ -4,23 +4,23 @@
 mod __parent {
     pub use anyhow::{Context, Result};
     pub use chrono::Utc;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         CertificateSigningRequest, CertificateSigningRequestCondition,
         CertificateSigningRequestStatus, KeyUsage,
     };
-    pub use rusternetes_controller_manager::controllers::cert_authority::CertificateAuthority;
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::cert_authority::CertificateAuthority;
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info, warn};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{CertificateSigningRequest, CertificateSigningRequestSpec};
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_controller_manager::controllers::certificate_signing_request::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::{CertificateSigningRequest, CertificateSigningRequestSpec};
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_controller_manager::controllers::certificate_signing_request::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_validate_csr_spec_valid() {
@@ -59,7 +59,7 @@ mod tests {
     fn ca_and_request(
         cn: &str,
     ) -> (
-        Arc<rusternetes_controller_manager::controllers::cert_authority::CertificateAuthority>,
+        Arc<k3rs_controller_manager::controllers::cert_authority::CertificateAuthority>,
         String,
     ) {
         use base64::{engine::general_purpose, Engine as _};
@@ -67,12 +67,12 @@ mod tests {
         let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
         ca_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "rusternetes-ca");
+            .push(rcgen::DnType::CommonName, "k3rs-ca");
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         let ca = Arc::new(
-            rusternetes_controller_manager::controllers::cert_authority::CertificateAuthority::from_pem(
+            k3rs_controller_manager::controllers::cert_authority::CertificateAuthority::from_pem(
                 &ca_cert.pem(),
                 &ca_key.serialize_pem(),
             )

@@ -11,8 +11,8 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{Pod, PodSpec};
-    pub use rusternetes_scheduler::cache::SchedulerCache;
+    pub use k3rs_common::resources::{Pod, PodSpec};
+    pub use k3rs_scheduler::cache::SchedulerCache;
     pub use std::time::{Duration, Instant};
 }
 
@@ -270,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_bindings_wait_idle() {
-        use rusternetes_scheduler::async_binding::InFlightBindings;
+        use k3rs_scheduler::async_binding::InFlightBindings;
         let b = std::sync::Arc::new(InFlightBindings::default());
         b.wait_idle().await;
         let g = b.start();

@@ -15,7 +15,7 @@
 //! In JSON, the same value is emitted as a bare integer (e.g. `8080`) for
 //! the int branch or a bare string (e.g. `"http"`) for the string branch —
 //! never a `{type, intVal, strVal}` object. The proto→JSON middleware in
-//! `rusternetes_api_server::protobuf::ProtoRegistry` must therefore collapse
+//! `k3rs_api_server::protobuf::ProtoRegistry` must therefore collapse
 //! the wire shape into the correct JSON primitive depending on the `type`
 //! discriminator. Otherwise the typed `serde` decoders downstream
 //! (`Service`, `Ingress`, `Pod` probes, `Deployment.rollingUpdate`, …)
@@ -29,7 +29,7 @@
 //! shuffle that drops `FieldType::IntOrString` from one of these fields will
 //! flip the corresponding test red.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::Value;
 
 /// Encode a varint into `out`.
@@ -442,14 +442,14 @@ fn test_ingress_backend_service_port_name_branch_decodes_as_string_field() {
 
 /// End-to-end: decode a `ServicePort` whose `targetPort` is the string
 /// branch and round-trip the resulting JSON through the typed
-/// `rusternetes_common::resources::ServicePort` deserializer. The
+/// `k3rs_common::resources::ServicePort` deserializer. The
 /// `IntOrString` enum's `serde` derive expects a bare primitive — if the
 /// proto decoder ever wraps it in `{type, intVal, strVal}` again, this
 /// test fails with the same `invalid type: map` error seen on the
 /// conformance canary.
 #[test]
 fn test_service_port_target_port_string_round_trips_through_typed_decoder() {
-    use rusternetes_common::resources::{IntOrString, ServicePort};
+    use k3rs_common::resources::{IntOrString, ServicePort};
 
     let registry = ProtoRegistry::new();
     // ServicePort { name: "web", protocol: "TCP", port: 80, targetPort: "http" }
@@ -490,7 +490,7 @@ fn test_service_port_target_port_string_round_trips_through_typed_decoder() {
 /// mode (proto decoder emits a string when wire says int).
 #[test]
 fn test_service_port_target_port_int_round_trips_through_typed_decoder() {
-    use rusternetes_common::resources::{IntOrString, ServicePort};
+    use k3rs_common::resources::{IntOrString, ServicePort};
 
     let registry = ProtoRegistry::new();
     let mut bytes = Vec::new();

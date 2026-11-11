@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the rusternetes service images once on the host, then `docker
+# Build the k3rs service images once on the host, then `docker
 # save` them to a tarball that every parallel-conformance agent dind
 # loads at start-up. Eliminates the ~5–30 min per-dind cold build.
 #
@@ -27,9 +27,9 @@ fi
 # Compose default project name is the dir basename, so `compose build`
 # tags images as `<dir>-<service>`. Force a stable project name so the
 # tags don't shift if someone renames the worktree.
-export COMPOSE_PROJECT_NAME=rusternetes
+export COMPOSE_PROJECT_NAME=k3rs
 
-echo "==> Building rusternetes service images (compose project: rusternetes)"
+echo "==> Building k3rs service images (compose project: k3rs)"
 # --profile build includes the build-only dns image (runs as an in-cluster
 # Deployment via bootstrap-dns.yaml, not a compose container — the kubelets
 # inside each agent dind need it loaded locally).
@@ -39,20 +39,20 @@ docker compose -f compose.yml --profile build build --parallel
 # is upstream and pulled fresh inside each dind (cheap), no need to
 # tarball it. Same for any future externally-pulled images.
 IMAGES=(
-  rusternetes-api-server
-  rusternetes-scheduler
-  rusternetes-controller-manager
-  rusternetes-kubelet
-  rusternetes-kubelet2
-  rusternetes-kube-proxy
-  rusternetes-dns
+  k3rs-api-server
+  k3rs-scheduler
+  k3rs-controller-manager
+  k3rs-kubelet
+  k3rs-kubelet2
+  k3rs-kube-proxy
+  k3rs-dns
 )
 
 echo "==> Verifying images exist before save"
 for img in "${IMAGES[@]}"; do
   if ! docker image inspect "$img" >/dev/null 2>&1; then
     echo "image $img missing after build — compose tag scheme drifted?" >&2
-    docker image ls | grep -E "rusternetes" || true
+    docker image ls | grep -E "k3rs" || true
     exit 1
   fi
 done

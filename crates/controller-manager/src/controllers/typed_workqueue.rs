@@ -12,7 +12,7 @@
 //!   `max(ItemExponentialFailureRateLimiter(5ms, 1000s),
 //!   BucketRateLimiter(10 qps, 100 burst))`.
 //!
-//! Unlike the string-keyed, async-producer [`rusternetes_storage::WorkQueue`],
+//! Unlike the string-keyed, async-producer [`k3rs_storage::WorkQueue`],
 //! producers here are plain (non-async) methods. Upstream's informer event
 //! handlers call `Add`/`AddAfter` while holding the controller mutex and must
 //! never block; an async producer could not be called from there.

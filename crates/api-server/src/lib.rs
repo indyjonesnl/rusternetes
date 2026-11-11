@@ -1,6 +1,6 @@
 // Modules name the shared process-global state through the extern crate path
-// (`rusternetes_api_server::...`), which `self` aliases here.
-extern crate self as rusternetes_api_server;
+// (`k3rs_api_server::...`), which `self` aliases here.
+extern crate self as k3rs_api_server;
 
 pub mod abac;
 pub mod admission;
@@ -22,7 +22,7 @@ pub mod negotiated_error;
 pub mod node_graph_populator;
 pub mod request_scope;
 pub mod request_timeout;
-pub use rusternetes_admission_webhook as admission_webhook;
+pub use k3rs_admission_webhook as admission_webhook;
 pub mod aggregated_discovery;
 pub mod aggregator_mux;
 pub mod apiserver_identity;
@@ -32,8 +32,8 @@ pub mod bootstrap;
 pub mod crdregistration;
 pub mod kube_openapi;
 pub mod legacy_token_tracking;
-pub use rusternetes_admission_webhook::cel_evaluators as cel;
-pub use rusternetes_middleware::cbor;
+pub use k3rs_admission_webhook::cel_evaluators as cel;
+pub use k3rs_middleware::cbor;
 pub mod apiserver_request_metrics;
 pub mod conversion;
 pub mod deprecation;
@@ -55,7 +55,7 @@ pub mod flow_control_work_estimator;
 pub mod gnostic;
 pub mod handlers;
 pub mod max_in_flight_filter;
-pub use rusternetes_middleware as middleware;
+pub use k3rs_middleware as middleware;
 pub mod openapi;
 pub mod openapi_aggregator;
 pub mod openapiconv;
@@ -66,12 +66,12 @@ pub mod post_start_hooks;
 pub mod prometheus_client;
 pub mod registry;
 pub mod request_header_authentication;
-pub use rusternetes_admission_webhook::service_resolver;
+pub use k3rs_admission_webhook::service_resolver;
 pub mod shared_informer_factory;
 pub mod storage_readiness_hook;
 pub mod upgrade_aware;
 pub mod webhook_transport;
-pub use rusternetes_protobuf as protobuf;
+pub use k3rs_protobuf as protobuf;
 pub mod cache_metrics;
 pub mod cache_watcher;
 pub mod fieldmanager;
@@ -85,10 +85,10 @@ pub mod watch_cache;
 pub mod zpages;
 
 use axum_server::tls_rustls::RustlsConfig;
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::tls::TlsConfig;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::auth::TokenManager;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::tls::TlsConfig;
+use k3rs_storage::StorageBackend;
 use state::ApiServerState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -116,7 +116,7 @@ pub fn resolve_ca_cert_pem(cert_file: Option<&str>, serving_cert_pem: &str) -> S
     }
     candidates.push("/etc/kubernetes/pki/ca.crt".to_string());
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(format!("{home}/.rusternetes/certs/ca.crt"));
+        candidates.push(format!("{home}/.k3rs/certs/ca.crt"));
     }
 
     for path in &candidates {
@@ -174,7 +174,7 @@ pub fn prepare_tls_for_config(
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
-        TlsConfig::generate_self_signed("rusternetes-api", sans)?
+        TlsConfig::generate_self_signed("k3rs-api", sans)?
     } else {
         anyhow::bail!("TLS enabled but no certificate provided");
     };
@@ -209,7 +209,7 @@ pub struct ApiServerConfig {
     pub jwt_secret: String,
     /// `--service-account-key-file` / `--service-account-signing-key-file` /
     /// `--service-account-issuer` / `--api-audiences` (#1575).
-    pub service_account: rusternetes_common::auth::ServiceAccountOptions,
+    pub service_account: k3rs_common::auth::ServiceAccountOptions,
     pub tls: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
@@ -347,7 +347,7 @@ pub struct ServiceAccountArgs {
 }
 
 fn parse_go_duration_arg(s: &str) -> std::result::Result<std::time::Duration, String> {
-    let ns = rusternetes_common::go_duration::parse_go_duration(s)?;
+    let ns = k3rs_common::go_duration::parse_go_duration(s)?;
     // A negative duration is below the 1h lower bound upstream rejects; map it
     // to zero here would silently mean "unset", so refuse it at parse time.
     u64::try_from(ns)
@@ -372,8 +372,8 @@ impl Default for ServiceAccountArgs {
 }
 
 impl ServiceAccountArgs {
-    pub fn to_options(&self) -> rusternetes_common::auth::ServiceAccountOptions {
-        rusternetes_common::auth::ServiceAccountOptions {
+    pub fn to_options(&self) -> k3rs_common::auth::ServiceAccountOptions {
+        k3rs_common::auth::ServiceAccountOptions {
             key_files: self.service_account_key_file.clone(),
             signing_key_file: self.service_account_signing_key_file.clone(),
             issuers: self.service_account_issuer.clone(),
@@ -392,7 +392,7 @@ impl Default for ApiServerConfig {
             bind_address: "0.0.0.0:6443".to_string(),
             advertise_address: None,
             external_hostname: None,
-            jwt_secret: "rusternetes-secret-change-in-production".to_string(),
+            jwt_secret: "k3rs-secret-change-in-production".to_string(),
             service_account: Default::default(),
             tls: false,
             tls_cert_file: None,
@@ -481,7 +481,7 @@ pub fn install_server_options(config: &ApiServerConfig) -> anyhow::Result<()> {
     ));
     // The webhook client's dial: `NewDefaultAuthenticationInfoResolverWrapper`
     // (util/webhook/authentication.go:46), built from the same egress selector.
-    rusternetes_admission_webhook::transport::set_transport(std::sync::Arc::new(
+    k3rs_admission_webhook::transport::set_transport(std::sync::Arc::new(
         webhook_transport::EgressWebhookTransport::new(egress_selector::egress_selector()),
     ));
     Ok(())
@@ -492,7 +492,7 @@ pub fn install_server_options(config: &ApiServerConfig) -> anyhow::Result<()> {
 /// This is the main entry point for embedding the API server in the all-in-one binary.
 /// Starts the HTTPS/HTTP server and blocks until shutdown.
 pub async fn run(storage: Arc<StorageBackend>, mut config: ApiServerConfig) -> anyhow::Result<()> {
-    info!("Starting Rusternetes API Server");
+    info!("Starting k3rs API Server");
 
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =

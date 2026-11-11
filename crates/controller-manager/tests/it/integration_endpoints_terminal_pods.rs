@@ -31,13 +31,13 @@
 //! TDD pins.
 
 use chrono::Utc;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerStatus, Endpoints, IntOrString, Pod, PodCondition, PodSpec, PodStatus,
     Service, ServicePort, ServiceSpec, ServiceType,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::endpoints::EndpointsController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::endpoints::EndpointsController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

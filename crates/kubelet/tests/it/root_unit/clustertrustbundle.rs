@@ -3,9 +3,9 @@
 
 mod __parent {
     pub use anyhow::{anyhow, Result};
-    pub use rusternetes_common::resources::ClusterTrustBundle;
-    pub use rusternetes_common::types::{label_selector_as_selector, LabelSelector};
-    pub use rusternetes_storage::{build_key, build_prefix, Storage};
+    pub use k3rs_common::resources::ClusterTrustBundle;
+    pub use k3rs_common::types::{label_selector_as_selector, LabelSelector};
+    pub use k3rs_storage::{build_key, build_prefix, Storage};
     pub use std::collections::BTreeSet;
     pub use std::hash::BuildHasher;
     pub use std::sync::OnceLock;
@@ -13,8 +13,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::clustertrustbundle::*;
-    use rusternetes_storage::StorageBackend;
+    use k3rs_kubelet::clustertrustbundle::*;
+    use k3rs_storage::StorageBackend;
     use std::collections::HashMap;
 
     /// A syntactically valid PEM `CERTIFICATE` block. `diffBundles`-style

@@ -4,9 +4,9 @@
 mod __parent {
     pub use anyhow::{Context, Result};
     pub use base64::Engine;
-    pub use rusternetes_client::http::ApiClient;
-    pub use rusternetes_kubectl::discovery::RestMapper;
-    pub use rusternetes_kubectl::types::{CreateCommands, SecretCommands, ServiceCommands};
+    pub use k3rs_client::http::ApiClient;
+    pub use k3rs_kubectl::discovery::RestMapper;
+    pub use k3rs_kubectl::types::{CreateCommands, SecretCommands, ServiceCommands};
     pub use serde_json::{json, Value};
     pub use std::collections::BTreeMap;
     pub use std::fs;
@@ -15,7 +15,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::create::*;
+    use k3rs_kubectl::commands::create::*;
 
     // 1. build_cluster_role — basic with verbs/resources
     #[test]

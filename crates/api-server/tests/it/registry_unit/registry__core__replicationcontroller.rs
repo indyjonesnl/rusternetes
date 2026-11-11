@@ -2,30 +2,30 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GarbageCollectionPolicy, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_api_server::registry::scale::{Scalable, ScaleRest};
-    pub use rusternetes_common::equality::semantic_equal;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_api_server::registry::scale::{Scalable, ScaleRest};
+    pub use k3rs_common::equality::semantic_equal;
+    pub use k3rs_common::resources::{
         ReplicationController, ReplicationControllerStatus, Scale, ScaleSpec, ScaleStatus,
     };
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_label;
-    pub use rusternetes_common::validation::replicationcontroller::{
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_label;
+    pub use k3rs_common::validation::replicationcontroller::{
         validate_replication_controller, validate_replication_controller_status_update,
         validate_replication_controller_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::replicationcontroller::*;
+    use k3rs_api_server::registry::core::replicationcontroller::*;
     use std::collections::HashMap;
 
     fn rc() -> ReplicationController {

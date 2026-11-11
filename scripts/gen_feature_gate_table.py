@@ -20,7 +20,7 @@ def main() -> None:
     sha = sys.argv[1]
     gates = json.load(sys.stdin)
     # AllAlpha / AllBeta are the specials `NewVersionedFeatureGate` seeds into
-    # `known` (feature_gate.go:305-318); rusternetes handles them in
+    # `known` (feature_gate.go:305-318); k3rs handles them in
     # resolve_gates, not as table rows.
     gates = [g for g in gates if g["name"] not in ("AllAlpha", "AllBeta")]
     out = []

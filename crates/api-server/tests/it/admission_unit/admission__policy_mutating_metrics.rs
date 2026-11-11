@@ -9,7 +9,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_mutating_metrics::*;
+    use k3rs_api_server::admission::policy_mutating_metrics::*;
 
     fn check(policy: &str, binding: &str, et: MutationErrorType) -> (u64, u64, f64) {
         let l = [policy, binding, et.as_str()];

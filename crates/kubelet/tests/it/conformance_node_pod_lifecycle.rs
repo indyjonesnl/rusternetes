@@ -10,7 +10,7 @@
 //!   - `pkg/api/v1/pod/util.go::GetContainerImagePullPolicy` — default
 //!     `imagePullPolicy` derivation from an image reference.
 
-use rusternetes_kubelet::lifecycle::{
+use k3rs_kubelet::lifecycle::{
     default_image_pull_policy, image_action, terminal_pod_phase, ImageAction,
 };
 

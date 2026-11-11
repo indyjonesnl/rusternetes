@@ -1,4 +1,4 @@
-//! Rusternetes port of upstream
+//! k3rs port of upstream
 //! `k8s.io/apimachinery/pkg/apis/meta/v1/validation/validation.go`
 //! (release-1.35).
 //!

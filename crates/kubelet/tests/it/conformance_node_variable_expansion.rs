@@ -21,13 +21,13 @@
 
 use std::collections::HashMap;
 
-use rusternetes_common::resources::pod::{EnvVar, VolumeMount};
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::cri_runtime::translate;
+use k3rs_common::resources::pod::{EnvVar, VolumeMount};
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::cri_runtime::translate;
 
 const VOLUME: &str = "workdir1";
-const HOST_ROOT: &str = "/var/lib/rusternetes/volumes/pod-uid/workdir1";
+const HOST_ROOT: &str = "/var/lib/k3rs/volumes/pod-uid/workdir1";
 
 fn env(name: &str, value: &str) -> EnvVar {
     EnvVar {
@@ -77,7 +77,7 @@ fn host_paths() -> HashMap<String, String> {
     HashMap::from([(VOLUME.to_string(), HOST_ROOT.to_string())])
 }
 
-fn build(pod: &Pod) -> Result<rusternetes_cri::v1::ContainerConfig, String> {
+fn build(pod: &Pod) -> Result<k3rs_cri::v1::ContainerConfig, String> {
     let container = &pod.spec.as_ref().unwrap().containers[0];
     translate::container_config(
         pod,

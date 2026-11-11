@@ -7,7 +7,7 @@ the real thing.
 
 - Built only from a local Kubernetes checkout's vendored sources (`GOPROXY=off`,
   `-mod=vendor`); nothing is downloaded.
-- Never shipped, never linked into a Rusternetes binary, not part of the Cargo
+- Never shipped, never linked into a k3rs binary, not part of the Cargo
   workspace or the default `cargo test`.
 
 ```bash
@@ -19,7 +19,7 @@ K8S_SRC=/path/to/kubernetes tools/cel-oracle/build.sh /tmp/celoracle
 CEL_ORACLE=/tmp/celoracle tools/cel-oracle/gen-goldens.sh
 
 # check that the checked-in goldens are what the oracle says today
-CEL_ORACLE=/tmp/celoracle cargo nextest run -p rusternetes-cel-checker --run-ignored only
+CEL_ORACLE=/tmp/celoracle cargo nextest run -p k3rs-cel-checker --run-ignored only
 ```
 
 Normal test runs compare the Rust checker with the checked-in goldens

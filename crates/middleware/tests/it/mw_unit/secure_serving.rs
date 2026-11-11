@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use axum::Router;
-    pub use rusternetes_middleware::secure_serving::options::{
+    pub use k3rs_middleware::secure_serving::options::{
         AuthenticationFlags, AuthorizationFlags, DelegatingAuthenticationOptions,
         DelegatingAuthorizationOptions, SecureServingFlags, SecureServingOptions,
     };
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_middleware::secure_serving::*;
+    use k3rs_middleware::secure_serving::*;
 
     // kcm options.go:233-238 / scheduler options.go:119-128
     #[test]

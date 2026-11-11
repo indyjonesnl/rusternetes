@@ -1,9 +1,9 @@
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     EndpointAddress, EndpointPort, EndpointReference, EndpointSlice, EndpointSubset, Endpoints,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::endpointslice::EndpointSliceController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::endpointslice::EndpointSliceController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::sync::Arc;
 
 fn create_test_endpoints(
@@ -684,15 +684,13 @@ async fn test_externally_created_endpointslice_not_deleted() {
     // Note: no "endpointslice.kubernetes.io/managed-by" label set to our controller
     external_slice
         .endpoints
-        .push(rusternetes_common::resources::endpointslice::Endpoint {
+        .push(k3rs_common::resources::endpointslice::Endpoint {
             addresses: vec!["10.244.1.50".to_string()],
-            conditions: Some(
-                rusternetes_common::resources::endpointslice::EndpointConditions {
-                    ready: Some(true),
-                    serving: Some(true),
-                    terminating: Some(false),
-                },
-            ),
+            conditions: Some(k3rs_common::resources::endpointslice::EndpointConditions {
+                ready: Some(true),
+                serving: Some(true),
+                terminating: Some(false),
+            }),
             hostname: None,
             target_ref: None,
             node_name: None,
@@ -702,7 +700,7 @@ async fn test_externally_created_endpointslice_not_deleted() {
         });
     external_slice
         .ports
-        .push(rusternetes_common::resources::endpointslice::EndpointPort {
+        .push(k3rs_common::resources::endpointslice::EndpointPort {
             name: Some("http".to_string()),
             port: Some(80),
             protocol: "TCP".to_string(),

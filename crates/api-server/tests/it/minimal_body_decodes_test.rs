@@ -12,7 +12,7 @@
 //! 422 spec.selector: Required value
 //! ```
 //!
-//! Rusternetes answered 400 BadRequest to that body for thirty-seven of the
+//! k3rs answered 400 BadRequest to that body for thirty-seven of the
 //! sixty-one creatable resources, because the Rust field was a bare non-`Option`
 //! with no `#[serde(default)]`:
 //!
@@ -28,7 +28,7 @@
 //! The sweep enumerates resources from the server's own discovery, so a
 //! resource added later is covered without editing this file.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

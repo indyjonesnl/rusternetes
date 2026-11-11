@@ -28,10 +28,10 @@
 //! `preemptionPolicy: Never` pins that used to live here as `#[ignore]`d
 //! controller tests (issue #1033).
 
-use rusternetes_common::resources::{Container, Pod, PodSpec, PriorityClass};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::priorityclass::PriorityClassController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Container, Pod, PodSpec, PriorityClass};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::priorityclass::PriorityClassController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

@@ -6,11 +6,11 @@
 //! test-only `list_bytes_max` / `contains_string` overrides.
 
 use cel::parser::Parser;
-use rusternetes_cel_checker::cost::{
+use k3rs_cel_checker::cost::{
     cost, AstNode, CallEstimate, CostEstimate, CostEstimator, CostOptions, SizeEstimate,
 };
-use rusternetes_cel_checker::overload_ids::TIMESTAMP_TO_YEAR;
-use rusternetes_cel_checker::{
+use k3rs_cel_checker::overload_ids::TIMESTAMP_TO_YEAR;
+use k3rs_cel_checker::{
     check, Container, DType, Env, MapProvider, NoLocations, Options, VariableDecl,
 };
 use std::collections::HashMap;

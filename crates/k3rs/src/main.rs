@@ -1,16 +1,16 @@
-//! Rusternetes — all-in-one Kubernetes in a single binary.
+//! k3rs — all-in-one Kubernetes in a single binary.
 //!
 //! Runs the API server, scheduler, controller manager, kubelet, kube-proxy,
 //! and cluster DNS as concurrent tokio tasks sharing a single storage backend.
 //!
 //! Usage:
-//!   rusternetes                                   # SQLite at ./data/rusternetes.db
-//!   rusternetes --data-dir /var/lib/rusternetes.db # custom path
-//!   rusternetes --etcd-servers http://etcd:2379    # use etcd instead
+//!   k3rs                                   # SQLite at ./data/k3rs.db
+//!   k3rs --data-dir /var/lib/k3rs.db # custom path
+//!   k3rs --etcd-servers http://etcd:2379    # use etcd instead
 
 use anyhow::Result;
 use clap::Parser;
-use rusternetes_storage::{StorageBackend, StorageConfig};
+use k3rs_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -31,8 +31,8 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(name = "rusternetes")]
-#[command(about = "Rusternetes — all-in-one Kubernetes in a single binary")]
+#[command(name = "k3rs")]
+#[command(about = "k3rs — all-in-one Kubernetes in a single binary")]
 #[command(version)]
 struct Args {
     /// Comma-separated `[component:]Gate=bool` pairs, e.g.
@@ -62,7 +62,7 @@ struct Args {
     storage_backend: String,
 
     /// SQLite database path (only used when --storage-backend=sqlite)
-    #[arg(long, default_value = "./data/rusternetes.db")]
+    #[arg(long, default_value = "./data/k3rs.db")]
     data_dir: String,
 
     /// Enable the in-process watch event bus (all-in-one fast path, #1039).
@@ -100,12 +100,12 @@ struct Args {
     /// `pkg/controller/apis/config/v1alpha1/defaults.go:59`). One limiter per
     /// controller, not shared (#1863); same flag and default as the
     /// standalone controller-manager. `<= 0` disables client-side throttling.
-    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_QPS)]
+    #[arg(long, default_value_t = k3rs_client::ratelimit::CONTROLLER_MANAGER_QPS)]
     kube_api_qps: f64,
 
     /// Burst each embedded controller's api client may send at once (upstream
     /// `--kube-api-burst`, default 30: `defaults.go:62`).
-    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_BURST)]
+    #[arg(long, default_value_t = k3rs_client::ratelimit::CONTROLLER_MANAGER_BURST)]
     kube_api_burst: f64,
 
     /// Run the CSI half of the AttachDetachController (#3048). Off by default;
@@ -138,7 +138,7 @@ struct Args {
     cluster_dns: String,
 
     /// Container network name
-    #[arg(long, default_value = "rusternetes-network")]
+    #[arg(long, default_value = "k3rs-network")]
     network: String,
 
     /// Enable TLS with self-signed certificates
@@ -238,7 +238,7 @@ struct Args {
     /// (`--service-cluster-ip-range`). Handed to the embedded api-server; the
     /// `kubernetes` Service address and the kubelet's
     /// `KUBERNETES_SERVICE_HOST` derive from its first address.
-    #[arg(long, default_value = rusternetes_api_server::registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE)]
+    #[arg(long, default_value = k3rs_api_server::registry::core::service::ipranges::DEFAULT_SERVICE_CLUSTER_IP_RANGE)]
     service_cluster_ip_range: String,
 
     /// `--enable-aggregator-routing`: turns on aggregator routing requests to
@@ -262,7 +262,7 @@ struct Args {
 
     /// NodePort range in iptables `start:end` form — must match the
     /// apiserver's `--service-node-port-range`. Hyphen also accepted.
-    #[arg(long, default_value = rusternetes_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE)]
+    #[arg(long, default_value = k3rs_kube_proxy::iptables::DEFAULT_NODEPORT_RANGE)]
     node_port_range: String,
 
     /// Skip authentication (insecure, for development)
@@ -274,8 +274,8 @@ struct Args {
     disable_proxy: bool,
 
     /// Disable the in-process DNS server (fall back to the standalone
-    /// rusternetes-dns container, or to the CoreDNS Pod from
-    /// bootstrap-cluster.yaml when USE_RUSTERNETES_DNS=0).
+    /// k3rs-dns container, or to the CoreDNS Pod from
+    /// bootstrap-cluster.yaml when USE_K3RS_DNS=0).
     #[arg(long)]
     disable_dns: bool,
 
@@ -303,26 +303,25 @@ struct Args {
     #[arg(
         long,
         default_value = "1h",
-        value_parser = rusternetes_api_server::registry::core::event::parse_event_ttl
+        value_parser = k3rs_api_server::registry::core::event::parse_event_ttl
     )]
     event_ttl: u64,
 
     /// `--service-account-*` / `--api-audiences` (#2713).
     #[command(flatten)]
-    service_account: rusternetes_api_server::ServiceAccountArgs,
+    service_account: k3rs_api_server::ServiceAccountArgs,
 
     /// `--authorization-mode` (#2854).
     #[command(flatten)]
-    authorization: rusternetes_api_server::authorizer::AuthorizationArgs,
+    authorization: k3rs_api_server::authorizer::AuthorizationArgs,
 
     /// `--enable-admission-plugins` / `--disable-admission-plugins` /
     /// `--admission-control` (#3415).
     #[command(flatten)]
-    admission: rusternetes_api_server::admission::plugins::AdmissionArgs,
+    admission: k3rs_api_server::admission::plugins::AdmissionArgs,
     /// `--requestheader-*` front-proxy authentication (#3414).
     #[command(flatten)]
-    request_header:
-        rusternetes_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
+    request_header: k3rs_api_server::request_header_authentication::RequestHeaderAuthenticationArgs,
 }
 
 fn main() -> Result<()> {
@@ -351,7 +350,7 @@ fn main() -> Result<()> {
 /// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()` then
 /// `Validate()` (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
 fn apply_feature_gates(args: &Args) -> Result<()> {
-    let effective_version = rusternetes_common::compatibility::apply_flags(
+    let effective_version = k3rs_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
@@ -360,8 +359,8 @@ fn apply_feature_gates(args: &Args) -> Result<()> {
     // `ComponentGlobalsRegistry.AddMetrics()` as in each component's server.go
     // (kube-apiserver :116, kube-controller-manager :146, kube-scheduler :165);
     // component-base/compatibility/registry.go:123-131: record `version_info`.
-    rusternetes_common::compat_version_metrics::add_metrics(
-        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+    k3rs_common::compat_version_metrics::add_metrics(
+        k3rs_common::compatibility::DEFAULT_KUBE_COMPONENT,
         &effective_version,
     );
     Ok(())
@@ -385,9 +384,8 @@ fn spawn_controller_manager_metrics(port: u16) {
         return;
     }
     tokio::spawn(async move {
-        let app = controller_manager_metrics_router(
-            rusternetes_controller_manager::controllers::gather_metrics,
-        );
+        let app =
+            controller_manager_metrics_router(k3rs_controller_manager::controllers::gather_metrics);
         let addr = format!("0.0.0.0:{port}");
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
@@ -402,18 +400,18 @@ fn spawn_controller_manager_metrics(port: u16) {
 }
 
 /// Build the embedded scheduler config, loading `--scheduler-config` when set.
-fn scheduler_config_from_args(args: &Args) -> Result<rusternetes_scheduler::SchedulerConfig> {
+fn scheduler_config_from_args(args: &Args) -> Result<k3rs_scheduler::SchedulerConfig> {
     let profiles = match &args.scheduler_config {
-        Some(path) => rusternetes_scheduler::scheduler_config::load_profiles(path)
+        Some(path) => k3rs_scheduler::scheduler_config::load_profiles(path)
             .map_err(|e| anyhow::anyhow!("--scheduler-config: {e}"))?,
-        None => rusternetes_scheduler::profile::Map::new_map(vec![
-            rusternetes_scheduler::profile::Profile::named(
-                rusternetes_scheduler::profile::DEFAULT_SCHEDULER_NAME,
-            ),
-        ])
-        .map_err(|e| anyhow::anyhow!(e))?,
+        None => {
+            k3rs_scheduler::profile::Map::new_map(vec![k3rs_scheduler::profile::Profile::named(
+                k3rs_scheduler::profile::DEFAULT_SCHEDULER_NAME,
+            )])
+            .map_err(|e| anyhow::anyhow!(e))?
+        }
     };
-    Ok(rusternetes_scheduler::SchedulerConfig {
+    Ok(k3rs_scheduler::SchedulerConfig {
         interval: args.scheduler_interval,
         profiles,
     })
@@ -435,13 +433,13 @@ async fn async_main() -> Result<()> {
     // Built before `args` is partially moved below.
     let pv_recycler = recycler_config_from_args(&args)?;
 
-    rusternetes_common::tracing::init_basic_tracing("rusternetes", &args.log_level)?;
+    k3rs_common::tracing::init_basic_tracing("k3rs", &args.log_level)?;
 
-    rusternetes_common::dump::install_panic_hook("rusternetes");
+    k3rs_common::dump::install_panic_hook("k3rs");
 
     info!(
-        "Starting Rusternetes (all-in-one) {}",
-        rusternetes_common::build_info::version_line()
+        "Starting k3rs (all-in-one) {}",
+        k3rs_common::build_info::version_line()
     );
 
     // Initialize storage — all components share one instance
@@ -490,14 +488,14 @@ async fn async_main() -> Result<()> {
     // --- API Server ---
     // `validateClusterIPFlags`: refuse to start on a bad range.
     let service_ranges =
-        rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
+        k3rs_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
             &args.service_cluster_ip_range,
         )
         .map_err(|e| anyhow::anyhow!(e))?;
     // Thread --event-ttl to every in-process EventRecorder (#3026).
-    rusternetes_storage::event_recorder::set_process_event_ttl(args.event_ttl);
+    k3rs_storage::event_recorder::set_process_event_ttl(args.event_ttl);
     let api_storage = storage.clone();
-    let mut api_config = rusternetes_api_server::ApiServerConfig {
+    let mut api_config = k3rs_api_server::ApiServerConfig {
         bind_address: args.bind_address.clone(),
         tls: args.tls,
         tls_cert_file: args.tls_cert_file.clone(),
@@ -519,13 +517,13 @@ async fn async_main() -> Result<()> {
         request_header: args.request_header.clone(),
         ..Default::default()
     };
-    let prepared_tls = rusternetes_api_server::prepare_tls_for_config(&api_config)?;
+    let prepared_tls = k3rs_api_server::prepare_tls_for_config(&api_config)?;
     let cm_ca_pem = prepared_tls
         .as_ref()
         .and_then(|prepared| prepared.ca_cert_pem().map(str::to_string));
     api_config.prepared_tls = prepared_tls;
     let api_handle = tokio::spawn(async move {
-        if let Err(e) = rusternetes_api_server::run(api_storage, api_config).await {
+        if let Err(e) = k3rs_api_server::run(api_storage, api_config).await {
             error!("API server error: {}", e);
         }
     });
@@ -550,15 +548,13 @@ async fn async_main() -> Result<()> {
 
     // --- Scheduler ---
     let sched_client = Arc::new(
-        rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+        k3rs_client::http::ApiClient::new(&loopback_url, args.tls, None)?
             // `rest.SetKubernetesDefaults`: the component's default User-Agent.
-            .with_default_user_agent(
-                rusternetes_common::compatibility::default_kubernetes_user_agent(),
-            ),
+            .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent()),
     );
     info!("Scheduler reading cluster state from embedded api-server at {loopback_url}");
     tokio::spawn(async move {
-        if let Err(e) = rusternetes_scheduler::run_with_api(sched_client, sched_config).await {
+        if let Err(e) = k3rs_scheduler::run_with_api(sched_client, sched_config).await {
             error!("Scheduler error: {}", e);
         }
     });
@@ -571,7 +567,7 @@ async fn async_main() -> Result<()> {
         .as_ref()
         .zip(args.tls_key_file.as_ref())
         .map(|(cert, key)| {
-            rusternetes_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
+            k3rs_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
                 api_server_url: format!("https://127.0.0.1:{api_port}"),
                 ca_pem: None,
                 ca_cert_path: Some(args.client_ca_file.clone().unwrap_or_else(|| cert.clone())),
@@ -593,7 +589,7 @@ async fn async_main() -> Result<()> {
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
+    let cm_config = k3rs_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
         // `newPersistentVolumeBinderController` (core.go:322-325): a bad
         // recycler template aborts startup.
@@ -608,41 +604,39 @@ async fn async_main() -> Result<()> {
         bootstrap_signer_controller: args.bootstrap_signer_controller,
         selinux_warning_controller: false,
         terminated_pod_gc_threshold:
-            rusternetes_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
+            k3rs_controller_manager::controllers::podgc::DEFAULT_TERMINATED_POD_GC_THRESHOLD,
         token_cleaner_controller: args.token_cleaner_controller,
         service_cluster_ip_range: args.service_cluster_ip_range.clone(),
         legacy_sa_token_clean_up_period:
-            rusternetes_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
+            k3rs_controller_manager::controllers::legacy_serviceaccount_token_cleaner::DEFAULT_CLEAN_UP_PERIOD,
     };
     // The controller-manager reaches cluster state through the embedded
     // api-server over the same loopback client as scheduler/DNS (#1128),
     // rather than the StorageBackend directly.
     let cm_client = Arc::new(
-        rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+        k3rs_client::http::ApiClient::new(&loopback_url, args.tls, None)?
             // The SKELETON: `run_with_api` clones it once per controller and
             // each clone gets its own limiter at this QPS/burst
             // (`clientbuilder/client_builder.go:40-47`).
             .with_rate_limit(args.kube_api_qps, args.kube_api_burst)
             // `rest.SetKubernetesDefaults`; each controller's clone appends
             // its name (`AddUserAgent`).
-            .with_default_user_agent(
-                rusternetes_common::compatibility::default_kubernetes_user_agent(),
-            ),
+            .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent()),
     );
     info!("Controller manager reading cluster state from embedded api-server at {loopback_url}");
     spawn_controller_manager_metrics(args.controller_manager_metrics_port);
     tokio::spawn(async move {
-        if let Err(e) = rusternetes_controller_manager::run_with_api(cm_client, cm_config).await {
+        if let Err(e) = k3rs_controller_manager::run_with_api(cm_client, cm_config).await {
             error!("Controller manager error: {}", e);
         }
     });
 
     // Pod networking is provided entirely by the CNI plugin (via the
-    // kubelet's CRI backend); rusternetes runs no in-process network stack.
+    // kubelet's CRI backend); k3rs runs no in-process network stack.
 
     // --- Kubelet ---
     let kubelet_storage = storage.clone();
-    let kubelet_config = rusternetes_kubelet::KubeletConfig {
+    let kubelet_config = k3rs_kubelet::KubeletConfig {
         node_name: args.node_name.clone(),
         volume_dir: args.volume_dir,
         cluster_dns: args.cluster_dns,
@@ -661,7 +655,7 @@ async fn async_main() -> Result<()> {
             .unwrap_or_else(|| service_ranges.api_server_service_ip().to_string()),
     };
     tokio::spawn(async move {
-        if let Err(e) = rusternetes_kubelet::run(kubelet_storage, kubelet_config).await {
+        if let Err(e) = k3rs_kubelet::run(kubelet_storage, kubelet_config).await {
             error!("Kubelet error: {}", e);
         }
     });
@@ -669,7 +663,7 @@ async fn async_main() -> Result<()> {
     // --- Kube-proxy ---
     if !args.disable_proxy {
         let proxy_storage = storage.clone();
-        let proxy_config = rusternetes_kube_proxy::KubeProxyConfig {
+        let proxy_config = k3rs_kube_proxy::KubeProxyConfig {
             node_name: args.node_name,
             sync_interval: args.proxy_sync_interval,
             cluster_cidr: args
@@ -684,11 +678,10 @@ async fn async_main() -> Result<()> {
             // image's cluster-wide CNI config keeps applying (#1691).
             node_net: None,
             // MetricsBindAddress default (defaults.go:52-56).
-            metrics_bind_address:
-                rusternetes_kube_proxy::serve_metrics::default_metrics_bind_address(""),
+            metrics_bind_address: k3rs_kube_proxy::serve_metrics::default_metrics_bind_address(""),
         };
         tokio::spawn(async move {
-            if let Err(e) = rusternetes_kube_proxy::run(proxy_storage, proxy_config).await {
+            if let Err(e) = k3rs_kube_proxy::run(proxy_storage, proxy_config).await {
                 error!("Kube-proxy error: {}", e);
             }
         });
@@ -702,24 +695,24 @@ async fn async_main() -> Result<()> {
             .dns_bind
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid --dns-bind {:?}: {}", args.dns_bind, e))?;
-        let dns_config = rusternetes_dns::DnsConfig {
+        let dns_config = k3rs_dns::DnsConfig {
             udp_bind: dns_bind,
             tcp_bind: dns_bind,
-            ..rusternetes_dns::DnsConfig::default()
+            ..k3rs_dns::DnsConfig::default()
         };
         // DNS reaches cluster state through the embedded api-server over
         // loopback rather than the StorageBackend directly (see the loopback
         // client note above the scheduler block, #1128).
         let dns_client = Arc::new(
-            rusternetes_client::http::ApiClient::new(&loopback_url, args.tls, None)?
+            k3rs_client::http::ApiClient::new(&loopback_url, args.tls, None)?
                 // `rest.SetKubernetesDefaults`: the component's default User-Agent.
                 .with_default_user_agent(
-                    rusternetes_common::compatibility::default_kubernetes_user_agent(),
+                    k3rs_common::compatibility::default_kubernetes_user_agent(),
                 ),
         );
         info!("DNS reading cluster state from embedded api-server at {loopback_url}");
         tokio::spawn(async move {
-            if let Err(e) = rusternetes_dns::run_with_api(dns_client, dns_config).await {
+            if let Err(e) = k3rs_dns::run_with_api(dns_client, dns_config).await {
                 error!("DNS server error: {}", e);
             }
         });
@@ -730,7 +723,7 @@ async fn async_main() -> Result<()> {
     info!("All components started");
 
     // The API server task blocks on its listener — wait for it or ctrl-c
-    let shutdown_ctx = rusternetes_common::signal::setup_signal_context();
+    let shutdown_ctx = k3rs_common::signal::setup_signal_context();
     tokio::select! {
         result = api_handle => {
             if let Err(e) = result {
@@ -738,7 +731,7 @@ async fn async_main() -> Result<()> {
             }
         }
         _ = shutdown_ctx.cancelled() => {
-            info!("Received shutdown signal, stopping rusternetes");
+            info!("Received shutdown signal, stopping k3rs");
         }
     }
 
@@ -750,10 +743,10 @@ async fn async_main() -> Result<()> {
 /// probes the volume plugins; failure aborts startup.
 /// kube-proxy's ClusterIP CIDR when `--cluster-cidr` is unset: the IPv4 entry
 /// of the service ranges (kube-proxy programs iptables only), else the primary.
-/// Rusternetes-only: upstream kube-proxy has no service-range flag (it learns
+/// k3rs-only: upstream kube-proxy has no service-range flag (it learns
 /// ClusterIPs from the Services themselves), so there is no Go source to port.
 fn kube_proxy_cluster_cidr(
-    ranges: &rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges,
+    ranges: &k3rs_api_server::registry::core::service::ipranges::ServiceIpRanges,
 ) -> String {
     let cidrs = ranges.cidrs();
     cidrs
@@ -761,13 +754,13 @@ fn kube_proxy_cluster_cidr(
         .find(|c| !c.contains(':'))
         .or_else(|| cidrs.first())
         .cloned()
-        .unwrap_or_else(|| rusternetes_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string())
+        .unwrap_or_else(|| k3rs_kube_proxy::iptables::DEFAULT_CLUSTER_CIDR.to_string())
 }
 
 fn recycler_config_from_args(
     args: &Args,
-) -> anyhow::Result<rusternetes_controller_manager::controllers::pv_recycler::RecyclerConfig> {
-    use rusternetes_controller_manager::controllers::pv_recycler::{
+) -> anyhow::Result<k3rs_controller_manager::controllers::pv_recycler::RecyclerConfig> {
+    use k3rs_controller_manager::controllers::pv_recycler::{
         PersistentVolumeRecyclerConfiguration, RecyclerConfig,
     };
     RecyclerConfig::from_configuration(&PersistentVolumeRecyclerConfiguration {
@@ -794,7 +787,7 @@ mod pv_recycler_flag_tests {
     /// `--pv-recycler-timeout-increment-hostpath`).
     #[test]
     fn recycler_flags_parse_with_upstream_names_and_defaults() {
-        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        let a = Args::try_parse_from(["k3rs"]).unwrap();
         assert_eq!(a.pv_recycler_minimum_timeout_nfs, 300);
         assert_eq!(a.pv_recycler_increment_timeout_nfs, 30);
         assert_eq!(a.pv_recycler_minimum_timeout_hostpath, 60);
@@ -802,7 +795,7 @@ mod pv_recycler_flag_tests {
         assert_eq!(a.pv_recycler_pod_template_filepath_nfs, "");
         assert_eq!(a.pv_recycler_pod_template_filepath_hostpath, "");
         let a = Args::try_parse_from([
-            "rusternetes",
+            "k3rs",
             "--pv-recycler-minimum-timeout-nfs=1",
             "--pv-recycler-increment-timeout-nfs=2",
             "--pv-recycler-minimum-timeout-hostpath=3",
@@ -822,7 +815,7 @@ mod pv_recycler_flag_tests {
     #[test]
     fn recycler_timeouts_reach_config() {
         let a = Args::try_parse_from([
-            "rusternetes",
+            "k3rs",
             "--pv-recycler-minimum-timeout-nfs=11",
             "--pv-recycler-timeout-increment-hostpath=7",
         ])
@@ -836,7 +829,7 @@ mod pv_recycler_flag_tests {
     #[test]
     fn bad_template_file_aborts_startup() {
         let a = Args::try_parse_from([
-            "rusternetes",
+            "k3rs",
             "--pv-recycler-pod-template-filepath-nfs=/nonexistent/pod.yaml",
         ])
         .unwrap();
@@ -850,11 +843,11 @@ mod pv_recycler_flag_tests {
 #[cfg(test)]
 mod feature_gates_flag_tests {
     use super::*;
-    use rusternetes_common::feature_gates::{enabled, reset_to_defaults, Feature};
+    use k3rs_common::feature_gates::{enabled, reset_to_defaults, Feature};
     use serial_test::serial;
 
     fn parse(gates: &str) -> Args {
-        let mut v: Vec<&str> = vec!["rusternetes"];
+        let mut v: Vec<&str> = vec!["k3rs"];
         v.push(gates);
         Args::try_parse_from(v).unwrap()
     }
@@ -896,8 +889,8 @@ mod feature_gates_flag_tests {
             "profiles:\n- pluginConfig:\n  - name: VolumeBinding\n    args:\n      bindTimeoutSeconds: 7\n",
         )
         .unwrap();
-        let args = Args::try_parse_from(["rusternetes", "--scheduler-config", f.to_str().unwrap()])
-            .unwrap();
+        let args =
+            Args::try_parse_from(["k3rs", "--scheduler-config", f.to_str().unwrap()]).unwrap();
         let cfg = scheduler_config_from_args(&args).unwrap();
         assert_eq!(
             cfg.profiles
@@ -922,10 +915,9 @@ mod controller_manager_metrics_tests {
     /// default `ports.KubeControllerManagerPort` = 10257), 0 disables it.
     #[test]
     fn metrics_port_flag_defaults_to_10257() {
-        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        let a = Args::try_parse_from(["k3rs"]).unwrap();
         assert_eq!(a.controller_manager_metrics_port, 10257);
-        let a = Args::try_parse_from(["rusternetes", "--controller-manager-metrics-port", "0"])
-            .unwrap();
+        let a = Args::try_parse_from(["k3rs", "--controller-manager-metrics-port", "0"]).unwrap();
         assert_eq!(a.controller_manager_metrics_port, 0);
     }
 
@@ -962,7 +954,7 @@ mod controller_manager_metrics_tests {
 #[cfg(test)]
 mod kube_proxy_cluster_cidr_tests {
     use super::*;
-    use rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges;
+    use k3rs_api_server::registry::core::service::ipranges::ServiceIpRanges;
 
     #[test]
     fn follows_service_range_when_flag_unset() {
@@ -976,7 +968,7 @@ mod kube_proxy_cluster_cidr_tests {
             let r = ServiceIpRanges::parse(flag).unwrap();
             assert_eq!(kube_proxy_cluster_cidr(&r), want, "{flag}");
         }
-        let a = Args::try_parse_from(["rusternetes"]).unwrap();
+        let a = Args::try_parse_from(["k3rs"]).unwrap();
         assert!(a.cluster_cidr.is_none());
     }
 }

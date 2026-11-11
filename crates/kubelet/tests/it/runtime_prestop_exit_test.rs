@@ -26,15 +26,15 @@
 //!      deletes — this is what the failing test exposes.
 //!
 //! The tests are written against the pure helpers in
-//! `rusternetes_kubelet::lifecycle`, so they exercise the lifecycle/preStop
+//! `k3rs_kubelet::lifecycle`, so they exercise the lifecycle/preStop
 //! block of `runtime.rs` without requiring a live Docker daemon.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerState, ContainerStateTerminated, ContainerStatus, ExecAction, Lifecycle,
     LifecycleHandler, Pod, PodSpec,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_kubelet::lifecycle;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_kubelet::lifecycle;
 
 // ---------------------------------------------------------------------------
 // Test helpers

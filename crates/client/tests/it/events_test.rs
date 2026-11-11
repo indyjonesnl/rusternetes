@@ -1,4 +1,4 @@
-use rusternetes_client::events::build_event;
+use k3rs_client::events::build_event;
 
 #[test]
 fn build_event_shapes_a_v1_event_for_post() {

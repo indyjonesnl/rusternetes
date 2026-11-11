@@ -2,7 +2,7 @@
 //! rules of `pkg/registry/storage/{csidriver,volumeattachment}/strategy.go`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const DRIVERS: &str = "/apis/storage.k8s.io/v1/csidrivers";

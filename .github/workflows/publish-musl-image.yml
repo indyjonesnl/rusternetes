@@ -102,10 +102,10 @@ jobs:
           set -euo pipefail
           docker buildx build \
             -f all-in-one-musl.Dockerfile \
-            --build-arg "RUSTERNETES_GIT_SHA=${{ github.event.pull_request.head.sha }}" \
-            --load -t "rusternetes-all-in-one:musl-${{ matrix.arch }}" \
+            --build-arg "K3RS_GIT_SHA=${{ github.event.pull_request.head.sha }}" \
+            --load -t "k3rs-all-in-one:musl-${{ matrix.arch }}" \
             .
-          size=$(docker image inspect "rusternetes-all-in-one:musl-${{ matrix.arch }}" \
+          size=$(docker image inspect "k3rs-all-in-one:musl-${{ matrix.arch }}" \
                    --format '{{.Size}}')
           echo "uncompressed image size (${{ matrix.arch }}): $((size / 1024 / 1024)) MiB"
 
@@ -115,7 +115,7 @@ jobs:
           set -euo pipefail
           docker buildx build \
             -f all-in-one-musl.Dockerfile \
-            --build-arg "RUSTERNETES_GIT_SHA=${{ github.sha }}" \
+            --build-arg "K3RS_GIT_SHA=${{ github.sha }}" \
             --platform "linux/${{ matrix.arch }}" \
             --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
             --metadata-file /tmp/build-meta.json \

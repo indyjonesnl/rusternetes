@@ -1,6 +1,6 @@
 # Resource Management Examples
 
-This directory contains examples demonstrating advanced resource management features in Rusternetes.
+This directory contains examples demonstrating advanced resource management features in k3rs.
 
 ## Features Covered
 

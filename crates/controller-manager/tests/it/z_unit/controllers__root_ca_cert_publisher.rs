@@ -3,12 +3,12 @@
 //! table) and `TestConfigMapUpdateNoHotLoop`. The controller runs against
 //! `MemoryStorage` through its reflectors, so these drive the real
 //! list+watch -> store -> queue -> sync path.
-use rusternetes_client::reflector::StoreEvent;
-use rusternetes_common::resources::Namespace;
-use rusternetes_common::types::Phase;
-use rusternetes_controller_manager::controllers::root_ca_cert_publisher::*;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::{build_key, Storage};
+use k3rs_client::reflector::StoreEvent;
+use k3rs_common::resources::Namespace;
+use k3rs_common::types::Phase;
+use k3rs_controller_manager::controllers::root_ca_cert_publisher::*;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::{build_key, Storage};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::Arc;

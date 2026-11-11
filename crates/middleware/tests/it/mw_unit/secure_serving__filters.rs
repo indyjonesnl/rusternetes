@@ -9,14 +9,14 @@ mod __parent {
     pub use axum::response::Response;
     pub use axum::Router;
     pub use futures::FutureExt;
-    pub use rusternetes_common::auth::UserInfo;
-    pub use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-    pub use rusternetes_common::error::Error;
-    pub use rusternetes_middleware::secure_serving::authn::{
+    pub use k3rs_common::auth::UserInfo;
+    pub use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+    pub use k3rs_common::error::Error;
+    pub use k3rs_middleware::secure_serving::authn::{
         clear_authentication_headers, AuthRequest, RequestAuthenticator, ALL_UNAUTHENTICATED,
         ANONYMOUS_USER,
     };
-    pub use rusternetes_middleware::PeerCertificates;
+    pub use k3rs_middleware::PeerCertificates;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
 }
@@ -27,12 +27,12 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::routing::get;
     use http_body_util::BodyExt;
-    use rusternetes_common::authz::Opinion;
-    use rusternetes_middleware::secure_serving::authn::{
+    use k3rs_common::authz::Opinion;
+    use k3rs_middleware::secure_serving::authn::{
         AuthRequest, AuthResult, Response as AuthResponse, ALL_AUTHENTICATED,
     };
-    use rusternetes_middleware::secure_serving::filters::*;
-    use rusternetes_middleware::PeerCertificates;
+    use k3rs_middleware::secure_serving::filters::*;
+    use k3rs_middleware::PeerCertificates;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
@@ -61,18 +61,18 @@ mod tests {
     #[async_trait]
     impl<F> Authorizer for Authz<F>
     where
-        F: Fn(&RequestAttributes) -> rusternetes_common::error::Result<Decision> + Send + Sync,
+        F: Fn(&RequestAttributes) -> k3rs_common::error::Result<Decision> + Send + Sync,
     {
         async fn authorize(
             &self,
             attrs: &RequestAttributes,
-        ) -> rusternetes_common::error::Result<Decision> {
+        ) -> k3rs_common::error::Result<Decision> {
             (self.0)(attrs)
         }
         async fn authorize_opinion(
             &self,
             attrs: &RequestAttributes,
-        ) -> rusternetes_common::error::Result<Opinion> {
+        ) -> k3rs_common::error::Result<Opinion> {
             Ok(match (self.0)(attrs)? {
                 Decision::Allow => Opinion::Allow(String::new()),
                 Decision::Deny(r) => Opinion::NoOpinion {
@@ -85,9 +85,8 @@ mod tests {
             &self,
             _u: &UserInfo,
             _ns: &str,
-        ) -> rusternetes_common::error::Result<rusternetes_common::authz::UserRulesOutcome>
-        {
-            Ok(rusternetes_common::authz::UserRulesOutcome::default())
+        ) -> k3rs_common::error::Result<k3rs_common::authz::UserRulesOutcome> {
+            Ok(k3rs_common::authz::UserRulesOutcome::default())
         }
     }
 
@@ -440,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn authorization_error_is_an_internal_error() {
         let authz: Arc<dyn Authorizer> = Arc::new(Authz(|_a: &RequestAttributes| {
-            Err(rusternetes_common::error::Error::Authorization(
+            Err(k3rs_common::error::Error::Authorization(
                 "sar failed".into(),
             ))
         }));

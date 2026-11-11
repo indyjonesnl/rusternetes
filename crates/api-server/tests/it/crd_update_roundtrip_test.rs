@@ -9,7 +9,7 @@
 //! structural check, so an `items.type` lost on the roundtrip is rejected with
 //! "must not be empty for specified array items".
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";
@@ -99,7 +99,7 @@ async fn get_then_update_keeps_array_items_type() {
 /// The same roundtrip over `application/cbor`, which client-go 1.35 negotiates.
 #[tokio::test]
 async fn cbor_get_then_update_keeps_array_items_type() {
-    use rusternetes_api_server::cbor;
+    use k3rs_api_server::cbor;
     let api = TestApiServer::new();
     let name = "foos.cbor.example.com";
     let body = json!({

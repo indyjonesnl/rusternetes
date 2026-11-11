@@ -2,30 +2,28 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::core::service::ipallocator::cidr::MetaAllocator;
-    pub use rusternetes_api_server::registry::core::service::ipallocator::IpError;
-    pub use rusternetes_api_server::registry::core::service::portallocator::operation::PortAllocationOperation;
-    pub use rusternetes_api_server::registry::core::service::portallocator::{
-        PortAllocator, PortError,
-    };
-    pub use rusternetes_api_server::registry::rest::internal_error;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_api_server::registry::core::service::ipallocator::cidr::MetaAllocator;
+    pub use k3rs_api_server::registry::core::service::ipallocator::IpError;
+    pub use k3rs_api_server::registry::core::service::portallocator::operation::PortAllocationOperation;
+    pub use k3rs_api_server::registry::core::service::portallocator::{PortAllocator, PortError};
+    pub use k3rs_api_server::registry::rest::internal_error;
+    pub use k3rs_common::resources::{
         IPFamily, IPFamilyPolicy, Service, ServiceExternalTrafficPolicy, ServiceType,
     };
-    pub use rusternetes_common::validation::field;
-    pub use rusternetes_common::validation::service::{
+    pub use k3rs_common::validation::field;
+    pub use k3rs_common::validation::service::{
         parse_ip_sloppy, validate_service_cluster_ips_related_fields,
     };
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::Storage;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::Storage;
     pub use std::net::IpAddr;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::core::service::alloc::*;
-    use rusternetes_api_server::registry::core::service::portallocator::PortRange;
+    use k3rs_api_server::registry::core::service::alloc::*;
+    use k3rs_api_server::registry::core::service::portallocator::PortRange;
     use serde_json::json;
 
     fn pa() -> Arc<PortAllocator> {
@@ -348,8 +346,8 @@ mod tests {
     /// therefore leaves the IPv4 address allocated.
     #[tokio::test]
     async fn failed_cluster_ip_alloc_leaves_partial_allocation_to_repair() {
-        use rusternetes_common::resources::ServiceCIDR;
-        use rusternetes_storage::{build_key, MemoryStorage};
+        use k3rs_common::resources::ServiceCIDR;
+        use k3rs_storage::{build_key, MemoryStorage};
 
         let storage = Arc::new(MemoryStorage::new());
         // Only the IPv4 family has a ServiceCIDR, so the IPv6 allocation

@@ -5,11 +5,11 @@ mod __parent {
     pub use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
     };
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_common::types::{List, Phase};
-    pub use rusternetes_common::Result;
-    pub use rusternetes_kubelet::kubelet::Kubelet;
-    pub use rusternetes_storage::{build_prefix, Storage, StorageBackend};
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_common::types::{List, Phase};
+    pub use k3rs_common::Result;
+    pub use k3rs_kubelet::kubelet::Kubelet;
+    pub use k3rs_storage::{build_prefix, Storage, StorageBackend};
     pub use serde_json::json;
     pub use std::sync::Arc;
 }
@@ -18,10 +18,8 @@ mod statusz_tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::Request;
-    use rusternetes_common::feature_gates::{
-        reset_to_defaults, set_from_str, with_feature, Feature,
-    };
-    use rusternetes_kubelet::server::*;
+    use k3rs_common::feature_gates::{reset_to_defaults, set_from_str, with_feature, Feature};
+    use k3rs_kubelet::server::*;
     use serial_test::serial;
     use tower::ServiceExt;
 
@@ -305,7 +303,7 @@ mod statusz_tests {
     // server_type, long_running); unknown paths and verbs collapse to `other`.
     #[tokio::test]
     async fn serve_http_records_bucketed_request_metrics() {
-        use rusternetes_kubelet::server_metrics::{
+        use k3rs_kubelet::server_metrics::{
             HTTP_INFLIGHT_REQUESTS, HTTP_REQUESTS, HTTP_REQUESTS_DURATION,
         };
         let app = Router::new()
@@ -356,7 +354,7 @@ mod statusz_tests {
             1
         );
         // Registered into the process-global registry `/metrics` serves.
-        let body = rusternetes_common::observability::MetricsRegistry::new().gather();
+        let body = k3rs_common::observability::MetricsRegistry::new().gather();
         assert!(body.contains("# HELP kubelet_http_requests_total [ALPHA] Number of the http requests received since the server started"));
         assert!(body.contains("kubelet_http_requests_duration_seconds_count"));
         assert!(body.contains("# TYPE kubelet_http_inflight_requests gauge"));
@@ -365,7 +363,7 @@ mod statusz_tests {
     // server.go:1179-1185: no auth -> `readonly`.
     #[tokio::test]
     async fn serve_http_server_type_is_readonly_without_auth() {
-        use rusternetes_kubelet::server_metrics::HTTP_REQUESTS;
+        use k3rs_kubelet::server_metrics::HTTP_REQUESTS;
         let app = install_metrics_filter(
             Router::new().route("/pods", axum::routing::get(|| async { "p" })),
             MetricsBuckets::new(),
@@ -406,7 +404,7 @@ mod debugging_handlers_tests {
     use super::__parent::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
-    use rusternetes_kubelet::server::*;
+    use k3rs_kubelet::server::*;
     use tower::ServiceExt;
 
     async fn call(app: &Router, method: Method, path: &str) -> (u16, String) {
@@ -479,7 +477,7 @@ mod debugging_handlers_tests {
     fn registered_paths_default_aggregate() {
         let paths = registered_handle_paths(true, true, true, false);
         assert_eq!(
-            rusternetes_common::statusz::aggregate_paths(&paths),
+            k3rs_common::statusz::aggregate_paths(&paths),
             vec!["/configz", "/debug", "/healthz", "/metrics"]
         );
         for ws in ["/pods", "/stats/summary", "/runningpods/", "/logs/"] {
@@ -506,7 +504,7 @@ mod debugging_handlers_tests {
         assert!(at("/healthz/log") < at("/healthz/syncloop"));
         assert_eq!(at("/flagz"), at("/configz") + 1);
         assert_eq!(
-            rusternetes_common::statusz::aggregate_paths(&p),
+            k3rs_common::statusz::aggregate_paths(&p),
             vec!["/configz", "/debug", "/flagz", "/healthz", "/metrics"]
         );
         // Debugging handlers off: /flagz belongs to InstallAuthRequiredHandlers.

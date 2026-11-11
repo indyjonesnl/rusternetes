@@ -6,7 +6,7 @@
 //! Source (release-1.35):
 //!   https://github.com/kubernetes/kubernetes/blob/release-1.35/test/e2e/node/pods.go#L437
 //!
-//! Closes rusternetes#483.
+//! Closes k3rs#483.
 //!
 //! The conformance test drives a sequence of mutations against a single Pod
 //! and asserts that `metadata.generation` is bumped for genuine spec changes
@@ -14,7 +14,7 @@
 //! the "empty update": GET the pod, re-marshal it through `corev1.Pod`,
 //! PUT it back unchanged, and expect `generation` to stay at 1.
 //!
-//! That sub-test was failing on rusternetes because Go's typed marshaller
+//! That sub-test was failing on k3rs because Go's typed marshaller
 //! emits `"resources":{}` on every container even when no resources are
 //! defined (Go's `omitempty` does not detect zero-valued struct values), and
 //! our `ValidatePodUpdate` immutability fence compared the resulting JSON
@@ -27,12 +27,12 @@
 //! The harness reuses the in-process Axum router pattern from
 //! `strategy_pod_test.rs` — duplicated inline per the per-file contract.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const TEST_NS: &str = "pods-gen";
 
-// Harness: thin `(u16, Value)` shims over `TestApiServer` (rusternetes-test-support),
+// Harness: thin `(u16, Value)` shims over `TestApiServer` (k3rs-test-support),
 // preserving this file's `*_json(&router, …)` call sites.
 async fn post_json(api: &TestApiServer, uri: &str, body: &Value) -> (u16, Value) {
     let (status, value) = api.post(uri, body).await;

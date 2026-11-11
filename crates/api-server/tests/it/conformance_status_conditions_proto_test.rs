@@ -36,7 +36,7 @@
 //! the parent — same pattern as the `PodStatus` / `DeploymentStatus` cases
 //! below.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::Value;
 
 /// Wire bytes for `Time { seconds: <s>, nanos: <n> }`. Both fields are

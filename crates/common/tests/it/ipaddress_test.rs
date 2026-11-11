@@ -6,8 +6,8 @@
 // 3. Different parent resource types (Service, Pod, etc.)
 // 4. Metadata and spec fields
 
-use rusternetes_common::resources::{IPAddress, IPAddressSpec, ParentReference};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
+use k3rs_common::resources::{IPAddress, IPAddressSpec, ParentReference};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
 
 fn create_ipaddress(name: &str, parent_ref: ParentReference) -> IPAddress {
     IPAddress {

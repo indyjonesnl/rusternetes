@@ -8,7 +8,7 @@
 
 use crate::static_pods::{parse_http_manifest, MAX_CONFIG_LENGTH};
 use anyhow::{anyhow, Result};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{debug, info};

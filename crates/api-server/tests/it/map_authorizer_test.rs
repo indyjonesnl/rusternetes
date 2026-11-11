@@ -8,19 +8,17 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_api_server::admission::policy_apply_config::ApplyConfigPatcher;
-use rusternetes_api_server::admission::policy_json_patch::JsonPatcher;
-use rusternetes_api_server::admission::policy_matching::Attributes;
-use rusternetes_api_server::admission::policy_mutating::{
-    PatchRequest, Patcher, VersionedAttributes,
-};
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{
+use k3rs_api_server::admission::policy_apply_config::ApplyConfigPatcher;
+use k3rs_api_server::admission::policy_json_patch::JsonPatcher;
+use k3rs_api_server::admission::policy_matching::Attributes;
+use k3rs_api_server::admission::policy_mutating::{PatchRequest, Patcher, VersionedAttributes};
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource, Operation};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{
     AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer, Decision, RequestAttributes,
     UserRulesOutcome,
 };
-use rusternetes_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
+use k3rs_common::cel_cost::RUNTIME_CEL_COST_BUDGET;
 use serde_json::{json, Value};
 
 /// Allows everything and records what it was asked.
@@ -29,7 +27,7 @@ struct Recording(Mutex<Vec<RequestAttributes>>);
 
 #[async_trait]
 impl Authorizer for Recording {
-    async fn authorize(&self, attrs: &RequestAttributes) -> rusternetes_common::Result<Decision> {
+    async fn authorize(&self, attrs: &RequestAttributes) -> k3rs_common::Result<Decision> {
         self.0.lock().unwrap().push(attrs.clone());
         Ok(Decision::Allow)
     }
@@ -38,7 +36,7 @@ impl Authorizer for Recording {
         &self,
         _user: &UserInfo,
         _namespace: &str,
-    ) -> rusternetes_common::Result<UserRulesOutcome> {
+    ) -> k3rs_common::Result<UserRulesOutcome> {
         Ok(UserRulesOutcome::default())
     }
 }

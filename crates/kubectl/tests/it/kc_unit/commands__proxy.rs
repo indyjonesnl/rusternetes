@@ -16,7 +16,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::proxy::*;
+    use k3rs_kubectl::commands::proxy::*;
 
     #[tokio::test]
     async fn test_proxy_binds_random_port() {

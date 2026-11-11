@@ -3,7 +3,7 @@
 #![cfg(feature = "sqlite")]
 
 use futures::StreamExt;
-use rusternetes_storage::{Storage, StorageBackend, StorageConfig};
+use k3rs_storage::{Storage, StorageBackend, StorageConfig};
 use std::sync::Arc;
 
 async fn bus_backend() -> Arc<StorageBackend> {
@@ -27,7 +27,7 @@ async fn watch_sees_create_update_delete_via_bus() {
     let created: serde_json::Value = storage.create(key, &obj).await.expect("create");
 
     let added = stream.next().await.expect("event").expect("ok");
-    assert!(matches!(added, rusternetes_storage::WatchEvent::Added(ref k, _) if k == key));
+    assert!(matches!(added, k3rs_storage::WatchEvent::Added(ref k, _) if k == key));
 
     let updated_input = {
         let mut v = created.clone();
@@ -36,12 +36,12 @@ async fn watch_sees_create_update_delete_via_bus() {
     };
     let _: serde_json::Value = storage.update(key, &updated_input).await.expect("update");
     let modified = stream.next().await.expect("event").expect("ok");
-    assert!(matches!(modified, rusternetes_storage::WatchEvent::Modified(ref k, _) if k == key));
+    assert!(matches!(modified, k3rs_storage::WatchEvent::Modified(ref k, _) if k == key));
 
     storage.delete(key).await.expect("delete");
     let deleted = stream.next().await.expect("event").expect("ok");
     match deleted {
-        rusternetes_storage::WatchEvent::Deleted(ref k, ref prev) => {
+        k3rs_storage::WatchEvent::Deleted(ref k, ref prev) => {
             assert_eq!(k, key);
             assert!(
                 prev.contains("\"name\":\"p1\""),
@@ -65,7 +65,7 @@ async fn failed_write_publishes_nothing() {
 
     // Consume the create's Added so the stream is drained to "now".
     let added = stream.next().await.expect("event").expect("ok");
-    assert!(matches!(added, rusternetes_storage::WatchEvent::Added(ref k, _) if k == key));
+    assert!(matches!(added, k3rs_storage::WatchEvent::Added(ref k, _) if k == key));
 
     // Update carrying a stale resourceVersion -> CAS fails -> Conflict.
     let stale = serde_json::json!({
@@ -77,7 +77,7 @@ async fn failed_write_publishes_nothing() {
         .await
         .expect_err("stale update must Conflict");
     assert!(
-        matches!(err, rusternetes_common::Error::Conflict(_)),
+        matches!(err, k3rs_common::Error::Conflict(_)),
         "expected Conflict, got {err:?}"
     );
 

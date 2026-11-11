@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         resources::{pod::HostIP, ContainerStatus, Pod, PodCondition, PodIP, PodStatus},
         types::Phase,
     };
@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pod_status::*;
+    use k3rs_kubelet::pod_status::*;
 
     fn cond(t: &str, s: &str) -> PodCondition {
         PodCondition {
@@ -193,7 +193,7 @@ mod tests {
         use chrono::Duration;
         let now = chrono::Utc::now();
         let mut pod = Pod::new("p", Default::default());
-        pod.spec = Some(rusternetes_common::resources::PodSpec {
+        pod.spec = Some(k3rs_common::resources::PodSpec {
             active_deadline_seconds: Some(5),
             ..Default::default()
         });

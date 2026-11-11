@@ -5,7 +5,7 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use rusternetes_controller_manager::controllers;
+use k3rs_controller_manager::controllers;
 
 use anyhow::Result;
 use clap::Parser;
@@ -52,7 +52,7 @@ use controllers::{
     volume_snapshot::VolumeSnapshotController,
     vpa::VerticalPodAutoscalerController,
 };
-use rusternetes_storage::{StorageBackend, StorageConfig};
+use k3rs_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -84,8 +84,8 @@ macro_rules! recycler_config {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "rusternetes-controller-manager")]
-#[command(about = "Rusternetes Controller Manager - Runs controller loops")]
+#[command(name = "k3rs-controller-manager")]
+#[command(about = "k3rs Controller Manager - Runs controller loops")]
 struct Args {
     /// Comma-separated `[component:]Gate=bool` pairs, e.g.
     /// `StorageCapacityScoring=true` or `kube:StorageCapacityScoring=true`;
@@ -287,7 +287,7 @@ struct Args {
     storage_backend: String,
 
     /// SQLite database path (only used when --storage-backend=sqlite)
-    #[arg(long, default_value = "./data/rusternetes.db")]
+    #[arg(long, default_value = "./data/k3rs.db")]
     data_dir: String,
 
     /// Log level
@@ -341,7 +341,7 @@ struct Args {
     cloud_provider: Option<String>,
 
     /// Cluster name (`--cluster-name`).
-    #[arg(long, default_value = "rusternetes")]
+    #[arg(long, default_value = "k3rs")]
     cluster_name: String,
 
     /// Enable leader election (for HA)
@@ -394,15 +394,15 @@ struct Args {
     /// `--tls-cert-file`, ...): HTTPS for `/metrics`, `/statusz`, `/flagz`
     /// (cmd/kube-controller-manager/app/options/options.go:224-238).
     #[command(flatten)]
-    secure_serving: rusternetes_middleware::secure_serving::options::SecureServingFlags,
+    secure_serving: k3rs_middleware::secure_serving::options::SecureServingFlags,
 
     /// `Authentication` (`--authentication-kubeconfig`, `--client-ca-file`, ...).
     #[command(flatten)]
-    authentication: rusternetes_middleware::secure_serving::options::AuthenticationFlags,
+    authentication: k3rs_middleware::secure_serving::options::AuthenticationFlags,
 
     /// `Authorization` (`--authorization-kubeconfig`, ...).
     #[command(flatten)]
-    authorization: rusternetes_middleware::secure_serving::options::AuthorizationFlags,
+    authorization: k3rs_middleware::secure_serving::options::AuthorizationFlags,
 
     /// API server base URL for the HPA metrics client
     #[arg(long, default_value = "https://api-server:6443")]
@@ -430,12 +430,12 @@ struct Args {
     /// `pkg/controller/apis/config/v1alpha1/defaults.go:59`). Applied per
     /// controller, not shared: every controller gets its own limiter (#1863).
     /// `<= 0` disables client-side throttling. API mode only.
-    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_QPS)]
+    #[arg(long, default_value_t = k3rs_client::ratelimit::CONTROLLER_MANAGER_QPS)]
     kube_api_qps: f64,
 
     /// Burst each controller's api client may send at once (upstream
     /// `--kube-api-burst`, default 30: `defaults.go:62`). API mode only.
-    #[arg(long, default_value_t = rusternetes_client::ratelimit::CONTROLLER_MANAGER_BURST)]
+    #[arg(long, default_value_t = k3rs_client::ratelimit::CONTROLLER_MANAGER_BURST)]
     kube_api_burst: f64,
 
     /// Skip TLS verification for the api-server data-plane connection in API
@@ -606,7 +606,7 @@ impl Args {
                 match v {
                     None => Ok(std::time::Duration::from_secs(native)),
                     Some(s) => {
-                        let ns = rusternetes_common::go_duration::parse_go_duration(s)
+                        let ns = k3rs_common::go_duration::parse_go_duration(s)
                             .map_err(|e| format!("invalid value {s:?} for --{flag}: {e}"))?;
                         Ok(std::time::Duration::from_nanos(ns.max(0) as u64))
                     }
@@ -680,7 +680,7 @@ impl Args {
 
 /// Parse a Go duration (`time.ParseDuration`) for a clap flag.
 fn parse_clean_up_period(s: &str) -> Result<std::time::Duration, String> {
-    let nanos = rusternetes_common::go_duration::parse_go_duration(s)?;
+    let nanos = k3rs_common::go_duration::parse_go_duration(s)?;
     u64::try_from(nanos)
         .map(std::time::Duration::from_nanos)
         .map_err(|_| format!("negative duration {s:?}"))
@@ -737,9 +737,8 @@ fn node_ipam_params(args: &Args) -> Result<Option<(String, NodeCidrMaskSizes, Op
 /// (cmd/kube-controller-manager/app/options/options.go:224-238).
 fn component_secure_serving(
     args: &Args,
-) -> rusternetes_middleware::secure_serving::ComponentSecureServing {
-    let mut c =
-        rusternetes_middleware::secure_serving::ComponentSecureServing::for_controller_manager();
+) -> k3rs_middleware::secure_serving::ComponentSecureServing {
+    let mut c = k3rs_middleware::secure_serving::ComponentSecureServing::for_controller_manager();
     c.apply_flags(
         &args.secure_serving,
         &args.authentication,
@@ -766,8 +765,8 @@ fn aggregate_errors(errs: &[String]) -> String {
 async fn serve_secure(
     args: &Args,
     gather: fn() -> String,
-    effective_version: rusternetes_common::compatibility::EffectiveVersion,
-    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+    effective_version: k3rs_common::compatibility::EffectiveVersion,
+    flags: k3rs_common::flagz::NamedFlagSetsReader,
 ) -> Result<()> {
     let component = component_secure_serving(args);
     let errs = component.validate();
@@ -780,7 +779,7 @@ async fn serve_secure(
     );
     // `flagz.Install` behind the `ComponentFlagz` gate
     // (cmd/kube-controller-manager/app/controllermanager.go:219-223).
-    let app = rusternetes_common::flagz::install_if_enabled(
+    let app = k3rs_common::flagz::install_if_enabled(
         app,
         "kube-controller-manager",
         Some(Box::new(flags)),
@@ -789,11 +788,10 @@ async fn serve_secure(
     // (cmd/kube-controller-manager/app/controllermanager.go:225-234), with
     // `ComponentGlobalsRegistry.EffectiveVersionFor(DefaultKubeComponent)`
     // and the listed paths of the mux (here only `/metrics`).
-    let app =
-        rusternetes_common::statusz::install_if_enabled(app, "kube-controller-manager", || {
-            rusternetes_common::statusz::Registry::new(Some(effective_version))
-                .with_listed_paths(vec!["/metrics".to_string()])
-        });
+    let app = k3rs_common::statusz::install_if_enabled(app, "kube-controller-manager", || {
+        k3rs_common::statusz::Registry::new(Some(effective_version))
+            .with_listed_paths(vec!["/metrics".to_string()])
+    });
     component
         .serve(app)
         .await
@@ -807,17 +805,17 @@ async fn serve_secure(
 /// `run_with_api`, which drives every controller through `ApiStorage`.
 async fn run_api_mode(
     args: Args,
-    effective_version: rusternetes_common::compatibility::EffectiveVersion,
-    flags: rusternetes_common::flagz::NamedFlagSetsReader,
+    effective_version: k3rs_common::compatibility::EffectiveVersion,
+    flags: k3rs_common::flagz::NamedFlagSetsReader,
 ) -> Result<()> {
-    use rusternetes_client::http::ApiClient;
-    use rusternetes_client::kubeconfig::KubeConfig;
+    use k3rs_client::http::ApiClient;
+    use k3rs_client::kubeconfig::KubeConfig;
 
     // API mode runs the lib's controllers, so serve the lib's registry (the
     // bin compiles its own copy of `controllers`, with a separate registry).
     serve_secure(
         &args,
-        rusternetes_controller_manager::controllers::gather_metrics,
+        k3rs_controller_manager::controllers::gather_metrics,
         effective_version,
         flags,
     )
@@ -866,16 +864,11 @@ async fn run_api_mode(
         .with_rate_limit(args.kube_api_qps, args.kube_api_burst)
         // `rest.SetKubernetesDefaults`; each controller's clone appends its
         // name (`AddUserAgent`).
-        .with_default_user_agent(
-            rusternetes_common::compatibility::default_kubernetes_user_agent(),
-        ),
+        .with_default_user_agent(k3rs_common::compatibility::default_kubernetes_user_agent()),
     );
-    let config = rusternetes_controller_manager::ControllerManagerConfig {
+    let config = k3rs_controller_manager::ControllerManagerConfig {
         sync_interval: args.sync_interval,
-        pv_recycler: recycler_config!(
-            &args,
-            rusternetes_controller_manager::controllers::pv_recycler
-        )?,
+        pv_recycler: recycler_config!(&args, k3rs_controller_manager::controllers::pv_recycler)?,
         // The standalone binary spawns these itself (with leader election).
         csi_attachers: Vec::new(),
         attach_detach_controller: false,
@@ -892,7 +885,7 @@ async fn run_api_mode(
         // library crate, whose `HttpMetricsConfig` is distinct from the bin's
         // own `mod controllers` copy imported at the top of this file.
         metrics_config: Some(
-            rusternetes_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
+            k3rs_controller_manager::controllers::hpa_metrics_client::HttpMetricsConfig {
                 api_server_url: args.api_server_url.clone(),
                 ca_pem: ca_pem.clone(),
                 ca_cert_path: None,
@@ -911,9 +904,9 @@ async fn run_api_mode(
         // copy), so it matches the type ControllerManagerConfig expects.
         node_ipam: match node_ipam_params(&args)? {
             Some((cidr, masks, svc)) => Some(
-                rusternetes_controller_manager::controllers::node_ipam::NodeIpamConfig::from_flags(
+                k3rs_controller_manager::controllers::node_ipam::NodeIpamConfig::from_flags(
                     &cidr,
-                    rusternetes_controller_manager::controllers::node_ipam::NodeCidrMaskSizes {
+                    k3rs_controller_manager::controllers::node_ipam::NodeCidrMaskSizes {
                         general: masks.general,
                         ipv4: masks.ipv4,
                         ipv6: masks.ipv6,
@@ -925,15 +918,15 @@ async fn run_api_mode(
             None => None,
         },
     };
-    rusternetes_controller_manager::run_with_api(client, config).await
+    k3rs_controller_manager::run_with_api(client, config).await
 }
 
 /// Apply `--emulated-version`, `--min-compatibility-version` and
 /// `--feature-gates` process-wide: `ComponentGlobalsRegistry.Set()`
 /// (cmd/kube-controller-manager/app/controllermanager.go:124) then `Validate`
 /// (staging/src/k8s.io/component-base/compatibility/registry.go:344-451).
-fn apply_feature_gates(args: &Args) -> Result<rusternetes_common::compatibility::EffectiveVersion> {
-    let effective_version = rusternetes_common::compatibility::apply_flags(
+fn apply_feature_gates(args: &Args) -> Result<k3rs_common::compatibility::EffectiveVersion> {
+    let effective_version = k3rs_common::compatibility::apply_flags(
         &args.emulated_version,
         &args.min_compatibility_version,
         &args.feature_gates,
@@ -942,15 +935,15 @@ fn apply_feature_gates(args: &Args) -> Result<rusternetes_common::compatibility:
     // `ComponentGlobalsRegistry.AddMetrics()`
     // (cmd/kube-controller-manager/app/controllermanager.go:146;
     // component-base/compatibility/registry.go:123-131): record `version_info`.
-    rusternetes_common::compat_version_metrics::add_metrics(
-        rusternetes_common::compatibility::DEFAULT_KUBE_COMPONENT,
+    k3rs_common::compat_version_metrics::add_metrics(
+        k3rs_common::compatibility::DEFAULT_KUBE_COMPONENT,
         &effective_version,
     );
     // #3190: legacy alias for the CrossNamespaceVolumeDataSource gate; the
     // provisioner reads the gate (upstream has only the gate).
     if args.csi_cross_namespace_volume_data_source {
-        rusternetes_common::feature_gates::set(
-            rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+        k3rs_common::feature_gates::set(
+            k3rs_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
             true,
         );
     }
@@ -963,13 +956,13 @@ async fn main() -> Result<()> {
     // (cmd/kube-controller-manager/app/options/options.go:535-539).
     let cmd = <Args as clap::CommandFactory>::command();
     let matches = cmd.clone().get_matches();
-    let flags = rusternetes_common::flagz::flags_from_clap(&cmd, &matches);
+    let flags = k3rs_common::flagz::flags_from_clap(&cmd, &matches);
     let args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
         .map_err(|e| e.exit())
         .unwrap();
     let effective_version = apply_feature_gates(&args)?;
 
-    rusternetes_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
+    k3rs_common::tracing::init_basic_tracing("controller-manager", &args.log_level)?;
 
     for flag in args.ignored_upstream_flags() {
         warn!("{flag} is accepted for upstream argv compatibility and ignored (not implemented)");
@@ -989,8 +982,8 @@ async fn main() -> Result<()> {
     // In-cluster static-pod path: run as an api-server client, no storage handle.
     if args.kubeconfig.is_some() {
         info!(
-            "Starting Rusternetes Controller Manager (API mode) {}",
-            rusternetes_common::build_info::version_line()
+            "Starting k3rs Controller Manager (API mode) {}",
+            k3rs_common::build_info::version_line()
         );
         return run_api_mode(args, effective_version, flags).await;
     }
@@ -998,8 +991,8 @@ async fn main() -> Result<()> {
     serve_secure(&args, controllers::gather_metrics, effective_version, flags).await?;
 
     info!(
-        "Starting Rusternetes Controller Manager {}",
-        rusternetes_common::build_info::version_line()
+        "Starting k3rs Controller Manager {}",
+        k3rs_common::build_info::version_line()
     );
 
     // Resolve node-IPAM params before `args` is partially moved below.
@@ -1048,10 +1041,10 @@ async fn main() -> Result<()> {
         // controller stops with the process; the restart policy brings it
         // back as a fresh follower. Upstream runs with context.Background()
         // and without ReleaseOnCancel (see the shutdown note below).
-        let elector = Arc::new(rusternetes_common::leaderelection::LeaderElector::new(
-            rusternetes_common::leaderelection::ElectionConfig {
+        let elector = Arc::new(k3rs_common::leaderelection::LeaderElector::new(
+            k3rs_common::leaderelection::ElectionConfig {
                 lock: Arc::new(
-                    rusternetes_storage::lease_lock::LeaseLock::new(
+                    k3rs_storage::lease_lock::LeaseLock::new(
                         storage.clone(),
                         args.leader_election_resource_namespace.clone(),
                         args.leader_election_resource_name.clone(),
@@ -1059,7 +1052,7 @@ async fn main() -> Result<()> {
                     )
                     // LockConfig.EventRecorder (options.go makeLeaderElectionConfig).
                     .with_event_recorder(
-                        rusternetes_storage::EventRecorder::new(storage.clone()),
+                        k3rs_storage::EventRecorder::new(storage.clone()),
                         "kube-controller-manager",
                     ),
                 ),
@@ -1068,7 +1061,7 @@ async fn main() -> Result<()> {
                 retry_period: le.retry_period,
                 release_on_cancel: false,
                 name: args.leader_election_resource_name.clone(),
-                callbacks: rusternetes_common::leaderelection::LeaderCallbacks {
+                callbacks: k3rs_common::leaderelection::LeaderCallbacks {
                     on_started_leading: Arc::new(|_| {}),
                     on_stopped_leading: Arc::new(|| {
                         tracing::error!("leaderelection lost");
@@ -1083,7 +1076,7 @@ async fn main() -> Result<()> {
         let elector_clone = elector.clone();
         tokio::spawn(async move {
             elector_clone
-                .run(rusternetes_common::signal::ShutdownContext::new())
+                .run(k3rs_common::signal::ShutdownContext::new())
                 .await
         });
 
@@ -1109,7 +1102,7 @@ async fn main() -> Result<()> {
                         // Run controller under crash supervision: a panic inside
                         // tokio::spawn is otherwise swallowed and the controller
                         // silently stops reconciling forever (#1775).
-                        rusternetes_controller_manager::supervise_controller(
+                        k3rs_controller_manager::supervise_controller(
                             $name,
                             None,
                             std::time::Duration::from_secs(1),
@@ -1130,7 +1123,7 @@ async fn main() -> Result<()> {
                     // disappearing (#1775: a futures Unfold panic killed the
                     // ResourceQuota controller and froze every quota's
                     // status.used until the process was restarted).
-                    rusternetes_controller_manager::supervise_controller(
+                    k3rs_controller_manager::supervise_controller(
                         $name,
                         None,
                         std::time::Duration::from_secs(1),
@@ -1340,17 +1333,16 @@ async fn main() -> Result<()> {
         if let Some(nd) = node_deployment.as_mut() {
             // `ctrl.GetNodeInfo` (controller.go:350-355); failure is fatal
             // (csi-provisioner.go:330-332).
-            let info =
-                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket)
-                    .get_node_info()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to get node info from CSI driver: {e}"))?;
+            let info = k3rs_csi::controller_client::CsiControllerClient::with_endpoint(socket)
+                .get_node_info()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get node info from CSI driver: {e}"))?;
             nd.accessible_topology = info.accessible_topology.map(|t| t.segments);
         }
         let mut provisioner = controllers::csi_provisioner::CsiProvisioner::new(
             storage.clone(),
             driver,
-            rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+            k3rs_csi::controller_client::CsiControllerClient::with_endpoint(socket),
         );
         let capacity_node_deployment = node_deployment.clone();
         if let Some(nd) = node_deployment {
@@ -1371,11 +1363,9 @@ async fn main() -> Result<()> {
                 .with_prevent_volume_mode_conversion(args.csi_prevent_volume_mode_conversion)
                 .with_retry_interval_start(args.csi_retry_interval_start)
                 .with_retry_interval_max(args.csi_retry_interval_max)
-                .with_cross_namespace_volume_data_source(
-                    rusternetes_common::feature_gates::enabled(
-                        rusternetes_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
-                    ),
-                )
+                .with_cross_namespace_volume_data_source(k3rs_common::feature_gates::enabled(
+                    k3rs_common::feature_gates::Feature::CrossNamespaceVolumeDataSource,
+                ))
                 .with_strict_topology(args.csi_strict_topology)
                 .with_immediate_topology(args.csi_immediate_topology),
         );
@@ -1450,9 +1440,7 @@ async fn main() -> Result<()> {
                 let limiter = capacity_limiter.clone();
                 async move {
                     let client =
-                        rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(
-                            socket,
-                        );
+                        k3rs_csi::controller_client::CsiControllerClient::with_endpoint(socket);
                     let ctl = controllers::csi_capacity::CapacityController {
                         storage: &*storage,
                         client: &client,
@@ -1496,7 +1484,7 @@ async fn main() -> Result<()> {
             controllers::csi_attacher::CsiAttacher::new(
                 storage.clone(),
                 driver,
-                rusternetes_csi::controller_client::CsiControllerClient::with_endpoint(socket),
+                k3rs_csi::controller_client::CsiControllerClient::with_endpoint(socket),
             )
             .with_default_fs_type(args.csi_default_fstype.clone())
             .with_reconcile_sync(std::time::Duration::from_secs(
@@ -1767,7 +1755,7 @@ async fn main() -> Result<()> {
     });
 
     // Start CertificateSigningRequest controller, enabling the in-process signer
-    // when a cluster CA is provided via env (RUSTERNETES_CA_CERT_FILE/KEY_FILE).
+    // when a cluster CA is provided via env (K3RS_CA_CERT_FILE/KEY_FILE).
     let csr_controller = {
         let mut controller = CertificateSigningRequestController::new(storage.clone());
         if let Some(ca) = controllers::cert_authority::load_cluster_ca_from_env() {
@@ -1837,9 +1825,8 @@ async fn main() -> Result<()> {
 
     // Start the kube-apiserver-serving ClusterTrustBundle publisher
     // (certificates.go:289-353): ClusterTrustBundle gate, root CA from pki_dir.
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::ClusterTrustBundle,
-    ) {
+    if k3rs_common::feature_gates::enabled(k3rs_common::feature_gates::Feature::ClusterTrustBundle)
+    {
         let root_ca = std::fs::read_to_string(format!("{}/ca.crt", args.pki_dir)).ok();
         match controllers::clustertrustbundle_publisher::ClusterTrustBundlePublisher::for_kube_apiserver_serving(
             storage.clone(),
@@ -1865,8 +1852,8 @@ async fn main() -> Result<()> {
     // (`newPodCertificateRequestCleanerController`,
     // cmd/kube-controller-manager/app/certificates.go:232-253), gated on the
     // `PodCertificateRequest` feature gate.
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::PodCertificateRequest,
+    if k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::PodCertificateRequest,
     ) {
         let pcr_cleaner = Arc::new(controllers::pcr_cleaner::PcrCleanerController::new(
             storage.clone(),
@@ -2123,7 +2110,7 @@ async fn main() -> Result<()> {
     // ReleaseOnCancel on its election (only kube-scheduler does, options.go:375);
     // a SIGTERM terminates the process and the lease expires, so the elector is
     // deliberately not released here.
-    rusternetes_common::signal::setup_signal_context()
+    k3rs_common::signal::setup_signal_context()
         .cancelled()
         .await;
     info!("Shutting down controller manager");
@@ -2192,7 +2179,7 @@ mod csi_node_deployment_flag_tests {
 #[cfg(test)]
 mod default_rate_limit_tests {
     use super::*;
-    use rusternetes_client::http::ApiClient;
+    use k3rs_client::http::ApiClient;
 
     /// Upstream defaults (`defaults.go:59,62`): 20 QPS / 30 burst, per controller.
     #[test]
@@ -2212,7 +2199,7 @@ mod default_rate_limit_tests {
 #[cfg(test)]
 mod feature_gates_flag_tests {
     use super::*;
-    use rusternetes_common::feature_gates::{enabled, reset_to_defaults, Feature};
+    use k3rs_common::feature_gates::{enabled, reset_to_defaults, Feature};
     use serial_test::serial;
 
     fn parse(gates: &str) -> Args {

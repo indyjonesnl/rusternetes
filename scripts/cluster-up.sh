@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# cluster-up.sh — one omnipotent command to (re)create a Rusternetes cluster
+# cluster-up.sh — one omnipotent command to (re)create a k3rs cluster
 # end-to-end and, optionally, drive a conformance suite against it.
 #
 # It is intentionally idempotent and safe to run whether or not a cluster is
@@ -26,7 +26,7 @@
 #   --conformance-image IMG       (default: registry.k8s.io/conformance:v1.35.0)
 #   --focus REGEX                 Ginkgo focus override for hydrophone (default: the
 #                                 image's built-in [Conformance] suite)
-#   --kubeconfig PATH             (default: $KUBECONFIG or ~/.kube/rusternetes-config)
+#   --kubeconfig PATH             (default: $KUBECONFIG or ~/.kube/k3rs-config)
 #   --kubectl PATH                kubectl used for bootstrap (default: system kubectl
 #                                 if present, else the in-tree target/release/kubectl)
 #   --keep-running                Skip teardown; reuse the stack that is already up
@@ -63,7 +63,7 @@ DO_BUILD=1
 CONFORMANCE="none"
 CONFORMANCE_IMAGE="registry.k8s.io/conformance:v1.35.0"
 FOCUS=""
-KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
 KUBECTL_BIN=""
 KEEP_RUNNING=0
 DO_BOOTSTRAP=1
@@ -127,34 +127,34 @@ esac
 COMPOSE_ARGS=(-f "$BASE_COMPOSE")
 
 # kubelet needs an absolute host path for its volume mounts.
-export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$PROJECT_ROOT/.rusternetes/volumes}"
+export KUBELET_VOLUMES_PATH="${KUBELET_VOLUMES_PATH:-$PROJECT_ROOT/.k3rs/volumes}"
 
 # CERTS_PATH must be exported BEFORE the first `compose up`, not just before
 # bootstrap: the node-1 kubelet mounts ${CERTS_PATH}:${CERTS_PATH} so that the
 # control-plane static pods' hostPath resolves to the same absolute path inside
 # the kubelet container as on the host. Left unset, compose falls back to
-# /etc/rusternetes/certs, the hostPath stat() fails inside the kubelet, and
+# /etc/k3rs/certs, the hostPath stat() fails inside the kubelet, and
 # kube-scheduler + kube-controller-manager sit Pending forever while
 # bootstrap-cluster.sh still reports success — a conformance run then blames the
 # code for a cluster with no control plane (#1777, #1152).
-export CERTS_PATH="${CERTS_PATH:-$PROJECT_ROOT/.rusternetes/certs}"
+export CERTS_PATH="${CERTS_PATH:-$PROJECT_ROOT/.k3rs/certs}"
 
 # Pre-create every bind-mount host directory as the invoking user BEFORE the
 # first `compose up`. Docker/Podman create a missing bind-mount source as root,
 # and the non-root scripts that write into them afterwards then fail with
 # "Permission denied" with no sudo to repair it: bootstrap-cluster.sh templates
-# the control-plane static-pod YAML into .rusternetes/manifests, and
-# generate-certs.sh + the SA tooling write .rusternetes/certs. (#1152)
+# the control-plane static-pod YAML into .k3rs/manifests, and
+# generate-certs.sh + the SA tooling write .k3rs/certs. (#1152)
 ensure_writable_dir() {
     local d="$1"
     mkdir -p "$d" 2>/dev/null || true
     if [[ ! -d "$d" || ! -w "$d" ]]; then
-        die "$d is not writable by $(id -un) — likely root-owned from a prior bare '${COMPOSE[*]} up'. Recover with: sudo chown -R \$USER:\$USER $PROJECT_ROOT/.rusternetes"
+        die "$d is not writable by $(id -un) — likely root-owned from a prior bare '${COMPOSE[*]} up'. Recover with: sudo chown -R \$USER:\$USER $PROJECT_ROOT/.k3rs"
     fi
 }
 ensure_writable_dir "$KUBELET_VOLUMES_PATH"
-ensure_writable_dir "$PROJECT_ROOT/.rusternetes/manifests"
-ensure_writable_dir "$PROJECT_ROOT/.rusternetes/certs"
+ensure_writable_dir "$PROJECT_ROOT/.k3rs/manifests"
+ensure_writable_dir "$PROJECT_ROOT/.k3rs/certs"
 
 # ---- pick a bootstrap kubectl ---------------------------------------------
 # The in-tree kubectl currently drops --insecure-skip-tls-verify / the
@@ -173,7 +173,7 @@ if [[ -z "$KUBECTL_BIN" ]]; then
 fi
 
 echo ""
-printf "${BOLD}Rusternetes cluster-up${NC}\n"
+printf "${BOLD}k3rs cluster-up${NC}\n"
 echo   "  backend          : $BACKEND  ($BASE_COMPOSE)"
 echo   "  runtime          : $RUNTIME"
 echo   "  compose          : ${COMPOSE[*]} ${COMPOSE_ARGS[*]}"
@@ -197,7 +197,7 @@ teardown() {
     # Force-remove leftover pod containers still attached to a project network,
     # then drop the network so 'up' recreates it clean.
     local nets
-    nets="$("${RT[@]}" network ls --format '{{.Name}}' 2>/dev/null | grep -iE 'rusternetes' || true)"
+    nets="$("${RT[@]}" network ls --format '{{.Name}}' 2>/dev/null | grep -iE 'k3rs' || true)"
     for net in $nets; do
         local cids
         cids="$("${RT[@]}" network inspect "$net" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null || true)"
@@ -271,13 +271,13 @@ if [[ "$DO_BOOTSTRAP" == 1 ]]; then
     step "Bootstrapping cluster (namespaces, kube-dns, ServiceAccount tokens)..."
     # On the prebuilt-image path bootstrap must template GHCR refs into the
     # control-plane static pods and the dns Deployment; without
-    # CONTROL_PLANE_IMAGE_REGISTRY it emits local `rusternetes-<component>:latest`
+    # CONTROL_PLANE_IMAGE_REGISTRY it emits local `k3rs-<component>:latest`
     # names, which the separate containerd image store cannot resolve, so those
     # pods never start (#1777). Only set it when we did NOT build locally — the
     # local-build path relies on bootstrap's `docker save | ctr images import`.
     if [[ "$DO_BUILD" == 0 && -z "${CONTROL_PLANE_IMAGE_REGISTRY:-}" ]]; then
         export CONTROL_PLANE_IMAGE_REGISTRY="ghcr.io/indyjonesnl/rusternetes"
-        step "Using prebuilt control-plane images from $CONTROL_PLANE_IMAGE_REGISTRY (tag ${RUSTERNETES_IMAGE_TAG:-main})"
+        step "Using prebuilt control-plane images from $CONTROL_PLANE_IMAGE_REGISTRY (tag ${K3RS_IMAGE_TAG:-main})"
     fi
     KUBECTL="$KUBECTL_BIN" KUBECONFIG="$KUBECONFIG_PATH" \
         bash "$SCRIPT_DIR/bootstrap-cluster.sh"
@@ -299,7 +299,7 @@ ${BOLD}Next:${NC} run a conformance suite against the cluster.
   # Hydrophone (fast, single conformance pod):
   KUBECONFIG=$KUBECONFIG_PATH hydrophone \\
     --conformance-image $CONFORMANCE_IMAGE \\
-    --output-dir .rusternetes/volumes/conformance-\$(date +%Y%m%d-%H%M%S)
+    --output-dir .k3rs/volumes/conformance-\$(date +%Y%m%d-%H%M%S)
 
   # Sonobuoy (full lifecycle):
   bash scripts/run-conformance.sh
@@ -309,7 +309,7 @@ EOF
         ;;
     hydrophone)
         command -v hydrophone >/dev/null 2>&1 || die "hydrophone not found on PATH"
-        OUT=".rusternetes/volumes/conformance-${BACKEND}-$(date +%Y%m%d-%H%M%S)"
+        OUT=".k3rs/volumes/conformance-${BACKEND}-$(date +%Y%m%d-%H%M%S)"
         mkdir -p "$OUT"
         step "Running Hydrophone conformance → $OUT"
         hy_args=(--kubeconfig "$KUBECONFIG_PATH" --output-dir "$OUT"

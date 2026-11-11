@@ -14282,7 +14282,7 @@ fn unwrap_json_schema_union(inner_type: &str, value: Value) -> Value {
 /// where `raw` carries the native protobuf encoding of `Status` itself.
 ///
 /// The returned bytes are decodable via `ProtoRegistry::decode_message("Status", &bytes[k8s\0+Unknown.raw offset..])`.
-pub fn encode_status_protobuf(status: &rusternetes_common::types::Status) -> Vec<u8> {
+pub fn encode_status_protobuf(status: &k3rs_common::types::Status) -> Vec<u8> {
     let raw = encode_status_native(status);
 
     // Wrap in the K8s runtime.Unknown envelope.
@@ -14317,7 +14317,7 @@ pub fn encode_status_protobuf(status: &rusternetes_common::types::Status) -> Vec
 /// Encode a `Status` to native protobuf bytes (without the `k8s\0` + Unknown
 /// envelope). Public for tests that want to round-trip via
 /// `ProtoRegistry::decode_message("Status", …)`.
-pub fn encode_status_native(status: &rusternetes_common::types::Status) -> Vec<u8> {
+pub fn encode_status_native(status: &k3rs_common::types::Status) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
     // field 1: metadata (ListMeta). Normally zero-valued and thus omitted, but a
@@ -14353,7 +14353,7 @@ pub fn encode_status_native(status: &rusternetes_common::types::Status) -> Vec<u
 /// Encode a `meta/v1.ListMeta` to native protobuf bytes. Field numbers per
 /// `apimachinery/pkg/apis/meta/v1/generated.proto`:
 /// selfLink=1, resourceVersion=2, continue=3, remainingItemCount=4.
-fn encode_list_meta_native(m: &rusternetes_common::types::ListMeta) -> Vec<u8> {
+fn encode_list_meta_native(m: &k3rs_common::types::ListMeta) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     if let Some(ref rv) = m.resource_version {
         if !rv.is_empty() {
@@ -14568,7 +14568,7 @@ pub fn encode_partial_object_metadata_k8s(value: &serde_json::Value, kind: &str)
     out
 }
 
-fn encode_status_details_native(d: &rusternetes_common::types::StatusDetails) -> Vec<u8> {
+fn encode_status_details_native(d: &k3rs_common::types::StatusDetails) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     if let Some(ref name) = d.name {
         push_string_field(&mut buf, 1, name.as_bytes());
@@ -14594,7 +14594,7 @@ fn encode_status_details_native(d: &rusternetes_common::types::StatusDetails) ->
     buf
 }
 
-fn encode_status_cause_native(c: &rusternetes_common::types::StatusCause) -> Vec<u8> {
+fn encode_status_cause_native(c: &k3rs_common::types::StatusCause) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16);
     if let Some(ref r) = c.reason {
         push_string_field(&mut buf, 1, r.as_bytes());

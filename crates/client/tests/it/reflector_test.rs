@@ -1,6 +1,6 @@
 use futures::stream::BoxStream;
-use rusternetes_client::reflector::{ListWatch, Reflector, StoreEvent, WatchItem};
-use rusternetes_client::watch::WatchEvent;
+use k3rs_client::reflector::{ListWatch, Reflector, StoreEvent, WatchItem};
+use k3rs_client::watch::WatchEvent;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]

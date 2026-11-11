@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Spawn one parallel-conformance agent: a privileged docker:dind sidecar
-# that runs a full rusternetes cluster + the conformance harness in
+# that runs a full k3rs cluster + the conformance harness in
 # total isolation from every other agent on the host.
 #
 # Required: AGENT_ID env var or arg in 1..9.
 # Optional: AGENT_WORKDIR (defaults to $PWD — must be a repo root or
-#           git worktree of rusternetes).
+#           git worktree of k3rs).
 #
 # Layout:
-#   ${AGENT_WORKDIR}/.rusternetes/agents/N/     ← kubeconfig, logs, results
+#   ${AGENT_WORKDIR}/.k3rs/agents/N/     ← kubeconfig, logs, results
 #   127.0.0.1:1644N                             ← agent's api-server (host-published)
 #
 # Re-running for an already-up agent is a no-op (idempotent).
@@ -66,11 +66,11 @@ done
 # --- load image tarball ------------------------------------------------------
 # `docker load` is idempotent — repeated loads are no-ops once the layers
 # exist. Cheap to re-run if the dind survived a previous agent-up.
-agent_banner "loading rusternetes images into dind"
+agent_banner "loading k3rs images into dind"
 docker exec "$DIND_NAME" docker load -i /images.tar | tail -10
 
 # --- install bash + openssl + kubectl in the dind ----------------------------
-# docker:dind is alpine. We need bash for the rusternetes shell scripts,
+# docker:dind is alpine. We need bash for the k3rs shell scripts,
 # openssl for generate-certs.sh, jq for that script's network inspection,
 # kubectl for bootstrap-cluster.sh + the health loop.
 agent_banner "installing bash/openssl/jq/kubectl in dind"
@@ -85,21 +85,21 @@ docker exec "$DIND_NAME" sh -c '
 '
 
 # --- generate TLS certs inside the workspace ---------------------------------
-# generate-certs.sh writes to /workspace/.rusternetes/certs. Because the
+# generate-certs.sh writes to /workspace/.k3rs/certs. Because the
 # /workspace bind-mount is per-agent (one worktree per agent), certs are
 # fully isolated.
 agent_banner "generating TLS certs"
 docker exec -w /workspace "$DIND_NAME" bash scripts/generate-certs.sh
 
 # --- bring up the cluster ----------------------------------------------------
-# Pin COMPOSE_PROJECT_NAME=rusternetes so compose looks up the loaded
-# image tags as `rusternetes-<service>:latest`. Without it, compose
+# Pin COMPOSE_PROJECT_NAME=k3rs so compose looks up the loaded
+# image tags as `k3rs-<service>:latest`. Without it, compose
 # falls back to the workdir basename (`workspace-…`) and "no such image"
 # fails the up step.
 agent_banner "compose up"
 docker exec -w /workspace \
-  -e COMPOSE_PROJECT_NAME=rusternetes \
-  -e KUBELET_VOLUMES_PATH=/workspace/.rusternetes/agents/${AGENT_ID}/kubelet-volumes \
+  -e COMPOSE_PROJECT_NAME=k3rs \
+  -e KUBELET_VOLUMES_PATH=/workspace/.k3rs/agents/${AGENT_ID}/kubelet-volumes \
   "$DIND_NAME" \
   docker compose -f compose.yml up -d --no-build
 
@@ -120,10 +120,10 @@ for i in $(seq 1 90); do
   if [[ $i -eq 90 ]]; then
     echo "api-server never returned 200 on /healthz (last: ${code})" >&2
     docker exec -w /workspace \
-      -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
+      -e COMPOSE_PROJECT_NAME=k3rs "$DIND_NAME" \
       docker compose -f compose.yml ps >&2 || true
     docker exec -w /workspace \
-      -e COMPOSE_PROJECT_NAME=rusternetes "$DIND_NAME" \
+      -e COMPOSE_PROJECT_NAME=k3rs "$DIND_NAME" \
       docker compose -f compose.yml logs --tail=80 api-server >&2 || true
     exit 1
   fi
@@ -136,16 +136,16 @@ cat > "$AGENT_KUBECONFIG" <<EOF
 apiVersion: v1
 kind: Config
 clusters:
-  - name: rusternetes-agent-${AGENT_ID}
+  - name: k3rs-agent-${AGENT_ID}
     cluster:
       insecure-skip-tls-verify: true
       server: https://127.0.0.1:${API_HOST_PORT}
 contexts:
-  - name: rusternetes-agent-${AGENT_ID}
+  - name: k3rs-agent-${AGENT_ID}
     context:
-      cluster: rusternetes-agent-${AGENT_ID}
+      cluster: k3rs-agent-${AGENT_ID}
       user: admin
-current-context: rusternetes-agent-${AGENT_ID}
+current-context: k3rs-agent-${AGENT_ID}
 users:
   - name: admin
     user:
@@ -155,22 +155,22 @@ EOF
 # --- bootstrap CoreDNS, services, SA tokens ----------------------------------
 agent_banner "bootstrap-cluster.sh"
 docker exec -w /workspace \
-  -e KUBECONFIG=/workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal \
+  -e KUBECONFIG=/workspace/.k3rs/agents/${AGENT_ID}/kubeconfig-internal \
   "$DIND_NAME" bash -c "
-    cat > /workspace/.rusternetes/agents/${AGENT_ID}/kubeconfig-internal <<INNER
+    cat > /workspace/.k3rs/agents/${AGENT_ID}/kubeconfig-internal <<INNER
 apiVersion: v1
 kind: Config
 clusters:
-  - name: rusternetes
+  - name: k3rs
     cluster:
       insecure-skip-tls-verify: true
       server: https://localhost:6443
 contexts:
-  - name: rusternetes
+  - name: k3rs
     context:
-      cluster: rusternetes
+      cluster: k3rs
       user: admin
-current-context: rusternetes
+current-context: k3rs
 users:
   - name: admin
     user:

@@ -17,7 +17,7 @@ members = [
     "crates/storage",
     "crates/client",
     "crates/dns",
-    "crates/rusternetes",
+    "crates/k3rs",
     "crates/test_support",
     "crates/streamproxy",
     "crates/csi",
@@ -27,9 +27,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["Rusternetes Contributors"]
+authors = ["k3rs Contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/rusternetes/rusternetes"
+repository = "https://github.com/k3rs/k3rs"
 
 [workspace.dependencies]
 tokio = { version = "1.40", features = ["full"] }

@@ -13,19 +13,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::fieldmanager::{Filter, PathElementMatcher, SetMatcher};
-use rusternetes_common::podutil::update_pod_condition;
-use rusternetes_common::resources::pod::PodSpec;
-use rusternetes_common::resources::pod::{AppArmorProfile, PodAffinityTerm, SecurityContext};
-use rusternetes_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
-use rusternetes_common::types::Phase;
-use rusternetes_common::types::{LabelSelector, LabelSelectorRequirement};
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::Status;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::fieldmanager::{Filter, PathElementMatcher, SetMatcher};
+use k3rs_common::podutil::update_pod_condition;
+use k3rs_common::resources::pod::PodSpec;
+use k3rs_common::resources::pod::{AppArmorProfile, PodAffinityTerm, SecurityContext};
+use k3rs_common::resources::{Binding, Container, Pod, PodCondition, PodStatus};
+use k3rs_common::types::Phase;
+use k3rs_common::types::{LabelSelector, LabelSelectorRequirement};
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::metav1::{get_warnings_for_ip, is_dns1123_label};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_common::Status;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::{Store, UpdateOptions};
 use crate::registry::rest::{
@@ -203,7 +203,7 @@ fn mutate_pod_affinity(pod: &mut Pod) {
 /// `mutateTopologySpreadConstraints` (strategy.go:925-935) with
 /// `applyMatchLabelKeys` (strategy.go:912-921): both gates must be on.
 fn mutate_topology_spread_constraints(pod: &mut Pod) {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     if !enabled(Feature::MatchLabelKeysInPodTopologySpread)
         || !enabled(Feature::MatchLabelKeysInPodTopologySpreadSelectorMerge)
     {
@@ -289,7 +289,7 @@ fn apply_app_armor_version_skew(ctx: &RequestContext, pod: &mut Pod) {
         }
         let mut new_field = apparmor_field_for_annotation(annotation);
         if let Some(f) = &new_field {
-            if !rusternetes_common::validation::pod::validate_app_armor_profile(f, &Path::new(""))
+            if !k3rs_common::validation::pod::validate_app_armor_profile(f, &Path::new(""))
                 .is_empty()
             {
                 new_field = None;
@@ -337,13 +337,13 @@ impl RestCreateStrategy<Pod> for Strategy {
         // The api-server is the authoritative writer of the QoS class
         // (strategy.go:92); the kubelet recomputes the same value
         // (pkg/kubelet/kubelet_pods.go:2097), both through `ComputePodQOS`.
-        let qos = rusternetes_common::qos::compute_pod_qos(obj);
+        let qos = k3rs_common::qos::compute_pod_qos(obj);
         obj.status = Some(PodStatus {
             phase: Some(Phase::Pending),
             qos_class: Some(qos.as_str().to_string()),
             ..Default::default()
         });
-        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, None);
+        k3rs_common::pod_drop_disabled::drop_disabled_pod_fields(obj, None);
         apply_scheduling_gated_condition(obj);
         mutate_pod_affinity(obj);
         mutate_topology_spread_constraints(obj);
@@ -352,14 +352,12 @@ impl RestCreateStrategy<Pod> for Strategy {
 
     /// strategy.go:111-116: `ValidatePodCreate`.
     fn validate(&self, _ctx: &RequestContext, obj: &Pod) -> ErrorList {
-        use rusternetes_common::feature_gates::{enabled, Feature};
+        use k3rs_common::feature_gates::{enabled, Feature};
         let mut errs = validate_pod_meta(obj);
         errs.extend(
-            rusternetes_common::validation::pod_status::validate_pod_metadata_annotations(
-                obj, None,
-            ),
+            k3rs_common::validation::pod_status::validate_pod_metadata_annotations(obj, None),
         );
-        errs.extend(rusternetes_common::validation::pod::validate_pod_create(
+        errs.extend(k3rs_common::validation::pod::validate_pod_create(
             obj,
             enabled(Feature::RelaxedDNSSearchValidation),
         ));
@@ -370,15 +368,13 @@ impl RestCreateStrategy<Pod> for Strategy {
     fn warnings_on_create(&self, _ctx: &RequestContext, obj: &Pod) -> Vec<String> {
         let msgs = is_dns1123_label(&obj.metadata.name);
         if msgs.is_empty() {
-            return rusternetes_common::pod_warnings::get_warnings_for_pod(obj, None);
+            return k3rs_common::pod_warnings::get_warnings_for_pod(obj, None);
         }
         let mut warnings = vec![format!(
             "metadata.name: this is used in the Pod's hostname, which can result in surprising behavior; a DNS label is recommended: [{}]",
             msgs.join(" ")
         )];
-        warnings.extend(rusternetes_common::pod_warnings::get_warnings_for_pod(
-            obj, None,
-        ));
+        warnings.extend(k3rs_common::pod_warnings::get_warnings_for_pod(obj, None));
         warnings
     }
 }
@@ -392,14 +388,14 @@ impl RestUpdateStrategy<Pod> for Strategy {
     /// strategy.go:103-109: the main resource never writes status.
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
         obj.status = old.status.clone();
-        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
+        k3rs_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
     }
 
     /// strategy.go:143-150: `ValidatePodUpdate`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        use rusternetes_common::feature_gates::{enabled, Feature};
-        let mut errs = rusternetes_common::validation::pod::validate_pod_update(
+        use k3rs_common::feature_gates::{enabled, Feature};
+        let mut errs = k3rs_common::validation::pod::validate_pod_update(
             obj,
             old,
             enabled(Feature::RelaxedDNSSearchValidation),
@@ -439,7 +435,7 @@ impl RestGracefulDeleteStrategy<Pod> for Strategy {
         &self,
         _ctx: &RequestContext,
         obj: &Pod,
-        options: &mut rusternetes_common::deletion::DeleteOptions,
+        options: &mut k3rs_common::deletion::DeleteOptions,
     ) -> bool {
         let spec = obj.spec.as_ref();
         // user has specified a value; otherwise use the default if set, or
@@ -542,12 +538,12 @@ impl RestUpdateStrategy<Pod> for StatusStrategy {
         }
 
         preserve_old_observed_generation(obj, old);
-        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
+        k3rs_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
     }
 
     /// strategy.go:263-271: `ValidatePodStatusUpdate`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        rusternetes_common::validation::pod_status::validate_pod_status_update(obj, old)
+        k3rs_common::validation::pod_status::validate_pod_status_update(obj, old)
     }
 
     /// strategy.go:273-283: a non-standard IP in `podIPs` or `hostIPs`
@@ -630,16 +626,14 @@ impl RestUpdateStrategy<Pod> for EphemeralContainersStrategy {
         }
         obj.status = old.status.clone();
         reset_object_meta_for_status(&mut obj.metadata, &old.metadata);
-        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
+        k3rs_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
     }
 
     /// `ValidatePodEphemeralContainersUpdate` (validation.go:6181-6212),
     /// ported in `validation::pod_subresource`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        rusternetes_common::validation::pod_subresource::validate_pod_ephemeral_containers_update(
-            obj, old,
-        )
+        k3rs_common::validation::pod_subresource::validate_pod_ephemeral_containers_update(obj, old)
     }
 
     fn allow_unconditional_update(&self) -> bool {
@@ -699,8 +693,8 @@ pub fn drop_non_resize_updates(new: &mut Pod, old: &Pod) {
     let mut spec = old_spec.clone();
     // With InPlacePodLevelResourcesVerticalScaling on, restore the saved
     // pod-level resources to the new pod's spec (strategy.go:376-380).
-    if rusternetes_common::feature_gates::enabled(
-        rusternetes_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
+    if k3rs_common::feature_gates::enabled(
+        k3rs_common::feature_gates::Feature::InPlacePodLevelResourcesVerticalScaling,
     ) {
         spec.resources = new_pod_resources;
     }
@@ -761,7 +755,7 @@ impl RestUpdateStrategy<Pod> for ResizeStrategy {
     /// `status.resize = Proposed` the kubelet reads (KEP-1287).
     fn prepare_for_update(&self, _ctx: &RequestContext, obj: &mut Pod, old: &Pod) {
         drop_non_resize_updates(obj, old);
-        rusternetes_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
+        k3rs_common::pod_drop_disabled::drop_disabled_pod_fields(obj, Some(old));
         update_pod_generation(obj, old);
         if container_resources_changed(old, obj) {
             if let Some(status) = obj.status.as_mut() {
@@ -773,7 +767,7 @@ impl RestUpdateStrategy<Pod> for ResizeStrategy {
     /// `ValidatePodResize` (validation.go:6217-6346), ported in
     /// `validation::pod_subresource`.
     fn validate_update(&self, _ctx: &RequestContext, obj: &Pod, old: &Pod) -> ErrorList {
-        rusternetes_common::validation::pod_subresource::validate_pod_resize(obj, old)
+        k3rs_common::validation::pod_subresource::validate_pod_resize(obj, old)
     }
 
     fn allow_unconditional_update(&self) -> bool {
@@ -830,8 +824,8 @@ impl BindingRest {
         binding: &Binding,
         create_validation: Option<&dyn crate::registry::rest::ValidateObject<Binding>>,
         dry_run: bool,
-    ) -> rusternetes_common::Result<()> {
-        use rusternetes_common::Error;
+    ) -> k3rs_common::Result<()> {
+        use k3rs_common::Error;
         if name != binding.metadata.name {
             return Err(Error::BadRequest(
                 "name in URL does not match name in Binding object".to_string(),
@@ -839,7 +833,7 @@ impl BindingRest {
         }
         // storage.go:188-190: `return nil, errs.ToAggregate()` - a plain
         // error, so a 500 (see `Error::aggregate`), not a 422.
-        let errs = rusternetes_common::validation::pod_status::validate_pod_binding(binding);
+        let errs = k3rs_common::validation::pod_status::validate_pod_binding(binding);
         if !errs.is_empty() {
             return Err(Error::aggregate(&errs));
         }
@@ -858,7 +852,7 @@ impl BindingRest {
         ctx: &RequestContext,
         binding: &Binding,
         dry_run: bool,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let name = binding.metadata.name.as_str();
         // `PreserveRequestObjectMetaSystemFieldsOnSubresourceCreate`: the
         // binding's UID and resourceVersion guard the pod it names.
@@ -869,7 +863,7 @@ impl BindingRest {
             .clone()
             .filter(|rv| !rv.is_empty());
         let preconditions = (uid.is_some() || resource_version.is_some()).then_some(
-            rusternetes_common::deletion::Preconditions {
+            k3rs_common::deletion::Preconditions {
                 uid,
                 resource_version,
             },
@@ -878,7 +872,7 @@ impl BindingRest {
         let annotations = binding.metadata.annotations.clone();
         let labels = binding.metadata.labels.clone();
         let binding_resource = GroupResource::new("", "pods/binding");
-        let mutate = move |pod: &mut Pod| -> rusternetes_common::Result<()> {
+        let mutate = move |pod: &mut Pod| -> k3rs_common::Result<()> {
             set_pod_node_and_metadata(pod, &node, &annotations, &labels)
                 .map_err(|reason| crate::registry::rest::conflict(&binding_resource, name, reason))
         };
@@ -898,7 +892,7 @@ fn set_pod_node_and_metadata(
     annotations: &Option<HashMap<String, String>>,
     labels: &Option<HashMap<String, String>>,
 ) -> Result<(), String> {
-    use rusternetes_common::feature_gates::{enabled, Feature};
+    use k3rs_common::feature_gates::{enabled, Feature};
     let name = pod.metadata.name.clone();
     if pod.metadata.deletion_timestamp.is_some() {
         return Err(format!(
@@ -1006,8 +1000,8 @@ impl Backoff {
 }
 
 /// `errors.IsConflict`.
-fn is_conflict(err: &rusternetes_common::Error) -> bool {
-    matches!(err, rusternetes_common::Error::Conflict(_))
+fn is_conflict(err: &k3rs_common::Error) -> bool {
+    matches!(err, k3rs_common::Error::Conflict(_))
 }
 
 /// `dryrun.IsDryRun`: any entry is a dry run.
@@ -1016,7 +1010,7 @@ fn is_dry_run(dry_run: Option<&[String]>) -> bool {
 }
 
 /// `resourceVersionIsUnset` (eviction.go:409-411).
-fn resource_version_is_unset(options: &rusternetes_common::deletion::DeleteOptions) -> bool {
+fn resource_version_is_unset(options: &k3rs_common::deletion::DeleteOptions) -> bool {
     options
         .preconditions
         .as_ref()
@@ -1025,7 +1019,7 @@ fn resource_version_is_unset(options: &rusternetes_common::deletion::DeleteOptio
 
 /// `setPreconditionsResourceVersion` (eviction.go:382-387).
 fn set_preconditions_resource_version(
-    options: &mut rusternetes_common::deletion::DeleteOptions,
+    options: &mut k3rs_common::deletion::DeleteOptions,
     resource_version: Option<String>,
 ) {
     options
@@ -1062,13 +1056,13 @@ fn should_enforce_resource_version(pod: &Pod) -> bool {
 /// into the eviction's delete options. "It returns an error if they have
 /// non-matching dry-run options."
 fn propagate_dry_run(
-    eviction: &mut rusternetes_common::resources::Eviction,
-    options: &rusternetes_common::validation::metav1::CreateOptions,
-) -> rusternetes_common::Result<rusternetes_common::deletion::DeleteOptions> {
+    eviction: &mut k3rs_common::resources::Eviction,
+    options: &k3rs_common::validation::metav1::CreateOptions,
+) -> k3rs_common::Result<k3rs_common::deletion::DeleteOptions> {
     use crate::registry::rest::zero_delete_options;
     let request = options.dry_run.clone().filter(|d| !d.is_empty());
     let Some(delete_options) = eviction.delete_options.as_mut() else {
-        return Ok(rusternetes_common::deletion::DeleteOptions {
+        return Ok(k3rs_common::deletion::DeleteOptions {
             dry_run: options.dry_run.clone(),
             ..zero_delete_options()
         });
@@ -1082,7 +1076,7 @@ fn propagate_dry_run(
         (Some(_), None) => Ok(delete_options.clone()),
         (Some(own), Some(request)) => {
             if own != request {
-                return Err(rusternetes_common::Error::Internal(format!(
+                return Err(k3rs_common::Error::Internal(format!(
                     "Non-matching dry-run options in request and content: {request:?} and {own:?}"
                 )));
             }
@@ -1101,13 +1095,13 @@ fn success_status() -> Status {
 }
 
 /// `createTooManyRequestsError` (eviction.go:413-421).
-fn create_too_many_requests_error(name: &str) -> rusternetes_common::Error {
+fn create_too_many_requests_error(name: &str) -> k3rs_common::Error {
     // TODO upstream: once there are time-based budgets, we can sometimes
     // compute a sensible suggested value. Even without that, a suggestion
     // (even a small one) prevents well-behaved clients from hammering us.
     too_many_requests(
         10,
-        vec![rusternetes_common::StatusCause {
+        vec![k3rs_common::StatusCause {
             reason: Some("DisruptionBudget".to_string()),
             message: Some(format!(
                 "The disruption budget {name} is still being processed by the server."
@@ -1121,9 +1115,9 @@ fn create_too_many_requests_error(name: &str) -> rusternetes_common::Error {
 /// the eviction message, and `causes` appended to its `Details`.
 fn too_many_requests(
     retry_after_seconds: i32,
-    causes: Vec<rusternetes_common::StatusCause>,
-) -> rusternetes_common::Error {
-    let details = rusternetes_common::StatusDetails {
+    causes: Vec<k3rs_common::StatusCause>,
+) -> k3rs_common::Error {
+    let details = k3rs_common::StatusDetails {
         name: None,
         group: None,
         kind: None,
@@ -1131,7 +1125,7 @@ fn too_many_requests(
         causes: (!causes.is_empty()).then_some(causes),
         retry_after_seconds: (retry_after_seconds > 0).then_some(retry_after_seconds),
     };
-    rusternetes_common::Error::Status(Box::new(Status::failure_with_details(
+    k3rs_common::Error::Status(Box::new(Status::failure_with_details(
         "Cannot evict pod as it would violate the pod's disruption budget.",
         "TooManyRequests",
         429,
@@ -1140,8 +1134,8 @@ fn too_many_requests(
 }
 
 /// `errors.NewForbidden(policy.Resource("poddisruptionbudget"), name, err)`.
-fn pdb_forbidden(name: &str, err: &str) -> rusternetes_common::Error {
-    rusternetes_common::Error::Forbidden(format!(
+fn pdb_forbidden(name: &str, err: &str) -> k3rs_common::Error {
+    k3rs_common::Error::Forbidden(format!(
         "poddisruptionbudget.policy \"{name}\" is forbidden: {err}"
     ))
 }
@@ -1153,26 +1147,26 @@ fn pdb_forbidden(name: &str, err: &str) -> rusternetes_common::Error {
 #[async_trait]
 pub trait EvictionPodStore: Send + Sync {
     /// `Get`.
-    async fn get(&self, ctx: &RequestContext, name: &str) -> rusternetes_common::Result<Pod>;
+    async fn get(&self, ctx: &RequestContext, name: &str) -> k3rs_common::Result<Pod>;
     /// `Update`, with the validation callbacks of `rest.ValidateAllObjectFunc`.
     async fn update(
         &self,
         ctx: &RequestContext,
         name: &str,
         obj_info: &dyn UpdatedObjectInfo<Pod>,
-    ) -> rusternetes_common::Result<Pod>;
+    ) -> k3rs_common::Result<Pod>;
     /// `Delete`, with `rest.ValidateAllObjectFunc`.
     async fn delete(
         &self,
         ctx: &RequestContext,
         name: &str,
-        options: rusternetes_common::deletion::DeleteOptions,
-    ) -> rusternetes_common::Result<()>;
+        options: k3rs_common::deletion::DeleteOptions,
+    ) -> k3rs_common::Result<()>;
 }
 
 #[async_trait]
-impl<S: rusternetes_storage::Storage + 'static> EvictionPodStore for Store<Pod, S> {
-    async fn get(&self, ctx: &RequestContext, name: &str) -> rusternetes_common::Result<Pod> {
+impl<S: k3rs_storage::Storage + 'static> EvictionPodStore for Store<Pod, S> {
+    async fn get(&self, ctx: &RequestContext, name: &str) -> k3rs_common::Result<Pod> {
         Store::get(
             self,
             ctx,
@@ -1187,7 +1181,7 @@ impl<S: rusternetes_storage::Storage + 'static> EvictionPodStore for Store<Pod, 
         ctx: &RequestContext,
         name: &str,
         obj_info: &dyn UpdatedObjectInfo<Pod>,
-    ) -> rusternetes_common::Result<Pod> {
+    ) -> k3rs_common::Result<Pod> {
         Store::update(
             self,
             ctx,
@@ -1206,8 +1200,8 @@ impl<S: rusternetes_storage::Storage + 'static> EvictionPodStore for Store<Pod, 
         &self,
         ctx: &RequestContext,
         name: &str,
-        options: rusternetes_common::deletion::DeleteOptions,
-    ) -> rusternetes_common::Result<()> {
+        options: k3rs_common::deletion::DeleteOptions,
+    ) -> k3rs_common::Result<()> {
         Store::delete(self, ctx, name, None, options)
             .await
             .map(|_| ())
@@ -1223,20 +1217,20 @@ pub trait PdbClient: Send + Sync {
     async fn list(
         &self,
         namespace: &str,
-    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>>;
+    ) -> k3rs_common::Result<Vec<k3rs_common::resources::PodDisruptionBudget>>;
     /// `PodDisruptionBudgets(ns).Get`.
     async fn get(
         &self,
         namespace: &str,
         name: &str,
-    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
+    ) -> k3rs_common::Result<k3rs_common::resources::PodDisruptionBudget>;
     /// `PodDisruptionBudgets(ns).UpdateStatus`: a write of the whole object
     /// that conflicts when its `resourceVersion` is not the stored one.
     async fn update_status(
         &self,
         namespace: &str,
-        pdb: &rusternetes_common::resources::PodDisruptionBudget,
-    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget>;
+        pdb: &k3rs_common::resources::PodDisruptionBudget,
+    ) -> k3rs_common::Result<k3rs_common::resources::PodDisruptionBudget>;
 }
 
 /// The PDB client over the PodDisruptionBudget store (reads) and its status
@@ -1260,9 +1254,9 @@ impl PdbClient for StorePdbClient {
     async fn list(
         &self,
         namespace: &str,
-    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>> {
-        use rusternetes_storage::{build_prefix, Storage};
-        let mut pdbs: Vec<rusternetes_common::resources::PodDisruptionBudget> = self
+    ) -> k3rs_common::Result<Vec<k3rs_common::resources::PodDisruptionBudget>> {
+        use k3rs_storage::{build_prefix, Storage};
+        let mut pdbs: Vec<k3rs_common::resources::PodDisruptionBudget> = self
             .storage
             .list(&build_prefix("poddisruptionbudgets", Some(namespace)))
             .await?;
@@ -1277,7 +1271,7 @@ impl PdbClient for StorePdbClient {
         &self,
         namespace: &str,
         name: &str,
-    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
+    ) -> k3rs_common::Result<k3rs_common::resources::PodDisruptionBudget> {
         crate::registry::policy::poddisruptionbudget::new_store(self.storage.clone())
             .get(
                 &Self::ctx(namespace),
@@ -1290,8 +1284,8 @@ impl PdbClient for StorePdbClient {
     async fn update_status(
         &self,
         namespace: &str,
-        pdb: &rusternetes_common::resources::PodDisruptionBudget,
-    ) -> rusternetes_common::Result<rusternetes_common::resources::PodDisruptionBudget> {
+        pdb: &k3rs_common::resources::PodDisruptionBudget,
+    ) -> k3rs_common::Result<k3rs_common::resources::PodDisruptionBudget> {
         // The loopback `UpdateStatus` (eviction.go:432, `PodDisruptionBudgets(ns).
         // UpdateStatus`) is a PUT to `/status`: `Store.Update` on the status
         // store (storage.go:60-62), so `podDisruptionBudgetStatusStrategy`
@@ -1341,7 +1335,7 @@ pub fn new_eviction_rest(storage: Arc<StorageBackend>) -> StoreEvictionRest {
 /// the latest pod from storage, so the condition appender cannot conflict;
 /// the delete options' preconditions are checked against it.
 struct GetLatestPod {
-    preconditions: Option<rusternetes_common::deletion::Preconditions>,
+    preconditions: Option<k3rs_common::deletion::Preconditions>,
 }
 
 #[async_trait]
@@ -1351,9 +1345,9 @@ impl TransformFunc<Pod> for GetLatestPod {
         _ctx: &RequestContext,
         _new: Option<Pod>,
         old: Option<&Pod>,
-    ) -> rusternetes_common::Result<Pod> {
+    ) -> k3rs_common::Result<Pod> {
         let latest = old.cloned().ok_or_else(|| {
-            rusternetes_common::Error::Internal("the pod to evict is not stored".to_string())
+            k3rs_common::Error::Internal("the pod to evict is not stored".to_string())
         })?;
         let pod_resource = GroupResource::new("", "Pod");
         if let Some(preconditions) = &self.preconditions {
@@ -1401,9 +1395,9 @@ impl TransformFunc<Pod> for ConditionAppender {
         _ctx: &RequestContext,
         new: Option<Pod>,
         _old: Option<&Pod>,
-    ) -> rusternetes_common::Result<Pod> {
+    ) -> k3rs_common::Result<Pod> {
         let mut pod = new.ok_or_else(|| {
-            rusternetes_common::Error::Internal("no pod to add the condition to".to_string())
+            k3rs_common::Error::Internal("no pod to add the condition to".to_string())
         })?;
         update_pod_condition(
             pod.status.get_or_insert_with(Default::default),
@@ -1438,13 +1432,13 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         ctx: &RequestContext,
         name: &str,
-        mut eviction: rusternetes_common::resources::Eviction,
+        mut eviction: k3rs_common::resources::Eviction,
         create_validation: Option<
-            &dyn crate::registry::rest::ValidateObject<rusternetes_common::resources::Eviction>,
+            &dyn crate::registry::rest::ValidateObject<k3rs_common::resources::Eviction>,
         >,
-        options: &rusternetes_common::validation::metav1::CreateOptions,
-    ) -> rusternetes_common::Result<Status> {
-        use rusternetes_common::Error;
+        options: &k3rs_common::validation::metav1::CreateOptions,
+    ) -> k3rs_common::Result<Status> {
+        use k3rs_common::Error;
         if name != eviction.metadata.name {
             return Err(Error::BadRequest(
                 "name in URL does not match name in Eviction object".to_string(),
@@ -1554,7 +1548,7 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
             // IsPodReady is the current implementation of IsHealthy. If the
             // pod is healthy, it should be guarded by the PDB.
             let mut check_budget = true;
-            if !rusternetes_common::podutil::is_pod_ready(&pod) {
+            if !k3rs_common::podutil::is_pod_ready(&pod) {
                 if pdb.spec.unhealthy_pod_eviction_policy.as_deref() == Some("AlwaysAllow") {
                     // Delete the unhealthy pod, it doesn't count towards
                     // currentHealthy and desiredHealthy and we should not
@@ -1630,8 +1624,8 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         ctx: &RequestContext,
         name: &str,
-        original_delete_options: &rusternetes_common::deletion::DeleteOptions,
-    ) -> rusternetes_common::Result<(Pod, bool)> {
+        original_delete_options: &k3rs_common::deletion::DeleteOptions,
+    ) -> k3rs_common::Result<(Pod, bool)> {
         let pod = self.store.get(ctx, name).await?;
 
         // Evicting a terminal pod should result in direct deletion of pod as
@@ -1670,9 +1664,9 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         namespace: &str,
         pod_name: &str,
-        pdb: rusternetes_common::resources::PodDisruptionBudget,
+        pdb: k3rs_common::resources::PodDisruptionBudget,
         dry_run: bool,
-    ) -> rusternetes_common::Result<()> {
+    ) -> k3rs_common::Result<()> {
         let pdb_name = pdb.metadata.name.clone();
         let mut pdb = pdb;
         let mut refresh = false;
@@ -1709,8 +1703,8 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         ctx: &RequestContext,
         name: &str,
-        options: &rusternetes_common::deletion::DeleteOptions,
-    ) -> rusternetes_common::Result<()> {
+        options: &k3rs_common::deletion::DeleteOptions,
+    ) -> k3rs_common::Result<()> {
         let mut options = options.clone();
         if !is_dry_run(options.dry_run.as_deref()) {
             // order important
@@ -1746,10 +1740,10 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         namespace: &str,
         pod_name: &str,
-        mut pdb: rusternetes_common::resources::PodDisruptionBudget,
+        mut pdb: k3rs_common::resources::PodDisruptionBudget,
         dry_run: bool,
-    ) -> rusternetes_common::Result<()> {
-        use rusternetes_common::pdbhelper::{
+    ) -> k3rs_common::Result<()> {
+        use k3rs_common::pdbhelper::{
             find_status_condition, update_disruption_allowed_condition,
             DISRUPTION_ALLOWED_CONDITION, SYNC_FAILED_REASON,
         };
@@ -1802,7 +1796,7 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
             };
             return Err(too_many_requests(
                 0,
-                vec![rusternetes_common::StatusCause {
+                vec![k3rs_common::StatusCause {
                     reason: Some("DisruptionBudget".to_string()),
                     message: Some(msg),
                     field: None,
@@ -1842,7 +1836,7 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
         &self,
         namespace: &str,
         pod: &Pod,
-    ) -> rusternetes_common::Result<Vec<rusternetes_common::resources::PodDisruptionBudget>> {
+    ) -> k3rs_common::Result<Vec<k3rs_common::resources::PodDisruptionBudget>> {
         let pdbs = self.pdb_client.list(namespace).await?;
         let pod_labels = pod.metadata.labels.clone().unwrap_or_default();
         Ok(pdbs
@@ -1862,8 +1856,8 @@ impl<P: EvictionPodStore, C: PdbClient> EvictionRest<P, C> {
 }
 
 /// The zero `policyv1.PodDisruptionBudgetStatus`.
-fn default_pdb_status() -> rusternetes_common::resources::PodDisruptionBudgetStatus {
-    rusternetes_common::resources::PodDisruptionBudgetStatus {
+fn default_pdb_status() -> k3rs_common::resources::PodDisruptionBudgetStatus {
+    k3rs_common::resources::PodDisruptionBudgetStatus {
         current_healthy: 0,
         desired_healthy: 0,
         disruptions_allowed: 0,

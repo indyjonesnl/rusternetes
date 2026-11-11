@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
 };
-use rusternetes_storage::{build_prefix, Storage};
+use k3rs_storage::{build_prefix, Storage};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,7 +64,7 @@ pub async fn resolve_aggregator_target_with_storage<S: Storage + Send + Sync>(
     version: &str,
 ) -> Result<Option<AggregatorTarget>, Response> {
     let apiservice_name = format!("{}.{}", version, group);
-    let apiservice_key = rusternetes_storage::build_key("apiservices", None, &apiservice_name);
+    let apiservice_key = k3rs_storage::build_key("apiservices", None, &apiservice_name);
     let Ok(apiservice) = storage.get::<Value>(&apiservice_key).await else {
         return Ok(None);
     };
@@ -305,7 +305,7 @@ pub fn proxy_current_cert_key_content() -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Load a reqwest client identity from a PEM cert + key file pair. Returns
-/// `None` when the files are absent (rusternetes' own cluster, whose backends
+/// `None` when the files are absent (k3rs' own cluster, whose backends
 /// don't require front-proxy client auth) or unparsable.
 pub fn load_proxy_client_identity_from(
     cert_path: &str,
@@ -1036,7 +1036,7 @@ pub async fn availability_discovery_request(
     let mut map = HeaderMap::new();
     crate::upgrade_aware::set_auth_proxy_headers(
         &mut map,
-        &rusternetes_common::auth::UserInfo {
+        &k3rs_common::auth::UserInfo {
             username: "system:kube-aggregator".to_string(),
             uid: String::new(),
             groups: vec!["system:masters".to_string()],

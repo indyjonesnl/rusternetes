@@ -3,9 +3,9 @@
 //! Tests all CRUD operations, edge cases, and error handling for resourcequotas
 //! ResourceQuota limits aggregate resource consumption per namespace.
 
-use rusternetes_common::resources::{ResourceQuota, ResourceQuotaSpec, ResourceQuotaStatus};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{ResourceQuota, ResourceQuotaSpec, ResourceQuotaStatus};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -509,7 +509,7 @@ async fn test_quota_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut quota = create_test_quota("test-owner", "default");
-    quota.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    quota.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "v1".to_string(),
         kind: "Namespace".to_string(),
         name: "default".to_string(),

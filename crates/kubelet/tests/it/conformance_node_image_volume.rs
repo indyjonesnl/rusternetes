@@ -1,4 +1,4 @@
-// Copyright The Rusternetes Authors
+// Copyright The k3rs Authors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Conformance: OCI image volume source (`spec.volumes[*].image`).
@@ -14,7 +14,7 @@
 //! create_pod_volumes`) receives the exact fields a client expects to
 //! send via Pod manifests.
 
-use rusternetes_common::resources::{ImageVolumeSource, Pod, Volume};
+use k3rs_common::resources::{ImageVolumeSource, Pod, Volume};
 use serde_json::json;
 
 fn image_volume(name: &str, reference: Option<&str>, policy: Option<&str>) -> Volume {

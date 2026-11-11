@@ -2,18 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::csi::{
-        VolumeAttachment, VolumeAttachmentStatus, VolumeError,
-    };
-    pub use rusternetes_common::validation::csinode::validate_csi_driver_name;
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_subdomain;
-    pub use rusternetes_common::validation::persistentvolume::validate_persistent_volume_spec;
+    pub use k3rs_common::resources::csi::{VolumeAttachment, VolumeAttachmentStatus, VolumeError};
+    pub use k3rs_common::validation::csinode::validate_csi_driver_name;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_subdomain;
+    pub use k3rs_common::validation::persistentvolume::validate_persistent_volume_spec;
 }
 
 mod inline_spec_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::volumeattachment::*;
+    use k3rs_common::validation::volumeattachment::*;
 
     fn errs(json: serde_json::Value) -> Vec<String> {
         let va: VolumeAttachment = serde_json::from_value(json).unwrap();
@@ -166,7 +164,7 @@ mod inline_spec_tests {
 
 mod parity_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::volumeattachment::*;
+    use k3rs_common::validation::volumeattachment::*;
 
     fn errs(json: serde_json::Value) -> Vec<String> {
         let va: VolumeAttachment = serde_json::from_value(json).unwrap();

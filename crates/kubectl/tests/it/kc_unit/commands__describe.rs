@@ -4,13 +4,13 @@
 mod __parent {
     pub use anyhow::Result;
     pub use chrono::Utc;
-    pub use rusternetes_client::http::{ApiClient, GetError};
-    pub use rusternetes_common::resources::{Deployment, Namespace, Node, Pod, Service};
+    pub use k3rs_client::http::{ApiClient, GetError};
+    pub use k3rs_common::resources::{Deployment, Namespace, Node, Pod, Service};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::describe::*;
+    use k3rs_kubectl::commands::describe::*;
 
     #[test]
     fn test_format_duration_days() {
@@ -59,8 +59,8 @@ mod tests {
     }
 
     fn make_test_pod() -> Pod {
-        use rusternetes_common::resources::pod::{Container, ContainerPort, PodSpec, PodStatus};
-        use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+        use k3rs_common::resources::pod::{Container, ContainerPort, PodSpec, PodStatus};
+        use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
         use std::collections::HashMap;
 
         Pod {
@@ -108,8 +108,8 @@ mod tests {
 
     #[test]
     fn test_describe_pod_minimal() {
-        use rusternetes_common::resources::pod::{Container, PodSpec};
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::resources::pod::{Container, PodSpec};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
 
         let pod = Pod {
             type_meta: TypeMeta {
@@ -135,9 +135,9 @@ mod tests {
 
     #[test]
     fn test_describe_service_output() {
-        use rusternetes_common::resources::service::{ServicePort, ServiceSpec};
-        use rusternetes_common::resources::IntOrString;
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::resources::service::{ServicePort, ServiceSpec};
+        use k3rs_common::resources::IntOrString;
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
         use std::collections::HashMap;
 
         let service = Service {
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn test_describe_service_no_type_defaults_to_clusterip() {
-        use rusternetes_common::resources::service::{ServicePort, ServiceSpec};
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::resources::service::{ServicePort, ServiceSpec};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
 
         let service = Service {
             type_meta: TypeMeta {
@@ -203,10 +203,10 @@ mod tests {
 
     #[test]
     fn test_describe_deployment_output() {
-        use rusternetes_common::resources::deployment::{DeploymentSpec, DeploymentStatus};
-        use rusternetes_common::resources::pod::{Container, PodSpec};
-        use rusternetes_common::resources::workloads::PodTemplateSpec;
-        use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+        use k3rs_common::resources::deployment::{DeploymentSpec, DeploymentStatus};
+        use k3rs_common::resources::pod::{Container, PodSpec};
+        use k3rs_common::resources::workloads::PodTemplateSpec;
+        use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
         use std::collections::HashMap;
 
         let deployment = Deployment {
@@ -252,8 +252,8 @@ mod tests {
 
     #[test]
     fn test_describe_node_output() {
-        use rusternetes_common::resources::node::{NodeAddress, NodeCondition, NodeStatus};
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::resources::node::{NodeAddress, NodeCondition, NodeStatus};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
         use std::collections::HashMap;
 
         let node = Node {
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_describe_namespace_output() {
-        use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+        use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
         use std::collections::HashMap;
 
         let ns = Namespace {
@@ -334,7 +334,7 @@ mod tests {
                 ..Default::default()
             },
             spec: None,
-            status: Some(rusternetes_common::resources::namespace::NamespaceStatus {
+            status: Some(k3rs_common::resources::namespace::NamespaceStatus {
                 phase: Some(Phase::Active),
                 conditions: None,
             }),
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_describe_namespace_no_status() {
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
 
         let ns = Namespace {
             type_meta: TypeMeta {
@@ -363,8 +363,8 @@ mod tests {
 
     #[test]
     fn test_map_get_error_not_found() {
-        let err = map_get_error(rusternetes_client::http::GetError::NotFound(
-            rusternetes_client::api_status::ApiStatusError {
+        let err = map_get_error(k3rs_client::http::GetError::NotFound(
+            k3rs_client::api_status::ApiStatusError {
                 code: 404,
                 reason: "NotFound".into(),
                 message: "x".into(),
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_map_get_error_other() {
-        let err = map_get_error(rusternetes_client::http::GetError::Other(anyhow::anyhow!(
+        let err = map_get_error(k3rs_client::http::GetError::Other(anyhow::anyhow!(
             "connection refused"
         )));
         assert_eq!(err.to_string(), "connection refused");

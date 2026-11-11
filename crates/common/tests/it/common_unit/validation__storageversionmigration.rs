@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::storageversionmigration::{
+    pub use k3rs_common::resources::storageversionmigration::{
         StorageVersionMigration, MIGRATION_FAILED, MIGRATION_RUNNING, MIGRATION_SUCCEEDED,
     };
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1035_label, is_dns1123_subdomain, validate_conditions,
     };
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_immutable_field, validate_object_meta,
         validate_object_meta_update,
     };
@@ -17,9 +17,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::storageversionmigration::GroupResource;
-    use rusternetes_common::types::Condition;
-    use rusternetes_common::validation::storageversionmigration::*;
+    use k3rs_common::resources::storageversionmigration::GroupResource;
+    use k3rs_common::types::Condition;
+    use k3rs_common::validation::storageversionmigration::*;
 
     fn agg(errs: &ErrorList) -> String {
         errs.iter()

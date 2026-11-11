@@ -27,12 +27,12 @@
 //! `Arc<MemoryStorage>` wrapped in `StorageBackend::Memory`, router built via
 //! `build_router`, requests dispatched with `tower::ServiceExt::oneshot`.
 
-use rusternetes_common::{
+use k3rs_common::{
     resources::{IntOrString, PodDisruptionBudget, PodDisruptionBudgetSpec},
     types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta},
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;

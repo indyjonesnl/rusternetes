@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a single Kubernetes conformance test against the rusternetes cluster via
+# Run a single Kubernetes conformance test against the k3rs cluster via
 # hydrophone (the SIG-Testing replacement for sonobuoy single-test runs).
 #
 # Writes per-test artifacts (e2e.log, junit_01.xml, run.log) into a dedicated
@@ -14,7 +14,7 @@
 # Flags:
 #   --output-dir <dir>          Override output directory.
 #   --kubeconfig <path>         Override kubeconfig (default: $KUBECONFIG or
-#                               ~/.kube/rusternetes-config).
+#                               ~/.kube/k3rs-config).
 #   --conformance-image <img>   Conformance image (default:
 #                               registry.k8s.io/conformance:v1.35.0).
 #   --no-anchor                 Treat <test-name-or-regex> as a raw regex
@@ -41,7 +41,7 @@ Usage:
 Flags:
   --output-dir <dir>          Override output directory.
   --kubeconfig <path>         Override kubeconfig (default: $KUBECONFIG or
-                              ~/.kube/rusternetes-config).
+                              ~/.kube/k3rs-config).
   --conformance-image <img>   Conformance image (default:
                               registry.k8s.io/conformance:v1.35.0).
   --no-anchor                 Treat <test-name-or-regex> as a raw regex
@@ -64,7 +64,7 @@ info() {
 
 TEST_NAME=""
 OUTPUT_DIR=""
-KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/rusternetes-config}"
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
 IMAGE="$DEFAULT_IMAGE"
 NO_ANCHOR=0
 
@@ -144,7 +144,7 @@ slug() {
 if [[ -z "$OUTPUT_DIR" ]]; then
     TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
     SLUG="$(slug "$TEST_NAME")"
-    OUTPUT_DIR="$REPO_ROOT/.rusternetes/volumes/conformance-per-test-runs/${SLUG}-${TIMESTAMP}"
+    OUTPUT_DIR="$REPO_ROOT/.k3rs/volumes/conformance-per-test-runs/${SLUG}-${TIMESTAMP}"
 fi
 
 mkdir -p "$OUTPUT_DIR"

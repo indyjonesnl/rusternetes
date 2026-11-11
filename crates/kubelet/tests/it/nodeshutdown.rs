@@ -11,18 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusternetes_common::feature_gates::{with_feature, Feature};
-use rusternetes_common::resources::{ObjectReference, Pod, PodSpec, PodStatus};
-use rusternetes_common::types::Phase;
-use rusternetes_kubelet::config::ShutdownGracePeriodByPodPriority as Period;
-use rusternetes_kubelet::nodeshutdown::linux::{
+use k3rs_common::feature_gates::{with_feature, Feature};
+use k3rs_common::resources::{ObjectReference, Pod, PodSpec, PodStatus};
+use k3rs_common::types::Phase;
+use k3rs_kubelet::config::ShutdownGracePeriodByPodPriority as Period;
+use k3rs_kubelet::nodeshutdown::linux::{
     new_manager, set_system_dbus, DbusInhibiter, ManagerImpl, DBUS_RECONNECT_PERIOD,
 };
-use rusternetes_kubelet::nodeshutdown::storage::{
-    timestamp, zero_time, LocalStorage, State, Storage,
-};
-use rusternetes_kubelet::nodeshutdown::systemd::InhibitLock;
-use rusternetes_kubelet::nodeshutdown::{
+use k3rs_kubelet::nodeshutdown::storage::{timestamp, zero_time, LocalStorage, State, Storage};
+use k3rs_kubelet::nodeshutdown::systemd::InhibitLock;
+use k3rs_kubelet::nodeshutdown::{
     group_by_priority, migrate_config, ActivePodsFunc, Clock, Config, Context, EventRecorder,
     KillPodFunc, Logger, PodManager, PodStatusFn, Timer, VolumeManager,
     DEFAULT_PRIORITY_WHEN_NO_DEFAULT_CLASS_EXISTS, HIGHEST_USER_DEFINABLE_PRIORITY,
@@ -275,7 +273,7 @@ fn test_migrate_config() {
     assert_eq!(migrate_config(secs(1), secs(100)), vec![]);
 }
 
-fn names(g: &rusternetes_kubelet::nodeshutdown::PodShutdownGroup) -> Vec<String> {
+fn names(g: &k3rs_kubelet::nodeshutdown::PodShutdownGroup) -> Vec<String> {
     g.pods.iter().map(|p| p.metadata.name.clone()).collect()
 }
 

@@ -6,8 +6,8 @@
 //! `TestDeletePods`), `pkg/drain/filter_test.go`, `pkg/drain/cordon_test.go`
 //! and `pkg/drain/default_test.go`, driven against an in-process API server.
 
-use rusternetes_client::http::ApiClient;
-use rusternetes_kubectl::commands::drain::{
+use k3rs_client::http::ApiClient;
+use k3rs_kubectl::commands::drain::{
     execute_cordon, format_go_duration, parse_go_duration, DrainCmdOptions, DrainFlags,
     DryRunStrategy, IoStreams, Mode, PodDeleteStatus,
 };

@@ -35,11 +35,11 @@
 //! depending on a real apiserver.
 
 use axum::http::{header, StatusCode};
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_common::protobuf::decode_unknown_raw;
-use rusternetes_common::resources::Scale;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_common::protobuf::decode_unknown_raw;
+use k3rs_common::resources::Scale;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 use std::sync::Arc;
 

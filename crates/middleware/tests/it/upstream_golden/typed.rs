@@ -3,14 +3,14 @@
 //! dispatched: the repo models one shape per kind (the GA one), so a v1beta1
 //! fixture cannot round-trip through it by construction.
 //!
-//! Stems with no typed model (no struct in `rusternetes_common::resources`)
+//! Stems with no typed model (no struct in `k3rs_common::resources`)
 //! are listed in `NO_TYPED_MODEL`; the test asserts every GA stem is either
 //! dispatched or listed there, so a newly added struct must be wired in.
-use rusternetes_common::resources::csi::{
+use k3rs_common::resources::csi::{
     CSIDriver, CSINode, CSIStorageCapacity, VolumeAttachment, VolumeAttributesClass,
 };
-use rusternetes_common::resources::rangeallocation::RangeAllocation;
-use rusternetes_common::resources::{
+use k3rs_common::resources::rangeallocation::RangeAllocation;
+use k3rs_common::resources::{
     Binding, CertificateSigningRequest, ClusterRole, ClusterRoleBinding, ComponentStatus,
     ConfigMap, ControllerRevision, CronJob, CustomResourceDefinition, DaemonSet, Deployment,
     DeviceClass, EndpointSlice, Endpoints, Event, EventV1, Eviction, FlowSchema,
@@ -204,10 +204,7 @@ pub const NO_TYPED_MODEL: &[(&str, &str)] = &[
     ("core.v1.PodProxyOptions", "options type"),
     ("core.v1.SerializedReference", "legacy reference type"),
     ("core.v1.ServiceProxyOptions", "options type"),
-    (
-        "core.v1.Status",
-        "meta type, rusternetes_common::types::Status",
-    ),
+    ("core.v1.Status", "meta type, k3rs_common::types::Status"),
     ("core.v1.UpdateOptions", "options type"),
     ("core.v1.WatchEvent", "watch envelope"),
     ("core.v1.PodStatusResult", "no struct"),

@@ -3,11 +3,11 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::event_correlator::TokenBucket;
-    pub use rusternetes_common::lru_expire_cache::LruExpireCache;
-    pub use rusternetes_common::resources::Event;
-    pub use rusternetes_common::validation::field;
-    pub use rusternetes_common::Error;
+    pub use k3rs_common::event_correlator::TokenBucket;
+    pub use k3rs_common::lru_expire_cache::LruExpireCache;
+    pub use k3rs_common::resources::Event;
+    pub use k3rs_common::validation::field;
+    pub use k3rs_common::Error;
     pub use serde::{Deserialize, Serialize};
     pub use std::sync::{Arc, Mutex, OnceLock};
     pub use std::time::{Duration, Instant};
@@ -15,9 +15,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::event_rate_limit::*;
-    use rusternetes_common::resources::event::EventSource;
-    use rusternetes_common::resources::{Event, ObjectReference};
+    use k3rs_api_server::admission::event_rate_limit::*;
+    use k3rs_common::resources::event::EventSource;
+    use k3rs_common::resources::{Event, ObjectReference};
 
     /// `testingclock.FakeClock`.
     #[derive(Clone)]

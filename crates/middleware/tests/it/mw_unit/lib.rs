@@ -10,9 +10,9 @@ mod __parent {
         response::{IntoResponse, Response},
         Extension,
     };
-    pub use rusternetes_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
-    pub use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-    pub use rusternetes_storage::{build_key, Storage, StorageBackend};
+    pub use k3rs_common::auth::{BootstrapTokenManager, TokenManager, UserInfo};
+    pub use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+    pub use k3rs_storage::{build_key, Storage, StorageBackend};
     pub use std::collections::HashMap;
     pub use std::sync::{Arc, LazyLock};
     pub use tracing::{debug, info, warn};
@@ -20,7 +20,7 @@ mod __parent {
 
 mod tests {
     use chrono::TimeZone;
-    use rusternetes_middleware::AuthObservations;
+    use k3rs_middleware::AuthObservations;
 
     fn at(secs: i64, nanos: u32) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.timestamp_opt(secs, nanos).unwrap()
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn warnafter_in_future_counts_valid_without_annotation() {
-        let before = rusternetes_middleware::serviceaccount_metrics()
+        let before = k3rs_middleware::serviceaccount_metrics()
             .valid_tokens_total
             .get();
         let mut obs = AuthObservations::default();
@@ -46,7 +46,7 @@ mod tests {
         obs.observe_warnafter("sub", Some(2000), at(2000, 0));
         assert!(obs.audit_annotations.is_empty());
         assert!(
-            rusternetes_middleware::serviceaccount_metrics()
+            k3rs_middleware::serviceaccount_metrics()
                 .valid_tokens_total
                 .get()
                 >= before + 2
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn warnafter_in_past_annotates_stale_token() {
-        let before = rusternetes_middleware::serviceaccount_metrics()
+        let before = k3rs_middleware::serviceaccount_metrics()
             .stale_tokens_total
             .get();
         let mut obs = AuthObservations::default();
@@ -69,7 +69,7 @@ mod tests {
             )]
         );
         assert!(
-            rusternetes_middleware::serviceaccount_metrics()
+            k3rs_middleware::serviceaccount_metrics()
                 .stale_tokens_total
                 .get()
                 > before
@@ -88,7 +88,7 @@ mod tests {
     /// records into the request's tracker on drop, and is a no-op without one.
     #[tokio::test]
     async fn authentication_latency_guard_records_on_drop() {
-        use rusternetes_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
+        use k3rs_common::latency_trackers::{with_latency_trackers, LatencyTrackers};
         drop(AuthenticationLatencyGuard(std::time::Instant::now()));
         let t = std::sync::Arc::new(LatencyTrackers::new());
         with_latency_trackers(t.clone(), async {
@@ -101,7 +101,7 @@ mod tests {
     }
 
     use super::__parent::*;
-    use rusternetes_middleware::*;
+    use k3rs_middleware::*;
 
     /// Build a DER-encoded self-signed cert with the given CN and Organizations,
     /// for exercising the x509-authn subject mapping.
@@ -133,7 +133,7 @@ mod tests {
     fn client_cert_org_differs_from_cn_becomes_group() {
         // rcgen's DistinguishedName is keyed by DnType, so a fixture can carry
         // only one Organization; multi-O fan-out is covered purely in
-        // rusternetes_common (UserInfo::from_cert_identity). Here we just prove
+        // k3rs_common (UserInfo::from_cert_identity). Here we just prove
         // the O is read independently of the CN.
         let der = cert_der_with_subject("dave", &["system:masters"]);
         let user = user_from_client_cert_der(&[der]).expect("should authenticate");
@@ -508,7 +508,7 @@ mod tests {
         // (field 2 = raw, field 4 = contentType) which differ from our prost
         // Unknown struct (field 3 = raw, field 5 = contentType). The Go client
         // needs field 2/4. Our own extract_json_from_k8s_protobuf handles both.
-        use rusternetes_common::protobuf::is_protobuf;
+        use k3rs_common::protobuf::is_protobuf;
 
         let json = b"{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{\"name\":\"test\"}}";
         let wrapped = wrap_json_in_protobuf(json);
@@ -929,7 +929,7 @@ mod tests {
 }
 
 mod delete_options_tests {
-    use rusternetes_middleware::{parse_delete_options, DeleteOptionsCtx};
+    use k3rs_middleware::{parse_delete_options, DeleteOptionsCtx};
     use std::collections::HashMap;
 
     fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {

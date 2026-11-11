@@ -8,7 +8,7 @@
 //! `master` -> `controlplane` conversion in `apis/apiserver/v1beta1/conversion.go`
 //! :24 (and v1alpha1) and the flag in `pkg/server/options/egress_selector.go`.
 
-use rusternetes_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::field::{BadValue, Error as FieldError, ErrorList, Path};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

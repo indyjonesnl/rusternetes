@@ -3,8 +3,8 @@
 //! and `options/audit.go` `AuditTruncateOptions`.
 
 use async_trait::async_trait;
-use rusternetes_api_server::audit_truncate::*;
-use rusternetes_common::audit::{AuditBackend, AuditEvent, AuditLevel, AuditStage, UserInfo};
+use k3rs_api_server::audit_truncate::*;
+use k3rs_common::audit::{AuditBackend, AuditEvent, AuditLevel, AuditStage, UserInfo};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

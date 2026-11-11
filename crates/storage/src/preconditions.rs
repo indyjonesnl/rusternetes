@@ -7,7 +7,7 @@
 //! against the object it is about to replace, inside the same compare-and-swap
 //! that performs the write (`etcd3/store.go` `conditionalDelete`).
 
-use rusternetes_common::{Error, Result};
+use k3rs_common::{Error, Result};
 
 /// `storage.Preconditions`: both fields optional, each checked only when set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

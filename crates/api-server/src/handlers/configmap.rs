@@ -16,13 +16,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::ConfigMap,
     List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -205,10 +205,10 @@ pub async fn list(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_namespaced::<ConfigMap>(
             state,
@@ -231,7 +231,7 @@ pub async fn list(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -276,10 +276,10 @@ pub async fn list_all_configmaps(
             watch: Some(true),
             allow_watch_bookmarks: params
                 .get("allowWatchBookmarks")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
             send_initial_events: params
                 .get("sendInitialEvents")
-                .map(|v| rusternetes_common::query::k8s_query_bool(v)),
+                .map(|v| k3rs_common::query::k8s_query_bool(v)),
         };
         return crate::handlers::watch::watch_cluster_scoped::<ConfigMap>(
             state,
@@ -299,7 +299,7 @@ pub async fn list_all_configmaps(
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
         Decision::Deny(reason) => {
-            return Err(rusternetes_common::Error::Forbidden(reason));
+            return Err(k3rs_common::Error::Forbidden(reason));
         }
     }
 
@@ -343,7 +343,7 @@ async fn paginate_configmaps_response(
     let limit = params.get("limit").and_then(|l| l.parse::<i64>().ok());
     let continue_token = params.get("continue").cloned();
 
-    let pagination_params = rusternetes_common::PaginationParams {
+    let pagination_params = k3rs_common::PaginationParams {
         limit,
         continue_token,
     };
@@ -355,31 +355,29 @@ async fn paginate_configmaps_response(
         crate::handlers::list_options::list_resource_version(&state.storage, params, &configmaps)
             .await;
 
-    let paginated =
-        match rusternetes_common::paginate(configmaps, pagination_params, &resource_version) {
-            Ok(p) => p,
-            Err(e) => {
-                if e.message.contains("410 Gone") {
-                    let mut status =
-                        rusternetes_common::Status::failure(&e.message, "Expired", 410);
-                    if let Some(token) = e.fresh_continue_token {
-                        status.metadata = Some(rusternetes_common::ListMeta {
-                            resource_version: Some(resource_version),
-                            continue_token: Some(token),
-                            remaining_item_count: None,
-                        });
-                    }
-                    return Ok((
-                        axum::http::StatusCode::GONE,
-                        crate::audit::json_response(status),
-                    )
-                        .into_response());
+    let paginated = match k3rs_common::paginate(configmaps, pagination_params, &resource_version) {
+        Ok(p) => p,
+        Err(e) => {
+            if e.message.contains("410 Gone") {
+                let mut status = k3rs_common::Status::failure(&e.message, "Expired", 410);
+                if let Some(token) = e.fresh_continue_token {
+                    status.metadata = Some(k3rs_common::ListMeta {
+                        resource_version: Some(resource_version),
+                        continue_token: Some(token),
+                        remaining_item_count: None,
+                    });
                 }
-                // Malformed continue token / encoding error -> 400 BadRequest
-                // Status object (kind=Status), matching upstream apiserver.
-                return Err(rusternetes_common::Error::BadRequest(e.message));
+                return Ok((
+                    axum::http::StatusCode::GONE,
+                    crate::audit::json_response(status),
+                )
+                    .into_response());
             }
-        };
+            // Malformed continue token / encoding error -> 400 BadRequest
+            // Status object (kind=Status), matching upstream apiserver.
+            return Err(k3rs_common::Error::BadRequest(e.message));
+        }
+    };
 
     let mut list = List::new(list_kind, "v1", paginated.items);
     list.metadata.continue_token = paginated.continue_token;

@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::workloads::{PodTemplate, PodTemplateSpec};
-    pub use rusternetes_common::validation::field::{ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::validate_labels;
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::resources::workloads::{PodTemplate, PodTemplateSpec};
+    pub use k3rs_common::validation::field::{ErrorList, Path};
+    pub use k3rs_common::validation::metav1::validate_labels;
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_annotations, validate_object_meta,
         validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::pod::validate_pod_spec_with_options;
-    pub use rusternetes_common::validation::pod_options::get_validation_options_from_pod_template;
-    pub use rusternetes_common::validation::pod_status::{
+    pub use k3rs_common::validation::pod::validate_pod_spec_with_options;
+    pub use k3rs_common::validation::pod_options::get_validation_options_from_pod_template;
+    pub use k3rs_common::validation::pod_status::{
         get_deletion_cost_from_pod_annotations, validate_pod_specific_annotations,
     };
     pub use std::collections::HashMap;
@@ -19,11 +19,11 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::PodSpec;
-    use rusternetes_common::validation::pod_status::{
+    use k3rs_common::resources::pod::PodSpec;
+    use k3rs_common::validation::pod_status::{
         MIRROR_POD_ANNOTATION_KEY, POD_DELETION_COST, TOLERATIONS_ANNOTATION_KEY,
     };
-    use rusternetes_common::validation::podtemplate::*;
+    use k3rs_common::validation::podtemplate::*;
 
     fn run(a: &[(&str, &str)], s: &PodSpec) -> Vec<String> {
         let m: HashMap<String, String> = a
@@ -241,7 +241,7 @@ mod tests {
 
 mod update_leniency_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::podtemplate::*;
+    use k3rs_common::validation::podtemplate::*;
 
     fn tpl(cost: &str) -> PodTemplate {
         serde_json::from_value(serde_json::json!({
@@ -270,7 +270,7 @@ mod update_leniency_tests {
 /// of the same template stays strict.
 mod old_template_options_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::podtemplate::*;
+    use k3rs_common::validation::podtemplate::*;
 
     fn tpl(search: &str) -> PodTemplate {
         serde_json::from_value(serde_json::json!({
@@ -286,8 +286,8 @@ mod old_template_options_tests {
     #[test]
     #[serial_test::serial]
     fn update_derives_pod_options_from_the_old_template() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::RelaxedDNSSearchValidation,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::RelaxedDNSSearchValidation,
             false,
         );
         let relaxed = "my_search.example.com";

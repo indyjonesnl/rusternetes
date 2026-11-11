@@ -3,21 +3,21 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_common::leaderelection::{LeaderElectionRecord, ResourceLock};
-    pub use rusternetes_common::resources::coordination::{Lease, LeaseSpec};
-    pub use rusternetes_common::resources::{EventSource, EventType, ObjectReference};
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::{EventRecorder, Storage};
+    pub use k3rs_common::leaderelection::{LeaderElectionRecord, ResourceLock};
+    pub use k3rs_common::resources::coordination::{Lease, LeaseSpec};
+    pub use k3rs_common::resources::{EventSource, EventType, ObjectReference};
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::{EventRecorder, Storage};
     pub use std::sync::{Arc, Mutex};
 }
 
 mod tests {
     use super::__parent::*;
     use chrono::Utc;
-    use rusternetes_common::leaderelection::{ElectionConfig, LeaderCallbacks, LeaderElector};
-    use rusternetes_common::signal::ShutdownContext;
-    use rusternetes_storage::lease_lock::*;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_common::leaderelection::{ElectionConfig, LeaderCallbacks, LeaderElector};
+    use k3rs_common::signal::ShutdownContext;
+    use k3rs_storage::lease_lock::*;
+    use k3rs_storage::MemoryStorage;
     use std::time::Duration;
 
     fn record(holder: &str) -> LeaderElectionRecord {
@@ -74,7 +74,7 @@ mod tests {
         lock.create(&record("a")).await.unwrap();
         lock.record_event("became leader").await;
         lock.record_event("stopped leading").await;
-        let events: Vec<rusternetes_common::resources::Event> =
+        let events: Vec<k3rs_common::resources::Event> =
             storage.list("/registry/events/kube-system/").await.unwrap();
         assert_eq!(events.len(), 1, "same (object, reason) bumps one Event");
         let e = &events[0];
@@ -94,7 +94,7 @@ mod tests {
         let bare = LeaseLock::new(storage.clone(), "other", "kcm", "a");
         bare.create(&record("a")).await.unwrap();
         bare.record_event("became leader").await;
-        let none: Vec<rusternetes_common::resources::Event> =
+        let none: Vec<k3rs_common::resources::Event> =
             storage.list("/registry/events/other/").await.unwrap();
         assert!(none.is_empty());
     }

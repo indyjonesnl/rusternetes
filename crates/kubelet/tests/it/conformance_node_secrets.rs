@@ -16,11 +16,11 @@
 //! No runtime / container creation — those paths live in node-conformance
 //! e2e and are out of unit-test scope.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     EnvFromSource, EnvVar, EnvVarSource, Secret, SecretEnvSource, SecretKeySelector,
     SecretVolumeSource, Volume,
 };
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------

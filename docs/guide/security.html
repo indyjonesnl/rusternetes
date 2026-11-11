@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Security - Rūsternetes</title>
+  <title>Security - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -103,7 +103,7 @@
     <main class="doc-content">
       <h1>Security</h1>
       <p class="lead">
-        Rūsternetes implements Kubernetes security features including TLS/mTLS, RBAC authorization,
+        k3rs implements Kubernetes security features including TLS/mTLS, RBAC authorization,
         ServiceAccount tokens (RS256 JWT), admission webhooks, ValidatingAdmissionPolicy with CEL,
         ResourceQuota, LimitRange, SecurityContext, and Secret management.
       </p>
@@ -112,7 +112,7 @@
       <h2 id="tls">TLS / mTLS</h2>
       <p>
         The API server requires TLS for all connections. The bootstrap script generates self-signed
-        certificates with 10-year validity. Certificates are stored in <code>.rusternetes/certs/</code>.
+        certificates with 10-year validity. Certificates are stored in <code>.k3rs/certs/</code>.
       </p>
 
       <h3>Certificate Requirements</h3>
@@ -167,7 +167,7 @@ IP:127.0.0.1,IP:10.96.0.1,IP:172.18.0.2,IP:172.18.0.3"</code>
           <span class="code-title">terminal</span>
         </div>
         <code><span class="comment"># API server flags</span>
-rusternetes-api-server \
+k3rs-api-server \
   <span class="flag">--tls-cert-file=</span><span class="value">/path/to/server.crt</span> \
   <span class="flag">--tls-private-key-file=</span><span class="value">/path/to/server.key</span> \
   <span class="flag">--client-ca-file=</span><span class="value">/path/to/ca.crt</span></code>
@@ -337,7 +337,7 @@ kubectl auth whoami</code>
       <!-- ───────────────────── ServiceAccount Tokens ───────────────────── -->
       <h2 id="sa-tokens">ServiceAccount Tokens</h2>
       <p>
-        Rūsternetes uses RS256 (RSA) JWT tokens for ServiceAccount authentication, compatible
+        k3rs uses RS256 (RSA) JWT tokens for ServiceAccount authentication, compatible
         with OIDC discovery. Tokens are automatically projected into pods via the projected
         volume mechanism.
       </p>
@@ -771,7 +771,7 @@ kubectl get secret <span class="value">db-creds</span> <span class="flag">-o</sp
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

@@ -14,8 +14,8 @@
 //! (`= ValidateDNS1123Label`, `:73`), `validateDeviceTaint` (`:1391`) and
 //! `validateDeviceCounterConsumption` (`:871`).
 
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// A ResourceSlice spec with the always-required scalars filled in; `extra` is

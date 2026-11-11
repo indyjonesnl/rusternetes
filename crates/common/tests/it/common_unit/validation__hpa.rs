@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::autoscaling::Scale;
-    pub use rusternetes_common::resources::autoscaling::{
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::autoscaling::Scale;
+    pub use k3rs_common::resources::autoscaling::{
         ContainerResourceMetricSource, CrossVersionObjectReference, ExternalMetricSource,
         HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler,
         HorizontalPodAutoscalerBehavior, HorizontalPodAutoscalerSpec, MetricIdentifier, MetricSpec,
         MetricTarget, ObjectMetricSource, PodsMetricSource, ResourceMetricSource,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::is_dns1123_label;
-    pub use rusternetes_common::validation::objectmeta::name_is_path_segment;
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::is_dns1123_label;
+    pub use k3rs_common::validation::objectmeta::name_is_path_segment;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::autoscaling::HorizontalPodAutoscalerBehavior;
-    use rusternetes_common::validation::field::ErrorType;
-    use rusternetes_common::validation::hpa::*;
+    use k3rs_common::resources::autoscaling::HorizontalPodAutoscalerBehavior;
+    use k3rs_common::validation::field::ErrorType;
+    use k3rs_common::validation::hpa::*;
     use serde_json::json;
 
     fn hpa_spec(spec: serde_json::Value) -> HorizontalPodAutoscalerSpec {

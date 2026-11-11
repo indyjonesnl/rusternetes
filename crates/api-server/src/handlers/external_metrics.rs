@@ -4,7 +4,7 @@ use axum::{
     Extension, Json,
 };
 use chrono::Utc;
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     resources::{ExternalMetricValue, ExternalMetricValueList},
     Result,
@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// TypeMeta for the external-metrics group; see the custom-metrics twin (#1916).
-fn external_metric_type_meta(kind: &str) -> rusternetes_common::types::TypeMeta {
-    rusternetes_common::types::TypeMeta {
+fn external_metric_type_meta(kind: &str) -> k3rs_common::types::TypeMeta {
+    k3rs_common::types::TypeMeta {
         api_version: "external.metrics.k8s.io/v1beta1".to_string(),
         kind: kind.to_string(),
     }
@@ -48,7 +48,7 @@ pub async fn list_external_metrics(
     .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
@@ -60,7 +60,7 @@ pub async fn list_external_metrics(
     // `GetExternalMetric` (provider.go:312-327): one value per series whose
     // labels satisfy the selector, each carrying that series' labels. The
     // built-in series carries no labels. With Prometheus the selector becomes
-    // series matchers (the Rusternetes-only mapping of
+    // series matchers (the k3rs-only mapping of
     // `prometheus_client::promql_matchers`) and every matching series is
     // returned with its own labels.
     let series: Vec<(Option<BTreeMap<String, String>>, String)> =
@@ -106,7 +106,7 @@ pub async fn list_external_metrics(
         type_meta: external_metric_type_meta("ExternalMetricValueList"),
         // `metav1.ListMeta`; the bespoke predecessor carried only the
         // long-deprecated `selfLink` (#1916).
-        metadata: rusternetes_common::types::ListMeta::default(),
+        metadata: k3rs_common::types::ListMeta::default(),
         items,
     };
 

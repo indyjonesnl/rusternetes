@@ -1,5 +1,5 @@
 #!/bin/bash
-# Discover the Docker/Podman bridge network gateway IP for the rusternetes network.
+# Discover the Docker/Podman bridge network gateway IP for the k3rs network.
 #
 # This is the scalable replacement for the hardcoded bridge IPs that PR #787
 # introduced (172.20.0.2). The gateway is always [subnet].1 and works on every
@@ -7,11 +7,11 @@
 #
 # Usage:
 #   source scripts/discover-bridge-gateway.sh
-#   echo "$RUSTERNETES_BRIDGE_GATEWAY"
+#   echo "$K3RS_BRIDGE_GATEWAY"
 #
 # The gateway is the .1 address in the docker-bridge subnet. From inside a pod,
 # .1 is the host — port mapping 6443:6443 on the host then reaches the
-# rusternetes container's api-server without needing to know the container's
+# k3rs container's api-server without needing to know the container's
 # IP or the bridge subnet.
 
 set -euo pipefail
@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Prefer the compose network name; fall back to the name used by compose.all-in-one.yml
-NETWORK_NAME="${RUSTERNETES_NETWORK_NAME:-rusternetes-network}"
+NETWORK_NAME="${K3RS_NETWORK_NAME:-k3rs-network}"
 
 # Helper: try to inspect the gateway from docker compose
 discover_via_inspect() {
@@ -52,11 +52,11 @@ if gateway=$(discover_via_inspect); then
     exit 0
 fi
 
-# Fallback: discover via host routes (works when rusternetes network
+# Fallback: discover via host routes (works when k3rs network
 # subnet is configured via Docker's default 172.18-172.30 range)
 # This reads the default route's subnet and replaces .0 with .1
-if ip route | grep -q "docker0\|rusternetes-network"; then
-    SUBNET=$(ip route show | grep "docker0\|rusternetes-network" | grep -oP 'inet\K[0-9./]+' | head -1)
+if ip route | grep -q "docker0\|k3rs-network"; then
+    SUBNET=$(ip route show | grep "docker0\|k3rs-network" | grep -oP 'inet\K[0-9./]+' | head -1)
     if [ -n "$SUBNET" ]; then
         NETWORK=$(echo "$SUBNET" | cut -d/ -f1 | rev | cut -d. -f2,3,4 | rev)
         echo "${NETWORK}.1"
@@ -76,7 +76,7 @@ echo "" >&2
 echo "ERROR: Could not discover Docker bridge gateway IP." >&2
 echo "" >&2
 echo "This is needed for CoreDNS to reach the API server after PR #787." >&2
-echo "Ensure the 'rusternetes-network' network exists and try again, or set:" >&2
+echo "Ensure the 'k3rs-network' network exists and try again, or set:" >&2
 echo "" >&2
 echo "  export DOCKER_GATEWAY=172.18.0.1  # replace with your host's gateway" >&2
 echo "" >&2

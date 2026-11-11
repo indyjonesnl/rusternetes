@@ -11,12 +11,12 @@
 //! Source: kubernetes/test/e2e/apps/daemon_set.go
 //!         kubernetes/pkg/controller/daemon/daemon_controller_test.go
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::workloads::{DaemonSetUpdateStrategy, RollingUpdateDaemonSet};
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::daemonset::DaemonSetController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::workloads::{DaemonSetUpdateStrategy, RollingUpdateDaemonSet};
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::daemonset::DaemonSetController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -469,7 +469,7 @@ async fn daemonset_rolling_update_respects_max_unavailable() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(2)),
+            max_unavailable: Some(k3rs_common::resources::policy::IntOrString::Int(2)),
             max_surge: None,
         }),
     });
@@ -798,7 +798,7 @@ async fn daemonset_should_respect_revision_history_limit() {
     }
 
     // Count ControllerRevisions
-    let revisions: Vec<rusternetes_common::resources::ControllerRevision> = storage
+    let revisions: Vec<k3rs_common::resources::ControllerRevision> = storage
         .list("/registry/controllerrevisions/default/")
         .await
         .unwrap_or_default();
@@ -878,7 +878,7 @@ async fn daemonset_should_respect_min_ready_seconds() {
 //
 // The tests below extend the suite with five upstream-inspired scenarios that
 // are not yet covered above. Each test documents its upstream reference and,
-// where Rusternetes' controller does not yet honour the contract, is gated
+// where k3rs' controller does not yet honour the contract, is gated
 // with `#[ignore = "RED-state: ..."]` so they document missing behaviour
 // without making the suite red.
 
@@ -910,7 +910,7 @@ async fn daemonset_rolling_update_max_unavailable_one_serialises_deletions() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(1)),
+            max_unavailable: Some(k3rs_common::resources::policy::IntOrString::Int(1)),
             max_surge: None,
         }),
     });
@@ -1003,7 +1003,7 @@ async fn daemonset_propagates_priority_class_to_pods() {
     // Persist the PriorityClass at the cluster-scoped registry path. The
     // controller is not required to consult it for this test, but storing it
     // keeps the test honest in a future where the controller might.
-    let pc = rusternetes_common::resources::policy::PriorityClass::new("high-priority", 1_000_000)
+    let pc = k3rs_common::resources::policy::PriorityClass::new("high-priority", 1_000_000)
         .with_description("DaemonSet critical workloads");
     storage
         .create(&build_key("priorityclasses", None, "high-priority"), &pc)
@@ -1143,11 +1143,11 @@ async fn daemonset_status_counters_steady_state_all_fields() {
 /// DaemonSet controller. Our controller is happy to place one DS pod per
 /// node regardless. The interesting failure mode is when a *user* pod with
 /// matching labels already exists on a node and pod-anti-affinity should
-/// block the DS from co-locating. Rusternetes' controller does not yet
+/// block the DS from co-locating. k3rs' controller does not yet
 /// consult `podAntiAffinity`, so this is RED-state.
 #[tokio::test]
 async fn daemonset_with_pod_anti_affinity_skips_conflicting_node() {
-    use rusternetes_common::resources::pod::{PodAffinityTerm, PodAntiAffinity};
+    use k3rs_common::resources::pod::{PodAffinityTerm, PodAntiAffinity};
 
     let storage = setup_test().await;
     let ns = "default";
@@ -1272,7 +1272,7 @@ async fn daemonset_handles_burst_template_updates() {
     ds.spec.update_strategy = Some(DaemonSetUpdateStrategy {
         strategy_type: Some("RollingUpdate".to_string()),
         rolling_update: Some(RollingUpdateDaemonSet {
-            max_unavailable: Some(rusternetes_common::resources::policy::IntOrString::Int(2)),
+            max_unavailable: Some(k3rs_common::resources::policy::IntOrString::Int(2)),
             max_surge: None,
         }),
     });

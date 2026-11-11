@@ -4,7 +4,7 @@
 //! `GuaranteedUpdate` it relies on (`staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go:463`).
 //!
 //! Upstream's storage layer offers a compare-and-swap `GuaranteedUpdate`;
-//! Rusternetes' [`Storage`] trait offers `get` plus an `update` that is guarded
+//! k3rs' [`Storage`] trait offers `get` plus an `update` that is guarded
 //! by the object's `resourceVersion` (etcd and rhino compare it; the memory
 //! backend does not). [`Store::guaranteed_update`] builds the upstream loop out
 //! of those two calls.
@@ -18,12 +18,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use rusternetes_common::deletion::{DeleteOptions, Preconditions};
-use rusternetes_common::types::{ObjectMeta, StatusDetails};
-use rusternetes_common::validation::field::{Error as FieldError, Path};
-use rusternetes_common::validation::objectmeta::is_valid_path_segment_name;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::deletion::{DeleteOptions, Preconditions};
+use k3rs_common::types::{ObjectMeta, StatusDetails};
+use k3rs_common::validation::field::{Error as FieldError, Path};
+use k3rs_common::validation::objectmeta::is_valid_path_segment_name;
+use k3rs_common::{Error, Result};
+use k3rs_storage::{build_key, Storage};
 use tracing::debug;
 
 use crate::registry::rest::{
@@ -177,21 +177,19 @@ pub fn too_large_resource_version(minimum: u64, current: u64, retry_seconds: i32
         group: None,
         kind: None,
         uid: None,
-        causes: Some(vec![rusternetes_common::StatusCause {
+        causes: Some(vec![k3rs_common::StatusCause {
             reason: Some("ResourceVersionTooLarge".to_string()),
             message: Some("Too large resource version".to_string()),
             field: None,
         }]),
         retry_after_seconds: (retry_seconds > 0).then_some(retry_seconds),
     };
-    Error::Status(Box::new(
-        rusternetes_common::types::Status::failure_with_details(
-            format!("Timeout: Too large resource version: {minimum}, current: {current}"),
-            "Timeout",
-            504,
-            details,
-        ),
-    ))
+    Error::Status(Box::new(k3rs_common::types::Status::failure_with_details(
+        format!("Timeout: Too large resource version: {minimum}, current: {current}"),
+        "Timeout",
+        504,
+        details,
+    )))
 }
 
 /// What `Store.Delete` returns: the object itself when it still exists
@@ -577,7 +575,7 @@ impl<T: Object, S: Storage> Store<T, S> {
     /// error already. Upstream tells them apart by type (`storage.IsNotFound`
     /// and friends match only a `*storage.StorageError`, so a `StatusError`
     /// raised by a strategy or admission passes through `Interpret*Error`
-    /// untouched). Rusternetes' backends signal a storage error by carrying
+    /// untouched). k3rs' backends signal a storage error by carrying
     /// the raw `/registry/...` key as the message.
     fn is_storage_error(msg: &str) -> bool {
         msg.starts_with("/registry/")
@@ -1713,7 +1711,7 @@ fn should_orphan_dependents(
     if let Some(orphan) = options.orphan_dependents {
         return orphan;
     }
-    use rusternetes_common::types::DeletionPropagation;
+    use k3rs_common::types::DeletionPropagation;
     match options.propagation_policy {
         Some(DeletionPropagation::Orphan) => return true,
         Some(DeletionPropagation::Background | DeletionPropagation::Foreground) => return false,
@@ -1742,7 +1740,7 @@ fn should_delete_dependents(
     if options.orphan_dependents.is_some() {
         return false;
     }
-    use rusternetes_common::types::DeletionPropagation;
+    use k3rs_common::types::DeletionPropagation;
     match options.propagation_policy {
         Some(DeletionPropagation::Foreground) => return true,
         Some(DeletionPropagation::Background | DeletionPropagation::Orphan) => return false,
@@ -1785,16 +1783,13 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
     // `ResetFieldsFilterStrategy`, so the installer never sees a filter for a
     // Store-backed resource (installer.go:707-711). The default (empty) stands.
 
-    fn field_schema(
-        &self,
-    ) -> Option<std::sync::Arc<rusternetes_common::fieldmanager::schema::Type>> {
+    fn field_schema(&self) -> Option<std::sync::Arc<k3rs_common::fieldmanager::schema::Type>> {
         self.update_strategy.field_schema()
     }
 
     fn field_converter(
         &self,
-    ) -> Option<std::sync::Arc<dyn rusternetes_common::fieldmanager::versionconverter::Converter>>
-    {
+    ) -> Option<std::sync::Arc<dyn k3rs_common::fieldmanager::versionconverter::Converter>> {
         self.update_strategy.field_converter()
     }
 
@@ -1854,8 +1849,7 @@ impl<T: Object, S: Storage + Send + Sync + 'static> crate::registry::rest::RestS
         options: &DeleteOptions,
         list_options: &std::collections::HashMap<String, String>,
     ) -> Result<DeletedCollection<T>> {
-        let prefix =
-            rusternetes_storage::build_prefix(&self.storage_prefix, ctx.namespace.as_deref());
+        let prefix = k3rs_storage::build_prefix(&self.storage_prefix, ctx.namespace.as_deref());
         // Read the revision BEFORE the data, as `Storage::list_paginated`
         // does, so the token's pin is never newer than the page.
         let revision = self.storage.current_revision().await.unwrap_or(0);
@@ -1893,15 +1887,12 @@ pub(crate) async fn reject_compacted_continue<S: Storage>(
     let Some(token) = list_options.get("continue").filter(|c| !c.is_empty()) else {
         return Ok(());
     };
-    let Ok(d) = rusternetes_storage::decode_default_token(token) else {
+    let Ok(d) = k3rs_storage::decode_default_token(token) else {
         return Ok(());
     };
     if let Some(rv) = d.compacted_at.filter(|rv| *rv > 0) {
         if storage.is_revision_compacted(rv).await.unwrap_or(false) {
-            return Err(rusternetes_storage::compacted_continue_error(
-                &d.start_key,
-                rv,
-            ));
+            return Err(k3rs_storage::compacted_continue_error(&d.start_key, rv));
         }
     }
     Ok(())
@@ -1944,7 +1935,7 @@ pub(crate) fn page_for_delete_collection<T: Object>(
     };
     let start = match list_options.get("continue").filter(|c| !c.is_empty()) {
         Some(token) => Some(
-            rusternetes_storage::decode_default_token(token)
+            k3rs_storage::decode_default_token(token)
                 .map_err(|_| Error::BadRequest("invalid continue token".to_string()))?
                 .start_key,
         ),
@@ -1960,10 +1951,7 @@ pub(crate) fn page_for_delete_collection<T: Object>(
     let mut page = DeletedCollection::from(items);
     if limit > 0 && page.items.len() > limit as usize {
         let rest = page.items.split_off(limit as usize);
-        page.continue_token = Some(rusternetes_storage::encode_default_token(
-            &key(&rest[0]),
-            revision,
-        ));
+        page.continue_token = Some(k3rs_storage::encode_default_token(&key(&rest[0]), revision));
         if empty_predicate {
             page.remaining_item_count = Some(rest.len() as i64);
         }

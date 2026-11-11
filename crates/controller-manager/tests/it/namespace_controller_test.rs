@@ -26,16 +26,16 @@
 //! <https://github.com/kubernetes/kubernetes/blob/release-1.35/test/e2e/apimachinery/namespaces.go>
 
 use chrono::Utc;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     namespace::{NamespaceSpec, NamespaceStatus},
     rbac::{PolicyRule, RoleBinding, RoleRef, Subject},
     ConfigMap, Container, Namespace, NetworkPolicy, NetworkPolicySpec, Pod, PodSpec, ResourceQuota,
     ResourceQuotaSpec, Role,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::namespace::NamespaceController;
-use rusternetes_controller_manager::controllers::resource_quota::ResourceQuotaController;
-use rusternetes_storage::{build_key, build_prefix, MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::namespace::NamespaceController;
+use k3rs_controller_manager::controllers::resource_quota::ResourceQuotaController;
+use k3rs_storage::{build_key, build_prefix, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -74,7 +74,7 @@ async fn test_namespace_active_not_deleted() {
         },
         spec: Some(NamespaceSpec { finalizers: None }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Active),
+            phase: Some(k3rs_common::types::Phase::Active),
             conditions: None,
         }),
     };
@@ -124,7 +124,7 @@ async fn test_namespace_with_finalizer_marked_for_deletion() {
             finalizers: Some(vec!["kubernetes".to_string()]),
         }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Terminating),
+            phase: Some(k3rs_common::types::Phase::Terminating),
             conditions: None,
         }),
     };
@@ -179,7 +179,7 @@ async fn test_namespace_deletion_removes_finalizers() {
             finalizers: Some(vec!["kubernetes".to_string()]),
         }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Terminating),
+            phase: Some(k3rs_common::types::Phase::Terminating),
             conditions: None,
         }),
     };
@@ -241,7 +241,7 @@ fn terminating_ns(name: &str, finalizers: Vec<String>) -> Namespace {
             finalizers: Some(finalizers),
         }),
         status: Some(NamespaceStatus {
-            phase: Some(rusternetes_common::types::Phase::Terminating),
+            phase: Some(k3rs_common::types::Phase::Terminating),
             conditions: None,
         }),
     }

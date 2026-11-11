@@ -12,7 +12,7 @@
 //! this module is the part that runs after that verification.
 
 use axum::http::{HeaderMap, HeaderName};
-use rusternetes_common::auth::UserInfo;
+use k3rs_common::auth::UserInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
 

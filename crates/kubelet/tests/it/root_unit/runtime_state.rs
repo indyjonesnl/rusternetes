@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::resources::NodeCondition;
-    pub use rusternetes_cri::v1;
+    pub use k3rs_common::resources::NodeCondition;
+    pub use k3rs_cri::v1;
     pub use std::collections::HashMap;
     pub use std::sync::Mutex;
     pub use std::time::{Duration, Instant};
@@ -12,7 +12,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::runtime_state::*;
+    use k3rs_kubelet::runtime_state::*;
 
     fn status(rt: Option<bool>, net: Option<bool>) -> v1::StatusResponse {
         let mut conditions = Vec::new();
@@ -305,11 +305,11 @@ mod tests {
     /// `NodeNotReady` event on the Node with "Node %s status is now: %s".
     #[tokio::test]
     async fn node_status_event_is_recorded_on_the_node() {
-        use rusternetes_storage::Storage;
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
-        let recorder = rusternetes_storage::EventRecorder::new(std::sync::Arc::clone(&storage));
+        use k3rs_storage::Storage;
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
+        let recorder = k3rs_storage::EventRecorder::new(std::sync::Arc::clone(&storage));
         record_node_status_event(&recorder, "node-1", EVENT_NODE_NOT_READY).await;
-        let evs: Vec<rusternetes_common::resources::Event> =
+        let evs: Vec<k3rs_common::resources::Event> =
             storage.list("/registry/events/").await.unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].reason, "NodeNotReady");

@@ -1,11 +1,11 @@
 use crate::controllers::worker_pool::spawn_workers;
 use anyhow::{Context, Result};
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::service_account::ObjectReference;
-use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-use rusternetes_common::resources::{EventSource, EventType};
-use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
-use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::service_account::ObjectReference;
+use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+use k3rs_common::resources::{EventSource, EventType};
+use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim};
+use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -82,7 +82,7 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("persistentvolumeclaims", None);
+            let prefix = k3rs_storage::build_prefix("persistentvolumeclaims", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -259,7 +259,7 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         }
 
         // `FindExpandablePluginBySpec` (:271-283) finds an expandable plugin only for
-        // in-tree volume types that implement `ExpandableVolumePlugin`; rusternetes
+        // in-tree volume types that implement `ExpandableVolumePlugin`; k3rs
         // has none (hostPath/nfs/iscsi/local never did upstream either), and a CSI
         // volume is expanded by the external-resizer sidecar calling
         // ControllerExpandVolume (and the kubelet NodeExpandVolume). So every other PV
@@ -298,7 +298,7 @@ impl<S: Storage + 'static> VolumeExpansionController<S> {
         let mut full = pvc.clone();
         // The REST scope's kind picks the patch schema (strategicPatchObject);
         // a PVC read back from storage may carry no TypeMeta.
-        full.type_meta = rusternetes_common::types::TypeMeta {
+        full.type_meta = k3rs_common::types::TypeMeta {
             kind: "PersistentVolumeClaim".to_string(),
             api_version: "v1".to_string(),
         };

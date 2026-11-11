@@ -15,12 +15,12 @@
 
 use async_trait::async_trait;
 use axum::http::{Method, StatusCode};
-use rusternetes_api_server::audit::request_info;
-use rusternetes_api_server::request_scope::first_value_for_authz_keys;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, RequestAttributes};
-use rusternetes_common::Result;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::audit::request_info;
+use k3rs_api_server::request_scope::first_value_for_authz_keys;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, RequestAttributes};
+use k3rs_common::Result;
+use k3rs_test_support::harness::TestApiServer;
 use std::sync::Arc;
 
 #[test]
@@ -98,8 +98,8 @@ impl Authorizer for Pred {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 

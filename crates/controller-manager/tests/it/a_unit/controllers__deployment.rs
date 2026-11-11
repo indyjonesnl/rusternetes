@@ -4,21 +4,21 @@
 mod __parent {
     pub use chrono::Utc;
     pub use futures::StreamExt;
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         resources::{
             Deployment, DeploymentCondition, DeploymentStatus, Pod, ReplicaSet, ReplicaSetSpec,
         },
         types::{ObjectMeta, TypeMeta},
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::{sync::Arc, time::Duration};
     pub use tracing::{debug, error, info, warn};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::deployment::*;
+    use k3rs_controller_manager::controllers::deployment::*;
 
     #[test]
     fn test_parse_int_or_percent_percentage() {
@@ -79,8 +79,8 @@ mod tests {
     }
 
     /// Helper to create a minimal Container for tests
-    fn test_container(name: &str, image: &str) -> rusternetes_common::resources::Container {
-        rusternetes_common::resources::Container {
+    fn test_container(name: &str, image: &str) -> k3rs_common::resources::Container {
+        k3rs_common::resources::Container {
             name: name.to_string(),
             image: image.to_string(),
             command: None,
@@ -133,9 +133,9 @@ mod tests {
     /// final step changes the image and `spec.replicas` 1 -> 2 in one PUT.
     #[tokio::test]
     async fn a_scaling_event_with_one_active_replicaset_scales_it_to_desired_not_allowed_size() {
-        use rusternetes_common::resources::{PodTemplateSpec, ReplicaSetStatus};
-        use rusternetes_common::types::LabelSelector;
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::resources::{PodTemplateSpec, ReplicaSetStatus};
+        use k3rs_common::types::LabelSelector;
+        use k3rs_storage::memory::MemoryStorage;
         use std::collections::HashMap;
 
         let storage = Arc::new(MemoryStorage::new());
@@ -151,7 +151,7 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
-            spec: rusternetes_common::resources::DeploymentSpec {
+            spec: k3rs_common::resources::DeploymentSpec {
                 replicas: Some(2),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
@@ -159,7 +159,7 @@ mod tests {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![test_container("test", "agnhost:2.59")],
                         ..Default::default()
                     },
@@ -202,7 +202,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 labels: Some(rs_labels.clone()),
                 annotations: Some(annotations),
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "Deployment".to_string(),
                     name: "test-deploy".to_string(),
@@ -246,9 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployment_status_aggregates_from_replicaset_status() {
-        use rusternetes_common::resources::{PodTemplateSpec, ReplicaSetStatus};
-        use rusternetes_common::types::LabelSelector;
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::resources::{PodTemplateSpec, ReplicaSetStatus};
+        use k3rs_common::types::LabelSelector;
+        use k3rs_storage::memory::MemoryStorage;
         use std::collections::HashMap;
 
         let storage = Arc::new(MemoryStorage::new());
@@ -264,7 +264,7 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
-            spec: rusternetes_common::resources::DeploymentSpec {
+            spec: k3rs_common::resources::DeploymentSpec {
                 replicas: Some(3),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
@@ -272,7 +272,7 @@ mod tests {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![test_container("test", "nginx:latest")],
                         ..Default::default()
                     },
@@ -302,7 +302,7 @@ mod tests {
                 name: "test-deploy-abc123".to_string(),
                 namespace: Some("default".to_string()),
                 labels: Some(rs_labels.clone()),
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "Deployment".to_string(),
                     name: "test-deploy".to_string(),
@@ -360,9 +360,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_deployment_status_fallback_to_pod_count_when_rs_has_no_status() {
-        use rusternetes_common::resources::{PodCondition, PodStatus, PodTemplateSpec};
-        use rusternetes_common::types::{LabelSelector, Phase};
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::resources::{PodCondition, PodStatus, PodTemplateSpec};
+        use k3rs_common::types::{LabelSelector, Phase};
+        use k3rs_storage::memory::MemoryStorage;
         use std::collections::HashMap;
 
         let storage = Arc::new(MemoryStorage::new());
@@ -377,7 +377,7 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
-            spec: rusternetes_common::resources::DeploymentSpec {
+            spec: k3rs_common::resources::DeploymentSpec {
                 replicas: Some(2),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
@@ -385,7 +385,7 @@ mod tests {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![test_container("test", "nginx:latest")],
                         ..Default::default()
                     },
@@ -415,7 +415,7 @@ mod tests {
                 name: "test-deploy-abc123".to_string(),
                 namespace: Some("default".to_string()),
                 labels: Some(rs_labels.clone()),
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "Deployment".to_string(),
                     name: "test-deploy".to_string(),
@@ -452,7 +452,7 @@ mod tests {
                     name: pod_name.clone(),
                     namespace: Some("default".to_string()),
                     labels: Some(rs_labels.clone()),
-                    owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                    owner_references: Some(vec![k3rs_common::types::OwnerReference {
                         api_version: "apps/v1".to_string(),
                         kind: "ReplicaSet".to_string(),
                         name: "test-deploy-abc123".to_string(),
@@ -499,9 +499,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_recreate_deployment_waits_for_old_pods() {
-        use rusternetes_common::resources::PodTemplateSpec;
-        use rusternetes_common::types::LabelSelector;
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::resources::PodTemplateSpec;
+        use k3rs_common::types::LabelSelector;
+        use k3rs_storage::memory::MemoryStorage;
         use std::collections::HashMap;
 
         let storage = Arc::new(MemoryStorage::new());
@@ -517,7 +517,7 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("recreate-deploy").with_namespace("default"),
-            spec: rusternetes_common::resources::DeploymentSpec {
+            spec: k3rs_common::resources::DeploymentSpec {
                 replicas: Some(1),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
@@ -525,17 +525,15 @@ mod tests {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![test_container("main", "nginx:1.0")],
                         ..Default::default()
                     },
                 },
-                strategy: Some(
-                    rusternetes_common::resources::deployment::DeploymentStrategy {
-                        strategy_type: "Recreate".to_string(),
-                        rolling_update: None,
-                    },
-                ),
+                strategy: Some(k3rs_common::resources::deployment::DeploymentStrategy {
+                    strategy_type: "Recreate".to_string(),
+                    rolling_update: None,
+                }),
                 min_ready_seconds: None,
                 revision_history_limit: None,
                 paused: None,
@@ -575,7 +573,7 @@ mod tests {
                 name: "old-pod-0".to_string(),
                 namespace: Some("default".to_string()),
                 labels: Some(labels.clone()),
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "ReplicaSet".to_string(),
                     name: old_rs.metadata.name.clone(),
@@ -585,12 +583,12 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            spec: Some(rusternetes_common::resources::PodSpec {
+            spec: Some(k3rs_common::resources::PodSpec {
                 containers: vec![test_container("main", "nginx:1.0")],
                 ..Default::default()
             }),
-            status: Some(rusternetes_common::resources::PodStatus {
-                phase: Some(rusternetes_common::types::Phase::Running),
+            status: Some(k3rs_common::resources::PodStatus {
+                phase: Some(k3rs_common::types::Phase::Running),
                 ..Default::default()
             }),
         };
@@ -630,7 +628,7 @@ mod tests {
     /// its revision should be the max revision from those ReplicaSets.
     #[tokio::test]
     async fn test_deployment_revision_from_existing_replicasets() {
-        use rusternetes_storage::MemoryStorage;
+        use k3rs_storage::MemoryStorage;
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -724,13 +722,13 @@ mod tests {
     /// one active ReplicaSet and no old ones, so `old_rs_total` is 0 — which is
     /// what made every scale branch unreachable (#1605).
     async fn seed_single_rs_deployment(
-        storage: &Arc<rusternetes_storage::memory::MemoryStorage>,
+        storage: &Arc<k3rs_storage::memory::MemoryStorage>,
         desired: i32,
         rs_replicas: i32,
         annotated_desired: Option<&str>,
     ) -> (Deployment, String) {
-        use rusternetes_common::resources::{PodTemplateSpec, ReplicaSetStatus};
-        use rusternetes_common::types::LabelSelector;
+        use k3rs_common::resources::{PodTemplateSpec, ReplicaSetStatus};
+        use k3rs_common::types::LabelSelector;
         use std::collections::HashMap;
 
         let mut labels = HashMap::new();
@@ -742,7 +740,7 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new("test-deploy").with_namespace("default"),
-            spec: rusternetes_common::resources::DeploymentSpec {
+            spec: k3rs_common::resources::DeploymentSpec {
                 replicas: Some(desired),
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
@@ -750,7 +748,7 @@ mod tests {
                 },
                 template: PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels.clone())),
-                    spec: rusternetes_common::resources::PodSpec {
+                    spec: k3rs_common::resources::PodSpec {
                         containers: vec![test_container("test", "agnhost:2.59")],
                         ..Default::default()
                     },
@@ -801,7 +799,7 @@ mod tests {
                 namespace: Some("default".to_string()),
                 labels: Some(rs_labels.clone()),
                 annotations,
-                owner_references: Some(vec![rusternetes_common::types::OwnerReference {
+                owner_references: Some(vec![k3rs_common::types::OwnerReference {
                     api_version: "apps/v1".to_string(),
                     kind: "Deployment".to_string(),
                     name: "test-deploy".to_string(),
@@ -851,7 +849,7 @@ mod tests {
     ///   pkg/controller/deployment/util/deployment_util.go:357-377 — FindActiveOrLatest
     #[tokio::test]
     async fn a_single_active_replicaset_scales_up_to_spec_replicas() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = DeploymentController::new(storage.clone(), 5);
@@ -872,7 +870,7 @@ mod tests {
     /// Deployment must also converge, and must not overshoot to 0.
     #[tokio::test]
     async fn a_single_active_replicaset_scales_down_to_spec_replicas() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = DeploymentController::new(storage.clone(), 5);
@@ -893,7 +891,7 @@ mod tests {
     /// bookkeeping, not a precondition for plain scaling.
     #[tokio::test]
     async fn a_single_active_replicaset_scales_without_a_desired_replicas_annotation() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = DeploymentController::new(storage.clone(), 5);
@@ -912,7 +910,7 @@ mod tests {
     /// Guard for the #1605 fix: a PAUSED Deployment is still never scaled.
     #[tokio::test]
     async fn a_paused_deployment_is_not_scaled_even_with_one_active_replicaset() {
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let controller = DeploymentController::new(storage.clone(), 5);

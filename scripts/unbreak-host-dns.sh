@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Recover host DNS after rusternetes-kube-proxy poisoned the host's
+# Recover host DNS after k3rs-kube-proxy poisoned the host's
 # iptables. Symptoms it fixes:
 #   - `getent hosts github.com` works but `curl` / browser / docker pull fail
 #   - Containers can't resolve anything (DNS timeouts to 127.0.0.11)
 #   - systemd-resolved stub at 127.0.0.53:53 unreachable
 #
-# These happen because a previous kube-proxy run left RUSTERNETES-SERVICES,
-# RUSTERNETES-NODEPORTS, and/or KUBE-FORWARD chains (with their jump rules)
+# These happen because a previous kube-proxy run left K3RS-SERVICES,
+# K3RS-NODEPORTS, and/or KUBE-FORWARD chains (with their jump rules)
 # on the host's iptables. After this script:
-#   - All RUSTERNETES-* / KUBE-FORWARD chains and jumps are gone.
+#   - All K3RS-* / KUBE-FORWARD chains and jumps are gone.
 #   - Docker's own iptables are rebuilt by restarting docker.service.
 #   - systemd-resolved is restarted so the stub listener is fresh.
 #
@@ -49,7 +49,7 @@ remove_all_jumps_to() {
     :
   done
 }
-for tgt in RUSTERNETES-SERVICES RUSTERNETES-NODEPORTS; do
+for tgt in K3RS-SERVICES K3RS-NODEPORTS; do
   remove_all_jumps_to nat PREROUTING "$tgt"
   remove_all_jumps_to nat OUTPUT     "$tgt"
 done
@@ -67,17 +67,17 @@ remove_all_matching() {
   done
 }
 remove_all_matching nat POSTROUTING \
-  -m comment --comment "rusternetes DNAT traffic masquerade" \
+  -m comment --comment "k3rs DNAT traffic masquerade" \
   -m conntrack --ctstate DNAT -j MASQUERADE
 remove_all_matching nat POSTROUTING \
-  -m comment --comment "rusternetes ClusterIP DNAT masquerade" \
+  -m comment --comment "k3rs ClusterIP DNAT masquerade" \
   -m conntrack --ctstate DNAT --ctorigdst 10.96.0.0/12 -j MASQUERADE
 remove_all_matching nat POSTROUTING \
-  -m comment --comment "rusternetes nodeport masquerade" \
+  -m comment --comment "k3rs nodeport masquerade" \
   -m addrtype --src-type LOCAL -j MASQUERADE
 for proto in tcp udp; do
   remove_all_matching nat POSTROUTING \
-    -m comment --comment "rusternetes NodePort masquerade" \
+    -m comment --comment "k3rs NodePort masquerade" \
     -p "$proto" \
     -m conntrack --ctstate DNAT --ctorigdstport 30000:32767 -j MASQUERADE
 done
@@ -90,14 +90,14 @@ done
 #
 # Using `read -ra cmd <<< "$line"` is also wrong here because plain bash
 # word-splitting doesn't honor the double-quotes that `iptables -S`
-# emits around comment values — the comment `"rusternetes service
+# emits around comment values — the comment `"k3rs service
 # hairpin masquerade"` would be torn into 4 separate args.
 #
 # `xargs` reads stdin with shell-style quoting, so a quoted comment
 # stays a single argument. Loop until no hairpin rule is left.
 while :; do
   line=$("$IPT" -t nat -S POSTROUTING 2>/dev/null \
-         | grep -F 'rusternetes service hairpin masquerade' | head -1)
+         | grep -F 'k3rs service hairpin masquerade' | head -1)
   [ -n "$line" ] || break
   if ! echo "$line" | sed 's/^-A /-D /' | xargs "$IPT" -t nat 2>/dev/null; then
     break
@@ -105,8 +105,8 @@ while :; do
 done
 ok "host jump rules + legacy MASQUERADE rules removed"
 
-step "2/4 — flush and delete RUSTERNETES-* / KUBE-FORWARD chains"
-# Discover any RUSTERNETES-* or KUBE-SEP-* / KUBE-NP-SEP-* chains and
+step "2/4 — flush and delete K3RS-* / KUBE-FORWARD chains"
+# Discover any K3RS-* or KUBE-SEP-* / KUBE-NP-SEP-* chains and
 # flush+delete them. The SEP chains are per-endpoint and named with
 # random suffixes — `iptables -L` is the only way to enumerate.
 flush_and_drop_chain() {
@@ -114,7 +114,7 @@ flush_and_drop_chain() {
   "$IPT" -t "$table" -F "$chain" 2>/dev/null || true
   "$IPT" -t "$table" -X "$chain" 2>/dev/null || true
 }
-discovered_nat=$("$IPT" -t nat    -S 2>/dev/null | awk '/^-N (RUSTERNETES-|KUBE-SEP-|KUBE-NP-SEP-)/ {print $2}' || true)
+discovered_nat=$("$IPT" -t nat    -S 2>/dev/null | awk '/^-N (K3RS-|KUBE-SEP-|KUBE-NP-SEP-)/ {print $2}' || true)
 discovered_flt=$("$IPT" -t filter -S 2>/dev/null | awk '/^-N (KUBE-FORWARD)/                              {print $2}' || true)
 for c in $discovered_nat; do flush_and_drop_chain nat "$c"; done
 for c in $discovered_flt; do flush_and_drop_chain filter "$c"; done

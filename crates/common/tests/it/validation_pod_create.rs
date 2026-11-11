@@ -11,13 +11,13 @@
 //! `for _, tc := range successCases { ... }` / `for _, tc := range errorCases
 //! { ... }` pattern.
 
-use rusternetes_common::resources::pod::{
+use k3rs_common::resources::pod::{
     Container, ContainerPort, Lifecycle, Pod, PodDNSConfig, PodSpec, Probe, Toleration,
 };
-use rusternetes_common::resources::pod::{ExecAction, HTTPGetAction, TCPSocketAction};
-use rusternetes_common::resources::policy::IntOrString;
-use rusternetes_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
-use rusternetes_common::validation::pod::validate_pod_create;
+use k3rs_common::resources::pod::{ExecAction, HTTPGetAction, TCPSocketAction};
+use k3rs_common::resources::policy::IntOrString;
+use k3rs_common::types::{ObjectMeta, ResourceRequirements, TypeMeta};
+use k3rs_common::validation::pod::validate_pod_create;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -73,11 +73,11 @@ fn check(pod: &Pod, expect_valid: bool, label: &str) {
     }
 }
 
-fn contains_field(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn contains_field(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field.contains(field))
 }
 
-fn contains_detail(errs: &[rusternetes_common::validation::field::Error], detail: &str) -> bool {
+fn contains_detail(errs: &[k3rs_common::validation::field::Error], detail: &str) -> bool {
     errs.iter()
         .any(|e| e.to_string().contains(detail) || e.detail.contains(detail))
 }
@@ -327,7 +327,7 @@ fn test_validate_pod_error_termination_grace_period_negative() {
 
 #[test]
 fn test_validate_pod_error_ephemeral_containers_on_create() {
-    use rusternetes_common::resources::pod::EphemeralContainer;
+    use k3rs_common::resources::pod::EphemeralContainer;
     let pod = pod_with_spec(PodSpec {
         containers: vec![minimal_container("c", "nginx")],
         ephemeral_containers: Some(vec![EphemeralContainer {
@@ -880,7 +880,7 @@ fn test_validate_restartable_init_container_allows_readiness_probe() {
 
 #[test]
 fn test_validate_init_containers_error_lifecycle_forbidden() {
-    use rusternetes_common::resources::pod::LifecycleHandler;
+    use k3rs_common::resources::pod::LifecycleHandler;
     // Init containers may not have lifecycle hooks.
     let pod = pod_with_spec(PodSpec {
         init_containers: Some(vec![Container {
@@ -955,7 +955,7 @@ fn test_validate_init_containers_success_liveness_probe_allowed() {
 
 #[test]
 fn test_validate_pod_spec_volumes_success_unique_names() {
-    use rusternetes_common::resources::pod::{EmptyDirVolumeSource, Volume};
+    use k3rs_common::resources::pod::{EmptyDirVolumeSource, Volume};
     let pod = pod_with_spec(PodSpec {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
@@ -1005,7 +1005,7 @@ fn test_validate_pod_spec_volumes_success_unique_names() {
 
 #[test]
 fn test_validate_pod_spec_volumes_error_duplicate_names() {
-    use rusternetes_common::resources::pod::{EmptyDirVolumeSource, Volume};
+    use k3rs_common::resources::pod::{EmptyDirVolumeSource, Volume};
     let pod = pod_with_spec(PodSpec {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![
@@ -1284,7 +1284,7 @@ fn pod_with_toleration(op: &str, value: &str) -> Pod {
 #[test]
 #[serial_test::serial]
 fn comparison_operator_is_not_supported_while_the_gate_is_off() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     let _g = with_feature(Feature::TaintTolerationComparisonOperators, false);
     let errs = validate_pod_create(&pod_with_toleration("Lt", "100"), true);
     assert_eq!(errs.len(), 1, "{errs:?}");
@@ -1299,7 +1299,7 @@ fn comparison_operator_is_not_supported_while_the_gate_is_off() {
 #[test]
 #[serial_test::serial]
 fn comparison_operator_is_valid_with_a_decimal_integer_when_the_gate_is_on() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     let _g = with_feature(Feature::TaintTolerationComparisonOperators, true);
     for (op, v) in [
         ("Lt", "100"),
@@ -1316,7 +1316,7 @@ fn comparison_operator_is_valid_with_a_decimal_integer_when_the_gate_is_on() {
 #[test]
 #[serial_test::serial]
 fn comparison_operator_value_must_be_a_canonical_int64_when_the_gate_is_on() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     let _g = with_feature(Feature::TaintTolerationComparisonOperators, true);
     for (v, detail) in [
         ("", "must be non-empty"),
@@ -1346,8 +1346,8 @@ fn comparison_operator_value_must_be_a_canonical_int64_when_the_gate_is_on() {
 #[test]
 #[serial_test::serial]
 fn update_with_comparison_operator_follows_the_old_spec_when_the_gate_is_off() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
-    use rusternetes_common::validation::pod::validate_pod_spec_update;
+    use k3rs_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::validation::pod::validate_pod_spec_update;
     let _g = with_feature(Feature::TaintTolerationComparisonOperators, false);
     let spec = |tols: Vec<Toleration>| PodSpec {
         containers: vec![minimal_container("c", "nginx")],
@@ -1380,7 +1380,7 @@ fn update_with_comparison_operator_follows_the_old_spec_when_the_gate_is_off() {
 // munged-spec fence message (validation.go:5579-5598, :5683-5689, :5695-5836).
 mod pod_update_fidelity {
     use super::*;
-    use rusternetes_common::validation::pod::validate_pod_spec_update;
+    use k3rs_common::validation::pod::validate_pod_spec_update;
 
     fn spec(image: &str) -> PodSpec {
         PodSpec {
@@ -1421,7 +1421,7 @@ mod pod_update_fidelity {
         let errs = validate_pod_spec_update(&spec("nginx"), &spec(""), false);
         assert!(
             errs.iter().any(|e| e.field == "spec.containers[0].image"
-                && e.error_type == rusternetes_common::validation::field::ErrorType::Required),
+                && e.error_type == k3rs_common::validation::field::ErrorType::Required),
             "{errs:?}"
         );
     }
@@ -1504,7 +1504,7 @@ mod pod_update_fidelity {
 // invalid therefore stays un-updatable until fixed.
 mod pod_update_whole {
     use super::*;
-    use rusternetes_common::validation::pod::validate_pod_update;
+    use k3rs_common::validation::pod::validate_pod_update;
 
     fn pod(name: &str, image: &str) -> Pod {
         let mut p = pod_with_spec(minimal_spec(vec![minimal_container(name, image)]));
@@ -1550,7 +1550,7 @@ mod pod_update_whole {
     // create-only "cannot be set on create" rule on a later update.
     #[test]
     fn ephemeral_containers_are_not_create_only_on_update() {
-        use rusternetes_common::resources::pod::EphemeralContainer;
+        use k3rs_common::resources::pod::EphemeralContainer;
         let mut old = pod("c", "nginx");
         old.spec.as_mut().unwrap().ephemeral_containers = Some(vec![EphemeralContainer {
             name: "dbg".to_string(),
@@ -1569,7 +1569,7 @@ mod pod_update_whole {
 // just ValidatePodUpdate.
 mod pod_only_rules_on_create_and_resize {
     use super::*;
-    use rusternetes_common::validation::pod_subresource::validate_pod_resize;
+    use k3rs_common::validation::pod_subresource::validate_pod_resize;
 
     fn sa_token_pod(service_account_name: Option<&str>) -> Pod {
         let mut spec = minimal_spec(vec![minimal_container("c", "nginx")]);
@@ -1643,7 +1643,7 @@ mod pod_only_rules_on_create_and_resize {
 // ---------------------------------------------------------------------------
 
 fn pod_with_volume_json(vol: serde_json::Value) -> Pod {
-    let v: rusternetes_common::resources::pod::Volume = serde_json::from_value(vol).unwrap();
+    let v: k3rs_common::resources::pod::Volume = serde_json::from_value(vol).unwrap();
     pod_with_spec(PodSpec {
         containers: vec![minimal_container("c", "nginx")],
         volumes: Some(vec![v]),
@@ -1889,7 +1889,7 @@ fn volume_fc_counts_toward_one_volume_type() {
 #[test]
 fn volume_fc_malformed_is_rejected_at_decode() {
     assert!(
-        serde_json::from_value::<rusternetes_common::resources::pod::Volume>(
+        serde_json::from_value::<k3rs_common::resources::pod::Volume>(
             serde_json::json!({"name": "v", "fc": {"lun": "two"}})
         )
         .is_err()

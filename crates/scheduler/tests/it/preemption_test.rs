@@ -18,10 +18,10 @@
 use std::collections::HashMap;
 
 use crate::preempt_support::check_preemption_with_pdbs;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, IntOrString, Pod, PodDisruptionBudget, PodDisruptionBudgetSpec, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{LabelSelector, Phase, ResourceRequirements};
+use k3rs_common::types::{LabelSelector, Phase, ResourceRequirements};
 
 fn make_container(cpu: &str, memory: &str) -> Container {
     let mut requests = HashMap::new();
@@ -60,7 +60,7 @@ fn make_container(cpu: &str, memory: &str) -> Container {
     }
 }
 
-use rusternetes_test_support::node_with_resources as make_node;
+use k3rs_test_support::node_with_resources as make_node;
 
 fn make_pod_with_labels(
     name: &str,
@@ -275,11 +275,11 @@ fn preemption_without_pdb_matches_legacy_behavior() {
 /// that blocks it.
 #[tokio::test]
 async fn preemption_falls_back_to_priorityclass_never_policy() {
-    use rusternetes_common::resources::PriorityClass;
-    use rusternetes_scheduler::diagnosis::Diagnosis;
-    use rusternetes_scheduler::fwk::Code;
-    use rusternetes_scheduler::scheduler::Scheduler;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::PriorityClass;
+    use k3rs_scheduler::diagnosis::Diagnosis;
+    use k3rs_scheduler::fwk::Code;
+    use k3rs_scheduler::scheduler::Scheduler;
+    use k3rs_storage::memory::MemoryStorage;
     use std::sync::Arc;
 
     // Node with room for exactly one unit pod, currently full.

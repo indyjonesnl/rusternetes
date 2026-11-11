@@ -2,7 +2,7 @@ use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
 use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, TxnOp, WatchOptions};
 use futures::StreamExt;
-use rusternetes_common::{authz::AuthzStorage, Error, Result};
+use k3rs_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, error, info};
 

@@ -2,10 +2,10 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::{
+    pub use k3rs_api_server::{
         apiserver_identity, bootstrap, legacy_token_tracking, registry, storage_readiness_hook,
     };
-    pub use rusternetes_storage::{Storage, StorageBackend};
+    pub use k3rs_storage::{Storage, StorageBackend};
     pub use std::sync::Arc;
     pub use tracing::{info, warn};
 }
@@ -17,14 +17,14 @@ mod aggregator_hooks {
     /// APIService (`apiServiceRegistrationControllerInitiated`).
     #[tokio::test]
     async fn startup_registers_and_finishes_the_apiservice_hooks() {
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
-        rusternetes_api_server::startup::register_post_start_hooks(
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
+        k3rs_api_server::startup::register_post_start_hooks(
             storage,
             6443,
             "10.96.0.1".parse().unwrap(),
-            rusternetes_api_server::bootstrap::AdvertiseAddress::new(None, "0.0.0.0:6443"),
+            k3rs_api_server::bootstrap::AdvertiseAddress::new(None, "0.0.0.0:6443"),
             vec!["10.96.0.0/12".to_string()],
-            rusternetes_api_server::startup::ClusterAuthnInputs::default(),
+            k3rs_api_server::startup::ClusterAuthnInputs::default(),
             |_| {},
         )
         .await;
@@ -34,7 +34,7 @@ mod aggregator_hooks {
         ] {
             let mut finished = false;
             for _ in 0..300 {
-                if rusternetes_api_server::post_start_hooks::global().check(name) == Some(Ok(())) {
+                if k3rs_api_server::post_start_hooks::global().check(name) == Some(Ok(())) {
                     finished = true;
                     break;
                 }

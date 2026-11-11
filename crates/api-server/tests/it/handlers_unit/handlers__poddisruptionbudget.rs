@@ -9,25 +9,25 @@ mod __parent {
         response::{IntoResponse, Response},
         Extension,
     };
-    pub use rusternetes_api_server::endpoints::handlers::{self as endpoints, RequestScope};
-    pub use rusternetes_api_server::registry::policy::poddisruptionbudget;
-    pub use rusternetes_api_server::{middleware::AuthContext, state::ApiServerState};
-    pub use rusternetes_common::{
+    pub use k3rs_api_server::endpoints::handlers::{self as endpoints, RequestScope};
+    pub use k3rs_api_server::registry::policy::poddisruptionbudget;
+    pub use k3rs_api_server::{middleware::AuthContext, state::ApiServerState};
+    pub use k3rs_common::{
         admission::{GroupVersionKind, GroupVersionResource},
         authz::{Decision, RequestAttributes},
         resources::PodDisruptionBudget,
         List, Result,
     };
-    pub use rusternetes_storage::build_prefix;
+    pub use k3rs_storage::build_prefix;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::debug;
 }
 
 mod tests {
-    use rusternetes_common::resources::PodDisruptionBudget;
-    use rusternetes_common::resources::{IntOrString, PodDisruptionBudgetSpec};
-    use rusternetes_common::types::LabelSelector;
+    use k3rs_common::resources::PodDisruptionBudget;
+    use k3rs_common::resources::{IntOrString, PodDisruptionBudgetSpec};
+    use k3rs_common::types::LabelSelector;
     use std::collections::HashMap;
 
     #[test]

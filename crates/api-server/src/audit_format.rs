@@ -5,8 +5,8 @@
 //! `HandlePluginError` (`pkg/audit/metrics.go`).
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusternetes_common::audit::AuditEvent;
-use rusternetes_common::authz::reasons::quoted;
+use k3rs_common::audit::AuditEvent;
+use k3rs_common::authz::reasons::quoted;
 
 /// `time.RFC3339Nano`: UTC, trailing fractional zeros trimmed.
 fn rfc3339_nano(t: &DateTime<Utc>) -> String {

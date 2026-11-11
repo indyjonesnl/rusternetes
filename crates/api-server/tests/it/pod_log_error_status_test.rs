@@ -22,7 +22,7 @@
 //! return errors.NewGenericServerResponse(resp.StatusCode, "", ..., bodyText, 0, false)
 //! ```
 //!
-//! Rusternetes proxied the kubelet response verbatim, so a client got a bare
+//! k3rs proxied the kubelet response verbatim, so a client got a bare
 //! 400 with `text/plain`. client-go cannot parse that as a `Status`, falls back
 //! to `NewGenericServerResponse`, and prints its generic 400 wording — losing
 //! the kubelet's actual explanation:
@@ -40,13 +40,13 @@
 //! e2e framework's post-failure log collection came back empty for exactly the
 //! two pods whose containers had never started.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     DaemonEndpoint, Node, NodeAddress, NodeDaemonEndpoints, NodeStatus, Pod, PodSpec,
 };
-use rusternetes_common::tls::TlsConfig;
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::tls::TlsConfig;
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -137,7 +137,7 @@ async fn fetch_logs(status_line: &'static str, kubelet_body: &str) -> (u16, Stri
     let mut pod = Pod::new(
         "log-pod",
         PodSpec {
-            containers: vec![rusternetes_common::resources::Container {
+            containers: vec![k3rs_common::resources::Container {
                 name: "nginx".to_string(),
                 image: "nginx".to_string(),
                 ..Default::default()

@@ -1,10 +1,10 @@
 //! Cases of `SelectVictimsOnNode` (`defaultpreemption/default_preemption.go:207-307`),
 //! the reprieve order of `TestDryRunPreemption`/`TestSelectBestCandidate`
 //! (`default_preemption_test.go`) and `addGENominatedPods` (`framework.go`).
-use rusternetes_common::resources::{Node, Pod, PodDisruptionBudget};
-use rusternetes_scheduler::default_preemption::{nominated_pods_for_node, select_victims_on_node};
-use rusternetes_scheduler::fwk::{Code, NoHandle};
-use rusternetes_scheduler::profile::Profile;
+use k3rs_common::resources::{Node, Pod, PodDisruptionBudget};
+use k3rs_scheduler::default_preemption::{nominated_pods_for_node, select_victims_on_node};
+use k3rs_scheduler::fwk::{Code, NoHandle};
+use k3rs_scheduler::profile::Profile;
 use serde_json::{json, Value};
 
 fn node(cpu: &str) -> Node {
@@ -130,7 +130,7 @@ async fn victims_are_listed_from_most_to_least_important() {
 async fn terminal_pods_hold_no_room_and_are_no_victims() {
     let n = node("2");
     let mut done = pod("done", "n", 1, "2", json!({}));
-    done.status.as_mut().unwrap().phase = Some(rusternetes_common::types::Phase::Succeeded);
+    done.status.as_mut().unwrap().phase = Some(k3rs_common::types::Phase::Succeeded);
     let e = select(&pod("p", "", 10, "2", json!({})), &n, &[done], &[])
         .await
         .unwrap_err();

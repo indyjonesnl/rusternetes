@@ -16,7 +16,7 @@
 //! - Expects the pod to reach `Succeeded` with the termination message round-
 //!   tripping through `Status.ContainerStatuses[0].LastTerminationState.Terminated.Message`.
 //!
-//! Symptom on rusternetes (hydrophone canary on PR #182, 2026-05-20):
+//! Symptom on k3rs (hydrophone canary on PR #182, 2026-05-20):
 //! the pod transitions to `Failed`. The shell redirect inside the container
 //! fails because the kubelet pre-creates the host-side bind-mounted file with
 //! the umask-trimmed default mode (typically `0o664`, root-owned). A
@@ -29,7 +29,7 @@
 //! `os.Chmod(containerLogPath, 0666)` to defeat the umask. We do the same in
 //! `setup_termination_message_file`.
 
-use rusternetes_kubelet::runtime::setup_termination_message_file;
+use k3rs_kubelet::runtime::setup_termination_message_file;
 
 /// [sig-node] Container Runtime blackbox test on terminated container should
 /// report termination message if TerminationMessagePath is set as non-root
@@ -37,7 +37,7 @@ use rusternetes_kubelet::runtime::setup_termination_message_file;
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/common/node/runtime.go (release-1.35),
 /// the "non-root user, non-default path" case. Upstream chmods the host-side
-/// file to `0o666` after creation; the rusternetes equivalent must do the
+/// file to `0o666` after creation; the k3rs equivalent must do the
 /// same so a non-root container UID can write to the bind-mounted path.
 #[test]
 #[cfg(unix)]

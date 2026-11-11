@@ -11,7 +11,7 @@
 //! and under the steps for which it implements `MutationInterface` (`admit`)
 //! and/or `ValidationInterface` (`validate`), whatever the resource.
 
-use rusternetes_common::admission::Operation;
+use k3rs_common::admission::Operation;
 
 const C: u8 = 1;
 const U: u8 = 2;

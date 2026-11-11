@@ -5,7 +5,7 @@
 //! Authorize`) and its test (`caching_authorizer_test.go`
 //! `TestCachingAuthorizer`).
 //!
-//! Deviation (Rust expression, not mechanism): `rusternetes_common::Error` is
+//! Deviation (Rust expression, not mechanism): `k3rs_common::Error` is
 //! not `Clone`, so a cached error is replayed as `Error::Authorization` with
 //! the original error's message rather than as the same error value.
 
@@ -13,11 +13,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{
-    AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes,
-};
-use rusternetes_common::{Error, Result};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{AuthorizationOutcome, Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::{Error, Result};
 
 type Cached<T> = std::result::Result<T, String>;
 
@@ -117,7 +115,7 @@ impl Authorizer for CachingAuthorizer {
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
         self.authorizer
             .get_user_rules_outcome(user, namespace)
             .await

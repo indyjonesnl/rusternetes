@@ -3,26 +3,26 @@
 
 mod __parent {
     pub use futures::StreamExt;
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         resources::{Pod, PodStatus, ReplicaSet, ReplicaSetStatus},
         types::{label_selector_as_selector, ObjectMeta, Phase, Selector},
     };
-    pub use rusternetes_controller_manager::controllers::controller_utils::{
+    pub use k3rs_controller_manager::controllers::controller_utils::{
         find_min_next_pod_availability_check, is_pod_available, is_pod_ready, is_pod_terminating,
         node_of, pod_key, pods_on_node_counts, sort_active_pods_with_ranks, RankGates,
     };
-    pub use rusternetes_controller_manager::controllers::expectations::ControllerExpectations;
-    pub use rusternetes_controller_manager::controllers::pod_informer::{
+    pub use k3rs_controller_manager::controllers::expectations::ControllerExpectations;
+    pub use k3rs_controller_manager::controllers::pod_informer::{
         apply_pod_observation, ControllerRef, PodEventTarget, PodObservation, ResolvedController,
         SharedPodInformer,
     };
-    pub use rusternetes_controller_manager::controllers::replicationcontroller::{
+    pub use k3rs_controller_manager::controllers::replicationcontroller::{
         generate_pod_name, is_namespace_terminating_rejection, slow_start_batches, BURST_REPLICAS,
         MAX_NAME_GENERATION_CREATE_ATTEMPTS, SLOW_START_INITIAL_BATCH_SIZE,
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::WatchEvent;
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::WatchEvent;
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::{sync::Arc, time::Duration};
     pub use tracing::{debug, error, info, warn};
@@ -30,11 +30,11 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::PodSpec;
-    use rusternetes_common::types::{LabelSelector, OwnerReference, TypeMeta};
-    use rusternetes_controller_manager::controllers::replicaset::*;
-    use rusternetes_storage::memory::MemoryStorage;
-    use rusternetes_storage::Storage;
+    use k3rs_common::resources::PodSpec;
+    use k3rs_common::types::{LabelSelector, OwnerReference, TypeMeta};
+    use k3rs_controller_manager::controllers::replicaset::*;
+    use k3rs_storage::memory::MemoryStorage;
+    use k3rs_storage::Storage;
     use std::collections::HashMap;
 
     fn make_labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -51,13 +51,13 @@ mod tests {
                 api_version: "apps/v1".to_string(),
             },
             metadata: ObjectMeta::new(name).with_namespace("default"),
-            spec: rusternetes_common::resources::ReplicaSetSpec {
+            spec: k3rs_common::resources::ReplicaSetSpec {
                 replicas,
                 selector: LabelSelector {
                     match_labels: Some(labels.clone()),
                     match_expressions: None,
                 },
-                template: rusternetes_common::resources::PodTemplateSpec {
+                template: k3rs_common::resources::PodTemplateSpec {
                     metadata: Some(ObjectMeta::new("").with_labels(labels)),
                     spec: PodSpec {
                         containers: vec![],
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn test_rs_replica_failure_from_apiserver_quota_forbidden() {
         let storage =
-            Arc::new(rusternetes_controller_manager::controllers::quota_admission_double::QuotaAdmissionStorage::new());
+            Arc::new(k3rs_controller_manager::controllers::quota_admission_double::QuotaAdmissionStorage::new());
         let controller = ReplicaSetController::new(storage.clone(), 10);
         let labels = make_labels(&[("app", "q")]);
         let rs = make_replicaset("q-rs", labels, 2);
@@ -367,9 +367,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = ReplicaSetController::new(storage.clone(), 5);
 
-        let mut sa = rusternetes_common::resources::ServiceAccount::new("default", "default");
+        let mut sa = k3rs_common::resources::ServiceAccount::new("default", "default");
         sa.image_pull_secrets = Some(vec![
-            rusternetes_common::resources::service_account::LocalObjectReference {
+            k3rs_common::resources::service_account::LocalObjectReference {
                 name: "regcred".to_string(),
             },
         ]);
@@ -471,7 +471,7 @@ mod tests {
 
     fn owned_pod(name: &str, labels: HashMap<String, String>, rs: &str, uid: &str) -> Pod {
         let mut pod = make_pod(name, labels);
-        pod.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+        pod.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
             api_version: "apps/v1".to_string(),
             kind: "ReplicaSet".to_string(),
             name: rs.to_string(),
@@ -601,12 +601,12 @@ mod tests {
     use crate::z_unit::controllers__replicationcontroller::tests::{
         ConcurrencyProbeStorage, TerminatingNamespaceStorage,
     };
-    use rusternetes_controller_manager::controllers::quota_admission_double::QuotaAdmissionStorage;
+    use k3rs_controller_manager::controllers::quota_admission_double::QuotaAdmissionStorage;
 
     fn rs_condition(
         rs: &ReplicaSet,
         ty: &str,
-    ) -> Option<rusternetes_common::resources::ReplicaSetCondition> {
+    ) -> Option<k3rs_common::resources::ReplicaSetCondition> {
         rs.status
             .as_ref()
             .and_then(|s| s.conditions.as_ref())
@@ -650,10 +650,9 @@ mod tests {
     async fn rs_caps_creates_at_burst_replicas_and_finishes_next_sync() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = ReplicaSetController::new(storage.clone(), 5);
-        let desired =
-            rusternetes_controller_manager::controllers::replicationcontroller::BURST_REPLICAS
-                as i32
-                + 100;
+        let desired = k3rs_controller_manager::controllers::replicationcontroller::BURST_REPLICAS
+            as i32
+            + 100;
         let rs = make_replicaset("burst", make_labels(&[("app", "burst")]), desired);
         storage
             .create(&build_key("replicasets", Some("default"), "burst"), &rs)
@@ -667,14 +666,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             pods.len(),
-            rusternetes_controller_manager::controllers::replicationcontroller::BURST_REPLICAS,
+            k3rs_controller_manager::controllers::replicationcontroller::BURST_REPLICAS,
             "one sync must not exceed burstReplicas"
         );
 
         // The creates were observed (pod watch Added events); simulate them.
-        for _ in
-            0..rusternetes_controller_manager::controllers::replicationcontroller::BURST_REPLICAS
-        {
+        for _ in 0..k3rs_controller_manager::controllers::replicationcontroller::BURST_REPLICAS {
             controller.observe_creation("default/burst");
         }
         let rs: ReplicaSet = storage
@@ -768,19 +765,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for LatePodStorage {
-        async fn create<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn create<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.create(key, value).await
         }
-        async fn get<T>(&self, key: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, key: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
             self.inner.get(key).await
         }
-        async fn update<T>(&self, key: &str, value: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, key: &str, value: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -790,13 +787,13 @@ mod tests {
             &self,
             key: &str,
             value: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        ) -> k3rs_common::Result<()> {
             self.inner.update_raw(key, value).await
         }
-        async fn delete(&self, key: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, key: &str) -> k3rs_common::Result<()> {
             self.inner.delete(key).await
         }
-        async fn list<T>(&self, prefix: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, prefix: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -816,23 +813,20 @@ mod tests {
             }
             snapshot
         }
-        async fn watch(
-            &self,
-            prefix: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, prefix: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch(prefix).await
         }
         async fn watch_from_revision(
             &self,
             prefix: &str,
             revision: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.inner.watch_from_revision(prefix, revision).await
         }
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.inner.current_revision().await
         }
-        async fn is_revision_compacted(&self, revision: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, revision: i64) -> k3rs_common::Result<bool> {
             self.inner.is_revision_compacted(revision).await
         }
     }
@@ -941,7 +935,7 @@ mod tests {
     // pkg/controller/controller_utils.go `ActivePodsWithRanks` (:778-870).
     // ---------------------------------------------------------------------
 
-    use rusternetes_common::resources::pod::PodCondition;
+    use k3rs_common::resources::pod::PodCondition;
 
     fn ready_condition(since: chrono::DateTime<chrono::Utc>) -> PodCondition {
         PodCondition {
@@ -1229,7 +1223,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rs_reports_terminating_replicas_when_the_gate_is_on() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let _gate = with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, true);
         let storage = Arc::new(MemoryStorage::new());
         let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
@@ -1251,7 +1245,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rs_leaves_terminating_replicas_unset_when_the_gate_is_off() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         let _gate = with_feature(Feature::DeploymentReplicaSetTerminatingReplicas, false);
         let storage = Arc::new(MemoryStorage::new());
         let controller = ReplicaSetController::new(Arc::clone(&storage), 30);
@@ -1534,7 +1528,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn calculate_status_follows_upstream_table() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
+        use k3rs_common::feature_gates::{with_feature, Feature};
         // Template labels are always the full map (`newReplicaSet`); the
         // pods carry the selector's labels (`newPod`).
         let rs_with = |replicas: i32, selector: &[(&str, &str)], min_ready: i32| {
@@ -1683,7 +1677,7 @@ mod tests {
         let rs = make_replicaset("foobar", make_labels(&[("name", "foo")]), 2);
         let mut failing_rs = make_replicaset("foobar", make_labels(&[("name", "foo")]), 10);
         failing_rs.status = Some(ReplicaSetStatus {
-            conditions: Some(vec![rusternetes_common::resources::ReplicaSetCondition {
+            conditions: Some(vec![k3rs_common::resources::ReplicaSetCondition {
                 condition_type: "ReplicaFailure".to_string(),
                 status: "True".to_string(),
                 last_transition_time: None,
@@ -1809,14 +1803,10 @@ mod tests {
     // `metav1.LabelSelectorAsSelector`.
     // ---------------------------------------------------------------------
 
-    pub(crate) fn expr(
-        key: &str,
-        op: &str,
-        values: &[&str],
-    ) -> rusternetes_common::types::LabelSelector {
-        rusternetes_common::types::LabelSelector {
+    pub(crate) fn expr(key: &str, op: &str, values: &[&str]) -> k3rs_common::types::LabelSelector {
+        k3rs_common::types::LabelSelector {
             match_labels: None,
-            match_expressions: Some(vec![rusternetes_common::types::LabelSelectorRequirement {
+            match_expressions: Some(vec![k3rs_common::types::LabelSelectorRequirement {
                 key: key.to_string(),
                 operator: op.to_string(),
                 values: if values.is_empty() {
@@ -2046,7 +2036,7 @@ mod tests {
         let mut invalid = make_replicaset("invalid", make_labels(&[("app", "a")]), 1);
         invalid.spec.selector = expr("app", "Bogus", &["a"]);
         let mut empty = make_replicaset("empty", make_labels(&[("app", "a")]), 1);
-        empty.spec.selector = rusternetes_common::types::LabelSelector {
+        empty.spec.selector = k3rs_common::types::LabelSelector {
             match_labels: None,
             match_expressions: None,
         };

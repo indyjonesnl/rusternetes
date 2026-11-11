@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusternetes_client::http::ApiClient;
+use k3rs_client::http::ApiClient;
 use std::env;
 use std::fs;
 use std::process::Command;

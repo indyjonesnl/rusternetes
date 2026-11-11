@@ -3,7 +3,7 @@
 //! the Priority admission plugin in the Store's validating admission.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PCS: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";

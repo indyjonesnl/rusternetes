@@ -29,7 +29,7 @@
 //! The CNI artifacts it writes are plain spec-compliant conflists, so any
 //! compliant plugin chain still applies.
 
-use rusternetes_common::resources::Node;
+use k3rs_common::resources::Node;
 
 /// A host-gw route to another node's pod CIDR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,7 +54,7 @@ pub fn cni_conflist(pod_cidr: &str) -> String {
     format!(
         r#"{{
   "cniVersion": "1.0.0",
-  "name": "rusternetes",
+  "name": "k3rs",
   "plugins": [
     {{
       "type": "bridge",
@@ -140,12 +140,12 @@ pub fn no_masq_rules(no_masq_cidrs: &[&str]) -> Vec<String> {
         .iter()
         .map(|cidr| {
             format!(
-                "-d {cidr} -j RETURN -m comment --comment \"rusternetes: cluster traffic is not masqueraded\""
+                "-d {cidr} -j RETURN -m comment --comment \"k3rs: cluster traffic is not masqueraded\""
             )
         })
         .collect();
     rules.push(
-        "-j MASQUERADE -m comment --comment \"rusternetes: outbound traffic is masqueraded (must be last)\""
+        "-j MASQUERADE -m comment --comment \"k3rs: outbound traffic is masqueraded (must be last)\""
             .to_string(),
     );
     rules
@@ -177,7 +177,7 @@ pub struct NodeNetConfig {
 }
 
 /// Chain holding the node's masquerade policy, hooked into POSTROUTING.
-pub const MASQ_CHAIN: &str = "RUSTERNETES-MASQ";
+pub const MASQ_CHAIN: &str = "K3RS-MASQ";
 
 /// Write `conflist` to `path` when it differs from what is already there.
 /// Returns whether a write happened.

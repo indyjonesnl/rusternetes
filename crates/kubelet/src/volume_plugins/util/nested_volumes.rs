@@ -1,7 +1,7 @@
 //! Port of `pkg/volume/util/nested_volumes.go`.
 
-use rusternetes_common::resources::pod::VolumeMount;
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::pod::VolumeMount;
+use k3rs_common::resources::Pod;
 
 /// Lexical `filepath.Clean` for slash-separated paths (Go `path/filepath`,
 /// Unix): collapses `//`, drops `.`, resolves `..` against earlier elements,

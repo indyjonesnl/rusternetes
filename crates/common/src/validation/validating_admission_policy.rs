@@ -786,7 +786,7 @@ fn validate_validating_admission_policy_status(
     }
 
     if let Some(conditions) = &status.conditions {
-        // `metav1validation.ValidateConditions` (`:1259`). Rusternetes models a
+        // `metav1validation.ValidateConditions` (`:1259`). k3rs models a
         // policy condition with its own struct rather than reusing
         // `metav1.Condition`, so map it across for the one shared predicate
         // instead of keeping a second copy of the condition rules.

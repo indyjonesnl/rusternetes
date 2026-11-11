@@ -11,16 +11,16 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::any;
 use axum::Router;
-use rusternetes_api_server::audit::{request_info, with_audit, AuditConfig, Policy};
-use rusternetes_api_server::authorization_filter::{
+use k3rs_api_server::audit::{request_info, with_audit, AuditConfig, Policy};
+use k3rs_api_server::authorization_filter::{
     forbidden_message, forbidden_negotiated, get_authorizer_attributes, with_authorization,
 };
-use rusternetes_api_server::request_scope::request_info_middleware;
-use rusternetes_common::audit::{AuditBackend, AuditEvent};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::Result;
-use rusternetes_middleware::AuthContext;
+use k3rs_api_server::request_scope::request_info_middleware;
+use k3rs_common::audit::{AuditBackend, AuditEvent};
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::Result;
+use k3rs_middleware::AuthContext;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -67,8 +67,8 @@ impl Authorizer for Fake {
     async fn authorize_outcome(
         &self,
         attrs: &RequestAttributes,
-    ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
-        Ok(rusternetes_common::authz::AuthorizationOutcome {
+    ) -> Result<k3rs_common::authz::AuthorizationOutcome> {
+        Ok(k3rs_common::authz::AuthorizationOutcome {
             opinion: self.authorize_opinion(attrs).await?,
             error: self.error.clone(),
         })
@@ -77,8 +77,8 @@ impl Authorizer for Fake {
         &self,
         _: &UserInfo,
         _: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
-        Ok(rusternetes_common::authz::UserRulesOutcome::default())
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
+        Ok(k3rs_common::authz::UserRulesOutcome::default())
     }
 }
 
@@ -596,7 +596,7 @@ async fn authorizes_once_per_request() {
 /// reached), not by the handler's own authorize.
 #[tokio::test]
 async fn router_authorizes_through_the_filter() {
-    use rusternetes_test_support::harness::TestApiServer;
+    use k3rs_test_support::harness::TestApiServer;
     let _g = LOCK.lock().await;
     let calls = Arc::new(AtomicUsize::new(0));
     let api = TestApiServer::builder()
@@ -623,7 +623,7 @@ async fn router_authorizes_through_the_filter() {
 /// handler check that remains behind it, without counting again.
 #[tokio::test]
 async fn router_counts_one_attempt_for_an_allowed_request() {
-    use rusternetes_test_support::harness::TestApiServer;
+    use k3rs_test_support::harness::TestApiServer;
     let _g = LOCK.lock().await;
     let api = TestApiServer::new();
     let before = attempts("allowed");

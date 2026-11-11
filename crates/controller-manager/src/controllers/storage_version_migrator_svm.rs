@@ -41,13 +41,13 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
-use rusternetes_common::resources::storageversionmigration::{
+use k3rs_common::resources::storageversionmigration::{
     StorageVersionMigration, MIGRATION_FAILED, MIGRATION_RUNNING, MIGRATION_SUCCEEDED,
 };
-use rusternetes_common::validation::storageversionmigration::compare_resource_version;
-use rusternetes_common::Error;
-use rusternetes_discovery::restmapper::{Gvk, Gvr};
-use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
+use k3rs_common::validation::storageversionmigration::compare_resource_version;
+use k3rs_common::Error;
+use k3rs_discovery::restmapper::{Gvk, Gvr};
+use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WatchEvent, WorkQueue};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;

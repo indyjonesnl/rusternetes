@@ -1,4 +1,4 @@
-# Rūsternetes Quick Start
+# k3rs Quick Start
 
 Get a Rust-based Kubernetes cluster running locally with a built-in web console.
 
@@ -47,9 +47,9 @@ sudo usermod -aG docker $USER
 
 ```bash
 git clone https://github.com/calfonso/rusternetes.git
-cd rusternetes
+cd k3rs
 
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
 
 # Podman
 podman compose build           # ~1 hour first build, faster with cache
@@ -76,7 +76,7 @@ See the [Console User Guide](CONSOLE_USER_GUIDE.md) for a full walkthrough of ev
 
 ## Use kubectl
 
-First generate a kubeconfig that embeds the rusternetes CA cert. This
+First generate a kubeconfig that embeds the k3rs CA cert. This
 makes the config work with any Kubernetes tool — `kubectl`, Lens, k9s,
 octant, kubeshark — not just kubectl.
 
@@ -84,11 +84,11 @@ octant, kubeshark — not just kubectl.
 bash scripts/generate-kubeconfig.sh
 ```
 
-The default output path is `~/.kube/rusternetes-config`; override with
+The default output path is `~/.kube/k3rs-config`; override with
 the first argument or `KUBECONFIG_OUT=`. Then:
 
 ```bash
-export KUBECONFIG=~/.kube/rusternetes-config
+export KUBECONFIG=~/.kube/k3rs-config
 
 kubectl get nodes
 kubectl get pods -A
@@ -96,7 +96,7 @@ kubectl create deployment nginx --image=nginx
 kubectl get pods -w    # watch pods start
 ```
 
-Standard `kubectl` works because rusternetes implements the same REST API as upstream Kubernetes.
+Standard `kubectl` works because k3rs implements the same REST API as upstream Kubernetes.
 
 ## What You Get
 
@@ -109,9 +109,9 @@ Standard `kubectl` works because rusternetes implements the same REST API as ups
 | Kube-Proxy | iptables ClusterIP/NodePort/LoadBalancer routing |
 | CoreDNS | Kubernetes service discovery |
 | Storage | etcd (default), SQLite, or Redis via [Rhino](https://github.com/calfonso/rhino) |
-| Default StorageClass | `standard` with `rusternetes.io/hostpath` provisioner |
+| Default StorageClass | `standard` with `k3rs.io/hostpath` provisioner |
 
-TLS certificates are auto-generated in `.rusternetes/certs/`.
+TLS certificates are auto-generated in `.k3rs/certs/`.
 
 ## Alternative: SQLite Instead of etcd
 
@@ -146,15 +146,15 @@ bash scripts/bootstrap-cluster.sh
 Full Kubernetes in a single process with embedded SQLite -- no Docker Compose, no etcd:
 
 ```bash
-cargo build -p rusternetes --release
-./target/release/rusternetes --data-dir ./cluster.db --console-dir ./console/dist
+cargo build -p k3rs --release
+./target/release/k3rs --data-dir ./cluster.db --console-dir ./console/dist
 ```
 
 Or with Redis instead of SQLite:
 
 ```bash
-cargo build -p rusternetes --features redis --release
-./target/release/rusternetes --storage-backend redis --redis-url redis://localhost:6379 --console-dir ./console/dist
+cargo build -p k3rs --features redis --release
+./target/release/k3rs --storage-backend redis --redis-url redis://localhost:6379 --console-dir ./console/dist
 ```
 
 Open `https://localhost:6443/console/` for the web console.
@@ -187,7 +187,7 @@ podman compose down                  # or: docker compose down
 
 ```bash
 cargo test                                    # all tests
-cargo test -p rusternetes-api-server          # single crate
+cargo test -p k3rs-api-server          # single crate
 make pre-commit                               # format + clippy + test
 ```
 
@@ -225,7 +225,7 @@ The console needs the cluster to be bootstrapped. Run `bash scripts/bootstrap-cl
 
 ## What's Different from Real Kubernetes
 
-Rusternetes is a ground-up reimplementation — not a fork. Every component is written from scratch in Rust.
+k3rs is a ground-up reimplementation — not a fork. Every component is written from scratch in Rust.
 
 - 216,000+ lines of Rust across 10 crates
 - 90% conformance pass rate (398/441 tests) across 149 rounds of testing

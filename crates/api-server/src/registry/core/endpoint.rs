@@ -4,13 +4,11 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::Endpoints;
-use rusternetes_common::validation::endpoints::{
-    validate_endpoints_create, validate_endpoints_update,
-};
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::metav1::get_warnings_for_ip;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::Endpoints;
+use k3rs_common::validation::endpoints::{validate_endpoints_create, validate_endpoints_update};
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::metav1::get_warnings_for_ip;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

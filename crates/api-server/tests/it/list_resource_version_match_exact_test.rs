@@ -7,7 +7,7 @@
 //! (`storage/testing/store_tests.go:1580`).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CMS: &str = "/api/v1/namespaces/default/configmaps";

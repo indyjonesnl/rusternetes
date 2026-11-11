@@ -292,7 +292,7 @@ cat >"$STUB_BIN/docker" <<'STUB'
 #!/bin/sh
 echo "STUB-docker $*"
 case "$1" in
-  ps) echo "vanilla-swap-vanilla-swap-kubelet-rusternetes-node" ;;
+  ps) echo "vanilla-swap-vanilla-swap-kubelet-k3rs-node" ;;
   logs) echo "STUB-kubelet-log-line" ;;
 esac
 exit 0
@@ -301,7 +301,7 @@ chmod +x "$STUB_BIN/kubectl" "$STUB_BIN/docker"
 
 diag="$(VS_READINESS=node-ready VS_MODULE=kubelet PATH="$STUB_BIN:$PATH" \
   vs_dump_readiness_diagnostics vanilla-swap-kubelet /dev/null 2>&1)"
-for want in "nodes" "describe node rusternetes-node" "harness containers" "swapped module logs" "STUB-docker ps -a --filter name=vanilla-swap-vanilla-swap-kubelet"; do
+for want in "nodes" "describe node k3rs-node" "harness containers" "swapped module logs" "STUB-docker ps -a --filter name=vanilla-swap-vanilla-swap-kubelet"; do
   case "$diag" in
     *"$want"*) ok "readiness diagnostics include: $want" ;;
     *) bad "readiness diagnostics missing '$want'" ;;
@@ -309,7 +309,7 @@ for want in "nodes" "describe node rusternetes-node" "harness containers" "swapp
 done
 
 case "$diag" in
-  *"[container vanilla-swap-vanilla-swap-kubelet-rusternetes-node]"*STUB-kubelet-log-line*)
+  *"[container vanilla-swap-vanilla-swap-kubelet-k3rs-node]"*STUB-kubelet-log-line*)
     ok "readiness diagnostics dump logs for each enumerated container" ;;
   *) bad "readiness diagnostics must dump logs for containers found via docker ps" ;;
 esac
@@ -441,7 +441,7 @@ case "$*" in
     # not scheduled on the first look, as in a real run
     if [ -f "$PIN_CALLS.seen" ]; then echo "vanilla-swap-kubelet-worker"; else : >"$PIN_CALLS.seen"; exit 1; fi ;;
   *"get nodes"*)
-    printf '%s\n' vanilla-swap-kubelet-control-plane vanilla-swap-kubelet-worker rusternetes-node ;;
+    printf '%s\n' vanilla-swap-kubelet-control-plane vanilla-swap-kubelet-worker k3rs-node ;;
 esac
 exit 0
 STUB
@@ -454,7 +454,7 @@ PIN_CALLS="$PIN_CALLS" PATH="$PIN_BIN:$PATH" VS_PIN_WAIT=5 bash -c "
   set -euo pipefail
   IFS=\$'\n\t'
   source '$SCRIPT_DIR/vanilla-swap-common.sh'
-  vs_pin_tests_to_swapped_node /dev/null rusternetes-node
+  vs_pin_tests_to_swapped_node /dev/null k3rs-node
 " >/dev/null 2>&1
 
 if grep -q "cordon vanilla-swap-kubelet-worker" "$PIN_CALLS"; then
@@ -462,7 +462,7 @@ if grep -q "cordon vanilla-swap-kubelet-worker" "$PIN_CALLS"; then
 else
   bad "must cordon the vanilla worker so test pods cannot land there"
 fi
-if grep -q "cordon rusternetes-node" "$PIN_CALLS"; then
+if grep -q "cordon k3rs-node" "$PIN_CALLS"; then
   bad "must NOT cordon the swapped node — it is where tests have to run"
 else
   ok "leaves the swapped node schedulable"
@@ -479,7 +479,7 @@ cat >"$PIN_BIN/kubectl" <<'STUB'
 #!/bin/sh
 echo "kubectl $*" >>"$PIN_CALLS"
 case "$*" in
-  *"get nodes"*) echo "a b rusternetes-node" ;;
+  *"get nodes"*) echo "a b k3rs-node" ;;
 esac
 exit 0
 STUB
@@ -489,7 +489,7 @@ PIN_CALLS="$PIN_CALLS" PATH="$PIN_BIN:$PATH" VS_PIN_WAIT=1 bash -c "
   set -euo pipefail
   IFS=\$'\n\t'
   source '$SCRIPT_DIR/vanilla-swap-common.sh'
-  vs_pin_tests_to_swapped_node /dev/null rusternetes-node
+  vs_pin_tests_to_swapped_node /dev/null k3rs-node
 " >/dev/null 2>&1
 if grep -q "cordon" "$PIN_CALLS"; then
   bad "must not cordon anything when the conformance pod never scheduled"
@@ -576,7 +576,7 @@ if grep -q "test-timeout" "$WF"; then ok "workflow marks a partial run on the ba
 
 # --- the conformance preflight must be told this is a kind cluster ----------
 # conformance-preflight.sh (#1777) asserts the COMPOSE stack's shape:
-# kube-scheduler-node-1 / kube-controller-manager-node-1 and the rusternetes-dns
+# kube-scheduler-node-1 / kube-controller-manager-node-1 and the k3rs-dns
 # Deployment. vanilla-swap drives the same runner against a kind cluster, whose
 # mirror pods are kube-<component>-<cluster>-control-plane and whose DNS is
 # CoreDNS — so from 2026-08-27 every leg died in preflight with three FAILs
@@ -593,13 +593,13 @@ case "$PF_ARGS" in
   *) bad "preflight args must point the DNS assertion at coredns, got: $PF_ARGS" ;;
 esac
 case "$PF_ARGS" in
-  *rusternetes-dns*|*node-1*) bad "preflight args must not carry compose-stack names: $PF_ARGS" ;;
+  *k3rs-dns*|*node-1*) bad "preflight args must not carry compose-stack names: $PF_ARGS" ;;
   *) ok "preflight args carry no compose-stack names" ;;
 esac
 
 # The container-scoped assertions address containers by NAME on the local
-# daemon. A vanilla-swap cluster is kind, so rusternetes-kubelet /
-# rusternetes-rhino / the kubelet2 peers either do not exist or — on a
+# daemon. A vanilla-swap cluster is kind, so k3rs-kubelet /
+# k3rs-rhino / the kubelet2 peers either do not exist or — on a
 # workstation running a compose stack next to this kind cluster — belong to a
 # DIFFERENT cluster, whose certs mount then refuses this run (observed
 # locally: "kubelet does not mount the certs dir ..." against a kind cluster).
@@ -617,7 +617,7 @@ case "$PF_ARGS" in
 esac
 
 # The api-server leg is the exception. Swapping the api-server swaps the OBJECT
-# STORE with it: the rusternetes api-server comes up on an empty database, so
+# STORE with it: the k3rs api-server comes up on an empty database, so
 # the kind control-plane mirror pods and the CoreDNS Deployment are not visible
 # through it — not because the module failed, but because that is what this
 # leg tests. Asserting them refuses the leg outright (run 33159492201:

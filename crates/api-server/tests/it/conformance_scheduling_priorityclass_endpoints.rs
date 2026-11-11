@@ -5,7 +5,7 @@
 //! methods". Pure API: the `BeforeEach` (`:896-908`) creates p1 and p2, then
 //! the body patches and updates immutable and mutable fields.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PCS: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";

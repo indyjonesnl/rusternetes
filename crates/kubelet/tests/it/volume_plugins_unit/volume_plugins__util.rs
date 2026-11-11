@@ -2,16 +2,16 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::volume::PersistentVolumeAccessMode;
-    pub use rusternetes_common::resources::{Pod, Volume};
-    pub use rusternetes_kubelet::volume_plugins::plugin::{Spec, VolumePlugin};
-    pub use rusternetes_kubelet::volume_plugins::registry::VolumePluginMgr;
-    pub use rusternetes_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
+    pub use k3rs_common::resources::volume::PersistentVolumeAccessMode;
+    pub use k3rs_common::resources::{Pod, Volume};
+    pub use k3rs_kubelet::volume_plugins::plugin::{Spec, VolumePlugin};
+    pub use k3rs_kubelet::volume_plugins::registry::VolumePluginMgr;
+    pub use k3rs_kubelet::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
 }
 
 mod fs_user_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::*;
+    use k3rs_kubelet::volume_plugins::util::*;
 
     fn pod(v: serde_json::Value) -> Pod {
         serde_json::from_value(serde_json::json!({
@@ -86,7 +86,7 @@ mod fs_user_tests {
 /// the volume path is gone) and of hostPath (`TearDown` is a no-op,
 /// `host_path.go:272-274`).
 mod unmounter_tests {
-    use rusternetes_kubelet::volume_plugins::{
+    use k3rs_kubelet::volume_plugins::{
         config_map::ConfigMapPlugin, downward_api::DownwardApiPlugin, host_path::HostPathPlugin,
         projected::ProjectedPlugin, secret::SecretPlugin, KubeletVolumeHost, VolumeHost,
         VolumePlugin,
@@ -97,7 +97,7 @@ mod unmounter_tests {
         Arc::new(KubeletVolumeHost::new_for_tests(
             root.to_string(),
             None,
-            rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+            k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
             std::collections::HashMap::new(),
         ))
     }
@@ -111,8 +111,7 @@ mod unmounter_tests {
 
     async fn tear_down_removes(plugin: &dyn VolumePlugin, root: &str) {
         // The atomic writer's layout: <vol>/..data -> ..ts/, <vol>/key -> ..data/key.
-        let dir =
-            rusternetes_kubelet::pod_dirs::get_pod_volume_dir(root, "uid-1", plugin.name(), "vol");
+        let dir = k3rs_kubelet::pod_dirs::get_pod_volume_dir(root, "uid-1", plugin.name(), "vol");
         std::fs::create_dir_all(dir.join("..ts")).unwrap();
         std::fs::write(dir.join("..ts/key"), "v").unwrap();
         std::os::unix::fs::symlink("..ts", dir.join("..data")).unwrap();
@@ -218,7 +217,7 @@ mod unmounter_tests {
 /// arm of the upstream disjunction.
 mod local_ephemeral_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::*;
+    use k3rs_kubelet::volume_plugins::util::*;
 
     fn vol(v: serde_json::Value) -> Volume {
         let mut m = serde_json::json!({"name": "v"});
@@ -263,7 +262,7 @@ mod local_ephemeral_tests {
 /// `GetDeviceMountRefs check failed` arms of `GenerateUnmountDeviceFunc`.
 mod mount_refs_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::*;
+    use k3rs_kubelet::volume_plugins::util::*;
 
     fn v(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -326,10 +325,10 @@ mod mount_refs_tests {
 
 mod wrapper_mounter_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::empty_dir::fake_mount_deps;
-    use rusternetes_kubelet::volume_plugins::util::*;
+    use k3rs_kubelet::volume_plugins::empty_dir::fake_mount_deps;
+    use k3rs_kubelet::volume_plugins::util::*;
 
-    fn pod() -> rusternetes_common::resources::Pod {
+    fn pod() -> k3rs_common::resources::Pod {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": "p", "namespace": "ns", "uid": "uid-1"},
@@ -347,13 +346,13 @@ mod wrapper_mounter_tests {
 
     fn host_with(
         root: &str,
-        deps: rusternetes_kubelet::volume_plugins::empty_dir::EmptyDirMountDeps,
-    ) -> std::sync::Arc<dyn rusternetes_kubelet::volume_plugins::VolumeHost> {
+        deps: k3rs_kubelet::volume_plugins::empty_dir::EmptyDirMountDeps,
+    ) -> std::sync::Arc<dyn k3rs_kubelet::volume_plugins::VolumeHost> {
         std::sync::Arc::new(
-            rusternetes_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
+            k3rs_kubelet::volume_plugins::KubeletVolumeHost::new_for_tests(
                 root.to_string(),
                 None,
-                rusternetes_common::auth::TokenManager::new_auto(b"test-secret"),
+                k3rs_common::auth::TokenManager::new_auto(b"test-secret"),
                 std::collections::HashMap::new(),
             )
             .with_empty_dir_mount_deps(deps),
@@ -406,9 +405,7 @@ mod wrapper_mounter_tests {
     /// is a memory mount point is not mounted again.
     #[tokio::test]
     async fn memory_wrapper_does_not_remount_an_existing_tmpfs() {
-        use rusternetes_kubelet::volume_plugins::empty_dir::{
-            EmptyDirMountDeps, Medium, MountDetector,
-        };
+        use k3rs_kubelet::volume_plugins::empty_dir::{EmptyDirMountDeps, Medium, MountDetector};
         struct AlreadyMounted;
         impl MountDetector for AlreadyMounted {
             fn get_mount_medium(
@@ -451,18 +448,18 @@ mod unmount_device_tests {
 
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
-    use rusternetes_common::resources::Pod;
-    use rusternetes_kubelet::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
-    use rusternetes_kubelet::volume_plugins::plugin::{
+    use k3rs_common::resources::Pod;
+    use k3rs_kubelet::volume_manager::cache::actual_state_of_world::ActualStateOfWorld;
+    use k3rs_kubelet::volume_plugins::plugin::{
         DeviceMountableVolumePlugin, DeviceMounter, DeviceMounterArgs, DeviceUnmounter, Mounter,
         OwnedSpec, ReconstructedVolume, Spec, Unmounter, VolumePlugin,
     };
-    use rusternetes_kubelet::volume_plugins::registry::VolumePluginMgr;
-    use rusternetes_kubelet::volume_plugins::util::hostutil::HostUtils;
-    use rusternetes_kubelet::volume_plugins::util::operation_executor::AttachedVolume;
-    use rusternetes_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
-    use rusternetes_kubelet::volume_plugins::util::operation_generator::generate_unmount_device_func;
-    use rusternetes_kubelet::volume_plugins::util::types::{OperationContext, UniqueVolumeName};
+    use k3rs_kubelet::volume_plugins::registry::VolumePluginMgr;
+    use k3rs_kubelet::volume_plugins::util::hostutil::HostUtils;
+    use k3rs_kubelet::volume_plugins::util::operation_executor::AttachedVolume;
+    use k3rs_kubelet::volume_plugins::util::operation_executor::DeviceMountState;
+    use k3rs_kubelet::volume_plugins::util::operation_generator::generate_unmount_device_func;
+    use k3rs_kubelet::volume_plugins::util::types::{OperationContext, UniqueVolumeName};
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -623,7 +620,7 @@ mod unmount_device_tests {
         fn get_file_type(
             &self,
             _pathname: &str,
-        ) -> io::Result<rusternetes_kubelet::volume_plugins::util::hostutil::FileType> {
+        ) -> io::Result<k3rs_kubelet::volume_plugins::util::hostutil::FileType> {
             Err(io::Error::other("FakeHostUtil: GetFileType is not faked"))
         }
         fn get_selinux_mount_context(&self, _pathname: &str) -> io::Result<String> {
@@ -1011,7 +1008,7 @@ mod unmount_device_tests {
 
 mod pod_volume_names_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::get_pod_volume_names;
+    use k3rs_kubelet::volume_plugins::util::get_pod_volume_names;
     use serde_json::json;
     use std::collections::HashSet;
 

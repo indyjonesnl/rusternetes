@@ -133,7 +133,7 @@ impl Event {
             reason,
             message,
             source: EventSource {
-                component: "rusternetes".to_string(),
+                component: "k3rs".to_string(),
                 host: None,
             },
             event_type,

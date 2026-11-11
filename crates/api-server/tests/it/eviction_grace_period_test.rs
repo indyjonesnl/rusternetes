@@ -8,7 +8,7 @@
 //! asserted a 422 the old hand-written handler made up (#2145).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

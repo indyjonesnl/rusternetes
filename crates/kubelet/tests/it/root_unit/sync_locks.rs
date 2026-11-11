@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::sync_locks::*;
+    use k3rs_kubelet::sync_locks::*;
 
     #[test]
     fn acquire_then_skip_then_reacquire_after_drop() {

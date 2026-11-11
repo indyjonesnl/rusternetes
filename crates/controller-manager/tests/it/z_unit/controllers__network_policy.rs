@@ -3,8 +3,8 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::resources::{NetworkPolicy, Pod};
-    pub use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+    pub use k3rs_common::resources::{NetworkPolicy, Pod};
+    pub use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
     pub use tracing::{debug, error, info, warn};
@@ -12,14 +12,12 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::{
         NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
     };
-    use rusternetes_common::types::{
-        LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta,
-    };
-    use rusternetes_controller_manager::controllers::network_policy::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+    use k3rs_controller_manager::controllers::network_policy::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_validate_policy_valid() {

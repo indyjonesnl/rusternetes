@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entrypoint for a rusternetes node: one container running containerd (CRI +
+# Entrypoint for a k3rs node: one container running containerd (CRI +
 # crun) AND the kubelet, kind-style. Bundling them in a single container means
 # the kubelet's hostPath validation and containerd's hostPath mounts share one
 # filesystem — required for Calico's CNI install (/opt/cni/bin, /etc/cni/net.d,

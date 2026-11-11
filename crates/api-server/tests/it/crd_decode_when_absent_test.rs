@@ -16,7 +16,7 @@
 //! rejects was accepted. Both halves land together: defaulting a field with no
 //! validator behind it turns a 400 into a silent accept.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const CRDS: &str = "/apis/apiextensions.k8s.io/v1/customresourcedefinitions";

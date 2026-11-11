@@ -18,13 +18,13 @@ use axum::{
     response::{IntoResponse, Response},
     Extension,
 };
-use rusternetes_common::{
+use k3rs_common::{
     admission::{GroupVersionKind, GroupVersionResource},
     authz::{Decision, RequestAttributes},
     resources::APIService,
     List, Result,
 };
-use rusternetes_storage::build_prefix;
+use k3rs_storage::build_prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -258,7 +258,7 @@ pub async fn list_apiservices(
         .with_api_group("apiregistration.k8s.io");
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}
-        Decision::Deny(reason) => return Err(rusternetes_common::Error::Forbidden(reason)),
+        Decision::Deny(reason) => return Err(k3rs_common::Error::Forbidden(reason)),
     }
 
     let prefix = build_prefix("apiservices", None);

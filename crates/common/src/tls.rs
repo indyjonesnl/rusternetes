@@ -40,7 +40,7 @@ impl TlsConfig {
         // Set distinguished name
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, common_name);
-        dn.push(DnType::OrganizationName, "Rusternetes");
+        dn.push(DnType::OrganizationName, "k3rs");
         dn.push(DnType::CountryName, "US");
         params.distinguished_name = dn;
 

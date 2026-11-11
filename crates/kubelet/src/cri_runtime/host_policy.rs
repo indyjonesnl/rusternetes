@@ -9,8 +9,8 @@
 //!   `runtimeClassSupportsRecursiveReadOnlyMounts`
 //!   (`pkg/kubelet/kubelet_pods.go:2800-2811`).
 
-use rusternetes_common::resources::RuntimeClass;
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::resources::RuntimeClass;
+use k3rs_storage::{build_key, Storage};
 use std::path::Path;
 use std::sync::OnceLock;
 

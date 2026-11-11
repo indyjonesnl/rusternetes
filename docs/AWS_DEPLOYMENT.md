@@ -1,6 +1,6 @@
-# Rusternetes on AWS - Production Deployment Guide
+# k3rs on AWS - Production Deployment Guide
 
-This guide provides comprehensive instructions for deploying Rusternetes on Amazon Web Services (AWS) for production use.
+This guide provides comprehensive instructions for deploying k3rs on Amazon Web Services (AWS) for production use.
 
 ## Table of Contents
 
@@ -116,12 +116,12 @@ aws sts get-caller-identity
 
 ```bash
 # Generate SSH key pair (if you don't have one)
-ssh-keygen -t rsa -b 4096 -f ~/.ssh/rusternetes-aws -C "rusternetes@aws"
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/k3rs-aws -C "k3rs@aws"
 
 # Import to AWS
 aws ec2 import-key-pair \
-  --key-name rusternetes-keypair \
-  --public-key-material fileb://~/.ssh/rusternetes-aws.pub \
+  --key-name k3rs-keypair \
+  --public-key-material fileb://~/.ssh/k3rs-aws.pub \
   --region us-east-1
 ```
 
@@ -133,7 +133,7 @@ aws ec2 import-key-pair \
 # Create VPC
 VPC_ID=$(aws ec2 create-vpc \
   --cidr-block 10.0.0.0/16 \
-  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=rusternetes-vpc}]' \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=k3rs-vpc}]' \
   --query 'Vpc.VpcId' \
   --output text)
 
@@ -155,7 +155,7 @@ aws ec2 modify-vpc-attribute \
 ```bash
 # Create Internet Gateway
 IGW_ID=$(aws ec2 create-internet-gateway \
-  --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=rusternetes-igw}]' \
+  --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=k3rs-igw}]' \
   --query 'InternetGateway.InternetGatewayId' \
   --output text)
 
@@ -175,7 +175,7 @@ SUBNET_ID=$(aws ec2 create-subnet \
   --vpc-id $VPC_ID \
   --cidr-block 10.0.1.0/24 \
   --availability-zone us-east-1a \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=rusternetes-public-1a}]' \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=k3rs-public-1a}]' \
   --query 'Subnet.SubnetId' \
   --output text)
 
@@ -186,7 +186,7 @@ SUBNET_ID_2=$(aws ec2 create-subnet \
   --vpc-id $VPC_ID \
   --cidr-block 10.0.2.0/24 \
   --availability-zone us-east-1b \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=rusternetes-public-1b}]' \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=k3rs-public-1b}]' \
   --query 'Subnet.SubnetId' \
   --output text)
 
@@ -194,7 +194,7 @@ SUBNET_ID_3=$(aws ec2 create-subnet \
   --vpc-id $VPC_ID \
   --cidr-block 10.0.3.0/24 \
   --availability-zone us-east-1c \
-  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=rusternetes-public-1c}]' \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=k3rs-public-1c}]' \
   --query 'Subnet.SubnetId' \
   --output text)
 
@@ -233,10 +233,10 @@ aws ec2 create-route \
 ```bash
 # Create security group
 SG_ID=$(aws ec2 create-security-group \
-  --group-name rusternetes-sg \
-  --description "Security group for Rusternetes cluster" \
+  --group-name k3rs-sg \
+  --description "Security group for k3rs cluster" \
   --vpc-id $VPC_ID \
-  --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=rusternetes-sg}]' \
+  --tag-specifications 'ResourceType=security-group,Tags=[{Key=Name,Value=k3rs-sg}]' \
   --query 'GroupId' \
   --output text)
 
@@ -315,29 +315,29 @@ ln -s /usr/local/bin/docker-compose /usr/bin/docker-compose
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source /root/.cargo/env
 
-# Create rusternetes user
-useradd -m -s /bin/bash rusternetes
-usermod -aG docker rusternetes
+# Create k3rs user
+useradd -m -s /bin/bash k3rs
+usermod -aG docker k3rs
 
 # Clone repository
-cd /home/rusternetes
-git clone https://github.com/yourusername/rusternetes.git
-chown -R rusternetes:rusternetes rusternetes
+cd /home/k3rs
+git clone https://github.com/yourusername/k3rs.git
+chown -R k3rs:k3rs k3rs
 
 # Mark initialization complete
-touch /var/log/rusternetes-init-complete
+touch /var/log/k3rs-init-complete
 EOF
 
 # Launch instance
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.xlarge \
-  --key-name rusternetes-keypair \
+  --key-name k3rs-keypair \
   --security-group-ids $SG_ID \
   --subnet-id $SUBNET_ID \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
   --user-data file://user-data.sh \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rusternetes-node}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k3rs-node}]' \
   --query 'Instances[0].InstanceId' \
   --output text)
 
@@ -361,7 +361,7 @@ echo "Instance is running at: $PUBLIC_IP"
 # Allocate Elastic IP
 EIP_ALLOC=$(aws ec2 allocate-address \
   --domain vpc \
-  --tag-specifications 'ResourceType=elastic-ip,Tags=[{Key=Name,Value=rusternetes-eip}]' \
+  --tag-specifications 'ResourceType=elastic-ip,Tags=[{Key=Name,Value=k3rs-eip}]' \
   --query 'AllocationId' \
   --output text)
 
@@ -386,23 +386,23 @@ echo "Elastic IP: $EIP"
 sleep 300
 
 # SSH into instance
-ssh -i ~/.ssh/rusternetes-aws ec2-user@$PUBLIC_IP
+ssh -i ~/.ssh/k3rs-aws ec2-user@$PUBLIC_IP
 
 # Check if initialization is complete
 tail -f /var/log/cloud-init-output.log
 # Wait for: "Cloud-init v. X.X.X finished"
 
-# Switch to rusternetes user
-sudo su - rusternetes
-cd ~/rusternetes
+# Switch to k3rs user
+sudo su - k3rs
+cd ~/k3rs
 
 # Build Rust binaries
 source $HOME/.cargo/env
 cargo build --release
 
 # Set volumes path
-export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes
-echo "export KUBELET_VOLUMES_PATH=$(pwd)/.rusternetes/volumes" >> ~/.bashrc
+export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes
+echo "export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes" >> ~/.bashrc
 
 # Build container images
 docker-compose build
@@ -423,7 +423,7 @@ KUBECONFIG=/dev/null ./target/release/kubectl --insecure-skip-tls-verify get pod
 ```bash
 # Create Route53 hosted zone (if you have a domain)
 ZONE_ID=$(aws route53 create-hosted-zone \
-  --name rusternetes.example.com \
+  --name k3rs.example.com \
   --caller-reference $(date +%s) \
   --query 'HostedZone.Id' \
   --output text)
@@ -435,7 +435,7 @@ aws route53 change-resource-record-sets \
     "Changes": [{
       "Action": "CREATE",
       "ResourceRecordSet": {
-        "Name": "api.rusternetes.example.com",
+        "Name": "api.k3rs.example.com",
         "Type": "A",
         "TTL": 300,
         "ResourceRecords": [{"Value": "'$PUBLIC_IP'"}]
@@ -455,11 +455,11 @@ For HA, launch 3 instances (one in each availability zone):
 INSTANCE_1=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.xlarge \
-  --key-name rusternetes-keypair \
+  --key-name k3rs-keypair \
   --security-group-ids $SG_ID \
   --subnet-id $SUBNET_ID \
   --user-data file://user-data.sh \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rusternetes-master-1}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k3rs-master-1}]' \
   --query 'Instances[0].InstanceId' \
   --output text)
 
@@ -467,11 +467,11 @@ INSTANCE_1=$(aws ec2 run-instances \
 INSTANCE_2=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.xlarge \
-  --key-name rusternetes-keypair \
+  --key-name k3rs-keypair \
   --security-group-ids $SG_ID \
   --subnet-id $SUBNET_ID_2 \
   --user-data file://user-data.sh \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rusternetes-master-2}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k3rs-master-2}]' \
   --query 'Instances[0].InstanceId' \
   --output text)
 
@@ -479,11 +479,11 @@ INSTANCE_2=$(aws ec2 run-instances \
 INSTANCE_3=$(aws ec2 run-instances \
   --image-id $AMI_ID \
   --instance-type t3.xlarge \
-  --key-name rusternetes-keypair \
+  --key-name k3rs-keypair \
   --security-group-ids $SG_ID \
   --subnet-id $SUBNET_ID_3 \
   --user-data file://user-data.sh \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rusternetes-master-3}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=k3rs-master-3}]' \
   --query 'Instances[0].InstanceId' \
   --output text)
 
@@ -495,7 +495,7 @@ echo "Instances: $INSTANCE_1, $INSTANCE_2, $INSTANCE_3"
 ```bash
 # Create load balancer
 LB_ARN=$(aws elbv2 create-load-balancer \
-  --name rusternetes-lb \
+  --name k3rs-lb \
   --subnets $SUBNET_ID $SUBNET_ID_2 $SUBNET_ID_3 \
   --security-groups $SG_ID \
   --scheme internet-facing \
@@ -506,7 +506,7 @@ LB_ARN=$(aws elbv2 create-load-balancer \
 
 # Create target group for API server
 TG_ARN=$(aws elbv2 create-target-group \
-  --name rusternetes-api-tg \
+  --name k3rs-api-tg \
   --protocol HTTPS \
   --port 6443 \
   --vpc-id $VPC_ID \
@@ -542,7 +542,7 @@ On each instance, use the HA compose file:
 
 ```bash
 # SSH to each instance and run:
-cd ~/rusternetes
+cd ~/k3rs
 
 # Use HA compose file
 docker-compose -f docker-compose.ha.yml up -d
@@ -563,7 +563,7 @@ VOLUME_ID=$(aws ec2 create-volume \
   --volume-type gp3 \
   --iops 3000 \
   --throughput 125 \
-  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=rusternetes-etcd-data}]' \
+  --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=k3rs-etcd-data}]' \
   --query 'VolumeId' \
   --output text)
 
@@ -586,15 +586,15 @@ echo '/dev/nvme1n1 /mnt/etcd-data ext4 defaults,nofail 0 2' | sudo tee -a /etc/f
 # Create snapshot
 SNAPSHOT_ID=$(aws ec2 create-snapshot \
   --volume-id $VOLUME_ID \
-  --description "Rusternetes etcd backup $(date +%Y-%m-%d)" \
-  --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Name,Value=rusternetes-backup}]' \
+  --description "k3rs etcd backup $(date +%Y-%m-%d)" \
+  --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Name,Value=k3rs-backup}]' \
   --query 'SnapshotId' \
   --output text)
 
 # List snapshots
 aws ec2 describe-snapshots \
   --owner-ids self \
-  --filters "Name=tag:Name,Values=rusternetes-backup"
+  --filters "Name=tag:Name,Values=k3rs-backup"
 ```
 
 ## Networking Configuration
@@ -614,7 +614,7 @@ aws ec2 create-vpc-peering-connection \
 ```bash
 # Create NLB for NodePort services
 NLB_ARN=$(aws elbv2 create-load-balancer \
-  --name rusternetes-nodeport-lb \
+  --name k3rs-nodeport-lb \
   --type network \
   --subnets $SUBNET_ID $SUBNET_ID_2 $SUBNET_ID_3 \
   --query 'LoadBalancers[0].LoadBalancerArn' \
@@ -639,30 +639,30 @@ cat > trust-policy.json <<'EOF'
 EOF
 
 aws iam create-role \
-  --role-name RusternetesEC2Role \
+  --role-name K3rsEC2Role \
   --assume-role-policy-document file://trust-policy.json
 
 # Attach policies
 aws iam attach-role-policy \
-  --role-name RusternetesEC2Role \
+  --role-name K3rsEC2Role \
   --policy-arn arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
 
 aws iam attach-role-policy \
-  --role-name RusternetesEC2Role \
+  --role-name K3rsEC2Role \
   --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
 
 # Create instance profile
 aws iam create-instance-profile \
-  --instance-profile-name RusternetesInstanceProfile
+  --instance-profile-name K3rsInstanceProfile
 
 aws iam add-role-to-instance-profile \
-  --instance-profile-name RusternetesInstanceProfile \
-  --role-name RusternetesEC2Role
+  --instance-profile-name K3rsInstanceProfile \
+  --role-name K3rsEC2Role
 
 # Associate with instance
 aws ec2 associate-iam-instance-profile \
   --instance-id $INSTANCE_ID \
-  --iam-instance-profile Name=RusternetesInstanceProfile
+  --iam-instance-profile Name=K3rsInstanceProfile
 ```
 
 ### TLS Certificates with ACM
@@ -670,7 +670,7 @@ aws ec2 associate-iam-instance-profile \
 ```bash
 # Request certificate from ACM
 CERT_ARN=$(aws acm request-certificate \
-  --domain-name api.rusternetes.example.com \
+  --domain-name api.k3rs.example.com \
   --validation-method DNS \
   --query 'CertificateArn' \
   --output text)
@@ -697,8 +697,8 @@ sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json > /dev/null <<'EOF'
       "files": {
         "collect_list": [
           {
-            "file_path": "/var/log/rusternetes/*.log",
-            "log_group_name": "/rusternetes/cluster",
+            "file_path": "/var/log/k3rs/*.log",
+            "log_group_name": "/k3rs/cluster",
             "log_stream_name": "{instance_id}"
           }
         ]
@@ -706,7 +706,7 @@ sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json > /dev/null <<'EOF'
     }
   },
   "metrics": {
-    "namespace": "Rusternetes",
+    "namespace": "k3rs",
     "metrics_collected": {
       "cpu": {"measurement": [{"name": "cpu_usage_idle"}]},
       "disk": {"measurement": [{"name": "used_percent"}]},
@@ -730,7 +730,7 @@ sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
 
 ```bash
 # Create backup script
-sudo tee /usr/local/bin/backup-rusternetes.sh > /dev/null <<'EOF'
+sudo tee /usr/local/bin/backup-k3rs.sh > /dev/null <<'EOF'
 #!/bin/bash
 INSTANCE_ID=$(ec2-metadata --instance-id | cut -d " " -f 2)
 VOLUME_ID=$(aws ec2 describe-volumes \
@@ -755,10 +755,10 @@ aws ec2 describe-snapshots \
   --output text | xargs -r -n 1 aws ec2 delete-snapshot --snapshot-id
 EOF
 
-sudo chmod +x /usr/local/bin/backup-rusternetes.sh
+sudo chmod +x /usr/local/bin/backup-k3rs.sh
 
 # Add to cron (daily at 2 AM)
-(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/backup-rusternetes.sh >> /var/log/rusternetes-backup.log 2>&1") | crontab -
+(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/backup-k3rs.sh >> /var/log/k3rs-backup.log 2>&1") | crontab -
 ```
 
 ## Scaling
@@ -768,12 +768,12 @@ sudo chmod +x /usr/local/bin/backup-rusternetes.sh
 ```bash
 # Create launch template
 TEMPLATE_ID=$(aws ec2 create-launch-template \
-  --launch-template-name rusternetes-worker \
-  --version-description "Rusternetes worker node" \
+  --launch-template-name k3rs-worker \
+  --version-description "k3rs worker node" \
   --launch-template-data '{
     "ImageId": "'$AMI_ID'",
     "InstanceType": "t3.large",
-    "KeyName": "rusternetes-keypair",
+    "KeyName": "k3rs-keypair",
     "SecurityGroupIds": ["'$SG_ID'"],
     "UserData": "'$(base64 -w 0 worker-user-data.sh)'"
   }' \
@@ -782,13 +782,13 @@ TEMPLATE_ID=$(aws ec2 create-launch-template \
 
 # Create auto scaling group
 aws autoscaling create-auto-scaling-group \
-  --auto-scaling-group-name rusternetes-workers \
+  --auto-scaling-group-name k3rs-workers \
   --launch-template LaunchTemplateId=$TEMPLATE_ID \
   --min-size 1 \
   --max-size 10 \
   --desired-capacity 3 \
   --vpc-zone-identifier "$SUBNET_ID,$SUBNET_ID_2,$SUBNET_ID_3" \
-  --tags Key=Name,Value=rusternetes-worker,PropagateAtLaunch=true
+  --tags Key=Name,Value=k3rs-worker,PropagateAtLaunch=true
 ```
 
 ## Cost Optimization
@@ -819,7 +819,7 @@ aws ec2 request-spot-instances \
   --launch-specification '{
     "ImageId": "'$AMI_ID'",
     "InstanceType": "t3.large",
-    "KeyName": "rusternetes-keypair",
+    "KeyName": "k3rs-keypair",
     "SecurityGroupIds": ["'$SG_ID'"],
     "SubnetId": "'$SUBNET_ID'"
   }'
@@ -851,7 +851,7 @@ aws ce get-cost-and-usage \
 
 # Enable cost anomaly detection
 aws ce create-anomaly-monitor \
-  --anomaly-monitor Name=rusternetes-monitor,MonitorType=DIMENSIONAL
+  --anomaly-monitor Name=k3rs-monitor,MonitorType=DIMENSIONAL
 ```
 
 ## Cleanup
@@ -900,7 +900,7 @@ aws ec2 delete-vpc --vpc-id $VPC_ID
 ✅ Security groups configured
 ✅ EC2 instances launched
 ✅ Storage configured
-✅ Rusternetes deployed
+✅ k3rs deployed
 ✅ HA setup (if applicable)
 ✅ Monitoring enabled
 ✅ Backups configured
@@ -925,7 +925,7 @@ aws ec2 delete-vpc --vpc-id $VPC_ID
 ## Support
 
 - **AWS Documentation**: https://docs.aws.amazon.com/
-- **Rusternetes Docs**: See `docs/` directory
+- **k3rs Docs**: See `docs/` directory
 - **Issues**: Report on GitHub
 - **HA Setup**: See [HIGH_AVAILABILITY.md](HIGH_AVAILABILITY.md)
 

@@ -3,14 +3,14 @@
 
 mod __parent {
     pub use chrono::{DateTime, Utc};
-    pub use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
+    pub use k3rs_common::types::{LabelSelector, ObjectMeta, TypeMeta};
     pub use serde::{Deserialize, Serialize};
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::policy::*;
+    use k3rs_common::resources::policy::*;
 
     #[test]
     fn test_resource_quota_creation() {

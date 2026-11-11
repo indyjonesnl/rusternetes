@@ -4,13 +4,13 @@
 //! ReplicationController is a legacy resource superseded by ReplicaSet and Deployment,
 //! but still supported for backwards compatibility.
 
-use rusternetes_api_server::handlers::filtering;
-use rusternetes_common::resources::{
+use k3rs_api_server::handlers::filtering;
+use k3rs_common::resources::{
     Container, PodSpec, PodTemplateSpec, ReplicationController, ReplicationControllerSpec,
     ReplicationControllerStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -406,7 +406,7 @@ async fn test_rc_with_owner_reference() {
     let storage = Arc::new(MemoryStorage::new());
 
     let mut rc = create_test_rc("test-owner", "default", 3);
-    rc.metadata.owner_references = Some(vec![rusternetes_common::types::OwnerReference {
+    rc.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference {
         api_version: "v1".to_string(),
         kind: "Service".to_string(),
         name: "parent-service".to_string(),

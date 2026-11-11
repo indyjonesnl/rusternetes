@@ -4,7 +4,7 @@
 //! `Convert*` functions' behaviour, and the one expected document upstream's
 //! `TestV2APIService` (kube-aggregator openapiv3) carries.
 
-use rusternetes_api_server::openapiconv::{convert_schema, convert_v2_to_v3};
+use k3rs_api_server::openapiconv::{convert_schema, convert_v2_to_v3};
 use serde_json::json;
 
 #[test]

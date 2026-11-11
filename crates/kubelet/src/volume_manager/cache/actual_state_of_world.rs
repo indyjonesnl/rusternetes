@@ -7,8 +7,8 @@ use crate::volume_plugins::util::operation_executor::{
     self, DeviceMountState, MarkVolumeOpts, VolumeMountState,
 };
 use crate::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::quantity::Quantity;
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::quantity::Quantity;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};

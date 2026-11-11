@@ -21,21 +21,21 @@ sonobuoy delete --wait 2>/dev/null || echo "No sonobuoy resources to delete"
 # Step 3: Delete test-job resources from default namespace (sonobuoy delete only handles sonobuoy namespace)
 echo "[3/4] Deleting test-job resources from default namespace..."
 # Delete test-job Jobs first (they create the pods)
-TEST_JOB_JOBS=$(docker exec rusternetes-etcd etcdctl get /registry/jobs/default/ --prefix --keys-only 2>/dev/null | grep -i test-job || true)
+TEST_JOB_JOBS=$(docker exec k3rs-etcd etcdctl get /registry/jobs/default/ --prefix --keys-only 2>/dev/null | grep -i test-job || true)
 if [ -n "$TEST_JOB_JOBS" ]; then
     while IFS= read -r key; do
         [ -z "$key" ] && continue
-        docker exec rusternetes-etcd etcdctl del "$key" >/dev/null 2>&1
+        docker exec k3rs-etcd etcdctl del "$key" >/dev/null 2>&1
         echo "  Deleted Job: $key"
     done <<< "$TEST_JOB_JOBS"
 fi
 
 # Delete test-job pods
-TEST_JOB_PODS=$(docker exec rusternetes-etcd etcdctl get /registry/pods/default/ --prefix --keys-only 2>/dev/null | grep -i test-job || true)
+TEST_JOB_PODS=$(docker exec k3rs-etcd etcdctl get /registry/pods/default/ --prefix --keys-only 2>/dev/null | grep -i test-job || true)
 if [ -n "$TEST_JOB_PODS" ]; then
     while IFS= read -r key; do
         [ -z "$key" ] && continue
-        docker exec rusternetes-etcd etcdctl del "$key" >/dev/null 2>&1
+        docker exec k3rs-etcd etcdctl del "$key" >/dev/null 2>&1
         echo "  Deleted pod: $key"
     done <<< "$TEST_JOB_PODS"
 fi

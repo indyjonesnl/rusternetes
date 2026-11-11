@@ -11,15 +11,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rusternetes_api_server::admission::plugins::{install, AdmissionOptions};
-use rusternetes_api_server::endpoints::handlers::admission::Admission;
-use rusternetes_api_server::state::ApiServerState;
-use rusternetes_common::admission::{GroupVersionKind, GroupVersionResource};
-use rusternetes_common::auth::{TokenManager, UserInfo};
-use rusternetes_common::authz::AlwaysAllowAuthorizer;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_common::resources::Pod;
-use rusternetes_storage::{MemoryStorage, StorageBackend};
+use k3rs_api_server::admission::plugins::{install, AdmissionOptions};
+use k3rs_api_server::endpoints::handlers::admission::Admission;
+use k3rs_api_server::state::ApiServerState;
+use k3rs_common::admission::{GroupVersionKind, GroupVersionResource};
+use k3rs_common::auth::{TokenManager, UserInfo};
+use k3rs_common::authz::AlwaysAllowAuthorizer;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_common::resources::Pod;
+use k3rs_storage::{MemoryStorage, StorageBackend};
 use serde_json::json;
 
 fn node_restriction_delete_admit() -> u64 {

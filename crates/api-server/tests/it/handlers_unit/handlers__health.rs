@@ -5,7 +5,7 @@
 use axum::body::to_bytes;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
-use rusternetes_api_server::handlers::health::*;
+use k3rs_api_server::handlers::health::*;
 
 fn checks(add_bad: bool) -> Vec<HealthChecker> {
     let mut c = vec![HealthChecker::ready("ping", Ok(()))];
@@ -91,7 +91,7 @@ async fn unknown_check_is_404() {
 /// `not finished` until the hook is done.
 #[tokio::test]
 async fn poststarthook_check_fails_until_finished() {
-    use rusternetes_api_server::post_start_hooks::PostStartHooks;
+    use k3rs_api_server::post_start_hooks::PostStartHooks;
     use std::sync::atomic::Ordering;
     let reg = PostStartHooks::new();
     let n = "scheduling/bootstrap-system-priority-classes";

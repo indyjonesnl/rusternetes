@@ -1,4 +1,4 @@
-//! Rusternetes port of upstream `k8s.io/apimachinery/pkg/util/validation/field`.
+//! k3rs port of upstream `k8s.io/apimachinery/pkg/util/validation/field`.
 //!
 //! Provides [`Path`] (a typed breadcrumb like `metadata.labels[foo]`) and
 //! [`Error`] (a structured validation error carrying type, field path, bad

@@ -34,7 +34,7 @@ use super::events::*;
 use super::scheduling_queue::{QueueingHintFunction, QueueingHintMap, QueueingHintMapPerProfile};
 use crate::framework_runtime::names;
 use crate::profile::Profile;
-use rusternetes_common::resources::{Node, NodeSelector, Pod};
+use k3rs_common::resources::{Node, NodeSelector, Pod};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -355,7 +355,7 @@ pub fn events_to_register(
 pub mod node_resources_fit {
     use super::*;
     use crate::advanced::pod_request_amounts;
-    use rusternetes_common::quantity::parse_resource_value;
+    use k3rs_common::quantity::parse_resource_value;
 
     /// `isSchedulableAfterPodEvent` (`fit.go:373-408`): a Pod delete of a
     /// scheduled (or nominated) pod, or a scale-down that frees a resource
@@ -528,7 +528,7 @@ pub mod node_resources_fit {
 /// `nodeaffinity/node_affinity.go` queueing hints.
 pub mod node_affinity {
     use super::*;
-    use rusternetes_common::affinity::{check_node_affinity, matches_node_selector};
+    use k3rs_common::affinity::{check_node_affinity, matches_node_selector};
 
     /// `isSchedulableAfterNodeChange` (`node_affinity.go:119-174`): a node
     /// add that matches the Pod's required affinity (incl. the profile's
@@ -582,7 +582,7 @@ pub mod node_affinity {
 pub mod node_ports {
     use super::*;
     use crate::advanced::host_ips_overlap;
-    use rusternetes_common::resources::ContainerPort;
+    use k3rs_common::resources::ContainerPort;
 
     /// `isSchedulableAfterPodDeleted` (`node_ports.go:126-158`): deleting a
     /// scheduled pod only helps when it held a host port the target wants.
@@ -674,7 +674,7 @@ pub mod node_ports {
 /// Taint helpers shared by NodeUnschedulable and TaintToleration.
 pub(crate) mod taints {
     use crate::advanced::toleration_matches_taint;
-    use rusternetes_common::resources::{Taint, Toleration};
+    use k3rs_common::resources::{Taint, Toleration};
 
     /// `TolerationsTolerateTaint` (`component-helpers/scheduling/corev1/helpers.go`).
     pub fn tolerations_tolerate_taint(tolerations: &[Toleration], taint: &Taint) -> bool {
@@ -697,14 +697,14 @@ pub(crate) mod taints {
     }
 }
 
-fn pod_tolerations(pod: &Pod) -> &[rusternetes_common::resources::Toleration] {
+fn pod_tolerations(pod: &Pod) -> &[k3rs_common::resources::Toleration] {
     pod.spec
         .as_ref()
         .and_then(|s| s.tolerations.as_deref())
         .unwrap_or(&[])
 }
 
-fn node_taints(node: &Node) -> &[rusternetes_common::resources::Taint] {
+fn node_taints(node: &Node) -> &[k3rs_common::resources::Taint] {
     node.spec
         .as_ref()
         .and_then(|s| s.taints.as_deref())
@@ -721,7 +721,7 @@ fn node_unschedulable_flag(node: &Node) -> bool {
 /// `nodeunschedulable/node_unschedulable.go` queueing hints.
 pub mod node_unschedulable {
     use super::*;
-    use rusternetes_common::resources::Taint;
+    use k3rs_common::resources::Taint;
 
     /// `isSchedulableAfterPodTolerationChange` (`node_unschedulable.go:78-105`).
     pub fn is_schedulable_after_pod_toleration_change(
@@ -863,8 +863,8 @@ pub mod scheduling_gates {
 /// `interpodaffinity/plugin.go` queueing hints.
 pub mod inter_pod_affinity {
     use super::*;
-    use rusternetes_common::resources::PodAffinityTerm;
-    use rusternetes_common::types::{label_selector_as_selector, Selector};
+    use k3rs_common::resources::PodAffinityTerm;
+    use k3rs_common::types::{label_selector_as_selector, Selector};
     use std::collections::HashSet;
 
     /// `fwk.AffinityTerm` (`kube-scheduler/framework/types.go:380-385`).

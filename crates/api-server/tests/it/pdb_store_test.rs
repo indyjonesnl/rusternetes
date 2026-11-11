@@ -3,7 +3,7 @@
 //! `Store.Create` / `Store.Update`, for PUT, PATCH and `/status` alike.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PDBS: &str = "/apis/policy/v1/namespaces/default/poddisruptionbudgets";

@@ -2,24 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::authorization::{
+    pub use k3rs_common::resources::authorization::{
         FieldSelectorAttributes, FieldSelectorRequirement, LabelSelectorAttributes,
         LabelSelectorRequirement, ResourceAttributes,
     };
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         LocalSubjectAccessReview, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
         SubjectAccessReview, SubjectAccessReviewSpec,
     };
-    pub use rusternetes_common::types::ObjectMeta;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::types::ObjectMeta;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         validate_label_selector_requirement, LabelSelectorValidationOptions,
     };
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::authorization::*;
+    use k3rs_common::validation::authorization::*;
 
     /// #2190: `metadata` renders in Go struct-field order
     /// (`ObjectMeta`: name, resourceVersion, generation, ..., labels), with

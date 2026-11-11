@@ -2,20 +2,20 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::workloads::{
+    pub use k3rs_common::resources::workloads::{
         ReplicationController, ReplicationControllerSpec, ReplicationControllerStatus,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_nonnegative_field, validate_object_meta,
         validate_object_meta_update,
     };
-    pub use rusternetes_common::validation::podtemplate::validate_pod_template_spec_with_old;
+    pub use k3rs_common::validation::podtemplate::validate_pod_template_spec_with_old;
 }
 
 mod old_template_options_tests {
     use super::__parent::*;
-    use rusternetes_common::validation::replicationcontroller::*;
+    use k3rs_common::validation::replicationcontroller::*;
 
     fn rc(search: &str) -> ReplicationController {
         serde_json::from_value(serde_json::json!({
@@ -32,8 +32,8 @@ mod old_template_options_tests {
     #[test]
     #[serial_test::serial]
     fn update_derives_pod_options_from_the_old_template() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::RelaxedDNSSearchValidation,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::RelaxedDNSSearchValidation,
             false,
         );
         let relaxed = "my_search.example.com";

@@ -10,7 +10,7 @@
 //! plugins.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PVCS: &str = "/api/v1/namespaces/default/persistentvolumeclaims";
@@ -107,7 +107,7 @@ async fn a_data_source_is_mirrored_into_data_source_ref() {
 /// with it on (#3149) it is kept.
 #[tokio::test]
 async fn cross_namespace_data_source_ref_follows_the_gate() {
-    use rusternetes_common::feature_gates::{with_feature, Feature};
+    use k3rs_common::feature_gates::{with_feature, Feature};
     let mut body = pvc("c-xns", "1Gi");
     body["spec"]["dataSourceRef"] = json!({
         "apiGroup": "snapshot.storage.k8s.io", "kind": "VolumeSnapshot",

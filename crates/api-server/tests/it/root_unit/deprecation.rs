@@ -9,7 +9,7 @@ mod tests {
     //! lookups against the generated release-1.35 data.
 
     use super::__parent::*;
-    use rusternetes_api_server::deprecation::*;
+    use k3rs_api_server::deprecation::*;
 
     fn fake(
         deprecated: (u32, u32),

@@ -1,5 +1,5 @@
-use rusternetes_common::resources::ResourceQuota;
-use rusternetes_common::validation::resourcequota::validate_resource_quota_update;
+use k3rs_common::resources::ResourceQuota;
+use k3rs_common::validation::resourcequota::validate_resource_quota_update;
 use serde_json::json;
 
 fn rq(scopes: serde_json::Value) -> ResourceQuota {

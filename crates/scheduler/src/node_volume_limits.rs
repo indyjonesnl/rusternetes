@@ -7,8 +7,8 @@
 use crate::volume_binding::{
     claim_class, ephemeral_volume_is_for_pod, pod_volumes, volume_pvc_name,
 };
-use rusternetes_common::csi_translation::CsiTranslator;
-use rusternetes_common::resources::{
+use k3rs_common::csi_translation::CsiTranslator;
+use k3rs_common::resources::{
     CSIDriver, CSINode, Node, PersistentVolume, PersistentVolumeClaim, Pod, StorageClass, Volume,
     VolumeAttachment,
 };
@@ -75,7 +75,7 @@ impl<'a> CsiLimits<'a> {
             snap,
             enable_csi_migration_portworx: false,
             // `fts.EnableVolumeLimitScaling` (plugins/feature/feature.go).
-            enable_volume_limit_scaling: rusternetes_common::feature_gates::gate_enabled(
+            enable_volume_limit_scaling: k3rs_common::feature_gates::gate_enabled(
                 "VolumeLimitScaling",
             )
             .unwrap_or(false),

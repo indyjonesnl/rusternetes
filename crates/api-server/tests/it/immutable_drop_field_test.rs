@@ -1,12 +1,12 @@
 //! Upstream `ValidateConfigMapUpdate` / `ValidateSecretUpdate` parity: once an
 //! object is created with `immutable: true`, a PUT may not flip it to `false`
 //! NOR drop the field entirely. Upstream guards both via
-//! `newObj.Immutable == nil || !*newObj.Immutable`. rusternetes previously
+//! `newObj.Immutable == nil || !*newObj.Immutable`. k3rs previously
 //! accepted the omitted (`nil`) case for Secrets — this regression test pins
 //! the corrected behaviour for both ConfigMap and Secret.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

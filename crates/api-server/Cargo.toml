@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-api-server"
+name = "k3rs-api-server"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_api_server"
+name = "k3rs_api_server"
 path = "src/lib.rs"
 # Unit tests live in tests/it: a second compilation of the lib as a test
 # target costs as much as the lib itself.
@@ -19,8 +19,8 @@ path = "src/main.rs"
 [features]
 mimalloc = ["dep:mimalloc"]
 default = []
-sqlite = ["rusternetes-storage/sqlite"]
-redis = ["rusternetes-storage/redis"]
+sqlite = ["k3rs-storage/sqlite"]
+redis = ["k3rs-storage/redis"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "integration-tests"))'] }
@@ -33,14 +33,14 @@ rand = "0.9"
 ipnet = "2"
 mimalloc = { version = "0.1", optional = true }
 async-trait.workspace = true
-rusternetes-common = { path = "../common", features = ["axum-support", "clap-support"] }
-rusternetes-middleware = { path = "../middleware" }
-rusternetes-discovery = { path = "../discovery" }
-rusternetes-protobuf = { path = "../protobuf" }
-rusternetes-admission-webhook = { path = "../admission-webhook" }
-rusternetes-storage = { path = "../storage" }
-rusternetes-cri = { path = "../cri" }
-rusternetes-streamproxy = { path = "../streamproxy" }
+k3rs-common = { path = "../common", features = ["axum-support", "clap-support"] }
+k3rs-middleware = { path = "../middleware" }
+k3rs-discovery = { path = "../discovery" }
+k3rs-protobuf = { path = "../protobuf" }
+k3rs-admission-webhook = { path = "../admission-webhook" }
+k3rs-storage = { path = "../storage" }
+k3rs-cri = { path = "../cri" }
+k3rs-streamproxy = { path = "../streamproxy" }
 tokio.workspace = true
 prometheus.workspace = true
 inotify = "0.11"
@@ -65,7 +65,7 @@ http-body = "1"
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
-rusternetes-client = { path = "../client" }
+k3rs-client = { path = "../client" }
 async-stream = "0.3"
 tokio-stream = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -94,17 +94,17 @@ prost-types = "0.13"
 # kube-aggregator placement), so this is a runtime dependency, not just dev.
 # Only the in-process controllers come from the small controller-core crate, so
 # editing an unrelated controller does not rebuild the api-server.
-rusternetes-controller-core = { path = "../controller-core" }
+k3rs-controller-core = { path = "../controller-core" }
 
 [build-dependencies]
 prost-build = "0.13"
 
 [dev-dependencies]
-rusternetes-controller-manager = { path = "../controller-manager" }
+k3rs-controller-manager = { path = "../controller-manager" }
 tokio-rustls = { workspace = true }
 tokio-test = "0.4"
 jsonwebtoken.workspace = true
-rusternetes-test-support = { path = "../test_support", features = ["apiserver-harness"] }
+k3rs-test-support = { path = "../test_support", features = ["apiserver-harness"] }
 async-trait.workspace = true
 protox-parse = "0.7"
 prost-types = "0.13"

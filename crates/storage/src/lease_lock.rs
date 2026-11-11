@@ -5,10 +5,10 @@
 
 use crate::{EventRecorder, Storage};
 use async_trait::async_trait;
-use rusternetes_common::leaderelection::{LeaderElectionRecord, ResourceLock};
-use rusternetes_common::resources::coordination::{Lease, LeaseSpec};
-use rusternetes_common::resources::{EventSource, EventType, ObjectReference};
-use rusternetes_common::{Error, Result};
+use k3rs_common::leaderelection::{LeaderElectionRecord, ResourceLock};
+use k3rs_common::resources::coordination::{Lease, LeaseSpec};
+use k3rs_common::resources::{EventSource, EventType, ObjectReference};
+use k3rs_common::{Error, Result};
 use std::sync::{Arc, Mutex};
 
 pub struct LeaseLock<S: Storage> {

@@ -7,13 +7,13 @@
 //! Reference: pkg/kubelet/pod_workers.go, pkg/kubelet/kuberuntime/kuberuntime_container.go,
 //! pkg/kubelet/kubelet_pods.go, pkg/kubelet/prober/prober_manager.go
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
     HTTPGetAction, Lifecycle, LifecycleHandler, Pod, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_kubelet::kubelet::{finalize_terminated_pod_storage, pod_recreated, stored_pod_of};
-use rusternetes_storage::{MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_kubelet::kubelet::{finalize_terminated_pod_storage, pod_recreated, stored_pod_of};
+use k3rs_storage::{MemoryStorage, Storage};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -581,7 +581,7 @@ fn make_container_with_prestop_http(
                 } else {
                     Some(host.to_string())
                 },
-                port: rusternetes_common::resources::IntOrString::Int(port),
+                port: k3rs_common::resources::IntOrString::Int(port),
                 path: Some(path.to_string()),
                 scheme: None,
                 http_headers: None,
@@ -625,7 +625,7 @@ fn prestop_hooks_called_before_container_stop() {
     assert_eq!(http_get.host.as_deref(), Some("10.244.0.5"));
     assert_eq!(
         http_get.port,
-        rusternetes_common::resources::IntOrString::Int(8080)
+        k3rs_common::resources::IntOrString::Int(8080)
     );
     assert_eq!(http_get.path.as_deref(), Some("/prestop"));
 }
@@ -805,7 +805,7 @@ fn per_pod_worker_timeout_adequate_for_deletion() {
 //          completeTerminating, completeTerminated
 // ===========================================================================
 
-use rusternetes_kubelet::PodWorkerState;
+use k3rs_kubelet::PodWorkerState;
 
 #[test]
 fn pod_worker_syncpod_to_terminating_on_deletion() {
@@ -1043,7 +1043,7 @@ fn orphan_cleanup_respects_pod_worker_state() {
 // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — computePodActions
 // ===========================================================================
 
-use rusternetes_common::resources::EphemeralContainer;
+use k3rs_common::resources::EphemeralContainer;
 
 #[test]
 fn new_ephemeral_container_detected_for_start() {
@@ -1291,7 +1291,7 @@ fn kubelet_heartbeat_preserves_extended_resources() {
 //   K8s reference: pkg/kubelet/pod_workers.go — SyncTerminatedPod completes
 //   then HandlePodCleanups removes the pod worker. The real K8s API server
 //   removes the object when the last finalizer is removed (tombstone GC).
-//   rusternetes has no finalizer mechanism, so the kubelet must delete directly.
+//   k3rs has no finalizer mechanism, so the kubelet must delete directly.
 // ===========================================================================
 
 // These exercise the real kubelet decision helper
@@ -1399,7 +1399,7 @@ async fn terminated_pod_with_finalizer_remains_in_storage() {
 //   K8s reference: pkg/kubelet/pod_workers.go — SyncTerminatedPod completes
 //   then HandlePodCleanups removes the pod worker. The real K8s API server
 //   removes the object when the last finalizer is removed (tombstone GC).
-//   rusternetes has no finalizer mechanism, so the kubelet must delete directly.
+//   k3rs has no finalizer mechanism, so the kubelet must delete directly.
 // ===========================================================================
 
 #[test]

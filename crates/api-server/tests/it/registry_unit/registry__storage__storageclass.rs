@@ -2,26 +2,24 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::volume::{
-        PersistentVolumeReclaimPolicy, VolumeBindingMode,
-    };
-    pub use rusternetes_common::resources::StorageClass;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::storageclass::{
+    pub use k3rs_common::resources::volume::{PersistentVolumeReclaimPolicy, VolumeBindingMode};
+    pub use k3rs_common::resources::StorageClass;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::storageclass::{
         get_warnings_for_storage_class, validate_storage_class, validate_storage_class_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::storage::storageclass::*;
+    use k3rs_api_server::registry::storage::storageclass::*;
 
     fn sc(v: serde_json::Value) -> StorageClass {
         let mut base = serde_json::json!({

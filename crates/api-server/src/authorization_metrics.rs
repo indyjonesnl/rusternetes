@@ -6,10 +6,10 @@
 //! (:66-95).
 
 use async_trait::async_trait;
+use k3rs_common::auth::UserInfo;
+use k3rs_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
+use k3rs_common::Result;
 use prometheus::{register, IntCounterVec, Opts};
-use rusternetes_common::auth::UserInfo;
-use rusternetes_common::authz::{Authorizer, Decision, Opinion, RequestAttributes};
-use rusternetes_common::Result;
 use std::sync::{Arc, LazyLock, Once};
 
 pub static DECISIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -103,7 +103,7 @@ impl Authorizer for InstrumentedAuthorizer {
     async fn authorize_outcome(
         &self,
         attrs: &RequestAttributes,
-    ) -> Result<rusternetes_common::authz::AuthorizationOutcome> {
+    ) -> Result<k3rs_common::authz::AuthorizationOutcome> {
         let outcome = self.delegate.authorize_outcome(attrs).await?;
         self.record(&outcome.opinion);
         Ok(outcome)
@@ -113,7 +113,7 @@ impl Authorizer for InstrumentedAuthorizer {
         &self,
         user: &UserInfo,
         namespace: &str,
-    ) -> Result<rusternetes_common::authz::UserRulesOutcome> {
+    ) -> Result<k3rs_common::authz::UserRulesOutcome> {
         self.delegate.get_user_rules_outcome(user, namespace).await
     }
 }

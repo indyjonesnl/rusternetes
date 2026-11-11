@@ -9,9 +9,9 @@
 use super::pod_security_api::{self as api, Level, LevelVersion, Policy};
 use super::pod_security_policy::aggregate_check_results;
 use super::{pod_security_registry, PodSecurityAdmission};
-use rusternetes_common::resources::{Namespace, Pod};
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::resources::{Namespace, Pod};
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -206,7 +206,7 @@ impl PodSecurityAdmission {
         timeout: Duration,
     ) -> Vec<String> {
         let deadline = Instant::now() + timeout;
-        let prefix = rusternetes_storage::build_prefix("pods", Some(namespace));
+        let prefix = k3rs_storage::build_prefix("pods", Some(namespace));
         let pods = match tokio::time::timeout(timeout, storage.list::<Pod>(&prefix)).await {
             Ok(Ok(pods)) => pods,
             _ => {
@@ -221,7 +221,7 @@ impl PodSecurityAdmission {
 
         let mut pod_warnings: Vec<String> = Vec::new();
         let mut counts: HashMap<String, PodCount> = HashMap::new();
-        let default_spec = rusternetes_common::resources::pod::PodSpec::default();
+        let default_spec = k3rs_common::resources::pod::PodSpec::default();
         let mut checked_pods = prioritized.len();
         for (i, pod) in prioritized.iter().enumerate() {
             let spec = pod.spec.as_ref().unwrap_or(&default_spec);

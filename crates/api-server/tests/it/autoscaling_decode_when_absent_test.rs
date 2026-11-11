@@ -12,7 +12,7 @@
 //! from serde to that validator rather than turning it into a silent accept —
 //! this file is the proof, one row per rejection upstream makes.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const HPAS: &str = "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers";
@@ -197,7 +197,7 @@ async fn a_minimal_hpa_and_an_empty_status_are_accepted() {
 /// so the contract to pin is the decode itself.
 #[test]
 fn a_vertical_pod_autoscaler_decodes_from_a_minimal_object() {
-    use rusternetes_common::resources::autoscaling::VerticalPodAutoscaler;
+    use k3rs_common::resources::autoscaling::VerticalPodAutoscaler;
 
     let vpa: VerticalPodAutoscaler = serde_json::from_value(json!({
         "apiVersion": "autoscaling.k8s.io/v1",

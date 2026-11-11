@@ -145,7 +145,7 @@ pub fn write_projected_payload_with(
         match std::fs::symlink_metadata(&link) {
             Ok(md) if md.file_type().is_symlink() => {}
             Ok(md) => {
-                // Rusternetes-only deviation (#2527): upstream's
+                // k3rs-only deviation (#2527): upstream's
                 // `createUserVisibleFiles` (`atomic_writer.go`) only creates
                 // the link when `os.Readlink` reports ENOENT, so a plain file
                 // left by an older kubelet (EINVAL) is skipped. Upstream never

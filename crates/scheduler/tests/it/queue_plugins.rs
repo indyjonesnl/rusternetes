@@ -5,14 +5,14 @@
 //! `scheduler.New` (`pkg/scheduler/scheduler.go:386-414`), and `NewFramework`'s
 //! "only one queue sort plugin" check (`framework.go:414`).
 
-use rusternetes_common::resources::{Pod, PodSpec};
-use rusternetes_scheduler::framework_runtime::{ExtensionPoint, PluginInstance, Registry};
-use rusternetes_scheduler::fwk::{Code, Plugin, QueueSortPlugin, Status};
-use rusternetes_scheduler::queue::scheduling_gates::build_pre_enqueue_plugin_map;
-use rusternetes_scheduler::queue::scheduling_queue::{
+use k3rs_common::resources::{Pod, PodSpec};
+use k3rs_scheduler::framework_runtime::{ExtensionPoint, PluginInstance, Registry};
+use k3rs_scheduler::fwk::{Code, Plugin, QueueSortPlugin, Status};
+use k3rs_scheduler::queue::scheduling_gates::build_pre_enqueue_plugin_map;
+use k3rs_scheduler::queue::scheduling_queue::{
     PreEnqueuePlugin, PriorityQueue, PriorityQueueOptions, QueuedPodInfo,
 };
-use rusternetes_scheduler::scheduler_config::profiles_from_config_with_registry;
+use k3rs_scheduler::scheduler_config::profiles_from_config_with_registry;
 use std::sync::Arc;
 
 /// Lowest priority first (the reverse of `PrioritySort`), so the test can tell
@@ -183,7 +183,7 @@ profiles:
 /// Default profile: PrioritySort and SchedulingGates are framework objects.
 #[test]
 fn default_profile_objects() {
-    let p = rusternetes_scheduler::profile::Profile::named("default-scheduler");
+    let p = k3rs_scheduler::profile::Profile::named("default-scheduler");
     let names: Vec<_> = p
         .framework
         .pre_enqueue_plugins()

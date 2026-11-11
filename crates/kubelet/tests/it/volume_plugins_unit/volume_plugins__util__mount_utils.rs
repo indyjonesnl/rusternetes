@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::volume_plugins::util::mount_utils::*;
+    use k3rs_kubelet::volume_plugins::util::mount_utils::*;
     use std::io::Write;
 
     // Fixture modelled on mount_helper_unix_test.go TestParseMountInfo.

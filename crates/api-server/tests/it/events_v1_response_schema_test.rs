@@ -8,13 +8,13 @@
 //! `message`, `source`, `involvedObject`, `firstTimestamp` or `lastTimestamp`
 //! field at all — those live on the core type, under `deprecated*` names here.
 //!
-//! Rusternetes stored the core object and rewrote only `apiVersion` on the way
+//! k3rs stored the core object and rewrote only `apiVersion` on the way
 //! out, so every `events.k8s.io/v1` read answered with core field names and
 //! omitted all four `deprecated*` fields (#1926). A client that reads `note`
 //! or `regarding` — `kubectl get events`, `client-go`'s events informer — saw
 //! nothing.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const NS: &str = "default";

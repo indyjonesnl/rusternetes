@@ -1,11 +1,11 @@
 // Scheduling Verification Tests
 // These tests verify the scheduler's decision-making logic
 
-use rusternetes_common::resources::node::*;
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::Node;
-use rusternetes_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::node::*;
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::Node;
+use k3rs_common::types::{ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -771,7 +771,7 @@ async fn test_pod_affinity_required() {
     storage.create(&cache_key, &cache_pod).await.unwrap();
 
     // Create pod with required pod affinity to co-locate with cache pods
-    use rusternetes_common::types::LabelSelector;
+    use k3rs_common::types::LabelSelector;
     let affinity = Affinity {
         node_affinity: None,
         pod_affinity: Some(PodAffinity {
@@ -829,7 +829,7 @@ async fn test_pod_affinity_preferred() {
     create_test_node(&storage, "node-2a", Some(labels1), "4", "8Gi", None).await;
 
     // Create pod with preferred pod affinity
-    use rusternetes_common::types::LabelSelector;
+    use k3rs_common::types::LabelSelector;
     let affinity = Affinity {
         node_affinity: None,
         pod_affinity: Some(PodAffinity {
@@ -910,7 +910,7 @@ async fn test_pod_anti_affinity_required() {
     storage.create(&web_1_key, &web_pod_1).await.unwrap();
 
     // Create pod with required anti-affinity (should NOT be placed on same node as web-1)
-    use rusternetes_common::types::LabelSelector;
+    use k3rs_common::types::LabelSelector;
     let affinity = Affinity {
         node_affinity: None,
         pod_affinity: None,
@@ -970,7 +970,7 @@ async fn test_pod_anti_affinity_preferred() {
     create_test_node(&storage, "node-1", Some(labels), "4", "8Gi", None).await;
 
     // Create pod with preferred anti-affinity
-    use rusternetes_common::types::LabelSelector;
+    use k3rs_common::types::LabelSelector;
     let affinity = Affinity {
         node_affinity: None,
         pod_affinity: None,
@@ -1048,7 +1048,7 @@ async fn test_topology_spread_with_affinity() {
 
     // Create pods with affinity to spread across zones
     for i in 1..=3 {
-        use rusternetes_common::types::LabelSelector;
+        use k3rs_common::types::LabelSelector;
         let affinity = Affinity {
             node_affinity: Some(NodeAffinity {
                 required_during_scheduling_ignored_during_execution: None,

@@ -4,19 +4,17 @@
 mod __parent {
     pub use async_trait::async_trait;
     pub use futures::StreamExt;
-    pub use rusternetes_api_server::admission::policy_dispatch::{
+    pub use k3rs_api_server::admission::policy_dispatch::{
         BindingAccessor, NamespacedName, ParamScope, ParamStore, PolicyAccessor, PolicyHook,
     };
-    pub use rusternetes_common::admission::GroupVersionResource;
-    pub use rusternetes_common::resources::validating_admission_policy::{
+    pub use k3rs_common::admission::GroupVersionResource;
+    pub use k3rs_common::resources::validating_admission_policy::{
         FailurePolicy, MatchResources, ParamKind, ParamRef,
     };
-    pub use rusternetes_common::resources::{
-        MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding,
-    };
-    pub use rusternetes_common::types::Selector;
-    pub use rusternetes_common::Error;
-    pub use rusternetes_storage::{build_prefix, Storage, WatchEvent};
+    pub use k3rs_common::resources::{MutatingAdmissionPolicy, MutatingAdmissionPolicyBinding};
+    pub use k3rs_common::types::Selector;
+    pub use k3rs_common::Error;
+    pub use k3rs_storage::{build_prefix, Storage, WatchEvent};
     pub use serde::de::DeserializeOwned;
     pub use serde_json::Value;
     pub use std::collections::{HashMap, HashSet};
@@ -27,9 +25,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::admission::policy_source::*;
-    use rusternetes_common::types::ObjectMeta;
-    use rusternetes_storage::MemoryStorage;
+    use k3rs_api_server::admission::policy_source::*;
+    use k3rs_common::types::ObjectMeta;
+    use k3rs_storage::MemoryStorage;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
@@ -402,7 +400,7 @@ mod tests {
 
     #[test]
     fn mutating_admission_policy_binding_policy_name_is_cluster_scoped() {
-        use rusternetes_common::resources::mutating_admission_policy::MutatingAdmissionPolicyBindingSpec;
+        use k3rs_common::resources::mutating_admission_policy::MutatingAdmissionPolicyBindingSpec;
         let mut b = MutatingAdmissionPolicyBinding::new("b");
         b.spec = Some(MutatingAdmissionPolicyBindingSpec {
             policy_name: Some("p".into()),

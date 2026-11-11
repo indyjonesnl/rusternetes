@@ -2,7 +2,7 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         ConfigMapProjection, DownwardAPIProjection, DownwardAPIVolumeFile, KeyToPath,
         ObjectFieldSelector, PodSpec, ProjectedVolumeSource, ServiceAccountTokenProjection, Volume,
         VolumeMount, VolumeProjection,
@@ -11,16 +11,16 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Container;
-    use rusternetes_common::serviceaccount::*;
+    use k3rs_common::resources::Container;
+    use k3rs_common::serviceaccount::*;
 
     fn sa_secrets(
         names: &[&str],
-    ) -> Vec<rusternetes_common::resources::service_account::LocalObjectReference> {
+    ) -> Vec<k3rs_common::resources::service_account::LocalObjectReference> {
         names
             .iter()
             .map(
-                |n| rusternetes_common::resources::service_account::LocalObjectReference {
+                |n| k3rs_common::resources::service_account::LocalObjectReference {
                     name: n.to_string(),
                 },
             )
@@ -52,11 +52,9 @@ mod tests {
     #[test]
     fn propagate_pod_list_wins_no_merge() {
         let mut spec = spec_with_container();
-        spec.image_pull_secrets = Some(vec![
-            rusternetes_common::resources::pod::LocalObjectReference {
-                name: "pod-own".to_string(),
-            },
-        ]);
+        spec.image_pull_secrets = Some(vec![k3rs_common::resources::pod::LocalObjectReference {
+            name: "pod-own".to_string(),
+        }]);
         let secrets = sa_secrets(&["regcred"]);
         let copied = propagate_image_pull_secrets(&mut spec, Some(&secrets));
         assert_eq!(copied, 0);

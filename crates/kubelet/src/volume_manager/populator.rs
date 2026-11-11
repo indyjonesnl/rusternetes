@@ -28,14 +28,14 @@ use crate::volume_plugins::util::types::{UniquePodName, UniqueVolumeName};
 use crate::volume_plugins::util::{get_pod_volume_names, get_unique_pod_name};
 use crate::volume_plugins::VolumePluginMgr;
 use anyhow::{anyhow, bail, Result};
-use rusternetes_common::feature_gates::{self, Feature};
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::volume::{
+use k3rs_common::feature_gates::{self, Feature};
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::volume::{
     PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimPhase, PersistentVolumeMode,
     PVC_PROTECTION_FINALIZER,
 };
-use rusternetes_common::resources::{Pod, Volume};
-use rusternetes_storage::{build_key, Storage, StorageBackend};
+use k3rs_common::resources::{Pod, Volume};
+use k3rs_storage::{build_key, Storage, StorageBackend};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -510,7 +510,7 @@ impl DesiredStateOfWorldPopulator {
             // constraint (checked below) is that the PVC must be
             // owned by the pod.
             pvc_source = Some((
-                rusternetes_common::ephemeral::volume_claim_name(pod, pod_volume),
+                k3rs_common::ephemeral::volume_claim_name(pod, pod_volume),
                 false,
             ));
         }
@@ -522,7 +522,7 @@ impl DesiredStateOfWorldPopulator {
                 .await
                 .map_err(|e| anyhow!("error processing PVC {namespace}/{claim_name}: {e}"))?;
             if is_ephemeral {
-                rusternetes_common::ephemeral::volume_is_for_pod(pod, &pvc)?;
+                k3rs_common::ephemeral::volume_is_for_pod(pod, &pvc)?;
             }
             let pv_name = pvc.spec.volume_name.clone().unwrap_or_default();
             let pvc_uid = pvc.metadata.uid.clone();

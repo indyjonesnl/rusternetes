@@ -29,9 +29,9 @@
 //!   - `pkg/api/v1/resource/helpers.go::ExtractContainerResourceValue`
 //!   - `pkg/volume/downwardapi/downwardapi.go` (volume side)
 
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::{Pod, ResourceFieldSelector};
-use rusternetes_common::validation::metav1::is_qualified_name;
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::{Pod, ResourceFieldSelector};
+use k3rs_common::validation::metav1::is_qualified_name;
 
 /// Error returned when a DownwardAPI field path or resource selector is
 /// unsupported or cannot be resolved against the supplied pod.
@@ -187,7 +187,7 @@ pub fn resolve_container_resource(
 /// rule makes `containerName` *required* for a downwardAPI volume, which is why
 /// the pod-based entry point above is the volume one.)
 pub fn resolve_container_resource_in(
-    container: &rusternetes_common::resources::Container,
+    container: &k3rs_common::resources::Container,
     sel: &ResourceFieldSelector,
     node_allocatable: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<String, DownwardError> {
@@ -206,9 +206,9 @@ pub fn resolve_container_resource_in(
 /// **init containers** — a `resourceFieldRef.containerName` naming a sidecar or
 /// init container resolves upstream and must resolve here.
 fn find_container_in_pod<'a>(
-    spec: &'a rusternetes_common::resources::PodSpec,
+    spec: &'a k3rs_common::resources::PodSpec,
     name: &str,
-) -> Option<&'a rusternetes_common::resources::Container> {
+) -> Option<&'a k3rs_common::resources::Container> {
     spec.containers
         .iter()
         .chain(spec.init_containers.iter().flatten())
@@ -218,7 +218,7 @@ fn find_container_in_pod<'a>(
 /// Default a missing request from the matching limit, on a container the caller
 /// already owns a copy of.
 ///
-/// Delegates to [`rusternetes_common::defaults::default_container_requests_from_limits`],
+/// Delegates to [`k3rs_common::defaults::default_container_requests_from_limits`],
 /// the port of `SetDefaults_Pod` (`pkg/apis/core/v1/defaults.go:169-179`), which
 /// the api-server's pod-create path and the static-pod decoder now both apply —
 /// so in a healthy cluster this is a no-op and every caller here sees a pod that
@@ -231,13 +231,11 @@ fn find_container_in_pod<'a>(
 /// idempotent, re-applying it costs nothing and keeps a `resourceFieldRef` from
 /// reporting `0` for a limits-only container.
 ///
-/// [`rusternetes_common::qos::compute_pod_qos`] compensates the same way, for
+/// [`k3rs_common::qos::compute_pod_qos`] compensates the same way, for
 /// the same reason — its upstream, `ComputePodQOS`, likewise assumes admission
 /// already ran.
-pub(crate) fn default_requests_from_limits(
-    container: &mut rusternetes_common::resources::Container,
-) {
-    rusternetes_common::defaults::default_container_requests_from_limits(container);
+pub(crate) fn default_requests_from_limits(container: &mut k3rs_common::resources::Container) {
+    k3rs_common::defaults::default_container_requests_from_limits(container);
 }
 
 /// Fill an unset (or zero) cpu / memory / ephemeral-storage **limit** from the
@@ -249,17 +247,16 @@ pub(crate) fn default_requests_from_limits(
 /// Note this touches limits **only** — upstream leaves requests alone, so an
 /// unset `requests.memory` reports `0`, not the node's allocatable.
 fn merge_container_resource_limits(
-    container: &mut rusternetes_common::resources::Container,
+    container: &mut k3rs_common::resources::Container,
     allocatable: &std::collections::HashMap<String, String>,
 ) {
-    let resources =
-        container
-            .resources
-            .get_or_insert(rusternetes_common::types::ResourceRequirements {
-                limits: None,
-                requests: None,
-                claims: None,
-            });
+    let resources = container
+        .resources
+        .get_or_insert(k3rs_common::types::ResourceRequirements {
+            limits: None,
+            requests: None,
+            claims: None,
+        });
     let limits = resources.limits.get_or_insert_with(Default::default);
     for name in ["cpu", "memory", "ephemeral-storage"] {
         let unset_or_zero = match limits.get(name) {
@@ -295,7 +292,7 @@ fn merge_container_resource_limits(
 ///   Go's `Limits.Cpu()` returns a zero quantity for a missing key.
 fn extract_container_resource_value(
     sel: &ResourceFieldSelector,
-    container: &rusternetes_common::resources::Container,
+    container: &k3rs_common::resources::Container,
 ) -> Result<String, DownwardError> {
     let unsupported = || DownwardError::UnsupportedResource(sel.resource.clone());
     let (kind, name) = sel.resource.split_once('.').ok_or_else(unsupported)?;

@@ -2,8 +2,8 @@
 //! endpoints answers with a protobuf envelope (upstream's
 //! `transformResponseObject` serializer choice), not JSON. Refs #3057.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PROTO_CT: &str = "application/vnd.kubernetes.protobuf";

@@ -1,8 +1,8 @@
 //! Tests for VolumeAttributesClass validation (upstream ValidateVolumeAttributesClass).
 
-use rusternetes_common::resources::csi::VolumeAttributesClass;
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::volumeattributesclass::validate_volume_attributes_class;
+use k3rs_common::resources::csi::VolumeAttributesClass;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::volumeattributesclass::validate_volume_attributes_class;
 use std::collections::HashMap;
 
 fn vac(driver: &str, params: Option<HashMap<String, String>>) -> VolumeAttributesClass {
@@ -22,7 +22,7 @@ fn one_param() -> HashMap<String, String> {
     m
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter().any(|e| e.field == field)
 }
 

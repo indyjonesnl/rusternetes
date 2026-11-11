@@ -7,7 +7,7 @@
 //! This file mirrors every `func Test*` in the upstream file as a
 //! `#[tokio::test]` of the same name. The transport layer is exercised via an
 //! inline `spawn_router()` helper that calls
-//! `rusternetes_api_server::router::build_router` against an
+//! `k3rs_api_server::router::build_router` against an
 //! `ApiServerState` backed by an `Arc<MemoryStorage>` so each test owns its
 //! own storage and is trivially parallel. Requests go through
 //! `tower::ServiceExt::oneshot` to mimic upstream's `clientset` calls.
@@ -43,10 +43,10 @@
 #![allow(non_snake_case)]
 
 use axum::http::{Method, StatusCode};
-use rusternetes_common::resources::{Deployment, Pod};
-use rusternetes_controller_manager::controllers::namespace::NamespaceController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::resources::{Deployment, Pod};
+use k3rs_controller_manager::controllers::namespace::NamespaceController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 

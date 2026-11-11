@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>All-in-One Binary - Rūsternetes</title>
+  <title>All-in-One Binary - k3rs</title>
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="stylesheet" href="../style.css">
 </head>
@@ -11,7 +11,7 @@
   <nav class="nav">
     <div class="nav-inner">
       <a href="../index.html" class="nav-logo">
-        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> rūsternetes
+        <img src="../favicon-colored.svg" width="22" height="22" alt="" style="vertical-align: middle;"> k3rs
       </a>
       <div class="nav-links">
         <a href="index.html" style="color: var(--walle-yellow);">Docs</a>
@@ -128,10 +128,10 @@
         </div>
         <code>
 <span class="comment"># Build and run with defaults (SQLite, no TLS, port 6443)</span>
-cargo run --release --bin rusternetes
+cargo run --release --bin k3rs
 
 <span class="comment"># Or if you have the binary already built:</span>
-./target/release/rusternetes
+./target/release/k3rs
 </code>
       </pre>
 
@@ -152,9 +152,9 @@ cargo run --release --bin rusternetes
 kubectl <span class="flag">--server</span>=<span class="value">http://localhost:6443</span> get nodes
 
 <span class="comment"># Or set up a kubeconfig</span>
-kubectl config set-cluster rusternetes <span class="flag">--server</span>=<span class="value">http://localhost:6443</span>
-kubectl config set-context rusternetes <span class="flag">--cluster</span>=<span class="value">rusternetes</span>
-kubectl config use-context rusternetes
+kubectl config set-cluster k3rs <span class="flag">--server</span>=<span class="value">http://localhost:6443</span>
+kubectl config set-context k3rs <span class="flag">--cluster</span>=<span class="value">k3rs</span>
+kubectl config use-context k3rs
 </code>
       </pre>
 
@@ -184,7 +184,7 @@ kubectl config use-context rusternetes
           <tr>
             <td><code><span class="flag">--data-dir</span></code></td>
             <td>String</td>
-            <td><code><span class="value">"./data/rusternetes.db"</span></code></td>
+            <td><code><span class="value">"./data/k3rs.db"</span></code></td>
             <td>Path to the SQLite database file. The directory is created automatically if it does not exist. Only used when <code>--storage-backend=sqlite</code>.</td>
           </tr>
           <tr>
@@ -228,7 +228,7 @@ kubectl config use-context rusternetes
           <tr>
             <td><code><span class="flag">--network</span></code></td>
             <td>String</td>
-            <td><code><span class="value">"rusternetes-network"</span></code></td>
+            <td><code><span class="value">"k3rs-network"</span></code></td>
             <td>Docker network name for pod containers. Created automatically if it does not exist.</td>
           </tr>
         </tbody>
@@ -380,7 +380,7 @@ kubectl config use-context rusternetes
         </div>
         <code>
 <span class="comment"># Simplest invocation: SQLite, no TLS, port 6443, auth disabled</span>
-./rusternetes
+./k3rs
 </code>
       </pre>
 
@@ -397,10 +397,10 @@ kubectl config use-context rusternetes
 bash scripts/generate-certs.sh
 
 <span class="comment"># Run with TLS enabled</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--tls</span> \
-  <span class="flag">--tls-cert-file</span>=<span class="value">.rusternetes/certs/server.crt</span> \
-  <span class="flag">--tls-key-file</span>=<span class="value">.rusternetes/certs/server.key</span>
+  <span class="flag">--tls-cert-file</span>=<span class="value">.k3rs/certs/server.crt</span> \
+  <span class="flag">--tls-key-file</span>=<span class="value">.k3rs/certs/server.key</span>
 </code>
       </pre>
 
@@ -414,7 +414,7 @@ bash scripts/generate-certs.sh
         </div>
         <code>
 <span class="comment"># Add extra SANs for remote access</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--tls</span> \
   <span class="flag">--tls-cert-file</span>=<span class="value">certs/server.crt</span> \
   <span class="flag">--tls-key-file</span>=<span class="value">certs/server.key</span> \
@@ -436,7 +436,7 @@ etcd <span class="flag">--listen-client-urls</span>=<span class="value">http://0
      <span class="flag">--advertise-client-urls</span>=<span class="value">http://localhost:2379</span>
 
 <span class="comment"># Point the binary at etcd</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--storage-backend</span>=<span class="value">etcd</span> \
   <span class="flag">--etcd-servers</span>=<span class="value">http://localhost:2379</span>
 </code>
@@ -455,7 +455,7 @@ etcd <span class="flag">--listen-client-urls</span>=<span class="value">http://0
 redis-server <span class="flag">--daemonize</span> <span class="value">yes</span>
 
 <span class="comment"># Point the binary at Redis</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--storage-backend</span>=<span class="value">redis</span> \
   <span class="flag">--redis-url</span>=<span class="value">redis://localhost:6379</span>
 </code>
@@ -470,15 +470,15 @@ redis-server <span class="flag">--daemonize</span> <span class="value">yes</span
           <span class="code-title">terminal</span>
         </div>
         <code>
-./rusternetes \
+./k3rs \
   <span class="flag">--storage-backend</span>=<span class="value">sqlite</span> \
-  <span class="flag">--data-dir</span>=<span class="value">/var/lib/rusternetes/state.db</span> \
-  <span class="flag">--volume-dir</span>=<span class="value">/var/lib/rusternetes/volumes</span> \
+  <span class="flag">--data-dir</span>=<span class="value">/var/lib/k3rs/state.db</span> \
+  <span class="flag">--volume-dir</span>=<span class="value">/var/lib/k3rs/volumes</span> \
   <span class="flag">--bind-address</span>=<span class="value">0.0.0.0:6443</span> \
   <span class="flag">--node-name</span>=<span class="value">edge-node-01</span> \
   <span class="flag">--tls</span> \
-  <span class="flag">--tls-cert-file</span>=<span class="value">/etc/rusternetes/tls/server.crt</span> \
-  <span class="flag">--tls-key-file</span>=<span class="value">/etc/rusternetes/tls/server.key</span> \
+  <span class="flag">--tls-cert-file</span>=<span class="value">/etc/k3rs/tls/server.crt</span> \
+  <span class="flag">--tls-key-file</span>=<span class="value">/etc/k3rs/tls/server.key</span> \
   <span class="flag">--tls-san</span>=<span class="value">"edge-node-01.example.com,10.0.0.50"</span> \
   <span class="flag">--skip-auth</span>=<span class="value">false</span> \
   <span class="flag">--authorization-mode</span>=<span class="value">Node,RBAC</span> \
@@ -507,10 +507,10 @@ redis-server <span class="flag">--daemonize</span> <span class="value">yes</span
         </div>
         <code>
 <span class="comment"># Hot backup: SQLite supports concurrent reads</span>
-cp ./data/rusternetes.db ./backups/rusternetes-$(date +%Y%m%d-%H%M%S).db
+cp ./data/k3rs.db ./backups/k3rs-$(date +%Y%m%d-%H%M%S).db
 
 <span class="comment"># Or use sqlite3's .backup for a consistent snapshot</span>
-sqlite3 ./data/rusternetes.db ".backup ./backups/rusternetes-backup.db"
+sqlite3 ./data/k3rs.db ".backup ./backups/k3rs-backup.db"
 </code>
       </pre>
 
@@ -524,7 +524,7 @@ sqlite3 ./data/rusternetes.db ".backup ./backups/rusternetes-backup.db"
         </div>
         <code>
 <span class="comment"># Open the database</span>
-sqlite3 ./data/rusternetes.db
+sqlite3 ./data/k3rs.db
 
 <span class="comment"># List all stored keys (resource paths)</span>
 SELECT key FROM kv ORDER BY key;
@@ -556,13 +556,13 @@ SELECT page_count * page_size AS size_bytes FROM pragma_page_count(), pragma_pag
         </div>
         <code>
 <span class="comment"># Stop the binary first</span>
-kill $(pgrep rusternetes)
+kill $(pgrep k3rs)
 
 <span class="comment"># Replace the database file</span>
-cp ./backups/rusternetes-backup.db ./data/rusternetes.db
+cp ./backups/k3rs-backup.db ./data/k3rs.db
 
 <span class="comment"># Restart</span>
-./rusternetes
+./k3rs
 </code>
       </pre>
 
@@ -593,10 +593,10 @@ cp ./backups/rusternetes-backup.db ./data/rusternetes.db
         </div>
         <code>
 <span class="comment"># Edge deployment with minimal intervals</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--node-name</span>=<span class="value">edge-gateway</span> \
-  <span class="flag">--data-dir</span>=<span class="value">/opt/rusternetes/state.db</span> \
-  <span class="flag">--volume-dir</span>=<span class="value">/opt/rusternetes/volumes</span> \
+  <span class="flag">--data-dir</span>=<span class="value">/opt/k3rs/state.db</span> \
+  <span class="flag">--volume-dir</span>=<span class="value">/opt/k3rs/volumes</span> \
   <span class="flag">--sync-interval</span>=<span class="value">30</span> \
   <span class="flag">--scheduler-interval</span>=<span class="value">10</span> \
   <span class="flag">--disable-proxy</span>
@@ -621,7 +621,7 @@ cp ./backups/rusternetes-backup.db ./data/rusternetes.db
 steps:
   - name: Start Kubernetes
     run: |
-      ./rusternetes <span class="flag">--log-level</span>=<span class="value">warn</span> &amp;
+      ./k3rs <span class="flag">--log-level</span>=<span class="value">warn</span> &amp;
       sleep 2
       kubectl <span class="flag">--server</span>=<span class="value">http://localhost:6443</span> cluster-info
 
@@ -654,8 +654,8 @@ docker save nginx:alpine busybox:latest | gzip > images.tar.gz
 <span class="comment"># On the air-gapped device: load images</span>
 docker load < images.tar.gz
 
-<span class="comment"># Run rusternetes (no internet needed)</span>
-./rusternetes <span class="flag">--node-name</span>=<span class="value">iot-hub</span>
+<span class="comment"># Run k3rs (no internet needed)</span>
+./k3rs <span class="flag">--node-name</span>=<span class="value">iot-hub</span>
 </code>
       </pre>
 
@@ -674,7 +674,7 @@ docker load < images.tar.gz
         </div>
         <code>
 <span class="comment"># Development workflow</span>
-cargo run <span class="flag">--bin</span> rusternetes <span class="flag">--</span> <span class="flag">--log-level</span>=<span class="value">debug</span>
+cargo run <span class="flag">--bin</span> k3rs <span class="flag">--</span> <span class="flag">--log-level</span>=<span class="value">debug</span>
 
 <span class="comment"># In another terminal</span>
 kubectl apply -f my-deployment.yaml
@@ -684,7 +684,7 @@ kubectl get pods -w
 
       <h3>Embedded Sandbox (OpenShell)</h3>
       <p>
-        Embed rusternetes as a library or spawn it as a subprocess inside a larger application.
+        Embed k3rs as a library or spawn it as a subprocess inside a larger application.
         This is how OpenShell provides each user session with an isolated Kubernetes environment.
         Each instance gets its own SQLite file, providing complete tenant isolation.
       </p>
@@ -698,7 +698,7 @@ kubectl get pods -w
         </div>
         <code>
 <span class="comment"># Per-session Kubernetes sandbox</span>
-./rusternetes \
+./k3rs \
   <span class="flag">--data-dir</span>=<span class="value">/tmp/sessions/user-abc123/state.db</span> \
   <span class="flag">--volume-dir</span>=<span class="value">/tmp/sessions/user-abc123/volumes</span> \
   <span class="flag">--bind-address</span>=<span class="value">127.0.0.1:0</span> \
@@ -709,7 +709,7 @@ kubectl get pods -w
 
       <h2>How It Works</h2>
       <p>
-        The <code>rusternetes</code> binary (in <code>crates/rusternetes/</code>) creates a shared
+        The <code>k3rs</code> binary (in <code>crates/k3rs/</code>) creates a shared
         <code>StorageBackend</code> and spawns each component as a concurrent tokio task:
       </p>
 
@@ -750,7 +750,7 @@ kubectl get pods -w
   </div>
 
   <footer class="doc-footer">
-    <p><a href="../index.html">Rūsternetes</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
+    <p><a href="../index.html">k3rs</a> &mdash; Kubernetes reimplemented in Rust. Apache-2.0 License.</p>
   </footer>
 
   <button class="sidebar-toggle" aria-label="Toggle navigation">&#9776;</button>

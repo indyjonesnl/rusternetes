@@ -11,13 +11,13 @@ use axum::{
     body::Body,
     http::{HeaderMap, Request, StatusCode},
 };
-use rusternetes_api_server::{router::build_router, state::ApiServerState};
-use rusternetes_common::{
+use k3rs_api_server::{router::build_router, state::ApiServerState};
+use k3rs_common::{
     auth::TokenManager,
     authz::{AlwaysAllowAuthorizer, Authorizer, RBACAuthorizer},
     observability::MetricsRegistry,
 };
-use rusternetes_storage::{memory::MemoryStorage, StorageBackend};
+use k3rs_storage::{memory::MemoryStorage, StorageBackend};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -86,7 +86,7 @@ impl TestApiServer {
             return;
         }
         let name = segs[i + 1];
-        let key = rusternetes_storage::build_key("namespaces", None, name);
+        let key = k3rs_storage::build_key("namespaces", None, name);
         let ns = serde_json::json!({
             "apiVersion": "v1", "kind": "Namespace",
             "metadata": {"name": name},
@@ -95,7 +95,7 @@ impl TestApiServer {
         });
         let storage = self.storage.clone();
         futures::FutureExt::now_or_never(async move {
-            use rusternetes_storage::Storage;
+            use k3rs_storage::Storage;
             if storage.get::<Value>(&key).await.is_err() {
                 let _ = storage.create(&key, &ns).await;
             }
@@ -444,11 +444,10 @@ impl TestApiServerBuilder {
             None => authorizer,
         };
         let metrics = Arc::new(MetricsRegistry::new());
-        let ranges =
-            rusternetes_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
-                &self.service_cluster_ip_range,
-            )
-            .expect("a valid --service-cluster-ip-range");
+        let ranges = k3rs_api_server::registry::core::service::ipranges::ServiceIpRanges::parse(
+            &self.service_cluster_ip_range,
+        )
+        .expect("a valid --service-cluster-ip-range");
         let state =
             ApiServerState::new(backend, token_manager, authorizer, metrics, self.skip_auth)
                 .with_service_cluster_ip_ranges(&ranges)
@@ -456,11 +455,10 @@ impl TestApiServerBuilder {
         // The `kubernetes` ServiceCIDR the ClusterIP allocator draws from:
         // the api-server seeds it before serving (default_servicecidr
         // controller `Start`), and the sync only touches storage.
-        let mut cidr_controller =
-            rusternetes_api_server::bootstrap::DefaultServiceCIDRController::new(
-                state.storage.clone(),
-                ranges.cidrs(),
-            );
+        let mut cidr_controller = k3rs_api_server::bootstrap::DefaultServiceCIDRController::new(
+            state.storage.clone(),
+            ranges.cidrs(),
+        );
         futures::FutureExt::now_or_never(cidr_controller.sync())
             .expect("the default ServiceCIDR sync on MemoryStorage completes without waiting")
             .expect("the default ServiceCIDR sync succeeds");
@@ -468,7 +466,7 @@ impl TestApiServerBuilder {
         // has initialised the allocation snapshot. On empty in-memory storage
         // that pass never waits, so it completes on its first poll.
         futures::FutureExt::now_or_never(
-            rusternetes_api_server::bootstrap::repair_service_node_ports_once(&state),
+            k3rs_api_server::bootstrap::repair_service_node_ports_once(&state),
         )
         .expect("the initial NodePort repair on MemoryStorage completes without waiting")
         .expect("the initial NodePort repair succeeds");
@@ -479,11 +477,8 @@ impl TestApiServerBuilder {
 /// Create the `default` ServiceAccount of `namespace` unless it exists: what
 /// upstream's ServiceAccount controller does for every namespace, which the
 /// ServiceAccount admission plugin relies on (serviceaccount/admission.go:160-163).
-pub async fn seed_default_service_account<S: rusternetes_storage::Storage>(
-    storage: &S,
-    namespace: &str,
-) {
-    let key = rusternetes_storage::build_key("serviceaccounts", Some(namespace), "default");
+pub async fn seed_default_service_account<S: k3rs_storage::Storage>(storage: &S, namespace: &str) {
+    let key = k3rs_storage::build_key("serviceaccounts", Some(namespace), "default");
     let sa = serde_json::json!({
         "apiVersion": "v1", "kind": "ServiceAccount",
         "metadata": {"name": "default", "namespace": namespace},

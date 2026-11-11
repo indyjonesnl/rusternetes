@@ -2,9 +2,9 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::flow_control_integrator::Integrator;
-    pub use rusternetes_api_server::flow_control_metrics as fcmetrics;
-    pub use rusternetes_api_server::flow_control_queueset::shufflesharding::Dealer;
+    pub use k3rs_api_server::flow_control_integrator::Integrator;
+    pub use k3rs_api_server::flow_control_metrics as fcmetrics;
+    pub use k3rs_api_server::flow_control_queueset::shufflesharding::Dealer;
     pub use std::collections::{HashMap, HashSet, VecDeque};
     pub use std::sync::{Arc, Mutex, Weak};
     pub use std::time::Duration;
@@ -14,7 +14,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::flow_control_queueset::*;
+    use k3rs_api_server::flow_control_queueset::*;
 
     // ---- test clock (eventclock/testing Fake) ----
 
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn queueset_publishes_virtual_time_and_dispatch_gauges() {
-        use rusternetes_api_server::flow_control::metric_test_util::{has_series, sample};
+        use k3rs_api_server::flow_control::metric_test_util::{has_series, sample};
         let clk = FakeClock::new();
         let qs = QueueSet::new(
             clk.clone(),
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn queue_length_after_enqueue_is_observed_and_no_accommodation_counted() {
-        use rusternetes_api_server::flow_control::metric_test_util::sample;
+        use k3rs_api_server::flow_control::metric_test_util::sample;
         let clk = FakeClock::new();
         let qs = QueueSet::new(
             clk.clone(),
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn epoch_advance_is_counted() {
-        use rusternetes_api_server::flow_control::metric_test_util::sample;
+        use k3rs_api_server::flow_control::metric_test_util::sample;
         let clk = FakeClock::new();
         let qs = QueueSet::new(
             clk.clone(),

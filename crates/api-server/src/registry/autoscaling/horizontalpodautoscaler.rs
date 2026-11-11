@@ -8,23 +8,23 @@
 //! it clears anything and is not modelled; with the second off,
 //! `validationOptionsForHorizontalPodAutoscaler` only lowers the `minReplicas`
 //! bound for an old object that already had 0, which
-//! `rusternetes_common::validation::hpa` implements.
+//! `k3rs_common::validation::hpa` implements.
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     HPAScalingPolicy, HPAScalingRules, HorizontalPodAutoscaler, HorizontalPodAutoscalerStatus,
     MetricSpec, MetricTarget, ResourceMetricSource,
 };
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::hpa::{
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::hpa::{
     validate_horizontal_pod_autoscaler, validate_horizontal_pod_autoscaler_status_update,
     validate_horizontal_pod_autoscaler_update,
 };
-use rusternetes_common::validation::objectmeta::{
+use k3rs_common::validation::objectmeta::{
     name_is_dns_subdomain, validate_object_meta, validate_object_meta_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use crate::registry::generic::Store;
 use crate::registry::rest::{

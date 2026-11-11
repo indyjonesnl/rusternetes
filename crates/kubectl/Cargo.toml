@@ -1,12 +1,12 @@
 [package]
-name = "rusternetes-kubectl"
+name = "k3rs-kubectl"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-name = "rusternetes_kubectl"
+name = "k3rs_kubectl"
 path = "src/lib.rs"
 # Unit tests live in tests/it: a second compilation of the lib as a test
 # target costs as much as the lib itself.
@@ -22,8 +22,8 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 mimalloc = { version = "0.1", optional = true }
-rusternetes-common = { path = "../common" }
-rusternetes-client = { path = "../client" }
+k3rs-common = { path = "../common" }
+k3rs-client = { path = "../client" }
 tokio = { workspace = true, features = ["full", "io-util", "io-std"] }
 serde.workspace = true
 serde_json.workspace = true

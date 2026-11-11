@@ -1,4 +1,4 @@
-use rusternetes_storage::etcd::EtcdStorage;
+use k3rs_storage::etcd::EtcdStorage;
 use std::sync::Arc;
 
 /// Create a test etcd storage instance

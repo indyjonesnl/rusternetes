@@ -31,7 +31,7 @@
 //!     exercises the real bearer-token auth pipeline and per-SA RBAC.
 //!
 //! Test 1 drives the production
-//! `rusternetes_controller_manager::controllers::ServiceAccountController`
+//! `k3rs_controller_manager::controllers::ServiceAccountController`
 //! reconcile loop as a tokio task. The controller's `reconcile_all()` walks
 //! every namespace and re-creates the `default` SA if missing — that is the
 //! upstream "watch + workqueue + requeue-not-retry" surface, condensed into a
@@ -40,13 +40,13 @@
 //! Part of the /batch landing upstream integration-test mirrors.
 
 use axum::http::StatusCode;
-use rusternetes_common::{
+use k3rs_common::{
     resources::{ClusterRole, Namespace, PolicyRule, RoleRef, ServiceAccount, Subject},
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountController;
-use rusternetes_storage::{build_key, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_controller_manager::controllers::serviceaccount::ServiceAccountController;
+use k3rs_storage::{build_key, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -314,7 +314,7 @@ async fn test_service_account_token_auto_mount() {
 ///
 /// Upstream: plugin/pkg/admission/serviceaccount/admission.go:167 — *"If the
 /// pod does not contain any ImagePullSecrets, the ImagePullSecrets of the
-/// service account are added."* In rusternetes this runs in
+/// service account are added."* In k3rs this runs in
 /// `admission::inject_service_account_token` via
 /// `serviceaccount::propagate_image_pull_secrets`. The helper has unit tests;
 /// this locks the end-to-end pod-create admission path.
@@ -403,7 +403,7 @@ async fn test_service_account_image_pull_secrets_propagate_on_pod_create() {
 /// Seed a ClusterRole + namespaced RoleBinding so the given SA gets the
 /// listed verbs on pods in `namespace`. Mirrors the upstream "read-only
 /// kubelet client" pattern used by the integration test, but consolidated
-/// to ClusterRole + RoleBinding because rusternetes' RBAC checker walks
+/// to ClusterRole + RoleBinding because k3rs' RBAC checker walks
 /// both surfaces.
 async fn grant_sa_pods_verbs(
     state: &TestApiServer,
@@ -433,7 +433,7 @@ async fn grant_sa_pods_verbs(
     let key = build_key("clusterroles", None::<&str>, role_name);
     state.storage.create(&key, &cluster_role).await.unwrap();
 
-    let binding = rusternetes_common::resources::RoleBinding {
+    let binding = k3rs_common::resources::RoleBinding {
         type_meta: TypeMeta {
             api_version: "rbac.authorization.k8s.io/v1".to_string(),
             kind: "RoleBinding".to_string(),
@@ -512,7 +512,7 @@ async fn seed_service_account(state: &TestApiServer, namespace: &str, name: &str
 ///   kubernetes.io: {namespace, serviceaccount: {name, uid}}
 fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
     let now = chrono::Utc::now();
-    let claims = rusternetes_common::auth::ServiceAccountClaims {
+    let claims = k3rs_common::auth::ServiceAccountClaims {
         sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
         namespace: namespace.to_string(),
         uid: uid.to_string(),
@@ -520,9 +520,9 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
         exp: (now + chrono::Duration::hours(1)).timestamp(),
         iss: "https://kubernetes.default.svc.cluster.local".to_string(),
         aud: vec!["https://kubernetes.default.svc".to_string()],
-        kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+        kubernetes: Some(k3rs_common::auth::KubernetesClaims {
             namespace: namespace.to_string(),
-            svcacct: rusternetes_common::auth::KubeRef {
+            svcacct: k3rs_common::auth::KubeRef {
                 name: sa_name.to_string(),
                 uid: uid.to_string(),
             },
@@ -539,7 +539,7 @@ fn mint_sa_token(namespace: &str, sa_name: &str, uid: &str) -> String {
     };
     // The server verifies with a `TokenManager` built from the same secret, so
     // a locally-constructed manager produces an identical, acceptable signature.
-    rusternetes_common::auth::TokenManager::new(TOKEN_SECRET)
+    k3rs_common::auth::TokenManager::new(TOKEN_SECRET)
         .generate_token(claims)
         .unwrap()
 }

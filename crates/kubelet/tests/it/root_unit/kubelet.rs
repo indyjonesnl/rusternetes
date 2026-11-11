@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_common::{
+    pub use k3rs_common::{
         resources::{
             ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
             ContainerStatus, Node, NodeAddress, NodeSpec, NodeStatus, Pod, PodCondition, PodIP,
@@ -11,12 +11,12 @@ mod __parent {
         },
         types::Phase,
     };
-    pub use rusternetes_kubelet::cri_runtime::CriContainerRuntime;
-    pub use rusternetes_kubelet::eviction::{
+    pub use k3rs_kubelet::cri_runtime::CriContainerRuntime;
+    pub use k3rs_kubelet::eviction::{
         get_node_stats, get_pod_stats, EvictionManager, EvictionSignal,
     };
-    pub use rusternetes_kubelet::lifecycle::{phase_is_terminal, should_skip_phase_write};
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
+    pub use k3rs_kubelet::lifecycle::{phase_is_terminal, should_skip_phase_write};
+    pub use k3rs_storage::{build_key, build_prefix, Storage, StorageBackend, WatchEvent};
     pub use std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
@@ -32,7 +32,7 @@ mod __parent {
 
 mod default_labels_tests {
     use super::__parent::*;
-    use rusternetes_kubelet::kubelet::*;
+    use k3rs_kubelet::kubelet::*;
 
     // kubelet_node_status.go:230-267: existing value != initial value is
     // overwritten (needsUpdate), equal is a no-op, empty initial is deleted.
@@ -73,7 +73,7 @@ mod default_labels_tests {
 }
 
 mod tests {
-    use rusternetes_kubelet::kubelet::service_account_token_manager;
+    use k3rs_kubelet::kubelet::service_account_token_manager;
 
     /// The storage-direct kubelet signer carries the api-server's
     /// `--service-account-issuer` / `--api-audiences` (issue #2713), so a token
@@ -85,7 +85,7 @@ mod tests {
             "{}/../common/tests/fixtures/sa/rsa-pkcs1.key",
             env!("CARGO_MANIFEST_DIR")
         );
-        let opts = rusternetes_common::auth::ServiceAccountOptions {
+        let opts = k3rs_common::auth::ServiceAccountOptions {
             key_files: vec![key.clone()],
             signing_key_file: Some(key),
             issuers: vec!["https://issuer.example".to_string()],
@@ -95,12 +95,8 @@ mod tests {
         let tm = service_account_token_manager(&opts).unwrap();
         assert_eq!(tm.issuer(), Some("https://issuer.example"));
         assert_eq!(tm.api_audiences(), ["api-aud".to_string()]);
-        let mut claims = rusternetes_common::auth::ServiceAccountClaims::new(
-            "sa".into(),
-            "ns".into(),
-            "uid".into(),
-            1,
-        );
+        let mut claims =
+            k3rs_common::auth::ServiceAccountClaims::new("sa".into(), "ns".into(), "uid".into(), 1);
         claims.aud = tm.api_audiences().to_vec();
         let tok = tm.generate_token(claims).unwrap();
         let api_server_tm = service_account_token_manager(&opts).unwrap();
@@ -111,27 +107,27 @@ mod tests {
         assert_eq!(none.issuer(), None);
         assert!(none.api_audiences().is_empty());
     }
-    use rusternetes_kubelet::kubelet::Kubelet;
+    use k3rs_kubelet::kubelet::Kubelet;
 
     /// Storage that behaves like the api-server Store on PUT: a non-empty
     /// `metadata.uid` that differs from the stored one is a 409 (rest/update.go:188-203).
-    struct UidStore(rusternetes_storage::memory::MemoryStorage);
+    struct UidStore(k3rs_storage::memory::MemoryStorage);
 
     #[async_trait::async_trait]
-    impl rusternetes_storage::Storage for UidStore {
-        async fn create<T>(&self, k: &str, v: &T) -> rusternetes_common::Result<T>
+    impl k3rs_storage::Storage for UidStore {
+        async fn create<T>(&self, k: &str, v: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.0.create(k, v).await
         }
-        async fn get<T>(&self, k: &str) -> rusternetes_common::Result<T>
+        async fn get<T>(&self, k: &str) -> k3rs_common::Result<T>
         where
             T: serde::de::DeserializeOwned + Send + Sync,
         {
             self.0.get(k).await
         }
-        async fn update<T>(&self, k: &str, v: &T) -> rusternetes_common::Result<T>
+        async fn update<T>(&self, k: &str, v: &T) -> k3rs_common::Result<T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
@@ -142,45 +138,38 @@ mod tests {
                 stored["metadata"]["uid"].as_str().unwrap_or(""),
             );
             if !a.is_empty() && a != b {
-                return Err(rusternetes_common::Error::Conflict(format!(
+                return Err(k3rs_common::Error::Conflict(format!(
                     "Precondition failed: UID in precondition: {a}, UID in object meta: {b}"
                 )));
             }
             self.0.update(k, v).await
         }
-        async fn update_raw(
-            &self,
-            k: &str,
-            v: &serde_json::Value,
-        ) -> rusternetes_common::Result<()> {
+        async fn update_raw(&self, k: &str, v: &serde_json::Value) -> k3rs_common::Result<()> {
             self.0.update_raw(k, v).await
         }
-        async fn delete(&self, k: &str) -> rusternetes_common::Result<()> {
+        async fn delete(&self, k: &str) -> k3rs_common::Result<()> {
             self.0.delete(k).await
         }
-        async fn list<T>(&self, p: &str) -> rusternetes_common::Result<Vec<T>>
+        async fn list<T>(&self, p: &str) -> k3rs_common::Result<Vec<T>>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
         {
             self.0.list(p).await
         }
-        async fn watch(
-            &self,
-            p: &str,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        async fn watch(&self, p: &str) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.0.watch(p).await
         }
         async fn watch_from_revision(
             &self,
             p: &str,
             r: i64,
-        ) -> rusternetes_common::Result<rusternetes_storage::WatchStream> {
+        ) -> k3rs_common::Result<k3rs_storage::WatchStream> {
             self.0.watch_from_revision(p, r).await
         }
-        async fn current_revision(&self) -> rusternetes_common::Result<i64> {
+        async fn current_revision(&self) -> k3rs_common::Result<i64> {
             self.0.current_revision().await
         }
-        async fn is_revision_compacted(&self, r: i64) -> rusternetes_common::Result<bool> {
+        async fn is_revision_compacted(&self, r: i64) -> k3rs_common::Result<bool> {
             self.0.is_revision_compacted(r).await
         }
     }
@@ -189,10 +178,10 @@ mod tests {
     /// stored one or the Store 409s every tick.
     #[tokio::test]
     async fn republished_node_metrics_survive_uid_precondition() {
-        use rusternetes_common::resources::NodeMetrics;
-        use rusternetes_common::types::{ObjectMeta, TypeMeta};
-        use rusternetes_storage::Storage;
-        let st = UidStore(rusternetes_storage::memory::MemoryStorage::new());
+        use k3rs_common::resources::NodeMetrics;
+        use k3rs_common::types::{ObjectMeta, TypeMeta};
+        use k3rs_storage::Storage;
+        let st = UidStore(k3rs_storage::memory::MemoryStorage::new());
         let mk = |cpu: &str| NodeMetrics {
             type_meta: TypeMeta {
                 api_version: "metrics.k8s.io/v1beta1".into(),
@@ -204,8 +193,8 @@ mod tests {
             usage: [("cpu".to_string(), cpu.to_string())].into(),
         };
         let key = "/registry/metrics.k8s.io/nodes/n1";
-        rusternetes_kubelet::kubelet::upsert_metrics(&st, key, mk("1m"), |m| &mut m.metadata).await;
-        rusternetes_kubelet::kubelet::upsert_metrics(&st, key, mk("2m"), |m| &mut m.metadata).await;
+        k3rs_kubelet::kubelet::upsert_metrics(&st, key, mk("1m"), |m| &mut m.metadata).await;
+        k3rs_kubelet::kubelet::upsert_metrics(&st, key, mk("2m"), |m| &mut m.metadata).await;
         let got: NodeMetrics = st.get(key).await.unwrap();
         assert_eq!(got.usage["cpu"], "2m");
     }
@@ -216,21 +205,19 @@ mod tests {
     fn terminating_grace_elapsed_treats_deletion_timestamp_as_deadline() {
         let now = chrono::Utc::now();
         let dl = now + chrono::Duration::seconds(30);
-        assert!(!rusternetes_kubelet::kubelet::terminating_grace_elapsed(
+        assert!(!k3rs_kubelet::kubelet::terminating_grace_elapsed(
             Some(dl),
             now
         ));
-        assert!(rusternetes_kubelet::kubelet::terminating_grace_elapsed(
+        assert!(k3rs_kubelet::kubelet::terminating_grace_elapsed(
             Some(dl),
             dl
         ));
-        assert!(rusternetes_kubelet::kubelet::terminating_grace_elapsed(
+        assert!(k3rs_kubelet::kubelet::terminating_grace_elapsed(
             Some(now - chrono::Duration::seconds(1)),
             now
         ));
-        assert!(rusternetes_kubelet::kubelet::terminating_grace_elapsed(
-            None, now
-        ));
+        assert!(k3rs_kubelet::kubelet::terminating_grace_elapsed(None, now));
     }
 
     /// A terminal pod with no running container no longer wants its volumes
@@ -238,7 +225,7 @@ mod tests {
     /// running pod, does.
     #[test]
     fn pod_volumes_released_only_when_terminal_and_stopped() {
-        let mk = |phase: &str, state: serde_json::Value| -> rusternetes_common::resources::Pod {
+        let mk = |phase: &str, state: serde_json::Value| -> k3rs_common::resources::Pod {
             serde_json::from_value(serde_json::json!({
                 "metadata": {"name": "p", "uid": "u"},
                 "spec": {"containers": []},
@@ -250,18 +237,18 @@ mod tests {
         };
         let done = serde_json::json!({"terminated": {"exitCode": 0}});
         let running = serde_json::json!({"running": {}});
-        assert!(rusternetes_kubelet::kubelet::pod_volumes_released(&mk(
+        assert!(k3rs_kubelet::kubelet::pod_volumes_released(&mk(
             "Succeeded",
             done.clone()
         )));
-        assert!(rusternetes_kubelet::kubelet::pod_volumes_released(&mk(
+        assert!(k3rs_kubelet::kubelet::pod_volumes_released(&mk(
             "Failed",
             done.clone()
         )));
-        assert!(!rusternetes_kubelet::kubelet::pod_volumes_released(&mk(
+        assert!(!k3rs_kubelet::kubelet::pod_volumes_released(&mk(
             "Running", done
         )));
-        assert!(!rusternetes_kubelet::kubelet::pod_volumes_released(&mk(
+        assert!(!k3rs_kubelet::kubelet::pod_volumes_released(&mk(
             "Failed", running
         )));
     }
@@ -273,7 +260,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn heartbeat_interval_follows_node_status_update_frequency() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
@@ -313,7 +300,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn volume_stats_agg_period_reaches_the_analyzer() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
@@ -362,7 +349,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn file_check_frequency_drives_static_pod_poll() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
@@ -412,7 +399,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn http_check_frequency_drives_static_pod_url_poll() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = tempfile::tempdir().unwrap();
@@ -488,7 +475,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn runtime_request_timeout_reaches_cri_client() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
@@ -528,8 +515,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn new_crash_loop_backoff_gate_matrix() {
-        use rusternetes_common::feature_gates::{with_feature, Feature};
-        use rusternetes_kubelet::kubelet::new_crash_loop_backoff;
+        use k3rs_common::feature_gates::{with_feature, Feature};
+        use k3rs_kubelet::kubelet::new_crash_loop_backoff;
         let s = std::time::Duration::from_secs;
         // Defaults (Max on, Reduce off): operator value wins, initial 10s clamped.
         assert_eq!(new_crash_loop_backoff(Some(s(45))), (s(45), s(10)));
@@ -550,7 +537,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn crash_loop_backoff_max_applies() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
@@ -592,7 +579,7 @@ mod tests {
     /// IPs need not be on a host interface.
     async fn node_ip_kubelet(
         dir: &tempfile::TempDir,
-        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+        storage: std::sync::Arc<k3rs_storage::StorageBackend>,
         name: &str,
         ips: &[&str],
         external: bool,
@@ -602,7 +589,7 @@ mod tests {
 
     async fn node_ip_kubelet_h(
         dir: &tempfile::TempDir,
-        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+        storage: std::sync::Arc<k3rs_storage::StorageBackend>,
         name: &str,
         hostname: Option<&str>,
         ips: &[&str],
@@ -623,7 +610,7 @@ mod tests {
             "bridge".into(),
             String::new(),
             dir.path().to_path_buf(),
-            rusternetes_kubelet::eviction::EvictionManager::new(),
+            k3rs_kubelet::eviction::EvictionManager::new(),
             10250,
             Vec::new(),
             ips.iter().map(|s| s.parse().unwrap()).collect(),
@@ -643,14 +630,14 @@ mod tests {
     }
 
     async fn get_node(
-        storage: &rusternetes_storage::StorageBackend,
+        storage: &k3rs_storage::StorageBackend,
         name: &str,
-    ) -> rusternetes_common::resources::Node {
-        use rusternetes_storage::{build_key, Storage};
+    ) -> k3rs_common::resources::Node {
+        use k3rs_storage::{build_key, Storage};
         storage.get(&build_key("nodes", None, name)).await.unwrap()
     }
 
-    fn node_addrs(n: &rusternetes_common::resources::Node) -> Vec<(String, String)> {
+    fn node_addrs(n: &k3rs_common::resources::Node) -> Vec<(String, String)> {
         n.status
             .as_ref()
             .and_then(|s| s.addresses.clone())
@@ -671,7 +658,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn external_cloud_provider_node_is_tainted_annotated_and_addressed() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let _k = node_ip_kubelet(&dir, storage.clone(), "node-ext", &["10.1.1.1"], true).await;
@@ -699,7 +686,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn non_external_node_has_no_cloud_taint_or_annotation() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let _k = node_ip_kubelet(&dir, storage.clone(), "node-int", &["10.1.1.1"], false).await;
@@ -724,18 +711,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn external_cloud_provider_addresses_survive_status_sync() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-prov", &["10.1.1.1"], true).await;
         let key = build_key("nodes", None, "node-prov");
         let mut n = get_node(&storage, "node-prov").await;
         n.status.as_mut().unwrap().addresses = Some(vec![
-            rusternetes_common::resources::NodeAddress {
+            k3rs_common::resources::NodeAddress {
                 address_type: "ExternalIP".into(),
                 address: "203.0.113.7".into(),
             },
-            rusternetes_common::resources::NodeAddress {
+            k3rs_common::resources::NodeAddress {
                 address_type: "InternalIP".into(),
                 address: "10.9.9.9".into(),
             },
@@ -758,17 +745,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn node_address_setter_reruns_every_status_sync() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-sync", &["10.1.1.1"], false).await;
         let key = build_key("nodes", None, "node-sync");
         let mut n = get_node(&storage, "node-sync").await;
-        n.status.as_mut().unwrap().addresses =
-            Some(vec![rusternetes_common::resources::NodeAddress {
-                address_type: "InternalIP".into(),
-                address: "9.9.9.9".into(),
-            }]);
+        n.status.as_mut().unwrap().addresses = Some(vec![k3rs_common::resources::NodeAddress {
+            address_type: "InternalIP".into(),
+            address: "9.9.9.9".into(),
+        }]);
         n.metadata
             .annotations
             .get_or_insert_with(Default::default)
@@ -801,7 +787,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn hostname_is_distinct_from_node_name() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let _k = node_ip_kubelet_h(
@@ -841,7 +827,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn host_ips_follow_node_addresses_without_invented_fallback() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
@@ -884,7 +870,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn node_ips_are_per_kubelet_not_process_global() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let _a = node_ip_kubelet(&dir, storage.clone(), "node-a", &["10.1.1.1"], false).await;
@@ -903,7 +889,7 @@ mod tests {
 
     async fn status_gate_kubelet(
         dir: &tempfile::TempDir,
-        storage: std::sync::Arc<rusternetes_storage::StorageBackend>,
+        storage: std::sync::Arc<k3rs_storage::StorageBackend>,
     ) -> Kubelet {
         let sock = dir.path().join("absent.sock");
         std::env::set_var(
@@ -928,10 +914,10 @@ mod tests {
     }
 
     async fn ready_heartbeat(
-        storage: &rusternetes_storage::StorageBackend,
+        storage: &k3rs_storage::StorageBackend,
     ) -> chrono::DateTime<chrono::Utc> {
-        use rusternetes_storage::{build_key, Storage};
-        let n: rusternetes_common::resources::Node = storage
+        use k3rs_storage::{build_key, Storage};
+        let n: k3rs_common::resources::Node = storage
             .get(&build_key("nodes", None, "node-gate"))
             .await
             .unwrap();
@@ -947,12 +933,12 @@ mod tests {
     }
 
     async fn backdate_ready_heartbeat(
-        storage: &rusternetes_storage::StorageBackend,
+        storage: &k3rs_storage::StorageBackend,
         secs: i64,
     ) -> chrono::DateTime<chrono::Utc> {
-        use rusternetes_storage::{build_key, Storage};
+        use k3rs_storage::{build_key, Storage};
         let key = build_key("nodes", None, "node-gate");
-        let mut n: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let mut n: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         let old = chrono::Utc::now() - chrono::Duration::seconds(secs);
         for c in n.status.as_mut().unwrap().conditions.as_mut().unwrap() {
             c.last_heartbeat_time = Some(old);
@@ -968,7 +954,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn unchanged_node_status_is_not_rewritten_within_report_frequency() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = status_gate_kubelet(&dir, storage.clone()).await;
@@ -987,7 +973,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn quiet_node_is_refreshed_after_report_frequency() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = status_gate_kubelet(&dir, storage.clone())
@@ -1010,14 +996,14 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn changed_node_status_is_written_immediately() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = status_gate_kubelet(&dir, storage.clone()).await;
         k.update_node_status().await.unwrap();
         let old = backdate_ready_heartbeat(&storage, 30).await;
         let key = build_key("nodes", None, "node-gate");
-        let mut n: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let mut n: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         n.status.as_mut().unwrap().daemon_endpoints = None;
         storage.update_status(&key, &n).await.unwrap();
         k.update_node_status().await.unwrap();
@@ -1034,8 +1020,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn node_status_sync_does_not_evict_for_noexecute_taints() {
-        use rusternetes_common::resources::{Node, Pod};
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_common::resources::{Node, Pod};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = status_gate_kubelet(&dir, storage.clone()).await;
@@ -1088,7 +1074,7 @@ mod tests {
     #[serial_test::serial]
     async fn report_frequency_builder_defaults_to_five_minutes() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = std::sync::Arc::new(rusternetes_storage::StorageBackend::new_memory());
+        let storage = std::sync::Arc::new(k3rs_storage::StorageBackend::new_memory());
         let k = status_gate_kubelet(&dir, storage).await;
         assert_eq!(k.node_status_report_frequency, Duration::from_secs(300));
         let k = k.with_node_status_report_frequency(Some(Duration::from_secs(42)));
@@ -1105,7 +1091,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn node_is_not_ready_when_the_cri_runtime_is_absent() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
         std::env::set_var(
@@ -1127,7 +1113,7 @@ mod tests {
         .unwrap();
         k.update_runtime_up().await;
         k.register_node().await.unwrap();
-        let ready = |n: &rusternetes_common::resources::Node| {
+        let ready = |n: &k3rs_common::resources::Node| {
             n.status
                 .as_ref()
                 .unwrap()
@@ -1140,7 +1126,7 @@ mod tests {
                 .unwrap()
         };
         let key = build_key("nodes", None, "node-x");
-        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let node: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         let c = ready(&node);
         assert_eq!(c.status, "False");
         assert_eq!(c.reason.as_deref(), Some("KubeletNotReady"));
@@ -1151,7 +1137,7 @@ mod tests {
         );
         // The heartbeat must not flip it back to True.
         k.update_node_status().await.unwrap();
-        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let node: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         assert_eq!(ready(&node).status, "False");
     }
 
@@ -1166,7 +1152,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn csinode_storage_error_gates_ready_condition() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
         std::env::set_var(
@@ -1198,7 +1184,7 @@ mod tests {
 
         k.register_node().await.unwrap();
         let key = build_key("nodes", None, "node-csi");
-        let ready = |n: &rusternetes_common::resources::Node| {
+        let ready = |n: &k3rs_common::resources::Node| {
             n.status
                 .as_ref()
                 .unwrap()
@@ -1210,7 +1196,7 @@ mod tests {
                 .cloned()
                 .unwrap()
         };
-        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let node: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         let c = ready(&node);
         assert_eq!(c.status, "False");
         assert_eq!(c.reason.as_deref(), Some("KubeletNotReady"));
@@ -1224,7 +1210,7 @@ mod tests {
         // Cleared (CSINode initialised): the heartbeat drops the message.
         k.set_kubelet_error(None);
         k.update_node_status().await.unwrap();
-        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let node: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         let c = ready(&node);
         assert!(!c.message.unwrap().contains("CSINode"));
     }
@@ -1236,7 +1222,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn fast_node_status_update_retries_then_arms_on_timeout() {
-        use rusternetes_storage::{build_key, Storage, StorageBackend};
+        use k3rs_storage::{build_key, Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("absent.sock");
         std::env::set_var(
@@ -1259,7 +1245,7 @@ mod tests {
         k.update_runtime_up().await;
         k.register_node().await.unwrap();
         let key = build_key("nodes", None, "node-fast");
-        let is_ready = |n: &rusternetes_common::resources::Node| {
+        let is_ready = |n: &k3rs_common::resources::Node| {
             n.status
                 .as_ref()
                 .unwrap()
@@ -1269,7 +1255,7 @@ mod tests {
                 .iter()
                 .any(|c| c.condition_type == "Ready" && c.status == "True")
         };
-        let node: rusternetes_common::resources::Node = storage.get(&key).await.unwrap();
+        let node: k3rs_common::resources::Node = storage.get(&key).await.unwrap();
         assert!(!is_ready(&node));
 
         // Runtime still absent: keep retrying, nothing armed.
@@ -1295,24 +1281,30 @@ mod tests {
     /// extended resource added to capacity becomes allocatable.
     #[test]
     fn allocatable_follows_capacity() {
-        let mut status = rusternetes_common::resources::NodeStatus {
+        let mut status = k3rs_common::resources::NodeStatus {
             capacity: resources(&[("cpu", "2"), ("pods", "110")]),
             allocatable: resources(&[("example.com/extended", "1"), ("cpu", "1")]),
             ..Default::default()
         };
-        assert!(rusternetes_kubelet::kubelet::sync_allocatable_with_capacity(&mut status));
+        assert!(k3rs_kubelet::kubelet::sync_allocatable_with_capacity(
+            &mut status
+        ));
         assert_eq!(
             status.allocatable,
             resources(&[("cpu", "2"), ("pods", "110")])
         );
-        assert!(!rusternetes_kubelet::kubelet::sync_allocatable_with_capacity(&mut status));
+        assert!(!k3rs_kubelet::kubelet::sync_allocatable_with_capacity(
+            &mut status
+        ));
 
         status
             .capacity
             .as_mut()
             .unwrap()
             .insert("scheduling.k8s.io/foo".into(), "5".into());
-        assert!(rusternetes_kubelet::kubelet::sync_allocatable_with_capacity(&mut status));
+        assert!(k3rs_kubelet::kubelet::sync_allocatable_with_capacity(
+            &mut status
+        ));
         assert_eq!(
             status.allocatable,
             resources(&[
@@ -1322,12 +1314,12 @@ mod tests {
             ])
         );
     }
-    use rusternetes_common::resources::pod::{PodCondition, PodSpec};
-    use rusternetes_common::resources::{
+    use k3rs_common::resources::pod::{PodCondition, PodSpec};
+    use k3rs_common::resources::{
         Container, ContainerState, ContainerStateRunning, ContainerStateTerminated,
         ContainerStateWaiting, ContainerStatus, Pod, PodStatus,
     };
-    use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
+    use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
 
     #[test]
     fn start_time_is_preserved_once_set() {
@@ -1338,14 +1330,11 @@ mod tests {
         // activeDeadlineSeconds elapsed keeps growing instead of resetting to ~0
         // every sync (which would mean the deadline is never reached).
         assert_eq!(
-            rusternetes_kubelet::kubelet::preserved_start_time(Some(earlier), now),
+            k3rs_kubelet::kubelet::preserved_start_time(Some(earlier), now),
             earlier
         );
         // First Running write (no prior startTime) stamps now.
-        assert_eq!(
-            rusternetes_kubelet::kubelet::preserved_start_time(None, now),
-            now
-        );
+        assert_eq!(k3rs_kubelet::kubelet::preserved_start_time(None, now), now);
     }
 
     #[test]
@@ -1359,11 +1348,11 @@ mod tests {
         };
 
         assert_eq!(
-            rusternetes_kubelet::kubelet::active_deadline_elapsed(Some(&status), 5, now),
+            k3rs_kubelet::kubelet::active_deadline_elapsed(Some(&status), 5, now),
             Some(5)
         );
         assert_eq!(
-            rusternetes_kubelet::kubelet::active_deadline_elapsed(Some(&status), 6, now),
+            k3rs_kubelet::kubelet::active_deadline_elapsed(Some(&status), 6, now),
             None
         );
     }
@@ -1376,15 +1365,11 @@ mod tests {
         };
 
         assert_eq!(
-            rusternetes_kubelet::kubelet::active_deadline_elapsed(
-                Some(&status),
-                5,
-                chrono::Utc::now()
-            ),
+            k3rs_kubelet::kubelet::active_deadline_elapsed(Some(&status), 5, chrono::Utc::now()),
             None
         );
         assert_eq!(
-            rusternetes_kubelet::kubelet::active_deadline_elapsed(None, 5, chrono::Utc::now()),
+            k3rs_kubelet::kubelet::active_deadline_elapsed(None, 5, chrono::Utc::now()),
             None
         );
     }
@@ -1408,12 +1393,14 @@ mod tests {
             }),
             status: Some(PodStatus {
                 phase: Some(Phase::Failed),
-                reason: Some(rusternetes_kubelet::kubelet::ACTIVE_DEADLINE_REASON.to_string()),
+                reason: Some(k3rs_kubelet::kubelet::ACTIVE_DEADLINE_REASON.to_string()),
                 ..Default::default()
             }),
         };
 
-        assert!(rusternetes_kubelet::kubelet::terminal_phase_requires_termination(&pod));
+        assert!(k3rs_kubelet::kubelet::terminal_phase_requires_termination(
+            &pod
+        ));
     }
 
     #[test]
@@ -1440,7 +1427,9 @@ mod tests {
             }),
         };
 
-        assert!(!rusternetes_kubelet::kubelet::terminal_phase_requires_termination(&pod));
+        assert!(!k3rs_kubelet::kubelet::terminal_phase_requires_termination(
+            &pod
+        ));
     }
 
     #[test]
@@ -1498,14 +1487,12 @@ mod tests {
             }),
         };
 
-        assert!(
-            rusternetes_kubelet::kubelet::init_container_failed_terminally(
-                &pod,
-                pod.status
-                    .as_ref()
-                    .and_then(|status| status.init_container_statuses.as_deref())
-            )
-        );
+        assert!(k3rs_kubelet::kubelet::init_container_failed_terminally(
+            &pod,
+            pod.status
+                .as_ref()
+                .and_then(|status| status.init_container_statuses.as_deref())
+        ));
     }
 
     // Regression: a restartPolicy=Never pod with NO init containers must not be
@@ -1562,14 +1549,12 @@ mod tests {
             }),
         };
 
-        assert!(
-            !rusternetes_kubelet::kubelet::init_container_failed_terminally(
-                &pod,
-                pod.status
-                    .as_ref()
-                    .and_then(|status| status.init_container_statuses.as_deref())
-            )
-        );
+        assert!(!k3rs_kubelet::kubelet::init_container_failed_terminally(
+            &pod,
+            pod.status
+                .as_ref()
+                .and_then(|status| status.init_container_statuses.as_deref())
+        ));
     }
 
     // Regression for NodeConformance "[sig-node] InitContainer should not start
@@ -1632,7 +1617,7 @@ mod tests {
             stop_signal: None,
         }];
         assert_eq!(
-            rusternetes_kubelet::kubelet::app_container_waiting_reason(&pod, Some(&init_statuses)),
+            k3rs_kubelet::kubelet::app_container_waiting_reason(&pod, Some(&init_statuses)),
             "PodInitializing",
             "app container blocked behind a failed init container must be PodInitializing"
         );
@@ -1692,7 +1677,7 @@ mod tests {
             stop_signal: None,
         }];
         assert_eq!(
-            rusternetes_kubelet::kubelet::app_container_waiting_reason(&pod, Some(&init_statuses)),
+            k3rs_kubelet::kubelet::app_container_waiting_reason(&pod, Some(&init_statuses)),
             "ContainerCreating"
         );
     }
@@ -1717,7 +1702,7 @@ mod tests {
             status: None,
         };
         assert_eq!(
-            rusternetes_kubelet::kubelet::app_container_waiting_reason(&pod, None),
+            k3rs_kubelet::kubelet::app_container_waiting_reason(&pod, None),
             "ContainerCreating"
         );
     }
@@ -1729,7 +1714,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn create_error_status_is_generated_from_prior_status() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage, "node-ce", &["10.1.1.1"], false).await;
@@ -1738,7 +1723,7 @@ mod tests {
         pod.status = Some(PodStatus {
             phase: Some(Phase::Pending),
             start_time: Some(t0),
-            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+            conditions: Some(vec![k3rs_common::resources::PodCondition {
                 condition_type: "DisruptionTarget".into(),
                 status: "True".into(),
                 reason: None,
@@ -1784,9 +1769,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn sync_loop_skips_iteration_on_runtime_errors_with_backoff() {
-        use rusternetes_cri::v1;
-        use rusternetes_kubelet::kubelet::SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE as BASE;
-        use rusternetes_storage::StorageBackend;
+        use k3rs_cri::v1;
+        use k3rs_kubelet::kubelet::SYNC_LOOP_RUNTIME_ERROR_BACKOFF_BASE as BASE;
+        use k3rs_storage::StorageBackend;
         use std::time::Duration;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
@@ -1827,8 +1812,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn volume_wait_status_is_generated_from_prior_status() {
-        use rusternetes_common::resources::ContainerStatus;
-        use rusternetes_storage::StorageBackend;
+        use k3rs_common::resources::ContainerStatus;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage, "node-vw", &["10.1.1.1"], false).await;
@@ -1840,7 +1825,7 @@ mod tests {
             pod_ip: Some("10.2.0.9".into()),
             qos_class: Some("Burstable".into()),
             start_time: Some(t0),
-            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+            conditions: Some(vec![k3rs_common::resources::PodCondition {
                 condition_type: "DisruptionTarget".into(),
                 status: "True".into(),
                 reason: None,
@@ -1896,7 +1881,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn init_failure_status_applies_host_ips_to_host_network_pod() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
@@ -1950,7 +1935,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn app_start_error_status_applies_host_ips_to_host_network_pod() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
@@ -1969,7 +1954,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn liveness_restart_status_applies_host_ips_to_host_network_pod() {
-        use rusternetes_storage::StorageBackend;
+        use k3rs_storage::StorageBackend;
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage, "node-hn", &["10.1.1.1"], false).await;
@@ -2072,7 +2057,7 @@ mod tests {
             &pod,
             (
                 Some("10.0.0.1".to_string()),
-                Some(vec![rusternetes_common::resources::pod::HostIP {
+                Some(vec![k3rs_common::resources::pod::HostIP {
                     ip: "10.0.0.1".to_string(),
                 }]),
             ),
@@ -2118,7 +2103,7 @@ mod tests {
 
     #[test]
     fn terminal_finalize_backoff_grows_then_caps() {
-        use rusternetes_kubelet::kubelet::{
+        use k3rs_kubelet::kubelet::{
             terminal_finalize_backoff, TERMINAL_FINALIZE_BACKOFF_INITIAL,
             TERMINAL_FINALIZE_BACKOFF_MAX,
         };
@@ -2166,9 +2151,9 @@ mod tests {
         }
     }
 
-    fn make_node_lease(node_name: &str) -> rusternetes_common::resources::Lease {
-        rusternetes_common::resources::Lease::new(node_name, "kube-node-lease").with_spec(
-            rusternetes_common::resources::LeaseSpec {
+    fn make_node_lease(node_name: &str) -> k3rs_common::resources::Lease {
+        k3rs_common::resources::Lease::new(node_name, "kube-node-lease").with_spec(
+            k3rs_common::resources::LeaseSpec {
                 holder_identity: Some(node_name.to_string()),
                 lease_duration_seconds: Some(40),
                 acquire_time: Some(chrono::Utc::now()),
@@ -2235,10 +2220,9 @@ mod tests {
     #[test]
     fn apply_node_lease_owner_ref_backfills_stale_uid() {
         let mut lease = make_node_lease("node-c");
-        lease.metadata.owner_references =
-            Some(vec![rusternetes_common::types::OwnerReference::new(
-                "v1", "Node", "node-c", "old-uid",
-            )]);
+        lease.metadata.owner_references = Some(vec![k3rs_common::types::OwnerReference::new(
+            "v1", "Node", "node-c", "old-uid",
+        )]);
 
         let mutated = Kubelet::apply_node_lease_owner_ref(&mut lease, "node-c", "new-uid");
 
@@ -2506,7 +2490,7 @@ mod tests {
 
     #[test]
     fn readiness_gates_gate_ready_until_condition_true() {
-        use rusternetes_common::resources::pod::PodReadinessGate;
+        use k3rs_common::resources::pod::PodReadinessGate;
 
         let gated_spec = || PodSpec {
             containers: vec![make_container("app")],
@@ -2533,23 +2517,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(rusternetes_kubelet::kubelet::readiness_gates_satisfied(
-            &no_gates
-        ));
+        assert!(k3rs_kubelet::kubelet::readiness_gates_satisfied(&no_gates));
 
         // Gate present but no matching condition -> NOT satisfied (this is the
         // "initially Ready=False" case the conformance suite checks).
         let pending = with_status(gated_spec(), vec![cond("ContainersReady", "True", now)]);
-        assert!(!rusternetes_kubelet::kubelet::readiness_gates_satisfied(
-            &pending
-        ));
+        assert!(!k3rs_kubelet::kubelet::readiness_gates_satisfied(&pending));
 
         // Gate condition present but False -> NOT satisfied.
         let gate_false = with_status(
             gated_spec(),
             vec![cond("www.example.com/feature-1", "False", now)],
         );
-        assert!(!rusternetes_kubelet::kubelet::readiness_gates_satisfied(
+        assert!(!k3rs_kubelet::kubelet::readiness_gates_satisfied(
             &gate_false
         ));
 
@@ -2558,9 +2538,7 @@ mod tests {
             gated_spec(),
             vec![cond("www.example.com/feature-1", "True", now)],
         );
-        assert!(rusternetes_kubelet::kubelet::readiness_gates_satisfied(
-            &gate_true
-        ));
+        assert!(k3rs_kubelet::kubelet::readiness_gates_satisfied(&gate_true));
 
         // #2384: the verdict depends on WHICH snapshot is evaluated. The
         // cycle-start pod (stale) lacks a gate condition patched mid-cycle;
@@ -2574,12 +2552,8 @@ mod tests {
                 cond("www.example.com/feature-1", "True", now),
             ],
         );
-        assert!(!rusternetes_kubelet::kubelet::readiness_gates_satisfied(
-            &stale
-        ));
-        assert!(rusternetes_kubelet::kubelet::readiness_gates_satisfied(
-            &fresh
-        ));
+        assert!(!k3rs_kubelet::kubelet::readiness_gates_satisfied(&stale));
+        assert!(k3rs_kubelet::kubelet::readiness_gates_satisfied(&fresh));
     }
 
     /// #2387 (red-first for #2384): drive the per-cycle readiness block without
@@ -2588,8 +2562,8 @@ mod tests {
     /// evaluate gates on the re-read pod.
     #[tokio::test]
     async fn readiness_cycle_evaluates_gates_on_reread_pod() {
-        use rusternetes_common::resources::pod::{PodReadinessGate, PodSpec};
-        use rusternetes_storage::{build_key, Storage};
+        use k3rs_common::resources::pod::{PodReadinessGate, PodSpec};
+        use k3rs_storage::{build_key, Storage};
         let now = chrono::Utc::now();
         let spec = || PodSpec {
             containers: vec![make_container("app")],
@@ -2612,7 +2586,7 @@ mod tests {
             cond("ContainersReady", "True", now),
             cond("www.example.com/feature-1", "True", now),
         ]);
-        let storage = rusternetes_storage::memory::MemoryStorage::new();
+        let storage = k3rs_storage::memory::MemoryStorage::new();
         let key = build_key("pods", Some("ns"), "pod-ready");
         storage.create(&key, &fresh).await.unwrap();
 
@@ -2622,38 +2596,34 @@ mod tests {
         .unwrap();
 
         // Stale snapshot alone: gate unsatisfied.
-        let (cr, ready) =
-            rusternetes_kubelet::kubelet::evaluate_pod_readiness(&stale, &statuses, None);
+        let (cr, ready) = k3rs_kubelet::kubelet::evaluate_pod_readiness(&stale, &statuses, None);
         assert!(cr);
         assert!(!ready);
 
         // The cycle re-reads the pod from storage and evaluates on that.
         let rp =
-            rusternetes_kubelet::kubelet::load_readiness_pod(&storage, "ns", "pod-ready", &stale)
-                .await;
-        let (cr, ready) =
-            rusternetes_kubelet::kubelet::evaluate_pod_readiness(&rp, &statuses, None);
+            k3rs_kubelet::kubelet::load_readiness_pod(&storage, "ns", "pod-ready", &stale).await;
+        let (cr, ready) = k3rs_kubelet::kubelet::evaluate_pod_readiness(&rp, &statuses, None);
         assert!(cr);
         assert!(ready, "gates must be evaluated on the re-read pod");
 
         // Storage miss falls back to the cycle-start pod.
         let missing =
-            rusternetes_kubelet::kubelet::load_readiness_pod(&storage, "ns", "absent", &stale)
-                .await;
-        assert!(!rusternetes_kubelet::kubelet::evaluate_pod_readiness(&missing, &statuses, None).1);
+            k3rs_kubelet::kubelet::load_readiness_pod(&storage, "ns", "absent", &stale).await;
+        assert!(!k3rs_kubelet::kubelet::evaluate_pod_readiness(&missing, &statuses, None).1);
 
         // A not-ready container holds both conditions false.
         let mut unready = statuses.clone();
         unready[0].ready = false;
         assert_eq!(
-            rusternetes_kubelet::kubelet::evaluate_pod_readiness(&rp, &unready, None),
+            k3rs_kubelet::kubelet::evaluate_pod_readiness(&rp, &unready, None),
             (false, false)
         );
     }
 
     #[test]
     fn spec_has_readiness_probe_includes_sidecars() {
-        use rusternetes_common::resources::pod::{PodSpec, Probe};
+        use k3rs_common::resources::pod::{PodSpec, Probe};
 
         // A restartable init container (sidecar) with a readiness probe gates
         // pod readiness (#1069).
@@ -2665,18 +2635,14 @@ mod tests {
             init_containers: Some(vec![sidecar]),
             ..Default::default()
         };
-        assert!(rusternetes_kubelet::kubelet::spec_has_readiness_probe(
-            &spec
-        ));
+        assert!(k3rs_kubelet::kubelet::spec_has_readiness_probe(&spec));
 
         // No readiness probe anywhere -> not gated.
         let spec_none = PodSpec {
             containers: vec![make_container("app")],
             ..Default::default()
         };
-        assert!(!rusternetes_kubelet::kubelet::spec_has_readiness_probe(
-            &spec_none
-        ));
+        assert!(!k3rs_kubelet::kubelet::spec_has_readiness_probe(&spec_none));
 
         // A regular container's readiness probe still gates.
         let mut app = make_container("app");
@@ -2685,9 +2651,7 @@ mod tests {
             containers: vec![app],
             ..Default::default()
         };
-        assert!(rusternetes_kubelet::kubelet::spec_has_readiness_probe(
-            &spec_reg
-        ));
+        assert!(k3rs_kubelet::kubelet::spec_has_readiness_probe(&spec_reg));
 
         // A plain (non-restartable) init container's probe does NOT gate.
         let mut plain_init = make_container("init");
@@ -2697,7 +2661,7 @@ mod tests {
             init_containers: Some(vec![plain_init]),
             ..Default::default()
         };
-        assert!(!rusternetes_kubelet::kubelet::spec_has_readiness_probe(
+        assert!(!k3rs_kubelet::kubelet::spec_has_readiness_probe(
             &spec_plain
         ));
     }
@@ -2903,8 +2867,8 @@ mod tests {
     /// Verify that allocatedResources is populated from spec resources after resize.
     #[test]
     fn test_resize_populates_allocated_resources() {
-        use rusternetes_common::resources::pod::PodSpec;
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::resources::pod::PodSpec;
+        use k3rs_common::types::ResourceRequirements;
         use std::collections::HashMap;
 
         let mut requests = HashMap::new();
@@ -3359,11 +3323,11 @@ mod tests {
         let mut pod = host_network_pod_for_3687(name);
         pod.metadata.uid = uid.to_string();
         pod.metadata.generation = Some(3);
-        pod.status = Some(rusternetes_common::resources::PodStatus {
+        pod.status = Some(k3rs_common::resources::PodStatus {
             phase: Some(phase),
             reason: Some("Keep".to_string()),
             message: Some("kept".to_string()),
-            conditions: Some(vec![rusternetes_common::resources::PodCondition {
+            conditions: Some(vec![k3rs_common::resources::PodCondition {
                 condition_type: "DisruptionTarget".to_string(),
                 status: "True".to_string(),
                 reason: Some("DeletionByTaintManager".to_string()),
@@ -3383,7 +3347,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_status_goes_through_generate_api_pod_status() {
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
@@ -3411,7 +3375,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_status_keeps_a_failed_phase() {
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
@@ -3430,7 +3394,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_status_skips_a_recreated_pod() {
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-t", &["10.1.1.1"], false).await;
@@ -3453,8 +3417,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn natural_completion_status_goes_through_generate_api_pod_status() {
-        use rusternetes_kubelet::kubelet::TerminalStatus;
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_kubelet::kubelet::TerminalStatus;
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
@@ -3463,7 +3427,7 @@ mod tests {
         pod.status.as_mut().unwrap().message = None;
         let key = "/registry/pods/default/n1";
         storage.create(key, &pod).await.unwrap();
-        let cs: rusternetes_common::resources::ContainerStatus = serde_json::from_value(
+        let cs: k3rs_common::resources::ContainerStatus = serde_json::from_value(
             serde_json::json!({"name": "app", "ready": false, "restartCount": 0}),
         )
         .unwrap();
@@ -3474,7 +3438,7 @@ mod tests {
                 phase: Phase::Failed,
                 message: Some("Pod failed".to_string()),
                 container_statuses: Some(vec![cs]),
-                kubelet_conditions: Some(vec![rusternetes_common::resources::PodCondition {
+                kubelet_conditions: Some(vec![k3rs_common::resources::PodCondition {
                     condition_type: "Ready".to_string(),
                     status: "False".to_string(),
                     reason: Some("PodCompleted".to_string()),
@@ -3506,8 +3470,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn never_completion_adjusts_ready_conditions() {
-        use rusternetes_kubelet::kubelet::TerminalStatus;
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_kubelet::kubelet::TerminalStatus;
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
@@ -3554,8 +3518,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn natural_completion_respects_terminal_phase_and_uid() {
-        use rusternetes_kubelet::kubelet::TerminalStatus;
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_kubelet::kubelet::TerminalStatus;
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-n", &["10.1.1.1"], false).await;
@@ -3598,7 +3562,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn reject_pod_publishes_minimal_failed_status() {
-        use rusternetes_storage::{Storage, StorageBackend};
+        use k3rs_storage::{Storage, StorageBackend};
         let dir = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(StorageBackend::new_memory());
         let k = node_ip_kubelet(&dir, storage.clone(), "node-r", &["10.1.1.1"], false).await;
@@ -3650,15 +3614,15 @@ mod sync_pod_fake_cri_tests {
     //! `newTestKubelet` (`kubelet_test.go:174`): a whole kubelet wired to fake
     //! runtime + storage, with no real container runtime.
     //!
-    //! Deliberate deviation (documented on `Kubelet::pod_sync_locks`): rusternetes
+    //! Deliberate deviation (documented on `Kubelet::pod_sync_locks`): k3rs
     //! keys a name-based skip-and-retry lock instead of upstream's per-UID worker
     //! goroutines, so a second concurrent sync is *skipped* (returns `Ok`) and
     //! retried by a later reconcile, rather than queued.
 
-    use rusternetes_common::resources::Pod;
-    use rusternetes_cri::fake::FakeCri;
-    use rusternetes_kubelet::kubelet::Kubelet;
-    use rusternetes_storage::{Storage, StorageBackend};
+    use k3rs_common::resources::Pod;
+    use k3rs_cri::fake::FakeCri;
+    use k3rs_kubelet::kubelet::Kubelet;
+    use k3rs_storage::{Storage, StorageBackend};
     use std::sync::Arc;
 
     /// Test constructor for a [`Kubelet`] on a fake CRI socket + memory storage
@@ -3907,10 +3871,7 @@ mod sync_pod_fake_cri_tests {
             b.unwrap();
             let stored: Pod = t.storage.get("/registry/pods/default/web-0").await.unwrap();
             let status = stored.status.expect("kubelet wrote a status");
-            assert_eq!(
-                status.phase,
-                Some(rusternetes_common::types::Phase::Running)
-            );
+            assert_eq!(status.phase, Some(k3rs_common::types::Phase::Running));
             assert_eq!(status.pod_ip.as_deref(), Some("192.168.192.168"));
         });
     }
@@ -3933,7 +3894,7 @@ mod sync_pod_fake_cri_tests {
         // are stopped (StopContainer), then the sandbox is stopped.
         //
         // Deliberate divergence, pinned here: upstream leaves the stopped
-        // sandbox/containers for container GC (`kuberuntime_gc.go`); rusternetes
+        // sandbox/containers for container GC (`kuberuntime_gc.go`); k3rs
         // `stop_pod_for` also issues RemovePodSandbox (which drops the sandbox's
         // containers in the runtime). No standalone RemoveContainer is sent.
         run(|| async {

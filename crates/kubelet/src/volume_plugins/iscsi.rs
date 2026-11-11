@@ -38,11 +38,11 @@ use super::{
 };
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     ISCSIVolumeSource, PersistentVolumeAccessMode, PersistentVolumeMode,
 };
-use rusternetes_common::resources::{Pod, Secret};
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::resources::{Pod, Secret};
+use k3rs_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -361,8 +361,8 @@ impl VolumePlugin for IscsiPlugin {
             }}),
         )?;
         // `iscsi.go:270-294`: the `-o context=` the pod mount carries.
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             reconstructed.selinux_mount_context = self
                 .host
@@ -599,8 +599,8 @@ impl super::Mounter for IscsiDiskMounter {
             error!("iscsi: failed to setup");
         }
 
-        if rusternetes_common::feature_gates::enabled(
-            rusternetes_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
+        if k3rs_common::feature_gates::enabled(
+            k3rs_common::feature_gates::Feature::SELinuxMountReadWriteOncePod,
         ) {
             // The volume must have been mounted in MountDevice with -o context.
             // TODO: extract from mount table in GetAttributes() to be sure?
@@ -978,14 +978,13 @@ fn create_persistent_volume_from_iscsi_pv_source(
     volume_name: &str,
     iscsi: ISCSIVolumeSource,
 ) -> Result<OwnedSpec> {
-    let pv: rusternetes_common::resources::PersistentVolume =
-        serde_json::from_value(serde_json::json!({
-            "metadata": {"name": volume_name},
-            "spec": {"iscsi": serde_json::to_value(&iscsi)?, "volumeMode": "Block"}
-        }))?;
+    let pv: k3rs_common::resources::PersistentVolume = serde_json::from_value(serde_json::json!({
+        "metadata": {"name": volume_name},
+        "spec": {"iscsi": serde_json::to_value(&iscsi)?, "volumeMode": "Block"}
+    }))?;
     // `volume.NewSpecFromPersistentVolume(iscsiPV, false)` (`iscsi.go:710`):
     // our `Spec` needs a `Volume`, named after the PV (see `Spec::name`).
-    let volume: rusternetes_common::resources::Volume =
+    let volume: k3rs_common::resources::Volume =
         serde_json::from_value(serde_json::json!({"name": volume_name}))?;
     Ok(OwnedSpec {
         volume,

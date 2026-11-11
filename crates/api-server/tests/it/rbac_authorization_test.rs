@@ -7,7 +7,7 @@
 //! `SubjectAccessReview` endpoint to assert the authorizer decision surface.
 //!
 //! The harness wires `ApiServerState` with the real
-//! `rusternetes_common::authz::RBACAuthorizer` backed by a fresh
+//! `k3rs_common::authz::RBACAuthorizer` backed by a fresh
 //! `MemoryStorage`. `skip_auth = true` injects the calling identity
 //! `admin`/`system:masters`; a pre-seeded `ClusterRoleBinding` named
 //! `test-bootstrap-admin` grants that identity `cluster-admin`-equivalent
@@ -28,21 +28,21 @@
 //! - `rolebinding_create_blocked_when_caller_lacks_escalate` — upstream
 //!   `pkg/registry/rbac/rest/rest.go` validates that the caller possesses
 //!   every PolicyRule contained in the bound Role (or the `escalate` verb)
-//!   before allowing a `RoleBinding` POST. The rusternetes handler currently
+//!   before allowing a `RoleBinding` POST. The k3rs handler currently
 //!   has no escalation check, so the assertion that the POST returns 403 is
 //!   `#[ignore]`d.
 
 #![allow(clippy::too_many_lines)]
 
-use rusternetes_common::{
+use k3rs_common::{
     auth::UserInfo,
     authz::{Authorizer, Decision, RBACAuthorizer, RequestAttributes},
     resources::{ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject},
     types::{ObjectMeta, TypeMeta},
 };
-use rusternetes_controller_manager::controllers::clusterrole_aggregation::ClusterRoleAggregationController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_controller_manager::controllers::clusterrole_aggregation::ClusterRoleAggregationController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -1169,7 +1169,7 @@ async fn rbac_namespace_isolation_role_vs_clusterrole() {
 /// drive this directly against `RBACAuthorizer::authorize` because the SAR
 /// endpoint surfaces only resource attributes — upstream's
 /// `SubjectAccessReview` has a separate `nonResourceAttributes` carrier which
-/// the rusternetes handler already reads.
+/// the k3rs handler already reads.
 #[tokio::test]
 async fn rbac_non_resource_url_rule_grants_path_get() {
     let (_state, mem, backend) = spawn_state().await;

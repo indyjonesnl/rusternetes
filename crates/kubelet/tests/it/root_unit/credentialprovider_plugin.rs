@@ -1,7 +1,7 @@
 //! Ports of `pkg/credentialprovider/plugin/config_test.go`
 //! (`Test_readCredentialProviderConfig`, `Test_validateCredentialProviderConfig`)
 //! and the checks of `RegisterCredentialProviderPlugins`.
-use rusternetes_kubelet::credentialprovider_plugin::*;
+use k3rs_kubelet::credentialprovider_plugin::*;
 use std::os::unix::fs::PermissionsExt;
 
 const V1ALPHA1: &str = r#"---
@@ -331,7 +331,7 @@ fn registration_checks_bin_dir_validation_and_binaries() {
 
 mod provide {
     use super::*;
-    use rusternetes_kubelet::credentialprovider::AuthConfig;
+    use k3rs_kubelet::credentialprovider::AuthConfig;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};

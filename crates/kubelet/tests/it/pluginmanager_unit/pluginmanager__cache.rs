@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::pluginmanager::cache::*;
+    use k3rs_kubelet::pluginmanager::cache::*;
 
     fn actual(path: &str, uuid: &str) -> PluginInfo {
         PluginInfo {

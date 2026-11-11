@@ -6,11 +6,11 @@ mod __parent {
     pub use chrono::Utc;
     pub use futures::StreamExt;
     pub use ipnet::IpNet;
-    pub use rusternetes_common::resources::{
+    pub use k3rs_common::resources::{
         IPAddress, ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus,
     };
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
     pub use std::net::IpAddr;
     pub use std::sync::Arc;
     pub use std::time::Duration;
@@ -20,7 +20,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::servicecidr::*;
+    use k3rs_controller_manager::controllers::servicecidr::*;
 
     #[test]
     fn network_and_broadcast_addresses_are_not_contained() {
@@ -53,7 +53,7 @@ mod tests {
     fn ip(addr: &str, managed_by: Option<&str>) -> IPAddress {
         let mut ip = IPAddress::new(
             addr,
-            rusternetes_common::resources::ParentReference {
+            k3rs_common::resources::ParentReference {
                 group: None,
                 resource: "services".to_string(),
                 namespace: Some("default".to_string()),

@@ -1,9 +1,9 @@
 // Automated Cluster Startup Tests
 // These tests verify that cluster components can start cleanly and communicate
 
-use rusternetes_common::auth::TokenManager;
-use rusternetes_common::observability::MetricsRegistry;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::auth::TokenManager;
+use k3rs_common::observability::MetricsRegistry;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 /// Setup test environment with in-memory storage
@@ -65,7 +65,7 @@ async fn test_storage_connectivity() {
 
 #[tokio::test]
 async fn test_token_manager_initialization() {
-    use rusternetes_common::auth::ServiceAccountClaims;
+    use k3rs_common::auth::ServiceAccountClaims;
 
     // Test that TokenManager can be initialized with a secret
     let secret = b"test-secret-for-jwt-tokens";
@@ -99,8 +99,8 @@ async fn test_rbac_authorizer_initialization() {
     // Note: RBACAuthorizer requires storage backend
     // This test verifies the pattern but uses AlwaysAllowAuthorizer instead
 
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_common::authz::{AlwaysAllowAuthorizer, Authorizer, RequestAttributes};
+    use k3rs_common::auth::UserInfo;
+    use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer, RequestAttributes};
 
     let authorizer = AlwaysAllowAuthorizer;
 
@@ -120,10 +120,8 @@ async fn test_rbac_authorizer_initialization() {
 #[tokio::test]
 async fn test_always_allow_authorizer_initialization() {
     // Test AlwaysAllowAuthorizer for development mode
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_common::authz::{
-        AlwaysAllowAuthorizer, Authorizer, Decision, RequestAttributes,
-    };
+    use k3rs_common::auth::UserInfo;
+    use k3rs_common::authz::{AlwaysAllowAuthorizer, Authorizer, Decision, RequestAttributes};
 
     let authorizer = AlwaysAllowAuthorizer;
 
@@ -306,7 +304,7 @@ async fn test_storage_error_handling() {
 
 #[tokio::test]
 async fn test_component_startup_order() {
-    use rusternetes_common::auth::ServiceAccountClaims;
+    use k3rs_common::auth::ServiceAccountClaims;
 
     // Simulate component startup in correct order
 
@@ -327,7 +325,7 @@ async fn test_component_startup_order() {
     assert!(token.is_ok(), "TokenManager should initialize");
 
     // 3. Authorizer can be initialized (using AlwaysAllow for testing)
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
     let _authorizer = AlwaysAllowAuthorizer;
 
     // 4. Metrics can initialize independently

@@ -10,8 +10,8 @@
 
 use std::sync::LazyLock;
 
+use k3rs_common::audit::AuditLevel;
 use prometheus::{register, IntCounter, IntCounterVec, Opts};
-use rusternetes_common::audit::AuditLevel;
 
 fn opts(name: &str, help: &str) -> Opts {
     Opts::new(name, help)

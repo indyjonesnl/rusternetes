@@ -10,10 +10,10 @@
 //!
 //! Harness mirrors `list_resource_version_router_test.rs`.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::json;
 
-// Harness: `TestApiServer` (rusternetes-test-support) — `build_router` on
+// Harness: `TestApiServer` (k3rs-test-support) — `build_router` on
 // `MemoryStorage` with `--skip-auth`, driven via `tower::oneshot`.
 
 #[tokio::test]

@@ -3,13 +3,13 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_common::quantity::Quantity;
-    pub use rusternetes_common::resources::service_account::ObjectReference;
-    pub use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-    pub use rusternetes_common::resources::{EventSource, EventType};
-    pub use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
-    pub use rusternetes_controller_manager::controllers::worker_pool::spawn_workers;
-    pub use rusternetes_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
+    pub use k3rs_common::quantity::Quantity;
+    pub use k3rs_common::resources::service_account::ObjectReference;
+    pub use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+    pub use k3rs_common::resources::{EventSource, EventType};
+    pub use k3rs_common::resources::{PersistentVolume, PersistentVolumeClaim};
+    pub use k3rs_controller_manager::controllers::worker_pool::spawn_workers;
+    pub use k3rs_storage::{build_key, extract_key, EventRecorder, Storage, WorkQueue};
     pub use std::sync::Arc;
     pub use std::time::Duration;
     pub use tokio::time;
@@ -18,9 +18,9 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::Event;
-    use rusternetes_controller_manager::controllers::volume_expansion::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_common::resources::Event;
+    use k3rs_controller_manager::controllers::volume_expansion::*;
+    use k3rs_storage::memory::MemoryStorage;
     use std::collections::HashMap;
 
     // Port of `TestSyncHandler` (pkg/controller/volume/expand/expand_controller_test.go:48-157)

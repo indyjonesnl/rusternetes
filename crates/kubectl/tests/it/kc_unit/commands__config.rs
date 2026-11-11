@@ -3,16 +3,16 @@
 
 mod __parent {
     pub use anyhow::Result;
-    pub use rusternetes_client::kubeconfig::{
+    pub use k3rs_client::kubeconfig::{
         Cluster, ClusterEntry, Context, ContextEntry, KubeConfig, User, UserEntry,
     };
-    pub use rusternetes_kubectl::types::ConfigCommands;
+    pub use k3rs_kubectl::types::ConfigCommands;
     pub use std::path::PathBuf;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::config::*;
+    use k3rs_kubectl::commands::config::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

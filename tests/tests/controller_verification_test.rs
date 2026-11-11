@@ -1,11 +1,11 @@
 // Controller Behavior Verification Test
-// This test verifies that Rusternetes controllers behave exactly like Kubernetes controllers
+// This test verifies that k3rs controllers behave exactly like Kubernetes controllers
 
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta, LabelSelector};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::job::JobController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::*;
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta, LabelSelector};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::job::JobController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};

@@ -21,7 +21,7 @@
 //! The prior-art file `watch_delete_test.rs` documents the same constraint
 //! and drives the handler helpers directly. We follow that pattern here:
 //! exercise `MemoryStorage` plus the public surface of `handlers::filtering`,
-//! `handlers::watch`, and the resource types in `rusternetes_common` to
+//! `handlers::watch`, and the resource types in `k3rs_common` to
 //! validate the same wire-level semantics that the upstream Ginkgo tests
 //! observe through the REST surface.
 //!
@@ -73,14 +73,14 @@
 //! treat this file as audited.
 //!
 
-use rusternetes_api_server::handlers::filtering::apply_selectors;
-use rusternetes_api_server::handlers::watch::{
+use k3rs_api_server::handlers::filtering::apply_selectors;
+use k3rs_api_server::handlers::watch::{
     build_delete_fallback_json, extract_rv_from_json, is_watch_request, normalize_resource_version,
     K8sWatchEvent, WatchEventType,
 };
-use rusternetes_common::resources::{ConfigMap, Namespace};
-use rusternetes_common::types::{DeletionPropagation, ListMeta, ObjectMeta, OwnerReference};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
+use k3rs_common::resources::{ConfigMap, Namespace};
+use k3rs_common::types::{DeletionPropagation, ListMeta, ObjectMeta, OwnerReference};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, WatchEvent};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -107,7 +107,7 @@ fn cm(name: &str, namespace: &str, labels: &[(&str, &str)]) -> ConfigMap {
 }
 
 /// Build the registry storage key for a configmap (delegates to
-/// `rusternetes_storage::build_key` so the prefix stays in sync with the
+/// `k3rs_storage::build_key` so the prefix stays in sync with the
 /// rest of the codebase).
 fn cm_key(namespace: &str, name: &str) -> String {
     build_key("configmaps", Some(namespace), name)
@@ -997,7 +997,7 @@ async fn gc_background_deletion_leaves_no_orphan_dependents() {
 /// scan with the relevant ownerReference gone.
 #[tokio::test]
 async fn gc_orphan_propagation_should_strip_owner_refs_not_delete() {
-    use rusternetes_controller_manager::controllers::garbage_collector::GarbageCollector;
+    use k3rs_controller_manager::controllers::garbage_collector::GarbageCollector;
 
     // -----------------------------------------------------------------
     // Arrange — owner is being deleted with propagationPolicy=Orphan.
@@ -1205,7 +1205,7 @@ async fn gc_delete_then_list_reflects_removal() {
 /// the same constraint recorded on the ServiceAccount lifecycle mirror.
 #[tokio::test]
 async fn watch_selector_exit_surfaces_as_deleted() {
-    use rusternetes_api_server::handlers::watch::watch_modified_event_type;
+    use k3rs_api_server::handlers::watch::watch_modified_event_type;
 
     let selector = Some("watch-this=yes".to_string());
     let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();

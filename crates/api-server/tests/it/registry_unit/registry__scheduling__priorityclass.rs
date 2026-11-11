@@ -3,29 +3,27 @@
 
 mod __parent {
     pub use async_trait::async_trait;
-    pub use rusternetes_api_server::registry::generic::{
-        CreateOptions, Deleted, Store, UpdateOptions,
-    };
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::{CreateOptions, Deleted, Store, UpdateOptions};
+    pub use k3rs_api_server::registry::rest::{
         DeletedCollection, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestStorage, RestUpdateStrategy, UpdatedObjectInfo,
         ValidateObject, ValidateObjectUpdate,
     };
-    pub use rusternetes_common::deletion::DeleteOptions;
-    pub use rusternetes_common::resources::PriorityClass;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::priorityclass::{
+    pub use k3rs_common::deletion::DeleteOptions;
+    pub use k3rs_common::resources::PriorityClass;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::priorityclass::{
         validate_priority_class, validate_priority_class_update,
     };
-    pub use rusternetes_common::{Error, Result};
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::{Error, Result};
+    pub use k3rs_storage::StorageBackend;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::scheduling::priorityclass::*;
+    use k3rs_api_server::registry::scheduling::priorityclass::*;
 
     fn pc(name: &str, value: i32) -> PriorityClass {
         let mut pc: PriorityClass = serde_json::from_value(serde_json::json!({

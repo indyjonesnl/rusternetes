@@ -1,5 +1,5 @@
-use rusternetes_common::resources::certificates::CertificateSigningRequest;
-use rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_create;
+use k3rs_common::resources::certificates::CertificateSigningRequest;
+use k3rs_common::validation::certificatesigningrequest::validate_certificate_signing_request_create;
 use serde_json::json;
 
 fn csr(spec: serde_json::Value) -> CertificateSigningRequest {
@@ -145,7 +145,7 @@ fn unknown_usage_not_supported_on_create() {
     let errs = validate_certificate_signing_request_create(&csr(s));
     assert!(
         errs.iter().any(|e| e.error_type
-            == rusternetes_common::validation::field::ErrorType::NotSupported
+            == k3rs_common::validation::field::ErrorType::NotSupported
             && e.field == "spec.usages[1]"),
         "{errs:?}"
     );
@@ -154,7 +154,7 @@ fn unknown_usage_not_supported_on_create() {
 #[test]
 fn unknown_usage_tolerated_on_update_when_old_had_it() {
     // validation.go:439-446 `allowUnknownUsages(oldCSR)`.
-    use rusternetes_common::validation::certificatesigningrequest::validate_certificate_signing_request_update_main;
+    use k3rs_common::validation::certificatesigningrequest::validate_certificate_signing_request_update_main;
     let mut s = valid_spec();
     s["usages"] = json!(["client auth", "teleport"]);
     let old = csr(s.clone());

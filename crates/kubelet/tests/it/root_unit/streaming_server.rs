@@ -8,24 +8,24 @@ mod __parent {
         http::StatusCode,
         response::{IntoResponse, Response},
     };
-    pub use rusternetes_common::resources::Pod;
-    pub use rusternetes_common::types::ObjectMeta;
+    pub use k3rs_common::resources::Pod;
+    pub use k3rs_common::types::ObjectMeta;
     pub use tracing::{info, warn};
 }
 
 mod run_checkpoint_tests {
     use super::__parent::*;
     use axum::http::{Method, Request};
-    use rusternetes_kubelet::server::ServerState;
-    use rusternetes_kubelet::streaming_server::*;
-    use rusternetes_storage::{Storage, StorageBackend};
+    use k3rs_kubelet::server::ServerState;
+    use k3rs_kubelet::streaming_server::*;
+    use k3rs_storage::{Storage, StorageBackend};
     use std::sync::Arc;
     use tower::ServiceExt;
 
     async fn app(checkpoint: bool) -> axum::Router {
         let storage = Arc::new(StorageBackend::new_memory());
         let pod = Pod {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 api_version: "v1".into(),
                 kind: "Pod".into(),
             },
@@ -45,10 +45,7 @@ mod run_checkpoint_tests {
             status: None,
         };
         storage
-            .create(
-                &rusternetes_storage::build_key("pods", Some("ns"), "p"),
-                &pod,
-            )
+            .create(&k3rs_storage::build_key("pods", Some("ns"), "p"), &pod)
             .await
             .unwrap();
         run_router(
@@ -131,7 +128,7 @@ mod run_checkpoint_tests {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::streaming_server::*;
+    use k3rs_kubelet::streaming_server::*;
 
     #[test]
     fn websocket_request_detection_matches_wsstream() {
@@ -465,7 +462,7 @@ mod tests {
 }
 
 mod pod_log_query_bool_tests {
-    use rusternetes_kubelet::streaming_server::is_true;
+    use k3rs_kubelet::streaming_server::is_true;
 
     /// PodLogOptions follow/previous/timestamps/insecureSkipTLSVerifyBackend
     /// are decoded upstream with `runtime.Convert_Slice_string_To_bool`, so

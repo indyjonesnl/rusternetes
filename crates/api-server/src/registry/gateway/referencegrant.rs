@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::resources::ReferenceGrant;
-use rusternetes_common::validation::field::{ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::validation::referencegrant::validate_reference_grant;
-use rusternetes_storage::StorageBackend;
+use k3rs_common::resources::ReferenceGrant;
+use k3rs_common::validation::field::{ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_common::validation::referencegrant::validate_reference_grant;
+use k3rs_storage::StorageBackend;
 
 use super::GROUP;
 use crate::registry::generic::Store;

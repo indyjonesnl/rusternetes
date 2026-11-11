@@ -30,10 +30,8 @@ use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
 use ipnet::IpNet;
-use rusternetes_common::resources::{
-    IPAddress, ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus,
-};
-use rusternetes_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
+use k3rs_common::resources::{IPAddress, ServiceCIDR, ServiceCIDRCondition, ServiceCIDRStatus};
+use k3rs_storage::{build_key, build_prefix, Storage, WatchEvent, WorkQueue};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -195,7 +193,7 @@ pub fn cidr_ip_family(cidr: &str) -> Option<&'static str> {
     }
 }
 
-fn label<'a>(meta: &'a rusternetes_common::types::ObjectMeta, key: &str) -> Option<&'a str> {
+fn label<'a>(meta: &'a k3rs_common::types::ObjectMeta, key: &str) -> Option<&'a str> {
     meta.labels.as_ref()?.get(key).map(String::as_str)
 }
 

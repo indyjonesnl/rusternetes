@@ -7,13 +7,13 @@
 
 use std::sync::Arc;
 
-use rusternetes_api_server::bootstrap::{
+use k3rs_api_server::bootstrap::{
     bootstrap_extension_apiserver_authentication_rbac, sync_cluster_authentication_trust,
 };
-use rusternetes_common::clusterauthenticationtrust::ClusterAuthenticationInfo;
-use rusternetes_common::resources::{ConfigMap, Namespace};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_common::clusterauthenticationtrust::ClusterAuthenticationInfo;
+use k3rs_common::resources::{ConfigMap, Namespace};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage, StorageBackend};
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 /// `someRandomCA` and `anotherRandomCA`

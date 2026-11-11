@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::validation::field::*;
+    use k3rs_common::validation::field::*;
 
     /// #2086: a struct-valued bad value renders in field order, not sorted.
     /// Go: `json.Marshal` keeps struct field order (errors.go:92-97).

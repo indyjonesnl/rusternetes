@@ -2,14 +2,14 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::Pod;
+    pub use k3rs_common::resources::pod::Pod;
     pub use std::collections::HashMap;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::{PodSecurityContext, PodSpec, Sysctl};
-    use rusternetes_kubelet::sysctl::*;
+    use k3rs_common::resources::pod::{PodSecurityContext, PodSpec, Sysctl};
+    use k3rs_kubelet::sysctl::*;
 
     fn pod_with(sysctls: Vec<(&str, &str)>, host_net: bool, host_ipc: bool) -> Pod {
         let spec = PodSpec {

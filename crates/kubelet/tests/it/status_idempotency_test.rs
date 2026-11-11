@@ -10,11 +10,11 @@
 //! These tests pin the equality predicate so a future regression that
 //! breaks the gate would fail here.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerState, ContainerStateTerminated, ContainerStatus, Pod, PodSpec, PodStatus,
 };
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_kubelet::kubelet::pod_status_equal;
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_kubelet::kubelet::pod_status_equal;
 
 fn make_succeeded_pod() -> Pod {
     let init_status = ContainerStatus {

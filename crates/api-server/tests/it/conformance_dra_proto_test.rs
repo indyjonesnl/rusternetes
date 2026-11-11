@@ -42,7 +42,7 @@
 //! pattern used for `events.k8s.io/v1.Event` vs. `core/v1.Event`), so
 //! these tests look up the DRA kinds under their group-qualified keys.
 
-use rusternetes_api_server::protobuf::ProtoRegistry;
+use k3rs_api_server::protobuf::ProtoRegistry;
 use serde_json::Value;
 
 // --------------------------------------------------------------------------

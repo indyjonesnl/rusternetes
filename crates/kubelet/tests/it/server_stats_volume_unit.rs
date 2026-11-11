@@ -16,12 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::Pod;
-use rusternetes_kubelet::server_stats::{
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::Pod;
+use k3rs_kubelet::server_stats::{
     parse_pod_volume_stats, FsResourceAnalyzer, PodEventSink, StatsProvider, VolumeStatCalculator,
 };
-use rusternetes_kubelet::volume_plugins::plugin::{
+use k3rs_kubelet::volume_plugins::plugin::{
     Attributes, Metrics, MetricsProvider, Mounter, MounterArgs,
 };
 use serde_json::json;
@@ -114,9 +114,8 @@ impl StatsProvider for Provider {
     fn list_block_volumes_for_pod(
         &self,
         _uid: &str,
-    ) -> Option<
-        HashMap<String, Arc<dyn rusternetes_kubelet::volume_plugins::plugin::BlockVolumeMapper>>,
-    > {
+    ) -> Option<HashMap<String, Arc<dyn k3rs_kubelet::volume_plugins::plugin::BlockVolumeMapper>>>
+    {
         None
     }
 }
@@ -202,7 +201,7 @@ fn parse_pod_volume_stats_defaults_and_health() {
 #[tokio::test]
 #[serial_test::serial]
 async fn abnormal_volume_emits_event_when_gate_enabled() {
-    rusternetes_common::feature_gates::set_from_str("CSIVolumeHealth=true").unwrap();
+    k3rs_common::feature_gates::set_from_str("CSIVolumeHealth=true").unwrap();
     let events = Arc::new(Events::default());
     let calc = VolumeStatCalculator::new(
         Arc::new(Provider {
@@ -214,7 +213,7 @@ async fn abnormal_volume_emits_event_when_gate_enabled() {
         events.clone(),
     );
     calc.calc_and_store_stats().await;
-    rusternetes_common::feature_gates::reset_to_defaults();
+    k3rs_common::feature_gates::reset_to_defaults();
     let got = events.0.lock().unwrap().clone();
     assert_eq!(got.len(), 4);
     assert!(got.iter().all(|(r, _)| r == "VolumeConditionAbnormal"));

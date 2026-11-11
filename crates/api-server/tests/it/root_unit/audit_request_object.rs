@@ -3,10 +3,10 @@
 //! audit filter: level gating, ObjectRef completion, managedFields omission.
 
 use axum::{body::Body, routing::post, Router};
-use rusternetes_api_server::audit::{
+use k3rs_api_server::audit::{
     log_request_object, log_request_patch, with_audit, AuditConfig, Policy,
 };
-use rusternetes_common::audit::{AuditBackend, AuditEvent};
+use k3rs_common::audit::{AuditBackend, AuditEvent};
 use std::sync::Arc;
 use tower::ServiceExt;
 

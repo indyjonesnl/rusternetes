@@ -8,7 +8,7 @@
 //! The status code is typically `400 BadRequest` (decode error) or `422 Invalid`
 //! (semantic decode error such as wrong-type field on a known schema).
 //!
-//! rusternetes currently routes every body-decode failure through
+//! k3rs currently routes every body-decode failure through
 //! `Error::InvalidResource` (see `crates/api-server/src/handlers/pod.rs:31`),
 //! which maps to HTTP 422 with `reason=Invalid` in `crates/common/src/error.rs:105-108`.
 //! Either 400 or 422 is acceptable per upstream — the contract these tests pin
@@ -22,7 +22,7 @@
 //! Each `test_malformed_<scenario>` POSTs a malformed body to
 //! `/api/v1/namespaces/default/pods` and asserts the contract above.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -163,7 +163,7 @@ async fn test_malformed_wrong_type_active_deadline() {
 
 // Upstream Kubernetes treats `spec` as required-non-nullable on PodTemplateSpec /
 // Pod: PodSpec validation ("spec.containers: Required value") fires when `spec`
-// is null/absent. In rusternetes, `Pod.spec` is `Option<PodSpec>`
+// is null/absent. In k3rs, `Pod.spec` is `Option<PodSpec>`
 // (crates/common/src/resources/pod.rs:50), so `spec: null` deserializes to
 // `None` and the create handler at crates/api-server/src/handlers/pod.rs:63
 // only validates containers when `spec` is `Some`. Result: 201 with an empty
@@ -187,7 +187,7 @@ async fn test_malformed_integer_overflow() {
 
 // `serde_json` enforces a recursion limit (~128 by default) to prevent stack
 // overflow on adversarial input — 10_000 nested arrays produce a syntax error.
-// Pins the contract: rusternetes (via serde_json) REJECTS deeply nested JSON.
+// Pins the contract: k3rs (via serde_json) REJECTS deeply nested JSON.
 #[tokio::test]
 async fn test_malformed_deeply_nested() {
     let router = spawn_router();

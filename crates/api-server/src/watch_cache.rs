@@ -6,8 +6,8 @@
 
 use crate::cache_watcher::{Dispatcher, WatchReceiver};
 use async_trait::async_trait;
-use rusternetes_storage::StorageBackend;
-use rusternetes_storage::{Storage, WatchEvent, WatchStream};
+use k3rs_storage::StorageBackend;
+use k3rs_storage::{Storage, WatchEvent, WatchStream};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,16 +27,12 @@ pub trait WatchSource: Send + Sync + 'static {
     /// Start a watch from the *current* revision — tails future events only.
     /// Used for the very first connection, where the handler's initial LIST
     /// already covers pre-existing state.
-    async fn watch_from_now(&self, prefix: &str) -> rusternetes_common::Result<WatchStream>;
+    async fn watch_from_now(&self, prefix: &str) -> k3rs_common::Result<WatchStream>;
 
     /// Start a watch that first *replays* every committed event since
     /// `revision`, then tails. Used on reconnect so events committed while the
     /// stream was down are not silently dropped (#cert-manager-cainjector).
-    async fn watch_since(
-        &self,
-        prefix: &str,
-        revision: i64,
-    ) -> rusternetes_common::Result<WatchStream>;
+    async fn watch_since(&self, prefix: &str, revision: i64) -> k3rs_common::Result<WatchStream>;
 
     /// Current storage revision. Recorded as the ring "floor" when a shared
     /// prefix watch starts: the ring is complete for every revision > floor,
@@ -55,15 +51,11 @@ pub trait WatchSource: Send + Sync + 'static {
 
 #[async_trait]
 impl WatchSource for StorageBackend {
-    async fn watch_from_now(&self, prefix: &str) -> rusternetes_common::Result<WatchStream> {
+    async fn watch_from_now(&self, prefix: &str) -> k3rs_common::Result<WatchStream> {
         self.watch_backend(prefix).await
     }
 
-    async fn watch_since(
-        &self,
-        prefix: &str,
-        revision: i64,
-    ) -> rusternetes_common::Result<WatchStream> {
+    async fn watch_since(&self, prefix: &str, revision: i64) -> k3rs_common::Result<WatchStream> {
         Storage::watch_from_revision(self, prefix, revision).await
     }
 
@@ -141,28 +133,27 @@ pub struct WatchScope {
 impl WatchScope {
     pub fn new(group: &str, resource: &str, field_selector: Option<&str>) -> Self {
         let name = field_selector
-            .and_then(|s| rusternetes_common::field_selector::FieldSelector::parse(s).ok())
+            .and_then(|s| k3rs_common::field_selector::FieldSelector::parse(s).ok())
             .and_then(|sel| {
                 sel.requirements()
                     .iter()
                     .find(|r| {
                         r.field == "metadata.name"
-                            && r.operator
-                                == rusternetes_common::field_selector::FieldOperator::Equals
+                            && r.operator == k3rs_common::field_selector::FieldOperator::Equals
                     })
                     .map(|r| r.value.clone())
             });
         let trigger_value =
             crate::cache_watcher::trigger_field(group, resource).and_then(|field| {
                 field_selector
-                    .and_then(|s| rusternetes_common::field_selector::FieldSelector::parse(s).ok())
+                    .and_then(|s| k3rs_common::field_selector::FieldSelector::parse(s).ok())
                     .and_then(|sel| {
                         sel.requirements()
                             .iter()
                             .find(|r| {
                                 r.field == field
                                     && r.operator
-                                        == rusternetes_common::field_selector::FieldOperator::Equals
+                                        == k3rs_common::field_selector::FieldOperator::Equals
                             })
                             .map(|r| r.value.clone())
                     })

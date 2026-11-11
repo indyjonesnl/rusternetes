@@ -2,17 +2,17 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::resources::pod::{Affinity, PodSpec};
-    pub use rusternetes_common::resources::workloads::{
+    pub use k3rs_common::resources::pod::{Affinity, PodSpec};
+    pub use k3rs_common::resources::workloads::{
         Job, JobCondition, JobSpec, JobTemplateSpec, PodFailurePolicyRule, SuccessPolicyRule,
     };
-    pub use rusternetes_common::types::LabelSelector;
-    pub use rusternetes_common::validation::field::{BadValue, Error, ErrorList, Path};
-    pub use rusternetes_common::validation::metav1::{
+    pub use k3rs_common::types::LabelSelector;
+    pub use k3rs_common::validation::field::{BadValue, Error, ErrorList, Path};
+    pub use k3rs_common::validation::metav1::{
         is_dns1123_label, is_dns1123_subdomain, is_qualified_name, label_selector_matches_labels,
         validate_label_selector, LabelSelectorValidationOptions,
     };
-    pub use rusternetes_common::validation::objectmeta::{
+    pub use k3rs_common::validation::objectmeta::{
         name_is_dns_subdomain, validate_immutable_field, validate_nonnegative_field,
         validate_object_meta, validate_object_meta_update,
     };
@@ -20,7 +20,7 @@ mod __parent {
 }
 
 mod success_policy_indexes_tests {
-    use rusternetes_common::validation::job::{parse_index_interval, validate_indexes_format};
+    use k3rs_common::validation::job::{parse_index_interval, validate_indexes_format};
 
     #[test]
     fn single_and_range_intervals() {
@@ -62,7 +62,7 @@ mod success_policy_indexes_tests {
 mod parity_tests {
     /// The create path's options: `RequirePrefixedLabels: true`.
     fn validate_job(job: &Job) -> ErrorList {
-        rusternetes_common::validation::job::validate_job(
+        k3rs_common::validation::job::validate_job(
             job,
             &JobValidationOptions {
                 require_prefixed_labels: true,
@@ -71,15 +71,13 @@ mod parity_tests {
         )
     }
     use super::__parent::*;
-    use rusternetes_common::resources::pod::{Container, PodSpec};
-    use rusternetes_common::resources::workloads::{
+    use k3rs_common::resources::pod::{Container, PodSpec};
+    use k3rs_common::resources::workloads::{
         Job, JobSpec, PodFailurePolicy, PodFailurePolicyOnPodConditionsPattern,
         PodFailurePolicyRule, PodTemplateSpec,
     };
-    use rusternetes_common::types::{
-        LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta,
-    };
-    use rusternetes_common::validation::job::*;
+    use k3rs_common::types::{LabelSelector, LabelSelectorRequirement, ObjectMeta, TypeMeta};
+    use k3rs_common::validation::job::*;
     use std::collections::HashMap;
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -168,7 +166,7 @@ mod parity_tests {
     /// (pkg/apis/batch/validation/validation_test.go).
     mod update {
         use super::*;
-        use rusternetes_common::resources::pod::{
+        use k3rs_common::resources::pod::{
             Affinity, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
         };
 
@@ -505,9 +503,9 @@ mod parity_tests {
 mod status_validation_tests {
     use super::__parent::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use rusternetes_common::resources::workloads::{JobStatus, UncountedTerminatedPods};
-    use rusternetes_common::validation::job::*;
-    use rusternetes_common::validation::objectmeta::IS_NEGATIVE_ERROR_MSG;
+    use k3rs_common::resources::workloads::{JobStatus, UncountedTerminatedPods};
+    use k3rs_common::validation::job::*;
+    use k3rs_common::validation::objectmeta::IS_NEGATIVE_ERROR_MSG;
 
     fn t(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
@@ -760,7 +758,7 @@ mod status_validation_tests {
             .expect("duplicate uid across the two lists");
         assert_eq!(
             dup.error_type,
-            rusternetes_common::validation::field::ErrorType::Duplicate
+            k3rs_common::validation::field::ErrorType::Duplicate
         );
     }
 

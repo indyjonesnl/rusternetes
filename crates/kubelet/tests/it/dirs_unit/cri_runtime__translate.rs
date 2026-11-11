@@ -2,18 +2,18 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::quantity::parse_resource_value;
-    pub use rusternetes_common::resources::pod::{Container, Pod};
-    pub use rusternetes_common::resources::{ConfigMap, Secret, Service};
-    pub use rusternetes_cri::v1;
+    pub use k3rs_common::quantity::parse_resource_value;
+    pub use k3rs_common::resources::pod::{Container, Pod};
+    pub use k3rs_common::resources::{ConfigMap, Secret, Service};
+    pub use k3rs_cri::v1;
     pub use std::collections::HashMap;
     pub use std::path::Path;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::resources::pod::PodSpec;
-    use rusternetes_kubelet::cri_runtime::translate::*;
+    use k3rs_common::resources::pod::PodSpec;
+    use k3rs_kubelet::cri_runtime::translate::*;
 
     fn pod_with(spec: PodSpec) -> Pod {
         let mut pod = Pod::new("web", spec);
@@ -23,7 +23,7 @@ mod tests {
     }
 
     fn svc(name: &str, cluster_ip: Option<&str>, port: u16, proto: &str) -> Service {
-        use rusternetes_common::resources::service::{ServicePort, ServiceSpec};
+        use k3rs_common::resources::service::{ServicePort, ServiceSpec};
         let mut s = Service {
             type_meta: Default::default(),
             metadata: Default::default(),
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn downward_api_pod_ip_and_host_ip_are_distinct() {
-        use rusternetes_common::resources::pod::{HostIP, PodIP, PodStatus};
+        use k3rs_common::resources::pod::{HostIP, PodIP, PodStatus};
         let mut pod = pod_with(PodSpec {
             node_name: Some("node-1".to_string()),
             ..Default::default()
@@ -210,12 +210,12 @@ mod tests {
         };
         c.command = Some(vec!["/bin/sh".to_string()]);
         c.args = Some(vec!["-c".to_string(), "sleep 1".to_string()]);
-        c.env = Some(vec![rusternetes_common::resources::pod::EnvVar {
+        c.env = Some(vec![k3rs_common::resources::pod::EnvVar {
             name: "FOO".to_string(),
             value: Some("bar".to_string()),
             value_from: None,
         }]);
-        c.resources = Some(rusternetes_common::types::ResourceRequirements {
+        c.resources = Some(k3rs_common::types::ResourceRequirements {
             limits: Some(HashMap::from([
                 ("cpu".to_string(), "500m".to_string()),
                 ("memory".to_string(), "64Mi".to_string()),
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn linux_resources_shares_quota_and_floors() {
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::types::ResourceRequirements;
         let res = |limits: Option<Vec<(&str, &str)>>, requests: Option<Vec<(&str, &str)>>| {
             let mut c = Container {
                 name: "app".to_string(),
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn volume_mounts_resolve_from_host_paths() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -351,7 +351,7 @@ mod tests {
     /// `stubVolume{attributes: ...}` (`kubelet_volumes_test.go:687`) is how the
     /// attributes reach `makeMounts`; here they arrive as `MountAttrs`.
     fn two_mounts_of_one_volume() -> (Container, HashMap<String, String>) {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let vm = |name: &str, path: &str, ro: bool| VolumeMount {
             name: name.to_string(),
             mount_path: path.to_string(),
@@ -470,7 +470,7 @@ mod tests {
 
     #[test]
     fn volume_mount_subpath_joins_onto_host_path() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn resolve_rro_matches_upstream() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let vm = |ro: bool, rro: Option<&str>, prop: Option<&str>| VolumeMount {
             name: "v".into(),
             mount_path: "/v".into(),
@@ -570,7 +570,7 @@ mod tests {
 
     #[test]
     fn mount_carries_recursive_read_only() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let c = Container {
             name: "app".into(),
             image: "busybox".into(),
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn mount_propagation_modes() {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         use v1::MountPropagation;
         let mk = |mode: Option<&str>| VolumeMount {
             name: "v".to_string(),
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn ports_map_with_protocol() {
-        use rusternetes_common::resources::pod::ContainerPort;
+        use k3rs_common::resources::pod::ContainerPort;
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn pod_sysctls_map_onto_sandbox_linux_config() {
-        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        use k3rs_common::resources::pod::{PodSecurityContext, Sysctl};
         let pod = pod_with(PodSpec {
             security_context: Some(PodSecurityContext {
                 sysctls: Some(vec![
@@ -809,7 +809,7 @@ mod tests {
     /// ```
     #[test]
     fn nc_sysctl_dot_form_lands_in_cri_sandbox_sysctls_map() {
-        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        use k3rs_common::resources::pod::{PodSecurityContext, Sysctl};
         // Exact sysctl the NC test uses (sysctl.go:83-89 in k8s v1.35):
         //   pod.Spec.SecurityContext.Sysctls = [{Name: "kernel.shm_rmid_forced", Value: "1"}]
         let pod = pod_with(PodSpec {
@@ -872,7 +872,7 @@ mod tests {
     /// ```
     #[test]
     fn nc_sysctl_slash_form_is_normalized_to_dot_form_in_cri_sandbox() {
-        use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
+        use k3rs_common::resources::pod::{PodSecurityContext, Sysctl};
         // Exact sysctl the NC slash test uses (sysctl.go:192-196 in k8s v1.35):
         //   pod.Spec.SecurityContext.Sysctls = [{Name: "kernel/shm_rmid_forced", Value: "1"}]
         let pod = pod_with(PodSpec {
@@ -984,7 +984,7 @@ mod tests {
 
     #[test]
     fn dns_none_uses_only_pod_dns_config() {
-        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        use k3rs_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
         let pod = pod_with(PodSpec {
             dns_policy: Some("None".to_string()),
             dns_config: Some(PodDNSConfig {
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn dns_cluster_first_merges_pod_dns_config_and_overrides_ndots() {
-        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        use k3rs_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
         let pod = pod_with(PodSpec {
             dns_config: Some(PodDNSConfig {
                 nameservers: Some(vec!["1.1.1.1".to_string()]),
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn get_pod_dns_default_policy_merges_explicit_dns_config() {
-        use rusternetes_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
+        use k3rs_common::resources::pod::{PodDNSConfig, PodDNSConfigOption};
         let pod = pod_with(PodSpec {
             dns_policy: Some("Default".to_string()),
             dns_config: Some(PodDNSConfig {
@@ -1132,7 +1132,7 @@ mod tests {
 
     #[test]
     fn get_pod_dns_limits_nameservers_searches_and_length() {
-        use rusternetes_common::resources::pod::PodDNSConfig;
+        use k3rs_common::resources::pod::PodDNSConfig;
         let pod = pod_with(PodSpec {
             dns_policy: Some("None".to_string()),
             dns_config: Some(PodDNSConfig {
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn get_pod_dns_limits_search_chars_and_overlong_entries() {
-        use rusternetes_common::resources::pod::PodDNSConfig;
+        use k3rs_common::resources::pod::PodDNSConfig;
         let long = "a".repeat(254);
         let pod = pod_with(PodSpec {
             dns_policy: Some("None".to_string()),
@@ -1288,7 +1288,7 @@ mod tests {
     /// `dns.go:119`/`:145`: truncation emits DNSConfigForming on the pod.
     #[test]
     fn limit_truncation_emits_dns_config_forming() {
-        use rusternetes_common::resources::pod::PodDNSConfig;
+        use k3rs_common::resources::pod::PodDNSConfig;
         let pod = pod_with(PodSpec {
             dns_policy: Some("None".to_string()),
             dns_config: Some(PodDNSConfig {
@@ -1372,7 +1372,7 @@ mod tests {
 
     #[test]
     fn security_context_maps_privileged_and_user() {
-        use rusternetes_common::resources::pod::SecurityContext;
+        use k3rs_common::resources::pod::SecurityContext;
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -1812,17 +1812,17 @@ mod tests {
 
     fn env_from(
         name: &str,
-        src: rusternetes_common::resources::pod::EnvVarSource,
-    ) -> rusternetes_common::resources::pod::EnvVar {
-        rusternetes_common::resources::pod::EnvVar {
+        src: k3rs_common::resources::pod::EnvVarSource,
+    ) -> k3rs_common::resources::pod::EnvVar {
+        k3rs_common::resources::pod::EnvVar {
             name: name.to_string(),
             value: None,
             value_from: Some(src),
         }
     }
 
-    fn empty_source() -> rusternetes_common::resources::pod::EnvVarSource {
-        rusternetes_common::resources::pod::EnvVarSource {
+    fn empty_source() -> k3rs_common::resources::pod::EnvVarSource {
+        k3rs_common::resources::pod::EnvVarSource {
             config_map_key_ref: None,
             secret_key_ref: None,
             field_ref: None,
@@ -1833,7 +1833,7 @@ mod tests {
 
     #[test]
     fn field_ref_resolves_labels_annotations_spec_and_phase() {
-        use rusternetes_common::types::Phase;
+        use k3rs_common::types::Phase;
         let mut pod = pod_with(PodSpec {
             restart_policy: Some("OnFailure".to_string()),
             scheduler_name: Some("custom-sched".to_string()),
@@ -1841,7 +1841,7 @@ mod tests {
         });
         pod.metadata.labels = Some(HashMap::from([("app".to_string(), "web".to_string())]));
         pod.metadata.annotations = Some(HashMap::from([("team".to_string(), "infra".to_string())]));
-        pod.status = Some(rusternetes_common::resources::pod::PodStatus {
+        pod.status = Some(k3rs_common::resources::pod::PodStatus {
             phase: Some(Phase::Running),
             ..Default::default()
         });
@@ -1872,11 +1872,8 @@ mod tests {
 
     /// A `resourceFieldRef` selector; env vars never carry a `containerName`
     /// (validation rejects it outside a volume).
-    fn rfr(
-        resource: &str,
-        divisor: Option<&str>,
-    ) -> rusternetes_common::resources::ResourceFieldSelector {
-        rusternetes_common::resources::ResourceFieldSelector {
+    fn rfr(resource: &str, divisor: Option<&str>) -> k3rs_common::resources::ResourceFieldSelector {
+        k3rs_common::resources::ResourceFieldSelector {
             container_name: None,
             resource: resource.to_string(),
             divisor: divisor.map(str::to_string),
@@ -1885,7 +1882,7 @@ mod tests {
 
     #[test]
     fn resource_field_ref_resolves_ephemeral_storage_and_hugepages() {
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::types::ResourceRequirements;
         let c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -1912,7 +1909,7 @@ mod tests {
 
     #[test]
     fn resource_field_ref_defaults_unset_limits_to_node_allocatable() {
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::types::ResourceRequirements;
         // upstream MergeContainerResourceLimits: an unset cpu/memory LIMIT
         // defaults to the node's allocatable for resourceFieldRef extraction
         // (the "default limits.cpu/memory from node allocatable" NodeConformance
@@ -1953,7 +1950,7 @@ mod tests {
 
     #[test]
     fn config_map_and_secret_key_ref_env_resolved() {
-        use rusternetes_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
+        use k3rs_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -1962,7 +1959,7 @@ mod tests {
         c.env = Some(vec![
             env_from(
                 "FROM_CM",
-                rusternetes_common::resources::pod::EnvVarSource {
+                k3rs_common::resources::pod::EnvVarSource {
                     config_map_key_ref: Some(ConfigMapKeySelector {
                         name: "cfg".to_string(),
                         key: "color".to_string(),
@@ -1973,7 +1970,7 @@ mod tests {
             ),
             env_from(
                 "FROM_SECRET",
-                rusternetes_common::resources::pod::EnvVarSource {
+                k3rs_common::resources::pod::EnvVarSource {
                     secret_key_ref: Some(SecretKeySelector {
                         name: "creds".to_string(),
                         key: "password".to_string(),
@@ -2012,9 +2009,7 @@ mod tests {
 
     #[test]
     fn env_from_bulk_imports_configmap_and_secret_with_prefix() {
-        use rusternetes_common::resources::pod::{
-            ConfigMapEnvSource, EnvFromSource, SecretEnvSource,
-        };
+        use k3rs_common::resources::pod::{ConfigMapEnvSource, EnvFromSource, SecretEnvSource};
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -2069,7 +2064,7 @@ mod tests {
 
     #[test]
     fn explicit_env_overrides_env_from_without_duplicating() {
-        use rusternetes_common::resources::pod::{ConfigMapEnvSource, EnvFromSource, EnvVar};
+        use k3rs_common::resources::pod::{ConfigMapEnvSource, EnvFromSource, EnvVar};
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -2118,7 +2113,7 @@ mod tests {
 
     #[test]
     fn missing_key_ref_omits_var() {
-        use rusternetes_common::resources::pod::ConfigMapKeySelector;
+        use k3rs_common::resources::pod::ConfigMapKeySelector;
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -2126,7 +2121,7 @@ mod tests {
         };
         c.env = Some(vec![env_from(
             "MISSING",
-            rusternetes_common::resources::pod::EnvVarSource {
+            k3rs_common::resources::pod::EnvVarSource {
                 config_map_key_ref: Some(ConfigMapKeySelector {
                     name: "absent".to_string(),
                     key: "k".to_string(),
@@ -2151,7 +2146,7 @@ mod tests {
         assert!(cfg.envs.iter().all(|e| e.key != "MISSING"));
     }
 
-    fn pod_with_env(env: Vec<rusternetes_common::resources::pod::EnvVar>) -> (Pod, Container) {
+    fn pod_with_env(env: Vec<k3rs_common::resources::pod::EnvVar>) -> (Pod, Container) {
         let mut c = Container {
             name: "app".to_string(),
             image: "busybox".to_string(),
@@ -2167,10 +2162,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonoptional_missing_key() {
-        use rusternetes_common::resources::pod::ConfigMapKeySelector;
+        use k3rs_common::resources::pod::ConfigMapKeySelector;
         let (pod, c) = pod_with_env(vec![env_from(
             "NEED",
-            rusternetes_common::resources::pod::EnvVarSource {
+            k3rs_common::resources::pod::EnvVarSource {
                 config_map_key_ref: Some(ConfigMapKeySelector {
                     name: "cfg".to_string(),
                     key: "absent".to_string(),
@@ -2189,10 +2184,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonoptional_missing_object() {
-        use rusternetes_common::resources::pod::SecretKeySelector;
+        use k3rs_common::resources::pod::SecretKeySelector;
         let (pod, c) = pod_with_env(vec![env_from(
             "NEED",
-            rusternetes_common::resources::pod::EnvVarSource {
+            k3rs_common::resources::pod::EnvVarSource {
                 secret_key_ref: Some(SecretKeySelector {
                     name: "creds".to_string(),
                     key: "password".to_string(),
@@ -2207,12 +2202,12 @@ mod tests {
 
     #[test]
     fn validate_allows_optional_missing_and_resolved_refs() {
-        use rusternetes_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
+        use k3rs_common::resources::pod::{ConfigMapKeySelector, SecretKeySelector};
         let (pod, c) = pod_with_env(vec![
             // optional + missing -> ok
             env_from(
                 "OPT",
-                rusternetes_common::resources::pod::EnvVarSource {
+                k3rs_common::resources::pod::EnvVarSource {
                     config_map_key_ref: Some(ConfigMapKeySelector {
                         name: "gone".to_string(),
                         key: "k".to_string(),
@@ -2224,7 +2219,7 @@ mod tests {
             // non-optional + present -> ok
             env_from(
                 "OK",
-                rusternetes_common::resources::pod::EnvVarSource {
+                k3rs_common::resources::pod::EnvVarSource {
                     secret_key_ref: Some(SecretKeySelector {
                         name: "creds".to_string(),
                         key: "password".to_string(),
@@ -2241,7 +2236,7 @@ mod tests {
     }
 
     fn container_with_env_from(
-        env_from: Vec<rusternetes_common::resources::pod::EnvFromSource>,
+        env_from: Vec<k3rs_common::resources::pod::EnvFromSource>,
     ) -> (Pod, Container) {
         let c = Container {
             name: "app".to_string(),
@@ -2258,7 +2253,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonoptional_missing_envfrom_configmap() {
-        use rusternetes_common::resources::pod::{ConfigMapEnvSource, EnvFromSource};
+        use k3rs_common::resources::pod::{ConfigMapEnvSource, EnvFromSource};
         let (pod, c) = container_with_env_from(vec![EnvFromSource {
             prefix: None,
             config_map_ref: Some(ConfigMapEnvSource {
@@ -2273,7 +2268,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonoptional_missing_envfrom_secret() {
-        use rusternetes_common::resources::pod::{EnvFromSource, SecretEnvSource};
+        use k3rs_common::resources::pod::{EnvFromSource, SecretEnvSource};
         let (pod, c) = container_with_env_from(vec![EnvFromSource {
             prefix: None,
             config_map_ref: None,
@@ -2288,9 +2283,7 @@ mod tests {
 
     #[test]
     fn validate_allows_optional_missing_and_present_envfrom() {
-        use rusternetes_common::resources::pod::{
-            ConfigMapEnvSource, EnvFromSource, SecretEnvSource,
-        };
+        use k3rs_common::resources::pod::{ConfigMapEnvSource, EnvFromSource, SecretEnvSource};
         let (pod, c) = container_with_env_from(vec![
             // optional + missing -> ok
             EnvFromSource {
@@ -2349,7 +2342,7 @@ mod tests {
         let sc = sec_ctx_for(serde_json::Value::Null);
         assert_eq!(
             sc.masked_paths,
-            rusternetes_kubelet::cri_runtime::host_policy::default_masked_paths()
+            k3rs_kubelet::cri_runtime::host_policy::default_masked_paths()
         );
         assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
     }
@@ -2359,7 +2352,7 @@ mod tests {
         let sc = sec_ctx_for(serde_json::json!({"procMount": "Default"}));
         assert_eq!(
             sc.masked_paths,
-            rusternetes_kubelet::cri_runtime::host_policy::default_masked_paths()
+            k3rs_kubelet::cri_runtime::host_policy::default_masked_paths()
         );
         assert_eq!(sc.readonly_paths, DEFAULT_READONLY_PATHS);
     }
@@ -2378,7 +2371,7 @@ mod tests {
     ///
     /// The Go/Kubernetes client marshals an unset `resource.Quantity` divisor as
     /// `"0"` in JSON (`zeroBytes = []byte("0")` in
-    /// `k8s.io/apimachinery/pkg/api/resource/amount.go:52`). When rusternetes
+    /// `k8s.io/apimachinery/pkg/api/resource/amount.go:52`). When k3rs
     /// deserialises the pod it gets `divisor: Some("0")`, which the former code
     /// treated as a zero divisor and returned `None` (skipping the env var
     /// entirely) instead of defaulting it to `"1"` — matching upstream
@@ -2393,8 +2386,8 @@ mod tests {
     /// ```
     #[test]
     fn resource_field_ref_zero_divisor_treated_as_default_one() {
-        use rusternetes_common::resources::pod::{EnvVar, EnvVarSource};
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::resources::pod::{EnvVar, EnvVarSource};
+        use k3rs_common::types::ResourceRequirements;
 
         // Container with explicit limits/requests matching the conformance pod
         // created by testDownwardAPI in test/e2e/common/node/downwardapi.go:
@@ -2420,7 +2413,7 @@ mod tests {
             name: name.to_string(),
             value: None,
             value_from: Some(EnvVarSource {
-                resource_field_ref: Some(rusternetes_common::resources::ResourceFieldSelector {
+                resource_field_ref: Some(k3rs_common::resources::ResourceFieldSelector {
                     container_name: None,
                     resource: resource.to_string(),
                     divisor: Some("0".to_string()), // zero Quantity = unset on the wire
@@ -2491,8 +2484,8 @@ mod tests {
     /// node allocatable, and divisor "0" must still resolve correctly.
     #[test]
     fn resource_field_ref_zero_divisor_with_allocatable_fallback() {
-        use rusternetes_common::resources::pod::{EnvVar, EnvVarSource};
-        use rusternetes_common::types::ResourceRequirements;
+        use k3rs_common::resources::pod::{EnvVar, EnvVarSource};
+        use k3rs_common::types::ResourceRequirements;
 
         let mut c = Container {
             name: "dapi-container".to_string(),
@@ -2509,7 +2502,7 @@ mod tests {
             name: name.to_string(),
             value: None,
             value_from: Some(EnvVarSource {
-                resource_field_ref: Some(rusternetes_common::resources::ResourceFieldSelector {
+                resource_field_ref: Some(k3rs_common::resources::ResourceFieldSelector {
                     container_name: None,
                     resource: resource.to_string(),
                     divisor: Some("0".to_string()),
@@ -2592,7 +2585,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             sc.masked_paths,
-            rusternetes_kubelet::cri_runtime::host_policy::default_masked_paths()
+            k3rs_kubelet::cri_runtime::host_policy::default_masked_paths()
         );
     }
 
@@ -2604,7 +2597,7 @@ mod tests {
     /// image field below is provided"); the image mount is read-only because
     /// the image plugin's mounter is (`image.go:75-81`).
     fn image_volume_container(sub_path: Option<&str>) -> Container {
-        use rusternetes_common::resources::pod::VolumeMount;
+        use k3rs_common::resources::pod::VolumeMount;
         let vm = |name: &str, path: &str, sub: Option<&str>| VolumeMount {
             name: name.to_string(),
             mount_path: path.to_string(),
@@ -2646,8 +2639,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_image_volume_mount_carries_the_image_not_a_host_path() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::ImageVolume,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::ImageVolume,
             true,
         );
         let c = image_volume_container(Some("dir/sub"));
@@ -2683,8 +2676,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_image_volume_without_a_sub_path_has_an_empty_image_sub_path() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::ImageVolume,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::ImageVolume,
             true,
         );
         let c = image_volume_container(None);
@@ -2707,8 +2700,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_image_volume_gate_off_ignores_pulled_images() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::ImageVolume,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::ImageVolume,
             false,
         );
         let c = image_volume_container(None);
@@ -2731,8 +2724,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn an_image_volume_sub_path_is_still_validated() {
-        let _g = rusternetes_common::feature_gates::with_feature(
-            rusternetes_common::feature_gates::Feature::ImageVolume,
+        let _g = k3rs_common::feature_gates::with_feature(
+            k3rs_common::feature_gates::Feature::ImageVolume,
             true,
         );
         let c = image_volume_container(Some("../escape"));
@@ -2751,7 +2744,7 @@ mod tests {
     // makeBlockVolumes (kubelet_pods.go:228): symlink -> CRI Device.
     #[test]
     fn volume_devices_become_cri_devices() {
-        use rusternetes_common::resources::pod::VolumeDevice;
+        use k3rs_common::resources::pod::VolumeDevice;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("dev");
         std::fs::write(&target, b"").unwrap();

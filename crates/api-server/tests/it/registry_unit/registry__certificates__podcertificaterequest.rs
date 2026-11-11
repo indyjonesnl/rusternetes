@@ -3,30 +3,30 @@
 
 mod __parent {
     pub use chrono::Utc;
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         reset_object_meta_for_status, GroupResource, NamespaceScopedStrategy, RequestContext,
         RestCreateStrategy, RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::podcertificaterequest::PodCertificateRequest;
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_common::validation::podcertificaterequest::{
+    pub use k3rs_common::resources::podcertificaterequest::PodCertificateRequest;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_common::validation::podcertificaterequest::{
         validate_pod_certificate_request_create, validate_pod_certificate_request_status_update,
         validate_pod_certificate_request_update,
     };
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::certificates::podcertificaterequest::*;
+    use k3rs_api_server::registry::certificates::podcertificaterequest::*;
 
     /// strategy_test.go: create wipes status; update keeps the old status;
     /// the status strategy keeps the old spec.
     #[test]
     fn reset_fields_only_on_status_strategy() {
-        use rusternetes_api_server::ssa::ResetFields;
+        use k3rs_api_server::ssa::ResetFields;
         assert_eq!(
             RestUpdateStrategy::<PodCertificateRequest>::get_reset_fields(&StatusStrategy),
             ResetFields::new().with("certificates.k8s.io/v1alpha1", &[&["spec"]])
@@ -63,10 +63,10 @@ mod tests {
     }
 
     use chrono::TimeZone;
-    use rusternetes_common::resources::podcertificaterequest::{
+    use k3rs_common::resources::podcertificaterequest::{
         PodCertificateRequestSpec, PodCertificateRequestStatus,
     };
-    use rusternetes_common::types::Condition;
+    use k3rs_common::types::Condition;
 
     fn cond(ty: &str, status: &str) -> Condition {
         Condition {

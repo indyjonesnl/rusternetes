@@ -73,10 +73,10 @@ jobs:
       - name: Run node conformance
         env:
           CONTAINER_RUNTIME: docker
-          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.rusternetes/volumes
+          KUBELET_VOLUMES_PATH: ${{ github.workspace }}/.k3rs/volumes
           FOCUS: ${{ github.event.inputs.focus || '\[NodeConformance\]' }}
           K8S_VERSION: ${{ github.event.inputs.k8s_version || 'v1.35.0' }}
-          RUSTERNETES_IMAGE_TAG: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image-tag }}
+          K3RS_IMAGE_TAG: ${{ github.event_name == 'schedule' && 'main' || github.event.inputs.image-tag }}
           # Nightly uses the `main` tag, which must be pullable once the GHCR
           # packages are public. A miss there means the visibility flip was
           # forgotten — hard-fail rather than silently compile locally forever

@@ -4,13 +4,13 @@ use crate::registry::rest::{
     GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy, RestDeleteStrategy,
     RestUpdateStrategy,
 };
-use rusternetes_common::equality::semantic_equal;
-use rusternetes_common::resources::IngressClass;
-use rusternetes_common::validation::field::ErrorList;
-use rusternetes_common::validation::ingressclass::{
+use k3rs_common::equality::semantic_equal;
+use k3rs_common::resources::IngressClass;
+use k3rs_common::validation::field::ErrorList;
+use k3rs_common::validation::ingressclass::{
     validate_ingress_class, validate_ingress_class_update,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 use std::sync::Arc;
 /// SetDefaults_IngressClass (pkg/apis/networking/v1/defaults.go:48-51).
 pub fn convert_to_internal(obj: &mut IngressClass) {

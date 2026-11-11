@@ -16,8 +16,8 @@
 use std::collections::HashSet;
 
 use chrono::{DateTime, Duration, Utc};
-use rusternetes_common::resources::pod::Pod;
-use rusternetes_common::types::Phase;
+use k3rs_common::resources::pod::Pod;
+use k3rs_common::types::Phase;
 
 use super::hpa_metrics_client::PodMetricsInfo;
 

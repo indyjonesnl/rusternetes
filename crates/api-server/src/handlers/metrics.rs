@@ -3,12 +3,12 @@ use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     resources::{NodeMetrics, PodMetrics},
     List, Result,
 };
-use rusternetes_storage::{build_key, build_prefix, Storage};
+use k3rs_storage::{build_key, build_prefix, Storage};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use tracing::debug;
 async fn pod_metrics<S: Storage>(
     storage: &S,
     namespace: &str,
-    pod: &rusternetes_common::resources::Pod,
+    pod: &k3rs_common::resources::Pod,
 ) -> Option<PodMetrics> {
     let key = format!(
         "/registry/metrics.k8s.io/pods/{}/{}",
@@ -46,7 +46,7 @@ fn sort_pod_metrics(metrics: &mut [PodMetrics]) {
 /// name))` with `groupResource = metrics.Resource("podmetrics")`
 /// (metrics-server pkg/api/pod.go:135, pkg/api/install.go:61): message
 /// `podmetrics.metrics.k8s.io "<namespace>/<name>" not found`.
-fn pod_metrics_not_found(namespace: &str, name: &str) -> rusternetes_common::Error {
+fn pod_metrics_not_found(namespace: &str, name: &str) -> k3rs_common::Error {
     metrics_not_found("podmetrics", &format!("{namespace}/{name}"))
 }
 
@@ -64,12 +64,12 @@ pub async fn get_node_metrics(
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Check if node exists
     let node_key = build_key("nodes", None, &name);
-    let node: rusternetes_common::resources::Node = state.storage.as_ref().get(&node_key).await?;
+    let node: k3rs_common::resources::Node = state.storage.as_ref().get(&node_key).await?;
 
     // metrics-server pkg/api/node.go Get: when no metrics exist for the node
     // it returns `errors.NewNotFound(m.groupResource, name)` -- no zero-usage
@@ -84,12 +84,12 @@ pub async fn get_node_metrics(
 /// Resource: "nodemetrics"}, name)` (apimachinery/pkg/api/errors/errors.go):
 /// message `nodemetrics.metrics.k8s.io "<name>" not found`, details carrying
 /// group, kind (= resource) and name.
-fn node_metrics_not_found(name: &str) -> rusternetes_common::Error {
+fn node_metrics_not_found(name: &str) -> k3rs_common::Error {
     metrics_not_found("nodemetrics", name)
 }
 
-fn metrics_not_found(resource: &str, name: &str) -> rusternetes_common::Error {
-    let details = rusternetes_common::types::StatusDetails {
+fn metrics_not_found(resource: &str, name: &str) -> k3rs_common::Error {
+    let details = k3rs_common::types::StatusDetails {
         name: Some(name.to_string()),
         group: Some("metrics.k8s.io".to_string()),
         kind: Some(resource.to_string()),
@@ -97,14 +97,12 @@ fn metrics_not_found(resource: &str, name: &str) -> rusternetes_common::Error {
         causes: None,
         retry_after_seconds: None,
     };
-    rusternetes_common::Error::Status(Box::new(
-        rusternetes_common::types::Status::failure_with_details(
-            format!("{resource}.metrics.k8s.io \"{name}\" not found"),
-            "NotFound",
-            404,
-            details,
-        ),
-    ))
+    k3rs_common::Error::Status(Box::new(k3rs_common::types::Status::failure_with_details(
+        format!("{resource}.metrics.k8s.io \"{name}\" not found"),
+        "NotFound",
+        404,
+        details,
+    )))
 }
 
 /// Return the kubelet-published `NodeMetrics` for `node` carrying the node's
@@ -113,7 +111,7 @@ fn metrics_not_found(resource: &str, name: &str) -> rusternetes_common::Error {
 /// kubelet publishes its sample without labels.
 pub async fn node_metrics<S: Storage>(
     storage: &S,
-    node: &rusternetes_common::resources::Node,
+    node: &k3rs_common::resources::Node,
 ) -> Option<NodeMetrics> {
     let metrics_key = format!("/registry/metrics.k8s.io/nodes/{}", node.metadata.name);
     let mut metrics = storage.get::<NodeMetrics>(&metrics_key).await.ok()?;
@@ -138,7 +136,7 @@ pub async fn list_node_metrics(
     .with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
@@ -148,7 +146,7 @@ pub async fn list_node_metrics(
     // stored point (no zero-usage entry) and labels each result with
     // `Labels: node.Labels`; getMetrics sorts by name.
     let nodes_prefix = build_prefix("nodes", None);
-    let nodes: Vec<rusternetes_common::resources::Node> =
+    let nodes: Vec<k3rs_common::resources::Node> =
         state.storage.as_ref().list(&nodes_prefix).await?;
     let mut metrics: Vec<NodeMetrics> = Vec::new();
     for node in &nodes {
@@ -180,12 +178,12 @@ pub async fn get_pod_metrics(
         .with_name(&name);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // Check if pod exists
     let pod_key = build_key("pods", Some(&namespace), &name);
-    let pod: rusternetes_common::resources::Pod = state.storage.as_ref().get(&pod_key).await?;
+    let pod: k3rs_common::resources::Pod = state.storage.as_ref().get(&pod_key).await?;
 
     // metrics-server pkg/api/pod.go Get: `len(ms) == 0` returns NotFound
     // (lines 134-136) -- no fabricated object.
@@ -214,15 +212,14 @@ pub async fn list_pod_metrics(
     .with_namespace(&namespace);
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Get all pods in namespace
     let pods_prefix = build_prefix("pods", Some(&namespace));
-    let pods: Vec<rusternetes_common::resources::Pod> =
-        state.storage.as_ref().list(&pods_prefix).await?;
+    let pods: Vec<k3rs_common::resources::Pod> = state.storage.as_ref().list(&pods_prefix).await?;
     let mut metrics_list = Vec::new();
 
     for pod in pods {
@@ -257,21 +254,21 @@ pub async fn list_all_pod_metrics(
     .with_api_group("metrics.k8s.io");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;
 
     // Get all namespaces first
     let ns_prefix = build_prefix("namespaces", None);
-    let namespaces: Vec<rusternetes_common::resources::Namespace> =
+    let namespaces: Vec<k3rs_common::resources::Namespace> =
         state.storage.as_ref().list(&ns_prefix).await?;
     let mut metrics_list = Vec::new();
 
     for ns in namespaces {
         // Get all pods in this namespace
         let pods_prefix = build_prefix("pods", Some(&ns.metadata.name));
-        let pods: Vec<rusternetes_common::resources::Pod> =
+        let pods: Vec<k3rs_common::resources::Pod> =
             state.storage.as_ref().list(&pods_prefix).await?;
 
         for pod in pods {
@@ -295,16 +292,16 @@ pub async fn list_all_pod_metrics(
 mod tests {
     use super::*;
     use crate::state::ApiServerState;
-    use rusternetes_common::auth::UserInfo;
-    use rusternetes_common::authz::AlwaysAllowAuthorizer;
-    use rusternetes_common::resources::{Namespace, Node, NodeSpec, Pod, PodSpec};
-    use rusternetes_common::storage::MemoryStorage;
-    use rusternetes_common::types::ObjectMeta;
+    use k3rs_common::auth::UserInfo;
+    use k3rs_common::authz::AlwaysAllowAuthorizer;
+    use k3rs_common::resources::{Namespace, Node, NodeSpec, Pod, PodSpec};
+    use k3rs_common::storage::MemoryStorage;
+    use k3rs_common::types::ObjectMeta;
 
     async fn create_test_state() -> Arc<ApiServerState> {
-        use rusternetes_common::auth::{BootstrapTokenManager, TokenManager};
-        use rusternetes_common::observability::MetricsRegistry;
-        use rusternetes_storage::memory::MemoryStorage;
+        use k3rs_common::auth::{BootstrapTokenManager, TokenManager};
+        use k3rs_common::observability::MetricsRegistry;
+        use k3rs_storage::memory::MemoryStorage;
 
         let storage = Arc::new(MemoryStorage::new());
         let token_manager = Arc::new(TokenManager::new(b"test-key"));
@@ -314,7 +311,7 @@ mod tests {
 
         // Create a test node
         let node = Node {
-            type_meta: rusternetes_common::types::TypeMeta {
+            type_meta: k3rs_common::types::TypeMeta {
                 kind: "Node".to_string(),
                 api_version: "v1".to_string(),
             },
@@ -344,7 +341,7 @@ mod tests {
         let pod = Pod::new(
             "test-pod",
             PodSpec {
-                containers: vec![rusternetes_common::resources::Container {
+                containers: vec![k3rs_common::resources::Container {
                     name: "nginx".to_string(),
                     image: "nginx:latest".to_string(),
                     command: None,

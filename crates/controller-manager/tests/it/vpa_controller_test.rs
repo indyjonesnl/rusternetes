@@ -1,11 +1,11 @@
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     Container, ContainerResourcePolicy, CrossVersionObjectReference, Deployment, DeploymentSpec,
     Pod, PodResourcePolicy, PodSpec, PodStatus, PodTemplateSpec, PodUpdatePolicy,
     VerticalPodAutoscaler, VerticalPodAutoscalerSpec,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_controller_manager::controllers::vpa::VerticalPodAutoscalerController;
-use rusternetes_storage::{build_key, MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_controller_manager::controllers::vpa::VerticalPodAutoscalerController;
+use k3rs_storage::{build_key, MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -681,7 +681,7 @@ async fn test_vpa_recommendation_includes_bounds_and_uncapped_target() {
 }
 
 /// Update mode "Auto": controller must still emit recommendations and must NOT
-/// mutate pod specs in place (upstream Auto = recreate or in-place; rusternetes
+/// mutate pod specs in place (upstream Auto = recreate or in-place; k3rs
 /// today only logs intent — verify it's non-destructive).
 #[tokio::test]
 async fn test_vpa_update_mode_auto_emits_recommendations_without_mutation() {
@@ -746,7 +746,7 @@ async fn test_vpa_update_mode_auto_emits_recommendations_without_mutation() {
         "Auto mode VPA should emit recommendations"
     );
 
-    // Pods present, unchanged spec — rusternetes Auto mode does not in-place
+    // Pods present, unchanged spec — k3rs Auto mode does not in-place
     // resize today, so the pod specs must be untouched.
     let pods_after: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
     assert_eq!(pods_after.len(), 2, "Auto mode should not evict pods");

@@ -1,9 +1,9 @@
 use anyhow::Result;
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     ingress::{HTTPIngressPath, IngressBackend, IngressRule, IngressSpec, IngressTLS},
     Ingress, IngressClass, Secret, Service,
 };
-use rusternetes_storage::{build_key, extract_key, Storage, WorkQueue};
+use k3rs_storage::{build_key, extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -45,7 +45,7 @@ impl<S: Storage + 'static> IngressController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("ingresses", None);
+            let prefix = k3rs_storage::build_prefix("ingresses", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -201,7 +201,7 @@ impl<S: Storage + 'static> IngressController<S> {
             let class_key = build_key("ingressclasses", None, class_name);
             match self.storage.get::<IngressClass>(&class_key).await {
                 Ok(_) => {}
-                Err(rusternetes_common::Error::NotFound(_)) => {
+                Err(k3rs_common::Error::NotFound(_)) => {
                     return Err(anyhow::anyhow!("IngressClass {} not found", class_name));
                 }
                 // A transport/decode error is NOT a missing class — surface it
@@ -285,7 +285,7 @@ impl<S: Storage + 'static> IngressController<S> {
             let secret_key = build_key("secrets", Some(namespace), secret_name);
             match self.storage.get::<Secret>(&secret_key).await {
                 Ok(_) => {}
-                Err(rusternetes_common::Error::NotFound(_)) => {
+                Err(k3rs_common::Error::NotFound(_)) => {
                     return Err(anyhow::anyhow!(
                         "TLS secret {} not found in namespace {}",
                         secret_name,
@@ -381,7 +381,7 @@ impl<S: Storage + 'static> IngressController<S> {
 
         // Create load balancer ingress status
         let lb_ingress_status = vec![
-            rusternetes_common::resources::ingress::IngressLoadBalancerIngress {
+            k3rs_common::resources::ingress::IngressLoadBalancerIngress {
                 ip: Some(lb_ip.clone()),
                 hostname: None,
                 ports: None,
@@ -389,12 +389,10 @@ impl<S: Storage + 'static> IngressController<S> {
         ];
 
         // Update status
-        updated_ingress.status = Some(rusternetes_common::resources::ingress::IngressStatus {
-            load_balancer: Some(
-                rusternetes_common::resources::ingress::IngressLoadBalancerStatus {
-                    ingress: Some(lb_ingress_status),
-                },
-            ),
+        updated_ingress.status = Some(k3rs_common::resources::ingress::IngressStatus {
+            load_balancer: Some(k3rs_common::resources::ingress::IngressLoadBalancerStatus {
+                ingress: Some(lb_ingress_status),
+            }),
         });
 
         // Status subresource write: a full-object PUT strips `.status` (#1723).
@@ -425,7 +423,7 @@ impl<S: Storage + 'static> IngressController<S> {
     ) -> Result<String> {
         // Check if ingress has a specific IP requested via annotation
         if let Some(ref annotations) = ingress.metadata.annotations {
-            if let Some(requested_ip) = annotations.get("ingress.rusternetes.io/load-balancer-ip") {
+            if let Some(requested_ip) = annotations.get("ingress.k3rs.io/load-balancer-ip") {
                 info!(
                     "Using requested load balancer IP {} for Ingress {}/{}",
                     requested_ip, namespace, ingress.metadata.name

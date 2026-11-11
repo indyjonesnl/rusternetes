@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 
 use crate::flow_control_object_count::ObjectCountTracker;
 use crate::flow_control_work_estimator::Stats;
@@ -73,13 +73,13 @@ fn group_resource(group: &str, resource: &str) -> String {
 /// `Set`.
 pub async fn poll_once<S: Storage>(storage: &S, tracker: &ObjectCountTracker) {
     for (group, resource) in OBSERVED_RESOURCES {
-        let prefix = rusternetes_storage::build_prefix(resource, None);
+        let prefix = k3rs_storage::build_prefix(resource, None);
         observe(storage, tracker, group, resource, &prefix).await;
     }
     for (group, plural) in registered_custom_resources(storage).await {
         // The storage type of `handlers/custom_resource.rs`.
         let resource_type = format!("{}_{}", group.replace('.', "_"), plural);
-        let prefix = rusternetes_storage::build_prefix(&resource_type, None);
+        let prefix = k3rs_storage::build_prefix(&resource_type, None);
         observe(storage, tracker, &group, &plural, &prefix).await;
     }
 }
@@ -115,7 +115,7 @@ async fn observe<S: Storage>(
 /// registry; the registered CRDs are read each poll, which also stops
 /// observing a CRD once it is deleted (upstream's `destroy`).
 async fn registered_custom_resources<S: Storage>(storage: &S) -> Vec<(String, String)> {
-    let prefix = rusternetes_storage::build_prefix("customresourcedefinitions", None);
+    let prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
     let crds: Vec<serde_json::Value> = match storage.list(&prefix).await {
         Ok(v) => v,
         Err(e) => {

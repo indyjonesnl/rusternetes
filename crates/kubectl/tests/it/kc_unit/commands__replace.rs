@@ -3,7 +3,7 @@
 
 mod __parent {
     pub use anyhow::{Context, Result};
-    pub use rusternetes_client::http::ApiClient;
+    pub use k3rs_client::http::ApiClient;
     pub use serde::Deserialize;
     pub use std::fs;
     pub use std::io::{self, Read};
@@ -11,7 +11,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::replace::*;
+    use k3rs_kubectl::commands::replace::*;
 
     #[test]
     fn test_resource_path_core_namespaced() {

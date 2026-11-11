@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_common::feature_gates::upstream_table::UPSTREAM_GATES;
+    pub use k3rs_common::feature_gates::upstream_table::UPSTREAM_GATES;
     pub use std::sync::atomic::{AtomicBool, Ordering};
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::feature_gates::*;
+    use k3rs_common::feature_gates::*;
     use serial_test::serial;
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
         reset_to_defaults();
     }
 
-    // #3321: gates registered upstream but consumed by no rusternetes code
+    // #3321: gates registered upstream but consumed by no k3rs code
     // are still known to `--feature-gates` (feature_gate.go:385-389 only
     // rejects names absent from `known`).
     #[test]

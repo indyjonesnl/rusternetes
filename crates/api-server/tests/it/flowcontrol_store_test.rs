@@ -3,7 +3,7 @@
 //! defaults of `pkg/apis/flowcontrol/v1/defaults.go`.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const FS: &str = "/apis/flowcontrol.apiserver.k8s.io/v1/flowschemas";

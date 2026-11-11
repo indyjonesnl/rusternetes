@@ -18,7 +18,7 @@
 //! * `EnableContentionProfiling` calls `runtime.SetBlockProfileRate(1)`;
 //!   there is no block profile in Rust, so it is logged and otherwise inert.
 //! * klog verbosity maps onto the `tracing` filter, see
-//!   `rusternetes_common::tracing::verbosity_directive`.
+//!   `k3rs_common::tracing::verbosity_directive`.
 
 use axum::body::Bytes;
 use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
@@ -53,7 +53,7 @@ fn write_plain_text(status: StatusCode, text: &str) -> Response {
 /// with `strconv.ParseUint(val, 10, 32)`, apply it, report it.
 pub fn glog_setter(val: &str) -> Result<String, String> {
     let v = parse_uint32(val)?;
-    rusternetes_common::tracing::set_verbosity(v).map_err(|e| e.to_string())?;
+    k3rs_common::tracing::set_verbosity(v).map_err(|e| e.to_string())?;
     Ok(format!("successfully set klog.logging.verbosity to {val}"))
 }
 

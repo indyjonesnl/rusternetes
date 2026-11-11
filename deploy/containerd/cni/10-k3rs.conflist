@@ -1,6 +1,6 @@
 {
   "cniVersion": "1.0.0",
-  "name": "rusternetes",
+  "name": "k3rs",
   "plugins": [
     {
       "type": "bridge",

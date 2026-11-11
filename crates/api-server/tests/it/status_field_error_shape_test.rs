@@ -27,7 +27,7 @@
 //!     friends, which pin the resulting `Status` byte-for-byte.
 //!
 //! ---------------------------------------------------------------------------
-//! Current rusternetes behaviour (release `feat/pod-update-immutability-parity`)
+//! Current k3rs behaviour (release `feat/pod-update-immutability-parity`)
 //! ---------------------------------------------------------------------------
 //!
 //! `crates/common/src/error.rs::extract_resource_details_for_invalid` builds a
@@ -64,12 +64,12 @@
 //! documents (and locks down) the current — wrong — shape, so any drift in
 //! the build_status_response code path is also caught here.
 //!
-//! TODO(rusternetes): once `extract_resource_details_for_invalid` is replaced
+//! TODO(k3rs): once `extract_resource_details_for_invalid` is replaced
 //! with a `field::ErrorList`-aware builder (i.e. handlers return the list
 //! rather than a flat `String`, and the IntoResponse impl maps each entry to
 //! its upstream `causes[].reason`), drop every `#[ignore]` below.
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------

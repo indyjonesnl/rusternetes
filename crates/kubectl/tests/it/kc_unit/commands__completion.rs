@@ -7,7 +7,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubectl::commands::completion::*;
+    use k3rs_kubectl::commands::completion::*;
 
     #[test]
     fn test_bash_completion_succeeds() {

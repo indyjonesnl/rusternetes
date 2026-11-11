@@ -4,9 +4,9 @@
 //! path and the API path funnel into the same pure zone construction, so
 //! the two modes provably produce identical zones for identical inputs.
 
-use rusternetes_common::resources::{EndpointSlice, Pod, Service};
-use rusternetes_dns::watcher::{api_paths, rebuild_zone, DnsData};
-use rusternetes_dns::zone::{DnsRecord, LookupOutcome};
+use k3rs_common::resources::{EndpointSlice, Pod, Service};
+use k3rs_dns::watcher::{api_paths, rebuild_zone, DnsData};
+use k3rs_dns::zone::{DnsRecord, LookupOutcome};
 
 #[test]
 fn api_paths_are_the_rest_collection_endpoints() {

@@ -12,11 +12,11 @@ use crate::authorization_config::{
     name_for_authorizer_mode, AuthorizationConfiguration, AuthorizerConfiguration,
 };
 use crate::authorization_reload::ChainBuilder;
-use rusternetes_common::authz::{
+use k3rs_common::authz::{
     node_graph::NodeGraph, superuser_then, AlwaysAllowAuthorizer, AlwaysDenyAuthorizer, Authorizer,
     AuthzStorage, NodeAuthorizer, NodeAuthorizerFeatures, RBACAuthorizer,
 };
-use rusternetes_storage::Storage;
+use k3rs_storage::Storage;
 use std::path::Path;
 use std::sync::Arc;
 

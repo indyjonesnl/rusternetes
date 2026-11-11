@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
     Extension, Json,
 };
-use rusternetes_common::{
+use k3rs_common::{
     authz::{Decision, RequestAttributes},
     resources::ComponentStatus,
     List, Result,
@@ -25,7 +25,7 @@ pub async fn get(
         .with_name(&name);
 
     if let Decision::Deny(reason) = _state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     // ComponentStatus is a special resource that checks the health of system components
@@ -35,7 +35,7 @@ pub async fn get(
         "controller-manager" => ComponentStatus::healthy("controller-manager"),
         "etcd-0" | "etcd-1" | "etcd-2" => ComponentStatus::healthy(&name),
         _ => {
-            return Err(rusternetes_common::Error::NotFound(format!(
+            return Err(k3rs_common::Error::NotFound(format!(
                 "Component {} not found",
                 name
             )));
@@ -62,7 +62,7 @@ pub async fn list(
     .with_api_group("");
 
     if let Decision::Deny(reason) = _state.authorizer.authorize(&attrs).await? {
-        return Err(rusternetes_common::Error::Forbidden(reason));
+        return Err(k3rs_common::Error::Forbidden(reason));
     }
 
     crate::handlers::validate_synthesized_list_options(&params)?;

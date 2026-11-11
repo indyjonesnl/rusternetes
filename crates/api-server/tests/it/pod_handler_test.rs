@@ -2,9 +2,9 @@
 //!
 //! Tests all CRUD operations, admission control, finalizers, pagination, filtering, and error cases
 
-use rusternetes_common::resources::{Container, Pod, PodSpec};
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::resources::{Container, Pod, PodSpec};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
 // Helper function to create a test pod
@@ -317,7 +317,7 @@ async fn test_pod_list_with_label_selector() {
     let mut params = std::collections::HashMap::new();
     params.insert("labelSelector".to_string(), "app=nginx".to_string());
 
-    rusternetes_api_server::handlers::filtering::apply_label_selector(&mut pods, &params).unwrap();
+    k3rs_api_server::handlers::filtering::apply_label_selector(&mut pods, &params).unwrap();
 
     // Should find at least our pod with app=nginx label
     assert!(
@@ -402,7 +402,7 @@ async fn test_pod_not_found() {
 
     assert!(result.is_err());
     match result {
-        Err(rusternetes_common::Error::NotFound(_)) => {
+        Err(k3rs_common::Error::NotFound(_)) => {
             // Expected
         }
         _ => panic!("Expected NotFound error"),

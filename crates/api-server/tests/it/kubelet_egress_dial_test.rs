@@ -4,10 +4,10 @@
 //! exec, attach, port-forward).
 
 use axum::body::Body;
-use rusternetes_api_server::egress_selector::{
+use k3rs_api_server::egress_selector::{
     Conn, Dialer, DialerCreator, MetricsOptions, Proxier, ProxyServerConnector,
 };
-use rusternetes_api_server::handlers::pod_subresources::{
+use k3rs_api_server::handlers::pod_subresources::{
     fetch_kubelet_log_stream, proxy_kubelet_stream, proxy_kubelet_upgrade,
 };
 use std::sync::{Arc, Mutex};

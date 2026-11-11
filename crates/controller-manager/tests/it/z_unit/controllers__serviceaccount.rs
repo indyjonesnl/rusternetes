@@ -5,9 +5,9 @@ mod __parent {
     pub use anyhow::Result;
     pub use futures::StreamExt;
     pub use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    pub use rusternetes_common::resources::{Namespace, Secret, ServiceAccount};
-    pub use rusternetes_common::types::{ObjectMeta, TypeMeta};
-    pub use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
+    pub use k3rs_common::resources::{Namespace, Secret, ServiceAccount};
+    pub use k3rs_common::types::{ObjectMeta, TypeMeta};
+    pub use k3rs_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
     pub use serde::Serialize;
     pub use std::collections::HashMap;
     pub use std::sync::Arc;
@@ -16,8 +16,8 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_controller_manager::controllers::serviceaccount::*;
-    use rusternetes_storage::memory::MemoryStorage;
+    use k3rs_controller_manager::controllers::serviceaccount::*;
+    use k3rs_storage::memory::MemoryStorage;
 
     #[tokio::test]
     async fn test_serviceaccount_controller_creation() {
@@ -86,7 +86,7 @@ mod tests {
     /// 30s resync (#3029).
     #[tokio::test]
     async fn namespace_add_event_creates_default_serviceaccount_promptly() {
-        use rusternetes_common::resources::Namespace;
+        use k3rs_common::resources::Namespace;
         let storage = Arc::new(MemoryStorage::new());
         let controller = Arc::new(ServiceAccountController::new(storage.clone()));
         let handle = tokio::spawn(controller.run());
@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_created_in_list_watch_gap_is_replayed() {
         use futures::StreamExt;
-        use rusternetes_common::resources::Namespace;
+        use k3rs_common::resources::Namespace;
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceAccountController::new(storage.clone());
 

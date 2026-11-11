@@ -12,7 +12,7 @@
 //! `TestMonitorNodeHealth` were dropped); the tests below pin the documented
 //! behaviour of the functions as written at the cited lines.
 
-use rusternetes_common::resources::Node;
+use k3rs_common::resources::Node;
 
 /// `ZoneState` (:114-123).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

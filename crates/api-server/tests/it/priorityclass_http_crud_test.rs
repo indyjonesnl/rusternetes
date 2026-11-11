@@ -17,7 +17,7 @@
 //!   * `tower::ServiceExt::oneshot` per request.
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 const PC_COLLECTION: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";
@@ -26,7 +26,7 @@ const PC_COLLECTION: &str = "/apis/scheduling.k8s.io/v1/priorityclasses";
 // HTTP harness (inline, matches the in-process pattern used elsewhere).
 // ---------------------------------------------------------------------------
 
-// Harness: thin delegates over `TestApiServer` (rusternetes-test-support),
+// Harness: thin delegates over `TestApiServer` (k3rs-test-support),
 // preserving this file's `*_json(&state, …)` call sites. `patch_json` keeps its
 // explicit content-type arg (the merge- vs strategic-merge cases below).
 async fn post_json(state: &TestApiServer, uri: &str, body: &Value) -> (StatusCode, Value) {

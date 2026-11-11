@@ -2,15 +2,15 @@
 //!
 //! Tests all CRUD operations, edge cases, and error handling for persistent volumes
 
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     HostPathType, HostPathVolumeSource, NFSVolumeSource, PersistentVolumeMode,
     PersistentVolumePhase, PersistentVolumeReclaimPolicy,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     PersistentVolume, PersistentVolumeAccessMode, PersistentVolumeSpec, PersistentVolumeStatus,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

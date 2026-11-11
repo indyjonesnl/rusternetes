@@ -540,7 +540,7 @@ cat > "$STUBBIN/fakert" <<'EOF2'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_LOG"
 case "$1" in
-  ps) printf 'rusternetes-containerd\nrusternetes-containerd2\nother\n' ;;
+  ps) printf 'k3rs-containerd\nk3rs-containerd2\nother\n' ;;
   pull) case "$3" in *"$STUB_FAIL"*) [ -n "${STUB_FAIL:-}" ] && exit 1 ;; esac ;;
   save) echo tar ;;
   exec) cat >/dev/null ;;
@@ -555,15 +555,15 @@ CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-im
 [ "$rc" -eq 0 ] && grep -q "^pull --quiet $SLC\$" "$STUB_LOG" \
   && grep -q "^pull --quiet ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/agnhost:2.59\$" "$STUB_LOG" \
   && grep -q "^pull --quiet ghcr.io/indyjonesnl/rusternetes/mirror/e2e-test-images/busybox:1.36.1-1\$" "$STUB_LOG" \
-  && grep -qE "^exec -i rusternetes-containerd ctr -n k8s.io images import -" "$STUB_LOG" \
-  && grep -qE "^exec -i rusternetes-containerd2 ctr -n k8s.io images import -" "$STUB_LOG" \
+  && grep -qE "^exec -i k3rs-containerd ctr -n k8s.io images import -" "$STUB_LOG" \
+  && grep -qE "^exec -i k3rs-containerd2 ctr -n k8s.io images import -" "$STUB_LOG" \
   && ok "sideload: mirror pulls + imports into every containerd" || bad "sideload mirror log: $(tr '\n' '|' < "$STUB_LOG")"
 grep -qE "^save .*registry.k8s.io/pause:3.10.1" "$STUB_LOG" \
   && ok "sideload: sandbox image is saved under the containerd-pinned name" || bad "sideload sandbox name missing"
 
 # mirror pull failing falls back to registry.k8s.io and tags the mirror name; never fails
 : > "$STUB_LOG"
-STUB_FAIL="rusternetes/mirror" CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
+STUB_FAIL="k3rs/mirror" CONTAINER_RT="$STUBBIN/fakert" bash "$SL" --image-source mirror --conformance-image "$SLC" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ] && grep -q "^pull --quiet registry.k8s.io/conformance:v1.35.0\$" "$STUB_LOG" \
   && grep -q "^tag registry.k8s.io/conformance:v1.35.0 $SLC\$" "$STUB_LOG" \
   && ok "sideload: mirror failure falls back to upstream, retagged as requested" || bad "sideload fallback: $(tr '\n' '|' < "$STUB_LOG" | head -c 400)"

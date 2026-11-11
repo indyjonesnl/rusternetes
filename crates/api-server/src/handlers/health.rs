@@ -248,8 +248,8 @@ pub async fn readyz_check(
 
 /// Storage connectivity check (the `etcd` / `etcd-readiness` checks).
 async fn check_storage(state: &Arc<ApiServerState>) -> Result<(), String> {
-    use rusternetes_common::resources::namespace::Namespace;
-    use rusternetes_storage::Storage;
+    use k3rs_common::resources::namespace::Namespace;
+    use k3rs_storage::Storage;
 
     // Try to list namespaces as a health check
     state
@@ -401,7 +401,7 @@ pub async fn openid_jwks(State(state): State<Arc<ApiServerState>>) -> Response {
     // Try to load the RSA public key from standard paths
     let key_paths = [
         "/etc/kubernetes/pki/sa.pub",
-        "/root/.rusternetes/keys/sa-signing-key.pub",
+        "/root/.k3rs/keys/sa-signing-key.pub",
     ];
 
     for path in &key_paths {

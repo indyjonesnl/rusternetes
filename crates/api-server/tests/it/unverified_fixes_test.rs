@@ -3,12 +3,12 @@
 //! Tests 66, 67, 77, 85, 86, 89, 91-93, 108
 //! Each test proves the corresponding fix is functional.
 
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     CertificateSigningRequest, CertificateSigningRequestSpec, Container, Deployment,
     DeploymentSpec, KeyUsage, Pod, PodSpec, PodTemplateSpec, Service,
 };
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, TypeMeta};
+use k3rs_storage::{build_key, build_prefix, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -205,7 +205,7 @@ fn test_67_resolv_conf_different_namespace() {
 
 #[test]
 fn test_77_prestop_hook_struct_exists() {
-    use rusternetes_common::resources::{ExecAction, Lifecycle, LifecycleHandler};
+    use k3rs_common::resources::{ExecAction, Lifecycle, LifecycleHandler};
 
     // Verify preStop hook can be constructed
     let lifecycle = Lifecycle {
@@ -236,7 +236,7 @@ fn test_77_prestop_hook_struct_exists() {
 
 #[test]
 fn test_77_prestop_hook_serialization() {
-    use rusternetes_common::resources::{ExecAction, Lifecycle, LifecycleHandler};
+    use k3rs_common::resources::{ExecAction, Lifecycle, LifecycleHandler};
 
     let lifecycle = Lifecycle {
         post_start: None,
@@ -284,7 +284,7 @@ fn test_77_container_with_prestop_hook() {
 
 #[test]
 fn test_77_prestop_sleep_action() {
-    use rusternetes_common::resources::{Lifecycle, LifecycleHandler, SleepAction};
+    use k3rs_common::resources::{Lifecycle, LifecycleHandler, SleepAction};
 
     let lifecycle = Lifecycle {
         post_start: None,
@@ -309,7 +309,7 @@ fn test_77_prestop_sleep_action() {
 
 #[test]
 fn test_85_pod_status_has_resize_field() {
-    use rusternetes_common::resources::pod::PodStatus;
+    use k3rs_common::resources::pod::PodStatus;
 
     let status = PodStatus {
         phase: Some(Phase::Running),
@@ -441,7 +441,7 @@ async fn test_89_deployment_dryrun_update() {
 #[test]
 fn test_91_strategic_merge_patch_labels() {
     // Verify strategic-merge-patch can add labels to a pod
-    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    use k3rs_api_server::patch::{apply_patch, PatchType};
 
     let original = serde_json::json!({
         "apiVersion": "v1",
@@ -478,7 +478,7 @@ fn test_91_strategic_merge_patch_labels() {
 #[test]
 fn test_92_strategic_merge_patch_annotations() {
     // Verify strategic-merge-patch can add annotations to a pod
-    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    use k3rs_api_server::patch::{apply_patch, PatchType};
 
     let original = serde_json::json!({
         "apiVersion": "v1",
@@ -658,21 +658,19 @@ async fn test_108_csr_update() {
 
     // Update with status (simulating approval)
     let mut updated_csr = csr.clone();
-    updated_csr.status = Some(
-        rusternetes_common::resources::CertificateSigningRequestStatus {
-            conditions: Some(vec![
-                rusternetes_common::resources::CertificateSigningRequestCondition {
-                    type_: "Approved".to_string(),
-                    status: "True".to_string(),
-                    reason: Some("AutoApproved".to_string()),
-                    message: Some("Auto-approved by test".to_string()),
-                    last_update_time: None,
-                    last_transition_time: None,
-                },
-            ]),
-            certificate: Some("LS0tLS1CRUdJTi...cert...".to_string()),
-        },
-    );
+    updated_csr.status = Some(k3rs_common::resources::CertificateSigningRequestStatus {
+        conditions: Some(vec![
+            k3rs_common::resources::CertificateSigningRequestCondition {
+                type_: "Approved".to_string(),
+                status: "True".to_string(),
+                reason: Some("AutoApproved".to_string()),
+                message: Some("Auto-approved by test".to_string()),
+                last_update_time: None,
+                last_transition_time: None,
+            },
+        ]),
+        certificate: Some("LS0tLS1CRUdJTi...cert...".to_string()),
+    });
 
     let result: CertificateSigningRequest = storage.update(&key, &updated_csr).await.unwrap();
     assert!(result.status.is_some());
@@ -737,7 +735,7 @@ async fn test_108_csr_delete() {
 #[tokio::test]
 async fn test_108_csr_patch_serialization() {
     // Verify CSR can be patched via strategic merge patch
-    use rusternetes_api_server::patch::{apply_patch, PatchType};
+    use k3rs_api_server::patch::{apply_patch, PatchType};
 
     let original = serde_json::json!({
         "apiVersion": "certificates.k8s.io/v1",

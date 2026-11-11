@@ -1,5 +1,5 @@
 //! Regression for #1566: cert-manager's cainjector hot-loops (~20 updates/sec)
-//! against a ValidatingWebhookConfiguration because rusternetes emits a MODIFIED
+//! against a ValidatingWebhookConfiguration because k3rs emits a MODIFIED
 //! watch event (and bumps resourceVersion) for a *no-op* update — one whose
 //! object is byte-identical (modulo resourceVersion) to what is already stored.
 //!
@@ -8,14 +8,14 @@
 //! in the storage layer (etcd3 store.go: `if !origState.stale &&
 //! bytes.Equal(data, origState.data)`) — no write, no resourceVersion bump, no
 //! watch event — so cainjector's own idempotent Update does not re-trigger it.
-//! rusternetes wrote+published unconditionally, so each idempotent Update
+//! k3rs wrote+published unconditionally, so each idempotent Update
 //! produced a new MODIFIED event → re-trigger → infinite loop.
 //!
 //! This test drives the exact shape: one real change (add caBundle) must emit
 //! exactly one MODIFIED; a second identical Update must emit none.
 
 use futures::StreamExt;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;

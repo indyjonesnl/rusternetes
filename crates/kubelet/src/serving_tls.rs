@@ -7,7 +7,7 @@
 //! plain HTTP here makes every such proxied request fail with
 //! `http: server gave HTTP response to HTTPS client`, which cascades across
 //! NodeConformance (a vanilla api-server proxying `kubectl logs` to a
-//! Rusternetes kubelet) — see #1644.
+//! k3rs kubelet) — see #1644.
 //!
 //! We present a freshly generated self-signed serving certificate. The
 //! api-server does not verify the kubelet serving cert unless
@@ -48,14 +48,14 @@ pub fn kubelet_serving_tls_with_client_ca(
     ];
     // generate_self_signed() installs the process-wide rustls crypto provider,
     // so it must run before ServerConfig::builder() below.
-    let tls = rusternetes_common::tls::TlsConfig::generate_self_signed(node_name, sans)?;
+    let tls = k3rs_common::tls::TlsConfig::generate_self_signed(node_name, sans)?;
 
     let builder = rustls::ServerConfig::builder();
     let builder = match client_ca_file {
         None => builder.with_no_client_auth(),
         Some(ca) => {
             // `certutil.NewPool(kc.Authentication.X509.ClientCAFile)`
-            let inner = rusternetes_common::tls::client_cert_verifier_for_ca_file(ca)
+            let inner = k3rs_common::tls::client_cert_verifier_for_ca_file(ca)
                 .map_err(|e| anyhow!("unable to load client CA file {ca}: {e}"))?;
             builder.with_client_cert_verifier(Arc::new(RequestClientCert { inner }))
         }
@@ -125,7 +125,7 @@ impl rustls::server::danger::ClientCertVerifier for RequestClientCert {
 }
 
 /// Surfaces the connection's peer certificate chain to handlers as a
-/// [`rusternetes_middleware::PeerCertificates`] request extension (`req.TLS.PeerCertificates`). The
+/// [`k3rs_middleware::PeerCertificates`] request extension (`req.TLS.PeerCertificates`). The
 /// chain is unverified here; see [`RequestClientCert`]. Shared with the other
 /// plain-TLS servers (#3535).
-pub use rusternetes_middleware::secure_serving::serve::PeerCertAcceptor;
+pub use k3rs_middleware::secure_serving::serve::PeerCertAcceptor;

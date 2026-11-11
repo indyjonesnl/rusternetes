@@ -21,10 +21,10 @@
 //!     existence check + overhead injection).
 
 use axum::http::StatusCode;
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
-// HTTP harness: `TestApiServer` (rusternetes-test-support) boots the real
+// HTTP harness: `TestApiServer` (k3rs-test-support) boots the real
 // `build_router` on `MemoryStorage` with `--skip-auth` and drives it via
 // `tower::oneshot`, replacing the per-file make_state/send/post/get/... helpers
 // these tests used to duplicate.
@@ -204,7 +204,7 @@ async fn pod_referencing_deleted_runtimeclass_is_rejected() {
 /// A RuntimeClass with `overhead.podFixed` causes the api-server to inject
 /// `pod.spec.overhead` at admission. Mirrors upstream "should schedule a Pod
 /// requesting a RuntimeClass and initialize its Overhead" (the overhead
-/// initialisation half, which rusternetes performs at admission rather than in
+/// initialisation half, which k3rs performs at admission rather than in
 /// the scheduler).
 #[tokio::test]
 async fn pod_overhead_injected_from_runtimeclass() {

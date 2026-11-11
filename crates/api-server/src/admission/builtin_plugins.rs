@@ -6,17 +6,17 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::quantity::{Format, Quantity};
-use rusternetes_common::resources::node::{NodeSpec, Taint};
-use rusternetes_common::resources::volume::PersistentVolumeClaimPhase;
-use rusternetes_common::resources::{
+use k3rs_common::quantity::{Format, Quantity};
+use k3rs_common::resources::node::{NodeSpec, Taint};
+use k3rs_common::resources::volume::PersistentVolumeClaimPhase;
+use k3rs_common::resources::{
     Ingress, IngressClass, Node, PersistentVolumeClaim, Pod, Service, StorageClass,
 };
-use rusternetes_common::tolerations::TAINT_NODE_NOT_READY;
-use rusternetes_common::types::{ObjectMeta, Status};
-use rusternetes_common::validation::field;
-use rusternetes_common::{Error, Result};
-use rusternetes_storage::Storage;
+use k3rs_common::tolerations::TAINT_NODE_NOT_READY;
+use k3rs_common::types::{ObjectMeta, Status};
+use k3rs_common::validation::field;
+use k3rs_common::{Error, Result};
+use k3rs_storage::Storage;
 
 /// `admission.NewForbidden(a, err)` (apiserver/pkg/admission/errors.go:53-63):
 /// `<resource> "<name>" is forbidden: <err>`.

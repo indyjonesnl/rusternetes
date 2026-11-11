@@ -10,7 +10,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_kubelet::atomic_writer::*;
+    use k3rs_kubelet::atomic_writer::*;
 
     /// Uniform-mode payload, the common shape in these tests.
     fn payload(pairs: &[(&str, &[u8])]) -> BTreeMap<String, FileProjection> {

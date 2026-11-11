@@ -1,10 +1,10 @@
 //! Tests for StorageClass update validation (upstream ValidateStorageClassUpdate).
 
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     PersistentVolumeReclaimPolicy, StorageClass, VolumeBindingMode,
 };
-use rusternetes_common::validation::field::ErrorType;
-use rusternetes_common::validation::storageclass::validate_storage_class_update;
+use k3rs_common::validation::field::ErrorType;
+use k3rs_common::validation::storageclass::validate_storage_class_update;
 use std::collections::HashMap;
 
 fn sc() -> StorageClass {
@@ -21,7 +21,7 @@ fn sc() -> StorageClass {
     }
 }
 
-fn has(errs: &[rusternetes_common::validation::field::Error], field: &str) -> bool {
+fn has(errs: &[k3rs_common::validation::field::Error], field: &str) -> bool {
     errs.iter()
         .any(|e| e.field == field && e.error_type == ErrorType::Forbidden)
 }

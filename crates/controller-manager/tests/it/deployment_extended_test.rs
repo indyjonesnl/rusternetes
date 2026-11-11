@@ -23,14 +23,14 @@
 //! removing it is the unit of work for whoever lands the matching
 //! behaviour.
 
-use rusternetes_common::resources::pod::*;
-use rusternetes_common::resources::policy::IntOrString;
-use rusternetes_common::resources::*;
-use rusternetes_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
-use rusternetes_controller_manager::controllers::deployment::DeploymentController;
-use rusternetes_controller_manager::controllers::pod_disruption_budget::PodDisruptionBudgetController;
-use rusternetes_controller_manager::controllers::replicaset::ReplicaSetController;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::pod::*;
+use k3rs_common::resources::policy::IntOrString;
+use k3rs_common::resources::*;
+use k3rs_common::types::{LabelSelector, ObjectMeta, Phase, ResourceRequirements, TypeMeta};
+use k3rs_controller_manager::controllers::deployment::DeploymentController;
+use k3rs_controller_manager::controllers::pod_disruption_budget::PodDisruptionBudgetController;
+use k3rs_controller_manager::controllers::replicaset::ReplicaSetController;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 

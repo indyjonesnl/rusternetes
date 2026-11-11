@@ -2,23 +2,23 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use rusternetes_api_server::registry::generic::Store;
-    pub use rusternetes_api_server::registry::rest::{
+    pub use k3rs_api_server::registry::generic::Store;
+    pub use k3rs_api_server::registry::rest::{
         GroupResource, NamespaceScopedStrategy, RequestContext, RestCreateStrategy,
         RestDeleteStrategy, RestUpdateStrategy,
     };
-    pub use rusternetes_common::resources::ControllerRevision;
-    pub use rusternetes_common::validation::controllerrevision::{
+    pub use k3rs_common::resources::ControllerRevision;
+    pub use k3rs_common::validation::controllerrevision::{
         validate_controller_revision, validate_controller_revision_update,
     };
-    pub use rusternetes_common::validation::field::ErrorList;
-    pub use rusternetes_storage::StorageBackend;
+    pub use k3rs_common::validation::field::ErrorList;
+    pub use k3rs_storage::StorageBackend;
     pub use std::sync::Arc;
 }
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_api_server::registry::apps::controllerrevision::*;
+    use k3rs_api_server::registry::apps::controllerrevision::*;
 
     #[test]
     fn strategy_flags_match_upstream() {

@@ -7,14 +7,14 @@
 //! `GetFinalizerName`) and `pkg/attacher/attacher.go`; the cases mirror
 //! `csi_handler_test.go`.
 
-use rusternetes_common::resources::csi::VolumeAttachment;
-use rusternetes_common::resources::PersistentVolume;
-use rusternetes_controller_manager::controllers::csi_attacher::CsiAttacher;
-use rusternetes_csi::controller_client::CsiControllerClient;
-use rusternetes_csi::proto::controller_server::{Controller, ControllerServer};
-use rusternetes_csi::proto::identity_server::{Identity, IdentityServer};
-use rusternetes_csi::proto::*;
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_common::resources::csi::VolumeAttachment;
+use k3rs_common::resources::PersistentVolume;
+use k3rs_controller_manager::controllers::csi_attacher::CsiAttacher;
+use k3rs_csi::controller_client::CsiControllerClient;
+use k3rs_csi::proto::controller_server::{Controller, ControllerServer};
+use k3rs_csi::proto::identity_server::{Identity, IdentityServer};
+use k3rs_csi::proto::*;
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

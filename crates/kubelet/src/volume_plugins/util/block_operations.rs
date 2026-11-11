@@ -29,7 +29,7 @@ use crate::volume_plugins::util::operation_generator::{
 use crate::volume_plugins::util::types::{OperationContext, VolumeOperationError};
 use crate::volume_plugins::util::volumepathhandler::VolumePathHandler;
 use anyhow::{anyhow, Error, Result};
-use rusternetes_common::resources::Pod;
+use k3rs_common::resources::Pod;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -231,8 +231,7 @@ pub async fn map_volume_with(
             // Because we do not know what access mode the pod intends to use if there are multiple.
             let modes = &pv.spec.access_modes;
             if modes.len() == 1
-                && modes[0]
-                    == rusternetes_common::resources::PersistentVolumeAccessMode::ReadWriteOncePod
+                && modes[0] == k3rs_common::resources::PersistentVolumeAccessMode::ReadWriteOncePod
             {
                 return Ok(fail(
                     v,

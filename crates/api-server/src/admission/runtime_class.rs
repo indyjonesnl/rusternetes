@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 
-use rusternetes_common::quantity::Quantity;
-use rusternetes_common::resources::{Pod, RuntimeClass};
+use k3rs_common::quantity::Quantity;
+use k3rs_common::resources::{Pod, RuntimeClass};
 
 use crate::admission::pod_plugins::merge_tolerations;
 

@@ -8,7 +8,7 @@ mod __parent {
 
 mod tests {
     use super::__parent::*;
-    use rusternetes_common::cel_env::*;
+    use k3rs_common::cel_env::*;
 
     fn env() -> MutationEnv {
         MutationEnv {

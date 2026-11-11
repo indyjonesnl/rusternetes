@@ -1,15 +1,15 @@
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     HostPathType, HostPathVolumeSource, PersistentVolumeAccessMode, PersistentVolumeClaimPhase,
     PersistentVolumeMode, PersistentVolumePhase, PersistentVolumeReclaimPolicy,
     ResourceRequirements,
 };
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimStatus, StorageClass,
 };
-use rusternetes_common::types::{ObjectMeta, TypeMeta};
-use rusternetes_controller_manager::controllers::volume_expansion::VolumeExpansionController;
-use rusternetes_storage::memory::MemoryStorage;
-use rusternetes_storage::{build_key, Storage};
+use k3rs_common::types::{ObjectMeta, TypeMeta};
+use k3rs_controller_manager::controllers::volume_expansion::VolumeExpansionController;
+use k3rs_storage::memory::MemoryStorage;
+use k3rs_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ async fn create_test_storage_class(
             api_version: "storage.k8s.io/v1".to_string(),
         },
         metadata: ObjectMeta::new(name),
-        provisioner: "rusternetes.io/hostpath".to_string(),
+        provisioner: "k3rs.io/hostpath".to_string(),
         parameters: None,
         reclaim_policy: Some(PersistentVolumeReclaimPolicy::Delete),
         volume_binding_mode: None,
@@ -61,7 +61,7 @@ async fn create_test_pv(
             meta.uid = uuid::Uuid::new_v4().to_string();
             meta
         },
-        spec: rusternetes_common::resources::PersistentVolumeSpec {
+        spec: k3rs_common::resources::PersistentVolumeSpec {
             gce_persistent_disk: None,
             aws_elastic_block_store: None,
             fc: None,
@@ -84,7 +84,7 @@ async fn create_test_pv(
             claim_ref: None,
             volume_attributes_class_name: None,
         },
-        status: Some(rusternetes_common::resources::PersistentVolumeStatus {
+        status: Some(k3rs_common::resources::PersistentVolumeStatus {
             phase: PersistentVolumePhase::Available,
             message: None,
             reason: None,
@@ -122,7 +122,7 @@ async fn create_bound_pvc(
             meta.uid = uuid::Uuid::new_v4().to_string();
             meta
         },
-        spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
+        spec: k3rs_common::resources::PersistentVolumeClaimSpec {
             access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),
@@ -156,15 +156,13 @@ async fn create_bound_pvc(
     // expand controller errors otherwise (expand_controller.go:222-226).
     let pv_key = build_key("persistentvolumes", None, pv_name);
     let mut pv: PersistentVolume = storage.get(&pv_key).await.unwrap();
-    pv.spec.claim_ref = Some(
-        rusternetes_common::resources::service_account::ObjectReference {
-            kind: Some("PersistentVolumeClaim".to_string()),
-            namespace: Some(namespace.to_string()),
-            name: Some(name.to_string()),
-            uid: Some(pvc.metadata.uid.clone()),
-            ..Default::default()
-        },
-    );
+    pv.spec.claim_ref = Some(k3rs_common::resources::service_account::ObjectReference {
+        kind: Some("PersistentVolumeClaim".to_string()),
+        namespace: Some(namespace.to_string()),
+        name: Some(name.to_string()),
+        uid: Some(pvc.metadata.uid.clone()),
+        ..Default::default()
+    });
     storage.update(&pv_key, &pv).await.unwrap();
     pvc
 }
@@ -214,7 +212,7 @@ async fn test_volume_expansion_allowed() {
     let updated_pv: PersistentVolume = storage.get(&pv_key).await.unwrap();
     assert_eq!(updated_pv.spec.capacity.get("storage").unwrap(), "5Gi");
 
-    let events: Vec<rusternetes_common::resources::Event> =
+    let events: Vec<k3rs_common::resources::Event> =
         storage.list("/registry/events/default/").await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].reason, "ExternalExpanding");
@@ -301,7 +299,7 @@ async fn test_expansion_only_for_bound_pvcs() {
             meta.uid = uuid::Uuid::new_v4().to_string();
             meta
         },
-        spec: rusternetes_common::resources::PersistentVolumeClaimSpec {
+        spec: k3rs_common::resources::PersistentVolumeClaimSpec {
             access_modes: Some(vec![PersistentVolumeAccessMode::ReadWriteOnce]),
             resources: ResourceRequirements {
                 requests: Some(requests),

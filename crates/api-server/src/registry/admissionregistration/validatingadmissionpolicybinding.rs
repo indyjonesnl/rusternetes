@@ -4,15 +4,15 @@
 
 use std::sync::Arc;
 
-use rusternetes_common::authz::Authorizer;
+use k3rs_common::authz::Authorizer;
 
-use rusternetes_common::resources::ValidatingAdmissionPolicyBinding;
-use rusternetes_common::validation::field::{Error as FieldError, ErrorList, Path};
-use rusternetes_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
-use rusternetes_common::validation::validating_admission_policy::{
+use k3rs_common::resources::ValidatingAdmissionPolicyBinding;
+use k3rs_common::validation::field::{Error as FieldError, ErrorList, Path};
+use k3rs_common::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use k3rs_common::validation::validating_admission_policy::{
     set_defaults_validating_admission_policy_binding, validate_validating_admission_policy_binding,
 };
-use rusternetes_storage::StorageBackend;
+use k3rs_storage::StorageBackend;
 
 use super::authz::{authorize_param_ref, ParamAuthz};
 use crate::registry::generic::Store;

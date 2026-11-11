@@ -1,4 +1,4 @@
-//! CRI v1 gRPC client for the rusternetes kubelet.
+//! CRI v1 gRPC client for the k3rs kubelet.
 //!
 //! This crate is the kubelet's southbound runtime backend: it speaks the
 //! Kubernetes Container Runtime Interface (`runtime.v1`, gRPC) to a
@@ -899,12 +899,12 @@ mod tests {
         assert_eq!(req.version, "v1");
     }
 
-    /// Socket-gated live handshake. Skips unless RUSTERNETES_CRI_SOCKET points at
+    /// Socket-gated live handshake. Skips unless K3RS_CRI_SOCKET points at
     /// a real CRI runtime — keeps `cargo test` green on machines without one.
     #[tokio::test]
     async fn version_handshake_against_real_runtime() {
-        let Ok(socket) = std::env::var("RUSTERNETES_CRI_SOCKET") else {
-            eprintln!("RUSTERNETES_CRI_SOCKET unset; skipping live CRI handshake");
+        let Ok(socket) = std::env::var("K3RS_CRI_SOCKET") else {
+            eprintln!("K3RS_CRI_SOCKET unset; skipping live CRI handshake");
             return;
         };
         let mut client = CriClient::connect(&socket)

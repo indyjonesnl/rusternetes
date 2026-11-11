@@ -2,13 +2,13 @@
 #![allow(unused_imports, dead_code)]
 
 mod __parent {
-    pub use once_cell::sync::Lazy;
-    pub use regex::Regex;
-    pub use rusternetes_common::deletion::DeleteOptions;
-    pub use rusternetes_common::types::{
+    pub use k3rs_common::deletion::DeleteOptions;
+    pub use k3rs_common::types::{
         Condition, DeletionPropagation, LabelSelector, LabelSelectorRequirement, ManagedFieldsEntry,
     };
-    pub use rusternetes_common::validation::field::{Error, ErrorList, Path};
+    pub use k3rs_common::validation::field::{Error, ErrorList, Path};
+    pub use once_cell::sync::Lazy;
+    pub use regex::Regex;
     pub use std::collections::HashMap;
 }
 
@@ -19,31 +19,25 @@ mod tests {
     fn get_warnings_for_ip_matches_upstream() {
         let cluster = "spec.clusterIPs[0]";
         assert!(
-            rusternetes_common::validation::metav1::get_warnings_for_ip(cluster, "192.12.2.2")
-                .is_empty()
+            k3rs_common::validation::metav1::get_warnings_for_ip(cluster, "192.12.2.2").is_empty()
         );
-        assert!(rusternetes_common::validation::metav1::get_warnings_for_ip(
-            cluster,
-            "2001:db8::2"
-        )
-        .is_empty());
+        assert!(
+            k3rs_common::validation::metav1::get_warnings_for_ip(cluster, "2001:db8::2").is_empty()
+        );
         assert_eq!(
-            rusternetes_common::validation::metav1::get_warnings_for_ip(cluster, "192.012.2.2"),
+            k3rs_common::validation::metav1::get_warnings_for_ip(cluster, "192.012.2.2"),
             vec![
                 r#"spec.clusterIPs[0]: non-standard IP address "192.012.2.2" will be considered invalid in a future Kubernetes release: use "192.12.2.2""#
             ]
         );
         assert_eq!(
-            rusternetes_common::validation::metav1::get_warnings_for_ip(
-                cluster,
-                "::ffff:192.12.2.2"
-            ),
+            k3rs_common::validation::metav1::get_warnings_for_ip(cluster, "::ffff:192.12.2.2"),
             vec![
                 r#"spec.clusterIPs[0]: non-standard IP address "::ffff:192.12.2.2" will be considered invalid in a future Kubernetes release: use "192.12.2.2""#
             ]
         );
         assert_eq!(
-            rusternetes_common::validation::metav1::get_warnings_for_ip(
+            k3rs_common::validation::metav1::get_warnings_for_ip(
                 "spec.loadBalancerIP",
                 "2001:db8:0:0::2"
             ),
@@ -53,7 +47,7 @@ mod tests {
         );
     }
     use super::__parent::*;
-    use rusternetes_common::validation::metav1::*;
+    use k3rs_common::validation::metav1::*;
 
     /// Ported from upstream `TestIsRelaxedEnvVarName`
     /// (`staging/src/k8s.io/apimachinery/pkg/util/validation/validation_test.go:588-613`).

@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use rusternetes_common::resources::{
+use k3rs_common::resources::{
     service::{LoadBalancerIngress, LoadBalancerStatus, ServiceStatus},
     Event, EventType, Node, ObjectReference, Service, ServiceType,
 };
-use rusternetes_storage::event_recorder::process_event_ttl;
-use rusternetes_storage::{extract_key, Storage, WorkQueue};
+use k3rs_storage::event_recorder::process_event_ttl;
+use k3rs_storage::{extract_key, Storage, WorkQueue};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -49,7 +49,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
         loop {
             self.enqueue_all(&queue).await;
 
-            let prefix = rusternetes_storage::build_prefix("services", None);
+            let prefix = k3rs_storage::build_prefix("services", None);
             let watch_result = self.storage.watch(&prefix).await;
             let mut watch = match watch_result {
                 Ok(w) => w,
@@ -101,7 +101,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                     continue;
                 }
             };
-            let storage_key = rusternetes_storage::build_key("services", Some(ns), name);
+            let storage_key = k3rs_storage::build_key("services", Some(ns), name);
             match self.storage.get::<Service>(&storage_key).await {
                 Ok(service) => {
                     // Only process LoadBalancer-type services
@@ -243,7 +243,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
                 .unwrap_or_else(|| "0.0.0.0".to_string());
 
             // Re-read to avoid clobbering concurrent updates.
-            let key = rusternetes_storage::build_key("services", Some(ns), name);
+            let key = k3rs_storage::build_key("services", Some(ns), name);
             let mut fresh: Service = match self.storage.get(&key).await {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -283,8 +283,8 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
     /// its subsets. A missing Endpoints object or only `notReadyAddresses`
     /// counts as "no ready endpoints".
     async fn has_ready_endpoints(&self, namespace: &str, name: &str) -> bool {
-        let key = rusternetes_storage::build_key("endpoints", Some(namespace), name);
-        let ep: rusternetes_common::resources::Endpoints = match self.storage.get(&key).await {
+        let key = k3rs_storage::build_key("endpoints", Some(namespace), name);
+        let ep: k3rs_common::resources::Endpoints = match self.storage.get(&key).await {
             Ok(ep) => ep,
             Err(_) => return false,
         };
@@ -327,7 +327,7 @@ impl<S: Storage + 'static> LoadBalancerController<S> {
             existing.count = existing.count.saturating_add(1);
             existing.last_timestamp = Some(now);
             existing.message = message.to_string();
-            existing.series = Some(rusternetes_common::resources::EventSeries {
+            existing.series = Some(k3rs_common::resources::EventSeries {
                 count: existing.count,
                 last_observed_time: now,
             });

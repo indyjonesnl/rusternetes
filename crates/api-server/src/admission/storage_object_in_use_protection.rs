@@ -12,10 +12,10 @@
 //! VolumeAttributesClass, gated by the `VolumeAttributesClass` feature gate
 //! (admission.go:76-80); the vac-protection controller removes the finalizer.
 
-use rusternetes_common::resources::volume::{
+use k3rs_common::resources::volume::{
     PVC_PROTECTION_FINALIZER, PV_PROTECTION_FINALIZER, VAC_PROTECTION_FINALIZER,
 };
-use rusternetes_common::types::ObjectMeta;
+use k3rs_common::types::ObjectMeta;
 
 /// `admitPV` / `admitPVC` body: append `finalizer` unless present.
 pub fn add_protection_finalizer(meta: &mut ObjectMeta, finalizer: &str) {

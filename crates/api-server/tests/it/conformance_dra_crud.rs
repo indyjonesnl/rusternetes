@@ -19,7 +19,7 @@
 //! from a typed object without a TypeMeta, so the create body deliberately
 //! carries no `apiVersion`/`kind` (conformance.go:414-416 and :685).
 
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_test_support::harness::TestApiServer;
 use serde_json::{json, Value};
 
 async fn send(

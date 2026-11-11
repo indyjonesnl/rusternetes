@@ -43,11 +43,11 @@
 //!   * JSON-side mirror: `tests/integration_eviction_subresource.rs`.
 
 use axum::http::StatusCode;
-use rusternetes_api_server::protobuf::ProtoRegistry;
-use rusternetes_common::resources::{Container, Pod, PodSpec, PodStatus};
-use rusternetes_common::types::{ObjectMeta, Phase, TypeMeta};
-use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
-use rusternetes_test_support::harness::TestApiServer;
+use k3rs_api_server::protobuf::ProtoRegistry;
+use k3rs_common::resources::{Container, Pod, PodSpec, PodStatus};
+use k3rs_common::types::{ObjectMeta, Phase, TypeMeta};
+use k3rs_storage::{build_key, memory::MemoryStorage, Storage};
+use k3rs_test_support::harness::TestApiServer;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
