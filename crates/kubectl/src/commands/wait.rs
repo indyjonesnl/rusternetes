@@ -84,7 +84,7 @@ async fn wait_for_deletion(
         };
 
         match client.get::<Value>(&path).await {
-            Err(GetError::NotFound) => {
+            Err(GetError::NotFound(_)) => {
                 println!("{}/{} deleted", resource_type, name.unwrap_or("*"));
                 return Ok(());
             }
@@ -128,7 +128,7 @@ async fn wait_for_condition(
         };
 
         let resource: Value = client.get(&path).await.map_err(|e| match e {
-            GetError::NotFound => anyhow::anyhow!("Resource not found"),
+            GetError::NotFound(_) => anyhow::anyhow!("Resource not found"),
             GetError::Other(e) => e,
         })?;
 

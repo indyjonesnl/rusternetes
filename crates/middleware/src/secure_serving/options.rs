@@ -721,7 +721,7 @@ async fn get_authentication_configmap(
     );
     match client.get::<serde_json::Value>(&path).await {
         Ok(v) => Ok(Some(v)),
-        Err(rusternetes_client::http::GetError::NotFound) => Ok(None),
+        Err(rusternetes_client::http::GetError::NotFound(_)) => Ok(None),
         Err(e) => Err(e.to_string()),
     }
 }

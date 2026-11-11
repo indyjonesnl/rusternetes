@@ -61,7 +61,7 @@ pub async fn execute(client: &ApiClient, client_only: bool, output: Option<&str>
     } else {
         // Get server version
         let server_version: ServerVersion = client.get("/version").await.map_err(|e| match e {
-            rusternetes_client::http::GetError::NotFound => {
+            rusternetes_client::http::GetError::NotFound(_) => {
                 anyhow::anyhow!("Server version endpoint not found")
             }
             rusternetes_client::http::GetError::Other(e) => e,

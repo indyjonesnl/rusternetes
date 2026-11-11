@@ -63,7 +63,7 @@ pub async fn execute_enhanced(
 // Helper to convert GetError to anyhow::Error
 pub fn map_get_error(err: GetError) -> anyhow::Error {
     match err {
-        GetError::NotFound => anyhow::anyhow!("Resource not found"),
+        GetError::NotFound(_) => anyhow::anyhow!("Resource not found"),
         GetError::Other(e) => e,
     }
 }

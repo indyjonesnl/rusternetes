@@ -334,7 +334,8 @@ async fn complete_unknown_node_and_wrong_resource() {
     let (r, _, _) = run_cordon(&mock, Mode::Cordon, &["missing"], &flags()).await;
     assert_eq!(
         r.unwrap_err().to_string(),
-        "Error from server (NotFound): nodes \"missing\" not found"
+        // The server's Status is surfaced as is (typed 404), not synthesized.
+        "Error from server (NotFound): nope /api/v1/nodes/missing"
     );
     let (r, _, _) = run_cordon(&mock, Mode::Cordon, &["pod/foo"], &flags()).await;
     assert_eq!(

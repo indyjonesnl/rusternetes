@@ -239,7 +239,7 @@ async fn watch_resources(client: &ApiClient, api_path: &str, query: &str) -> Res
     };
 
     let response = client.get_stream(&watch_path).await.map_err(|e| match e {
-        GetError::NotFound => anyhow::anyhow!("Resource not found"),
+        GetError::NotFound(_) => anyhow::anyhow!("Resource not found"),
         GetError::Other(e) => e,
     })?;
 

@@ -55,14 +55,18 @@ pub struct ApiClient {
 
 #[derive(Debug)]
 pub enum GetError {
-    NotFound,
+    /// HTTP 404. Carries the typed `StatusError` client-go hands back
+    /// (rest/request.go:1489-1511 `Result.Error()`): the body's `Status` when
+    /// it decodes as a `Failure`, else the `NewGenericServerResponse` error
+    /// (apimachinery errors.go:437-493). Query with `api_status::is_not_found`.
+    NotFound(crate::api_status::ApiStatusError),
     Other(anyhow::Error),
 }
 
 impl std::fmt::Display for GetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GetError::NotFound => write!(f, "Resource not found"),
+            GetError::NotFound(_) => write!(f, "Resource not found"),
             GetError::Other(e) => write!(f, "{}", e),
         }
     }
@@ -382,7 +386,13 @@ impl ApiClient {
         let status = response.status();
 
         if status == StatusCode::NOT_FOUND {
-            return Err(GetError::NotFound);
+            let retry_after = retry_after_seconds(&response);
+            let body = response.text().await.unwrap_or_default();
+            let err = format_status_error(status, &reqwest::Method::GET, &body, retry_after);
+            return Err(match err.downcast::<crate::api_status::ApiStatusError>() {
+                Ok(status_err) => GetError::NotFound(status_err),
+                Err(other) => GetError::Other(other),
+            });
         }
 
         if !status.is_success() {

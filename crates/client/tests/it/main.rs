@@ -9,6 +9,7 @@
 //! reintroduces a separate binary, which is what this layout avoids.
 mod config_test;
 mod events_test;
+mod get_not_found_test;
 mod list_envelope_test;
 mod reflector_live_test;
 mod reflector_test;

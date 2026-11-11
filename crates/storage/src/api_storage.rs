@@ -566,7 +566,7 @@ pub fn map_write_err(e: anyhow::Error) -> Error {
 
 pub fn map_get_err(e: GetError) -> Error {
     match e {
-        GetError::NotFound => Error::NotFound("resource not found".into()),
+        GetError::NotFound(_) => Error::NotFound("resource not found".into()),
         // Preserve the full source chain (see `map_write_err`).
         GetError::Other(e) => Error::Storage(format!("{e:#}")),
     }
