@@ -258,5 +258,5 @@ Join sequence:
 - [Talos Image Factory](https://factory.talos.dev/) · [siderolabs/image-factory](https://github.com/siderolabs/image-factory)
 - [Sidero Labs — Talos Linux](https://www.siderolabs.com/talos-linux)
 
-[#1036]: https://github.com/indyjonesnl/rusternetes/issues/1036
+[#1036]: https://github.com/indyjonesnl/k3rs/issues/1036
 [siderolabs/image-factory]: https://github.com/siderolabs/image-factory

@@ -83,7 +83,7 @@ specifically (filed as issue #1580 — see below).
 ## Filed issues
 
 Every capability gap this harness surfaced was filed as a GitHub issue on
-`indyjonesnl/rusternetes` (component-scoped) or, where the gap was in the
+`indyjonesnl/k3rs` (component-scoped) or, where the gap was in the
 adjacent CRI runtime rather than k3rs itself, on `containerd-rs`:
 
 | Issue | Component | Gap |

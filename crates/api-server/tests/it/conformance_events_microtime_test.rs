@@ -3,7 +3,7 @@
 //! [Conformance]` (`k8s.io/kubernetes/test/e2e/instrumentation/events.go:217`).
 //!
 //! The conformance canary
-//! (https://github.com/indyjonesnl/rusternetes/actions/runs/26315095760/job/77472467511)
+//! (https://github.com/indyjonesnl/k3rs/actions/runs/26315095760/job/77472467511)
 //! reported:
 //!
 //!     422 UnexpectedServerResponse: 'Failed to deserialize the JSON body

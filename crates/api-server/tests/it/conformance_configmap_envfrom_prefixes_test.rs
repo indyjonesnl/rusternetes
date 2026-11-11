@@ -4,7 +4,7 @@
 //! (`k8s.io/kubernetes/test/e2e/common/node/configmap.go:261`, k8s v1.34+).
 //!
 //! The conformance canary
-//! (https://github.com/indyjonesnl/rusternetes/actions/runs/26249262860/job/77255760479)
+//! (https://github.com/indyjonesnl/k3rs/actions/runs/26249262860/job/77255760479)
 //! reported:
 //!
 //!     Error creating Pod: failed to decode: missing field `name` at line 1 column 311
