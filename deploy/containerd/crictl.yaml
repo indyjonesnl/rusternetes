@@ -1,0 +1,6 @@
+# crictl endpoints: the CRI socket containerd serves in this container
+# (deploy/containerd/config.toml [grpc].address). Same layout k3s writes to
+# /etc/crictl.yaml for its embedded containerd.
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
