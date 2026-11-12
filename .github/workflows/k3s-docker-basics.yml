@@ -8,9 +8,6 @@ name: k3s-docker-basics
 # A failing spec fails the job, as it does in k3s.
 
 on:
-  push:
-    branches: [test/k3s-docker-basics]
-    paths: ['.github/workflows/k3s-docker-basics.yml']
   workflow_dispatch:
     inputs:
       image-tag:
@@ -40,7 +37,7 @@ jobs:
       - name: Resolve image tag
         id: tag
         env:
-          REQUESTED: ${{ inputs.image-tag || 'local' }}
+          REQUESTED: ${{ inputs.image-tag }}
         run: |
           set -euo pipefail
           if [ "$REQUESTED" = "local" ] || [ -z "$REQUESTED" ]; then
