@@ -303,6 +303,33 @@ import_addon_image() {
     import_image_into_containerd "$image"
 }
 
+# Every image of ci/mirror/addon-images.txt (the upstream images the k3s
+# manifests in deploy/addons/ run, plus the pause image k3s's own tests use),
+# side-loaded under its docker.io name.
+import_addon_images() {
+    local list="$PROJECT_ROOT/ci/mirror/addon-images.txt" path
+    [ -f "$list" ] || return 0
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        import_addon_image "docker.io/$path"
+    done < <(sed 's/#.*//' "$list" | tr -d ' \t' | grep -v '^$')
+}
+
+# k3s templates its bundled manifests at startup (pkg/server/server.go
+# `%{...}%` replacement map: CLUSTER_DOMAIN, CLUSTER_DNS, CLUSTER_DNS_LIST,
+# CLUSTER_DNS_IPFAMILYPOLICY, SYSTEM_DEFAULT_REGISTRY, DEFAULT_LOCAL_STORAGE_PATH).
+# Same substitution here; the empty registry leaves the docker.io/rancher/...
+# names the airgap list pins. Prints the templated manifest on stdout.
+template_k3s_manifest() {
+    sed -e 's|%{CLUSTER_DOMAIN}%|cluster.local|g' \
+        -e 's|%{SYSTEM_DEFAULT_REGISTRY}%||g' \
+        -e 's|%{CLUSTER_DNS}%|10.96.0.10|g' \
+        -e 's|%{CLUSTER_DNS_LIST}%|["10.96.0.10"]|g' \
+        -e 's|%{CLUSTER_DNS_IPFAMILYPOLICY}%|SingleStack|g' \
+        -e 's|%{DEFAULT_LOCAL_STORAGE_PATH}%|/var/lib/k3rs/storage|g' \
+        "$1"
+}
+
 # The sandbox (pause) image containerd requests before any pod can start
 # (deploy/containerd/config.toml pinned_images.sandbox). Pull it with the host
 # daemon, which retries, and import it like the control-plane images: the
@@ -648,26 +675,12 @@ EOF
         $KUBECTL $KUBECTL_FLAGS delete endpointslice kube-dns-k3rs -n kube-system 2>/dev/null \
             && echo "  Deleted stale kube-dns-k3rs EndpointSlice" || true
 
-        # The CoreDNS pod runs inside containerd too (same store problem as
-        # the static pods): side-load its image under the exact upstream name
-        # the manifest requests.
-        coredns_image="$(sed -nE 's#^[[:space:]]*image:[[:space:]]*"?%\{SYSTEM_DEFAULT_REGISTRY\}%([^"]+)"?[[:space:]]*$#docker.io/\1#p' "$coredns_manifest" | head -1)"
-        if [ -n "$coredns_image" ]; then
-            echo "  CoreDNS image: $coredns_image"
-            import_addon_image "$coredns_image"
-        fi
+        # The addon pods run inside containerd too (same store problem as the
+        # static pods): side-load every upstream addon image under the exact
+        # name the k3s manifests request (ci/mirror/addon-images.txt).
+        import_addon_images
 
-        # k3s templates manifests/coredns.yaml at startup (pkg/deploy,
-        # pkg/daemons/config: CLUSTER_DOMAIN, CLUSTER_DNS, SYSTEM_DEFAULT_REGISTRY,
-        # CLUSTER_DNS_LIST, CLUSTER_DNS_IPFAMILYPOLICY). Same substitution here;
-        # the empty registry leaves the docker.io/rancher/... name the airgap
-        # list (scripts/airgap/image-list.txt) pins.
-        sed -e 's|%{CLUSTER_DOMAIN}%|cluster.local|g' \
-            -e 's|%{SYSTEM_DEFAULT_REGISTRY}%||g' \
-            -e 's|%{CLUSTER_DNS}%|10.96.0.10|g' \
-            -e 's|%{CLUSTER_DNS_LIST}%|["10.96.0.10"]|g' \
-            -e 's|%{CLUSTER_DNS_IPFAMILYPOLICY}%|SingleStack|g' \
-            "$coredns_manifest" | $KUBECTL $KUBECTL_FLAGS apply -f -
+        template_k3s_manifest "$coredns_manifest" | $KUBECTL $KUBECTL_FLAGS apply -f -
 
         # The Corefile's `hosts /etc/coredns/NodeHosts` block and the
         # Deployment's configMap items both require a NodeHosts key. k3s fills
@@ -697,6 +710,35 @@ EOF
                 print_warning "Check: $KUBECTL $KUBECTL_FLAGS get pods -n kube-system"
             else
                 echo "  Waiting for coredns... ($i/$MAX_WAIT)"
+                sleep 2
+            fi
+        done
+
+        # Upstream local-path-provisioner exactly as k3s ships it (k3s
+        # manifests/local-storage.yaml): the `local-path` default StorageClass
+        # (rancher.io/local-path, WaitForFirstConsumer, Delete) + RBAC +
+        # config. Replaces the old api-server-seeded `standard` class served
+        # by the in-tree k3rs.io/hostpath provisioner.
+        print_step "Applying local-path-provisioner (deploy/addons/local-storage.yaml, from k3s manifests/local-storage.yaml)..."
+        local_storage_manifest="$PROJECT_ROOT/deploy/addons/local-storage.yaml"
+        if [ ! -f "$local_storage_manifest" ]; then
+            print_error "$local_storage_manifest not found"
+            exit 1
+        fi
+        template_k3s_manifest "$local_storage_manifest" | $KUBECTL $KUBECTL_FLAGS apply -f -
+
+        print_step "Waiting for the local-path-provisioner Deployment to be ready..."
+        MAX_WAIT=90
+        for i in $(seq 1 $MAX_WAIT); do
+            LP_READY=$($KUBECTL $KUBECTL_FLAGS get deployment local-path-provisioner -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+            if [ "$LP_READY" == "1" ]; then
+                print_success "local-path-provisioner Deployment is ready!"
+                break
+            fi
+            if [ $i -eq $MAX_WAIT ]; then
+                print_warning "local-path-provisioner not ready after ${MAX_WAIT} attempts (readyReplicas: ${LP_READY:-none})"
+            else
+                echo "  Waiting for local-path-provisioner... ($i/$MAX_WAIT)"
                 sleep 2
             fi
         done
