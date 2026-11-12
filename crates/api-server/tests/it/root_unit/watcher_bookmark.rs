@@ -2,9 +2,9 @@
 //! `TestBookmarkAfterResourceVersionWatchers`, plus `nextBookmarkTime` cases
 //! (`cache_watcher.go:215-262`). `FakeClock` is `testingclock.FakeClock` over
 //! the repo's `PassiveClock` (`clock.Step(d)` is `step(d)`).
-use rusternetes_api_server::cache_watcher::*;
-use rusternetes_api_server::flow_control_object_count::PassiveClock;
-use rusternetes_api_server::watcher_bookmark::*;
+use k3rs_api_server::cache_watcher::*;
+use k3rs_api_server::flow_control_object_count::PassiveClock;
+use k3rs_api_server::watcher_bookmark::*;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
