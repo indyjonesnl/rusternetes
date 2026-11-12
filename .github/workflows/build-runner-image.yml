@@ -41,13 +41,13 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         # PR runs from forks don't get write packages — skip the login so
         # the build still verifies but won't try to push.
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -72,7 +72,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build (and push on main)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ci/arc-runner
           file: ci/arc-runner/Dockerfile
