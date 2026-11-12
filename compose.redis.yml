@@ -169,6 +169,7 @@ services:
       - k3rs-net
     volumes:
       - containerd-run:/run/containerd
+      - local-path-storage:/var/lib/k3rs/storage
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
       # filesystem, not the container's own overlay rootfs — nested overlay
       # mounts fail with "invalid argument". A named volume is host-fs-backed.
@@ -195,6 +196,7 @@ services:
     volumes:
       # CRI socket shared from the containerd service.
       - containerd-run:/run/containerd
+      - local-path-storage:/var/lib/k3rs/storage
       # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
       # mount namespace and survive container restarts (#445).
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
@@ -230,6 +232,7 @@ services:
     volumes:
       # CRI socket shared from the containerd service.
       - containerd-run:/run/containerd
+      - local-path-storage:/var/lib/k3rs/storage
       # rshared so Memory-medium emptyDir tmpfs mounts propagate to the host
       # mount namespace and survive container restarts (#445).
       - ${KUBELET_VOLUMES_PATH}:${KUBELET_VOLUMES_PATH}:rw,rshared
@@ -285,6 +288,12 @@ networks:
     name: k3rs-network
 
 volumes:
+  # local-path-provisioner data dir (/var/lib/k3rs/storage), shared between a
+  # node's runtime (whose helper pod creates the PV directory and whose pods
+  # mount it) and its kubelet (whose local volume plugin stats the path). In a
+  # real node these are one filesystem; here they are two containers.
+  local-path-storage:
+    name: k3rs-local-path-storage
   redis-data:
     name: k3rs-redis-data
   # CRI socket shared from the containerd service to the kubelets + api-server.
