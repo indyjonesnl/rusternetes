@@ -25,6 +25,21 @@ RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
     && tar -xzf /tmp/containerd.tar.gz -C /usr/local \
     && rm /tmp/containerd.tar.gz
 
+# crictl from upstream kubernetes-sigs/cri-tools (k3s bundles crictl too:
+# scripts/package-cli), sha256-verified. /etc/crictl.yaml points it at the CRI
+# socket this container serves, so `crictl version|images|ps` work out of the box.
+ARG CRICTL_VERSION=v1.35.0
+RUN curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+      "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${TARGETARCH}.tar.gz" \
+      -o /tmp/crictl.tar.gz \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+      "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${TARGETARCH}.tar.gz.sha256" \
+      -o /tmp/crictl.sha256 \
+    && echo "$(cut -d' ' -f1 /tmp/crictl.sha256)  /tmp/crictl.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/crictl.tar.gz -C /usr/local/bin crictl \
+    && rm /tmp/crictl.tar.gz /tmp/crictl.sha256
+COPY deploy/containerd/crictl.yaml /etc/crictl.yaml
+
 # CNI plugins (bridge, host-local, portmap, loopback, …) for pod networking.
 RUN mkdir -p /opt/cni/bin \
     && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
