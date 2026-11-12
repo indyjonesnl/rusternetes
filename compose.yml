@@ -263,23 +263,6 @@ services:
     # alias api-server:6443.
     command: ["--node-name", "node-1", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf"]
 
-  # DNS - authoritative cluster.local DNS server, build-only. The dns
-  # binary no longer runs as a compose container: bootstrap-cluster.sh
-  # applies bootstrap-dns.yaml, which deploys this image as a kube-system
-  # Deployment (k8s-app=kube-dns) reading cluster state from the
-  # api-server. Kubelets share the host docker daemon, so the locally
-  # built tag is visible to pods without a registry.
-  # Build with: docker compose --profile build build dns
-  dns:
-    profiles: ["build"]
-    image: k3rs-dns:latest
-    build:
-      context: .
-      dockerfile: services.Dockerfile
-      args:
-        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
-      target: dns
-
 networks:
   k3rs-net:
     driver: bridge

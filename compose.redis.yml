@@ -276,20 +276,6 @@ services:
     # netns → rhino reached at its compose alias rhino:2379.
     command: ["--node-name", "node-1", "--etcd-servers", "http://rhino:2379"]
 
-  # DNS image, build-only. The dns binary runs as a kube-system Deployment
-  # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
-  # state from the api-server — not as a compose container.
-  # Build with: docker compose -f compose.redis.yml --profile build build dns
-  dns:
-    profiles: ["build"]
-    image: k3rs-dns:latest
-    build:
-      context: .
-      dockerfile: services.Dockerfile
-      args:
-        K3RS_GIT_SHA: "${K3RS_GIT_SHA-}"
-      target: dns
-
 networks:
   k3rs-net:
     driver: bridge

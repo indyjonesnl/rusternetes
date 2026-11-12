@@ -30,9 +30,9 @@ fi
 export COMPOSE_PROJECT_NAME=k3rs
 
 echo "==> Building k3rs service images (compose project: k3rs)"
-# --profile build includes the build-only dns image (runs as an in-cluster
-# Deployment via bootstrap-dns.yaml, not a compose container — the kubelets
-# inside each agent dind need it loaded locally).
+# --profile build includes the build-only scheduler / controller-manager images
+# (they run as static pods, not compose containers — the kubelets inside each
+# agent dind need them loaded locally).
 docker compose -f compose.yml --profile build build --parallel
 
 # Image set matches compose.yml's services with a `build:` block. etcd

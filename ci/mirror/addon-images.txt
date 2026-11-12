@@ -1,0 +1,8 @@
+# Upstream (Go) addon images the k3s manifests in deploy/addons/ run, mirrored
+# from Docker Hub (docker.io) to ghcr.io/indyjonesnl/rusternetes/mirror/<path>
+# by .github/workflows/mirror-images.yml (SOURCE_REGISTRY=docker.io). One
+# "<path>:<tag>" per line, <path> relative to docker.io. Tags are the ones k3s
+# pins in scripts/airgap/image-list.txt (v1.35.9+k3s1); keep them in step with
+# the manifests. scripts/bootstrap-cluster.sh import_addon_image pulls from the
+# mirror first and falls back to docker.io.
+rancher/mirrored-coredns-coredns:1.14.7

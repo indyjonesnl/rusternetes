@@ -18,6 +18,7 @@ on:
     branches: [main]
     paths:
       - 'ci/mirror/images.txt'
+      - 'ci/mirror/addon-images.txt'
       - 'scripts/mirror-images.sh'
       - '.github/workflows/mirror-images.yml'
 
@@ -47,6 +48,10 @@ jobs:
         run: scripts/check-mirror-images.sh --list-images
       - name: Mirror images
         run: scripts/mirror-images.sh | tee "$RUNNER_TEMP/mirror.log"
+      # Upstream addon images (rancher/*) the k3s manifests in deploy/addons/
+      # run; same copy mechanism, Docker Hub as the source.
+      - name: Mirror addon images
+        run: SOURCE_REGISTRY=docker.io scripts/mirror-images.sh ci/mirror/addon-images.txt | tee -a "$RUNNER_TEMP/mirror.log"
       - name: Summary
         if: always()
         run: |

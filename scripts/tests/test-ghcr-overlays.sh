@@ -16,8 +16,8 @@ command -v jq >/dev/null 2>&1 || { echo "FAIL: jq required" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "FAIL: docker required" >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "FAIL: docker compose v2 required" >&2; exit 1; }
 
-# The dns service is build-only (profiles: ["build"]); activate the profile
-# so `compose config` still enumerates it for the sync checks below.
+# Several services are build-only (profiles: ["build"]); activate the profile
+# so `compose config` still enumerates them for the sync checks below.
 export COMPOSE_PROFILES=build
 
 fail=0

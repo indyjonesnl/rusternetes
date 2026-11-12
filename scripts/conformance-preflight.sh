@@ -12,7 +12,7 @@
 #     against a cluster with no scheduler looks like ~400 product bugs.
 #   * CONTROL_PLANE_IMAGE_REGISTRY unset on the prebuilt-image path — bootstrap
 #     templates `k3rs-<component>:latest`, which the containerd image
-#     store cannot resolve, so the same pods (and k3rs-dns) never start.
+#     store cannot resolve, so the same pods (and coredns) never start.
 #   * A host over the kubelet's imagefs eviction threshold — hydrophone's
 #     e2e-conformance-test pod is evicted ("Pod evicted due to resource
 #     pressure: ImageFsAvailable") after the run has already logged
@@ -60,7 +60,7 @@
 #                       named after the kind control-plane node.
 #   --dns-deployment NAME
 #                       kube-system Deployment that must have a ready replica
-#                       (default: k3rs-dns; 'none' skips the assertion,
+#                       (default: coredns; 'none' skips the assertion,
 #                       e.g. a kind cluster serving DNS from CoreDNS)
 #   --sandbox-image REF Image whose pull is exercised
 #                       (default: registry.k8s.io/pause:3.10.1)
@@ -100,7 +100,7 @@ KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/k3rs-config}"
 CERTS_PATH_EXPECTED="${CERTS_PATH:-$REPO_ROOT/.k3rs/certs}"
 KUBELET_CONTAINER="k3rs-kubelet"
 CONTROL_PLANE_PODS="kube-scheduler-node-1,kube-controller-manager-node-1"
-DNS_DEPLOYMENT="k3rs-dns"
+DNS_DEPLOYMENT="coredns"
 SANDBOX_IMAGE="registry.k8s.io/pause:3.10.1"
 SKIP_IMAGE_PULL=0
 STORAGE_CONTAINER="k3rs-rhino"
@@ -208,9 +208,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Cluster DNS has a ready backend. k3rs-dns is a kube-system
-#    Deployment (not CoreDNS); without it every DNS-dependent spec times out.
-#    --dns-deployment names a different one (kind serves DNS from CoreDNS).
+# 3. Cluster DNS has a ready backend. CoreDNS is the kube-system `coredns`
+#    Deployment (k3s manifests/coredns.yaml); without it every DNS-dependent
+#    spec times out. --dns-deployment names a different one.
 # ---------------------------------------------------------------------------
 if [ "$DNS_DEPLOYMENT" = "none" ] || [ -z "$DNS_DEPLOYMENT" ]; then
     pass "cluster-DNS assertion skipped (--dns-deployment none)"

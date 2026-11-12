@@ -374,19 +374,6 @@ services:
       - RUST_LOG=info
     command: ["--node-name", "node-2", "--api-server-url", "https://api-server:6443", "--kubeconfig", "/etc/kubernetes/pki/kube-proxy.conf", "--configure-node-network", "--pod-cidr", "10.244.0.0/16"]
 
-  # DNS image, build-only. The dns binary runs as a kube-system Deployment
-  # (bootstrap-dns.yaml, applied by bootstrap-cluster.sh) reading cluster
-  # state from the api-server — not as a compose container.
-  # Build with: docker compose --profile build build dns
-  dns:
-    profiles: ["build"]
-    image: k3rs-dns:latest
-    build:
-      context: .
-      dockerfile: services.Dockerfile
-      target: dns
-      args: *sccache-args
-
 networks:
   k3rs-net:
     driver: bridge
