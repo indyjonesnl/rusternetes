@@ -240,8 +240,8 @@ KUBECONFIG_OUT="$KUBECONFIG_PATH" bash "$SCRIPT_DIR/generate-kubeconfig.sh" >/de
 # ---- build ----------------------------------------------------------------
 if [[ "$DO_BUILD" == 1 ]]; then
     step "Building container images..."
-    # --profile build includes the build-only dns image (runs as an
-    # in-cluster Deployment via bootstrap-dns.yaml, not a compose container).
+    # --profile build includes the build-only scheduler / controller-manager
+    # images (they run as static pods, not compose containers).
     compose --profile build build
 fi
 

@@ -34,7 +34,16 @@ spec:
   # first connect exceeds the client connect-timeout and the control plane
   # never comes up. The control plane only needs `api-server`, so skipping the
   # search domains here is safe.
+  # The `api-server` name is only known to Docker's embedded resolver
+  # (127.0.0.11), which a hostNetwork pod reaches because it shares the node
+  # runtime container's netns. The kubelet's --resolv-conf (the node's
+  # /etc/resolv.conf, upstream's hostNetwork/Default source) may be a generated
+  # public-resolver file (see deploy/kubelet/entrypoint.sh), so pin the
+  # resolver explicitly: dnsPolicy None is the upstream mechanism for that.
+  dnsPolicy: None
   dnsConfig:
+    nameservers:
+    - 127.0.0.11
     options:
     - name: ndots
       value: "0"
