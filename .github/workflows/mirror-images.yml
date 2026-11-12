@@ -11,8 +11,6 @@ name: Mirror e2e images
 # public in the GitHub package settings so containerd can pull anonymously.
 
 on:
-  schedule:
-    - cron: '23 4 * * 1'
   workflow_dispatch:
   push:
     branches: [main]

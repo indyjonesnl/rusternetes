@@ -2,13 +2,11 @@
 # DO NOT EDIT — change the registry and re-run the generator instead.
 name: conformance-sig-auth
 
-# Independent per-target conformance run. Full runs fire nightly (refreshing the
+# Independent per-target conformance run. Full runs are dispatched manually (the nightly schedule is disabled; they refresh the
 # sig-auth badge against the latest main image); workflow_dispatch with a `focus`
 # runs one named test to prove a PR (that focused run does NOT touch the badge).
 # All logic lives in the reusable .github/workflows/conformance-target.yml engine.
 on:
-  schedule:
-    - cron: '42 2 * * *'
   workflow_dispatch:
     inputs:
       focus:

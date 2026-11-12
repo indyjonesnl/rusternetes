@@ -44,24 +44,17 @@ command -v jq >/dev/null 2>&1 || die "jq required"
 mkdir -p "$OUT_DIR"
 
 emit_one() {
-    local target="$1" idx="$2"
-    # Nightly at 02:xx UTC, staggered per target (minute = idx*6) so the runs
-    # don't stampede the shared arc-runner-set-conformance pool (~1 DinD/node) —
-    # a per-publish fan-out queued for hours and every run hit the job timeout
-    # (#1616). Nightly + stagger caps it at N jobs/day that drain overnight.
-    local cron_min=$(( (idx * 6) % 60 ))
+    local target="$1"
     cat <<EOF
 $GENERATED_MARKER
 # DO NOT EDIT — change the registry and re-run the generator instead.
 name: conformance-$target
 
-# Independent per-target conformance run. Full runs fire nightly (refreshing the
+# Independent per-target conformance run. Full runs are dispatched manually (the nightly schedule is disabled; they refresh the
 # $target badge against the latest main image); workflow_dispatch with a \`focus\`
 # runs one named test to prove a PR (that focused run does NOT touch the badge).
 # All logic lives in the reusable .github/workflows/conformance-target.yml engine.
 on:
-  schedule:
-    - cron: '$cron_min 2 * * *'
   workflow_dispatch:
     inputs:
       focus:
