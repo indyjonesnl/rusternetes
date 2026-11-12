@@ -195,6 +195,7 @@ services:
       - CNI_CONF_FROM_NODE_IPAM=1
     volumes:
       - containerd-run:/run/containerd
+      - local-path-storage:/var/lib/k3rs/storage
       # The node-network agent runs in kube-proxy, which shares this runtime's
       # NETWORK namespace but not its MOUNT namespace — so the conflist it writes
       # must land on a volume both containers see, or containerd never sees a CNI
@@ -226,6 +227,7 @@ services:
       - CNI_CONF_FROM_NODE_IPAM=1
     volumes:
       - containerd-run2:/run/containerd
+      - local-path-storage2:/var/lib/k3rs/storage
       # Shared with kube-proxy2 — see the note on node-1's runtime.
       - cni-conf2:/etc/cni/net.d
       # /var/lib/containerd (the overlayfs snapshotter root) must live on a real
@@ -258,6 +260,7 @@ services:
     network_mode: "service:containerd"
     volumes:
       - containerd-run:/run/containerd
+      - local-path-storage:/var/lib/k3rs/storage
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # volumes propagate back to the host mount namespace, where the Docker
       # daemon resolves the app-container bind mounts. Without shared
@@ -309,6 +312,7 @@ services:
     network_mode: "service:containerd2"
     volumes:
       - containerd-run2:/run/containerd
+      - local-path-storage2:/var/lib/k3rs/storage
       # rshared so tmpfs mounts the kubelet makes for Memory-medium emptyDir
       # volumes propagate back to the host mount namespace, where the Docker
       # daemon resolves the app-container bind mounts. Without shared
@@ -398,6 +402,14 @@ networks:
     name: k3rs-network
 
 volumes:
+  # local-path-provisioner data dir (/var/lib/k3rs/storage), shared between a
+  # node's runtime (whose helper pod creates the PV directory and whose pods
+  # mount it) and its kubelet (whose local volume plugin stats the path). In a
+  # real node these are one filesystem; here they are two containers.
+  local-path-storage:
+    name: k3rs-local-path-storage
+  local-path-storage2:
+    name: k3rs-local-path-storage2
   kine-data:
     name: k3rs-kine-data
   # CRI socket shared from the containerd service to the kubelets.
