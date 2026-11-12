@@ -317,7 +317,8 @@ import_addon_images() {
 
 # k3s templates its bundled manifests at startup (pkg/server/server.go
 # `%{...}%` replacement map: CLUSTER_DOMAIN, CLUSTER_DNS, CLUSTER_DNS_LIST,
-# CLUSTER_DNS_IPFAMILYPOLICY, SYSTEM_DEFAULT_REGISTRY, DEFAULT_LOCAL_STORAGE_PATH).
+# CLUSTER_DNS_IPFAMILYPOLICY, SYSTEM_DEFAULT_REGISTRY, DEFAULT_LOCAL_STORAGE_PATH,
+# PREFERRED_ADDRESS_TYPES = addrTypesPrioTemplate(false)).
 # Same substitution here; the empty registry leaves the docker.io/rancher/...
 # names the airgap list pins. Prints the templated manifest on stdout.
 template_k3s_manifest() {
@@ -327,6 +328,7 @@ template_k3s_manifest() {
         -e 's|%{CLUSTER_DNS_LIST}%|["10.96.0.10"]|g' \
         -e 's|%{CLUSTER_DNS_IPFAMILYPOLICY}%|SingleStack|g' \
         -e 's|%{DEFAULT_LOCAL_STORAGE_PATH}%|/var/lib/k3rs/storage|g' \
+        -e 's|%{PREFERRED_ADDRESS_TYPES}%|InternalIP,ExternalIP,Hostname|g' \
         "$1"
 }
 
@@ -739,6 +741,30 @@ EOF
                 print_warning "local-path-provisioner not ready after ${MAX_WAIT} attempts (readyReplicas: ${LP_READY:-none})"
             else
                 echo "  Waiting for local-path-provisioner... ($i/$MAX_WAIT)"
+                sleep 2
+            fi
+        done
+
+        # Upstream metrics-server exactly as k3s ships it (k3s
+        # manifests/metrics-server/*.yaml: ServiceAccount, Deployment, Service,
+        # APIService v1beta1.metrics.k8s.io and the four RBAC manifests).
+        print_step "Applying metrics-server (deploy/addons/metrics-server/, from k3s manifests/metrics-server/)..."
+        for ms_manifest in "$PROJECT_ROOT"/deploy/addons/metrics-server/*.yaml; do
+            template_k3s_manifest "$ms_manifest" | $KUBECTL $KUBECTL_FLAGS apply -f -
+        done
+
+        print_step "Waiting for the metrics-server Deployment to be ready..."
+        MAX_WAIT=90
+        for i in $(seq 1 $MAX_WAIT); do
+            MS_READY=$($KUBECTL $KUBECTL_FLAGS get deployment metrics-server -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+            if [ "$MS_READY" == "1" ]; then
+                print_success "metrics-server Deployment is ready!"
+                break
+            fi
+            if [ $i -eq $MAX_WAIT ]; then
+                print_warning "metrics-server not ready after ${MAX_WAIT} attempts (readyReplicas: ${MS_READY:-none})"
+            else
+                echo "  Waiting for metrics-server... ($i/$MAX_WAIT)"
                 sleep 2
             fi
         done

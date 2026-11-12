@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 list="$(sed 's/#.*//' ci/mirror/addon-images.txt | tr -d ' \t' | grep -v '^$' | sort -u)"
-want="$(grep -hoE '%\{SYSTEM_DEFAULT_REGISTRY\}%[^"[:space:]]+' deploy/addons/*.yaml \
+want="$(grep -rhoE '%\{SYSTEM_DEFAULT_REGISTRY\}%[^"[:space:]]+' deploy/addons \
     | sed 's/^%{SYSTEM_DEFAULT_REGISTRY}%//' | sort -u)"
 
 fail=0
