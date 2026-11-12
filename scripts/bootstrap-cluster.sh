@@ -438,6 +438,12 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
     for src in "$PROJECT_ROOT/manifests/control-plane/"*.yaml; do
         [ -e "$src" ] || continue
         dst="$PROJECT_ROOT/.k3rs/manifests/$(basename "$src")"
+        # Build the manifest outside the kubelet's watched manifest dir and
+        # move it into place only after the image is imported: the kubelet
+        # starts the static pod the moment the file appears, and a pull of a
+        # not-yet-imported local image fails into an image back-off longer
+        # than the bring-up wait.
+        staged="$PROJECT_ROOT/.k3rs/.staged-$(basename "$src")"
         # Derive the component (and thus the image) from the manifest name:
         # kube-scheduler.yaml -> scheduler, kube-controller-manager.yaml ->
         # controller-manager. resolve_cluster_image picks GHCR vs local :latest.
@@ -445,19 +451,20 @@ if [ -d "$PROJECT_ROOT/manifests/control-plane" ]; then
         component="${component#kube-}"
         cp_image="$(resolve_cluster_image "$component")"
         sed -e "s|@CERTS_PATH@|${CERTS_PATH}|g" \
-            -e "s|@CONTROL_PLANE_IMAGE@|${cp_image}|g" "$src" > "$dst"
+            -e "s|@CONTROL_PLANE_IMAGE@|${cp_image}|g" "$src" > "$staged"
         if [ -n "$node_ipam_args" ]; then
-            sed -i "s|@NODE_IPAM_ARGS@|${node_ipam_args}|" "$dst"
+            sed -i "s|@NODE_IPAM_ARGS@|${node_ipam_args}|" "$staged"
         else
-            sed -i '/@NODE_IPAM_ARGS@/d' "$dst"
+            sed -i '/@NODE_IPAM_ARGS@/d' "$staged"
         fi
         # CSI attach flags + driver-socket hostPath mounts (#3128, #3133).
-        template_csi_attach "$dst"
+        template_csi_attach "$staged"
         echo "  $(basename "$src") -> $dst (image: $cp_image)"
         # The image only exists in the docker/podman daemon (locally built or
         # `compose pull`ed) — import it into the containerd CRI store so
         # IfNotPresent resolves it without a registry round-trip.
         import_image_into_containerd "$cp_image"
+        mv -f "$staged" "$dst"
     done
     # Persist CERTS_PATH so a compose restart picks up the same mount path.
     if [ -f "$PROJECT_ROOT/.env" ] && grep -q '^CERTS_PATH=' "$PROJECT_ROOT/.env" 2>/dev/null; then
