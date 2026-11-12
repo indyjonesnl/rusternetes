@@ -451,6 +451,22 @@ COPY cni-config/10-k3rs.conflist /etc/cni/net.d/
 COPY --from=cargo-builder /out/kubelet /app/kubelet
 RUN ln -s /app/kubelet /usr/local/bin/kubelet
 
+# Upstream (Go) kubectl, like the one k3s bundles (scripts/package-cli symlinks
+# kubectl into the k3s multi-call binary; the k3s docker tests run
+# `kubectl version` inside the server container). The release-1.35 binary from
+# dl.k8s.io, sha256-verified. Pinned to the patch k3s v1.35.9+k3s1 vendors.
+# It reaches the api-server with the kubelet's own client kubeconfig, mounted at
+# /root/.k3rs/certs (compose), via kubectl's default ~/.kube/config.
+ARG KUBECTL_VERSION=v1.35.9
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o /usr/local/bin/kubectl && \
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o /tmp/kubectl.sha256 && \
+    echo "$(cat /tmp/kubectl.sha256)  /usr/local/bin/kubectl" | sha256sum -c - && \
+    chmod +x /usr/local/bin/kubectl && rm /tmp/kubectl.sha256 && \
+    mkdir -p /root/.kube && ln -s /root/.k3rs/certs/kubelet.conf /root/.kube/config
+
 # Entrypoint installs a route to the pod CIDR via the containerd container so
 # the kubelet can dial pod IPs for probes + HTTP lifecycle hooks (mirrors the
 # api-server entrypoint). iproute2 is installed above; needs NET_ADMIN /
