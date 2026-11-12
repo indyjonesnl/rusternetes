@@ -65,6 +65,9 @@ on:
       - 'scripts/conformance-target-run.sh'
       # rehomed guards (compose overlays + image Dockerfiles)
       - 'scripts/tests/test-ghcr-overlays.sh'
+      - 'scripts/tests/test-addon-images.sh'
+      - 'deploy/addons/**'
+      - 'ci/mirror/addon-images.txt'
       - 'scripts/tests/test-dockerfile-crate-enumeration.sh'
       - 'scripts/tests/test-dockerfile-multiarch.sh'
       - 'scripts/tests/test-dockerfile-kube-symlinks.sh'
@@ -128,6 +131,8 @@ jobs:
         run: bash scripts/tests/test-badge-publish-guard.sh
       - name: SIG coverage (sample fixture)
         run: bash scripts/tests/test-target-coverage.sh
+      - name: Addon image list sync test
+        run: bash scripts/tests/test-addon-images.sh
       - name: GHCR overlay sync test
         run: bash scripts/tests/test-ghcr-overlays.sh
       - name: Dockerfile crate-enumeration sync test
