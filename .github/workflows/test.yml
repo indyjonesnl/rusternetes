@@ -89,7 +89,7 @@ jobs:
         # the upload at job end. Own shared-key: this job's target/ holds
         # check metadata only.
         if: steps.rust.outputs.changed == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           shared-key: "checks-clippy"
@@ -142,7 +142,7 @@ jobs:
         # Same cache policy as the clippy job, own shared-key: this job's
         # target/ holds the sqlite-feature test build.
         if: steps.rust.outputs.changed == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           shared-key: "checks-nextest"
