@@ -46,7 +46,7 @@ sudo usermod -aG docker $USER
 ## Start the Cluster
 
 ```bash
-git clone https://github.com/calfonso/rusternetes.git
+git clone https://github.com/indyjonesnl/k3rs.git
 cd k3rs
 
 export KUBELET_VOLUMES_PATH=$(pwd)/.k3rs/volumes

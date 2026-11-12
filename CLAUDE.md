@@ -264,7 +264,7 @@ make build-fast ARGS="-p k3rs-api-server --bin api-server --features sqlite"
 
 `build-fast` uses the `release-fast` profile (`codegen-units = 16`, `lto = off`)
 — same speed class as CI's test build, output at `target/release-fast/`. Reserve
-`make build` (full `release`) for the shipped `indyjonesnl/rusternetes` release
+`make build` (full `release`) for the shipped `indyjonesnl/k3rs` release
 artifacts only. `make build-dev` is the debug build. Rule of thumb: if the
 binary just needs to *run* (a swap test, a canary image, local debugging), it
 does NOT need LTO — use `make build-fast`.
