@@ -770,6 +770,7 @@ EOF
             fi
             if [ $i -eq $MAX_WAIT ]; then
                 print_warning "metrics-server not ready after ${MAX_WAIT} attempts (readyReplicas: ${MS_READY:-none})"
+                $KUBECTL $KUBECTL_FLAGS -n kube-system logs deploy/metrics-server --tail=40 2>&1 | sed 's/^/    metrics-server: /' || true
             else
                 echo "  Waiting for metrics-server... ($i/$MAX_WAIT)"
                 sleep 2
