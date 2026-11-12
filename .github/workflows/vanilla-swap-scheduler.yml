@@ -8,8 +8,6 @@ name: vanilla-swap-scheduler
 # scheduler badge; workflow_dispatch runs it on demand.
 # All logic lives in the reusable .github/workflows/vanilla-swap-module.yml engine.
 on:
-  schedule:
-    - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
       image-tag:

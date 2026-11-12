@@ -12,10 +12,6 @@ on:
         description: "cert-manager release tag"
         required: false
         default: "v1.16.2"
-  schedule:
-    # 04:00 UTC nightly (an hour after the node-conformance job). Self-hosted
-    # runner; respects the project's GH Actions minute budget.
-    - cron: "0 4 * * *"
 
 jobs:
   cert-manager-smoke:

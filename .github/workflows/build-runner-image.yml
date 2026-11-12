@@ -15,8 +15,6 @@ on:
   # deprecates old runner versions: a runner too old to register exits 7 and
   # ARC parks every scale set in phase Outdated, so all self-hosted CI stops
   # (#2002). Rebuild weekly so the embedded runner keeps up.
-  schedule:
-    - cron: '17 4 * * 1'
 
 env:
   # One line per build step instead of an in-place redraw; the redraw becomes

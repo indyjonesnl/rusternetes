@@ -41,8 +41,6 @@ on:
       - '.github/workflows/publish-musl-image.yml'
   # Weekly refresh so :musl tracks main's Rust even though a Rust-only change
   # does not match the paths filter above.
-  schedule:
-    - cron: '0 4 * * 0'
   workflow_dispatch: {}
 
 env:
