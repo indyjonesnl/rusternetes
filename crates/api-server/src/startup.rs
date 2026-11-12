@@ -141,8 +141,17 @@ pub async fn register_post_start_hooks(
         ),
     );
 
-    // Create default StorageClass (like k3s/kind ship with a default)
-    {
+    // Create default StorageClass (like k3s/kind ship with a default).
+    //
+    // Upstream's kube-apiserver seeds no StorageClass; k3s gets its default
+    // (`local-path`) from the bundled local-path-provisioner manifest
+    // (manifests/local-storage.yaml). The multi-container stacks apply exactly
+    // that manifest from scripts/bootstrap-cluster.sh and set
+    // `K3RS_NO_DEFAULT_STORAGE_CLASS=1` on the api-server so two defaults never
+    // coexist. This seeded `standard` class (k3rs-only, served by the in-tree
+    // k3rs.io/hostpath provisioner) remains for the all-in-one binary, which
+    // has no addon bootstrap yet.
+    if std::env::var_os("K3RS_NO_DEFAULT_STORAGE_CLASS").is_none() {
         let sc_key = k3rs_storage::build_key("storageclasses", None, "standard");
         if storage.get::<serde_json::Value>(&sc_key).await.is_err() {
             let storage_class = serde_json::json!({
