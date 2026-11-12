@@ -45,13 +45,7 @@ command -v jq >/dev/null 2>&1 || die "jq required"
 mkdir -p "$OUT_DIR"
 
 emit_one() {
-    local module="$1" idx="$2"
-    # Nightly, staggered 2h apart starting 04:00 UTC. Each swap run brings up a
-    # kind cluster and can take the full 90-minute budget, and the shared
-    # arc-runner-set-conformance pool fits ~1 DinD job per node — firing all
-    # five at 04:00 (the old matrix) queued them behind each other anyway, just
-    # invisibly. Spreading them keeps each run's queue time near zero.
-    local cron_hour=$(( (4 + idx * 2) % 24 ))
+    local module="$1"
     cat <<EOF
 $GENERATED_MARKER
 # DO NOT EDIT — change the registry and re-run the generator instead.
@@ -59,12 +53,10 @@ name: vanilla-swap-$module
 
 # Independent single-module vanilla-swap run: an UNMODIFIED upstream Kubernetes
 # cluster (kind) with exactly ONE k3rs component — $module — swapped in,
-# then the test subset scoped to that component. Nightly runs refresh the
-# $module badge; workflow_dispatch runs it on demand.
+# then the test subset scoped to that component. Runs are dispatched
+# manually (the nightly schedule is disabled) and refresh the $module badge.
 # All logic lives in the reusable .github/workflows/vanilla-swap-module.yml engine.
 on:
-  schedule:
-    - cron: '0 $cron_hour * * *'
   workflow_dispatch:
     inputs:
       image-tag:

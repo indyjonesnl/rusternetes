@@ -4,8 +4,8 @@ name: vanilla-swap-kube-proxy
 
 # Independent single-module vanilla-swap run: an UNMODIFIED upstream Kubernetes
 # cluster (kind) with exactly ONE k3rs component — kube-proxy — swapped in,
-# then the test subset scoped to that component. Nightly runs refresh the
-# kube-proxy badge; workflow_dispatch runs it on demand.
+# then the test subset scoped to that component. Runs are dispatched
+# manually (the nightly schedule is disabled) and refresh the kube-proxy badge.
 # All logic lives in the reusable .github/workflows/vanilla-swap-module.yml engine.
 on:
   workflow_dispatch:
