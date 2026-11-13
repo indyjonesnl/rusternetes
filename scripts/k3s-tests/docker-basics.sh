@@ -166,6 +166,8 @@ verify_airgap_images() {
   done
   if [ ! -f "$AIRGAP_IMAGE_LIST" ]; then
     echo "airgap image list ${AIRGAP_IMAGE_LIST#"$REPO_ROOT"/} does not exist: k3rs has no build-time generated airgap image list yet (k3s generates scripts/airgap/image-list.txt during build packaging), so the installed images cannot be verified"
+    echo "images found on the nodes (generate the list with scripts/airgap/generate-list.sh):"
+    printf '%s' "$images" | grep -v '^$' | sort -u | sed 's/^/  /'
     return 1
   fi
   local want have
