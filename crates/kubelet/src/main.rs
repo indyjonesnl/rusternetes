@@ -190,6 +190,16 @@ struct Args {
     #[arg(long, value_parser = parse_go_duration_flag)]
     authentication_token_webhook_cache_ttl: Option<std::time::Duration>,
 
+    /// `--tls-cert-file`: serving certificate for the kubelet API port, with
+    /// `--tls-private-key-file`. When both are unset a self-signed pair is
+    /// generated (cmd/kubelet/app/server.go).
+    #[arg(long)]
+    tls_cert_file: Option<String>,
+
+    /// `--tls-private-key-file`: key for `--tls-cert-file`.
+    #[arg(long)]
+    tls_private_key_file: Option<String>,
+
     /// `--client-ca-file` (options.go:389): PEM bundle for x509 client
     /// certificate authentication.
     #[arg(long)]
@@ -797,6 +807,8 @@ async fn main() -> Result<()> {
     }
     let client_ca_file =
         (!authn_config.client_ca_file.is_empty()).then(|| authn_config.client_ca_file.clone());
+    let tls_cert_file = args.tls_cert_file.clone();
+    let tls_private_key_file = args.tls_private_key_file.clone();
     tokio::spawn(async move {
         let _keep_auth_stop = _auth_stop_tx;
         let app = server::build_server_router(
@@ -830,9 +842,15 @@ async fn main() -> Result<()> {
         // proxies logs/exec/attach/metrics to `https://<nodeIP>:10250` and will
         // not talk plain HTTP to a kubelet.
         let addr: std::net::SocketAddr = metrics_addr.parse().expect("valid metrics addr");
-        let tls = serving_tls::kubelet_serving_tls_with_client_ca(
+        let tls_files = match (&tls_cert_file, &tls_private_key_file) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            (None, None) => None,
+            _ => panic!("--tls-cert-file and --tls-private-key-file must be set together"),
+        };
+        let tls = serving_tls::kubelet_serving_tls_with_options(
             &tls_node_name,
             client_ca_file.as_deref(),
+            tls_files,
         )
         .expect("build kubelet serving TLS config");
         axum_server::bind_rustls(addr, tls.clone())

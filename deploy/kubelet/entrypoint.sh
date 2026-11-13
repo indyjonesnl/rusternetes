@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # kubelet entrypoint.
 #
 # The kubelet dials pod IPs directly for liveness/readiness/startup probes
@@ -66,5 +66,52 @@ case " $* " in
         ;;
 esac
 
+# Kubelet serving certificate. Upstream's kubelet serves a self-signed cert when
+# --tls-cert-file/--tls-private-key-file are unset (cmd/kubelet/app/server.go),
+# which nothing can verify: metrics-server scrapes https://<nodeIP>:10250 and
+# checks the cert against the cluster CA. k3s hands the kubelet a CA-signed
+# serving cert instead: the server signs it in pkg/server/handlers/handlers.go
+# (ServingKubeletCert: CN=<node>, SANs <node>, localhost, 127.0.0.1, ::1 and the
+# node IPs, ExtKeyUsage serverAuth, response = leaf + CA bundle) and the agent
+# passes it as --tls-cert-file/--tls-private-key-file
+# (pkg/daemons/agent/agent.go). There is no server endpoint for this here, so
+# the node signs the same cert itself from the CA mounted with the other certs.
+# An explicit --tls-cert-file is left alone; with no CA key mounted the kubelet
+# falls back to its self-signed cert.
+CERT_DIR="${K3RS_CERT_DIR:-/root/.k3rs/certs}"
+TLS_ARGS=""
+case " $* " in
+    *" --tls-cert-file"*) ;;
+    *)
+        if [ -r "$CERT_DIR/ca.crt" ] && [ -r "$CERT_DIR/ca.key" ] && command -v openssl >/dev/null 2>&1; then
+            node_name=""
+            prev=""
+            for a in "$@"; do
+                case "$prev" in --hostname-override) node_name="$a" ;; esac
+                case "$a" in --hostname-override=*) node_name="${a#*=}" ;; esac
+                prev="$a"
+            done
+            [ -n "$node_name" ] || node_name="$(hostname)"
+            san="DNS:${node_name},DNS:localhost,IP:127.0.0.1,IP:::1"
+            for ip in $(ip -o addr show scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }'); do
+                san="${san},IP:${ip}"
+            done
+            d=/run/k3rs
+            mkdir -p "$d"
+            if openssl ecparam -name prime256v1 -genkey -noout -out "$d/serving-kubelet.key" 2>/dev/null \
+                && openssl req -new -key "$d/serving-kubelet.key" -subj "/CN=${node_name}" -out "$d/serving-kubelet.csr" 2>/dev/null \
+                && openssl x509 -req -in "$d/serving-kubelet.csr" -CA "$CERT_DIR/ca.crt" -CAkey "$CERT_DIR/ca.key" \
+                    -CAcreateserial -CAserial "$d/serving-kubelet.srl" -days 365 -out "$d/serving-kubelet.leaf.crt" \
+                    -extfile <(printf 'extendedKeyUsage = serverAuth\nsubjectAltName = %s\n' "$san") 2>/dev/null; then
+                cat "$d/serving-kubelet.leaf.crt" "$CERT_DIR/ca.crt" > "$d/serving-kubelet.crt"
+                TLS_ARGS="--tls-cert-file $d/serving-kubelet.crt --tls-private-key-file $d/serving-kubelet.key"
+                echo "kubelet entrypoint: serving cert for ${node_name} signed by the cluster CA (SANs: ${san})"
+            else
+                echo "kubelet entrypoint: WARNING: could not sign a kubelet serving cert; the kubelet will use a self-signed one" >&2
+            fi
+        fi
+        ;;
+esac
+
 # shellcheck disable=SC2086
-exec /app/kubelet "$@" $RESOLV_ARGS
+exec /app/kubelet "$@" $RESOLV_ARGS $TLS_ARGS

@@ -423,6 +423,7 @@ FROM debian:sid-slim AS kubelet
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    openssl \
     iproute2 \
     iptables \
     curl \
