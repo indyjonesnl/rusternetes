@@ -809,6 +809,9 @@ EOF
                 print_warning "traefik not ready after ${MAX_WAIT} attempts (readyReplicas: ${TR_READY:-none})"
                 $KUBECTL $KUBECTL_FLAGS -n helm-controller logs deploy/helm-controller --tail=40 2>&1 | sed 's/^/    helm-controller: /' || true
                 $KUBECTL $KUBECTL_FLAGS get helmcharts,jobs,pods -A 2>&1 | sed 's/^/    state: /' || true
+                $KUBECTL $KUBECTL_FLAGS -n kube-system get job helm-install-traefik -o yaml 2>&1 | sed 's/^/    jobyaml: /' || true
+                $KUBECTL $KUBECTL_FLAGS get events -A 2>&1 | tail -40 | sed 's/^/    event: /' || true
+                $KUBECTL $KUBECTL_FLAGS -n kube-system logs kube-controller-manager-node-1 --tail=80 2>&1 | grep -i "job\|error" | tail -30 | sed 's/^/    kcm: /' || true
                 for j in $($KUBECTL $KUBECTL_FLAGS -n kube-system get jobs -o name 2>/dev/null | grep helm-install || true); do
                     $KUBECTL $KUBECTL_FLAGS -n kube-system logs "$j" --tail=30 2>&1 | sed "s|^|    $j: |" || true
                 done
