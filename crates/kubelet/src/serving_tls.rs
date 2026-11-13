@@ -39,6 +39,22 @@ pub fn kubelet_serving_tls_with_client_ca(
     node_name: &str,
     client_ca_file: Option<&str>,
 ) -> Result<axum_server::tls_rustls::RustlsConfig> {
+    kubelet_serving_tls_with_options(node_name, client_ca_file, None)
+}
+
+/// [`kubelet_serving_tls_with_client_ca`] plus `--tls-cert-file` /
+/// `--tls-private-key-file`. Upstream (`cmd/kubelet/app/server.go`: when both
+/// are unset a self-signed cert is generated, otherwise the supplied pair is
+/// served) and k3s points them at its CA-signed `serving-kubelet.crt`
+/// (`pkg/daemons/agent/agent.go`: `defaultConfig.TLSCertFile =
+/// cfg.ServingKubeletCert`), which is what lets metrics-server verify the
+/// kubelet. The cert file may carry the CA bundle after the leaf, as k3s's
+/// `/v1-k3s/serving-kubelet.crt` response does.
+pub fn kubelet_serving_tls_with_options(
+    node_name: &str,
+    client_ca_file: Option<&str>,
+    tls_files: Option<(&str, &str)>,
+) -> Result<axum_server::tls_rustls::RustlsConfig> {
     // SANs are cosmetic while the api-server skips kubelet-cert verification,
     // but populate the obvious ones anyway (node name + loopback).
     let sans = vec![
@@ -48,7 +64,11 @@ pub fn kubelet_serving_tls_with_client_ca(
     ];
     // generate_self_signed() installs the process-wide rustls crypto provider,
     // so it must run before ServerConfig::builder() below.
-    let tls = k3rs_common::tls::TlsConfig::generate_self_signed(node_name, sans)?;
+    let tls = match tls_files {
+        Some((cert, key)) => k3rs_common::tls::TlsConfig::from_pem_files(cert, key)
+            .map_err(|e| anyhow!("unable to load kubelet serving cert {cert}/{key}: {e}"))?,
+        None => k3rs_common::tls::TlsConfig::generate_self_signed(node_name, sans)?,
+    };
 
     let builder = rustls::ServerConfig::builder();
     let builder = match client_ca_file {
