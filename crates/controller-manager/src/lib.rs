@@ -1,4 +1,5 @@
 // Library interface for controller-manager
+pub mod cloud_provider;
 pub mod controllers;
 pub use controllers::*;
 

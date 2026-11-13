@@ -13,6 +13,7 @@ mod a_unit;
 mod apiservice_available_test;
 mod attach_detach_test;
 mod availability_status_test;
+mod cloud_node_lifecycle_test;
 mod conformance_apps_deployment_replicaset;
 mod conformance_apps_job_cronjob;
 mod conformance_apps_rc_daemonset_pdb;

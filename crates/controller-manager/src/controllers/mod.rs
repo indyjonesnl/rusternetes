@@ -6,6 +6,7 @@ pub mod cascade_tests;
 pub mod cert_authority;
 pub mod certificate_signing_request;
 pub mod cidrset_metrics;
+pub mod cloud_node_lifecycle;
 pub mod clustertrustbundle_publisher;
 pub mod controller_utils;
 pub mod cronjob;
