@@ -1,0 +1,44 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik-crd
+  namespace: kube-system
+spec:
+  forceConflicts: true
+  failurePolicy: retry
+  chart: https://%{KUBERNETES_API}%/static/charts/traefik-crd-40.1.5+up40.1.0.tgz
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  forceConflicts: true
+  failurePolicy: retry
+  chart: https://%{KUBERNETES_API}%/static/charts/traefik-40.1.5+up40.1.0.tgz
+  set:
+    global.systemDefaultRegistry: "%{SYSTEM_DEFAULT_REGISTRY_RAW}%"
+  valuesContent: |-
+    deployment:
+      podAnnotations:
+        prometheus.io/port: "8082"
+        prometheus.io/scrape: "true"
+    providers:
+      kubernetesIngress:
+        publishedService:
+          enabled: true
+    priorityClassName: "system-cluster-critical"
+    image:
+      repository: "rancher/mirrored-library-traefik"
+      tag: "3.7.13"
+    tolerations:
+    - key: "CriticalAddonsOnly"
+      operator: "Exists"
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    service:
+      spec:
+        ipFamilyPolicy: "PreferDualStack"

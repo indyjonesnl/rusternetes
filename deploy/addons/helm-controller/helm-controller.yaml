@@ -1,0 +1,93 @@
+# Upstream k3s-io/helm-controller (v0.17.9, the version k3s v1.35.9+k3s1 links:
+# go.mod github.com/k3s-io/helm-controller) run as its published image, the way
+# the upstream repo's own manifests/{ns,rbac,deployment}.yaml deploy it.
+#
+# k3s embeds the controller in the server process (pkg/server/server.go
+# coreControllers -> helmchart.Register, jobClusterRole "cluster-admin") and
+# registers the helm.cattle.io CRDs itself (pkg/server/context.go registerCRDs
+# -> helm-controller pkg/crds.List, applied here from the sibling
+# helm.cattle.io_*.yaml files). k3rs has no such in-process hook, so the
+# standalone image does the job; flags are the standalone cmd's
+# (pkg/app/app.go): --default-job-image, --job-cluster-role, --node-name,
+# --namespace (empty = watch all namespaces).
+#
+# DEFAULT_JOB_IMAGE is the klipper-helm tag k3s v1.35.9+k3s1 pins in
+# scripts/airgap/image-list.txt (the helm job image that runs `helm install`).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: helm-controller
+  labels:
+    name: helm-controller
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: helm-controller
+  namespace: helm-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: helm-controller
+rules:
+- apiGroups:
+  - "*"
+  resources:
+  - "*"
+  verbs:
+  - "*"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: helm-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: helm-controller
+subjects:
+- kind: ServiceAccount
+  name: helm-controller
+  namespace: helm-controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helm-controller
+  namespace: helm-controller
+  labels:
+    app: helm-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: helm-controller
+  template:
+    metadata:
+      labels:
+        app: helm-controller
+    spec:
+      serviceAccountName: helm-controller
+      priorityClassName: system-cluster-critical
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: helm-controller
+        image: rancher/helm-controller:v0.17.9
+        command: ["helm-controller"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: JOB_CLUSTER_ROLE
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        - name: DEFAULT_JOB_IMAGE
+          value: "rancher/klipper-helm:v0.13.3-build20260727"

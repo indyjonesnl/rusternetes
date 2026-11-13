@@ -1,8 +1,11 @@
 docker.io/library/k3rs-controller-manager:latest
 docker.io/library/k3rs-scheduler:latest
+docker.io/rancher/helm-controller:v0.17.9
+docker.io/rancher/klipper-helm:v0.13.3-build20260727
 docker.io/rancher/local-path-provisioner:v0.0.37
 docker.io/rancher/mirrored-coredns-coredns:1.14.7
 docker.io/rancher/mirrored-library-busybox:1.37.0
+docker.io/rancher/mirrored-library-traefik:3.7.13
 docker.io/rancher/mirrored-metrics-server:v0.9.0
 docker.io/rancher/mirrored-pause:3.10.2
 registry.k8s.io/pause:3.10.1
