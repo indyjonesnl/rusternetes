@@ -61,4 +61,5 @@ mod state;
 mod storage_readiness_hook;
 mod streaming;
 mod watch_cache;
+mod watcher_bookmark;
 mod zpages;
