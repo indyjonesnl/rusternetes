@@ -58,7 +58,6 @@ pub mod priorityclass;
 pub mod proxy;
 pub mod ratcheting;
 pub mod rbac;
-pub mod referencegrant;
 pub mod replicaset;
 pub mod replicationcontroller;
 pub mod resourceclaim;

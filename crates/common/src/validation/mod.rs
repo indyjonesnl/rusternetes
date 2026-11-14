@@ -54,7 +54,6 @@ pub mod priorityclass;
 pub mod prioritylevelconfiguration;
 pub mod pvc;
 pub mod rbac;
-pub mod referencegrant;
 pub mod replicationcontroller;
 pub mod resourceclaim;
 pub mod resourcequota;
