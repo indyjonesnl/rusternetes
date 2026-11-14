@@ -526,6 +526,37 @@ pub fn validate_crd_schema_rules(
 /// The type scope of a rule on `schema` for the shadow checker run, or `None`
 /// when shadowing is off or the schema is not exposed to CEL (upstream's
 /// "failed to convert to declType for CEL validation rules").
+/// The static cost the limit is compared with (`compileRule`,
+/// compilation.go: `ruleEnv.EstimateCost(ast, estimator)`, `Max` of the
+/// estimate, validation.go:1280-1287). It is the cel-go checker port's
+/// estimate over the schema's size bounds (`maxItems`, `maxLength`, ...), so a
+/// bounded rule such as the Gateway API `targetRefs` uniqueness rule is
+/// accepted exactly as upstream accepts it. The coarse [`estimate_cost`]
+/// heuristic is only the fallback for an expression the checker cannot type
+/// (it has no schema-typed `self`).
+fn static_rule_cost(
+    expression: &str,
+    env_set: &EnvSet,
+    env_type: EnvType,
+    schema: &JSONSchemaProps,
+    is_root: bool,
+    rule: &serde_json::Value,
+) -> u64 {
+    let embedded = schema.x_kubernetes_embedded_resource == Some(true);
+    let scope = cel_schema_types::schema_decl_type(schema, is_root || embedded).map(|decl| {
+        cel_checker_shadow::SelfScope {
+            decl,
+            optional_old_self: rule.get("optionalOldSelf").and_then(|v| v.as_bool()) == Some(true),
+        }
+    });
+    scope
+        .and_then(|scope| {
+            cel_checker_shadow::estimate_rule_cost(expression, env_set, env_type, &scope)
+        })
+        .map(|est| est.max)
+        .unwrap_or_else(|| estimate_cost(expression))
+}
+
 fn shadow_scope(
     schema: &JSONSchemaProps,
     is_root: bool,
@@ -765,7 +796,7 @@ fn compile_schema_rules(
             continue;
         }
         // validation.go:1280-1287.
-        let cost = estimate_cost(rule);
+        let cost = static_rule_cost(rule, env_set, pre.rule_env(rule), schema, is_root, raw);
         // Default-off shadow run of the static cost estimator
         // (`checker.Cost` with the Kubernetes estimator over the schema's
         // size estimates); the heuristic keeps deciding.
@@ -822,7 +853,14 @@ fn compile_schema_rules(
             errs.push(FieldError::invalid(&me_field, raw.clone(), detail));
             continue;
         }
-        let me_cost = estimate_cost(me);
+        let me_cost = static_rule_cost(
+            me,
+            env_set,
+            pre.message_expression_env(me),
+            schema,
+            is_root,
+            raw,
+        );
         if let Some(scope) = shadow_scope(schema, is_root, raw) {
             cel_checker_shadow::observe_cost(
                 me,

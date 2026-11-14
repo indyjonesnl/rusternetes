@@ -1286,6 +1286,72 @@ async fn cel_rule_cost_limit_exceeded_crd_rejected() {
     );
 }
 
+/// The Gateway API `BackendTLSPolicy` `targetRefs` rule (traefik-crd chart)
+/// is bounded by `maxItems: 16` and per-field `maxLength`, so the estimated
+/// cost (`compilation.go` `compileRule`, `Max` vs `StaticEstimatedCostLimit`,
+/// validation.go:1280-1287) is far below 10,000,000 and a real apiserver
+/// admits it. The retired `estimate_cost` heuristic ignored the bounds and
+/// rejected it ("estimated rule cost exceeds budget by factor of 21.0x"),
+/// which made `helm install traefik-crd` fail.
+#[tokio::test]
+async fn crd_bounded_nested_all_rule_is_admitted() {
+    let router = spawn_router();
+    let rule = "self.all(p1, self.all(p2, p1.group == p2.group && p1.kind == p2.kind && p1.name == p2.name ? ((!has(p1.sectionName) || p1.sectionName == '') == (!has(p2.sectionName) || p2.sectionName == '')) : true))";
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "tlspolicies.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "tlspolicies",
+                "singular": "tlspolicy",
+                "kind": "TLSPolicy",
+                "listKind": "TLSPolicyList",
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {
+                    "openAPIV3Schema": {
+                        "type": "object",
+                        "properties": {
+                            "spec": {
+                                "type": "object",
+                                "properties": {
+                                    "targetRefs": {
+                                        "type": "array",
+                                        "maxItems": 16,
+                                        "x-kubernetes-validations": [{"rule": rule}],
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "group": {"type": "string", "maxLength": 253},
+                                                "kind": {"type": "string", "maxLength": 63},
+                                                "name": {"type": "string", "maxLength": 253},
+                                                "sectionName": {"type": "string", "maxLength": 253}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    });
+    let (s, body) = post_json(
+        &router,
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        &crd,
+    )
+    .await;
+    assert_eq!(s, 201, "bounded rule must be admitted, body={body}");
+}
+
 /// [sig-api-machinery] CustomResourceValidationRules MUST fail create of a CR that exceeds the runtime cost limit for x-kubernetes-validations rule execution
 ///
 /// Upstream: k8s.io/kubernetes/test/e2e/apimachinery/crd_validation_rules.go:231 — **not a conformance
