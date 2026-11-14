@@ -127,6 +127,13 @@ pub fn floor_settles_compaction(floor: i64, revision: i64) -> Option<bool> {
 /// under the default 4MB gRPC message limit.
 const DEFAULT_LIST_PAGE_SIZE: i64 = 500;
 
+/// Largest response a range read may decode. etcd's own client
+/// (`clientv3` `Config.MaxCallRecvMsgSize`, "If 0, it defaults to
+/// math.MaxInt32", `client/v3/client.go` `defaultMaxCallRecvMsgSize`) never
+/// applies tonic's 4 MiB default, so a page of large objects (helm release
+/// Secrets) must not fail with `decoded message length too large`.
+const MAX_RECV_MSG_SIZE: usize = i32::MAX as usize;
+
 /// How many times an unversioned write re-reads and retries its guarded
 /// transaction before giving up, mirroring upstream's `GuaranteedUpdate` retry
 /// loop in `etcd3/store.go`.
@@ -286,7 +293,10 @@ impl EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
+        let mut client = self
+            .client
+            .kv_client()
+            .max_decoding_message_size(MAX_RECV_MSG_SIZE);
         let page_size = self.page_size;
         let range_end = prefix_range_end(prefix.as_bytes());
         let mut results = Vec::new();
