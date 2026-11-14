@@ -798,7 +798,7 @@ EOF
         template_k3s_manifest "$PROJECT_ROOT/deploy/addons/traefik.yaml" | $KUBECTL $KUBECTL_FLAGS apply -f -
 
         print_step "Waiting for the traefik Deployment (installed by the helm-controller job)..."
-        MAX_WAIT=150
+        MAX_WAIT=300
         for i in $(seq 1 $MAX_WAIT); do
             TR_READY=$($KUBECTL $KUBECTL_FLAGS get deployment traefik -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
             if [ "$TR_READY" == "1" ]; then
