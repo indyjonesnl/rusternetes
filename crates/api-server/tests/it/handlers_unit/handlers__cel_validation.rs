@@ -466,10 +466,87 @@ mod tests {
         assert!(!rule_references_old_self("myoldSelfFoo > 0"));
     }
 
+    fn crd_schema(list: serde_json::Value, rules: Vec<String>) -> JSONSchemaProps {
+        let validations: Vec<serde_json::Value> =
+            rules.iter().map(|r| json!({"rule": r})).collect();
+        serde_json::from_value(json!({
+            "type": "object",
+            "x-kubernetes-validations": validations,
+            "properties": {"list": list}
+        }))
+        .unwrap()
+    }
+
+    fn rule_errors(schema: &JSONSchemaProps) -> Vec<FieldError> {
+        let set = EnvSet::must_base_env_set(Version::major_minor(1, 35));
+        validate_crd_schema_rules(
+            schema,
+            &Path::new("openAPIV3Schema"),
+            &set,
+            &PreexistingExpressions::default(),
+            false,
+        )
+    }
+
+    /// validation.go:1281-1288: the rule's static cost over the schema's size
+    /// bounds. Unbounded nested arrays make the nested `all` exceed
+    /// `StaticEstimatedCostLimit`.
     #[test]
-    fn estimate_cost_is_large_for_nested_comprehensions() {
-        // Two nested all(...) calls => 1024*1024 multiplier
-        let rule = "self.list.all(x, x.all(y, y > 0))";
-        assert!(estimate_cost(rule) > 10_000_000);
+    fn an_unbounded_nested_comprehension_is_over_the_per_rule_limit() {
+        let unbounded =
+            json!({"type": "array", "items": {"type": "array", "items": {"type": "integer"}}});
+        let schema = crd_schema(unbounded, vec!["self.list.all(x, x.all(y, y > 0))".into()]);
+        let errs = rule_errors(&schema);
+        assert!(
+            errs.iter()
+                .any(|e| e.detail.contains("estimated rule cost exceeds budget")),
+            "{errs:?}"
+        );
+    }
+
+    /// The same rule over bounded arrays is admitted, as the cardinality and
+    /// size bounds come from the schema (not a guess).
+    #[test]
+    fn a_bounded_nested_comprehension_is_admitted() {
+        let bounded = json!({"type": "array", "maxItems": 10,
+            "items": {"type": "array", "maxItems": 10, "items": {"type": "integer"}}});
+        let schema = crd_schema(bounded, vec!["self.list.all(x, x.all(y, y > 0))".into()]);
+        assert!(rule_errors(&schema).is_empty());
+    }
+
+    /// An expression the checker cannot type is its compile error, never
+    /// costed by a guess (`compileRule`, compilation.go:210-216).
+    #[test]
+    fn an_untypeable_rule_is_a_compile_error_not_a_cost() {
+        let schema = crd_schema(
+            json!({"type": "array", "maxItems": 3, "items": {"type": "integer"}}),
+            vec!["self.list.all(x, x.nope > 0)".into()],
+        );
+        let errs = rule_errors(&schema);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].detail.contains("compilation failed"), "{errs:?}");
+    }
+
+    /// validation.go:981-992 / cel_validation.go:259-296: many rules that are
+    /// each under the per-rule limit but together exceed
+    /// `StaticEstimatedCRDCostLimit`.
+    #[test]
+    fn the_total_rule_cost_of_a_crd_version_is_limited() {
+        let list = json!({"type": "array", "maxItems": 1000, "items": {"type": "integer"}});
+        let rule = "self.list.all(x, self.list.all(y, x != y))".to_string();
+        let schema = crd_schema(list.clone(), vec![rule.clone()]);
+        assert!(rule_errors(&schema).is_empty(), "one rule fits");
+        let schema = crd_schema(list, vec![rule; 200]);
+        let errs = rule_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.detail.contains(
+                "x-kubernetes-validations estimated rule cost total for entire OpenAPIv3 schema exceeds budget"
+            )),
+            "{:?}",
+            errs.iter().map(|e| e.detail.clone()).collect::<Vec<_>>()
+        );
+        assert!(errs.iter().any(|e| e
+            .detail
+            .contains("contributed to estimated rule cost total exceeding cost limit")));
     }
 }

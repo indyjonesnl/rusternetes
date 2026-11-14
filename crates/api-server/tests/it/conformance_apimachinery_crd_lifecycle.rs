@@ -2167,6 +2167,8 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
     let (s, _) = ratchet_post_cr(&router, group, "t1", initial.clone()).await;
     assert_eq!(s, 201);
 
+    // Bounded (maxLength/maxItems/maxProperties) so the rules fit the static
+    // cost budget a real apiserver enforces (validation.go:1281-1288).
     // Tight CRD with transition rule `self != oldSelf`. Even with the
     // sub-tree unchanged (`self == oldSelf`), this rule MUST fail — and
     // ratcheting MUST NOT suppress it.
@@ -2175,6 +2177,7 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
         "properties": {
             "field": {
                 "type": "string",
+                "maxLength": 16,
                 "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
             },
             "struct": {
@@ -2182,12 +2185,14 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
                 "properties": {
                     "field": {
                         "type": "string",
+                        "maxLength": 16,
                         "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
                     }
                 }
             },
             "list": {
                 "type": "array",
+                "maxItems": 16,
                 "x-kubernetes-list-type": "map",
                 "x-kubernetes-list-map-keys": ["key"],
                 "items": {
@@ -2196,6 +2201,7 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
                         "key": {"type": "string"},
                         "field": {
                             "type": "string",
+                            "maxLength": 16,
                             "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
                         }
                     },
@@ -2204,11 +2210,13 @@ async fn ratcheting_transition_rule_errors_never_ratcheted() {
             },
             "map": {
                 "type": "object",
+                "maxProperties": 16,
                 "additionalProperties": {
                     "type": "object",
                     "properties": {
                         "field": {
                             "type": "string",
+                            "maxLength": 16,
                             "x-kubernetes-validations": [{"rule": "self != oldSelf"}]
                         }
                     }
