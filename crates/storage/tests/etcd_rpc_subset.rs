@@ -469,3 +469,29 @@ async fn etcd_backend_speaks_the_upstream_rpc_subset_on_kine() {
     exercise_list_paging(&storage, "kine", PAGE_SIZE).await;
     exercise_watch_create_vs_update(&storage, "kine").await;
 }
+
+/// `clientv3` never applies tonic's 4 MiB decode default
+/// (`client/v3/options.go:40`, `defaultMaxCallRecvMsgSize = math.MaxInt32`): a
+/// single range response above 4 MiB (helm release Secrets) must round-trip.
+/// Five ~1.2 MiB values (each under etcd's 1.5 MiB request limit) make one
+/// 6 MiB page.
+#[tokio::test]
+async fn etcd_list_page_above_4_mib_round_trips() {
+    let Some(container) = start_etcd().await else {
+        return;
+    };
+    let storage = connect(&container, 500).await;
+    let blob = "x".repeat(1_200_000);
+    for i in 0..5 {
+        let key = format!("/registry/secrets/default/big-{i}");
+        let _: serde_json::Value = storage
+            .create(&key, &json!({"data": {"release": blob}}))
+            .await
+            .unwrap_or_else(|e| panic!("create {key}: {e}"));
+    }
+    let listed: Vec<serde_json::Value> = storage
+        .list("/registry/secrets/default/")
+        .await
+        .expect("a >4 MiB range response must decode");
+    assert_eq!(listed.len(), 5);
+}

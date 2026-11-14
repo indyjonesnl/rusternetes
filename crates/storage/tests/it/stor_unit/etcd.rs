@@ -44,6 +44,13 @@ pub mod tests {
         )));
     }
 
+    /// `client/v3/options.go:34-40`: send 2 MiB, receive math.MaxInt32.
+    #[test]
+    fn call_limits_match_etcd_clientv3_defaults() {
+        assert_eq!(MAX_CALL_SEND_MSG_SIZE, 2 * 1024 * 1024);
+        assert_eq!(MAX_CALL_RECV_MSG_SIZE, i32::MAX as usize);
+    }
+
     #[test]
     fn write_error_tags_only_too_large_grpc_statuses() {
         let big = etcd_client::Error::GRpcStatus(tonic::Status::new(
