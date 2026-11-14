@@ -423,6 +423,8 @@ pub async fn get_api_groups(
                         groups.push(
                             serde_json::json!({ "metadata": { "name": group }, "versions": versions }),
                         );
+                    } else {
+                        merge_crd_group_versions_aggregated(&mut groups, &group, versions);
                     }
                 }
             }
@@ -554,18 +556,6 @@ pub async fn get_api_groups(
             preferred_version: GroupVersionForDiscovery {
                 group_version: "snapshot.storage.k8s.io/v1".to_string(),
                 version: "v1".to_string(),
-            },
-        },
-        // gateway.networking.k8s.io API group (ReferenceGrant only)
-        APIGroup {
-            name: "gateway.networking.k8s.io".to_string(),
-            versions: vec![GroupVersionForDiscovery {
-                group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
-                version: "v1beta1".to_string(),
-            }],
-            preferred_version: GroupVersionForDiscovery {
-                group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
-                version: "v1beta1".to_string(),
             },
         },
         // scheduling.k8s.io API group
@@ -901,12 +891,7 @@ pub async fn get_api_groups(
                 kube_version::sort_by_kube_aware_version_desc(&mut gv_versions, |v| {
                     v.version.as_str()
                 });
-                let preferred_version = gv_versions[0].clone();
-                groups.push(APIGroup {
-                    name: group,
-                    versions: gv_versions,
-                    preferred_version,
-                });
+                merge_crd_group_versions(&mut groups, group, gv_versions);
             }
         }
     }
@@ -959,6 +944,134 @@ pub async fn get_api_groups(
     };
 
     (StatusCode::OK, Json(api_group_list)).into_response()
+}
+
+/// One `APIGroup` per group name (`/apis` lists each group once): a CRD group
+/// that a built-in group already occupies (this server serves
+/// `snapshot.storage.k8s.io/v1` natively, while the external-snapshotter CRDs
+/// add `v1beta1`) is merged
+/// into that entry instead of being listed twice. Versions are de-duplicated
+/// and sorted by `sortGroupDiscoveryByKubeAwareVersion`; the first is the
+/// preferred version (apiextensions-apiserver
+/// `customresource_discovery_controller.go:105-135` `versionsForDiscoveryMap`,
+/// `:225-231`, `:284-288`). A group with no built-in entry is pushed as is.
+fn merge_crd_group_versions(
+    groups: &mut Vec<APIGroup>,
+    name: String,
+    mut crd_versions: Vec<GroupVersionForDiscovery>,
+) {
+    if let Some(existing) = groups.iter_mut().find(|g| g.name == name) {
+        for v in crd_versions {
+            if !existing.versions.iter().any(|e| e.version == v.version) {
+                existing.versions.push(v);
+            }
+        }
+        kube_version::sort_by_kube_aware_version_desc(&mut existing.versions, |v| {
+            v.version.as_str()
+        });
+        existing.preferred_version = existing.versions[0].clone();
+        return;
+    }
+    kube_version::sort_by_kube_aware_version_desc(&mut crd_versions, |v| v.version.as_str());
+    let preferred_version = crd_versions[0].clone();
+    groups.push(APIGroup {
+        name,
+        versions: crd_versions,
+        preferred_version,
+    });
+}
+
+/// The aggregated-discovery (`APIGroupDiscoveryList`) counterpart of
+/// [`merge_crd_group_versions`]: the CRD versions are merged into the group's
+/// existing entry; a version present on both sides gets the union of the
+/// resources (by resource name) and the versions are re-sorted by kube-aware
+/// version, highest first.
+fn merge_crd_group_versions_aggregated(
+    groups: &mut [serde_json::Value],
+    name: &str,
+    crd_versions: Vec<serde_json::Value>,
+) {
+    let Some(group) = groups
+        .iter_mut()
+        .find(|g| g.pointer("/metadata/name").and_then(|v| v.as_str()) == Some(name))
+    else {
+        return;
+    };
+    let Some(existing) = group.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for cv in crd_versions {
+        let ver = cv["version"].as_str().unwrap_or("").to_string();
+        match existing
+            .iter_mut()
+            .find(|e| e["version"].as_str() == Some(ver.as_str()))
+        {
+            Some(e) => {
+                let have: Vec<String> = e["resources"]
+                    .as_array()
+                    .map(|rs| {
+                        rs.iter()
+                            .filter_map(|r| r["resource"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let (Some(dst), Some(src)) = (
+                    e.get_mut("resources").and_then(|r| r.as_array_mut()),
+                    cv["resources"].as_array(),
+                ) {
+                    for r in src {
+                        if !r["resource"]
+                            .as_str()
+                            .is_some_and(|n| have.iter().any(|h| h == n))
+                        {
+                            dst.push(r.clone());
+                        }
+                    }
+                }
+            }
+            None => existing.push(cv),
+        }
+    }
+    kube_version::sort_by_kube_aware_version_desc(existing, |v| {
+        v["version"].as_str().unwrap_or("")
+    });
+}
+
+/// The served versions of every Established CRD in `group`, de-duplicated.
+async fn crd_served_versions(
+    storage: &k3rs_storage::StorageBackend,
+    group: &str,
+) -> Vec<GroupVersionForDiscovery> {
+    use k3rs_storage::Storage;
+    let crd_prefix = k3rs_storage::build_prefix("customresourcedefinitions", None);
+    let mut versions: Vec<GroupVersionForDiscovery> = Vec::new();
+    let Ok(crds) = storage.list::<serde_json::Value>(&crd_prefix).await else {
+        return versions;
+    };
+    for crd in crds.iter().filter(|c| crd_established(c)) {
+        if crd.pointer("/spec/group").and_then(|v| v.as_str()) != Some(group) {
+            continue;
+        }
+        for ver in crd
+            .pointer("/spec/versions")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if !ver.get("served").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(n) = ver.get("name").and_then(|v| v.as_str()) {
+                if !versions.iter().any(|v| v.version == n) {
+                    versions.push(GroupVersionForDiscovery {
+                        group_version: format!("{group}/{n}"),
+                        version: n.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    versions
 }
 
 /// Whether `certificates.k8s.io/v1beta1` is served: its resources,
@@ -1256,7 +1369,6 @@ fn raw_api_group_names() -> Vec<(&'static str, &'static str)> {
         ("rbac.authorization.k8s.io", "v1"),
         ("storage.k8s.io", "v1"),
         ("snapshot.storage.k8s.io", "v1"),
-        ("gateway.networking.k8s.io", "v1beta1"),
         ("scheduling.k8s.io", "v1"),
         ("apiextensions.k8s.io", "v1"),
         ("admissionregistration.k8s.io", "v1"),
@@ -2164,15 +2276,6 @@ fn get_aggregated_resources_for_group_unfiltered(
                 vec![],
             ),
         ],
-        "gateway.networking.k8s.io" => vec![res_with_short(
-            "referencegrants",
-            "referencegrant",
-            "ReferenceGrant",
-            true,
-            all_verbs,
-            vec![],
-            Some(vec!["refgrant"]),
-        )],
         "metrics.k8s.io" => vec![
             res(
                 "nodes",
@@ -2310,12 +2413,21 @@ pub async fn get_api_group(
                 version: "v1alpha3".to_string(),
             });
         }
-        let preferred = versions[0].clone();
-        let api_group = APIGroup {
+        // A CRD may add versions to a built-in group (the external-snapshotter
+        // CRDs next to the native `snapshot.storage.k8s.io/v1`): one merged
+        // entry, as `/apis`.
+        let mut merged = vec![APIGroup {
             name: name.to_string(),
+            preferred_version: versions[0].clone(),
             versions,
-            preferred_version: preferred,
-        };
+        }];
+        if let Some(ref storage) = storage {
+            let crd_versions = crd_served_versions(storage.as_ref(), name).await;
+            if !crd_versions.is_empty() {
+                merge_crd_group_versions(&mut merged, name.to_string(), crd_versions);
+            }
+        }
+        let api_group = merged.remove(0);
         let response = serde_json::json!({
             "kind": "APIGroup",
             "apiVersion": "v1",
@@ -4708,50 +4820,6 @@ pub async fn get_snapshot_v1_resources() -> (StatusCode, Json<APIResourceList>) 
     )
 }
 
-/// GET /apis/gateway.networking.k8s.io/v1beta1
-/// The `ReferenceGrant` CRD of kubernetes-sigs/gateway-api
-/// (`config/crd/standard/gateway.networking.k8s.io_referencegrants.yaml`:
-/// namespaced, `shortNames: [refgrant]`, `categories: [gateway-api]`, no
-/// subresources).
-pub async fn get_gateway_v1beta1_resources() -> (StatusCode, Json<APIResourceList>) {
-    let resources = vec![APIResource {
-        name: "referencegrants".to_string(),
-        singular_name: "referencegrant".to_string(),
-        namespaced: true,
-        kind: "ReferenceGrant".to_string(),
-        verbs: [
-            "create",
-            "delete",
-            "deletecollection",
-            "get",
-            "list",
-            "patch",
-            "update",
-            "watch",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect(),
-        short_names: Some(vec!["refgrant".to_string()]),
-        categories: Some(vec!["gateway-api".to_string()]),
-        storage_version_hash: None,
-        group: None,
-        version: None,
-    }];
-
-    let resource_list = APIResourceList {
-        kind: "APIResourceList".to_string(),
-        api_version: "v1".to_string(),
-        group_version: "gateway.networking.k8s.io/v1beta1".to_string(),
-        resources,
-    };
-
-    (
-        StatusCode::OK,
-        Json(resource_list.with_storage_version_hashes()),
-    )
-}
-
 /// GET /apis/discovery.k8s.io/v1
 /// Returns the list of resources available in the discovery.k8s.io/v1 API
 pub async fn get_discovery_v1_resources() -> (StatusCode, Json<APIResourceList>) {
@@ -5484,6 +5552,77 @@ mod listed_paths_tests {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn gv(group: &str, v: &str) -> GroupVersionForDiscovery {
+        GroupVersionForDiscovery {
+            group_version: format!("{group}/{v}"),
+            version: v.to_string(),
+        }
+    }
+
+    /// A natively served group (`snapshot.storage.k8s.io/v1`) plus CRDs that
+    /// add `v1beta1` is ONE `APIGroup` with both versions, `v1` preferred
+    /// (customresource_discovery_controller.go:225-231, :284-288).
+    #[test]
+    fn crd_group_merges_into_the_builtin_group_entry() {
+        let g = "snapshot.storage.k8s.io";
+        let mut groups = vec![APIGroup {
+            name: g.to_string(),
+            versions: vec![gv(g, "v1")],
+            preferred_version: gv(g, "v1"),
+        }];
+        merge_crd_group_versions(
+            &mut groups,
+            g.to_string(),
+            vec![gv(g, "v1beta1"), gv(g, "v1")],
+        );
+        assert_eq!(groups.len(), 1);
+        let vs: Vec<_> = groups[0]
+            .versions
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(vs, ["v1", "v1beta1"]);
+        assert_eq!(groups[0].preferred_version.version, "v1");
+    }
+
+    #[test]
+    fn crd_only_group_is_pushed_with_highest_version_preferred() {
+        let g = "example.com";
+        let mut groups = Vec::new();
+        merge_crd_group_versions(
+            &mut groups,
+            g.to_string(),
+            vec![gv(g, "v1alpha1"), gv(g, "v2"), gv(g, "v1")],
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].preferred_version.version, "v2");
+        assert_eq!(groups[0].versions[2].version, "v1alpha1");
+    }
+
+    #[test]
+    fn aggregated_crd_group_merges_versions_and_resources() {
+        use serde_json::json;
+        let mut groups = vec![json!({
+            "metadata": {"name": "snapshot.storage.k8s.io"},
+            "versions": [{"version": "v1", "freshness": "Current",
+                          "resources": [{"resource": "volumesnapshots"}]}]
+        })];
+        merge_crd_group_versions_aggregated(
+            &mut groups,
+            "snapshot.storage.k8s.io",
+            vec![
+                json!({"version": "v1beta1", "freshness": "Current",
+                       "resources": [{"resource": "volumesnapshotclasses"}]}),
+                json!({"version": "v1", "freshness": "Current",
+                       "resources": [{"resource": "volumesnapshots"}, {"resource": "volumesnapshotcontents"}]}),
+            ],
+        );
+        let vs = groups[0]["versions"].as_array().unwrap();
+        assert_eq!(vs[0]["version"], "v1");
+        assert_eq!(vs[1]["version"], "v1beta1");
+        assert_eq!(vs[0]["resources"].as_array().unwrap().len(), 2);
+    }
 
     /// installer.go:488-498: top-level resources carry the storage-version
     /// hash, subresources and non-Store resources do not.

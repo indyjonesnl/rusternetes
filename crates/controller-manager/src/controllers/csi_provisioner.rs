@@ -2135,7 +2135,13 @@ impl<S: Storage + 'static> CsiProvisioner<S> {
             if Some(ds.namespace.as_str()) != claim.metadata.namespace.as_deref() {
                 let grants: Vec<ReferenceGrant> = self
                     .storage
-                    .list(&format!("/registry/referencegrants/{}/", ds.namespace))
+                    // ReferenceGrant is a Gateway API CRD (external-provisioner
+                    // lists it through the gateway client); a CR is stored under
+                    // `<group with . -> _>_<plural>` (api-server custom_resource.rs).
+                    .list(&k3rs_storage::build_prefix(
+                        "gateway_networking_k8s_io_referencegrants",
+                        Some(&ds.namespace),
+                    ))
                     .await
                     .map_err(|e| {
                         fin(format!(

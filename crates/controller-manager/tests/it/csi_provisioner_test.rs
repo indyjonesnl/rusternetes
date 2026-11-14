@@ -2238,7 +2238,14 @@ async fn put_grant(storage: &MemoryStorage, from_ns: &str, to_name: Option<&str>
         ..Default::default()
     };
     storage
-        .create(&build_key("referencegrants", Some("ns1"), "grant"), &g)
+        .create(
+            &build_key(
+                "gateway_networking_k8s_io_referencegrants",
+                Some("ns1"),
+                "grant",
+            ),
+            &g,
+        )
         .await
         .unwrap();
 }

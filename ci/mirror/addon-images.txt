@@ -11,3 +11,7 @@ rancher/mirrored-library-busybox:1.37.0
 # pause image of k3s's docker/basics volume-test pod (scripts/airgap/volume-test.yaml)
 rancher/mirrored-pause:3.10.2
 rancher/mirrored-metrics-server:v0.9.0
+# helm-controller, its helm job image and traefik (deploy/addons/helm-controller/, deploy/addons/traefik.yaml)
+rancher/helm-controller:v0.17.9
+rancher/klipper-helm:v0.13.3-build20260727
+rancher/mirrored-library-traefik:3.7.13

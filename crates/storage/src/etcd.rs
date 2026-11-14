@@ -1,6 +1,8 @@
 use crate::{Storage, WatchEvent, WatchStream};
 use async_trait::async_trait;
-use etcd_client::{Client, Compare, CompareOp, GetOptions, PutOptions, TxnOp, WatchOptions};
+use etcd_client::{
+    Client, Compare, CompareOp, GetOptions, KvClient, PutOptions, TxnOp, WatchClient, WatchOptions,
+};
 use futures::StreamExt;
 use k3rs_common::{authz::AuthzStorage, Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -127,6 +129,43 @@ pub fn floor_settles_compaction(floor: i64, revision: i64) -> Option<bool> {
 /// under the default 4MB gRPC message limit.
 const DEFAULT_LIST_PAGE_SIZE: i64 = 500;
 
+/// Client-side gRPC message limits, ported from etcd's `clientv3`
+/// (`client/v3/options.go:34-40`):
+///
+/// * `defaultMaxCallSendMsgSize = grpc.MaxCallSendMsgSize(2 * 1024 * 1024)`
+/// * `defaultMaxCallRecvMsgSize = grpc.MaxCallRecvMsgSize(math.MaxInt32)`,
+///   "because range response can easily exceed request send limits".
+///
+/// `clientv3` applies both to every call of every service it dials
+/// (`client.go:417-430`, `defaultCallOpts`). tonic's own defaults (4 MiB
+/// decode) would fail a page of large objects (helm release Secrets) with
+/// `decoded message length too large`.
+pub const MAX_CALL_SEND_MSG_SIZE: usize = 2 * 1024 * 1024;
+/// See [`MAX_CALL_SEND_MSG_SIZE`].
+pub const MAX_CALL_RECV_MSG_SIZE: usize = i32::MAX as usize;
+
+/// The KV service client with the `clientv3` call limits applied.
+///
+/// `etcd-client` 0.14 only exposes the limit setters on its `KvClient` (both
+/// directions) and `WatchClient` (decode); its lease and maintenance clients
+/// have none, so those keep tonic's defaults. Every KV and watch call in this
+/// file goes through [`kv_client`] / [`watch_client`], the single place the
+/// limits are applied.
+pub fn kv_client(client: &Client) -> KvClient {
+    client
+        .kv_client()
+        .max_decoding_message_size(MAX_CALL_RECV_MSG_SIZE)
+        .max_encoding_message_size(MAX_CALL_SEND_MSG_SIZE)
+}
+
+/// The watch service client with the `clientv3` receive limit applied
+/// (see [`kv_client`]).
+pub fn watch_client(client: &Client) -> WatchClient {
+    client
+        .watch_client()
+        .max_decoding_message_size(MAX_CALL_RECV_MSG_SIZE)
+}
+
 /// How many times an unversioned write re-reads and retries its guarded
 /// transaction before giving up, mirroring upstream's `GuaranteedUpdate` retry
 /// loop in `etcd3/store.go`.
@@ -190,7 +229,7 @@ impl EtcdStorage {
     }
 
     /// Read a key's current `mod_revision`, or [`Error::NotFound`].
-    async fn read_mod_revision(client: &mut Client, key: &str) -> Result<i64> {
+    async fn read_mod_revision(client: &mut KvClient, key: &str) -> Result<i64> {
         let resp = crate::latency::tracked(client.get(key, None))
             .await
             .map_err(|e| Error::Storage(format!("Failed to read resource: {}", e)))?;
@@ -242,7 +281,7 @@ impl EtcdStorage {
     /// it. Mirroring that keeps every mutation inside the upstream RPC subset
     /// *and* closes the lost-update race a bare `Put` leaves open.
     async fn put_guaranteed(&self, key: &str, json: &str, ttl: u64) -> Result<i64> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
             let expected = Self::read_mod_revision(&mut client, key).await?;
             // The failure branch's GET is upstream's `GetOnFailure: true`,
@@ -286,7 +325,7 @@ impl EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         let page_size = self.page_size;
         let range_end = prefix_range_end(prefix.as_bytes());
         let mut results = Vec::new();
@@ -390,7 +429,7 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         // Stamp system-managed creation metadata (uid, creationTimestamp,
         // generation) centrally, mirroring k8s registry.Store.Create.
         let json = {
@@ -443,7 +482,7 @@ impl Storage for EtcdStorage {
     where
         T: DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
 
         let resp = crate::latency::tracked(client.get(key, None))
             .await
@@ -474,7 +513,7 @@ impl Storage for EtcdStorage {
     where
         T: Serialize + DeserializeOwned + Send + Sync,
     {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         let json = Self::serialize(value)?;
 
         // Extract resourceVersion from the incoming resource
@@ -563,7 +602,7 @@ impl Storage for EtcdStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
 
         // Upstream `OptimisticDelete` (`client/v3/kubernetes/client.go`):
         //
@@ -606,7 +645,7 @@ impl Storage for EtcdStorage {
         key: &str,
         preconditions: &crate::Preconditions,
     ) -> Result<()> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         for _ in 0..GUARANTEED_UPDATE_ATTEMPTS {
             let resp = crate::latency::tracked(client.get(key, None))
                 .await
@@ -665,7 +704,7 @@ impl Storage for EtcdStorage {
     /// read of the prefix for the count, the average size from the per-key
     /// cache. Walks the range in pages like `list_inner`.
     async fn stats(&self, prefix: &str) -> Result<crate::ResourceStats> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         let page_size = self.page_size;
         let range_end = prefix_range_end(prefix.as_bytes());
         let mut next_start: Vec<u8> = prefix.as_bytes().to_vec();
@@ -701,7 +740,7 @@ impl Storage for EtcdStorage {
     }
 
     async fn watch_from_revision(&self, prefix: &str, revision: i64) -> Result<WatchStream> {
-        let mut client = self.client.clone();
+        let mut client = watch_client(&self.client);
         let watch_options = WatchOptions::new()
             .with_prefix()
             .with_prev_key()
@@ -807,7 +846,7 @@ impl Storage for EtcdStorage {
     }
 
     async fn watch(&self, prefix: &str) -> Result<WatchStream> {
-        let mut client = self.client.clone();
+        let mut client = watch_client(&self.client);
 
         // Enable prev_kv to get the previous value on DELETE events (required for Kubernetes)
         let watch_options = WatchOptions::new().with_prefix().with_prev_key();
@@ -896,7 +935,7 @@ impl Storage for EtcdStorage {
     }
 
     async fn current_revision(&self) -> Result<i64> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         // A single-key GET of a key that does not exist: the response carries
         // the current revision in its header and no payload. (`keys_only`
         // would be a hair cheaper but is outside the RPC subset — and
@@ -908,7 +947,7 @@ impl Storage for EtcdStorage {
     }
 
     async fn is_revision_compacted(&self, revision: i64) -> Result<bool> {
-        let mut client = self.client.clone();
+        let mut client = kv_client(&self.client);
         // Read a single key at the requested revision. etcd answers a read
         // below its compaction point with `OutOfRange` / "required revision
         // has been compacted"; anything else means the revision is still

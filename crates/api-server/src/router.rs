@@ -1104,10 +1104,6 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             get(handlers::discovery::get_snapshot_v1_resources),
         )
         .route(
-            "/apis/gateway.networking.k8s.io/v1beta1",
-            get(handlers::discovery::get_gateway_v1beta1_resources),
-        )
-        .route(
             "/apis/discovery.k8s.io/v1",
             get(handlers::discovery::get_discovery_v1_resources),
         )
@@ -1875,24 +1871,6 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         .route(
             "/apis/snapshot.storage.k8s.io/v1/volumesnapshots",
             get(handlers::volumesnapshot::list_all_volumesnapshots),
-        )
-        // Gateway API - ReferenceGrants (namespace-scoped, no status)
-        .route(
-            "/apis/gateway.networking.k8s.io/v1beta1/namespaces/:namespace/referencegrants",
-            get(handlers::referencegrant::list_referencegrants)
-                .post(handlers::referencegrant::create_referencegrant)
-                .delete(handlers::referencegrant::deletecollection_referencegrants),
-        )
-        .route(
-            "/apis/gateway.networking.k8s.io/v1beta1/namespaces/:namespace/referencegrants/:name",
-            get(handlers::referencegrant::get_referencegrant)
-                .put(handlers::referencegrant::update_referencegrant)
-                .patch(handlers::referencegrant::patch_referencegrant)
-                .delete(handlers::referencegrant::delete_referencegrant),
-        )
-        .route(
-            "/apis/gateway.networking.k8s.io/v1beta1/referencegrants",
-            get(handlers::referencegrant::list_all_referencegrants),
         )
         // VolumeSnapshotContents (cluster-scoped)
         .route(
@@ -3177,6 +3155,17 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
         let index_file = dir.join("index.html");
         let serve_dir = ServeDir::new(dir).fallback(ServeFile::new(&index_file));
         app = app.nest_service("/console", serve_dir);
+    }
+
+    // Serve bundled static files (the addon chart tarballs) at /static/, as k3s
+    // does: pkg/server/handlers/router.go `staticURL = "/static/"` mounts
+    // `handlers.Static("/static/", <data-dir>/static)` (http.FileServer) for
+    // the HelmChart specs' `https://%{KUBERNETES_API}%/static/charts/<chart>.tgz`.
+    // Like k3s's supervisor mux, it sits outside API authentication.
+    // The directory comes from `K3RS_STATIC_DIR` (k3s's is `<data-dir>/static`).
+    if let Some(dir) = std::env::var_os("K3RS_STATIC_DIR") {
+        info!("serving static files from {:?} at /static/", dir);
+        app = app.nest_service("/static", ServeDir::new(dir));
     }
 
     app.layer(axum_middleware::map_request(

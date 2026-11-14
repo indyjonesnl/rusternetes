@@ -341,6 +341,64 @@ pub fn estimate_rule_cost(
     ))
 }
 
+/// What `compileRule` (`apiextensions-apiserver/.../schema/cel/compilation.go`
+/// :203-300) makes of a CRD rule (`expected` `Bool`) or messageExpression
+/// (`String`) under `scope`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuleCompilation {
+    /// The expression does not parse; the syntax error is the caller's
+    /// (`cel_versions::compile_failure`) to report.
+    Unparsable,
+    /// `compilation failed: <issues>` or the output-type error
+    /// (`:217-219`, `:260-262`).
+    Failed(String),
+    /// Compiled; `ruleEnv.EstimateCost(ast, estimator).Max` (`:246-251`,
+    /// `:279-285`).
+    Compiled { max_cost: u64 },
+}
+
+/// `compileRule`'s compile + `EstimateCost`: the checker's verdict and, when
+/// the expression type-checks, the static cost over the schema's size
+/// estimates. There is no heuristic: an expression the checker cannot type is
+/// `Failed`, never costed by a guess.
+pub fn compile_rule(
+    expression: &str,
+    set: &EnvSet,
+    env_type: EnvType,
+    scope: &SelfScope,
+    expected: crate::cel_env::ExpectedOutput,
+) -> RuleCompilation {
+    use crate::cel_env::ExpectedOutput;
+    let Some(c) = run_checker(expression, set, env_type, Some(scope)) else {
+        return RuleCompilation::Unparsable;
+    };
+    if !c.errors.is_empty() {
+        let prefix = match expected {
+            ExpectedOutput::Bool => "compilation failed: ",
+            _ => "messageExpression compilation failed: ",
+        };
+        return RuleCompilation::Failed(format!("{prefix}{}", c.display));
+    }
+    let output = c.ast.output_type().cloned().unwrap_or(DType::Dyn);
+    match expected {
+        ExpectedOutput::Bool if output != DType::Bool => {
+            return RuleCompilation::Failed("cel expression must evaluate to a bool".to_string());
+        }
+        ExpectedOutput::String if output != DType::Str => {
+            return RuleCompilation::Failed(
+                "messageExpression must evaluate to a string".to_string(),
+            );
+        }
+        _ => {}
+    }
+    let Some(scoped) = c.scoped else {
+        return RuleCompilation::Failed("cost estimation failed: no scope".to_string());
+    };
+    let sizes = crate::cel_crd_cost::SchemaSizeEstimator::new(scoped);
+    let est = checker::library_cost::kubernetes_cost(&c.ast, &c.expr, Some(&sizes));
+    RuleCompilation::Compiled { max_cost: est.max }
+}
+
 /// The hook of the cost check of a CRD rule: in `shadow` mode compares the
 /// static estimate with the heuristic the validation decides with, and logs
 /// when they disagree on whether the rule is over `limit`. Never affects the

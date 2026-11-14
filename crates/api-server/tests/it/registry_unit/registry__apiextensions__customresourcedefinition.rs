@@ -309,10 +309,10 @@ mod tests {
     fn optional_old_self_requires_old_self_in_rule() {
         let c = crd_with_schema(serde_json::json!({"type": "object",
             "x-kubernetes-validations": [
-                {"rule": "self.size() >= 0", "optionalOldSelf": true},
-                {"rule": "self.size() >= 0", "optionalOldSelf": false},
-                {"rule": "oldSelf.hasValue() || self.size() >= 0", "optionalOldSelf": true},
-                {"rule": "self.size() >= 0"}]}));
+                {"rule": "self == self", "optionalOldSelf": true},
+                {"rule": "self == self", "optionalOldSelf": false},
+                {"rule": "oldSelf.hasValue() || self == self", "optionalOldSelf": true},
+                {"rule": "self == self"}]}));
         let errs = schema_rule_errors_in(&c, None, &env_1_32());
         assert_eq!(
             fields(&errs),
@@ -908,11 +908,14 @@ mod tests {
         );
     }
 
-    const EXPENSIVE: &str = "self.all(a, self.all(b, self.all(c, true)))";
+    /// Over `StaticEstimatedCostLimit` (10M) for one rule yet under
+    /// `StaticEstimatedCRDCostLimit` (100M) for the version, so the per-rule
+    /// suppression on an unchanged schema is what the test observes.
+    const EXPENSIVE: &str = "self.all(a, self.all(b, true))";
 
     fn crd_two_versions(v1_extra: &str, v2_rule: &str) -> CustomResourceDefinition {
         let schema = |rule: &str, extra: &str| {
-            serde_json::json!({"openAPIV3Schema": {"type": "array",
+            serde_json::json!({"openAPIV3Schema": {"type": "array", "maxItems": 3000,
                 "items": {"type": "string"}, "description": extra,
                 "x-kubernetes-validations": [{"rule": rule}]}})
         };

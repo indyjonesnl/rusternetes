@@ -38,8 +38,13 @@ use k3rs_common::{cel_checker_shadow, cel_schema_types};
 use k3rs_common::{CELContext, CELEvaluator, Error, Result};
 use std::collections::HashSet;
 
-/// Default per-rule estimated cost budget (K8s default = 10M tokens).
+/// `StaticEstimatedCostLimit` (apiextensions validation.go:56-58): the largest
+/// allowed estimated cost of one rule.
 const DEFAULT_RULE_COST_LIMIT: u64 = 10_000_000;
+
+/// `StaticEstimatedCRDCostLimit` (validation.go:60-61): the largest allowed
+/// total estimated cost of all the rules of a CRD.
+const STATIC_ESTIMATED_CRD_COST_LIMIT: u64 = 100_000_000;
 
 /// `supportedValidationReason` (apiextensions validation.go:66-71), in
 /// `sets.String.List()` (sorted) order.
@@ -317,21 +322,6 @@ pub fn schema_has_rules(schema: &JSONSchemaProps) -> bool {
     false
 }
 
-/// The first unknown property reference in one `x-kubernetes-validations`
-/// rule of `schema`. A rule reference like `self.foo` is "known" if `foo` is
-/// declared in the same schema's `properties` map.
-///
-/// This is a deliberately conservative heuristic (no schema-typed CEL
-/// environment exists yet): it only flags obvious references such as
-/// `self.<ident>` against a schema with a declared `properties` map. More
-/// subtle references (chained accesses, dynamic indexing) are deferred to
-/// runtime.
-pub fn unknown_property_in_rule(schema: &JSONSchemaProps, rule: &str) -> Option<String> {
-    let known = schema.properties.as_ref()?;
-    let prop = first_self_reference(rule)?;
-    (!known.contains_key(&prop)).then_some(prop)
-}
-
 /// Return the first `self.<ident>` access in `rule`, or `None` if there is
 /// no plain `self.X` reference (rules may still legitimately use `self` as
 /// a scalar — `self > 0` — and we leave those alone).
@@ -383,33 +373,6 @@ pub fn rule_references_old_self(rule: &str) -> bool {
         i += 1;
     }
     false
-}
-
-/// Estimate the cost of a CEL expression. K8s computes an "estimated cost" at
-/// compile time as a (deliberately loose) upper bound on runtime tokens.
-///
-/// We approximate that with a cheap heuristic: each operator/identifier
-/// contributes 1, each comprehension-style call (`all`, `exists`, `filter`,
-/// `map`) multiplies by an assumed iteration count of 1024, and string
-/// literals add their length / 8.  This is intentionally generous so that
-/// the obviously-expensive expressions used in the upstream cost-limit test
-/// (e.g. nested `all` over many list items) exceed the limit while the
-/// trivial rules used in normal tests stay well under it.
-pub fn estimate_cost(rule: &str) -> u64 {
-    let mut cost: u64 = rule.len() as u64;
-    let comprehensions = ["all(", "exists(", "filter(", "map("];
-    let mut multiplier: u64 = 1;
-    for token in comprehensions {
-        let count = rule.matches(token).count() as u32;
-        for _ in 0..count {
-            multiplier = multiplier.saturating_mul(1024);
-            if multiplier > DEFAULT_RULE_COST_LIMIT {
-                return DEFAULT_RULE_COST_LIMIT.saturating_add(1);
-            }
-        }
-    }
-    cost = cost.saturating_mul(multiplier);
-    cost
 }
 
 /// `preexistingExpressions` (apiextensions validation.go:153-156): the rules
@@ -476,6 +439,81 @@ pub fn find_preexisting_expressions(spec: &CustomResourceDefinitionSpec) -> Pree
     found.into_inner()
 }
 
+/// `multiplyWithOverflowGuard` (validation.go:1335-1343).
+fn multiply_with_overflow_guard(base_cost: u64, cardinality: u64) -> u64 {
+    if base_cost == 0 {
+        // an empty rule can return 0, so guard for that here
+        0
+    } else if u64::MAX / base_cost < cardinality {
+        u64::MAX
+    } else {
+        base_cost * cardinality
+    }
+}
+
+/// `getExpressionCost` (validation.go:1345-1350): the rule's static cost
+/// times the cardinality the parent schemas bound, or, if some parent is
+/// unbounded, the worst case from the minimum serialized size
+/// (`maxCardinality`, compilation.go:357).
+fn get_expression_cost(
+    max_cost: u64,
+    max_cardinality: Option<u64>,
+    min_serialized_size: i64,
+) -> u64 {
+    match max_cardinality {
+        Some(c) => multiply_with_overflow_guard(max_cost, c),
+        None => multiply_with_overflow_guard(
+            max_cost,
+            k3rs_common::cel_crd_cost::max_cardinality(min_serialized_size),
+        ),
+    }
+}
+
+/// `extractMaxElements` (cel_validation.go:297-326): the factor by which the
+/// schema increases the cardinality of its children; `None` is unbounded.
+fn extract_max_elements(schema: &JSONSchemaProps) -> Option<u64> {
+    let zero_if_negative = |v: i64| v.max(0) as u64;
+    match schema.type_.as_deref() {
+        Some("object") => {
+            if schema.additional_properties.is_some() {
+                schema.max_properties.map(zero_if_negative)
+            } else {
+                Some(1)
+            }
+        }
+        Some("array") => schema.max_items.map(zero_if_negative),
+        _ => Some(1),
+    }
+}
+
+/// `childContext`'s `MaxCardinality` (cel_validation.go:182-211): the parent's
+/// cardinality times the factor its own schema adds, unbounded if either is.
+fn child_cardinality(parent: &JSONSchemaProps, parent_cardinality: Option<u64>) -> Option<u64> {
+    let c = parent_cardinality?;
+    let elements = extract_max_elements(parent)?;
+    Some(multiply_with_overflow_guard(c, elements))
+}
+
+/// `TotalCost` (cel_validation.go:261-293).
+#[derive(Default)]
+struct TotalCost {
+    total: u64,
+    /// The top 4 rules contributing at least 1% of the CRD limit.
+    most_expensive: Vec<(Path, u64)>,
+}
+
+impl TotalCost {
+    fn observe(&mut self, path: Path, cost: u64) {
+        self.total = self.total.saturating_add(cost);
+        if cost < STATIC_ESTIMATED_CRD_COST_LIMIT / 100 {
+            return;
+        }
+        self.most_expensive.push((path, cost));
+        self.most_expensive.sort_by_key(|a| std::cmp::Reverse(a.1));
+        self.most_expensive.truncate(4);
+    }
+}
+
 /// `getCostErrorMessage` (validation.go:1352-1366).
 fn get_cost_error_message(cost_name: &str, expression_cost: u64, cost_limit: u64) -> String {
     let exceed_factor = expression_cost as f64 / cost_limit as f64;
@@ -492,17 +530,17 @@ fn get_cost_error_message(cost_name: &str, expression_cost: u64, cost_limit: u64
 /// The CEL half of `ValidateCustomResourceDefinitionOpenAPISchema` for one
 /// version's `openAPIV3Schema` at `fld_path`.
 ///
-/// Not ported: the per-CRD `TotalCost` (`StaticEstimatedCRDCostLimit`,
-/// validation.go:981-992, cel_validation.go:260-297) and the per-schema
-/// cardinality multiplication (`getExpressionCost`, validation.go:1345): both
-/// need a real cost estimator, and the coarse [`estimate_cost`] heuristic
-/// would reject valid CRDs with them.
+/// Costs are the static estimate of the cel-go checker port over the
+/// schema's size bounds (`compileRule`, compilation.go:203-300), times the
+/// rule's cardinality (`getExpressionCost`, validation.go:1345), accumulated
+/// per CRD version against `StaticEstimatedCRDCostLimit`
+/// (validation.go:981-992). An expression the checker cannot type is its
+/// compile error, never costed by a guess.
 ///
 /// Rules are compiled against `env_set`; those already stored on the CRD
-/// (`pre`) in the stored environment. Rust has no schema-typed CEL
-/// environment or cost estimator yet, so compile errors are the
-/// undeclared-reference / syntax checks of `cel_versions` and the CEL parser,
-/// and costs come from the coarse [`estimate_cost`] heuristic.
+/// (`pre`) in the stored environment. Not ported: `UsesOldSelf` is read
+/// lexically (`rule_references_old_self`), not from the checker's reference
+/// map.
 pub fn validate_crd_schema_rules(
     schema: &JSONSchemaProps,
     fld_path: &Path,
@@ -511,34 +549,37 @@ pub fn validate_crd_schema_rules(
     suppress_per_expression_cost: bool,
 ) -> Vec<FieldError> {
     let mut errs = Vec::new();
+    // `RootCELContext`: the root's MaxCardinality is 1 (cel_validation.go:121).
+    let mut total = TotalCost::default();
     compile_schema_rules(
         schema,
         true,
+        Some(1),
+        &mut total,
         fld_path,
         env_set,
         pre,
         suppress_per_expression_cost,
         &mut errs,
     );
-    errs
-}
-
-/// The type scope of a rule on `schema` for the shadow checker run, or `None`
-/// when shadowing is off or the schema is not exposed to CEL (upstream's
-/// "failed to convert to declType for CEL validation rules").
-fn shadow_scope(
-    schema: &JSONSchemaProps,
-    is_root: bool,
-    rule: &serde_json::Value,
-) -> Option<cel_checker_shadow::SelfScope> {
-    if cel_checker_shadow::Mode::current() != cel_checker_shadow::Mode::Shadow {
-        return None;
+    // validation.go:981-992.
+    if total.total > STATIC_ESTIMATED_CRD_COST_LIMIT {
+        for (path, _) in &total.most_expensive {
+            errs.push(FieldError::forbidden(
+                path,
+                "contributed to estimated rule cost total exceeding cost limit for entire OpenAPIv3 schema",
+            ));
+        }
+        errs.push(FieldError::forbidden(
+            fld_path,
+            get_cost_error_message(
+                "x-kubernetes-validations estimated rule cost total for entire OpenAPIv3 schema",
+                total.total,
+                STATIC_ESTIMATED_CRD_COST_LIMIT,
+            ),
+        ));
     }
-    let embedded = schema.x_kubernetes_embedded_resource == Some(true);
-    Some(cel_checker_shadow::SelfScope {
-        decl: cel_schema_types::schema_decl_type(schema, is_root || embedded)?,
-        optional_old_self: rule.get("optionalOldSelf").and_then(|v| v.as_bool()) == Some(true),
-    })
+    errs
 }
 
 /// The recursion of `ValidateCustomResourceDefinitionOpenAPISchema`
@@ -550,9 +591,12 @@ fn shadow_scope(
 ///
 /// Returns whether a schema error occurred here or deeper: CEL compilation
 /// is skipped for the node then (:1264-1268).
+#[allow(clippy::too_many_arguments)]
 fn compile_schema_rules(
     schema: &JSONSchemaProps,
     is_root: bool,
+    max_cardinality: Option<u64>,
+    total: &mut TotalCost,
     fld_path: &Path,
     env_set: &EnvSet,
     pre: &PreexistingExpressions,
@@ -564,6 +608,8 @@ fn compile_schema_rules(
         schema_errors |= compile_schema_rules(
             child,
             false,
+            child_cardinality(schema, max_cardinality),
+            total,
             &fld_path.child("additionalProperties"),
             env_set,
             pre,
@@ -578,6 +624,8 @@ fn compile_schema_rules(
             schema_errors |= compile_schema_rules(
                 &properties[name],
                 false,
+                child_cardinality(schema, max_cardinality),
+                total,
                 &fld_path.child("properties").key(name.clone()),
                 env_set,
                 pre,
@@ -591,6 +639,8 @@ fn compile_schema_rules(
             schema_errors |= compile_schema_rules(
                 i,
                 false,
+                child_cardinality(schema, max_cardinality),
+                total,
                 &fld_path.child("items"),
                 env_set,
                 pre,
@@ -603,6 +653,8 @@ fn compile_schema_rules(
                 schema_errors |= compile_schema_rules(
                     item,
                     false,
+                    child_cardinality(schema, max_cardinality),
+                    total,
                     &fld_path.child("items").index(i),
                     env_set,
                     pre,
@@ -733,9 +785,28 @@ fn compile_schema_rules(
                 ));
             }
         }
-        // compileRule (compilation.go:242-246), then the unknown-property
-        // heuristic standing in for the schema-typed checker.
-        let failure = compile_failure(rule, env_set, pre.rule_env(rule))
+        // `typeInfo.DeclType` of this node (validation.go:1268-1275): CEL
+        // validation needs `self` typed by the schema.
+        let Some(decl) = cel_schema_types::schema_decl_type(
+            schema,
+            is_root || schema.x_kubernetes_embedded_resource == Some(true),
+        ) else {
+            errs.push(FieldError::internal(
+                &fld_path.child("x-kubernetes-validations"),
+                "internal error: failed to construct type information for x-kubernetes-validations rules: unable to convert structural schema to CEL declarations",
+            ));
+            return schema_errors;
+        };
+        let scope = cel_checker_shadow::SelfScope {
+            decl,
+            optional_old_self: raw.get("optionalOldSelf").and_then(|v| v.as_bool()) == Some(true),
+        };
+        let rule_env = pre.rule_env(rule);
+        // compileRule (compilation.go:242-246): the syntax and library
+        // checks of `cel_versions`, then the schema-typed checker, whose
+        // verdict also yields `MaxCost` (:246-251).
+        let mut max_cost = 0u64;
+        let failure = compile_failure(rule, env_set, rule_env)
             .or_else(|| {
                 CELEvaluator::new()
                     .type_check(rule)
@@ -743,47 +814,35 @@ fn compile_schema_rules(
                     .map(|e| format!("compilation failed: {e}"))
             })
             .or_else(|| {
-                unknown_property_in_rule(schema, rule).map(|prop| {
-                    format!("x-kubernetes-validations rule refers to unknown property: {prop}")
-                })
+                match cel_checker_shadow::compile_rule(
+                    rule,
+                    env_set,
+                    rule_env,
+                    &scope,
+                    ExpectedOutput::Bool,
+                ) {
+                    cel_checker_shadow::RuleCompilation::Failed(detail) => Some(detail),
+                    cel_checker_shadow::RuleCompilation::Compiled { max_cost: c } => {
+                        max_cost = c;
+                        None
+                    }
+                    cel_checker_shadow::RuleCompilation::Unparsable => None,
+                }
             });
-        // Default-off shadow run of the schema-typed checker (`self` typed by
-        // the node's `SchemaDeclType`); never changes `failure`.
-        if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_rule_output(
-                rule,
-                env_set,
-                pre.rule_env(rule),
-                &failure,
-                &scope,
-                ExpectedOutput::Bool,
-            );
-        }
-        if let Some(detail) = failure {
-            errs.push(FieldError::invalid(&rule_field, raw.clone(), detail));
-            // compileRule returns before the messageExpression (:242-246).
-            continue;
-        }
-        // validation.go:1280-1287.
-        let cost = estimate_cost(rule);
-        // Default-off shadow run of the static cost estimator
-        // (`checker.Cost` with the Kubernetes estimator over the schema's
-        // size estimates); the heuristic keeps deciding.
-        if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_cost(
-                rule,
-                env_set,
-                pre.rule_env(rule),
-                &scope,
-                cost,
-                DEFAULT_RULE_COST_LIMIT,
-            );
-        }
+        // validation.go:1281-1288: `getExpressionCost` is evaluated even for
+        // a rule that failed to compile (`MaxCost` 0).
+        let cost = get_expression_cost(max_cost, max_cardinality, scope.decl.min_serialized_size);
         if !suppress && cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &rule_field,
                 get_cost_error_message("estimated rule cost", cost, DEFAULT_RULE_COST_LIMIT),
             ));
+        }
+        total.observe(rule_field.clone(), cost);
+        if let Some(detail) = failure {
+            errs.push(FieldError::invalid(&rule_field, raw.clone(), detail));
+            // compileRule returns before the messageExpression (:242-246).
+            continue;
         }
         // compileRule's messageExpression (compilation.go:253-287), and
         // validation.go:1295-1307.
@@ -795,7 +854,9 @@ fn compile_schema_rules(
             continue;
         }
         let me_field = rule_path(i).child("messageExpression");
-        let me_failure = compile_failure(me, env_set, pre.message_expression_env(me))
+        let me_env = pre.message_expression_env(me);
+        let mut me_cost = 0u64;
+        let me_failure = compile_failure(me, env_set, me_env)
             .map(|d| {
                 format!(
                     "messageExpression compilation failed: {}",
@@ -807,32 +868,29 @@ fn compile_schema_rules(
                     .type_check(me)
                     .err()
                     .map(|e| format!("messageExpression compilation failed: {e}"))
+            })
+            .or_else(|| {
+                match cel_checker_shadow::compile_rule(
+                    me,
+                    env_set,
+                    me_env,
+                    &scope,
+                    ExpectedOutput::String,
+                ) {
+                    cel_checker_shadow::RuleCompilation::Failed(detail) => Some(detail),
+                    cel_checker_shadow::RuleCompilation::Compiled { max_cost: c } => {
+                        me_cost = c;
+                        None
+                    }
+                    cel_checker_shadow::RuleCompilation::Unparsable => None,
+                }
             });
-        if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_rule_output(
-                me,
-                env_set,
-                pre.message_expression_env(me),
-                &me_failure,
-                &scope,
-                ExpectedOutput::String,
-            );
-        }
         if let Some(detail) = me_failure {
             errs.push(FieldError::invalid(&me_field, raw.clone(), detail));
             continue;
         }
-        let me_cost = estimate_cost(me);
-        if let Some(scope) = shadow_scope(schema, is_root, raw) {
-            cel_checker_shadow::observe_cost(
-                me,
-                env_set,
-                pre.message_expression_env(me),
-                &scope,
-                me_cost,
-                DEFAULT_RULE_COST_LIMIT,
-            );
-        }
+        // `MessageExpressionMaxCost` is not multiplied by the cardinality
+        // (validation.go:1303-1311).
         if !suppress && me_cost > DEFAULT_RULE_COST_LIMIT {
             errs.push(FieldError::forbidden(
                 &me_field,
@@ -843,6 +901,7 @@ fn compile_schema_rules(
                 ),
             ));
         }
+        total.observe(me_field, me_cost);
     }
     false
 }

@@ -309,7 +309,7 @@ mod rbac_authorization_test;
 mod rbac_handler_test;
 mod rbac_store_test;
 mod rc_default_replicas_test;
-mod referencegrant_store_test;
+mod referencegrant_crd_test;
 mod registry_unit;
 mod replicaset_generic_store_test;
 mod replicaset_handler_test;

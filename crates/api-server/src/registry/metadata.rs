@@ -290,16 +290,6 @@ impl HasMetadata for k3rs_common::resources::VolumeSnapshot {
     }
 }
 
-impl HasMetadata for k3rs_common::resources::ReferenceGrant {
-    fn metadata(&self) -> &k3rs_common::types::ObjectMeta {
-        &self.metadata
-    }
-
-    fn metadata_mut(&mut self) -> &mut k3rs_common::types::ObjectMeta {
-        &mut self.metadata
-    }
-}
-
 impl HasMetadata for k3rs_common::resources::VolumeSnapshotClass {
     fn metadata(&self) -> &k3rs_common::types::ObjectMeta {
         &self.metadata

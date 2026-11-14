@@ -202,6 +202,44 @@ fn count_unfinished_pods(pods: &[Pod]) -> i32 {
         .count() as i32
 }
 
+/// `ensureJobConditionStatus` (`job_controller.go:2008-2021`): update the
+/// condition of `c_type` in place when status/reason/message differ (fresh
+/// `newCondition`, i.e. new transition time); append it when absent and
+/// `status != "False"`; a missing condition set to False is a no-op. Returns
+/// whether anything changed.
+fn ensure_job_condition_status(
+    mut list: Vec<JobCondition>,
+    c_type: &str,
+    status: &str,
+    reason: &str,
+    message: &str,
+) -> (Vec<JobCondition>, bool) {
+    let now = chrono::Utc::now();
+    let new_condition = || JobCondition {
+        condition_type: c_type.to_string(),
+        status: status.to_string(),
+        last_probe_time: Some(now),
+        last_transition_time: Some(now),
+        reason: Some(reason.to_string()),
+        message: Some(message.to_string()),
+    };
+    if let Some(cond) = list.iter_mut().find(|c| c.condition_type == c_type) {
+        if cond.status != status
+            || cond.reason.as_deref() != Some(reason)
+            || cond.message.as_deref() != Some(message)
+        {
+            *cond = new_condition();
+            return (list, true);
+        }
+        return (list, false);
+    }
+    if status != "False" {
+        list.push(new_condition());
+        return (list, true);
+    }
+    (list, false)
+}
+
 /// `enactJobFinished` (`job_controller.go:1520-1524`): "Delaying marking the
 /// Job as finished, because there are still terminating pod(s)". `conditions`
 /// is an interim + terminal pair (`FailureTarget`+`Failed` or
@@ -2286,7 +2324,21 @@ impl<S: Storage + 'static> JobController<S> {
             let ready = ready - removed_ready;
             // Preserve existing start_time
             let existing_start_time = job.status.as_ref().and_then(|s| s.start_time);
-            let existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
+            let mut existing_conditions = job.status.as_ref().and_then(|s| s.conditions.clone());
+            // `syncJob` (job_controller.go:1043-1052): when `manageJob` ran
+            // (expectations satisfied) a suspended Job gets the Suspended
+            // condition. helm-controller (chart.go:439-443, :765-790) waits
+            // for it before resuming the Job it created suspended.
+            if satisfied_expectations {
+                let (conds, _) = ensure_job_condition_status(
+                    existing_conditions.unwrap_or_default(),
+                    "Suspended",
+                    "True",
+                    "JobSuspended",
+                    "Job suspended",
+                );
+                existing_conditions = (!conds.is_empty()).then_some(conds);
+            }
             job.status = Some(JobStatus {
                 active: Some(active),
                 succeeded: status_succeeded,
@@ -2668,6 +2720,26 @@ impl<S: Storage + 'static> JobController<S> {
                 .unwrap_or(false);
 
             if !already_complete {
+                // `syncJob` (job_controller.go:1053-1066): not suspended and
+                // `manageJob` ran -> Suspended=False "JobResumed" (only if a
+                // Suspended condition exists); a resumed Job resets
+                // startTime to now (the ActiveDeadlineSeconds timer must not
+                // run while suspended).
+                let mut existing_conditions = existing_conditions;
+                let mut start_time = start_time;
+                if satisfied_expectations {
+                    let (conds, resumed) = ensure_job_condition_status(
+                        existing_conditions.unwrap_or_default(),
+                        "Suspended",
+                        "False",
+                        "JobResumed",
+                        "Job resumed",
+                    );
+                    existing_conditions = (!conds.is_empty()).then_some(conds);
+                    if resumed {
+                        start_time = Some(chrono::Utc::now());
+                    }
+                }
                 job.status = Some(JobStatus {
                     active: Some(active),
                     succeeded: status_succeeded,

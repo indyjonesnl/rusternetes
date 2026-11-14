@@ -604,6 +604,75 @@ async fn test_job_unsuspend_resumes_pod_creation() {
     assert_eq!(pods.len(), 2, "Unsuspended job should create pods");
 }
 
+/// `TestSuspendJob` (job_controller_test.go): a suspended Job gets
+/// `Suspended=True/JobSuspended`; resuming flips it to
+/// `Suspended=False/JobResumed` and resets startTime. helm-controller
+/// (chart.go:439-443) relies on the True condition before it resumes a Job it
+/// created suspended.
+#[tokio::test]
+async fn test_job_suspend_sets_and_flips_suspended_condition() {
+    let storage = setup_test().await;
+    let mut job = create_test_job("susp-cond", "default", 1, 1);
+    job.spec.suspend = Some(true);
+    let key = build_key("jobs", Some("default"), "susp-cond");
+    storage.create(&key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+
+    controller.reconcile_all().await.unwrap();
+    let j: Job = storage.get(&key).await.unwrap();
+    let conds = j
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap();
+    let c = conds
+        .iter()
+        .find(|c| c.condition_type == "Suspended")
+        .unwrap();
+    assert_eq!(c.status, "True");
+    assert_eq!(c.reason.as_deref(), Some("JobSuspended"));
+    assert_eq!(c.message.as_deref(), Some("Job suspended"));
+    assert!(j.status.as_ref().unwrap().start_time.is_none());
+
+    let mut j = j;
+    j.spec.suspend = Some(false);
+    storage.update(&key, &j).await.unwrap();
+    controller.reconcile_all().await.unwrap();
+    let j: Job = storage.get(&key).await.unwrap();
+    let conds = j
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap();
+    let c = conds
+        .iter()
+        .find(|c| c.condition_type == "Suspended")
+        .unwrap();
+    assert_eq!(c.status, "False");
+    assert_eq!(c.reason.as_deref(), Some("JobResumed"));
+    assert!(j.status.as_ref().unwrap().start_time.is_some());
+    let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+    assert_eq!(pods.len(), 1);
+}
+
+/// A Job that was never suspended gets no Suspended condition
+/// (`ensureJobConditionStatus` is a no-op for a missing condition set False).
+#[tokio::test]
+async fn test_job_never_suspended_has_no_suspended_condition() {
+    let storage = setup_test().await;
+    let job = create_test_job("nosusp", "default", 1, 1);
+    let key = build_key("jobs", Some("default"), "nosusp");
+    storage.create(&key, &job).await.unwrap();
+    let controller = JobController::new(storage.clone());
+    controller.reconcile_all().await.unwrap();
+    let j: Job = storage.get(&key).await.unwrap();
+    let has = j
+        .status
+        .and_then(|s| s.conditions)
+        .is_some_and(|c| c.iter().any(|c| c.condition_type == "Suspended"));
+    assert!(!has);
+}
+
 /// A pod belonging to `job_name`/`job_uid` at completion index `index`.
 fn indexed_job_pod(
     name: &str,

@@ -139,7 +139,6 @@ mod validation__podtemplate;
 mod validation__priorityclass;
 mod validation__prioritylevelconfiguration;
 mod validation__rbac;
-mod validation__referencegrant;
 mod validation__replicationcontroller;
 mod validation__resourceclaim;
 mod validation__resourcequota;
