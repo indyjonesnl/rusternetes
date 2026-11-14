@@ -6,9 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 k3rs is a Rust rewrite of **k3s**: Kubernetes release-1.35 packaged as a
 lightweight, single-binary distribution, with the in-tree cloud provider
-implementations (AWS, GCP, Azure) dropped. Conformance is unchanged: the target
-is still the full CNCF conformance suite (Hydrophone / Sonobuoy), which k3s
-itself passes.
+implementations (AWS, GCP, Azure) dropped. The CNCF conformance suite
+(Hydrophone / Sonobuoy) stays as the regression guard for the behaviour we ship;
+it is no longer the v1.0 goal (see "v1.0 scope" below).
+
+### v1.0 scope (decided 2026-11-14)
+
+Kubernetes is huge, and k3rs reimplements it in Rust rather than vendoring the Go
+code, so v1.0 is scoped to the maintainer's own use, not to full parity:
+
+- **Audience and target hardware: homelab and edge**, specifically a Raspberry Pi
+  3A+ (aarch64, 512 MB RAM in total, OS and container runtime included). Idle
+  memory footprint on that class of device is the deciding metric: a feature that
+  costs RAM must earn it.
+- **Kubernetes minor: 1.35 only.** Do not chase 1.36 or later before v1.0.
+- **Single server.** HA, embedded etcd, and the redis/etcd storage backends do not
+  gate v1.0.
+- **No CNCF certification** (no submission to cncf/k8s-conformance).
+- **No goal of full Go-Kubernetes parity.** Port what a Pi homelab needs; when
+  weighing a feature or a conformance gap, ask whether that usage needs it.
+- Milestones: M1 stabilise and measure (aarch64 build, idle RSS in a 512 MB
+  budget), M2 installable (join token, install script, flannel), M3 addon parity
+  (CoreDNS, local-path-provisioner, metrics-server, traefik), M4 hardening
+  (secrets encryption, certificate rotation), M5 tag v1.0 (single server).
+- Names: the repository and the images are `k3rs`.
+
+The upstream-first rule below is unaffected: whatever we do ship is ported from
+k3s / Kubernetes, not invented.
 
 What "k3s parity" means in practice:
 
