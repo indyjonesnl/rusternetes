@@ -448,13 +448,17 @@ mod tests {
         assert_eq!(first_self_reference("myself.foo > 0"), None);
     }
 
+    /// crd_validation_rules.go:180: an undeclared field is reported by the
+    /// schema-typed checker as `undefined field 'z'`, not a bespoke message.
     #[test]
-    fn detect_unknown_property_flags_misspelling() {
-        let schema = schema_with_rule("self.replicaz <= 100", "msg");
-        let spec = &schema.properties.as_ref().unwrap()["spec"];
-        let unknown = unknown_property_in_rule(spec, "self.replicaz <= 100");
-        assert_eq!(unknown.as_deref(), Some("replicaz"));
-        assert_eq!(unknown_property_in_rule(spec, "self.replicas <= 100"), None);
+    fn unknown_field_is_reported_by_the_typed_checker() {
+        let schema = schema_with_rule("self.z == 100", "m");
+        let env = EnvSet::must_base_env_set(Version::major_minor(1, 35));
+        let root = Path::new("openAPIV3Schema");
+        let pre = PreexistingExpressions::default();
+        let errs = validate_crd_schema_rules(&schema, &root, &env, &pre, false);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].detail.contains("undefined field 'z'"), "{errs:?}");
     }
 
     #[test]

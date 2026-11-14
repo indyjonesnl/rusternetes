@@ -322,21 +322,6 @@ pub fn schema_has_rules(schema: &JSONSchemaProps) -> bool {
     false
 }
 
-/// The first unknown property reference in one `x-kubernetes-validations`
-/// rule of `schema`. A rule reference like `self.foo` is "known" if `foo` is
-/// declared in the same schema's `properties` map.
-///
-/// This is a deliberately conservative heuristic (no schema-typed CEL
-/// environment exists yet): it only flags obvious references such as
-/// `self.<ident>` against a schema with a declared `properties` map. More
-/// subtle references (chained accesses, dynamic indexing) are deferred to
-/// runtime.
-pub fn unknown_property_in_rule(schema: &JSONSchemaProps, rule: &str) -> Option<String> {
-    let known = schema.properties.as_ref()?;
-    let prop = first_self_reference(rule)?;
-    (!known.contains_key(&prop)).then_some(prop)
-}
-
 /// Return the first `self.<ident>` access in `rule`, or `None` if there is
 /// no plain `self.X` reference (rules may still legitimately use `self` as
 /// a scalar — `self > 0` — and we leave those alone).
@@ -827,11 +812,6 @@ fn compile_schema_rules(
                     .type_check(rule)
                     .err()
                     .map(|e| format!("compilation failed: {e}"))
-            })
-            .or_else(|| {
-                unknown_property_in_rule(schema, rule).map(|prop| {
-                    format!("x-kubernetes-validations rule refers to unknown property: {prop}")
-                })
             })
             .or_else(|| {
                 match cel_checker_shadow::compile_rule(
